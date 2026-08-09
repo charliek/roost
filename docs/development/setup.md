@@ -2,7 +2,7 @@
 
 Roost has two active development surfaces:
 
-1. The Rust workspace at `crates/` (`roost-ipc`, `roost-vt`, `roost-osc`, `roost-cli`, `roost-linux`).
+1. The Rust workspace at `crates/` (`roost-ipc`, `roost-vt`, `roost-osc`, `roost-cli`, `roost-linux`, `roost-iced`).
 2. The Swift package at `mac/` (the macOS UI, `Roost.app`).
 
 Both link the same vendored `libghostty-vt` static archive built from `third_party/ghostty/`.
@@ -35,11 +35,13 @@ mise install                           # Rust + Zig
 
 | Goal | Command |
 |---|---|
-| Run the Linux UI | `~/.cargo/bin/cargo run -p roost-linux` |
+| Run the Linux UI (iced, what the package ships) | `~/.cargo/bin/cargo run -p roost-iced` |
+| Run the Linux UI (GTK, in-repo dev/parity) | `~/.cargo/bin/cargo run -p roost-linux` |
 | Run the Mac UI | `./mac/scripts/bundle.sh debug && open mac/build/Roost.app` |
 | Smoke-test the CLI | `~/.cargo/bin/cargo run -p roost-cli -- identify` |
 | Rust unit tests | `~/.cargo/bin/cargo test --workspace --exclude roost-linux` |
-| Linux UI tests | `~/.cargo/bin/cargo test -p roost-linux` (needs GTK) |
+| Linux UI tests (GTK) | `~/.cargo/bin/cargo test -p roost-linux` (needs GTK) |
+| Linux UI tests (iced) | `~/.cargo/bin/cargo test -p roost-iced` |
 | Mac unit tests | `cd mac && swift test` |
 | Rust formatting | `~/.cargo/bin/cargo fmt --all` |
 | Rust lint | `~/.cargo/bin/cargo clippy --workspace --all-targets` |
@@ -47,7 +49,7 @@ mise install                           # Rust + Zig
 
 The IPC sockets live at:
 
-| OS | Swift/AppKit | GTK | Iced POC |
+| OS | Swift/AppKit | GTK | Iced (dev build) |
 |---|---|---|---|
 | macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` | `~/Library/Caches/Roost-iced/roost.sock` |
 | Linux | n/a | `$XDG_RUNTIME_DIR/roost/roost.sock` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock` |
@@ -73,7 +75,8 @@ Rust tests live next to the code they exercise. Major coverage:
 | `roost-vt` | FFI smoke tests against the vendored `libghostty-vt` archive (gated on `--features ffi`) |
 | `roost-engine` | Workspace, PTY supervision, persistence, events, IPC dispatch, instance lock |
 | `roost-ui-model` | Config, theme, keybind, palette, provider, and agent projection models |
-| `roost-linux` | GTK presentation, native ports, input, and terminal rendering adapter |
+| `roost-linux` | GTK presentation, native ports, input, and terminal rendering adapter — in-repo dev/parity UI |
+| `roost-iced` | iced presentation, native ports, input, and terminal rendering adapter — what the Linux package ships |
 | `roost-cli` | Escape decoder, shell quoter, target arg mapping |
 
 Mac tests are under `mac/Tests/RoostTests/`; they cover the workspace state machine, PTY supervisor lifecycle, IPC server framing, single-instance flock, renderer, OSC scanner, key encoder, drag/drop math, and tab pill state machine. They run in headless `swift test` (no NSWindow required for any covered surface).

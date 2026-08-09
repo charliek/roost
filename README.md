@@ -6,11 +6,13 @@ libghostty-vt terminal per tab. The
 `roostctl` companion CLI surfaces notifications when an agent in a tab needs
 attention.
 
-Two native UIs — **Swift + AppKit on macOS** (`Roost.app`) and **Rust + gtk4-rs
+Two native UIs — **Swift + AppKit on macOS** (`Roost.app`) and **Rust + iced
 on Linux** (`roost`) — each embed the workspace + PTY supervisor + a JSON-IPC
-server **in-process** (no daemon). External tooling (`roostctl`, Claude Code
-hooks) talks to the running UI over newline-delimited JSON on a Unix-domain
-socket; the wire contract is in [`docs/reference/ipc.md`](docs/reference/ipc.md).
+server **in-process** (no daemon). The Linux package ships the iced UI; GTK
+(`crates/roost-linux`, gtk4-rs) remains in-repo as the development/parity
+implementation. External tooling (`roostctl`, Claude Code hooks) talks to
+the running UI over newline-delimited JSON on a Unix-domain socket; the wire
+contract is in [`docs/reference/ipc.md`](docs/reference/ipc.md).
 
 ## Install
 
@@ -41,9 +43,12 @@ cd roost
 mise install                          # Rust (rust-toolchain.toml) + Zig 0.15.x
 ./third_party/ghostty/build.sh        # clones Ghostty at the pinned SHA, builds libghostty-vt
 
-# Linux UI (needs: sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config):
+# Linux UI — iced, what the packaged .deb ships (needs: sudo apt install libclang-dev pkg-config):
+cargo build --release -p roost-iced -p roost-cli    # → target/release/{roost-iced,roostctl}
+./linux/scripts/build-deb.sh 0.0.1-dev              # …or build an installable .deb (stages it as /usr/bin/roost)
+
+# Linux UI — gtk4-rs, the in-repo development/parity UI (needs: sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config):
 cargo build --release -p roost-linux -p roost-cli   # → target/release/{roost,roostctl}
-./linux/scripts/build-deb.sh 0.0.1-dev              # …or build an installable .deb
 
 # macOS UI (needs: brew install gtk4 libadwaita):
 cd mac && swift build                 # or: ./mac/scripts/bundle.sh release  → mac/build/Roost.app

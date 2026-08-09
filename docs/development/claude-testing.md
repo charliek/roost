@@ -148,7 +148,7 @@ above tests:
 # macOS (Swift Roost.app)
 tail -f ~/Library/Logs/Roost/roost.log
 
-# Linux (gtk4-rs roost) — also tees to stdout
+# Linux (iced roost, the packaged UI) — also tees to stdout
 tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/roost/roost.log"
 ```
 

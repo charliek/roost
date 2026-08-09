@@ -3,12 +3,18 @@
 ## Direction (read first)
 
 Roost is a cross-platform (Mac + Linux) desktop terminal multiplexer
-built around libghostty-vt. The architecture is two native UIs that
-each embed the workspace + PTY supervisor in-process and serve a JSON
-IPC socket for external tooling (`roostctl`, Claude hooks). No daemon.
+built around libghostty-vt. It ships **two platform products** — Swift
++ AppKit on macOS and Rust + iced on Linux — that each embed the
+workspace + PTY supervisor in-process and serve a JSON IPC socket for
+external tooling (`roostctl`, Claude hooks). No daemon. **Three UI
+implementations** live in the repo: `mac/` (Swift + AppKit),
+`crates/roost-iced/` (iced, what the Linux package ships), and
+`crates/roost-linux/` (gtk4-rs, the in-repo Linux development/parity
+implementation).
 
 * Mac UI: Swift + AppKit, `mac/` (bundle id `ai.stridelabs.Roost`).
-* Linux UI: gtk4-rs + libadwaita, `crates/roost-linux/`.
+* Linux UI (shipped): Rust + iced, `crates/roost-iced/` (packaged as `/usr/bin/roost`).
+* Linux UI (in-repo dev/parity): gtk4-rs + libadwaita, `crates/roost-linux/`.
 * CLI: `crates/roost-cli/` (binary `roostctl`).
 * IPC + path resolution: `crates/roost-ipc/`.
 * libghostty-vt FFI + OSC: `crates/roost-vt/`, `crates/roost-osc/`.
@@ -16,12 +22,12 @@ IPC socket for external tooling (`roostctl`, Claude hooks). No daemon.
 **North star.** Every surface — UI clicks, hotkeys, `roostctl`, and Lua
 scripts — routes through **one core: the workspace operation set**; the
 UI is a *reaction* to the core's events, never its own source of truth.
-One contract (`roost-ipc`'s op set), two implementations (Swift + AppKit,
-Rust + GTK) kept at behavioral parity. Optimize for **testability,
+One contract (`roost-ipc`'s op set), three implementations (Swift + AppKit,
+Rust + GTK, Rust + iced) kept at behavioral parity. Optimize for **testability,
 programmability, clean architecture**: adding a capability is "add an op
 + thin adapters", not per-surface logic. When in doubt, ask: *does this
 route through the one op set, keep the UI reactive, and stay at parity
-across both implementations?*
+across all three implementations?*
 
 See [docs/development/vision.md](docs/development/vision.md) for the full
 architecture, principles, and decision log;
@@ -56,16 +62,18 @@ See `docs/development/vision.md` for the design rationale and
 
 ## Architecture
 
-- Two UIs (Swift Mac, gtk4-rs Linux). Each embeds the workspace + PTY
+- Three UIs (Swift Mac; gtk4-rs Linux, in-repo dev/parity; Rust + iced
+  Linux, what the package ships). Each embeds the workspace + PTY
   supervisor in-process.
-- libghostty-vt is the terminal engine on both UIs — VT parsing,
+- libghostty-vt is the terminal engine on all three UIs — VT parsing,
   screen state, OSC parsing, key/mouse encoding.
-- The renderer is ours on both sides: AppKit + Core Graphics on Mac,
-  Cairo + Pango on `GtkDrawingArea` on Linux. We walk
-  libghostty-vt's render state and draw cell-aligned rects + text.
+- The renderer is ours across all three: AppKit + Core Graphics on
+  Mac, Cairo + Pango on `GtkDrawingArea` for the GTK dev UI, and iced +
+  wgpu for the shipped Linux UI. We walk libghostty-vt's render state
+  and draw cell-aligned rects + text.
 - The PTY is ours — `forkpty(3)` directly on Mac (`mac/Sources/Roost/
-  PtySupervisor.swift`), `portable-pty` on Linux (`crates/roost-linux/
-  src/daemon/pty.rs`). One PTY per tab.
+  PtySupervisor.swift`), `portable-pty` on Linux (`crates/roost-engine/
+  src/pty.rs`, shared by both Linux UIs). One PTY per tab.
 - External tools dial the running UI process at the bundle profile's
   socket path (`~/Library/Caches/Roost/roost.sock` for Mac,
   `$XDG_RUNTIME_DIR/roost/roost.sock` for Linux — fallback
@@ -157,10 +165,11 @@ wrapper small.
   `<private>` by default; the file appender uses `privacy: .public`
   to defeat that. For raw values without redaction, prefer the file
   log.
-- **Linux UI logs**: `roost-linux` writes `$XDG_STATE_HOME/roost/roost.log`
+- **Linux UI logs**: the shipped iced UI writes `$XDG_STATE_HOME/roost/roost.log`
   (default `~/.local/state/roost/roost.log`) **and** tees to stdout
-  (synchronous file appender in `crates/roost-linux/src/main.rs`, so
-  entries survive a crash). `tail -f` it while reproducing; set
+  (synchronous file appender in `crates/roost-iced/src/main.rs`, so
+  entries survive a crash) — the in-repo GTK UI's own log lives at the
+  same profile path under its `Gtk` bundle profile. `tail -f` it while reproducing; set
   `RUST_LOG=info,roost_ipc=debug` to adjust. On macOS the Gtk dev
   profile writes `~/Library/Logs/Roost-gtk/roost.log` — a **distinct**
   file from the Swift app's `~/Library/Logs/Roost/roost.log`, so both UIs

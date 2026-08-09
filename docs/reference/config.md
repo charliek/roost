@@ -2,9 +2,13 @@
 
 Roost reads a single user-level config file at `~/.config/roost/config.conf`
 (XDG-style on macOS by deliberate divergence from Apple HIG — matching
-Ghostty / nvim / fish). Both UIs (Swift Mac app, Linux gtk4-rs binary)
-parse the same file with the same semantics, so a config tuned on one
-platform is portable to the other.
+Ghostty / nvim / fish). All three UIs (Swift Mac app, Linux gtk4-rs
+binary, Linux iced binary) parse the same file with the same
+semantics, so a config tuned on one platform is portable to the
+others. A few settings are honored by only some UIs — where that is the
+case, the setting's own section says so explicitly (see
+[`link-modifier`](#link-modifier)); unknown and unsupported keys are
+dropped rather than erroring, so a portable file stays valid everywhere.
 
 The file is plain text, one `key = value` per line, `#`-prefixed comments
 allowed, whitespace forgiving. Unknown keys are silently dropped — this
@@ -161,9 +165,11 @@ common-terminal convention) just set:
 link-modifier = ctrl
 ```
 
-> **Scope:** this setting is honored by the **GTK app only**. The Swift
-> Mac app's modifier is currently fixed to Cmd, so the key is silently
-> ignored there (harmless — unknown keys are always dropped).
+> **Scope:** this setting is honored by **both Linux UIs** — GTK and the
+> shipped iced app (`link_modifier_held` in
+> `crates/roost-iced/src/app.rs`). The Swift Mac app's modifier is
+> currently fixed to Cmd, so the key is silently ignored there (harmless
+> — unknown keys are always dropped).
 >
 > **Heads up (Linux):** some window managers/compositors grab `Alt`+drag
 > to move windows, which can swallow `Alt`+click. If link-clicking feels

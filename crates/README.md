@@ -10,7 +10,10 @@ Rust workspace for the Roost UIs and supporting crates:
 - `roost-cli` — shell-integration CLI; binary is `roostctl`.
 - `roost-engine` — toolkit-neutral workspace, persistence, PTY runtime, events, and IPC dispatch.
 - `roost-ui-model` — toolkit-neutral config, themes, keybinds, palettes, providers, and projections.
-- `roost-linux` — gtk4-rs + libadwaita adapter over the shared Rust engine.
+- `roost-linux` — gtk4-rs + libadwaita adapter over the shared Rust engine; the in-repo
+  Linux development/parity implementation.
+- `roost-iced` — iced adapter over the shared Rust engine; what the packaged Linux `.deb`
+  ships as `/usr/bin/roost`.
 - `roost-vt` / `roost-osc` — libghostty-vt FFI wrapper + OSC scanner.
 
 The daemon-era crates (`roost-core`, `roost-proto`, `roost-common`,

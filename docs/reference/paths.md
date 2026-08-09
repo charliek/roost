@@ -46,7 +46,7 @@ Same shape as the `Mac` profile with `Roost-gtk` in place of `Roost`:
 
 ### macOS — `Iced` profile (`cargo run -p roost-iced`)
 
-The Iced POC uses the same shape with `Roost-iced`, so all three UIs can run
+The Iced dev build uses the same shape with `Roost-iced`, so all three UIs can run
 at once:
 
 | Path | Purpose |
@@ -227,13 +227,13 @@ rm "$HOME/Library/Application Support/Roost/state.json"
 # macOS — Gtk dev profile (cargo run -p roost-linux on Mac)
 rm "$HOME/Library/Application Support/Roost-gtk/state.json"
 
-# macOS — Iced POC
+# macOS — Iced dev build
 rm "$HOME/Library/Application Support/Roost-iced/state.json"
 
 # Linux (uses XDG_DATA_HOME with the spec-default fallback)
 rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/state.json"
 
-# Linux — Iced POC
+# Linux — Iced dev build
 rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost-iced/state.json"
 ```
 

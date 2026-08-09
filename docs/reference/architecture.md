@@ -1,30 +1,35 @@
 # Architecture
 
-Roost ships two production native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed their runtime in-process. The GTK runtime's authoritative state is provided by the toolkit-neutral `roost-engine` crate. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
+Roost ships two platform products — Swift + AppKit on macOS (`Roost.app`) and Rust + iced on Linux (`roost`, packaged as the `.deb`) — that each embed their runtime in-process. A third UI implementation, Rust + gtk4-rs (`crates/roost-linux`), lives in the repo as the Linux development/parity implementation; both Linux UIs share their authoritative state via the toolkit-neutral `roost-engine` crate. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into all three UIs for in-process VT parsing and rendering.
 
-The `poc/iced` branch proposes extending the shared Rust engine to Iced and, incrementally, Swift. This is a POC architecture proposal, not approval to migrate the production AppKit implementation; see [the reviewed Iced POC plan](../development/iced-poc-plan.md).
+iced (`crates/roost-iced`) has shipped as the Linux package's production UI since the `poc/iced` branch merged to `main`; the production Swift + AppKit implementation on macOS is unaffected by that work — see [the Iced POC plan](../development/iced-poc-plan.md) for the design record that led here.
 
 For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md).
 
 ## Stack
 
-| Layer | macOS | Linux |
-|---|---|---|
-| Window + chrome | Swift + AppKit | Rust + gtk4-rs + libadwaita |
-| Renderer | Core Graphics over libghostty-vt cell grid | Cairo + Pango over libghostty-vt cell grid |
-| Terminal engine | `libghostty-vt` (vendored, shared archive) | `libghostty-vt` (vendored, shared archive) |
-| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-engine/src/workspace.rs` |
-| PTY supervisor | `mac/Sources/Roost/PtySupervisor.swift` (forkpty + DispatchSourceRead) | `crates/roost-linux/src/daemon/pty.rs` (`portable-pty` + tokio tasks) |
-| Persistence | `state.json` via tmp + fsync + `replaceItemAt` | `state.json` via tmp + fsync + rename + parent-dir fsync |
-| IPC server | `mac/Sources/Roost/IPCServer.swift` (Darwin sockets) | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`) |
-| IPC wire types | `mac/Sources/Roost/IPCMessages.swift` (Codable) | `crates/roost-ipc/src/messages.rs` (serde) |
-| OSC scanning | `mac/Sources/Roost/OscScanner.swift` per `TerminalView` | `roost-osc` crate per per-tab drain task |
-| Agent state model (shell/lifecycle/attention/ownership axes, `tab.state` derivation) | `mac/Sources/Roost/AgentState.swift` | `crates/roost-ipc/src/agent.rs` |
-| Agent adapters (Claude Code today) | `roostctl claude-hook` (binary from `crates/roost-cli`, links `crates/roost-agent`) — same binary on both platforms | (same) |
-| Single-instance | `mac/Sources/Roost/SingleInstance.swift` (flock via `@_silgen_name`) | `crates/roost-linux/src/single_instance.rs` (`fs2::FileExt::try_lock_exclusive`) |
-| Shell-integration CLI | `roostctl` (binary from `crates/roost-cli`) — same binary on both platforms | (same) |
+Linux splits into two columns because the two Linux UIs share almost
+everything below the window/renderer layer — both adapt the same
+toolkit-neutral `roost-engine` — but differ in windowing toolkit and
+renderer, and only one of them ships.
 
-The UIs are written separately and idiomatic to their platform; only the JSON IPC wire format is shared between them (via the `roost-ipc` crate on the Rust side + its hand-mirrored Swift counterpart in `IPCMessages.swift`).
+| Layer | macOS | Linux — GTK (`crates/roost-linux`, dev/parity) | Linux — iced (`crates/roost-iced`, shipped) |
+|---|---|---|---|
+| Window + chrome | Swift + AppKit | Rust + gtk4-rs + libadwaita (`crates/roost-linux/src/app.rs`) | Rust + iced (`crates/roost-iced/src/app.rs`) |
+| Renderer | Core Graphics over libghostty-vt cell grid | Cairo + Pango over libghostty-vt cell grid (`crates/roost-linux/src/terminal_view.rs`) | iced + wgpu over libghostty-vt cell grid (`crates/roost-iced/src/terminal_widget.rs`) |
+| Terminal engine | `libghostty-vt` (vendored, shared archive) | `libghostty-vt` (vendored, shared archive) | `libghostty-vt` (vendored, shared archive) |
+| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-engine/src/workspace.rs` (shared) | `crates/roost-engine/src/workspace.rs` (shared) |
+| PTY supervisor | `mac/Sources/Roost/PtySupervisor.swift` (forkpty + DispatchSourceRead) | `crates/roost-engine/src/pty.rs` (`portable-pty` + tokio tasks, shared) | `crates/roost-engine/src/pty.rs` (shared) |
+| Persistence | `state.json` via tmp + fsync + `replaceItemAt` | `state.json` via tmp + fsync + rename + parent-dir fsync (`crates/roost-engine/src/persistence.rs`, shared) | `crates/roost-engine/src/persistence.rs` (shared) |
+| IPC server | `mac/Sources/Roost/IPCServer.swift` (Darwin sockets) | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`, shared) | `crates/roost-ipc/src/server.rs` (shared) |
+| IPC wire types | `mac/Sources/Roost/IPCMessages.swift` (Codable) | `crates/roost-ipc/src/messages.rs` (serde, shared) | `crates/roost-ipc/src/messages.rs` (shared) |
+| OSC scanning | `mac/Sources/Roost/OscScanner.swift` per `TerminalView` | `roost-osc` crate + `crates/roost-engine/src/osc.rs` (`OscRouter`, shared) per per-tab drain task | same (shared) |
+| Agent state model (shell/lifecycle/attention/ownership axes, `tab.state` derivation) | `mac/Sources/Roost/AgentState.swift` | `crates/roost-ipc/src/agent.rs` (shared) | `crates/roost-ipc/src/agent.rs` (shared) |
+| Agent adapters (Claude Code today) | `roostctl claude-hook` (binary from `crates/roost-cli`, links `crates/roost-agent`) — same binary on all three UIs | (same) | (same) |
+| Single-instance | `mac/Sources/Roost/SingleInstance.swift` (flock via `@_silgen_name`) | `crates/roost-engine/src/single_instance.rs` (`fs2::FileExt::try_lock_exclusive`, shared) | `crates/roost-engine/src/single_instance.rs` (shared) |
+| Shell-integration CLI | `roostctl` (binary from `crates/roost-cli`) — same binary on all three UIs | (same) | (same) |
+
+The UIs are written separately and idiomatic to their platform; the JSON IPC wire format is shared across all three (via the `roost-ipc` crate on the Rust side + its hand-mirrored Swift counterpart in `IPCMessages.swift`), and the two Linux UIs additionally share `roost-engine` (workspace, PTY, persistence, events, single-instance) and `roost-ui-model` (config, theme, keybinds, palette, providers, agent/notification projections) — see [Shared Rust engine](../development/shared-rust-engine.md).
 
 ## Repository layout
 
@@ -33,10 +38,13 @@ crates/
   roost-ipc/              # JSON wire format, framing, client, server, paths, target picker
   roost-agent/            # Pure agent adapters (Claude Code today) — hook event JSON in,
                           # tab.agent_report params out; no I/O, no socket, no clap
+  roost-engine/           # Toolkit-neutral workspace, PTY, persistence, events, IPC dispatch — shared by both Linux UIs
+  roost-ui-model/         # Toolkit-neutral config, theme, keybind, palette, provider, agent/notification projections
   roost-vt/               # libghostty-vt FFI wrapper (--features ffi)
   roost-osc/              # OSC scanner + state machine
   roost-cli/              # roostctl binary
-  roost-linux/            # Linux UI (gtk4-rs) — embeds Workspace + PtySupervisor + IPC server
+  roost-linux/            # Linux UI (gtk4-rs) — in-repo development/parity implementation
+  roost-iced/             # Linux UI (iced) — what the packaged .deb ships as /usr/bin/roost
 mac/
   Sources/Roost/          # Swift Mac UI — embeds Workspace + PtySupervisor + IPC server
   Resources/              # themes, Info.plist.template, Roost.entitlements
@@ -105,7 +113,7 @@ The Mac PTY read path uses a dedicated pattern: the `DispatchSourceRead` closure
 - `libghostty-vt` lives inside each UI for VT parsing + rendering.
 - OSC scanning lives in the UI (`OscScanner.swift` on macOS, `roost-osc` crate on Linux) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace via `LocalClient.applyOSC`.
 - Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) split across two channels — embedder-synthesized OSC color replies vs. libghostty-answered device replies. See [Terminal query replies](terminal-queries.md) for which is which and why.
-- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket. The Iced POC adds isolated `Roost-iced`/`roost-iced` paths alongside the existing Mac and GTK paths. `roostctl --target {mac,gtk,iced}` routes explicitly; with no selector it probes every distinct candidate concurrently and requires a choice if multiple UIs answer.
+- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket. Dev builds of iced use isolated `Roost-iced`/`roost-iced` paths alongside the existing Mac and GTK paths; the packaged `.deb` build adopts the production `roost`/`Roost` profile instead (see [Paths & Environment](paths.md)). `roostctl --target {mac,gtk,iced}` routes explicitly; with no selector it probes every distinct candidate concurrently and requires a choice if multiple UIs answer.
 - Single-instance enforcement uses `flock(LOCK_EX | LOCK_NB)` on a pidfile next to the socket. Second launches read the holder PID and exit 0. `ROOST_ALLOW_MULTI=1` bypasses for dev/test workflows.
 
 See [Vision → Decision log](../development/vision.md#decision-log) for the rationale behind each major choice.

@@ -32,15 +32,19 @@ ut_resolve_roostctl() {
 
 # Per-target socket path (matches roost-ipc's BundleProfile resolver).
 # macOS uses three `~/Library/Caches/Roost*` namespaces. Linux keeps the
-# production GTK socket under `roost/` and the POC under `roost-iced/`.
+# production `roost/` namespace — owned by the gtk profile, which the
+# packaged iced UI adopts — and the isolated iced dev profile on
+# `roost-iced/`.
 ut_socket_for() {
   case "$1" in
     mac) echo "${HOME}/Library/Caches/Roost/roost.sock" ;;
     gtk)
       if [[ "$(uname -s)" == "Darwin" ]]; then
         echo "${HOME}/Library/Caches/Roost-gtk/roost.sock"
+      elif [[ -n "${XDG_RUNTIME_DIR:-}" && "${XDG_RUNTIME_DIR}" == /* ]]; then
+        echo "${XDG_RUNTIME_DIR}/roost/roost.sock"
       else
-        echo "${XDG_RUNTIME_DIR:-/tmp/roost-$(id -u)}/roost/roost.sock"
+        echo "/tmp/roost-$(id -u)/roost.sock"
       fi
       ;;
     iced)

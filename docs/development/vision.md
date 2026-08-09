@@ -8,11 +8,13 @@ the north star every PR is measured against.
 A single-window, cross-platform terminal multiplexer: a sidebar of
 projects, tabs per project, one terminal per tab. The differentiator is
 the multi-project workspace with **notification routing for AI coding
-agents** (Claude Code, Codex, …). It ships as **two native UIs that each
-embed the workspace + PTY supervisor in-process** — Swift + AppKit on
-macOS (`Roost.app`), Rust + gtk4-rs on Linux (`roost-linux`).
-`libghostty-vt` is vendored once and linked into both for in-process VT
-parsing and rendering. There is no daemon.
+agents** (Claude Code, Codex, …). It ships **two platform products, each
+embedding the workspace + PTY supervisor in-process** — Swift + AppKit on
+macOS (`Roost.app`), Rust + iced on Linux (`roost`, the packaged `.deb`).
+A third UI implementation, Rust + gtk4-rs (`roost-linux`), lives in the
+repo as the Linux development/parity implementation. `libghostty-vt` is
+vendored once and linked into all three for in-process VT parsing and
+rendering. There is no daemon.
 
 ## The command core (north star)
 
@@ -39,15 +41,17 @@ truth.**
 - A hotkey (`Cmd+Shift+T`), a `roostctl` call, and a Lua script all
   invoke the **same** command — e.g. "run action" or "open tab".
 
-**One contract, two implementations.** There is no shared *codebase*
-core — Swift and Rust can't share one. There is one shared **contract**
-— the IPC op set in [`crates/roost-ipc`](../reference/ipc.md) —
-implemented by **Swift `Workspace` + AppKit** and **Rust `Workspace` +
-GTK**. "Same interface" means same op contract + behavioral parity,
-which the cross-platform E2E suite ([test-automation.md](test-automation.md))
-exists to enforce. Per platform: identical command surface,
-platform-specific guts (`forkpty` vs `portable-pty`, Core Graphics vs
-Cairo).
+**One contract, three implementations.** There is no shared *codebase*
+core across languages — Swift and Rust can't share one. There is one
+shared **contract** — the IPC op set in
+[`crates/roost-ipc`](../reference/ipc.md) — implemented by **Swift
+`Workspace` + AppKit**, **Rust + GTK**, and **Rust + iced** (the two
+Rust UIs additionally share `roost-engine`). "Same interface" means same
+op contract + behavioral parity, which the cross-platform E2E suite
+([test-automation.md](test-automation.md)) exists to enforce. Per
+implementation: identical command surface, platform-specific guts
+(`forkpty` vs `portable-pty`; Core Graphics vs Cairo + Pango vs
+iced + wgpu).
 
 **Two seams** connect the surfaces to the core:
 
@@ -75,7 +79,7 @@ for at once:
 
 Every decision below — and every new feature — is measured against it:
 *does it route through the one op set, keep the UI reactive, and stay at
-parity across both implementations?*
+parity across all three implementations?*
 
 ## Why this shape
 
@@ -131,8 +135,8 @@ flowchart LR
     macWS --- macIPC
   end
 
-  subgraph LinuxApp["roost-linux (Rust + gtk4-rs)"]
-    linuxView["Cell renderer<br/>(Cairo + Pango)"]
+  subgraph LinuxApp["roost (Rust + iced) — packaged Linux UI"]
+    linuxView["Cell renderer<br/>(iced + wgpu)"]
     linuxVT["libghostty-vt<br/>(in-process VT parse)"]
     linuxWS["Workspace + PtySupervisor<br/>(tokio + portable-pty)"]
     linuxIPC["JSON IPC server<br/>(tokio UnixListener)"]

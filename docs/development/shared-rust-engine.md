@@ -1,7 +1,8 @@
 # Shared Rust engine
 
 `roost-engine` is Roost's toolkit-neutral authoritative Rust application
-engine. GTK consumes it today; the Iced POC consumes it directly. A future
+engine. Both Linux UIs consume it directly — the shipped iced UI and the
+in-repo GTK development/parity UI. A future
 Swift adapter can adopt the same boundary incrementally without exposing Rust
 layouts across an ABI.
 
