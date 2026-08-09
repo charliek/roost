@@ -57,6 +57,15 @@ pub const ACTIVE_AGENT: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
 pub const TEXT: Color = Color::from_rgb8(0xf2, 0xf2, 0xf2);
 pub const MUTED_TEXT: Color = Color::from_rgb8(0xa0, 0xa4, 0xb0);
 pub const NOTIFICATION: Color = Color::from_rgb8(0x4e, 0x9a, 0xf1);
+/// Both notification dots — the tab-pill badge and the sidebar
+/// project-row dot. Pinned to the Mac's `NSColor.controlAccentColor`
+/// (#007aff), which both Mac surfaces use (`App.swift:4772`, `:5207`)
+/// and which GTK hardcodes for its tab badge
+/// (`crates/roost-linux/src/resources/style.css:277-288`) rather than
+/// tracking the desktop accent — on COSMIC `@accent_bg_color` renders
+/// teal. Deliberately separate from `NOTIFICATION`: only the dots have a
+/// cited reference value (#311).
+pub const NOTIFICATION_BADGE: Color = Color::from_rgb8(0x00, 0x7a, 0xff);
 pub const DRAGGED_PILL: Color = Color::from_rgba8(0x55, 0x68, 0x7b, 0.65);
 pub const PALETTE_SURFACE: Color = Color::from_rgb8(0x2d, 0x2d, 0x33);
 pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
@@ -114,7 +123,7 @@ pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::S
 
 pub fn badge(_: &Theme) -> container::Style {
     container::Style::default()
-        .background(NOTIFICATION)
+        .background(NOTIFICATION_BADGE)
         .border(Border::default().rounded(NOTIFICATION_DOT_SIZE / 2.0))
 }
 
@@ -454,5 +463,31 @@ mod tests {
         assert_eq!(style.background, Some(Background::Color(PALETTE_SURFACE)));
         assert_eq!(style.border.color, ERROR_TEXT.scale_alpha(0.55));
         assert_eq!(style.border.width, 1.0);
+    }
+
+    #[test]
+    fn notification_dots_pin_the_mac_accent_and_leave_the_generic_accent_alone() {
+        // Literals, not the constants themselves: comparing a constant to
+        // itself passes for any value and would not catch a re-flip.
+        assert_eq!(NOTIFICATION_BADGE, Color::from_rgb8(0x00, 0x7a, 0xff));
+        assert_eq!(NOTIFICATION, Color::from_rgb8(0x4e, 0x9a, 0xf1));
+
+        // Wiring, not color: this one is tautological on its own (it would
+        // hold for any value of the constant). It exists to catch `badge()`
+        // being repointed at a *different* constant; the literals above are
+        // what pin the value.
+        let theme = Theme::Dark;
+        assert_eq!(
+            badge(&theme).background,
+            Some(Background::Color(NOTIFICATION_BADGE)),
+            "both notification dots render the Mac accent"
+        );
+
+        // The generic accent keeps its other uses — nothing in #311's scope
+        // touches the rename affordances.
+        let focused =
+            inline_rename_input(&theme, text_input::Status::Focused { is_hovered: false });
+        assert_eq!(focused.border.color, NOTIFICATION);
+        assert_eq!(focused.selection, NOTIFICATION.scale_alpha(0.65));
     }
 }

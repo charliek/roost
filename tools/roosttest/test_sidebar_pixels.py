@@ -119,27 +119,45 @@ def _components(points: set[tuple[int, int]]) -> list[tuple[int, int, int, int]]
     return sorted(out)
 
 
+def _blobs(
+    shot,
+    color: tuple[int, int, int],
+    *,
+    x0: int = 0,
+    x1: int | None = None,
+    y0: int = 0,
+    y1: int | None = None,
+    tol: int = 0,
+    min_side: int = 1,
+) -> list[tuple[int, int, int, int]]:
+    """Connected components matching `color` within [x0,x1) x [y0,y1),
+    filtered to those at least `min_side` on both axes. Returns
+    (minx, miny, maxx, maxy) tuples, sorted."""
+    width, height, bpp, px = shot
+    x1 = width if x1 is None else min(x1, width)
+    y1 = height if y1 is None else min(y1, height)
+    x0 = max(0, min(x0, x1))
+    y0 = max(0, min(y0, y1))
+    tr, tg, tb = color
+    points: set[tuple[int, int]] = set()
+    for y in range(y0, y1):
+        base = y * width * bpp
+        for x in range(x0, x1):
+            o = base + x * bpp
+            if abs(px[o] - tr) <= tol and abs(px[o + 1] - tg) <= tol and abs(px[o + 2] - tb) <= tol:
+                points.add((x, y))
+    return [
+        c
+        for c in _components(points)
+        if (c[2] - c[0] + 1) >= min_side and (c[3] - c[1] + 1) >= min_side
+    ]
+
+
 def _dot_blobs(shot, max_x: int) -> dict[str, list[tuple[int, int, int, int]]]:
     """Solid, dot-sized blobs of each lifecycle colour within `max_x`."""
-    width, height, bpp, px = shot
-    max_x = max(0, min(max_x, width))
-    matches: dict[str, set[tuple[int, int]]] = {name: set() for name in LIFECYCLE_COLORS}
-    for y in range(height):
-        base = y * width * bpp
-        for x in range(max_x):
-            o = base + x * bpp
-            r, g, b = px[o], px[o + 1], px[o + 2]
-            for name, (tr, tg, tb) in LIFECYCLE_COLORS.items():
-                if abs(r - tr) <= COLOR_TOL and abs(g - tg) <= COLOR_TOL and abs(b - tb) <= COLOR_TOL:
-                    matches[name].add((x, y))
-                    break
     return {
-        name: [
-            c
-            for c in _components(pts)
-            if (c[2] - c[0] + 1) >= MIN_DOT_SIDE and (c[3] - c[1] + 1) >= MIN_DOT_SIDE
-        ]
-        for name, pts in matches.items()
+        name: _blobs(shot, color, x1=max_x, tol=COLOR_TOL, min_side=MIN_DOT_SIDE)
+        for name, color in LIFECYCLE_COLORS.items()
     }
 
 
@@ -163,15 +181,7 @@ def _longest_vertical_run(shot, x: int, color: tuple[int, int, int]) -> int:
 
 
 def _color_components(shot, max_x: int, color: tuple[int, int, int]):
-    width, height, bpp, px = shot
-    points = set()
-    for y in range(height):
-        base = y * width * bpp
-        for x in range(min(width, max_x)):
-            offset = base + x * bpp
-            if tuple(px[offset : offset + 3]) == color:
-                points.add((x, y))
-    return _components(points)
+    return _blobs(shot, color, x1=max_x)
 
 
 def _capture(roost, path: Path):
