@@ -34,8 +34,21 @@ description: |
 # application itself loads (their own Depends pull the rest of the closure —
 # Mesa alone accounts for ~30 more packages that must NOT be pinned here).
 depends:
-  - libc6 (>= 2.31)
+  # Measured, not inherited: `objdump -T` on the release binary shows
+  # non-weak GLIBC_2.35 imports (hypot/hypotf) and GLIBC_2.34 (pthread_*,
+  # __libc_start_main). The 2.39 symbols it also references are weak, so
+  # they do not raise the floor. The old `>= 2.31` carried over from the GTK
+  # package would let this install on Ubuntu 20.04 / Debian 11 and then fail
+  # in the dynamic loader before a window ever appears — the same
+  # install-clean-then-fail shape the dlopen note below is about.
+  - libc6 (>= 2.35)
   - libgcc-s1
+  # A terminal with no monospace glyphs is not usable. Startup itself does
+  # survive a font-less system (measured: a --no-install-recommends install
+  # into a container with zero files under /usr/share/fonts and no
+  # fontconfig still opened a window), so this is about being legible, not
+  # about booting.
+  - fonts-dejavu-core
   # winit: keyboard mapping, and the X11/Wayland client libraries.
   - libxkbcommon0
   - libxkbcommon-x11-0

@@ -50,6 +50,7 @@ jobs:
             linux:
               - *rustcore
               - 'linux/**'
+              - 'packaging/**'
             # repo-root shared fixture corpora (parity gates for both UIs),
             # consumed only by the unit-test jobs (rust-build, gtk-build,
             # swift-mac) — distinct from the `tests` output below, which
@@ -675,7 +676,12 @@ jobs:
   # itself, not the backend.
   iced-release:
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    # `linux` is in here for the packaging paths it covers (linux/** and
+    # packaging/**): this lane builds the same packaged configuration the deb
+    # ships, so a build-deb.sh or nfpm.yaml change must be able to reach it.
+    # Without that, a packaging-only PR triggered no lane that compiles the
+    # linux-package feature at all.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

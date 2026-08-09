@@ -245,7 +245,29 @@ jobs:
           mkdir -p "${XDG_RUNTIME_DIR}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
           chmod 700 "${XDG_RUNTIME_DIR}"
 
-          xvfb-run -a --server-args="-screen 0 1280x800x24" ./dist/roost \
+          # Smoke what nfpm actually produced, not what build-deb.sh staged.
+          # Running ./dist/roost would prove the binary works while leaving
+          # every packaging-layer mistake — a wrong `contents:` destination,
+          # a dropped entry, a lost exec bit — to be discovered by users.
+          shopt -s nullglob
+          debs=(out/*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one out/*.deb to smoke, found ${#debs[@]}: ${debs[*]:-none}"
+            exit 1
+          fi
+          payload="${RUNNER_TEMP}/roost-smoke/payload"
+          rm -rf "${payload}"; mkdir -p "${payload}"
+          dpkg-deb -x "${debs[0]}" "${payload}"
+          for f in usr/bin/roost usr/bin/roostctl; do
+            if [ ! -x "${payload}/${f}" ]; then
+              echo "::error::${f} missing or not executable inside ${debs[0]}"
+              exit 1
+            fi
+          done
+          UI="${payload}/usr/bin/roost"
+          ROOSTCTL="${payload}/usr/bin/roostctl"
+
+          xvfb-run -a --server-args="-screen 0 1280x800x24" "${UI}" \
             > "${RUNNER_TEMP}/roost-smoke/app.log" 2>&1 &
           APP=$!
           trap 'kill "${APP}" 2>/dev/null || true; wait "${APP}" 2>/dev/null || true' EXIT
@@ -257,14 +279,14 @@ jobs:
           identify_out=""
           ok=0
           for _ in $(seq 1 60); do
-            if identify_out="$(./dist/roostctl identify 2>/dev/null)"; then
+            if identify_out="$("${ROOSTCTL}" identify 2>/dev/null)"; then
               ok=1
               break
             fi
             sleep 0.5
           done
           if [ "${ok}" -ne 1 ]; then
-            echo "::error::dist/roostctl identify never succeeded against dist/roost after 30s — the packaged UI never came up (or never opened its IPC socket)."
+            echo "::error::roostctl identify never succeeded against the packaged /usr/bin/roost after 30s — the UI never came up (or never opened its IPC socket)."
             tail -50 "${RUNNER_TEMP}/roost-smoke/app.log" || true
             exit 1
           fi

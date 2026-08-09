@@ -18,13 +18,19 @@ gauntlet passes sized one milestone slice at a time.
 1. **The Swift/AppKit app is the production daily driver.** It must stay
    release-ready on `main` at all times. No Swift behavior change lands
    without its own tests, and `e2e-mac` stays a required gate.
-2. **The GTK app ships to Linux users.** No regressions — `e2e-gtk` and the
-   Wayland drag guard are its no-regression gates — but GTK is the UI Iced
-   eventually replaces, so it receives fixes, not new investment.
-3. **`roost-iced` may live on `main` incomplete.** It is fully isolated (own
-   binary, `ai.stridelabs.Roost.iced` profile, own socket/state/log paths,
-   absent from release artifacts), so incompleteness cannot leak into either
-   shipped app.
+2. **~~The GTK app ships to Linux users.~~ Superseded by M4 (plan 022):**
+   the `.deb` now ships Iced as `/usr/bin/roost` on the production GTK
+   bundle profile. GTK stays in-repo as the development and parity
+   implementation, still gated by `e2e-gtk` and the Wayland drag guard,
+   still receiving fixes rather than new investment — but it is no longer
+   what Linux users install. Retirement remains a separate decision.
+3. **`roost-iced` may live on `main` incomplete** — with the M4 caveat that
+   this no longer holds for the Linux package. Off Linux, and in every dev
+   build, it stays isolated (own binary, `ai.stridelabs.Roost.iced` profile,
+   own socket/state/log paths). What a *packaged* Linux build does is the
+   opposite by design: it adopts the production profile, so incompleteness
+   there reaches users. That is what the M4 entry criteria and the parity
+   inventory exist to gate.
 4. **One op set.** All Rust UI capability routes through
    `roost-engine`/`roost-ui-model`; the exhaustive `UiRequest` match in both
    Rust UIs is the parity mechanism. Never add a wildcard arm.
