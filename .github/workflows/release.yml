@@ -157,14 +157,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install GTK4 + libadwaita + build deps
+      # The .deb ships the iced UI as /usr/bin/roost (linux/scripts/
+      # build-deb.sh), not roost-linux — GTK dev packages (libgtk-4-dev,
+      # libadwaita-1-dev) are dead weight now that the package no longer
+      # contains the GTK UI. pkg-config + libclang-dev build roost-vt's
+      # bindgen; the rest mirrors ci.yml's `iced-release` job — the display
+      # + wgpu/vulkan stack the packaged-artifact smoke below needs to
+      # actually launch the binary under Xvfb.
+      - name: Install Iced + build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev \
-            libadwaita-1-dev \
             pkg-config \
-            libclang-dev
+            libclang-dev \
+            fonts-noto-cjk \
+            libxkbcommon-x11-0 \
+            libwayland-client0 \
+            mesa-vulkan-drivers \
+            xvfb \
+            xdotool \
+            zsh
 
       - name: Install nfpm
         env:
@@ -211,6 +223,73 @@ jobs:
 
       - name: Build .deb
         run: ./linux/scripts/build-deb.sh "${GITHUB_REF_NAME#v}"
+
+      # This is the only thing in the release path that actually launches
+      # the artifact being shipped. Nothing upstream (cargo build, nfpm pkg)
+      # can catch "wrong binary staged" or "linux-package silently didn't
+      # compile in" — both fail *only* by the running binary binding the
+      # wrong IPC namespace, which is exactly what this checks. Runs the
+      # dist/roost build-deb.sh just staged (the real packaged build,
+      # feature and all) in a throwaway XDG_* sandbox so it can't touch
+      # anything else on the runner, and deliberately leaves
+      # ROOST_BUNDLE_PROFILE UNSET — the point is to prove the *compiled-in
+      # default* lands on the production `roost` namespace (what existing
+      # GTK users already have on disk), not an env override papering over
+      # a build that defaults to the dev `roost-iced` namespace.
+      - name: Smoke the packaged artifact
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="${RUNNER_TEMP}/roost-smoke/runtime"
+          export XDG_DATA_HOME="${RUNNER_TEMP}/roost-smoke/data"
+          export XDG_STATE_HOME="${RUNNER_TEMP}/roost-smoke/state"
+          mkdir -p "${XDG_RUNTIME_DIR}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+
+          xvfb-run -a --server-args="-screen 0 1280x800x24" ./dist/roost \
+            > "${RUNNER_TEMP}/roost-smoke/app.log" 2>&1 &
+          APP=$!
+          trap 'kill "${APP}" 2>/dev/null || true; wait "${APP}" 2>/dev/null || true' EXIT
+
+          # Poll a successful `identify` round-trip, NOT socket-file
+          # existence: a stale socket file can sit there with nothing
+          # listening, so a file-existence check races and can pass on a
+          # dead UI.
+          identify_out=""
+          ok=0
+          for _ in $(seq 1 60); do
+            if identify_out="$(./dist/roostctl identify 2>/dev/null)"; then
+              ok=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "${ok}" -ne 1 ]; then
+            echo "::error::dist/roostctl identify never succeeded against dist/roost after 30s — the packaged UI never came up (or never opened its IPC socket)."
+            tail -50 "${RUNNER_TEMP}/roost-smoke/app.log" || true
+            exit 1
+          fi
+          echo "${identify_out}"
+
+          socket_path="$(printf '%s\n' "${identify_out}" | awk -F= '/^socket=/{print $2}')"
+          if [ -z "${socket_path}" ]; then
+            echo "::error::identify succeeded but printed no socket= line: ${identify_out}"
+            exit 1
+          fi
+
+          case "${socket_path}" in
+            "${XDG_RUNTIME_DIR}/roost/"*)
+              echo "socket ${socket_path} is under the production roost/ namespace — ok."
+              ;;
+            *)
+              echo "::error::packaged roost bound socket '${socket_path}', expected it under ${XDG_RUNTIME_DIR}/roost/ (the production GTK/roost namespace shared with existing users). The linux-package feature may be missing from this build."
+              exit 1
+              ;;
+          esac
+
+          if [ -d "${XDG_RUNTIME_DIR}/roost-iced" ]; then
+            echo "::error::${XDG_RUNTIME_DIR}/roost-iced exists — the packaged binary created the DEV iced namespace instead of defaulting to production roost."
+            exit 1
+          fi
 
       - name: Upload .deb to the Release
         env:
