@@ -26,6 +26,9 @@ from client import Roost, RoostError, scaled_timeout
 # real saved tabs — and is wiped between runs so no stale layout leaks in.
 # Only set when the harness *launches* the UI; a reused dev instance keeps
 # its own state. None when reusing or before a session starts.
+#
+# The directory also holds the UI's **state lock** (`state.lock`), so
+# removing it is not a plain `rmtree` — see `_remove_session_state`.
 _SESSION_STATE_DIR: Path | None = None
 
 # Harness-launched Rust UI process handles + files capturing their
@@ -38,6 +41,19 @@ _GTK_PROC: "subprocess.Popen[bytes] | None" = None
 _GTK_LOG: Path | None = None
 _ICED_PROC: "subprocess.Popen[bytes] | None" = None
 _ICED_LOG: Path | None = None
+
+# Size of the Mac app's own file log at the moment `_launch_mac` ran `open`.
+# The Mac app is launched through LaunchServices, so there is no child whose
+# stderr we can capture; its startup diagnostics only exist in
+# `~/Library/Logs/<label>/roost.log`, which persists across launches. The
+# offset is what makes "what this launch said" separable from the developer's
+# accumulated log.
+_MAC_LOG_OFFSET = 0
+
+# The UI's own words when it refuses to start because another process holds
+# the state lock (`crates/roost-{iced,linux}/src/main.rs`,
+# `mac/Sources/Roost/App.swift` — all three share this wording).
+_STATE_LOCK_REFUSAL = "is using this state directory"
 
 # Env vars to strip from a harness-launched Rust UI's inherited environment.
 # These are either per-tab values Roost injects itself (a stale inherited
@@ -148,6 +164,32 @@ def socket_path(target: str) -> Path:
     return Path(f"/tmp/{spec.linux_namespace}-{os.getuid()}") / "roost.sock"
 
 
+def socket_lock_path(target: str) -> Path:
+    """The **socket/bind lock**, beside the socket.
+
+    One of the UI's two permanent locks (`docs/reference/paths.md`). It
+    follows `XDG_RUNTIME_DIR`, guards the probe→unlink→bind sequence and
+    the bound socket's lifetime, and a `ROOST_STATE_DIR` override never
+    moves it. Mirrors `BundleProfile::socket_lock_path`.
+    """
+    return socket_path(target).with_name("roost.lock")
+
+
+def state_lock_path(state_dir: Path) -> Path:
+    """The **state lock**, beside `state.json`.
+
+    The other permanent lock. It follows `ROOST_STATE_DIR`, so a harness
+    session's throwaway state dir gets its own, and it is held for as long
+    as a UI is writing that `state.json`. Mirrors
+    `BundleProfile::state_lock_path`.
+
+    Its filename deliberately differs from the socket lock's: the two
+    directories can be the same directory, and one filename would make a
+    process contend with itself (flock is per open file description).
+    """
+    return state_dir / "state.lock"
+
+
 def rust_binary_path(target: str) -> tuple[Path, bool]:
     """Resolve a Rust UI binary and whether the path was explicit.
 
@@ -193,28 +235,92 @@ def _rust_log_path(target: str) -> Path:
     return base / f"roost-{target}-ui.log"
 
 
-def _boot_failure_detail(target: str) -> str:
-    """Diagnostic suffix for a Rust UI boot timeout: whether the launched UI
-    already exited (so it crashed, not just slow) and the tail of its
-    captured log. Empty for Mac (launched via `open`, no captured child)."""
-    proc, log = {
-        "gtk": (_GTK_PROC, _GTK_LOG),
-        "iced": (_ICED_PROC, _ICED_LOG),
-    }.get(target, (None, None))
-    if proc is None:
+def _mac_ui_log_path() -> Path:
+    """The Mac app's own file log. `open` gives us no child to capture, so
+    this file is the only place its startup diagnostics land."""
+    return Path.home() / f"Library/Logs/{TARGET_SPECS['mac'].mac_label}/roost.log"
+
+
+def _launch_output(target: str) -> str:
+    """What the harness-launched UI has written *since this launch*.
+
+    Rust targets get a fresh capture file per launch (opened `wb`), so the
+    whole file is this launch. Mac appends to a persistent log, so read from
+    the offset `_launch_mac` recorded. Empty when the harness did not launch
+    this UI.
+    """
+    if target == "mac":
+        log: Path | None = _mac_ui_log_path()
+        offset = _MAC_LOG_OFFSET
+    else:
+        proc, log = {
+            "gtk": (_GTK_PROC, _GTK_LOG),
+            "iced": (_ICED_PROC, _ICED_LOG),
+        }.get(target, (None, None))
+        if proc is None:
+            return ""
+        offset = 0
+    if log is None or not log.exists():
         return ""
+    try:
+        with open(log, "rb") as handle:
+            handle.seek(offset)
+            return handle.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def _boot_failure_detail(target: str) -> str:
+    """Diagnostic suffix for a UI boot timeout: whether the launched UI
+    already exited (so it crashed, not just slow) and the tail of what it
+    logged since launch."""
     parts = []
-    rc = proc.poll()
-    if rc is not None:
+    proc = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+    if proc is not None and (rc := proc.poll()) is not None:
         parts.append(f" — UI process exited (code {rc}) before becoming ready")
-    if log is not None and log.exists():
-        try:
-            tail = log.read_text(errors="replace").splitlines()[-40:]
-        except OSError:
-            tail = []
-        if tail:
-            parts.append("\n--- captured UI log (last 40 lines) ---\n" + "\n".join(tail))
+    tail = _launch_output(target).splitlines()[-40:]
+    if tail:
+        parts.append("\n--- captured UI log (last 40 lines) ---\n" + "\n".join(tail))
     return "".join(parts)
+
+
+def _boot_refusal(target: str) -> str | None:
+    """The message for a UI that *exited refusing to start*, or None while it
+    may still be coming up.
+
+    The two-lock design added a startup path that deliberately does not
+    boot: another process holds the state lock for this `ROOST_STATE_DIR`,
+    so the UI exits rather than write one `state.json` from two processes.
+    Without this, that refusal reaches the developer as a bare `wait_alive`
+    timeout and sends them hunting a hang that isn't one.
+
+    Only consulted once the UI is gone — a Rust exit code of 0 is the
+    activate-the-running-instance path, not a refusal.
+    """
+    if target == "mac":
+        if _roost_running():
+            return None
+    else:
+        proc = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+        rc = proc.poll() if proc is not None else None
+        if rc is None or rc == 0:
+            return None
+    line = next(
+        (
+            line.strip()
+            for line in _launch_output(target).splitlines()
+            if _STATE_LOCK_REFUSAL in line
+        ),
+        None,
+    )
+    if line is None:
+        return None
+    return (
+        f"{target} UI refused to start: {line}\n"
+        "Another process holds the state lock for this ROOST_STATE_DIR, so "
+        "the UI exited rather than write one state.json from two processes. "
+        "This is a refusal, not a hang."
+    )
 
 
 def wait_alive(target: str, timeout: float = 30.0) -> None:
@@ -250,6 +356,12 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
                 c.close()
         except (OSError, RoostError):
             pass
+        # A UI that exited *refusing* to start will never answer; report the
+        # refusal now instead of burning the deadline (and, on Mac, instead
+        # of `_launch_mac` spending its retry on the same refusal). Not a
+        # TimeoutError, on purpose — that retry catches TimeoutError only.
+        if (refusal := _boot_refusal(target)) is not None:
+            raise RuntimeError(refusal)
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"{target} UI did not boot within {timeout}s{_boot_failure_detail(target)}"
@@ -361,7 +473,15 @@ def start_session(target: str, *, fresh: bool) -> bool:
 
 def end_session(target: str) -> None:
     """Quit a harness-owned UI and remove its throwaway state (state dir +,
-    on Mac, the isolated UserDefaults suite)."""
+    on Mac, the isolated UserDefaults suite).
+
+    The two cleanups are ordered to match the UI's own acquisition order —
+    socket side (`_cleanup_owned_rust_runtime`, which proves the socket lock
+    is free) before state side (`_remove_session_state`, which proves the
+    state lock is). Both probes are `LOCK_NB` so they cannot deadlock, but
+    out-of-order non-blocking probes produce spurious refusals when a
+    harness runs beside anything else taking the same pair.
+    """
     global _SESSION_STATE_DIR, _GTK_PROC, _GTK_LOG, _ICED_PROC, _ICED_LOG
     quit(target)
     _cleanup_owned_rust_runtime(target)
@@ -370,18 +490,24 @@ def end_session(target: str) -> None:
     _ICED_PROC = None
     _ICED_LOG = None
     if _SESSION_STATE_DIR is not None:
-        shutil.rmtree(_SESSION_STATE_DIR, ignore_errors=True)
+        _remove_session_state(target, _SESSION_STATE_DIR)
         _SESSION_STATE_DIR = None
     if target == "mac":
         _clear_mac_test_defaults()
 
 
 def _cleanup_owned_rust_runtime(target: str) -> None:
-    """Remove a harness-owned Rust UI's socket/lock after it has exited.
+    """Remove a harness-owned Rust UI's socket + **socket lock** after it has
+    exited.
 
-    Rust single-instance locks are inode-scoped, so unlinking while the child
-    is merely shutting down could permit a second instance. The direct child
-    handle is the ownership proof and the exit wait is the safety fence.
+    Single-instance locks are inode-scoped, so unlinking while the child is
+    merely shutting down could permit a second instance. The direct child
+    handle is the ownership proof and the exit wait is the safety fence; the
+    flock, the `identify` silence, and the before/after (dev, ino) check are
+    the proof that nothing else has taken the socket meanwhile.
+
+    This is the socket/bind lock only. `state.lock` lives in the state dir
+    and is cleared by `_remove_session_state`.
     """
     process = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
     if process is None:
@@ -393,7 +519,7 @@ def _cleanup_owned_rust_runtime(target: str) -> None:
             f"harness-owned {target} UI did not exit; refusing runtime cleanup"
         ) from error
     socket = socket_path(target)
-    lock = socket.with_name("roost.lock")
+    lock = socket_lock_path(target)
     if not lock.exists():
         if socket.exists():
             raise RuntimeError(
@@ -407,7 +533,7 @@ def _cleanup_owned_rust_runtime(target: str) -> None:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError(
-                f"{target} runtime lock is held by another process; refusing cleanup"
+                f"{target} socket lock is held by another process; refusing cleanup"
             ) from error
         if _answering_pid(target) is not None:
             raise RuntimeError(
@@ -416,12 +542,59 @@ def _cleanup_owned_rust_runtime(target: str) -> None:
         locked = os.fstat(fd)
         named = os.stat(lock, follow_symlinks=False)
         if (locked.st_dev, locked.st_ino) != (named.st_dev, named.st_ino):
-            raise RuntimeError(f"{target} runtime lock was replaced; refusing cleanup")
+            raise RuntimeError(f"{target} socket lock was replaced; refusing cleanup")
         socket.unlink(missing_ok=True)
         named = os.stat(lock, follow_symlinks=False)
         if (locked.st_dev, locked.st_ino) != (named.st_dev, named.st_ino):
-            raise RuntimeError(f"{target} runtime lock changed during cleanup")
+            raise RuntimeError(f"{target} socket lock changed during cleanup")
         lock.unlink()
+    finally:
+        os.close(fd)
+
+
+def _remove_session_state(target: str, state_dir: Path) -> None:
+    """Delete the session's throwaway state dir — but only once nothing holds
+    its **state lock**.
+
+    `state.lock` is an inode, not a name. Deleting it out from under a live
+    UI frees the name, so the next launch creates a *fresh* lock inode, takes
+    it happily, and two processes write one `state.json`. That is precisely
+    the failure the state lock exists to prevent, reintroduced by the
+    cleanup — and an unconditional `rmtree(..., ignore_errors=True)` would do
+    it silently, with no liveness proof at all.
+
+    So take the lock first, the same shape `_cleanup_owned_rust_runtime` uses
+    for the socket lock, and raise rather than delete if it is held: a held
+    state lock means a UI is still writing that `state.json`.
+    """
+    lock = state_lock_path(state_dir)
+    if not lock.exists():
+        # Never launched (or already cleaned): nothing claims this dir. The
+        # UI creates the lock eagerly at startup and never unlinks it, so an
+        # absent lock beside a used state dir is not a live instance.
+        shutil.rmtree(state_dir, ignore_errors=True)
+        return
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock, flags)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"{target} state lock {lock} is held: a UI is still writing "
+                "state.json there; refusing to remove the session state dir"
+            ) from error
+        locked = os.fstat(fd)
+        named = os.stat(lock, follow_symlinks=False)
+        if (locked.st_dev, locked.st_ino) != (named.st_dev, named.st_ino):
+            raise RuntimeError(
+                f"{target} state lock was replaced; refusing state cleanup"
+            )
+        # Unlink the lock while still holding it, then sweep the rest. Errors
+        # on the sweep are ignorable (a throwaway dir the harness owns); the
+        # lock is the part that must not go without proof.
+        lock.unlink()
+        shutil.rmtree(state_dir, ignore_errors=True)
     finally:
         os.close(fd)
 
@@ -514,16 +687,22 @@ def _launch_mac(app: Path, *, state_dir: Path | None = None) -> None:
     one launch path that can inherit a poisoned environment. A prior
     Roost that crashed (or was force-killed) releases its IPC socket
     cleanly — `IPCServer` re-binds over a stale socket — but the
-    single-instance flock (`roost.lock`) has *no* liveness recovery, so a
+    socket/bind flock (`roost.lock`) has *no* liveness recovery, so a
     fresh `open` silently terminates against the held lock and never
     answers. `_mac_cleanup()` clears that before launching; the second
     attempt also absorbs a slow/contended LaunchServices spawn under CI
     load. (GTK launches a detached binary on a fresh DISPLAY — no shared
     state, so it needs neither.)
     """
+    global _MAC_LOG_OFFSET
     last: TimeoutError | None = None
     for attempt in (1, 2):
         _mac_cleanup()
+        # Everything after this point in the app's persistent log belongs to
+        # this attempt, so a boot failure (including a state-lock refusal) is
+        # readable without the developer's accumulated history.
+        mac_log = _mac_ui_log_path()
+        _MAC_LOG_OFFSET = mac_log.stat().st_size if mac_log.exists() else 0
         # `open --env` injects the seed config into the launched app
         # (LaunchServices otherwise drops the caller's env). Forward
         # ROOST_TEST_MODE + ROOST_STATE_DIR the same way so the bundled UI
@@ -574,6 +753,48 @@ def _wait_gone(timeout: float) -> bool:
     return True
 
 
+def _quit_mac_process(graceful: float = 3.0) -> None:
+    """Stop the Mac app and *prove* it is gone: quit → SIGTERM → SIGKILL.
+
+    A polite `osascript ... to quit` is a request, not a proof. The harness
+    goes on to delete the session's throwaway state dir — the state lock
+    inode included — the moment this returns, so "asked nicely, then deleted
+    the lock" is how a still-live app and its replacement come to write one
+    `state.json`. Both locks live on inodes, not names, so the only safe
+    predicate before touching either is a confirmed-dead process; that is
+    strictly stronger than any flock probe and it covers both locks at once.
+
+    SIGKILL is uncatchable, so a wedged app can't keep us from a clean slate;
+    if even that fails (an unreapable zombie), fail loud rather than risk a
+    second instance. No-op — and no waits — when nothing is running.
+
+    `graceful` is how long a *healthy* app gets to exit on its own before we
+    start signalling; `_wait_gone` returns the instant it dies, so a normal
+    quit never pays it. Callers that are cleaning up after an app which
+    already failed to answer `identify` pass the short default.
+    """
+    if not _roost_running():
+        return
+    # Graceful first; bound the Apple Event so a hung app can't wedge us
+    # (osascript would otherwise block on the default AE reply timeout).
+    try:
+        subprocess.run(["osascript", "-e", 'tell application "Roost" to quit'],
+                       check=False, timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    if _wait_gone(graceful):
+        return
+    subprocess.run(["pkill", "-x", "Roost"], check=False)             # SIGTERM
+    if _wait_gone(2.0):
+        return
+    subprocess.run(["pkill", "-9", "-x", "Roost"], check=False)       # SIGKILL
+    if not _wait_gone(5.0):
+        raise RuntimeError(
+            "Roost survived SIGKILL — refusing to unlink its locks or delete "
+            "its state dir (would risk a second instance against fresh lock "
+            "inodes)")
+
+
 def _mac_cleanup() -> None:
     """Make the next Mac launch start from a clean slate.
 
@@ -581,36 +802,14 @@ def _mac_cleanup() -> None:
     returns early otherwise), so we never disturb a developer's running
     app — and when nothing is running this is a pure no-op (no waits).
 
-    Lock invariant: a process holding the single-instance flock must be
-    *confirmed dead* before we unlink the lock/socket. The flock lives on
-    the inode, not the path — unlinking it out from under a still-live
-    (wedged) process frees the path, so the launch retry creates a fresh
-    lock inode and a second instance runs alongside the old one. So
-    escalate quit → SIGTERM → SIGKILL and only unlink once nothing's left.
-    SIGKILL is uncatchable, so a wedged app can't keep us from a clean
-    slate; if even that fails (an unreapable zombie), fail loud rather than
-    double-instance.
+    Lock invariant: a process holding either instance lock must be
+    *confirmed dead* before we unlink anything (see `_quit_mac_process`).
+    Only the socket/bind lock lives here; the state lock lives in the
+    throwaway `ROOST_STATE_DIR` and is handled by `_remove_session_state`.
     """
-    home = Path.home()
-    if _roost_running():
-        # Graceful first; bound the Apple Event so a hung app can't wedge us
-        # (osascript would otherwise block on the default AE reply timeout).
-        try:
-            subprocess.run(["osascript", "-e", 'tell application "Roost" to quit'],
-                           check=False, timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        if not _wait_gone(3.0):
-            subprocess.run(["pkill", "-x", "Roost"], check=False)         # SIGTERM
-            if not _wait_gone(2.0):
-                subprocess.run(["pkill", "-9", "-x", "Roost"], check=False)   # SIGKILL
-                if not _wait_gone(5.0):
-                    raise RuntimeError(
-                        "Roost survived SIGKILL — refusing to unlink its lock "
-                        "(would risk a second instance against a fresh lock inode)")
-    cache = home / "Library/Caches/Roost"
-    (cache / "roost.sock").unlink(missing_ok=True)
-    (cache / "roost.lock").unlink(missing_ok=True)
+    _quit_mac_process()
+    socket_path("mac").unlink(missing_ok=True)
+    socket_lock_path("mac").unlink(missing_ok=True)
     # Fresh workspace comes from the throwaway `ROOST_STATE_DIR` the harness
     # passes at launch (an empty dir = no stale tabs), so there's nothing to
     # delete here and the developer's real state.json is never touched. This
@@ -618,25 +817,36 @@ def _mac_cleanup() -> None:
 
 
 def quit(target: str) -> None:
+    if target == "mac":
+        # Escalate rather than ask: `end_session` deletes the state dir (and
+        # its `state.lock`) right after this returns, and a live app holding
+        # that lock is exactly what must not be deleted out from under. This
+        # also reaches a wedged app that no longer answers `identify`.
+        #
+        # The graceful window matches the budget the old polite-quit poll
+        # gave a healthy app (and scales on slow CI runners), so a mid-test
+        # relaunch is never signalled just for being slow to exit.
+        _quit_mac_process(graceful=scaled_timeout(10.0))
+        return
     pid = _answering_pid(target)
     if pid is None:
         return
-    if target == "mac":
-        subprocess.run(["osascript", "-e", 'tell application "Roost" to quit'], check=False)
-    else:
-        owned = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
-        if owned is not None:
-            if owned.poll() is not None:
-                raise RuntimeError(
-                    f"harness-owned {target} child already exited but pid {pid} answers; "
-                    "refusing to terminate a replacement"
-                )
-            if pid != owned.pid:
-                raise RuntimeError(
-                    f"{target} socket owner changed from harness pid {owned.pid} to {pid}; "
-                    "refusing to terminate it"
-                )
-        subprocess.run(["kill", str(pid)], check=False)
+    owned = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+    if owned is not None:
+        if owned.poll() is not None:
+            raise RuntimeError(
+                f"harness-owned {target} child already exited but pid {pid} answers; "
+                "refusing to terminate a replacement"
+            )
+        if pid != owned.pid:
+            raise RuntimeError(
+                f"{target} socket owner changed from harness pid {owned.pid} to {pid}; "
+                "refusing to terminate it"
+            )
+    subprocess.run(["kill", str(pid)], check=False)
+    # The Rust side's proof of death is `_cleanup_owned_rust_runtime`'s
+    # `process.wait()`; this bounded poll just avoids returning while the UI
+    # is visibly still answering.
     deadline = time.monotonic() + 10
     while is_alive(target) and time.monotonic() < deadline:
         time.sleep(0.25)

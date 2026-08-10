@@ -78,22 +78,48 @@ seed). (`ROOST_CONFIG` is a real override on both UIs, mirroring
 A **harness-launched** UI always runs against a throwaway state dir, so a
 run never reads or writes the developer's real `state.json`/tabs:
 
-- `ROOST_STATE_DIR` (prod env on **both** UIs) redirects only `state.json`'s
-  directory; socket/lock/log stay on the default profile path, so `ui.py`
-  still finds the UI by its unchanged socket. The harness `mkdtemp`s one
-  per session and cleans it up. (Stricter than `ROOST_CONFIG`: must be
-  absolute — see [paths.md](../../docs/reference/paths.md).)
+- `ROOST_STATE_DIR` (prod env on **both** UIs) redirects `state.json`'s
+  directory **and the state lock beside it**; the socket, the socket/bind
+  lock and the log stay on the default profile path, so `ui.py` still finds
+  the UI by its unchanged socket. The harness `mkdtemp`s one per session
+  and cleans it up. (Stricter than `ROOST_CONFIG`: must be absolute — see
+  [paths.md](../../docs/reference/paths.md).)
 - `ROOST_DEFAULTS_SUITE` (prod env, **Mac** only) redirects the app's
   `UserDefaults` (sidebar visibility/width) to a throwaway suite —
   `ROOST_STATE_DIR` can't reach `UserDefaults`.
 
 `--roost-fresh` / `ROOST_TEST_FRESH=1` makes the harness **own** the
 instance: it force-quits any running UI first (lock-safe on Mac via
-`_mac_cleanup`), launches a hermetic one, and always quits it at teardown
-— vs. the default, which reuses a developer's running UI and leaves it
-alone. Fresh mode is what `make e2e-*-ci` (and CI) use; it also flips
-setup preconditions to hard failures (below). (It replaced the old
-`ROOST_TEST_RESET_STATE`, which *deleted* the real `state.json` on Mac.)
+`_quit_mac_process` + `_mac_cleanup`), launches a hermetic one, and always
+quits it at teardown — vs. the default, which reuses a developer's running
+UI and leaves it alone. Fresh mode is what `make e2e-*-ci` (and CI) use; it
+also flips setup preconditions to hard failures (below). (It replaced the
+old `ROOST_TEST_RESET_STATE`, which *deleted* the real `state.json` on Mac.)
+
+### Teardown and the two instance locks
+
+A UI holds two locks: the **socket/bind lock** (`<socket dir>/roost.lock`)
+and the **state lock** (`<state dir>/state.lock`). Both live on inodes, not
+names, so unlinking either out from under a live process frees the *name* —
+the next launch takes a fresh inode and two UIs run against one socket or
+one `state.json`. `end_session` therefore releases in the UI's own order,
+with a proof at each step:
+
+1. `_cleanup_owned_rust_runtime` — waits for the harness's own child to
+   exit, takes `roost.lock` `LOCK_NB`, confirms nothing answers `identify`,
+   and (dev, ino)-validates the lock before *and* after unlinking the
+   socket.
+2. `_remove_session_state` — takes `state.lock` `LOCK_NB` and
+   (dev, ino)-validates it before deleting the session state dir. If it is
+   held, teardown **raises** rather than deleting a live UI's lock.
+
+Mac has no child handle for either proof, so `quit("mac")` escalates
+`osascript quit` → SIGTERM → SIGKILL and confirms the process is gone —
+strictly stronger than a flock probe, and it covers both locks at once.
+
+A UI that exits *refusing* to start because another process holds the state
+lock is surfaced by `wait_alive` as that refusal (a `RuntimeError` carrying
+the UI's own message), not as a boot timeout.
 
 The GTK launch env is sanitized (the UI inherits the parent env): the
 per-tab vars Roost injects itself — `ROOST_SHELL_FEATURES`, etc. — and the
