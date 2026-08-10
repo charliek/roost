@@ -24,13 +24,13 @@ async fn inherited_terminfo_is_stripped_from_child_env() {
         .spawn(11, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
         .expect("spawn");
 
-    // Same budget-bounded drain rationale as pty_smoke's
-    // collect_until_closed: content assertions below are what prove the
-    // capture wasn't truncated.
+    // Same drain rationale as pty_smoke's collect_until_exit: `Exit`
+    // arrives after the reader's last bytes (#255), and the content
+    // assertions below are what prove the capture wasn't truncated.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut collected = Vec::new();
     let mut exit_status = None;
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && exit_status.is_none() {
         match output.try_recv() {
             Ok(PtyOutputEvent::Bytes(bytes)) => collected.extend_from_slice(&bytes),
             Ok(PtyOutputEvent::Exit(status)) => exit_status = Some(status),

@@ -89,6 +89,20 @@ impl TabSession {
                             break;
                         }
                     }
+                    // Stopping here is safe on the normal path: the
+                    // supervisor's reader task publishes `Exit` after
+                    // the last bytes it read, so nothing is left
+                    // behind (#255).
+                    //
+                    // The exception is `pty.rs`'s bounded deadline
+                    // fallback. A reader that never reaches EOF — a
+                    // background descendant holding the slave fd keeps
+                    // the master readable forever — has `Exit`
+                    // published out from under it after
+                    // `EXIT_PUBLISH_GRACE`, and the bytes it reads
+                    // afterwards are dropped by the `break` below.
+                    // That is the deliberate trade: a tab that never
+                    // reports its exit would never auto-close.
                     Ok(PtyOutputEvent::Exit(status)) => {
                         let _ = output_tx.send(TabOutput::Exit {
                             status,
@@ -96,6 +110,13 @@ impl TabSession {
                         });
                         break;
                     }
+                    // The other way a tab's output can be truncated,
+                    // independent of the #255 ordering fix: this drain
+                    // fell far enough behind that the broadcast
+                    // dropped `n` messages. Out of scope there —
+                    // fixing it means resizing or redesigning the
+                    // channel (see `PTY_OUTPUT_BROADCAST_CAPACITY`).
+                    // Surfaced rather than swallowed.
                     Err(RecvError::Lagged(n)) => {
                         let _ = output_tx.send(TabOutput::Error(format!(
                             "broadcast lagged: dropped {n} message(s)"
