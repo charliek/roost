@@ -612,7 +612,9 @@ jobs:
         # a focused seat/serial, so native clipboard coverage runs in the X11
         # lane above. This lane still requires the complete non-clipboard
         # Wayland renderer suite; the POC plan records the real-seat evidence
-        # and remaining programmatic-write limitation.
+        # and remaining programmatic-write limitation. `test_selection.py` is
+        # in this list because `selection.*` reads UI state over IPC and never
+        # touches the pasteboard — only `test_osc52.py` is X11-only.
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -637,6 +639,7 @@ jobs:
           tools/roosttest/test_osc_pipeline.py
           tools/roosttest/test_sprite_pixels.py
           tools/roosttest/test_ime.py
+          tools/roosttest/test_selection.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (macOS)
@@ -1209,11 +1212,14 @@ jobs:
         # (GDK_BACKEND=wayland) and runs the IPC-driven suite — tab.dump reads
         # in-process render state, so no screen capture is involved.
         #
-        # Curated subset: skip the clipboard/selection + shell-env tests. On
-        # headless Wayland there's no clipboard manager, so a GTK clipboard read
-        # can block indefinitely (the full suite hung ~2h on the runner before
+        # Curated subset: skip the clipboard + shell-env tests. On headless
+        # Wayland there's no clipboard manager, so a GTK clipboard read can
+        # block indefinitely (the full suite hung ~2h on the runner before
         # this cap), and those paths test integration semantics that diverge
         # X11↔Wayland — not the GDK-Wayland backend this job exists to cover.
+        # `test_selection.py` is NOT skipped: `selection.set`/`selection.dump`
+        # go straight to the TerminalView and never reach GdkClipboard, so
+        # there's nothing here for a missing clipboard manager to block on.
         # `timeout-minutes` is the belt-and-suspenders cap so a future hang can
         # never run away again — and now that this step is required, a hang
         # reds the gate instead of being swallowed.
@@ -1228,7 +1234,6 @@ jobs:
           uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
           --timeout=$((30 * ROOST_TEST_TIMEOUT_SCALE)) --timeout-method=thread
           --ignore=tools/roosttest/test_osc52.py
-          --ignore=tools/roosttest/test_selection.py
           --ignore=tools/roosttest/test_shell_integration.py
 
       - name: Collect failure diagnostics
