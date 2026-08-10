@@ -647,12 +647,11 @@ jobs:
           # attempt can still be carrying an asset from a PREVIOUS version —
           # apt-charliek globs `roost_*.deb`, so a stale one there is a wrong
           # package shipped, and the three named checks above would not see it.
-          # shellcheck disable=SC2086  # deliberate split into one name per line
           unexpected="$(printf '%s\n' "${assets}" | cut -f1 \
-            | grep -vxF "$(printf '%s\n' ${expected_names})" || true)"
+            | grep -vxF "$(printf '%s' "${expected_names}" | tr ' ' '\n')" || true)"
           if [ -n "${unexpected}" ]; then
             echo "::error::unexpected assets on ${tag} (a stale upload from an earlier attempt?):"
-            printf '::error::  %s\n' ${unexpected}
+            printf '%s\n' "${unexpected}" | sed 's/^/::error::  /'
             fail=1
           fi
 
