@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::net::UnixStream;
 use tokio::process::Command;
 
 use roost_agent::claude::{canonical_hook_event, CLAUDE_HOOK_EVENTS};
@@ -34,6 +33,7 @@ use roost_ipc::agent::{
     effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, ShellState,
 };
 use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
+use roost_ipc::socket_state::{self, describe_file_type, SocketState};
 use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
 use roost_ipc::{ClientError, IpcClient};
 
@@ -972,45 +972,17 @@ async fn drain_capped(child: &mut tokio::process::Child) -> std::io::Result<Stri
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Doctor's view of `socket_state::probe`. The classification itself —
+/// including the rule that only `ECONNREFUSED` and an absent path mean
+/// stale — lives in `roost_ipc::socket_state`, shared with the UI's
+/// bind path so the two can't drift.
 async fn classify_socket(path: &Path) -> SocketOutcome {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SocketOutcome::Missing,
-        Err(e) => return SocketOutcome::Error(e.to_string()),
-        Ok(meta) => {
-            if !is_socket(meta.file_type()) {
-                return SocketOutcome::NotASocket(describe_file_type(meta.file_type()).to_string());
-            }
-        }
-    }
-    match tokio::time::timeout(IPC_TIMEOUT, UnixStream::connect(path)).await {
-        Ok(Ok(_)) => SocketOutcome::Connected,
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => SocketOutcome::Stale,
-        Ok(Err(e)) => SocketOutcome::Error(e.to_string()),
-        Err(_) => SocketOutcome::Error("connect timed out".into()),
-    }
-}
-
-/// Mirrors the check `server.rs` performs before unlinking a socket
-/// path, so doctor and the server agree on what "is a socket" means.
-fn is_socket(file_type: std::fs::FileType) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    file_type.is_socket()
-}
-
-fn describe_file_type(file_type: std::fs::FileType) -> &'static str {
-    use std::os::unix::fs::FileTypeExt;
-    if file_type.is_symlink() {
-        "symlink"
-    } else if file_type.is_dir() {
-        "directory"
-    } else if file_type.is_file() {
-        "regular file"
-    } else if file_type.is_fifo() {
-        "fifo"
-    } else if file_type.is_char_device() || file_type.is_block_device() {
-        "device"
-    } else {
-        "unknown file type"
+    match socket_state::probe(path, IPC_TIMEOUT).await {
+        SocketState::Missing => SocketOutcome::Missing,
+        SocketState::NotASocket(kind) => SocketOutcome::NotASocket(kind.to_string()),
+        SocketState::Live => SocketOutcome::Connected,
+        SocketState::Stale => SocketOutcome::Stale,
+        SocketState::Indeterminate(why) => SocketOutcome::Error(why),
     }
 }
 

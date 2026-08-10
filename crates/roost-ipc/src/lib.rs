@@ -17,6 +17,9 @@
 //!   `tokio::net::UnixStream`. Enforces the 16 MiB line limit.
 //! * [`paths`] — `BundleProfile` path resolution. The Mac UI's Swift
 //!   side has a byte-for-byte equivalent.
+//! * [`socket_state`] — the one shared answer to "is a listener alive
+//!   at this socket path?", used by the bind path and `roostctl
+//!   doctor` and mirrored in Swift.
 //! * [`client`] — `IpcClient`: typed wrappers around the framed
 //!   request/response cycle, one method per op.
 //! * [`server`] — `IpcServer` + `Handler` trait. The UI implements
@@ -33,6 +36,7 @@ pub mod agent;
 pub mod framing;
 pub mod messages;
 pub mod paths;
+pub mod socket_state;
 pub mod target;
 
 mod client;

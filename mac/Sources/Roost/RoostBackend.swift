@@ -271,12 +271,13 @@ final class RoostBackend {
         self.ui = ui
     }
 
-    /// True iff the caller has confirmed (via M4c's
-    /// `SingleInstance.acquire(...).acquired`) that we own the
-    /// flock at the bundle profile's lock path. When set, the
-    /// IPC server is allowed to recover a stale socket left by a
-    /// previously kill -9'd instance (M6).
-    private var holdsSingleInstanceLock = false
+    /// True iff the caller has confirmed (via
+    /// `SingleInstance.acquirePair`) that we own the **socket/bind**
+    /// flock at `profile.socketLockPath` — the one that guards the
+    /// socket, not the state lock. When set, the IPC server is allowed
+    /// to recover a stale socket left by a previously kill -9'd
+    /// instance (M6).
+    private var holdsSocketLock = false
 
     private init() {}
 
@@ -284,11 +285,11 @@ final class RoostBackend {
     /// the JSON IPC server on `profile.socketPath`. Idempotent —
     /// safe to call from `applicationDidFinishLaunching` once.
     ///
-    /// Pass `holdsSingleInstanceLock: true` iff the caller already
-    /// acquired the M4c `SingleInstance` flock. With the lock held
-    /// the M6 stale-socket recovery is safe (no live writer can
-    /// race the unlink); without it, `EADDRINUSE` surfaces as
-    /// `.alreadyBound` so we don't steal someone else's socket.
+    /// Pass `holdsSocketLock: true` iff the caller already acquired
+    /// the socket/bind flock. With that lock held the M6 stale-socket
+    /// recovery is safe (no live writer can race the unlink); without
+    /// it, `EADDRINUSE` surfaces as `.alreadyBound` so we don't steal
+    /// someone else's socket.
     /// One-shot SIGPIPE-to-SIG_IGN installer. Without this, writing
     /// to a Unix-domain socket whose peer has closed its end
     /// raises SIGPIPE and terminates the process. The IPC server's
@@ -303,11 +304,11 @@ final class RoostBackend {
         signal(SIGPIPE, SIG_IGN)
     }
 
-    func start(profile: BundleProfile, holdsSingleInstanceLock: Bool = false) {
+    func start(profile: BundleProfile, holdsSocketLock: Bool = false) {
         Self.ignoreSigpipe()
         if started { return }
         started = true
-        self.holdsSingleInstanceLock = holdsSingleInstanceLock
+        self.holdsSocketLock = holdsSocketLock
         // Read ROOST_TEST_MODE once at boot. Matches the GTK side
         // `env::var("ROOST_TEST_MODE").as_deref() == Ok("1")`.
         self.testMode = ProcessInfo.processInfo.environment["ROOST_TEST_MODE"] == "1"
@@ -394,7 +395,7 @@ final class RoostBackend {
             let server = try IPCServer(
                 socketPath: profile.socketPath,
                 handler: handler,
-                recoverStaleSocket: holdsSingleInstanceLock
+                recoverStaleSocket: holdsSocketLock
             )
             server.start()
             self.ipcServer = server

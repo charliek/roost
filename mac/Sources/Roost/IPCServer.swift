@@ -23,6 +23,10 @@ final class IPCServer {
     private var listenFD: Int32 = -1
     private let socketPath: String
     private let handler: IPCHandler
+    /// `(dev, ino)` of the socket file this server bound, captured
+    /// right after `bind`. `deinit` unlinks only if the path still
+    /// resolves to it — see the comment there.
+    private var boundIdentity: (dev: dev_t, ino: ino_t)?
 
     /// Bind a fresh server at `socketPath`.
     ///
@@ -57,6 +61,10 @@ final class IPCServer {
             socketPath: socketPath,
             recoverStaleSocket: recoverStaleSocket
         )
+        var st = stat()
+        if lstat(socketPath, &st) == 0 {
+            self.boundIdentity = (dev: st.st_dev, ino: st.st_ino)
+        }
     }
 
     private static func bindWithRecovery(
@@ -72,9 +80,10 @@ final class IPCServer {
             }
             // The flock holder said "stale socket is safe to clean".
             // First, sanity-check that no live listener is there
-            // via a connect() probe. If something answers, bail —
-            // we'd be stealing a live UI's socket.
-            if Self.connectProbe(socketPath: socketPath) {
+            // via a connect() probe. If something answers — or if we
+            // can't prove nothing does — bail rather than steal a live
+            // UI's socket.
+            if Self.connectProbe(socketPath: socketPath) == .live {
                 throw IPCServerError.alreadyBound(path: socketPath)
             }
             try? FileManager.default.removeItem(atPath: socketPath)
@@ -143,22 +152,48 @@ final class IPCServer {
         return .ok(fd)
     }
 
-    /// Brief `connect()` probe — returns true if a live listener is
-    /// answering on `socketPath`. Used by the stale-socket recovery
-    /// path to refuse to unlink an actually-alive socket. No timeout
-    /// is set; UNIX domain `connect()` either succeeds immediately
-    /// or fails with `ECONNREFUSED` (no listener queued for accept)
-    /// or `ENOENT` (path gone).
-    private static func connectProbe(socketPath: String) -> Bool {
+    /// What a `connect()` probe found. Deliberately two-valued: the
+    /// caller only ever needs "may I unlink this?".
+    enum SocketLiveness {
+        case live
+        case stale
+    }
+
+    /// The errno rule, isolated from the socket dance so it can be
+    /// tested. Mirrors `roost_ipc::socket_state::classify_connect_error`
+    /// and it is **fail-safe**: only `ECONNREFUSED` (nothing queued for
+    /// accept) and `ENOENT` (path gone) mean stale. Everything else
+    /// means assume-live-and-refuse.
+    ///
+    /// The old predicate here was `rc == 0`, i.e. every non-zero errno
+    /// collapsed to "stale, unlink it". That happens to be right on
+    /// Darwin and is wrong the moment the same rule meets Linux, where
+    /// `connect(2)` to an `AF_UNIX` stream socket whose accept backlog
+    /// is full returns `EAGAIN` — from a very much live listener. The
+    /// two UIs keep this rule in lockstep so neither can drift into
+    /// unlinking a busy peer's socket.
+    nonisolated static func classifyConnect(result: Int32, errnoValue: Int32) -> SocketLiveness {
+        if result == 0 { return .live }
+        if errnoValue == ECONNREFUSED || errnoValue == ENOENT { return .stale }
+        return .live
+    }
+
+    /// Brief `connect()` probe — `.live` if a listener is answering on
+    /// `socketPath`, or if we cannot prove otherwise. Used by the
+    /// stale-socket recovery path to refuse to unlink an alive socket.
+    /// No timeout is set; a UNIX-domain `connect()` resolves in the
+    /// kernel without waiting on the peer.
+    private static func connectProbe(socketPath: String) -> SocketLiveness {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        if fd < 0 { return false }
+        // Can't probe → can't prove stale.
+        if fd < 0 { return .live }
         defer { Darwin.close(fd) }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(socketPath.utf8)
         if pathBytes.count >= MemoryLayout.size(ofValue: addr.sun_path) {
-            return false
+            return .live
         }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count + 1) { c in
@@ -174,14 +209,32 @@ final class IPCServer {
                 Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        return rc == 0
+        // Captured immediately: anything between the syscall and the
+        // read could clobber the thread's errno.
+        let connectErrno = errno
+        return classifyConnect(result: rc, errnoValue: connectErrno)
     }
 
     deinit {
         if listenFD >= 0 {
             Darwin.close(listenFD)
         }
-        try? FileManager.default.removeItem(atPath: socketPath)
+        // Only unlink the socket file we ourselves bound. Without the
+        // identity check this deinit could delete a *successor's*
+        // socket: a late-released server (an autorelease pool draining
+        // after a replacement instance has already bound the same path)
+        // would take the new listener's socket down with it, leaving
+        // `roostctl` and the hooks with nothing to dial. The socket
+        // lock guards the socket's lifetime; this is the same guarantee
+        // on the release side.
+        if let identity = boundIdentity {
+            var st = stat()
+            if lstat(socketPath, &st) == 0,
+                st.st_dev == identity.dev, st.st_ino == identity.ino
+            {
+                try? FileManager.default.removeItem(atPath: socketPath)
+            }
+        }
     }
 
     /// Begin accepting connections on a background queue.

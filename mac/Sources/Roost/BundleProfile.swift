@@ -40,14 +40,31 @@ struct BundleProfile: Sendable {
     /// `roost.log` path inside `logDir`.
     var logPath: String { (logDir as NSString).appendingPathComponent("roost.log") }
 
-    /// `roost.lock` lives next to the socket so the single-instance
-    /// flock and the IPC socket share a parent directory — on **both**
-    /// UIs (Linux passes `BundleProfile::lock_path()`, also socket-
-    /// relative). Because it derives from `socketPath`, a
-    /// `ROOST_STATE_DIR` override never moves the lock.
-    var lockPath: String {
+    /// flock guarding the IPC socket: the probe→unlink→bind sequence
+    /// and the bound socket's lifetime. `roost.lock` lives next to the
+    /// socket, so it never moves with a `ROOST_STATE_DIR` override.
+    /// Mirrors `BundleProfile::socket_lock_path()` in `paths.rs`.
+    ///
+    /// The name stays `roost.lock` for compatibility with tooling that
+    /// already knows it (`tools/roosttest`, `docs/reference/paths.md`).
+    var socketLockPath: String {
         let parent = (socketPath as NSString).deletingLastPathComponent
         return (parent as NSString).appendingPathComponent("roost.lock")
+    }
+
+    /// flock guarding `state.json`. Lives next to it, so it follows
+    /// `ROOST_STATE_DIR` — two UIs pointed at one state dir contend
+    /// even when their socket directories differ. Mirrors
+    /// `BundleProfile::state_lock_path()` in `paths.rs`.
+    ///
+    /// The filename differs from `socketLockPath`'s on purpose:
+    /// `stateDir` can equal the socket's directory (the HOME-less
+    /// `/tmp/<appLabel>` fallback below, or a `ROOST_STATE_DIR` aimed
+    /// at it). One shared name would make the two locks one file, and
+    /// `flock` is per-open-file-description — the app would contend
+    /// with itself and refuse to start.
+    var stateLockPath: String {
+        (stateDir as NSString).appendingPathComponent("state.lock")
     }
 
     /// Resolve a profile by kind using the host's environment.
@@ -95,7 +112,8 @@ struct BundleProfile: Sendable {
             socketPath: socket,
             // Redirect ONLY the state dir when ROOST_STATE_DIR is set, so
             // tests (and side-by-side instances) get an isolated state.json
-            // while socket/lock/log stay on the default path.
+            // — and, with it, the state lock — while the socket, the socket
+            // lock, and the log stay on the default path.
             stateDir: applyStateDirOverride(stateDir, env["ROOST_STATE_DIR"]),
             logDir: logDir
         )

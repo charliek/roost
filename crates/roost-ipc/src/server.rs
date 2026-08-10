@@ -25,6 +25,7 @@ use tracing::{debug, warn};
 
 use crate::framing::{write_frame, FrameReader};
 use crate::messages::{RawRequest, Response};
+use crate::socket_state::{self, SocketState};
 use crate::Error;
 
 /// A handler dispatches a single request to a typed implementation.
@@ -97,17 +98,42 @@ impl<H: Handler> IpcServer<H> {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
 
-        // Remove a stale socket if present. Safe because the caller
-        // already holds the `SingleInstance` flock (acquired in
-        // `roost-linux/src/main.rs` before this bind path is
-        // reached, since M3b), so no live writer can race the
-        // unlink. The Mac side does the equivalent dance in
-        // `mac/Sources/Roost/IPCServer.swift::bindWithRecovery`
-        // (M6); it gates the unlink on the flock state rather than
-        // doing it unconditionally because Mac's `IPCServer` is
-        // sometimes constructed from contexts that don't own the
-        // lock (tests, `ROOST_ALLOW_MULTI=1`).
-        remove_socket_if_present(&socket_path).await?;
+        // Remove a stale socket if present.
+        //
+        // What makes this safe is the caller holding the socket/bind
+        // flock (`BundleProfile::socket_lock_path`, acquired in each
+        // UI's `main` before this path is reached) across the whole
+        // probe→unlink→bind sequence — not the probe, which on its own
+        // is TOCTOU. The probe is the second line of defence: it stops
+        // a process whose lock file was removed underneath it, or that
+        // holds the lock for a different runtime dir, from stealing a
+        // live socket. Anything other than "refused" or "absent" is
+        // treated as live and refused (see `socket_state`).
+        //
+        // The Mac side does the equivalent dance in
+        // `mac/Sources/Roost/IPCServer.swift::bindWithRecovery` (M6);
+        // it gates the unlink on the flock state rather than doing it
+        // unconditionally because Mac's `IPCServer` is sometimes
+        // constructed from contexts that don't own the lock (tests,
+        // `ROOST_ALLOW_MULTI=1`).
+        let state = socket_state::probe(&socket_path, socket_state::PROBE_TIMEOUT).await;
+        match state {
+            SocketState::Missing => {}
+            SocketState::Stale => remove_socket_if_present(&socket_path).await?,
+            SocketState::NotASocket(kind) => anyhow::bail!(
+                "refusing to remove non-socket path {} (file type: {kind}). \
+                 If this was intentional, remove it manually first.",
+                socket_path.display(),
+            ),
+            SocketState::Live => anyhow::bail!(
+                "a live listener already answers on {}; refusing to unlink it",
+                socket_path.display(),
+            ),
+            SocketState::Indeterminate(why) => anyhow::bail!(
+                "cannot tell whether {} is live ({why}); refusing to unlink it",
+                socket_path.display(),
+            ),
+        }
 
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind {}", socket_path.display()))?;
@@ -221,21 +247,13 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
     Ok(())
 }
 
-#[cfg(unix)]
-fn is_socket(file_type: std::fs::FileType) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    file_type.is_socket()
-}
-
-#[cfg(not(unix))]
-fn is_socket(_file_type: std::fs::FileType) -> bool {
-    false
-}
-
+/// Unlink `path` if it is a socket. Re-checks the file type rather
+/// than trusting the probe's stat, so a path that turned into
+/// something else in between is still refused.
 async fn remove_socket_if_present(path: &Path) -> anyhow::Result<()> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(meta) => {
-            if is_socket(meta.file_type()) {
+            if socket_state::is_socket(meta.file_type()) {
                 tokio::fs::remove_file(path)
                     .await
                     .with_context(|| format!("remove stale socket {}", path.display()))?;
