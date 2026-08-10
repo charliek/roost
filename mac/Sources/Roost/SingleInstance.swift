@@ -139,6 +139,10 @@ final class SingleInstance: @unchecked Sendable {
         }
         if written < 0 {
             let writeErrno = errno
+            // No `SingleInstance` exists yet, so `deinit`'s LOCK_UN can't
+            // run — release here or a forked child could hold the lock on
+            // past this close (#324).
+            _ = roost_flock(fd, LOCK_UN)
             Darwin.close(fd)
             throw SingleInstanceError.writeFailed(errno: writeErrno)
         }

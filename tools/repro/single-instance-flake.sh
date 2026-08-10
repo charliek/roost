@@ -145,7 +145,7 @@ while [ "${i}" -le "${iterations}" ]; do
   # shellcheck disable=SC2086 # cargo_args is a deliberate word list
   if (cd "${REPO_ROOT}" && cargo ${cargo_args} -- --test-threads="${test_threads}") \
       >"${out}" 2>&1; then
-    rm -f "${out}"
+    [ "${keep}" -eq 1 ] || rm -f "${out}"
   else
     failures=$((failures + 1))
     if grep -qE "${LOCK_FAILURE_MARKER}" "${out}"; then
