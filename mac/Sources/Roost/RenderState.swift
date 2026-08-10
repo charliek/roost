@@ -86,9 +86,38 @@ final class RenderState {
         }
     }
 
+    /// How a cell participates in double-width text. Mirrors
+    /// `GhosttyCellWide`.
+    enum CellWide {
+        case narrow
+        /// Carries a double-width grapheme; the next column is its
+        /// `spacerTail`.
+        case wide
+        /// Placeholder occupying the second column of a wide grapheme.
+        case spacerTail
+        /// Placeholder at the end of a row where a wide grapheme did
+        /// not fit and wrapped to the next row.
+        case spacerHead
+
+        /// True for the placeholder cells that carry no text of their
+        /// own. Text extraction skips them so a wide grapheme
+        /// contributes one grapheme, not a grapheme plus a phantom
+        /// space.
+        var isSpacer: Bool { self == .spacerTail || self == .spacerHead }
+
+        init(_ raw: GhosttyCellWide) {
+            switch raw {
+            case GHOSTTY_CELL_WIDE_WIDE: self = .wide
+            case GHOSTTY_CELL_WIDE_SPACER_TAIL: self = .spacerTail
+            case GHOSTTY_CELL_WIDE_SPACER_HEAD: self = .spacerHead
+            default: self = .narrow
+            }
+        }
+    }
+
     /// One cell's renderable contents at frame snapshot time.
     /// `background` and `foreground` are nil when the cell defers
-    /// to the terminal's default colors. `glyph` is nil when the
+    /// to the terminal's default colors. `text` is empty when the
     /// cell has no graphemes (empty cell — possibly with a bg fill,
     /// e.g. erase-with-color).
     ///
@@ -103,10 +132,42 @@ final class RenderState {
         let col: Int
         let background: NSColor?
         let foreground: NSColor?
-        let glyph: Character?
+        /// Every codepoint libghostty reports for the cell. Selection
+        /// extraction copies this verbatim; the renderer draws
+        /// `glyph`, which is only the first grapheme cluster of it.
+        let text: String
         let bold: Bool
         let italic: Bool
         let inverse: Bool
+        /// Double-width role. Spacers are textless placeholders, not
+        /// blanks.
+        let wide: CellWide
+
+        init(
+            row: Int,
+            col: Int,
+            background: NSColor?,
+            foreground: NSColor?,
+            text: String = "",
+            bold: Bool = false,
+            italic: Bool = false,
+            inverse: Bool = false,
+            wide: CellWide = .narrow
+        ) {
+            self.row = row
+            self.col = col
+            self.background = background
+            self.foreground = foreground
+            self.text = text
+            self.bold = bold
+            self.italic = italic
+            self.inverse = inverse
+            self.wide = wide
+        }
+
+        /// The single `Character` the renderer draws. `nil` for a cell
+        /// with no text.
+        var glyph: Character? { text.first }
     }
 
     /// Walk every cell in the latest snapshot. The callback runs
@@ -183,7 +244,7 @@ final class RenderState {
                     &graphLen
                 )
 
-                var glyph: Character?
+                var text = ""
                 if graphLen > 0 {
                     var cps = [UInt32](repeating: 0, count: Int(graphLen))
                     cps.withUnsafeMutableBufferPointer { ptr in
@@ -193,7 +254,7 @@ final class RenderState {
                             UnsafeMutableRawPointer(ptr.baseAddress)
                         )
                     }
-                    glyph = makeCharacter(from: cps)
+                    text = makeText(from: cps)
                 }
 
                 // SGR style bits. GhosttyStyle is a sized C struct —
@@ -220,13 +281,33 @@ final class RenderState {
                     col: col,
                     background: background,
                     foreground: foreground,
-                    glyph: glyph,
+                    text: text,
                     bold: bold,
                     italic: italic,
-                    inverse: inverse
+                    inverse: inverse,
+                    wide: readCellWide()
                 ))
             }
         }
+    }
+
+    /// Double-width role of the cell the row-cells iterator is on.
+    /// Read from the raw cell value rather than inferred from the
+    /// grapheme's display width, so it can never disagree with the
+    /// engine's own width table. Anything unreadable falls back to
+    /// `.narrow`, which keeps the cell's text.
+    private func readCellWide() -> CellWide {
+        guard let cells else { return .narrow }
+        var raw: GhosttyCell = 0
+        guard ghostty_render_state_row_cells_get(
+            cells,
+            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+            &raw
+        ).rawValue == 0 else { return .narrow }
+        var wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW
+        guard ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide).rawValue == 0
+        else { return .narrow }
+        return CellWide(wide)
     }
 
     /// The terminal's current default foreground + background colors.
@@ -349,17 +430,17 @@ private func nsColor(_ c: GhosttyColorRgb) -> NSColor {
     )
 }
 
-/// Build a `Character` from a libghostty-vt grapheme codepoint
+/// Build a `String` from a libghostty-vt grapheme codepoint
 /// sequence. Most cells have len == 1 (ASCII / single Unicode
 /// scalar). Multi-codepoint clusters (combining marks, ZWJ emoji)
-/// concatenate into one Character via Swift's String grapheme
-/// breaker. Returns nil if the sequence has no valid scalars.
-private func makeCharacter(from codepoints: [UInt32]) -> Character? {
+/// concatenate via Swift's String grapheme breaker. Invalid
+/// scalars are dropped; an empty cell yields "".
+private func makeText(from codepoints: [UInt32]) -> String {
     var s = String()
     s.reserveCapacity(codepoints.count)
     for cp in codepoints {
         guard let scalar = Unicode.Scalar(cp) else { continue }
         s.unicodeScalars.append(scalar)
     }
-    return s.first
+    return s
 }

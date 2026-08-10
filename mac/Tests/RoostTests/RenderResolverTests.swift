@@ -32,7 +32,6 @@ private func cell(
         col: 0,
         background: background,
         foreground: foreground,
-        glyph: nil,
         bold: bold,
         italic: italic,
         inverse: inverse

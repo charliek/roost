@@ -1669,8 +1669,9 @@ final class TerminalView: NSView {
     }
 
     /// Result of [`dumpSelection`]. Mirrors the `SelectionDumpResult`
-    /// wire type. `text` is `nil` when no selection rows are currently
-    /// visible (same limitation as `selectedPlainText`).
+    /// wire type. `text` is `nil` when the selection covers no text at
+    /// all, or when an endpoint no longer names a live cell (alt-screen
+    /// switch, a row evicted from scrollback).
     struct SelectionDump {
         let text: String?
         let anchorVisible: Bool
@@ -1813,36 +1814,90 @@ final class TerminalView: NSView {
         return nil
     }
 
-    /// Walk the latest render-state snapshot and concatenate the
-    /// glyphs inside the current selection. Trims trailing whitespace
-    /// per row + drops empty trailing rows so a multi-line copy
-    /// doesn't carry a wall of spaces from cells the terminal hasn't
-    /// drawn into. Returns nil when there's no selection.
+    /// Text covered by the current selection, or nil when there is
+    /// nothing to copy.
     ///
-    /// Selection rows live in `PointTag::Screen` space; we resolve
-    /// each to its current viewport row before walking. Rows that
-    /// have scrolled out of the viewport are skipped — copy returns
-    /// only the portion of the selection that's currently visible.
-    /// A fuller scroll-walk-restore implementation is a follow-up.
+    /// A selection entirely inside the viewport is read from the render
+    /// state; anything reaching into scrollback goes through
+    /// libghostty's formatter (`SelectionFormatter`), which is the only
+    /// API that can see rows the viewport does not show.
+    ///
+    /// The two paths are kept byte-identical on purpose — a fast path
+    /// that disagreed with the slow one would make the same selection
+    /// copy differently depending on scroll position. Mirrors
+    /// `TerminalSelection::selected_text` in `roost-vt`.
     @MainActor
     private func selectedPlainText() -> String? {
-        guard let sel = selection else { return nil }
+        guard let sel = selection, let terminal else { return nil }
         let n = sel.normalized()
-        if let terminal { renderState.update(terminal: terminal) }
-        let totalRowSpan = Int(n.endY - n.startY)
+        let totalRowSpan = Int(n.endY &- n.startY)
         guard totalRowSpan > 0 else { return nil }
-        var outRows: [String] = Array(repeating: "", count: totalRowSpan)
 
-        // Map currently-visible viewport rows -> selection offset.
+        // The viewport is a contiguous window over screen rows, so both
+        // edges being visible means every row between them is too.
+        if viewportRow(forScreenY: n.startY) != nil,
+           viewportRow(forScreenY: n.endY &- 1) != nil
+        {
+            return viewportSelectedText(
+                terminal: terminal, normalized: n, totalRowSpan: totalRowSpan
+            )
+        }
+
+        // Raw anchor/cursor cells: the formatter's range is inclusive on
+        // both ends, unlike `normalized()`'s half-open one, and it
+        // orders reversed endpoints itself. Columns are clamped because
+        // a column equal to `cols` has no cell to pin and libghostty
+        // would reject the whole selection — `setSelection` accepts
+        // IPC-supplied coordinates without validating the column.
+        let lastCol = max(Int(cols) - 1, 0)
+        let text = SelectionFormatter.text(
+            terminal: terminal,
+            startCol: min(max(sel.anchorCol, 0), lastCol),
+            startScreenY: sel.anchorScreenY,
+            endCol: min(max(sel.cursorCol, 0), lastCol),
+            endScreenY: sel.cursorScreenY
+        )
+        guard let text, !text.isEmpty else { return nil }
+        return text
+    }
+
+    /// One row of a selection while it is being assembled from the
+    /// viewport walk.
+    private struct SelectedRow {
+        var text = ""
+        /// True once a cell with actual content lands in the row — a
+        /// space counts, an empty cell does not.
+        var hasText = false
+        /// The row starts on a wrapped grapheme's placeholder, so it
+        /// contributes nothing at all — not even a line break.
+        var skipped = false
+    }
+
+    /// Render-state walk for a selection that is entirely on screen.
+    /// Mirrors `TerminalSelection::viewport_text` in `roost-vt`, which
+    /// in turn mirrors libghostty's formatter.
+    @MainActor
+    private func viewportSelectedText(
+        terminal: GhosttyTerminal,
+        normalized n: (startY: UInt32, startCol: Int, endY: UInt32, endCol: Int),
+        totalRowSpan: Int
+    ) -> String? {
+        renderState.update(terminal: terminal)
+
         var offsetForViewportRow: [Int: Int] = [:]
         for offset in 0..<totalRowSpan {
-            let screenY = n.startY &+ UInt32(offset)
-            if let vRow = viewportRow(forScreenY: screenY) {
+            if let vRow = viewportRow(forScreenY: n.startY &+ UInt32(offset)) {
                 offsetForViewportRow[vRow] = offset
             }
         }
         if offsetForViewportRow.isEmpty { return nil }
 
+        var rows = [SelectedRow](repeating: SelectedRow(), count: totalRowSpan)
+        // Text of the cell just before a row's first selected column,
+        // kept so a selection starting on a wide grapheme's spacer can
+        // reach back and pick the grapheme up — libghostty's formatter
+        // applies the same rule to its start column.
+        var preceding = ""
         let cols = Int(self.cols)
         renderState.walk { cell in
             guard let offset = offsetForViewportRow[cell.row] else { return }
@@ -1852,27 +1907,55 @@ final class TerminalView: NSView {
                 normalized: n,
                 cols: cols
             )
+            if cell.col + 1 == startCol { preceding = cell.text }
             guard cell.col >= startCol, cell.col < endCol else { return }
-            if let g = cell.glyph {
-                outRows[offset].append(String(g))
+            // Spacers are placeholders for a wide grapheme, not blank
+            // cells: emitting anything for them would double-space
+            // every wide character.
+            if cell.wide.isSpacer {
+                guard cell.col == startCol else { return }
+                switch cell.wide {
+                // The grapheme lives one column back, inside the
+                // selection's intent even though its cell is not.
+                case .spacerTail where !preceding.isEmpty:
+                    rows[offset].text += preceding
+                    rows[offset].hasText = true
+                // A grapheme that did not fit wrapped to the next row,
+                // leaving nothing here to select.
+                case .spacerHead:
+                    rows[offset].skipped = true
+                default:
+                    break
+                }
+                return
+            }
+            if cell.text.isEmpty {
+                rows[offset].text += " "
             } else {
-                outRows[offset].append(" ")
+                rows[offset].text += cell.text
+                rows[offset].hasText = true
             }
         }
-        var trimmed = outRows.map {
-            String($0.reversed().drop(while: { $0 == " " }).reversed())
+
+        // Same shape as libghostty's formatter so the two paths cannot
+        // disagree: rows with no text at all are held back as pending
+        // newlines and only flushed once a later row has text, which
+        // preserves leading and interior blanks while dropping trailing
+        // ones. A row whose only text is spaces counts as having text —
+        // it trims to nothing but still ends a line.
+        var out = ""
+        var pendingNewlines = 0
+        for row in rows {
+            if row.skipped { continue }
+            if !row.hasText {
+                pendingNewlines += 1
+                continue
+            }
+            out += String(repeating: "\n", count: pendingNewlines)
+            pendingNewlines = 1
+            out += SelectionFormatter.trimTrailingSpaces(row.text)
         }
-        // Drop empty leading rows too — a partial copy where the
-        // first selection rows scrolled off-screen leaves their
-        // entries as empty strings here, and joining would emit
-        // stray leading newlines into the clipboard.
-        while let first = trimmed.first, first.isEmpty {
-            trimmed.removeFirst()
-        }
-        while let last = trimmed.last, last.isEmpty {
-            trimmed.removeLast()
-        }
-        return trimmed.joined(separator: "\n")
+        return out.isEmpty ? nil : out
     }
 
     /// Compute `[startCol, endCol)` for a single row of a multi-row
