@@ -626,7 +626,24 @@ jobs:
           # Space-separated, then split by IFS. No heredoc: its terminator has
           # to sit at column 0, which would end this YAML block scalar. None of
           # these filenames can contain a space.
-          expected_names="roost_${deb_ver}_amd64.deb roost_${deb_ver}_arm64.deb Roost-${ver}.dmg"
+          #
+          # GitHub REWRITES asset filenames on upload, replacing anything
+          # outside [A-Za-z0-9._-] with a dot — so the `~` nfpm puts in a
+          # prerelease version does not survive: `roost_0.0.18~rc1_arm64.deb`
+          # is stored as `roost_0.0.18.rc1_arm64.deb`. Verified empirically
+          # against this repo with a throwaway draft. Without this the checks
+          # below report `found 0` for every prerelease AND flag the same
+          # asset as unexpected, so `publish-release` would fail and the draft
+          # would never flip — for exactly the `-rc` tags used to validate the
+          # Sparkle round-trip. Stable tags are unaffected, which is why it
+          # would have hidden until the first prerelease.
+          expected_names=""
+          for raw in "roost_${deb_ver}_amd64.deb" \
+                     "roost_${deb_ver}_arm64.deb" \
+                     "Roost-${ver}.dmg"; do
+            expected_names="${expected_names}${expected_names:+ }$(printf '%s' "${raw}" | tr -c 'A-Za-z0-9._-' '.')"
+          done
+          echo "expected asset names (after GitHub's filename sanitization): ${expected_names}"
 
           for expected in ${expected_names}; do
             sizes="$(printf '%s\n' "${assets}" \

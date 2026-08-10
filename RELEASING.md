@@ -90,7 +90,7 @@ To re-dispatch apt or rebuild the appcast after a successful publish, re-run
 **those individual jobs**. To genuinely rebuild a published version,
 `gh release delete vX.Y.Z --yes` first, or cut a new tag.
 
-### `appcast` failed — the one case that happens after the point of no return
+### A post-publication job failed — the cases after the point of no return
 
 The release is already live and correct: users can download it. `appcast` and
 `dispatch-apt-charliek` are **parallel siblings** of `publish-release`, so the
@@ -100,7 +100,12 @@ existing macOS installs will not be offered the update until it is fixed.
 **Nothing is broken for new users; in-app updates are simply not offered
 yet.**
 
-Re-run just the `appcast` job. It re-downloads `sparkle-sign` from the same
+`dispatch-apt-charliek` can fail here too, and independently. Its own row in
+the symptom table covers it; the short version is that apt-charliek re-scans
+on its next scheduled run, so a missed dispatch self-heals where a missed
+appcast does not.
+
+For `appcast`: re-run just that job. It re-downloads `sparkle-sign` from the same
 workflow run, and `update-appcast.py` dedupes by version and preserves the
 prior `pubDate`, so re-runs are safe and idempotent. Two failure modes worth
 telling apart:
@@ -108,7 +113,7 @@ telling apart:
 - **the DMG URL check failed** — the asset is not actually on the published
   release, so contrary to the paragraph above **this release is not fine**:
   macOS users have nothing to download. `publish-release` asserts the DMG is
-  present, so reaching this state means it was removed afterwards, or the CDN
+  present, so reaching this state means it was removed afterward, or the CDN
   has not caught up. Re-upload the DMG (`gh release upload <tag>
   Roost-X.Y.Z.dmg --clobber`), confirm the public URL resolves, then re-run.
 - **the push loop exhausted its 3 attempts** — main moved faster than the
