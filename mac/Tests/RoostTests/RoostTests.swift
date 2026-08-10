@@ -101,8 +101,10 @@ func bundleProfileIcedIsDistinctFromMacAndGtk() {
     #expect(iced.logDir == "/Users/tester/Library/Logs/Roost-iced")
     #expect(iced.socketPath != mac.socketPath)
     #expect(iced.socketPath != gtk.socketPath)
-    #expect(iced.lockPath != mac.lockPath)
-    #expect(iced.lockPath != gtk.lockPath)
+    #expect(iced.socketLockPath != mac.socketLockPath)
+    #expect(iced.socketLockPath != gtk.socketLockPath)
+    #expect(iced.stateLockPath != mac.stateLockPath)
+    #expect(iced.stateLockPath != gtk.stateLockPath)
 }
 
 @Test
@@ -134,7 +136,7 @@ func bundleProfileIcedEnvOverridesDefault() {
 // MARK: - ROOST_STATE_DIR override (lockstep with paths.rs apply_state_dir_override)
 
 @Test
-func stateDirOverrideAbsoluteMovesOnlyStateDir() {
+func stateDirOverrideMovesStateAndItsLockOnly() {
     let base = BundleProfile.mac(environment: ["HOME": "/Users/tester"])
     let p = BundleProfile.mac(environment: [
         "HOME": "/Users/tester",
@@ -142,10 +144,36 @@ func stateDirOverrideAbsoluteMovesOnlyStateDir() {
     ])
     #expect(p.stateDir == "/tmp/roost-isolated-state")
     #expect(p.stateJSONPath == "/tmp/roost-isolated-state/state.json")
-    // Invariant: socket, lock, log stay on the default profile path.
+    // The state lock follows the state it guards — that is the whole
+    // point: two UIs on one state dir must contend even when their
+    // socket directories differ.
+    #expect(p.stateLockPath == "/tmp/roost-isolated-state/state.lock")
+    #expect(p.stateLockPath != base.stateLockPath)
+    // Invariant: socket, socket lock, and log stay on the default path.
     #expect(p.socketPath == base.socketPath)
-    #expect(p.lockPath == base.lockPath)
+    #expect(p.socketLockPath == base.socketLockPath)
     #expect(p.logPath == base.logPath)
+}
+
+/// R1. `stateDir` collapses onto the socket'"'"'s directory whenever HOME is
+/// missing (the `/tmp/<appLabel>` fallback) or `ROOST_STATE_DIR` points
+/// at the runtime dir. One shared lock filename would make the two
+/// locks one file, and `flock` is per-open-file-description — the app
+/// would contend with itself. Lockstep with `paths.rs`'"'"'s
+/// `the_two_lock_filenames_differ_even_when_the_directories_collide`.
+@Test
+func theTwoLockFilenamesDifferWhenTheDirectoriesCollide() {
+    let homeless = BundleProfile.mac(environment: [:])
+    #expect(homeless.stateDir == "/tmp/Roost")
+    #expect((homeless.socketPath as NSString).deletingLastPathComponent == homeless.stateDir)
+    #expect(homeless.socketLockPath != homeless.stateLockPath)
+
+    let aimed = BundleProfile.mac(environment: [
+        "HOME": "/Users/tester",
+        "ROOST_STATE_DIR": "/Users/tester/Library/Caches/Roost",
+    ])
+    #expect((aimed.socketPath as NSString).deletingLastPathComponent == aimed.stateDir)
+    #expect(aimed.socketLockPath != aimed.stateLockPath)
 }
 
 @Test

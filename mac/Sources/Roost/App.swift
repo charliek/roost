@@ -249,11 +249,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// pushing a stale frame onto the current one.
     private var providerReq = 0
 
-    /// M4c: the single-instance flock held for the lifetime of the
-    /// process. Released when the holder is dropped (the lock fd is
-    /// closed in `SingleInstance.deinit`), which happens at app
-    /// shutdown.
-    private var singleInstance: SingleInstance?
+    /// The single-instance flocks — socket/bind and state — held for
+    /// the lifetime of the process. Released when this holder is
+    /// dropped at app shutdown; `InstanceLocks` releases them in the
+    /// reverse of the order they were taken, which Swift's stored-
+    /// property deinit order would not guarantee on its own.
+    private var instanceLocks: InstanceLocks?
     private var daemonReachable: Bool = false
 
     /// Sparkle 2 auto-update controller (issue #122). Retained for the
@@ -368,29 +369,67 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // dropping queued writes.
         RoostLogger.shared.attach(path: profile.logPath)
 
-        // M4c: single-instance enforcement. Two Mac UIs cannot share
-        // an IPC socket; the second launch detects the live lock,
-        // logs the holder PID, and exits 0. `ROOST_ALLOW_MULTI=1`
-        // bypasses for dev / test workflows (Xcode debug, swift test).
+        // M4c: single-instance enforcement, now two locks — the
+        // socket/bind lock beside the socket and the state lock beside
+        // `state.json`. They move independently (`ROOST_STATE_DIR`
+        // moves only the second), so one lock can't cover both. Second
+        // launch on the same socket detects the live lock, logs the
+        // holder PID, and exits 0. `ROOST_ALLOW_MULTI=1` bypasses both
+        // for dev / test workflows (Xcode debug, swift test).
         //
-        // `holdsSingleInstanceLock` is forwarded to RoostBackend so
+        // `holdsSocketLock` is forwarded to RoostBackend so
         // M6's stale-socket recovery (IPCServer.bindWithRecovery)
-        // only fires when we genuinely own the flock; on the
+        // only fires when we genuinely own the SOCKET flock; on the
         // ROOST_ALLOW_MULTI bypass we surface .alreadyBound on
         // EADDRINUSE rather than unlinking the live other instance.
-        var holdsLock = false
+        //
+        // Failure policy is per lock and lives in
+        // `SingleInstance.acquirePair`: a state-lock failure throws and
+        // we refuse to launch (fail closed — `state.json` has no other
+        // guard), while a socket-lock failure that isn't contention is
+        // reported on `socketLockError` and we continue degraded.
+        var holdsSocketLock = false
         do {
-            switch try SingleInstance.acquire(lockPath: profile.lockPath) {
-            case .acquired(let lock):
-                self.singleInstance = lock
-                holdsLock = true
+            switch try SingleInstance.acquirePair(
+                socketLockPath: profile.socketLockPath,
+                stateLockPath: profile.stateLockPath
+            ) {
+            case .acquired(let locks):
+                self.instanceLocks = locks
+                holdsSocketLock = locks.holdsSocketLock
+                if let error = locks.socketLockError {
+                    RoostLogger.shared.error(
+                        "single-instance: socket lock at \(profile.socketLockPath) failed: "
+                            + "\(error); continuing without socket enforcement"
+                    )
+                } else {
+                    RoostLogger.shared.info(
+                        "single-instance: acquired locks at \(profile.socketLockPath) "
+                            + "and \(locks.stateLockPath ?? profile.socketLockPath)"
+                    )
+                }
+            case .alreadyRunning(let pid):
                 RoostLogger.shared.info(
-                    "single-instance: acquired lock at \(profile.lockPath)"
+                    "single-instance: lock at \(profile.socketLockPath) already held by pid \(pid); exiting"
                 )
-            case .alreadyHeld(let pid):
-                RoostLogger.shared.info(
-                    "single-instance: lock at \(profile.lockPath) already held by pid \(pid); exiting"
-                )
+                // Nothing was taken, but be explicit: no launch path
+                // may return while still holding a lock.
+                self.instanceLocks?.release()
+                self.instanceLocks = nil
+                NSApp.terminate(nil)
+                return
+            case .stateHeld(let pid, let statePath):
+                // We own the socket lock, so nothing is listening on
+                // our socket: the holder is on a different socket
+                // directory and there is no window for us to activate.
+                let message =
+                    "single-instance: another Roost (pid \(pid)) is using this state "
+                    + "directory; exiting rather than writing state.json from two "
+                    + "processes. State lock: \(statePath)"
+                RoostLogger.shared.error(message)
+                FileHandle.standardError.write(Data((message + "\n").utf8))
+                self.instanceLocks?.release()
+                self.instanceLocks = nil
                 NSApp.terminate(nil)
                 return
             case .bypassed:
@@ -399,12 +438,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 )
             }
         } catch {
-            // Lock fd open / write failed for a reason other than
-            // contention. Log and continue — better to start with no
-            // single-instance guard than to refuse to launch.
-            RoostLogger.shared.error(
-                "single-instance: acquire failed: \(error); continuing without enforcement"
-            )
+            // Fail closed. The only thing `acquirePair` throws is a
+            // state-lock failure that isn't contention, and starting
+            // without that lock is how two processes come to write one
+            // `state.json`.
+            let message = "single-instance: refusing to start: \(error)"
+            RoostLogger.shared.error(message)
+            FileHandle.standardError.write(Data((message + "\n").utf8))
+            self.instanceLocks?.release()
+            self.instanceLocks = nil
+            NSApp.terminate(nil)
+            return
         }
 
         // Register the UI bridge *before* `start()` binds the IPC
@@ -417,7 +461,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         RoostBackend.shared.registerUI(self)
         RoostBackend.shared.start(
             profile: profile,
-            holdsSingleInstanceLock: holdsLock
+            holdsSocketLock: holdsSocketLock
         )
 
         let socketPath = profile.socketPath

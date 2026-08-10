@@ -222,14 +222,28 @@ fn main() -> anyhow::Result<()> {
     );
     forced_test_panic();
 
-    let lock_path = profile.lock_path();
+    let socket_lock_path = profile.socket_lock_path();
 
-    // M3b: single-instance via flock-on-pidfile. The Mac side will
-    // pick up the same primitive in M4. Second launch falls
-    // through with a clear error rather than racing on the socket.
-    let _lock = match single_instance::acquire(&lock_path) {
-        Ok(lock) => lock,
-        Err(single_instance::AcquireError::AlreadyHeld(pid)) => {
+    // Single-instance via flock-on-pidfile, one lock per resource:
+    // the socket/bind lock (taken first) and the state lock. Second
+    // launch falls through with a clear error rather than racing on
+    // the socket or on `state.json`. Both are fatal if they fail for
+    // any reason other than contention — starting without either
+    // guard is what the locks exist to prevent.
+    let attempt = single_instance::acquire_locks(&socket_lock_path, profile.state_lock_path());
+    let _locks = match attempt {
+        Ok(locks) => locks,
+        Err(single_instance::LocksError::StateHeld { pid, path }) => {
+            // We took the socket lock, so nothing is listening on our
+            // socket: the holder is on a different runtime dir and
+            // there is no socket to activate it through. Refuse.
+            return Err(anyhow::anyhow!(
+                "another Roost (pid {pid}) is using this state directory; exiting \
+                 rather than writing state.json from two processes.\nState lock: {}",
+                path.display()
+            ));
+        }
+        Err(single_instance::LocksError::SocketHeld { pid, .. }) => {
             // Another instance holds the lock. Ask it to raise its
             // window via `app.activate` over IPC, then exit. The
             // tokio runtime isn't built yet here, so spin up a tiny
@@ -281,7 +295,7 @@ fn main() -> anyhow::Result<()> {
             if !activated {
                 eprintln!(
                     "Roost (GTK) is already running (pid {pid}); exiting.\nLock: {}",
-                    lock_path.display()
+                    socket_lock_path.display()
                 );
             }
             return Ok(());

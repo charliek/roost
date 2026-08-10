@@ -23,7 +23,7 @@ use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter}
 use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
 use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
-use roost_engine::single_instance::InstanceLock;
+use roost_engine::single_instance::InstanceLocks;
 use roost_engine::{
     LocalClient, PtySupervisor, RestoreTab, Workspace, WorkspaceError, WorkspaceEvent,
 };
@@ -948,16 +948,19 @@ pub struct App {
     // Field order is intentional: terminal sessions and the engine feed
     // (whose receiver carries the wake every sender notifies on) are
     // dropped before the runtime — a dropped receiver is how the adapter
-    // tasks learn to stop. The lock is held until every runtime task has
-    // been cancelled and joined by Runtime::drop.
+    // tasks learn to stop. The locks are held until every runtime task
+    // has been cancelled and joined by Runtime::drop, so they stay last.
+    // `InstanceLocks` owns the release *order* between the two locks
+    // (state before socket, the reverse of acquisition) in its own field
+    // order — one field here, so no ordering trap at this seam.
     feed_rx: EngineFeedReceiver,
     feed_tx: EngineFeedSender,
     runtime: tokio::runtime::Runtime,
-    _lock: InstanceLock,
+    _locks: InstanceLocks,
 }
 
 impl App {
-    pub fn bootstrap(profile: &BundleProfile, lock: InstanceLock) -> Result<Self> {
+    pub fn bootstrap(profile: &BundleProfile, locks: InstanceLocks) -> Result<Self> {
         let config = RoostConfig::load_default();
         let font_registry = system_font_registry();
         let configured_typography =
@@ -1102,7 +1105,7 @@ impl App {
             feed_rx,
             feed_tx,
             runtime,
-            _lock: lock,
+            _locks: locks,
         };
         app.reconcile();
         app.resize(app.window_size);

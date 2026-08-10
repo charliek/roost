@@ -1,20 +1,41 @@
-//! Cross-platform single-instance lock for a Roost UI profile.
+//! Cross-platform single-instance locks for a Roost UI profile.
 //!
 //! M3a of the daemon-removal refactor. GApplication's D-Bus
 //! uniqueness check doesn't work on macOS (no system D-Bus session
 //! bus by default), so we use the same flock-on-pidfile mechanism
-//! the Mac UI will pick up in M4. The bind sequence is intentionally
-//! TOCTOU-safe:
+//! the Mac UI picked up in M4. One acquisition is:
 //!
-//! 1. Open the lock file (`O_CREAT | O_RDWR`). The caller passes
-//!    `BundleProfile::lock_path()`, which lives next to the socket
-//!    (`<socket dir>/roost.lock`), NOT under `state_dir` — so a
-//!    `ROOST_STATE_DIR` override doesn't move the lock.
+//! 1. Open the lock file (`O_CREAT | O_RDWR`).
 //! 2. `flock(LOCK_EX | LOCK_NB)`. Fails → another live instance
 //!    owns it; read the PID, return [`AcquireError::AlreadyHeld`].
 //! 3. Truncate + write our PID to the lock file (best-effort —
 //!    the flock is the source of truth, the PID is just for
 //!    diagnostics + an "activate the running window" hint).
+//!
+//! # Two locks, not one
+//!
+//! A UI process owns two independent resources, and they move
+//! independently, so [`acquire_locks`] takes one lock for each:
+//!
+//! * the **socket/bind lock** (`BundleProfile::socket_lock_path`,
+//!   `<socket dir>/roost.lock`) guards the probe→unlink→bind sequence
+//!   and the socket's lifetime, and follows `XDG_RUNTIME_DIR`;
+//! * the **state lock** (`BundleProfile::state_lock_path`,
+//!   `<state dir>/state.lock`) guards `state.json`, and follows
+//!   `ROOST_STATE_DIR`.
+//!
+//! The original single lock lived beside the socket. That was right
+//! about the socket and wrong about state: two processes with the same
+//! `ROOST_STATE_DIR` and different runtime dirs both started and wrote
+//! one `state.json`. Moving the one lock would have been a
+//! single-instance regression rather than a fix — see the module docs
+//! on `roost_ipc::paths`. Neither lock is legacy; dropping the runtime
+//! one reopens the socket race permanently.
+//!
+//! **Acquisition order is load-bearing**: socket lock first, then
+//! state lock, and release in the reverse order. If one process took
+//! state-then-socket while another took socket-then-state, both could
+//! refuse and neither would start.
 //!
 //! The returned [`InstanceLock`] holds the open file descriptor.
 //! Dropping it flock(LOCK_UN)s explicitly and then closes — closing
@@ -77,12 +98,159 @@ pub enum AcquireError {
     Io(#[from] std::io::Error),
 }
 
-/// Attempt to claim the single-instance lock at `lock_path`.
+/// Both locks a UI process must own to run: the socket/bind lock and
+/// the state lock.
+///
+/// Field order is load-bearing. Rust drops fields in declaration
+/// order, so `state` before `socket` releases in the reverse of the
+/// order [`acquire_locks`] takes them. Do not reorder.
+#[derive(Debug)]
+pub struct InstanceLocks {
+    /// `None` only in the degenerate case where both paths name the
+    /// same file — a second `flock` on it would contend with the first
+    /// (locks belong to the open file description), so we hold one.
+    state: Option<InstanceLock>,
+    socket: InstanceLock,
+}
+
+impl InstanceLocks {
+    pub fn socket_lock_path(&self) -> &Path {
+        self.socket.lock_path()
+    }
+
+    /// The state lock's path, or `None` when it collapsed onto the
+    /// socket lock's file and the single held lock guards both.
+    pub fn state_lock_path(&self) -> Option<&Path> {
+        self.state.as_ref().map(InstanceLock::lock_path)
+    }
+}
+
+/// Outcome of an [`acquire_locks`] attempt.
+#[derive(Debug, thiserror::Error)]
+pub enum LocksError {
+    /// Another instance is serving the socket in this runtime dir.
+    /// Callers activate that instance and exit 0.
+    #[error("another instance owns the socket (pid {pid}); lock: {}", path.display())]
+    SocketHeld { pid: i32, path: PathBuf },
+    /// We took the socket lock, so nobody is on our socket — which
+    /// makes this by construction the cross-runtime-dir case: some
+    /// other process shares our state dir but not our socket, so we
+    /// cannot activate it and cannot safely write `state.json`.
+    /// Callers refuse to start.
+    #[error("another instance owns this state directory (pid {pid}); lock: {}", path.display())]
+    StateHeld { pid: i32, path: PathBuf },
+    #[error("lock {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Claim both single-instance locks, socket first.
+///
+/// Failing the state lock releases the socket lock before returning,
+/// so a refusing process never sits on a lock a peer is waiting for.
+///
+/// Note that acquiring the state lock creates the state dir eagerly
+/// (`create_dir_all` below), where `persist_state` used to create it
+/// lazily on first write. A UI that starts and never persists now
+/// leaves an empty state dir behind.
+pub fn acquire_locks(
+    socket_lock_path: impl AsRef<Path>,
+    state_lock_path: impl AsRef<Path>,
+) -> Result<InstanceLocks, LocksError> {
+    let socket_lock_path = socket_lock_path.as_ref().to_path_buf();
+    let state_lock_path = state_lock_path.as_ref().to_path_buf();
+
+    let socket = match acquire(&socket_lock_path) {
+        Ok(lock) => lock,
+        Err(AcquireError::AlreadyHeld(pid)) => {
+            return Err(LocksError::SocketHeld {
+                pid,
+                path: socket_lock_path,
+            })
+        }
+        Err(AcquireError::Io(source)) => {
+            return Err(LocksError::Io {
+                path: socket_lock_path,
+                source,
+            })
+        }
+    };
+
+    // Defence in depth for the case where both paths name one file.
+    // `BundleProfile` gives the two locks different filenames, so
+    // getting here takes a caller passing one path twice, or a state
+    // dir symlinked onto the socket dir with matching names. Either
+    // way the second acquisition would contend with the first: `flock`
+    // is per-open-file-description, so our own second open+flock
+    // returns WouldBlock and we would refuse to start against
+    // ourselves.
+    if same_file(&socket_lock_path, &state_lock_path) {
+        return Ok(InstanceLocks {
+            state: None,
+            socket,
+        });
+    }
+
+    let state = match acquire(&state_lock_path) {
+        Ok(lock) => lock,
+        // `socket` drops at the end of this scope — after the error is
+        // built, before the caller sees it — which is the reverse
+        // release the acquisition order requires.
+        Err(AcquireError::AlreadyHeld(pid)) => {
+            return Err(LocksError::StateHeld {
+                pid,
+                path: state_lock_path,
+            })
+        }
+        Err(AcquireError::Io(source)) => {
+            return Err(LocksError::Io {
+                path: state_lock_path,
+                source,
+            })
+        }
+    };
+
+    Ok(InstanceLocks {
+        state: Some(state),
+        socket,
+    })
+}
+
+/// Do these two paths name the same file? Compares canonicalized
+/// parents (the lock files themselves may not exist yet) so a
+/// symlinked state dir pointing at the socket dir is caught too. Falls
+/// back to a literal comparison when a parent can't be canonicalized —
+/// which means it doesn't exist, which means it isn't the directory
+/// we just created for the socket lock.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    with_canonical_parent(a) == with_canonical_parent(b)
+}
+
+fn with_canonical_parent(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+            Ok(parent) => parent.join(name),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Attempt to claim one single-instance lock at `lock_path`.
 ///
 /// On success returns an [`InstanceLock`] that must be held for
 /// the lifetime of the UI process. On contention returns
 /// [`AcquireError::AlreadyHeld`] with the previous holder's PID
 /// (or `0` if the PID could not be read).
+///
+/// UIs call [`acquire_locks`] instead; this is the primitive it and
+/// the tests are built on.
 pub fn acquire(lock_path: impl AsRef<Path>) -> Result<InstanceLock, AcquireError> {
     let lock_path = lock_path.as_ref().to_path_buf();
     if let Some(parent) = lock_path.parent() {
@@ -280,6 +448,125 @@ mod tests {
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         // Bounded so a stranded helper cannot outlive the suite.
         std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    /// The bug the second lock exists to fix: same state dir, different
+    /// runtime dirs. Before this, both processes started and wrote one
+    /// `state.json`.
+    #[test]
+    fn same_state_dir_with_different_runtime_dirs_contends() {
+        let runtime_a = tempdir().unwrap();
+        let runtime_b = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let state_lock = state.path().join("state.lock");
+
+        let _first = acquire_locks(runtime_a.path().join("roost.lock"), &state_lock).unwrap();
+        match acquire_locks(runtime_b.path().join("roost.lock"), &state_lock) {
+            Err(LocksError::StateHeld { pid, path }) => {
+                assert_eq!(pid, std::process::id() as i32);
+                assert_eq!(path, state_lock);
+            }
+            other => panic!("expected StateHeld, got {other:?}"),
+        }
+    }
+
+    /// The regression a naive "just move the lock next to state.json"
+    /// would have introduced: different state dirs, one socket. Both
+    /// would bind, the second unlinking the first's socket.
+    #[test]
+    fn same_socket_with_different_state_dirs_contends() {
+        let runtime = tempdir().unwrap();
+        let state_a = tempdir().unwrap();
+        let state_b = tempdir().unwrap();
+        let socket_lock = runtime.path().join("roost.lock");
+
+        let _first = acquire_locks(&socket_lock, state_a.path().join("state.lock")).unwrap();
+        match acquire_locks(&socket_lock, state_b.path().join("state.lock")) {
+            Err(LocksError::SocketHeld { pid, path }) => {
+                assert_eq!(pid, std::process::id() as i32);
+                assert_eq!(path, socket_lock);
+            }
+            other => panic!("expected SocketHeld, got {other:?}"),
+        }
+    }
+
+    /// Reverse release. A process that refuses because the state dir is
+    /// taken must not sit on the socket lock — the instance that owns
+    /// the state dir may be about to want it.
+    #[test]
+    fn refusing_on_the_state_lock_releases_the_socket_lock() {
+        let runtime = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let socket_lock = runtime.path().join("roost.lock");
+        let contended_state = state.path().join("state.lock");
+        let _holder = acquire(&contended_state).unwrap();
+
+        match acquire_locks(&socket_lock, &contended_state) {
+            Err(LocksError::StateHeld { .. }) => {}
+            other => panic!("expected StateHeld, got {other:?}"),
+        }
+
+        acquire(&socket_lock).expect("the socket lock must have been released on refusal");
+    }
+
+    /// R1. When both paths name one file, a second `flock` would
+    /// contend with the first — `flock` is per-open-file-description,
+    /// which `second_acquire_is_already_held` proves. Degrade to a
+    /// single acquisition rather than refusing to start against
+    /// ourselves.
+    #[test]
+    fn one_shared_path_degrades_to_a_single_acquisition() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roost.lock");
+        let locks = acquire_locks(&path, &path).expect("must not contend with itself");
+        assert_eq!(locks.socket_lock_path(), path);
+        assert_eq!(locks.state_lock_path(), None);
+    }
+
+    /// Same degradation, reached the way it could actually happen: a
+    /// state dir that is a symlink to the socket dir, with lock names
+    /// that happen to match.
+    #[test]
+    fn a_symlinked_state_dir_degrades_to_a_single_acquisition() {
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let linked = dir.path().join("state-link");
+        std::os::unix::fs::symlink(&runtime, &linked).unwrap();
+
+        let locks = acquire_locks(runtime.join("roost.lock"), linked.join("roost.lock"))
+            .expect("a symlinked state dir must not contend with itself");
+        assert_eq!(locks.state_lock_path(), None);
+    }
+
+    /// Distinct directories are the normal case and must NOT degrade —
+    /// otherwise the same-path guard would silently disable the state
+    /// lock everywhere.
+    #[test]
+    fn distinct_paths_take_both_locks() {
+        let runtime = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let locks = acquire_locks(
+            runtime.path().join("roost.lock"),
+            state.path().join("state.lock"),
+        )
+        .unwrap();
+        assert!(locks.state_lock_path().is_some());
+        assert!(locks.socket_lock_path().exists());
+        assert!(locks.state_lock_path().unwrap().exists());
+    }
+
+    #[test]
+    fn dropping_both_locks_frees_them_for_the_next_start() {
+        let runtime = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let socket_lock = runtime.path().join("roost.lock");
+        let state_lock = state.path().join("state.lock");
+
+        let locks = acquire_locks(&socket_lock, &state_lock).unwrap();
+        drop(locks);
+
+        acquire_locks(&socket_lock, &state_lock).expect("both locks must be free after a drop");
     }
 
     #[test]

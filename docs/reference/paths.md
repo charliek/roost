@@ -19,7 +19,7 @@ The profile defaults to:
 
 The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-gtk`, or `Roost-iced`.
 
-Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` lives) — the socket, single-instance lock, and log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
+Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` and its `state.lock` live) — the socket, the socket lock, and the log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. Note the consequence: two UIs with different `ROOST_STATE_DIR` values no longer collide on state, so a collision that used to be loud is now silent isolation; the socket lock is what still catches a genuine second instance on one socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
 
 This is a deliberate divergence from Apple's HIG on macOS: Roost matches the convention used by Ghostty, nvim, fish, and most CLI-adjacent tools, which keeps user-edited config alongside the rest of one's dotfiles. State files (which the user does not edit) stay in `~/Library/Application Support/<app_label>/` and the socket lives in `~/Library/Caches/<app_label>/`.
 
@@ -29,8 +29,9 @@ This is a deliberate divergence from Apple's HIG on macOS: Roost matches the con
 |---|---|
 | `~/.config/roost/config.conf` | User-editable config; see [Config keys](#config-keys) below |
 | `~/Library/Application Support/Roost/state.json` | UI-owned workspace state (projects, tabs) |
+| `~/Library/Application Support/Roost/state.lock` | flock guarding `state.json` (moves with `ROOST_STATE_DIR`) |
 | `~/Library/Caches/Roost/roost.sock` | Unix socket the UI listens on |
-| `~/Library/Caches/Roost/roost.lock` | flock-based single-instance lock |
+| `~/Library/Caches/Roost/roost.lock` | flock guarding the socket's bind + lifetime |
 | `~/Library/Logs/Roost/roost.log` | App log |
 
 ### macOS — `Gtk` profile (`cargo run -p roost-linux` dev mode)
@@ -40,8 +41,9 @@ Same shape as the `Mac` profile with `Roost-gtk` in place of `Roost`:
 | Path | Purpose |
 |---|---|
 | `~/Library/Application Support/Roost-gtk/state.json` | GTK-app workspace state |
+| `~/Library/Application Support/Roost-gtk/state.lock` | GTK-app state lock |
 | `~/Library/Caches/Roost-gtk/roost.sock` | GTK-app Unix socket |
-| `~/Library/Caches/Roost-gtk/roost.lock` | GTK-app single-instance lock |
+| `~/Library/Caches/Roost-gtk/roost.lock` | GTK-app socket lock |
 | `~/Library/Logs/Roost-gtk/roost.log` | GTK-app log (also teed to stdout); distinct from the Swift app's `~/Library/Logs/Roost/roost.log` |
 
 ### macOS — `Iced` profile (`cargo run -p roost-iced`)
@@ -52,8 +54,9 @@ at once:
 | Path | Purpose |
 |---|---|
 | `~/Library/Application Support/Roost-iced/state.json` | Iced workspace state |
+| `~/Library/Application Support/Roost-iced/state.lock` | Iced state lock |
 | `~/Library/Caches/Roost-iced/roost.sock` | Iced Unix socket |
-| `~/Library/Caches/Roost-iced/roost.lock` | Iced single-instance lock |
+| `~/Library/Caches/Roost-iced/roost.lock` | Iced socket lock |
 | `~/Library/Logs/Roost-iced/roost.log` | Iced log (also teed to stdout) |
 
 ### Linux
@@ -68,7 +71,9 @@ lands here too. A dev build of `roost-iced` stays in a separate
 |---|---|
 | `$XDG_CONFIG_HOME/roost/config.conf` | User-editable config; defaults to `~/.config/roost/` |
 | `$XDG_DATA_HOME/roost/state.json` | UI-owned workspace state; defaults to `~/.local/share/roost/` |
+| `$XDG_DATA_HOME/roost/state.lock` | flock guarding `state.json`; moves with `ROOST_STATE_DIR` |
 | `$XDG_RUNTIME_DIR/roost/roost.sock` | Unix socket; falls back to `/tmp/roost-<uid>/roost.sock` when `XDG_RUNTIME_DIR` is unset |
+| `$XDG_RUNTIME_DIR/roost/roost.lock` | flock guarding the socket's bind + lifetime |
 | `$XDG_STATE_HOME/roost/roost.log` | app log (also teed to stdout); falls back to `~/.local/state/roost/` |
 
 For a dev build of Iced, replace each `roost` path component with
@@ -76,6 +81,42 @@ For a dev build of Iced, replace each `roost` path component with
 packaged (`.deb`) Iced build uses the `roost` paths above, unchanged.
 
 The directories are created at first launch with mode `0700`.
+
+### Two single-instance locks
+
+A running UI holds **two** flocks, because the two things a single
+instance must own move independently:
+
+* `<socket dir>/roost.lock` — the **socket/bind lock**. Guards the
+  probe→unlink→bind sequence and the bound socket's lifetime. Follows
+  `XDG_RUNTIME_DIR` (macOS: `~/Library/Caches/<app_label>/`).
+* `<state dir>/state.lock` — the **state lock**. Guards `state.json`.
+  Follows `ROOST_STATE_DIR` / `XDG_DATA_HOME`.
+
+Neither is legacy. One lock beside the socket let two processes with the
+same `ROOST_STATE_DIR` and different runtime dirs both write one
+`state.json`; one lock beside `state.json` would let two processes with
+different state dirs both bind one socket, the second unlinking the
+first's. Acquisition order is socket first, then state, and release is
+the reverse — mixed orders would let two starting processes refuse each
+other.
+
+The filenames differ on purpose: `state_dir` can equal the socket's
+directory (the HOME-less `/tmp/<app_label>` fallback, or a
+`ROOST_STATE_DIR` aimed at the runtime dir), and one shared name would
+make the two locks one file — `flock` is per-open-file-description, so
+the app would contend with itself and refuse to start. When both paths
+do resolve to one file, acquisition degrades to a single lock.
+
+Contention on the socket lock activates the running window and exits 0.
+Contention on the **state** lock refuses to start with a message naming
+the holder PID and the state lock path: taking the socket lock first
+proves nothing is listening on our socket, so the holder is on a
+different runtime dir and there is no window to activate.
+
+Cross-version exclusion holds only when the runtime path agrees — a new
+binary cannot contend with an older one whose `XDG_RUNTIME_DIR` differs,
+because it has no way to discover that path.
 
 ### No migration from pre-rewrite lowercase paths
 

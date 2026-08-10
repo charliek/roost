@@ -163,16 +163,32 @@ fn main() -> anyhow::Result<()> {
     );
     forced_test_panic();
 
-    let lock = match single_instance::acquire(profile.lock_path()) {
-        Ok(lock) => lock,
-        Err(single_instance::AcquireError::AlreadyHeld(pid)) => {
+    // Single-instance via flock-on-pidfile, one lock per resource: the
+    // socket/bind lock (taken first) and the state lock. Both are fatal
+    // if they fail for any reason other than contention — starting
+    // without either guard is what the locks exist to prevent.
+    let attempt =
+        single_instance::acquire_locks(profile.socket_lock_path(), profile.state_lock_path());
+    let locks = match attempt {
+        Ok(locks) => locks,
+        Err(single_instance::LocksError::SocketHeld { pid, .. }) => {
             activate_existing(&profile, pid);
             return Ok(());
+        }
+        Err(single_instance::LocksError::StateHeld { pid, path }) => {
+            // We hold the socket lock, so nothing is listening on our
+            // socket: the holder is on a different runtime dir, with no
+            // socket for us to activate it through. Refuse.
+            return Err(anyhow::anyhow!(
+                "another Roost (pid {pid}) is using this state directory; exiting \
+                 rather than writing state.json from two processes.\nState lock: {}",
+                path.display()
+            ));
         }
         Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
     };
 
-    let initial = Arc::new(Mutex::new(Some(App::bootstrap(&profile, lock)?)));
+    let initial = Arc::new(Mutex::new(Some(App::bootstrap(&profile, locks)?)));
     let boot = {
         let initial = Arc::clone(&initial);
         move || {

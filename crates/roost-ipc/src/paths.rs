@@ -5,6 +5,33 @@
 //! goes away in M7. The Swift companion at
 //! `mac/Sources/Roost/BundleProfile.swift` mirrors this resolver
 //! byte-for-byte; the two implementations are tested in lockstep.
+//!
+//! # Two locks
+//!
+//! A profile resolves **two** permanent lock paths, because the two
+//! things a single instance must own move independently:
+//!
+//! * [`BundleProfile::socket_lock_path`] — beside the socket, follows
+//!   `XDG_RUNTIME_DIR`. Guards the probe→unlink→bind sequence and the
+//!   socket's lifetime.
+//! * [`BundleProfile::state_lock_path`] — beside `state.json`, follows
+//!   `ROOST_STATE_DIR`/`XDG_DATA_HOME`. Guards persistent state.
+//!
+//! Neither is legacy and neither replaces the other. The original
+//! single lock lived beside the socket, which was right about the
+//! socket and wrong about state: two processes sharing a `state_dir`
+//! but not a runtime dir both started and wrote one `state.json`.
+//! Simply moving that lock next to `state.json` would have traded the
+//! bug for a worse one — two processes sharing a socket but not a
+//! state dir would both bind, the second unlinking the first's socket,
+//! and `roostctl` would address whichever bound last.
+//!
+//! Their **filenames deliberately differ**. `state_dir` can equal the
+//! socket's directory (the HOME-less `/tmp/<label>` fallback below, or
+//! `ROOST_STATE_DIR` pointed at the runtime dir): with one filename
+//! they would be one file, and the second `flock` would contend with
+//! the first — `flock` is per-open-file-description, so a process
+//! would refuse to start against itself.
 
 use std::path::PathBuf;
 
@@ -122,9 +149,18 @@ impl BundleProfile {
         self.log_dir.join("roost.log")
     }
 
-    /// flock-based single-instance lock path. Lives next to the
-    /// socket so cleanup logic only has to know one directory.
-    pub fn lock_path(&self) -> PathBuf {
+    /// flock guarding the IPC socket: the probe→unlink→bind sequence
+    /// and the bound socket's lifetime. Lives next to the socket, so
+    /// it follows `XDG_RUNTIME_DIR` and a `ROOST_STATE_DIR` override
+    /// never moves it.
+    ///
+    /// The filename stays `roost.lock` — it is the path external
+    /// tooling (`tools/roosttest`, `docs/reference/paths.md`, muscle
+    /// memory) already knows, and keeping it means a new binary still
+    /// contends with an older one **when the runtime path agrees**.
+    /// It cannot contend with an old binary whose `XDG_RUNTIME_DIR`
+    /// differs, because it has no way to discover that path.
+    pub fn socket_lock_path(&self) -> PathBuf {
         // `socket_path` always lives in a directory we control.
         match self.socket_path.parent() {
             Some(parent) => parent.join("roost.lock"),
@@ -133,6 +169,22 @@ impl BundleProfile {
             // Fall back to a leaf-style filename to avoid a panic.
             None => PathBuf::from("roost.lock"),
         }
+    }
+
+    /// flock guarding persistent state. Lives next to `state.json`, so
+    /// it follows `ROOST_STATE_DIR` — two UIs pointed at one state dir
+    /// contend even when their runtime dirs differ.
+    ///
+    /// Named differently from [`Self::socket_lock_path`] on purpose:
+    /// see the module docs on why one shared filename would make a
+    /// process refuse to start against itself.
+    ///
+    /// The trade-off this locks in: `ROOST_STATE_DIR`-isolated sessions
+    /// each get their own state lock, so collisions that used to be
+    /// loud go silent. That is what isolation means; the socket lock is
+    /// what still catches a genuine double instance on one socket.
+    pub fn state_lock_path(&self) -> PathBuf {
+        self.state_dir.join("state.lock")
     }
 }
 
@@ -303,12 +355,51 @@ mod tests {
     }
 
     #[test]
-    fn lock_path_is_next_to_socket() {
+    fn socket_lock_is_next_to_the_socket() {
         let p = BundleProfile::mac().expect("mac profile");
         assert_eq!(
-            p.lock_path().parent(),
+            p.socket_lock_path().parent(),
             p.socket_path.parent(),
-            "lock and socket must share a directory"
+            "the socket lock must share a directory with the socket it guards"
+        );
+    }
+
+    #[test]
+    fn state_lock_is_next_to_state_json() {
+        let p = BundleProfile::mac().expect("mac profile");
+        assert_eq!(
+            p.state_lock_path().parent(),
+            p.state_json_path().parent(),
+            "the state lock must share a directory with the state it guards"
+        );
+    }
+
+    /// The R1 guard. When `state_dir` collapses onto the socket's
+    /// directory — the HOME-less `/tmp/<label>` fallback, or a
+    /// `ROOST_STATE_DIR` aimed at the runtime dir — one shared
+    /// filename would make the two locks one file, and the second
+    /// `flock` would contend with the first (per-open-file-description
+    /// semantics). Distinct filenames are what keeps that impossible.
+    #[test]
+    fn the_two_lock_filenames_differ_even_when_the_directories_collide() {
+        let p = BundleProfile::mac().expect("mac profile");
+        let collapsed = BundleProfile {
+            state_dir: p
+                .socket_path
+                .parent()
+                .expect("socket has a parent")
+                .to_path_buf(),
+            ..p.clone()
+        };
+        assert_eq!(
+            collapsed.socket_lock_path().parent(),
+            collapsed.state_lock_path().parent(),
+            "this test is only meaningful with both locks in one directory"
+        );
+        assert_ne!(
+            collapsed.socket_lock_path(),
+            collapsed.state_lock_path(),
+            "the two locks must never resolve to the same file"
         );
     }
 
@@ -408,9 +499,12 @@ mod tests {
     }
 
     #[test]
-    fn state_dir_override_moves_only_state_dir() {
-        // The lockstep invariant: redirecting state_dir must leave the
-        // socket, lock, and log paths byte-identical.
+    fn state_dir_override_moves_state_and_its_lock_only() {
+        // The lockstep invariant: redirecting state_dir moves
+        // `state.json` AND the lock that guards it, and leaves the
+        // socket, the socket lock, and the log byte-identical. The
+        // state lock moving is the whole point — two UIs on one state
+        // dir must contend even when their runtime dirs differ.
         let base = BundleProfile::gtk().expect("gtk profile");
         let overridden = BundleProfile {
             state_dir: apply_state_dir_override(
@@ -423,8 +517,13 @@ mod tests {
             overridden.state_json_path(),
             PathBuf::from("/tmp/roost-isolated-state/state.json")
         );
+        assert_eq!(
+            overridden.state_lock_path(),
+            PathBuf::from("/tmp/roost-isolated-state/state.lock")
+        );
+        assert_ne!(overridden.state_lock_path(), base.state_lock_path());
         assert_eq!(overridden.socket_path, base.socket_path);
-        assert_eq!(overridden.lock_path(), base.lock_path());
+        assert_eq!(overridden.socket_lock_path(), base.socket_lock_path());
         assert_eq!(overridden.log_path(), base.log_path());
     }
 }
