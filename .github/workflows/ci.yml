@@ -1489,12 +1489,18 @@ jobs:
           set -euo pipefail
           echo "${NEEDS}" | jq -r 'to_entries[] | "  \(.key): \(.value.result)"'
 
-          # A `needs:` list that somehow arrived empty would make every check
-          # below vacuous, and this gate is what `release.yml`'s ci-gate
-          # trusts.
+          # Deriving membership from `needs` means a job DELETED from that
+          # list silently stops being gated — the gate would still pass, just
+          # over less. A floor catches that. It is one integer rather than a
+          # second copy of the list, so it cannot drift the way the old
+          # hand-written `results` string did; adding a gate is free (the
+          # count only rises), and lowering this number should be a
+          # deliberate act with a reason. `release.yml`'s ci-gate trusts this
+          # check, so "fewer gates than we think" has to be loud.
+          required_jobs=12
           count="$(echo "${NEEDS}" | jq -r 'length')"
-          if [ "${count}" -lt 2 ]; then
-            echo "::error::ci-success saw ${count} upstream jobs — the needs list is wrong"
+          if [ "${count}" -lt "${required_jobs}" ]; then
+            echo "::error::ci-success is gating ${count} jobs but expects at least ${required_jobs} — a job was removed from its needs list. If that was deliberate, lower required_jobs in the same commit."
             exit 1
           fi
 
