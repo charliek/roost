@@ -104,6 +104,40 @@ pub struct Style {
     pub inverse: bool,
 }
 
+/// How a cell participates in double-width text. Mirrors
+/// `GhosttyCellWide`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CellWide {
+    #[default]
+    Narrow,
+    /// Carries a double-width grapheme; the next column is its
+    /// [`CellWide::SpacerTail`].
+    Wide,
+    /// Placeholder occupying the second column of a wide grapheme.
+    SpacerTail,
+    /// Placeholder at the end of a row where a wide grapheme did not
+    /// fit and wrapped to the next row.
+    SpacerHead,
+}
+
+impl CellWide {
+    fn from_raw(raw: sys::GhosttyCellWide) -> Self {
+        match raw {
+            sys::GhosttyCellWide_GHOSTTY_CELL_WIDE_WIDE => Self::Wide,
+            sys::GhosttyCellWide_GHOSTTY_CELL_WIDE_SPACER_TAIL => Self::SpacerTail,
+            sys::GhosttyCellWide_GHOSTTY_CELL_WIDE_SPACER_HEAD => Self::SpacerHead,
+            _ => Self::Narrow,
+        }
+    }
+
+    /// True for the placeholder cells that carry no text of their own.
+    /// Text extraction skips them so a wide grapheme contributes one
+    /// grapheme, not a grapheme plus a phantom space.
+    pub fn is_spacer(self) -> bool {
+        matches!(self, Self::SpacerTail | Self::SpacerHead)
+    }
+}
+
 /// Per-cell data the renderer needs. Background / foreground are
 /// `Option` because cells often inherit the terminal default (None →
 /// renderer paints with `Colors::foreground` / `Colors::background`).
@@ -120,6 +154,19 @@ pub struct Cell {
     /// SGR style bits (bold / italic / inverse). Default-style cells
     /// carry `Style::default()` — all bits clear.
     pub style: Style,
+    /// Double-width role. Spacers are textless placeholders, not blanks.
+    pub wide: CellWide,
+}
+
+/// A row's soft-wrap flags, from `GHOSTTY_ROW_DATA_WRAP` and
+/// `GHOSTTY_ROW_DATA_WRAP_CONTINUATION`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RowWrap {
+    /// The row soft-wraps into the next one: there is no line break
+    /// between them, only a screen edge.
+    pub wrap: bool,
+    /// The row is itself the continuation of the row above.
+    pub wrap_continuation: bool,
 }
 
 /// Global dirty state after `update`. Maps `GhosttyRenderStateDirty`.
@@ -323,6 +370,26 @@ impl RenderState {
             }
         }
         Ok(())
+    }
+
+    /// Soft-wrap flags for every viewport row, in row order.
+    ///
+    /// A separate pass rather than a field on [`Cell`]: the flags are
+    /// row-level, so hanging them off every cell would repeat them
+    /// `cols` times for the one consumer that reads them. Like
+    /// [`Self::dirty_rows`] it rebinds the cached row iterator, so it
+    /// must not be called from inside a `walk` / `walk_dirty` callback.
+    pub fn row_wraps(&mut self, terminal: &Terminal) -> Result<Vec<RowWrap>> {
+        self.bind_row_iterator()?;
+        // Keep `terminal` alive across the walk (see `walk`).
+        let _ = terminal;
+
+        let mut wraps = Vec::new();
+        // SAFETY: iter handle non-null.
+        while unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
+            wraps.push(self.read_row_wrap());
+        }
+        Ok(wraps)
     }
 
     /// Global dirty state. Pure read — clears nothing.
@@ -577,6 +644,69 @@ impl RenderState {
             fg,
             text,
             style,
+            wide: self.read_cells_wide(),
+        }
+    }
+
+    /// Double-width role of the cell the row-cells iterator is on.
+    /// Read from the raw cell value rather than inferred from the
+    /// grapheme's display width, so it can never disagree with the
+    /// engine's own width table. Anything unreadable falls back to
+    /// `Narrow`, which keeps the cell's text.
+    fn read_cells_wide(&self) -> CellWide {
+        let mut raw: sys::GhosttyCell = 0;
+        // SAFETY: row_cells handle non-null; `raw` is a real local
+        // matching the RAW datum's type.
+        let rc = unsafe {
+            sys::ghostty_render_state_row_cells_get(
+                self.row_cells,
+                sys::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+                (&mut raw) as *mut sys::GhosttyCell as *mut _,
+            )
+        };
+        if Error::from_result(rc).is_err() {
+            return CellWide::Narrow;
+        }
+        let mut wide: sys::GhosttyCellWide = 0;
+        // SAFETY: `raw` is the cell value libghostty just handed back;
+        // `wide` is a real local matching the WIDE datum's type.
+        let rc = unsafe {
+            sys::ghostty_cell_get(
+                raw,
+                sys::GhosttyCellData_GHOSTTY_CELL_DATA_WIDE,
+                (&mut wide) as *mut sys::GhosttyCellWide as *mut _,
+            )
+        };
+        if Error::from_result(rc).is_err() {
+            return CellWide::Narrow;
+        }
+        CellWide::from_raw(wide)
+    }
+
+    /// Soft-wrap flags of the row the iterator sits on. Anything
+    /// unreadable reports "not wrapped", which leaves the row on its own
+    /// line — copy loses a join it should have made, never joins two
+    /// lines that were really separate.
+    fn read_row_wrap(&self) -> RowWrap {
+        let mut raw: sys::GhosttyRow = 0;
+        // SAFETY: iter handle non-null; `raw` is a real local matching
+        // the RAW datum's type.
+        let rc = unsafe {
+            sys::ghostty_render_state_row_get(
+                self.row_iter,
+                sys::GhosttyRenderStateRowData_GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
+                (&mut raw) as *mut sys::GhosttyRow as *mut _,
+            )
+        };
+        if Error::from_result(rc).is_err() {
+            return RowWrap::default();
+        }
+        RowWrap {
+            wrap: read_row_flag(raw, sys::GhosttyRowData_GHOSTTY_ROW_DATA_WRAP),
+            wrap_continuation: read_row_flag(
+                raw,
+                sys::GhosttyRowData_GHOSTTY_ROW_DATA_WRAP_CONTINUATION,
+            ),
         }
     }
 
@@ -660,6 +790,15 @@ impl RenderState {
             Err(_) => None,
         }
     }
+}
+
+/// Read one boolean row flag out of a raw `GhosttyRow` value.
+fn read_row_flag(row: sys::GhosttyRow, data: sys::GhosttyRowData) -> bool {
+    let mut out: bool = false;
+    // SAFETY: `row` is the value libghostty just handed back; `out` is a
+    // real local matching every boolean row datum's type.
+    let rc = unsafe { sys::ghostty_row_get(row, data, (&mut out) as *mut bool as *mut _) };
+    Error::from_result(rc).is_ok() && out
 }
 
 impl Drop for RenderState {

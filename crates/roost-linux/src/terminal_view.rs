@@ -2691,11 +2691,8 @@ fn color_scheme_report(light: bool) -> &'static [u8] {
 /// the drag-end PRIMARY publish, neither of which can hold an
 /// `&TerminalView`.
 ///
-/// Selection rows are stored in screen-y space; we resolve each to its
-/// current viewport row before walking. Rows currently outside the
-/// viewport are skipped — copy returns only the visible portion of the
-/// selection. A fuller scroll-walk-restore implementation is a
-/// follow-up; mirrors the Mac UI's limitation in `selectedPlainText`.
+/// Selection rows are stored in screen-y space and the full range is
+/// copied, including rows scrolled out of the viewport (#249).
 fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
     let mut s = state.borrow_mut();
     let s_mut: &mut TerminalViewState = &mut s;
@@ -3285,6 +3282,7 @@ mod tests {
             bg,
             text: String::new(),
             style,
+            wide: roost_vt::CellWide::Narrow,
         }
     }
 

@@ -1,12 +1,15 @@
-"""End-to-end tests for the `selection.*` and `clipboard.*` IPC ops.
+"""End-to-end tests for the `selection.*` IPC ops.
 
 These exercise the selection-coordinate plumbing landed in PR #146 and
-the copy-on-select / middle-click work from PR #147, *without* needing
-a real mouse — `selection.set` drives the same flow `mouseDown` /
-`drag_begin` would. The clipboard ops let tests assert on the host
-pasteboard, which roosttest previously had no way to read.
+the copy-completeness fix from #249, *without* needing a real mouse —
+`selection.set` drives the same flow `mouseDown` / `drag_begin` would,
+and `selection.dump` reads the copied text back over IPC.
 
-Run against either UI:
+Nothing here touches the host pasteboard, which is why this file runs
+in every lane including headless Wayland. The clipboard round-trip
+lives in `test_osc52.py` alongside the OSC 52 tests that need it.
+
+Run against any UI:
 
     pytest -q tools/roosttest/test_selection.py --roost-target mac
     pytest -q tools/roosttest/test_selection.py --roost-target gtk
@@ -15,7 +18,17 @@ Run against either UI:
 
 from __future__ import annotations
 
+import os
 import uuid
+
+import pytest
+
+from util import wait_tab_quiet
+
+# `tab.feed_pty_bytes` is gated the same way it is in `test_test_ops.py`
+# — without it the handler returns `not-enabled` and every assertion
+# fails for an unrelated reason.
+TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
 def _seed_lines(roost, tab, n: int = 10) -> str:
@@ -31,24 +44,43 @@ def _seed_lines(roost, tab, n: int = 10) -> str:
     return marker
 
 
+def _row_span(dump: dict, needle: str) -> tuple[int, int, int]:
+    """(viewport row, first col, last col) of `needle` in a dump.
+
+    Cols are cell columns, which equal character indices only because
+    every marker row here is pure ASCII — the wide-glyph test below
+    places its content at known cells instead.
+    """
+    rows_text = dump["rows_text"]
+    row = next(i for i, line in enumerate(rows_text) if needle in line)
+    col0 = rows_text[row].index(needle)
+    return row, col0, col0 + len(needle) - 1
+
+
+def _scroll_out_of_view(roost, tab) -> None:
+    """Push enough output to move the whole viewport into scrollback.
+
+    Sized off the tab's own row count rather than a hardcoded 24: the
+    UI sizes the grid to the window, so a taller window would leave the
+    selection on screen and quietly turn the scrollback assertions back
+    into viewport ones.
+    """
+    rows = roost.dump(tab)["rows"]
+    pad = uuid.uuid4().hex[:6]
+    count = rows + 5
+    roost.run(tab, f"for i in $(seq 1 {count}); do printf '{pad}-pad%03d\\n' $i; done")
+    roost.wait_text(tab, f"{pad}-pad{count:03d}", timeout=10)
+
+
 def test_selection_set_dump_round_trip(roost, project):
     """Anchor a selection on a known row + col, then dump it. The
     returned text should be the substring of that row between the
     anchor + cursor cols."""
     tab = roost.open_tab(project, cwd="/tmp")
     marker = _seed_lines(roost, tab, n=5)
-    dump = roost.dump(tab)
-    # Find the viewport row holding row-03.
     target = f"{marker}-row03"
-    rows_text = dump["rows_text"]
-    row_idx = next(i for i, line in enumerate(rows_text) if target in line)
-    col_start = rows_text[row_idx].index(target)
-    col_end = col_start + len(target)
-    roost.selection_set(
-        tab,
-        anchor=(col_start, row_idx),
-        cursor=(col_end - 1, row_idx),
-    )
+    row, col0, col1 = _row_span(roost.dump(tab), target)
+    roost.selection_set(tab, anchor=(col0, row), cursor=(col1, row))
     sel = roost.selection_dump(tab)
     assert sel["anchor_visible"] is True
     assert sel["cursor_visible"] is True
@@ -65,17 +97,9 @@ def test_selection_clear(roost, project):
     use `.get()` rather than subscript."""
     tab = roost.open_tab(project, cwd="/tmp")
     marker = _seed_lines(roost, tab, n=3)
-    dump = roost.dump(tab)
     target = f"{marker}-row01"
-    rows_text = dump["rows_text"]
-    row_idx = next(i for i, line in enumerate(rows_text) if target in line)
-    col_start = rows_text[row_idx].index(target)
-    col_end = col_start + len(target)
-    roost.selection_set(
-        tab,
-        anchor=(col_start, row_idx),
-        cursor=(col_end - 1, row_idx),
-    )
+    row, col0, col1 = _row_span(roost.dump(tab), target)
+    roost.selection_set(tab, anchor=(col0, row), cursor=(col1, row))
     assert roost.selection_dump(tab).get("text") == target
     roost.selection_clear(tab)
     sel = roost.selection_dump(tab)
@@ -84,62 +108,121 @@ def test_selection_clear(roost, project):
     assert sel["cursor_visible"] is False
 
 
-def test_clipboard_write_dump_round_trip(roost, project):
-    """`clipboard.write` + `clipboard.dump` round-trip via the host
-    pasteboard. Sanity check for the test ops themselves — they're
-    needed by the OSC 52 PR's E2E test."""
-    # Use a unique payload so a leaked prior clipboard value doesn't
-    # produce a false pass.
-    first = f"roost-clip-a-{uuid.uuid4().hex[:8]}"
-    second = f"roost-clip-b-{uuid.uuid4().hex[:8]}"
-    roost.clipboard_write("system", first)
-    assert roost.clipboard_dump("system") == first
-    # No polling between these calls: the UI adapter must serialize both
-    # fire-and-forget writes ahead of the following native read, even if IPC
-    # delivery straddles event-loop ticks.
-    roost.clipboard_write("system", first)
-    roost.clipboard_write("system", second)
-    assert roost.clipboard_dump("system") == second
-
-
 def test_selection_survives_scroll(roost, project):
-    """Regression for the scroll-drift bug fixed in PR #146.
+    """Regression for the scroll-drift bug (#146) and the copy
+    clipping fixed in #249.
 
-    Selection is anchored on a row, then enough output is generated to
-    scroll the original viewport position off-screen. The selection
-    should track the row (screen-y stable), not the viewport position.
+    A selection is anchored on a row, then enough output is generated
+    to push that row out of the viewport and into scrollback. The
+    selection still refers to the same row (screen-y stable, not
+    viewport-relative) and copying it returns that row's text IN FULL
+    — the endpoint being off screen is not a reason to return partial
+    text or nothing at all.
     """
     tab = roost.open_tab(project, cwd="/tmp")
     marker = _seed_lines(roost, tab, n=5)
-    dump = roost.dump(tab)
-    rows_text = dump["rows_text"]
     target = f"{marker}-row03"
-    row_idx = next(i for i, line in enumerate(rows_text) if target in line)
-    col_start = rows_text[row_idx].index(target)
-    col_end = col_start + len(target)
-    roost.selection_set(
-        tab,
-        anchor=(col_start, row_idx),
-        cursor=(col_end - 1, row_idx),
-    )
-    # Generate enough new output to push the original row off-screen.
-    # The default 24-row viewport needs roughly that many extra lines.
-    pad = uuid.uuid4().hex[:6]
-    roost.run(tab, f"for i in $(seq 1 30); do printf '{pad}-pad%02d\\n' $i; done")
-    roost.wait_text(tab, f"{pad}-pad30", timeout=8)
-    # The originally-selected row may have scrolled off the visible
-    # viewport entirely. In that case copy returns None (partial-copy
-    # limitation documented for v1) and `anchor_visible` is false.
-    # Either way the selection didn't silently start pointing at the
-    # wrong text — that's the regression we're checking.
+    row, col0, col1 = _row_span(roost.dump(tab), target)
+    roost.selection_set(tab, anchor=(col0, row), cursor=(col1, row))
+    assert roost.selection_dump(tab).get("text") == target
+
+    _scroll_out_of_view(roost, tab)
+
     sel = roost.selection_dump(tab)
-    text = sel.get("text")
-    if text is not None:
-        # If still partially visible, the text must match the original
-        # row content; it must NOT be one of the new pad rows.
-        assert target in text or text == target, (
-            f"selection drifted to wrong content: {text!r}"
-        )
-        assert pad not in text, (
-            f"selection picked up unrelated newer content: {text!r}"
-        )
+    # `anchor_visible` / `cursor_visible` stay viewport-truthful by
+    # design (D4.5) — they answer "is this endpoint on screen", which
+    # is now independent of what `text` contains.
+    assert sel["anchor_visible"] is False
+    assert sel["cursor_visible"] is False
+    assert sel.get("text") == target, (
+        f"scrolled-off selection copied {sel.get('text')!r}, want {target!r}"
+    )
+
+
+def test_selection_spanning_scrollback_copies_every_row(roost, project):
+    """A multi-row selection copies every row, in order, whether the
+    rows are on screen or in scrollback.
+
+    The scrollback text is asserted against the *same* selection's
+    on-screen text rather than a second literal, so the two copy paths
+    (the viewport walk and libghostty's selection formatter) cannot
+    disagree without failing here.
+    """
+    tab = roost.open_tab(project, cwd="/tmp")
+    n = 8
+    marker = _seed_lines(roost, tab, n=n)
+    dump = roost.dump(tab)
+    first_row, first_col, _ = _row_span(dump, f"{marker}-row01")
+    last_row, _, last_col = _row_span(dump, f"{marker}-row{n:02d}")
+    roost.selection_set(
+        tab, anchor=(first_col, first_row), cursor=(last_col, last_row)
+    )
+    expected = "\n".join(f"{marker}-row{i:02d}" for i in range(1, n + 1))
+    assert roost.selection_dump(tab).get("text") == expected
+
+    _scroll_out_of_view(roost, tab)
+
+    sel = roost.selection_dump(tab)
+    assert sel["anchor_visible"] is False
+    assert sel["cursor_visible"] is False
+    assert sel.get("text") == expected, (
+        f"scrollback selection copied {sel.get('text')!r}, want {expected!r}"
+    )
+
+
+def test_reversed_drag_copies_in_document_order(roost, project):
+    """Dragging upward selects the same text as dragging downward.
+
+    The endpoints are handed to the copy path raw (the formatter orders
+    them itself), so a reversed drag is the case where an ordering slip
+    would surface — on screen and, after scrolling, through the
+    formatter path too.
+    """
+    tab = roost.open_tab(project, cwd="/tmp")
+    n = 6
+    marker = _seed_lines(roost, tab, n=n)
+    dump = roost.dump(tab)
+    first_row, first_col, _ = _row_span(dump, f"{marker}-row01")
+    last_row, _, last_col = _row_span(dump, f"{marker}-row{n:02d}")
+    expected = "\n".join(f"{marker}-row{i:02d}" for i in range(1, n + 1))
+
+    # Anchor on the LAST row, drag up to the first.
+    roost.selection_set(
+        tab, anchor=(last_col, last_row), cursor=(first_col, first_row)
+    )
+    assert roost.selection_dump(tab).get("text") == expected
+
+    _scroll_out_of_view(roost, tab)
+
+    assert roost.selection_dump(tab).get("text") == expected
+
+
+@pytest.mark.skipif(
+    not TEST_MODE,
+    reason="seeding exact cells needs tab.feed_pty_bytes (ROOST_TEST_MODE=1)",
+)
+def test_wide_glyphs_copy_without_phantom_space(roost, project):
+    """A CJK run copies as its graphemes, with no spacer cells leaking
+    in as spaces (`你好`, not `你 好` — #249).
+
+    The content is placed with an explicit erase + cursor-home so the
+    wide graphemes sit on known CELLS: column indices and character
+    indices diverge for wide glyphs, so deriving them from
+    `rows_text` would be assuming the very mapping under test.
+    """
+    tab = roost.open_tab(project, cwd="/tmp")
+    wait_tab_quiet(roost, tab)
+    text = "你好"
+    roost.tab_feed_pty_bytes(tab, b"\x1b[2J\x1b[H" + text.encode())
+    # Wait on the leading grapheme alone: `tab.dump`'s `rows_text` is one
+    # character per CELL, so a wide glyph reads back as the grapheme
+    # followed by a space for its spacer — the very artifact this test
+    # says must not reach the copied text.
+    roost.wait_text(tab, text[0], timeout=5)
+    # 你 occupies cells 0-1, 好 cells 2-3. The cursor endpoint is the
+    # trailing spacer on purpose: it must contribute nothing.
+    roost.selection_set(tab, anchor=(0, 0), cursor=(3, 0))
+    sel = roost.selection_dump(tab)
+    assert sel.get("text") == text, (
+        f"wide-glyph selection copied {sel.get('text')!r}, want {text!r}"
+    )

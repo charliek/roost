@@ -52,6 +52,8 @@ silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 | `test_test_ops.py` | Smoke triple for the test-only IPC ops (`tab.feed_pty_bytes`, `tab.capture_pty_input`, `tab.dump_resolved`) — the scaffolding for the byte-level OSC pipeline tests. Skipped without `ROOST_TEST_MODE=1`. |
 | `test_osc_pipeline.py` | End-to-end OSC pipeline: bold + inverse resolver call-site coverage (#142), OSC 10/11/12 set/query reply round-trips (#145), and parity OSC 0/7/9 routing tests. Drives bytes via `tab.feed_pty_bytes`; reads back via `tab.dump_resolved` + `tab.capture_pty_input`. The canonical example for the "OSC-routed regression patterns" section below. |
 | `test_device_queries.py` | End-to-end device-query replies (#247): each engine-autonomous query (DA1, DSR 5n/6n, DECRQM ?25, XTVERSION `libghostty`, Kitty keyboard `ESC[?u`) fed via `tab.feed_pty_bytes` produces its reply on the input side, read back via `tab.capture_pty_input`. Pins the `write_pty` drain wiring both UIs install. Skipped without `ROOST_TEST_MODE=1`. |
+| `test_selection.py` | The `selection.*` op set: set/dump/clear round trips, and copy completeness (#249) — a selection scrolled into scrollback still copies in full, a multi-row selection copies every row in order, a reversed drag copies in document order, and wide/CJK glyphs copy without a phantom space. IPC-only (no pasteboard), so it runs in every lane including headless Wayland. |
+| `test_osc52.py` | Program-initiated OSC 52 clipboard writes, plus the `clipboard.write`/`clipboard.dump` round trip they read through. Touches the host pasteboard, so it is the one module the headless-Wayland lanes skip. |
 | `test_ime.py` | End-to-end IME (plan 021): `tab.feed_ime` (preedit/commit/clear) driven through the same route the iced adapter's winit IME handler takes — byte-exact commit encoding, preedit-only-at-cursor (never reaches the PTY), single-emit on preedit-then-commit, and the one-shot discard latch that drops a stray commit after a route change (e.g. opening the palette) cancels a live composition. Iced-only; skipped without `ROOST_TEST_MODE=1`. |
 | `fixtures/launcher.conf` | Seed config the harness points the UI at via `ROOST_CONFIG` (see below), giving the launcher tests a deterministic command list. |
 
@@ -202,7 +204,7 @@ it's pixel- or input- or shell-level. It lives elsewhere, by design:
 
 | Behavior | Why not here | Where |
 |---|---|---|
-| Selection + copy, real clipboard paste | mouse selection + OS clipboard, not IPC | `tools/input/linux` (uinput inject + clipread) |
+| Real mouse selection, real clipboard paste | a physical drag + the OS pasteboard, not IPC (what copy *contains* is covered here by `test_selection.py` via `selection.set`/`selection.dump`) | `tools/input/linux` (uinput inject + clipread) |
 | Live resize / reflow | the UI sizes the grid to the window, so `tab.resize` doesn't pin a size | `tools/screenshot` (resize window, check reflow) |
 | Theme color rendering | `tab.dump` is text-only (no color) | `tools/screenshot` screenshots |
 | OSC 2 window-title | cwd-derived title + the shell re-emits each prompt overwrites it | `tools/screenshot` (visible title) |

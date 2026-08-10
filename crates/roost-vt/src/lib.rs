@@ -74,6 +74,8 @@ pub enum Error {
     OutOfSpace,
     #[error("libghostty-vt: no value")]
     NoValue,
+    #[error("libghostty-vt returned non-UTF-8 text")]
+    InvalidUtf8,
     #[error("libghostty-vt returned error code {0}")]
     Other(i32),
 }
@@ -105,6 +107,8 @@ pub const fn ffi_available() -> bool {
 }
 
 #[cfg(feature = "ffi")]
+mod formatter;
+#[cfg(feature = "ffi")]
 mod key_encoder;
 #[cfg(feature = "ffi")]
 mod mouse_encoder;
@@ -118,13 +122,17 @@ mod selection;
 mod terminal;
 
 #[cfg(feature = "ffi")]
+pub use formatter::UNWRAP_SOFT_WRAPPED_LINES;
+#[cfg(feature = "ffi")]
 pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
 #[cfg(feature = "ffi")]
 pub use mouse_encoder::{
     mouse_action, mouse_button, MouseAction, MouseButton, MouseEncoder, MouseEvent,
 };
 #[cfg(feature = "ffi")]
-pub use render_state::{Cell, Colors, CursorInfo, CursorVisualStyle, Dirty, RenderState, Style};
+pub use render_state::{
+    Cell, CellWide, Colors, CursorInfo, CursorVisualStyle, Dirty, RenderState, RowWrap, Style,
+};
 #[cfg(feature = "ffi")]
 pub use scroll::{PageDirection, PageRoute, ScrollDirection, ScrollRoute, TerminalScroll};
 #[cfg(feature = "ffi")]

@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{Point, PointTag, RenderState, Result, Terminal};
+use crate::formatter::{self, UNWRAP_SOFT_WRAPPED_LINES};
+use crate::{CellWide, Point, PointTag, RenderState, Result, RowWrap, Terminal};
 
 /// A terminal row rendered as exact grapheme text plus reversible mappings
 /// between Unicode scalar indices and terminal cell columns.
@@ -277,6 +278,12 @@ impl TerminalSelection {
         Ok(RowTextProjection::from_cells(cols, cells))
     }
 
+    /// Text covered by the selection, or `None` if nothing is selected.
+    ///
+    /// A selection entirely inside the viewport is read from the render
+    /// state; anything reaching into scrollback — or any selection the
+    /// walk declines — goes through libghostty's formatter, which is the
+    /// only API that can see rows the viewport does not show.
     pub fn selected_text(
         &self,
         terminal: &Terminal,
@@ -287,10 +294,57 @@ impl TerminalSelection {
         let Some(selection) = self.active.filter(|selection| selection.is_visible()) else {
             return Ok(None);
         };
+        let (_, start_y, _, end_y) = selection.normalized();
+        if end_y == start_y {
+            return Ok(None);
+        }
+        // The viewport is a contiguous window over screen rows, so both
+        // edges being visible means every row between them is too.
+        let fully_visible = viewport_row(terminal, start_y, rows).is_some()
+            && viewport_row(terminal, end_y.saturating_sub(1), rows).is_some();
+        if fully_visible {
+            if let ViewportCopy::Text(text) =
+                self.viewport_text(terminal, render_state, cols, rows)?
+            {
+                return Ok(text);
+            }
+        }
+
+        // Raw anchor/cursor cells: the formatter's range is inclusive on
+        // both ends, unlike `normalized`'s half-open one, and it orders
+        // reversed endpoints itself. Columns are clamped because a column
+        // equal to `cols` has no cell to pin and libghostty would reject
+        // the whole selection — `set` accepts IPC-supplied coordinates
+        // without validating the column.
+        let last_col = cols.saturating_sub(1);
+        let text = formatter::selection_text(
+            terminal,
+            Point::screen(
+                selection.anchor_col.min(last_col),
+                selection.anchor_screen_y,
+            ),
+            Point::screen(
+                selection.cursor_col.min(last_col),
+                selection.cursor_screen_y,
+            ),
+        )?;
+        Ok(text.filter(|text| !text.is_empty()))
+    }
+
+    fn viewport_text(
+        &self,
+        terminal: &Terminal,
+        render_state: &mut RenderState,
+        cols: u16,
+        rows: u16,
+    ) -> Result<ViewportCopy> {
+        let Some(selection) = self.active.filter(|selection| selection.is_visible()) else {
+            return Ok(ViewportCopy::Text(None));
+        };
         let (start_col, start_y, end_col, end_y) = selection.normalized();
         let total = (end_y - start_y) as usize;
         if total == 0 {
-            return Ok(None);
+            return Ok(ViewportCopy::Text(None));
         }
         let visible: HashMap<u32, usize> = (0..total)
             .filter_map(|offset| {
@@ -299,37 +353,175 @@ impl TerminalSelection {
             })
             .collect();
         if visible.is_empty() {
-            return Ok(None);
+            return Ok(ViewportCopy::Text(None));
         }
 
-        let mut lines = vec![String::new(); total];
+        let mut lines = vec![SelectedRow::default(); total];
+        // Text of the cell just before a row's first selected column,
+        // kept so a selection starting on a wide grapheme's spacer can
+        // reach back and pick the grapheme up — libghostty's formatter
+        // applies the same rule to its start column.
+        let mut preceding = String::new();
+        // Whether the selection's very last cell is the placeholder a
+        // wide grapheme left behind when it did not fit and wrapped.
+        let mut ends_on_spacer_head = false;
+        let last_col = end_col.min(cols).saturating_sub(1);
         render_state.update(terminal)?;
         render_state.walk(terminal, |row, cell| {
             let Some(&offset) = visible.get(&row) else {
                 return;
             };
             let (col0, col1) = column_range(offset, total, start_col, end_col, cols);
+            if cell.col.saturating_add(1) == col0 {
+                preceding.clear();
+                preceding.push_str(&cell.text);
+            }
+            if offset == total - 1 && cell.col == last_col {
+                ends_on_spacer_head = cell.wide == CellWide::SpacerHead;
+            }
             if cell.col < col0 || cell.col >= col1 {
                 return;
             }
+            // Spacers are placeholders for a wide grapheme, not blank
+            // cells: emitting anything for them would double-space every
+            // wide character.
+            if cell.wide.is_spacer() {
+                if cell.col != col0 {
+                    return;
+                }
+                match cell.wide {
+                    // The grapheme lives one column back, inside the
+                    // selection's intent even though its cell is not.
+                    CellWide::SpacerTail if !preceding.is_empty() => {
+                        lines[offset].push_text(&preceding)
+                    }
+                    // A grapheme that did not fit wrapped to the next
+                    // row, leaving nothing here to select.
+                    CellWide::SpacerHead => lines[offset].skipped = true,
+                    _ => {}
+                }
+                return;
+            }
             if cell.text.is_empty() {
-                lines[offset].push(' ');
+                lines[offset].pending_blanks += 1;
             } else {
-                lines[offset].push_str(&cell.text);
+                lines[offset].push_text(&cell.text);
             }
         })?;
 
-        let mut lines: Vec<String> = lines
-            .into_iter()
-            .map(|line| line.trim_end().to_string())
-            .collect();
-        while matches!(lines.first(), Some(line) if line.is_empty()) {
-            lines.remove(0);
+        // When unwrapping, a selection ending on a spacer head reaches
+        // into the row BELOW for the grapheme that wrapped — and how far
+        // it may reach is decided in page coordinates the viewport walk
+        // cannot see (`PageFormatter.formatWithState`, which declines the
+        // reach at a page boundary). Rather than guess, hand these back
+        // to the formatter, which is authoritative by construction.
+        if UNWRAP_SOFT_WRAPPED_LINES && ends_on_spacer_head {
+            return Ok(ViewportCopy::Unsupported);
         }
-        while matches!(lines.last(), Some(line) if line.is_empty()) {
-            lines.pop();
+
+        let mut wraps = vec![RowWrap::default(); total];
+        if UNWRAP_SOFT_WRAPPED_LINES {
+            // Without the wrap flags the walk would mark every row "not
+            // wrapped" and emit per-row text while the formatter joins,
+            // so the same selection would copy differently depending on
+            // scroll position. Defer rather than diverge — and defer
+            // rather than fail the copy outright, since the formatter
+            // can still answer.
+            let Ok(by_viewport_row) = render_state.row_wraps(terminal) else {
+                return Ok(ViewportCopy::Unsupported);
+            };
+            for (&row, &offset) in &visible {
+                wraps[offset] = by_viewport_row
+                    .get(row as usize)
+                    .copied()
+                    .unwrap_or_default();
+            }
         }
-        Ok((!lines.is_empty()).then(|| lines.join("\n")))
+
+        // Same shape as libghostty's formatter so the two paths cannot
+        // disagree. Rows with no text at all are held back as pending
+        // newlines and only flushed once a later row has text, which
+        // preserves leading and interior blanks while dropping trailing
+        // ones. A row whose only text is spaces counts as having text —
+        // it trims to nothing but still ends a line. A soft-wrapped row
+        // contributes no newline at all when unwrapping, and its trailing
+        // blank cells carry into the continuation row instead of being
+        // dropped, so the rejoined line keeps its interior spacing.
+        let mut out = String::new();
+        let mut pending_newlines = 0_usize;
+        let mut carried_blanks = 0_usize;
+        for (offset, line) in lines.iter().enumerate() {
+            if line.skipped {
+                continue;
+            }
+            if !line.has_text {
+                pending_newlines += 1;
+                continue;
+            }
+            for _ in 0..pending_newlines {
+                out.push('\n');
+            }
+            pending_newlines = usize::from(!(UNWRAP_SOFT_WRAPPED_LINES && wraps[offset].wrap));
+            if !(UNWRAP_SOFT_WRAPPED_LINES && wraps[offset].wrap_continuation) {
+                carried_blanks = 0;
+            }
+            for _ in 0..carried_blanks + line.leading_blanks {
+                out.push(' ');
+            }
+            out.push_str(&line.text);
+            carried_blanks = line.pending_blanks;
+        }
+        // Only 0x20 is trimmed, and only at the end of a line — which
+        // when unwrapping means the end of the JOINED line, so a wrapped
+        // row's trailing spaces are interior and survive.
+        let out = formatter::trim_trailing_spaces(&out);
+        Ok(ViewportCopy::Text((!out.is_empty()).then_some(out)))
+    }
+}
+
+/// What the viewport fast path came back with.
+enum ViewportCopy {
+    /// The selection's text (`None` once every row turned out blank).
+    Text(Option<String>),
+    /// The walk cannot mirror the formatter for this selection, so the
+    /// caller has to use the formatter itself.
+    Unsupported,
+}
+
+/// One row of a selection while it is being assembled from the viewport.
+#[derive(Debug, Default, Clone)]
+struct SelectedRow {
+    text: String,
+    /// True once a cell with actual content lands in the row — a space
+    /// counts, an empty cell does not.
+    has_text: bool,
+    /// The row starts on a wrapped grapheme's placeholder, so it
+    /// contributes nothing at all — not even a line break.
+    skipped: bool,
+    /// Textless cells seen before the row's first text cell. Held apart
+    /// from `text` because the formatter emits them only after whatever
+    /// carried over from a soft-wrapped predecessor.
+    leading_blanks: usize,
+    /// Textless cells seen since the row's last text cell. Dropped at the
+    /// end of a line; carried into the next row when that row continues
+    /// this one's soft wrap.
+    pending_blanks: usize,
+}
+
+impl SelectedRow {
+    /// Append a cell's text, materializing any textless cells that
+    /// turned out to be interior rather than trailing.
+    fn push_text(&mut self, text: &str) {
+        if self.has_text {
+            for _ in 0..self.pending_blanks {
+                self.text.push(' ');
+            }
+        } else {
+            self.leading_blanks = self.pending_blanks;
+        }
+        self.pending_blanks = 0;
+        self.text.push_str(text);
+        self.has_text = true;
     }
 }
 

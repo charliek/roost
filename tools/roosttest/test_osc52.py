@@ -60,6 +60,26 @@ def _wait_clipboard(roost, target: str, expected: str, timeout: float = 5.0) -> 
     )
 
 
+def test_clipboard_write_dump_round_trip(roost, project):
+    """`clipboard.write` + `clipboard.dump` round-trip via the host
+    pasteboard. Sanity check for the test ops themselves — every
+    assertion below is read through them, so a broken op would look
+    like a broken OSC 52. (Lived in `test_selection.py` until the
+    selection tests stopped touching the pasteboard.)"""
+    # Use a unique payload so a leaked prior clipboard value doesn't
+    # produce a false pass.
+    first = f"roost-clip-a-{uuid.uuid4().hex[:8]}"
+    second = f"roost-clip-b-{uuid.uuid4().hex[:8]}"
+    roost.clipboard_write("system", first)
+    assert roost.clipboard_dump("system") == first
+    # No polling between these calls: the UI adapter must serialize both
+    # fire-and-forget writes ahead of the following native read, even if IPC
+    # delivery straddles event-loop ticks.
+    roost.clipboard_write("system", first)
+    roost.clipboard_write("system", second)
+    assert roost.clipboard_dump("system") == second
+
+
 def test_osc52_writes_system_clipboard(roost, project):
     tab = roost.open_tab(project, cwd="/tmp", title="osc52")
     baseline = _seed_baseline(roost, "system")
