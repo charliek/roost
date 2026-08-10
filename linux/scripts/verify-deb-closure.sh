@@ -102,8 +102,20 @@ IMAGE="${ROOST_CLOSURE_IMAGE:-ubuntu:24.04}"
 # check cannot tell "launched" from "bound the socket and then died".
 LIVENESS_SECONDS="${ROOST_CLOSURE_LIVENESS_SECONDS:-8}"
 
+# The liveness sleep happens INSIDE the phase bounded by LAUNCH_TIMEOUT, and
+# the two are independent env knobs. Raising the first past the second makes
+# the launch phase time out and report "the package did not come up" — the
+# opposite of what happened. Reject the combination rather than misdiagnose it.
+# 30s is the identify poll (60 x 0.5s) that precedes the sleep; 20s is margin
+# for apt-free startup and the second probe.
+if [ "$((LIVENESS_SECONDS + 50))" -gt "${LAUNCH_TIMEOUT}" ]; then
+  die "ROOST_CLOSURE_LIVENESS_SECONDS=${LIVENESS_SECONDS} does not fit inside ROOST_CLOSURE_LAUNCH_TIMEOUT=${LAUNCH_TIMEOUT} (needs at least $((LIVENESS_SECONDS + 50))): the launch phase would time out and report itself as a startup failure."
+fi
+
 run_id="roost-closure-$$"
 compositor_cid=""
+package_container=""
+share_root=""
 share_dir=""
 
 cleanup() {
@@ -111,15 +123,28 @@ cleanup() {
     docker rm -f "${compositor_cid}" >/dev/null 2>&1 || true
     compositor_cid=""
   fi
-  if [ -n "${share_dir}" ] && [ -d "${share_dir}" ]; then
-    # The compositor container runs as root, so its socket is root-owned and a
-    # plain rm leaves the directory behind on any non-root host. Borrow root
-    # from a throwaway container to empty it; best-effort either way.
-    rm -rf "${share_dir}" 2>/dev/null || {
-      docker run --rm -v "${share_dir}:/share" "${IMAGE}" \
-        find /share -mindepth 1 -delete >/dev/null 2>&1 || true
-      rmdir "${share_dir}" 2>/dev/null || true
+  # `timeout` around `docker run` kills the docker CLIENT, not the container:
+  # the daemon keeps running it and `--rm` never fires. Left alone it outlives
+  # this script AND keeps share_dir bind-mounted, so the directory cleanup
+  # below silently fails too. The name is deterministic, so no extra state is
+  # needed to find it.
+  if [ -n "${package_container}" ]; then
+    docker rm -f "${package_container}" >/dev/null 2>&1 || true
+    package_container=""
+  fi
+  if [ -n "${share_root}" ] && [ -d "${share_root}" ]; then
+    # Everything the containers create in here is root-owned, and the X11 leg
+    # is worse than that: Xvfb chowns its socket directory to root and sets
+    # the sticky bit, so a non-root host cannot even rmdir the empty shell
+    # afterwards. Hence the two levels — the containers only ever mount
+    # `share_dir`, so `share_root` stays ours and is removable once a
+    # throwaway container has emptied it as root.
+    rm -rf "${share_root}" 2>/dev/null || {
+      docker run --rm -v "${share_root}:/share_root" "${IMAGE}" \
+        find /share_root -mindepth 1 -delete >/dev/null 2>&1 || true
+      rmdir "${share_root}" 2>/dev/null || true
     }
+    share_root=""
     share_dir=""
   fi
 }
@@ -297,8 +322,11 @@ run_leg() {
   local leg="$1"
   echo "==> closure leg: ${leg}"
 
-  share_dir="$(mktemp -d)"
+  share_root="$(mktemp -d)"
+  share_dir="${share_root}/xdg"
+  mkdir -p "${share_dir}"
   chmod 700 "${share_dir}"
+  package_container="${run_id}-${leg}-package"
   start_compositor "${leg}"
 
   local -a display_env
@@ -324,7 +352,7 @@ run_leg() {
 
   set +e
   timeout "${DOCKER_TIMEOUT}" docker run --rm \
-    --name "${run_id}-${leg}-package" \
+    --name "${package_container}" \
     "${display_env[@]}" \
     -e "ROOST_LEG=${leg}" \
     -e "LIVENESS_SECONDS=${LIVENESS_SECONDS}" \

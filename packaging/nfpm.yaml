@@ -34,13 +34,13 @@ description: |
 # application itself loads (their own Depends pull the rest of the closure —
 # Mesa alone accounts for ~30 more packages that must NOT be pinned here).
 #
-# Measured over SEVEN configurations, not one (#325): {Wayland, X11} ×
-# {Vulkan ICD, none} × {libEGL reachable, not}. The first six axes exist
-# because a single measurement is systematically blind: the original list was
-# taken under Xvfb only, and X11 never needs `libwayland-egl`. The libEGL axis
-# exists because with neither a Vulkan ICD nor libEGL, wgpu enumerates zero
-# adapters and iced quietly renders on the CPU via tiny-skia — so the whole
-# GLES path, and every library it loads, stays untouched and unmeasured.
+# Measured over SEVEN of the eight cells of {Wayland, X11} x {Vulkan ICD,
+# none} x {libEGL reachable, not} (#325). The first two axes exist because a
+# single measurement is systematically blind: the original list was taken
+# under Xvfb only, and X11 never needs `libwayland-egl`. The third axis exists
+# because with neither a Vulkan ICD nor libEGL, wgpu enumerates zero adapters
+# and iced quietly renders on the CPU via tiny-skia — so the whole GLES path,
+# and every library it loads, stays untouched and unmeasured.
 depends:
   # Measured, not inherited: `objdump -T` on the release binary shows
   # non-weak GLIBC_2.35 imports (hypot/hypotf) and GLIBC_2.34 (pthread_*,
