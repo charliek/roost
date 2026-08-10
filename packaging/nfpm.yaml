@@ -33,6 +33,14 @@ description: |
 # actually opened, mapped through `dpkg -S` and reduced to the libraries the
 # application itself loads (their own Depends pull the rest of the closure —
 # Mesa alone accounts for ~30 more packages that must NOT be pinned here).
+#
+# Measured over SEVEN of the eight cells of {Wayland, X11} x {Vulkan ICD,
+# none} x {libEGL reachable, not} (#325). The first two axes exist because a
+# single measurement is systematically blind: the original list was taken
+# under Xvfb only, and X11 never needs `libwayland-egl`. The third axis exists
+# because with neither a Vulkan ICD nor libEGL, wgpu enumerates zero adapters
+# and iced quietly renders on the CPU via tiny-skia — so the whole GLES path,
+# and every library it loads, stays untouched and unmeasured.
 depends:
   # Measured, not inherited: `objdump -T` on the release binary shows
   # non-weak GLIBC_2.35 imports (hypot/hypotf) and GLIBC_2.34 (pthread_*,
@@ -58,6 +66,19 @@ depends:
   - libxcb1
   - libxcursor1
   - libxi6
+  # wgpu's GLES backend, reached whenever no Vulkan ICD is usable — which both
+  # `--no-install-recommends` and any GPU without an ICD produce. `libegl1` is
+  # the vendor-neutral loader the app dlopens by soname; `libwayland-egl1`
+  # supplies the `wl_egl_window_create` the same backend needs to build a
+  # surface on a Wayland compositor.
+  #
+  # These two travel TOGETHER. Measured: with libEGL present and
+  # libwayland-egl1 absent, roost does not degrade — it SIGABRTs (exit 134)
+  # inside `Surface::configure`, because iced's tiny-skia fallback covers
+  # compositor *creation* and not surface configure. Adding `libegl1` alone
+  # would therefore create that crash rather than prevent it.
+  - libegl1
+  - libwayland-egl1
 # Vulkan is deliberately NOT a hard dependency. Measured: with
 # /usr/share/vulkan/icd.d removed entirely the app still opens a window —
 # wgpu falls back to the software renderer that is compiled in alongside it.
