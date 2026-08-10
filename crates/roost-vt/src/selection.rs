@@ -421,7 +421,15 @@ impl TerminalSelection {
 
         let mut wraps = vec![RowWrap::default(); total];
         if UNWRAP_SOFT_WRAPPED_LINES {
-            let by_viewport_row = render_state.row_wraps(terminal)?;
+            // Without the wrap flags the walk would mark every row "not
+            // wrapped" and emit per-row text while the formatter joins,
+            // so the same selection would copy differently depending on
+            // scroll position. Defer rather than diverge — and defer
+            // rather than fail the copy outright, since the formatter
+            // can still answer.
+            let Ok(by_viewport_row) = render_state.row_wraps(terminal) else {
+                return Ok(ViewportCopy::Unsupported);
+            };
             for (&row, &offset) in &visible {
                 wraps[offset] = by_viewport_row
                     .get(row as usize)

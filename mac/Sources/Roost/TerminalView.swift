@@ -1986,6 +1986,12 @@ final class TerminalView: NSView {
         var wraps = [RenderState.RowWrap](repeating: RenderState.RowWrap(), count: totalRowSpan)
         if SelectionFormatter.unwrapSoftWrappedLines {
             let byViewportRow = renderState.rowWraps()
+            // `rowWraps()` returns [] when rebinding the row iterator
+            // fails. Carrying on would leave every row marked "not
+            // wrapped", so the walk would emit per-row text while the
+            // formatter joins — the same selection copying differently
+            // depending on scroll position. Defer instead.
+            if byViewportRow.isEmpty { return .unsupported }
             for (vRow, offset) in offsetForViewportRow
             where vRow >= 0 && vRow < byViewportRow.count {
                 wraps[offset] = byViewportRow[vRow]
