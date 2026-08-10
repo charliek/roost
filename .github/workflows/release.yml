@@ -515,6 +515,10 @@ jobs:
           name: sparkle-sign
           path: ${{ runner.temp }}/appcast/sign.txt
           if-no-files-found: error
+          # Artifacts are immutable, so without this a re-run of just the mac
+          # job (e.g. after the release-body step failed) dies on the existing
+          # name instead of recovering.
+          overwrite: true
 
       # Interim only: while the DMG isn't notarized, append the Gatekeeper-bypass
       # instructions to the release body so downloaders see them at the earliest
@@ -579,13 +583,28 @@ jobs:
             exit 1
           fi
 
+          # Read the draft flag into a variable rather than inline in a test.
+          # A standalone assignment DOES propagate a `gh` failure under
+          # `set -e`; the same substitution inside `[ ... ]` does not, and a
+          # transient API error would then read as an empty string. Empty is
+          # not "true", so the old form treated a failed query as "already
+          # published", skipped the publish, and let apt dispatch fire against
+          # a still-draft release — the exact bug this job exists to prevent.
+          is_draft="$(gh release view "${tag}" --json isDraft -q .isDraft)"
+
           # Idempotent: re-running this job against an already-published
           # release is a no-op, not a failure. Publishing twice is harmless,
           # but the asset assertions below would be re-litigating a decision
           # that can no longer be acted on.
-          if [ "$(gh release view "${tag}" --json isDraft -q .isDraft)" != "true" ]; then
+          if [ "${is_draft}" = "false" ]; then
             echo "::notice::Release ${tag} is already published — nothing to do."
             exit 0
+          fi
+          # Anything that is neither "true" nor "false" means the query did
+          # not answer the question. Fail closed.
+          if [ "${is_draft}" != "true" ]; then
+            echo "::error::could not determine whether ${tag} is a draft (got '${is_draft}'). Refusing to publish or to assume it is already published."
+            exit 1
           fi
 
           assets="$(gh release view "${tag}" --json assets \
@@ -593,15 +612,23 @@ jobs:
           echo "assets currently on the ${tag} draft:"
           printf '%s\n' "${assets}"
 
-          # Exactly one of each, non-empty, named for this tag. The `#Display
-          # Label` suffix on the upload steps only sets the Release page's
-          # label — the filename is what apt-charliek globs and what the
-          # appcast's enclosure URL is built from, so that's what we check.
+          # Exactly one of each, plausibly sized, named for this tag, and
+          # NOTHING ELSE. The `#Display Label` suffix on the upload steps only
+          # sets the Release page's label — the filename is what apt-charliek
+          # globs and what the appcast's enclosure URL is built from, so that
+          # is what we check.
+          #
+          # The floor is 1 MiB rather than "non-empty": every one of these is
+          # multi-megabyte, and a truncated upload lands somewhere above zero,
+          # so `> 0` would wave through exactly the corruption worth catching.
+          min_bytes=1048576
           fail=0
-          for expected in \
-            "roost_${deb_ver}_amd64.deb" \
-            "roost_${deb_ver}_arm64.deb" \
-            "Roost-${ver}.dmg"; do
+          # Space-separated, then split by IFS. No heredoc: its terminator has
+          # to sit at column 0, which would end this YAML block scalar. None of
+          # these filenames can contain a space.
+          expected_names="roost_${deb_ver}_amd64.deb roost_${deb_ver}_arm64.deb Roost-${ver}.dmg"
+
+          for expected in ${expected_names}; do
             sizes="$(printf '%s\n' "${assets}" \
               | awk -F'\t' -v e="${expected}" '$1 == e { print $2 }')"
             count="$(printf '%s\n' "${sizes}" | grep -c '^[0-9]' || true)"
@@ -610,11 +637,25 @@ jobs:
               fail=1
               continue
             fi
-            if [ "${sizes}" -eq 0 ]; then
-              echo "::error::asset ${expected} on ${tag} is zero bytes."
+            if [ "${sizes}" -lt "${min_bytes}" ]; then
+              echo "::error::asset ${expected} on ${tag} is only ${sizes} bytes (expected at least ${min_bytes}) — it looks truncated."
               fail=1
             fi
           done
+
+          # Reject anything else on the release. A reused draft from an earlier
+          # attempt can still be carrying an asset from a PREVIOUS version —
+          # apt-charliek globs `roost_*.deb`, so a stale one there is a wrong
+          # package shipped, and the three named checks above would not see it.
+          # shellcheck disable=SC2086  # deliberate split into one name per line
+          unexpected="$(printf '%s\n' "${assets}" | cut -f1 \
+            | grep -vxF "$(printf '%s\n' ${expected_names})" || true)"
+          if [ -n "${unexpected}" ]; then
+            echo "::error::unexpected assets on ${tag} (a stale upload from an earlier attempt?):"
+            printf '::error::  %s\n' ${unexpected}
+            fail=1
+          fi
+
           if [ "${fail}" -ne 0 ]; then
             echo "::error::refusing to publish ${tag}. The draft is untouched — inspect it with 'gh release view ${tag}', then re-run the failed jobs or 'gh release delete ${tag}'."
             exit 1
