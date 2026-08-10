@@ -85,22 +85,21 @@ selection.
 
 ### Trimming
 
-The text written to either clipboard has trailing whitespace stripped
+The text written to either clipboard has trailing **spaces** stripped
 per row (matches Ghostty's `clipboard-trim-trailing-spaces` default
-behavior). Leading/trailing entirely-blank rows are also dropped so
-multi-row selections don't carry stray newlines.
+behavior). Only `U+0020` is stripped — any other whitespace codepoint in
+a cell is content the program deliberately wrote. Entirely-blank trailing
+rows are dropped so a multi-row selection doesn't carry stray newlines;
+leading and interior blank rows are kept, since they are part of what was
+selected.
 
-### Limitation (v1)
-
-If a selection extends beyond the visible viewport (the user drags
-inside the visible area, then scrolls so the selection is partly or
-fully off-screen), copy returns only the still-visible portion. The
-visible highlight rectangle scrolls with the content, so the visual
-contract is correct — but the copied text is what's currently shown,
-not the entirety of the original selection. A future PR will add
-scroll-walk-restore to copy off-screen rows; the bug-fix
-[#146](https://github.com/charliek/roost/pull/146) explicitly leaves
-this as a known limitation.
+A selection that extends beyond the visible viewport copies **in full**,
+including rows scrolled off-screen ([#249](https://github.com/charliek/roost/issues/249)).
+The one thing copy still cannot survive is a row being **evicted** from
+scrollback entirely: selection endpoints are stored as screen
+coordinates, which shift by one for every row the buffer drops off the
+top, so a selection left anchored while a saturated scrollback keeps
+scrolling will drift onto different rows.
 
 ## `clipboard-write`
 
