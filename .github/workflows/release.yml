@@ -12,13 +12,24 @@ name: Release
 #   APPLE_APP_SPECIFIC_PASSWORD. Without them the DMG ships ad-hoc-signed
 #   (Gatekeeper requires right-click → Open).
 #
-# Sparkle auto-update (issue #122): after the DMG is uploaded to the Release,
-#   the mac job EdDSA-signs it with SPARKLE_ED_PRIVATE_KEY, appends an entry
-#   to docs/appcast.xml, and pushes that commit to main as the
+# The Release is created as a DRAFT and stays one until `publish-release`
+#   flips it, after both .debs and the DMG are attached, non-empty and named
+#   for the tag. Publishing up front let two things go wrong: a failed build
+#   left a public, empty release behind, and apt-charliek could consume it —
+#   its collect-debs.sh walks releases newest-first and only *warns* past one
+#   that carries no matching .deb, so it silently republishes the PREVIOUS
+#   version. A draft is invisible to it (GitHub lists drafts only to callers
+#   with push access, which its repo-scoped GITHUB_TOKEN doesn't have).
+#
+# Sparkle auto-update (issue #122): the mac job EdDSA-signs the DMG with
+#   SPARKLE_ED_PRIVATE_KEY and hands sign.txt forward; the `appcast` job then
+#   appends an entry to docs/appcast.xml and pushes that commit to main as the
 #   charliek-release-bot GitHub App. The App is in main's ruleset bypass list
 #   (the only way to push past the ci-success requirement on a bot-authored
 #   commit — see #136 for the GITHUB_TOKEN attempt that failed). docs.yml then
-#   redeploys Pages → appcast live. No manual post-release step.
+#   redeploys Pages → appcast live. No manual post-release step. That job runs
+#   after publish-release because the enclosure URL it writes is a public
+#   /releases/download/ link, which a draft's assets don't answer.
 
 on:
   push:
@@ -110,7 +121,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Create (or reuse) the GitHub Release
+      - name: Create (or reuse) the draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -126,13 +137,26 @@ jobs:
             flag {print}
           ' CHANGELOG.md || true)"
           if gh release view "${tag}" >/dev/null 2>&1; then
-            echo "Release ${tag} already exists — reusing."
+            # Reuse is for the re-run case, where the earlier attempt left a
+            # draft behind. Reusing a PUBLISHED release is not: the build jobs
+            # would `--clobber` new assets straight into something users and
+            # apt-charliek can already see, mid-run. Fail closed and make a
+            # human decide (RELEASING.md covers the recovery).
+            if [ "$(gh release view "${tag}" --json isDraft -q .isDraft)" != "true" ]; then
+              echo "::error::Release ${tag} already exists and is PUBLISHED. Refusing to rebuild into a live release — delete it (gh release delete ${tag}) or cut a new tag."
+              exit 1
+            fi
+            echo "Draft release ${tag} already exists — reusing."
             exit 0
           fi
+          # --draft: no artifacts are attached yet. publish-release flips it.
+          # A draft does NOT create or move a git tag, and `gh release upload
+          # --clobber` works against it (verified empirically before this
+          # change landed), so the build jobs need no other adjustment.
           if [ -n "${notes}" ]; then
-            printf '%s\n' "${notes}" | gh release create "${tag}" --title "${tag}" --notes-file - ${pre}
+            printf '%s\n' "${notes}" | gh release create "${tag}" --draft --title "${tag}" --notes-file - ${pre}
           else
-            gh release create "${tag}" --title "${tag}" --generate-notes ${pre}
+            gh release create "${tag}" --draft --title "${tag}" --generate-notes ${pre}
           fi
 
   linux:
@@ -448,20 +472,14 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" \
             "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg#macOS (.dmg)" --clobber
 
-      # Sparkle appcast publishing (issue #122). EdDSA-sign the just-uploaded
-      # DMG, append a signed <item> to docs/appcast.xml, and push to main as
-      # the charliek-release-bot App (which is in main's ruleset bypass list —
-      # the previous GITHUB_TOKEN attempt was rejected by branch protection;
-      # see #136). The mac job already has the Sparkle SPM artifacts (which
-      # carry sign_update) under mac/.build/artifacts, so no re-bootstrap.
-      - name: Mint release-bot App token
-        id: bot-token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id:      ${{ secrets.RELEASE_BOT_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
-
-      - name: Sign DMG + append appcast entry
+      # Sparkle appcast, part 1 of 2 (issue #122). The signing happens HERE
+      # because this job is the only one holding the Sparkle SPM artifacts
+      # (which carry sign_update) under mac/.build/artifacts — signing
+      # elsewhere would mean re-bootstrapping the whole Swift build. Writing
+      # the appcast is part 2, in the `appcast` job, which can't run until the
+      # Release is published: the enclosure URL is a public
+      # /releases/download/ link and a draft's assets don't answer it.
+      - name: Sign the DMG for Sparkle
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
@@ -473,7 +491,7 @@ jobs:
           fi
           VER="${GITHUB_REF_NAME#v}"
           DMG="mac/build/Roost-${VER}.dmg"
-          test -s "${DMG}" || { echo "::error::${DMG} missing — DMG upload step must run first."; exit 1; }
+          test -s "${DMG}" || { echo "::error::${DMG} missing — the DMG steps must run first."; exit 1; }
           SIGN_UPDATE="$(find mac/.build/artifacts -path '*/bin/sign_update' -type f -not -path '*old_dsa*' | head -1)"
           if [ -z "${SIGN_UPDATE}" ]; then
             echo "::error::sign_update not found under mac/.build/artifacts. Did Bundle Roost.app (which triggers swift build) run?"
@@ -483,17 +501,261 @@ jobs:
           chmod 700 "$W"
           trap 'rm -rf "$W"' EXIT
           printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" | base64 --decode > "${W}/key"
-          "${SIGN_UPDATE}" --ed-key-file "${W}/key" "${DMG}" > "${W}/sign.txt"
+          mkdir -p "${RUNNER_TEMP}/appcast"
+          "${SIGN_UPDATE}" --ed-key-file "${W}/key" "${DMG}" > "${RUNNER_TEMP}/appcast/sign.txt"
           rm -f "${W}/key"
-          cat "${W}/sign.txt"
+          # The whole line is what travels to the appcast job: it carries both
+          # sparkle:edSignature AND length, and update-appcast.py needs both to
+          # build the <enclosure>. Not a secret — both end up in the public feed.
+          cat "${RUNNER_TEMP}/appcast/sign.txt"
 
-          # Switch the workspace from the tagged commit onto main, mutate the
-          # tracked file, commit, push. The mac/build/ artifacts produced earlier
-          # are untracked and survive the checkout. Tag SHA is reachable from
-          # main (tag was cut from main), so the checkout is clean.
-          git fetch origin main
-          git checkout main
-          ROOST_VERSION="${VER}" ROOST_TAG="${GITHUB_REF_NAME}" ROOST_SIGN_FILE="${W}/sign.txt" \
+      - name: Hand sign.txt to the appcast job
+        uses: actions/upload-artifact@v7
+        with:
+          name: sparkle-sign
+          path: ${{ runner.temp }}/appcast/sign.txt
+          if-no-files-found: error
+          # Artifacts are immutable, so without this a re-run of just the mac
+          # job (e.g. after the release-body step failed) dies on the existing
+          # name instead of recovering.
+          overwrite: true
+
+      # Interim only: while the DMG isn't notarized, append the Gatekeeper-bypass
+      # instructions to the release body so downloaders see them at the earliest
+      # touchpoint. Gated on the stapled-ticket check above, so it self-disables
+      # once notarization lands. A sentinel marker keeps re-runs idempotent.
+      - name: Append macOS first-launch note to release body
+        if: steps.dmg_notarized.outputs.value != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          marker="<!-- roost-macos-firstlaunch -->"
+          body="$(gh release view "${tag}" --json body -q .body)"
+          case "${body}" in
+            *"${marker}"*) echo "First-launch note already present — skipping."; exit 0 ;;
+          esac
+          {
+            printf '%s\n\n' "${body}"
+            printf '%s\n' "${marker}"
+            printf '### macOS first launch\n\n'
+            printf 'The macOS DMG is not yet notarized (pending an Apple Developer account), so Gatekeeper blocks the first launch. Clear it once after dragging Roost to Applications:\n\n'
+            printf '```\nxattr -dr com.apple.quarantine /Applications/Roost.app\n```\n\n'
+            printf 'Or, on macOS 15+, use **System Settings → Privacy & Security → Open Anyway**. Full details: [Installation → First launch on macOS](https://github.com/charliek/roost/blob/main/docs/getting-started/installation.md#first-launch-on-macos).\n'
+          } > "${RUNNER_TEMP}/relbody.md"
+          gh release edit "${tag}" --notes-file "${RUNNER_TEMP}/relbody.md"
+
+  # The one irreversible step in the pipeline: everything before it lands on a
+  # draft nobody can see, everything after it consumes a public release. So the
+  # assertions belong HERE, where the fix is still "delete the draft and
+  # re-run" rather than "a broken release is live and apt-charliek already
+  # republished the previous version".
+  #
+  # `needs: [linux, mac]` (and deliberately no `if: always()`) is what makes a
+  # failed build leave the draft unpublished.
+  publish-release:
+    needs: [linux, mac]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Assert the artifact set, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          # nfpm's Debian version: it splits at the FIRST hyphen and rejoins
+          # with `~` (v0.0.18-rc1 -> 0.0.18~rc1), leaving later hyphens alone.
+          # Same substitution the linux job's smoke step makes; a blanket
+          # `tr '-' '~'` would mangle v1.2.3-rc-2.
+          deb_ver="${ver/-/\~}"
+
+          # Explicit existence check first: `gh release view` failing inside a
+          # command substitution wouldn't trip `set -e`, so a missing release
+          # would otherwise read as an empty isDraft and be misreported below
+          # as "already published".
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            echo "::error::no release ${tag} exists — create-release should have left a draft. Nothing to publish."
+            exit 1
+          fi
+
+          # Read the draft flag into a variable rather than inline in a test.
+          # A standalone assignment DOES propagate a `gh` failure under
+          # `set -e`; the same substitution inside `[ ... ]` does not, and a
+          # transient API error would then read as an empty string. Empty is
+          # not "true", so the old form treated a failed query as "already
+          # published", skipped the publish, and let apt dispatch fire against
+          # a still-draft release — the exact bug this job exists to prevent.
+          is_draft="$(gh release view "${tag}" --json isDraft -q .isDraft)"
+
+          # Idempotent: re-running this job against an already-published
+          # release is a no-op, not a failure. Publishing twice is harmless,
+          # but the asset assertions below would be re-litigating a decision
+          # that can no longer be acted on.
+          if [ "${is_draft}" = "false" ]; then
+            echo "::notice::Release ${tag} is already published — nothing to do."
+            exit 0
+          fi
+          # Anything that is neither "true" nor "false" means the query did
+          # not answer the question. Fail closed.
+          if [ "${is_draft}" != "true" ]; then
+            echo "::error::could not determine whether ${tag} is a draft (got '${is_draft}'). Refusing to publish or to assume it is already published."
+            exit 1
+          fi
+
+          assets="$(gh release view "${tag}" --json assets \
+            -q '.assets[] | [.name, (.size|tostring)] | @tsv')"
+          echo "assets currently on the ${tag} draft:"
+          printf '%s\n' "${assets}"
+
+          # Exactly one of each, plausibly sized, named for this tag, and
+          # NOTHING ELSE. The `#Display Label` suffix on the upload steps only
+          # sets the Release page's label — the filename is what apt-charliek
+          # globs and what the appcast's enclosure URL is built from, so that
+          # is what we check.
+          #
+          # The floor is 1 MiB rather than "non-empty": every one of these is
+          # multi-megabyte, and a truncated upload lands somewhere above zero,
+          # so `> 0` would wave through exactly the corruption worth catching.
+          min_bytes=1048576
+          fail=0
+          # Space-separated, then split by IFS. No heredoc: its terminator has
+          # to sit at column 0, which would end this YAML block scalar. None of
+          # these filenames can contain a space.
+          #
+          # GitHub REWRITES asset filenames on upload, replacing anything
+          # outside [A-Za-z0-9._-] with a dot — so the `~` nfpm puts in a
+          # prerelease version does not survive: `roost_0.0.18~rc1_arm64.deb`
+          # is stored as `roost_0.0.18.rc1_arm64.deb`. Verified empirically
+          # against this repo with a throwaway draft. Without this the checks
+          # below report `found 0` for every prerelease AND flag the same
+          # asset as unexpected, so `publish-release` would fail and the draft
+          # would never flip — for exactly the `-rc` tags used to validate the
+          # Sparkle round-trip. Stable tags are unaffected, which is why it
+          # would have hidden until the first prerelease.
+          expected_names=""
+          for raw in "roost_${deb_ver}_amd64.deb" \
+                     "roost_${deb_ver}_arm64.deb" \
+                     "Roost-${ver}.dmg"; do
+            expected_names="${expected_names}${expected_names:+ }$(printf '%s' "${raw}" | tr -c 'A-Za-z0-9._-' '.')"
+          done
+          echo "expected asset names (after GitHub's filename sanitization): ${expected_names}"
+
+          for expected in ${expected_names}; do
+            sizes="$(printf '%s\n' "${assets}" \
+              | awk -F'\t' -v e="${expected}" '$1 == e { print $2 }')"
+            count="$(printf '%s\n' "${sizes}" | grep -c '^[0-9]' || true)"
+            if [ "${count}" -ne 1 ]; then
+              echo "::error::expected exactly one asset named ${expected} on ${tag}, found ${count}."
+              fail=1
+              continue
+            fi
+            if [ "${sizes}" -lt "${min_bytes}" ]; then
+              echo "::error::asset ${expected} on ${tag} is only ${sizes} bytes (expected at least ${min_bytes}) — it looks truncated."
+              fail=1
+            fi
+          done
+
+          # Reject anything else on the release. A reused draft from an earlier
+          # attempt can still be carrying an asset from a PREVIOUS version —
+          # apt-charliek globs `roost_*.deb`, so a stale one there is a wrong
+          # package shipped, and the three named checks above would not see it.
+          unexpected="$(printf '%s\n' "${assets}" | cut -f1 \
+            | grep -vxF "$(printf '%s' "${expected_names}" | tr ' ' '\n')" || true)"
+          if [ -n "${unexpected}" ]; then
+            echo "::error::unexpected assets on ${tag} (a stale upload from an earlier attempt?):"
+            printf '%s\n' "${unexpected}" | sed 's/^/::error::  /'
+            fail=1
+          fi
+
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::refusing to publish ${tag}. The draft is untouched — inspect it with 'gh release view ${tag}', then re-run the failed jobs or 'gh release delete ${tag}'."
+            exit 1
+          fi
+
+          gh release edit "${tag}" --draft=false
+          echo "::notice::Published ${tag} — assets are now publicly downloadable."
+
+  # Sparkle appcast, part 2 of 2 (issue #122). Split out of `mac` (where the
+  # DMG is signed) so it lands strictly after publish-release: the entry it
+  # writes points at https://github.com/<repo>/releases/download/<tag>/<dmg>,
+  # which only resolves once the Release leaves draft. A feed published ahead
+  # of that would point every macOS updater at a 404 until a human noticed.
+  #
+  # Consequence worth naming: this runs AFTER the irreversible publish, so a
+  # failure here leaves a good release with a stale appcast. That's recoverable
+  # (re-run this job) — the reverse order is not.
+  appcast:
+    needs: publish-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Read-only on purpose. The appcast commit is pushed with the release-bot
+    # App token, not GITHUB_TOKEN: main's ruleset requires ci-success, and only
+    # the App is in its bypass list (#136).
+    permissions:
+      contents: read
+    steps:
+      # Commit onto main, not the tagged commit — docs/appcast.xml is served
+      # from main via Pages. fetch-depth: 0 so the push retry below can rebase
+      # if main moves under us.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the Sparkle signature
+        uses: actions/download-artifact@v7
+        with:
+          name: sparkle-sign
+          path: ${{ runner.temp }}/appcast
+
+      - name: Ensure xmllint is available
+        run: |
+          set -euo pipefail
+          command -v xmllint >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y libxml2-utils
+          }
+
+      - name: Mint release-bot App token
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:      ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+
+      # The whole point of the job split, asserted rather than assumed. Sparkle
+      # has no fallback for a dead enclosure: a feed pointing at a 404 breaks
+      # in-app updates for every user until someone notices. Range-GET the
+      # first byte rather than the whole DMG; retry because the release CDN can
+      # lag the publish flip by a few seconds.
+      - name: Verify the published DMG URL resolves
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/Roost-${GITHUB_REF_NAME#v}.dmg"
+          echo "checking ${url}"
+          if ! curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors \
+                 --range 0-0 -o /dev/null "${url}"; then
+            echo "::error::${url} does not resolve — refusing to publish an appcast entry that points at a 404. Confirm the DMG asset is on the published release, then re-run this job."
+            exit 1
+          fi
+
+      - name: Append signed appcast entry
+        run: |
+          set -euo pipefail
+          SIGN_FILE="${RUNNER_TEMP}/appcast/sign.txt"
+          test -s "${SIGN_FILE}" || { echo "::error::${SIGN_FILE} missing or empty — the mac job's signing step should have uploaded it."; exit 1; }
+          # ROOST_REPO must match the URL verified above; the script's default
+          # is charliek/roost, which would silently diverge on a fork.
+          ROOST_VERSION="${GITHUB_REF_NAME#v}" \
+            ROOST_TAG="${GITHUB_REF_NAME}" \
+            ROOST_REPO="${GITHUB_REPOSITORY}" \
+            ROOST_SIGN_FILE="${SIGN_FILE}" \
             python3 mac/scripts/update-appcast.py
           xmllint --noout docs/appcast.xml
 
@@ -554,32 +816,6 @@ jobs:
           echo "::error::push failed after 3 attempts; main moved faster than the retry loop. Re-run the workflow."
           exit 1
 
-      # Interim only: while the DMG isn't notarized, append the Gatekeeper-bypass
-      # instructions to the release body so downloaders see them at the earliest
-      # touchpoint. Gated on the stapled-ticket check above, so it self-disables
-      # once notarization lands. A sentinel marker keeps re-runs idempotent.
-      - name: Append macOS first-launch note to release body
-        if: steps.dmg_notarized.outputs.value != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          marker="<!-- roost-macos-firstlaunch -->"
-          body="$(gh release view "${tag}" --json body -q .body)"
-          case "${body}" in
-            *"${marker}"*) echo "First-launch note already present — skipping."; exit 0 ;;
-          esac
-          {
-            printf '%s\n\n' "${body}"
-            printf '%s\n' "${marker}"
-            printf '### macOS first launch\n\n'
-            printf 'The macOS DMG is not yet notarized (pending an Apple Developer account), so Gatekeeper blocks the first launch. Clear it once after dragging Roost to Applications:\n\n'
-            printf '```\nxattr -dr com.apple.quarantine /Applications/Roost.app\n```\n\n'
-            printf 'Or, on macOS 15+, use **System Settings → Privacy & Security → Open Anyway**. Full details: [Installation → First launch on macOS](https://github.com/charliek/roost/blob/main/docs/getting-started/installation.md#first-launch-on-macos).\n'
-          } > "${RUNNER_TEMP}/relbody.md"
-          gh release edit "${tag}" --notes-file "${RUNNER_TEMP}/relbody.md"
-
   # Notify charliek/apt-charliek to republish its package index. Uses a
   # release-bot App token scoped to the receiver (no per-pipeline PAT). The
   # App must be installed on apt-charliek (it was as of 2026-05-29 — verify
@@ -588,8 +824,17 @@ jobs:
   # Legacy alternative: APT_DISPATCH_TOKEN PAT. To use it instead, drop the
   # mint step and set GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }} on the
   # dispatch step. Roost migrated to the App in this commit.
+  #
+  # `needs: publish-release`, not `needs: linux`: the receiver's collect-debs.sh
+  # walks releases newest-first and only *warns* past one with no matching .deb,
+  # so dispatching against a release the debs aren't visible on republishes the
+  # PREVIOUS version — silently, with a green run on both sides. Its
+  # repo-scoped GITHUB_TOKEN has no push access here and GitHub lists drafts
+  # only to callers that do, so until the flip our release doesn't exist to it.
+  # This also closes the older race where the dispatch could fire while the mac
+  # job was still building the DMG.
   dispatch-apt-charliek:
-    needs: linux
+    needs: publish-release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -25,17 +25,103 @@ That's it. Everything else is automatic.
 2. **`release.yml`** (CI, on tag):
    - `version-check` — tag matches `[workspace.package].version`
    - `ci-gate` — `ci-success` green on tagged commit
-   - `create-release` — extract CHANGELOG section → `gh release create`
+   - `create-release` — extract CHANGELOG section → `gh release create --draft`
    - `linux` (amd64 + arm64 matrix) — build + upload `roost_X.Y.Z_<arch>.deb`
    - `mac` — build + sign + notarize + upload `Roost-X.Y.Z.dmg`, then
-     EdDSA-sign the DMG and bot-push the appcast entry to main (Sparkle
-     auto-update). The mac job's "Append macOS first-launch note" step
-     keeps the Gatekeeper bypass instructions on the Release body while
-     the DMG is not notarized.
+     EdDSA-sign it and hand `sign.txt` forward as a build artifact. The
+     "Append macOS first-launch note" step keeps the Gatekeeper bypass
+     instructions on the Release body while the DMG is not notarized.
+   - **`publish-release`** — asserts the artifact set, then flips the draft
+     public. **This is the only irreversible step in the pipeline.**
+   - `appcast` — append the signed Sparkle entry to `docs/appcast.xml` and
+     bot-push it to main. Runs after publish because the enclosure URL it
+     writes is a public `/releases/download/` link.
    - `dispatch-apt-charliek` — fire a `repository_dispatch` at
      `charliek/apt-charliek` so the .debs land on `apt.stridelabs.ai`.
      Uses a release-bot App token scoped to `apt-charliek` (no
      per-pipeline PAT); the App must be installed on apt-charliek too.
+
+## Draft-until-complete, and how to recover
+
+The Release is created as a **draft** and stays one until `publish-release`
+has seen an amd64 `.deb`, an arm64 `.deb` and a `.dmg` on it — each present
+exactly once, non-empty, and named for the tag.
+
+A draft is invisible on the public releases page and API to anyone without
+push access. That is not cosmetic: apt-charliek authenticates with a
+repo-scoped `GITHUB_TOKEN` that has no push access here, so it cannot see a
+draft at all. Before this, `dispatch-apt-charliek` fired on `needs: linux`
+and apt-charliek's `collect-debs.sh` — which walks releases newest-first and
+only *warns* past one carrying no matching `.deb` — would **silently
+republish the previous version**.
+
+### A build job failed
+
+`linux` or `mac` red → the draft stays a draft. Nothing is public, no apt
+dispatch, no appcast entry. `publish-release` has a plain `needs:` and no
+`if: always()`, so it simply never runs.
+
+    gh release view vX.Y.Z --json isDraft,assets   # inspect
+
+**Re-run** the failed jobs from the Actions UI. `create-release` sees the
+existing draft and reuses it, `gh release upload --clobber` overwrites any
+partial asset, and the `sparkle-sign` artifact upload sets `overwrite: true`
+so a mac re-run does not collide with its own earlier output. The workflow's concurrency group serializes a re-run
+against a still-running original.
+
+**Discard** with `gh release delete vX.Y.Z --yes`. That deletes the release
+only, not the git tag; re-running the workflow recreates the draft from
+scratch.
+
+### `publish-release` failed its assertions
+
+The draft is untouched and the error names the missing, duplicated or empty
+asset. Fix the cause, re-run. The job is idempotent — against an
+already-published release it emits a notice and exits 0.
+
+### Re-running the whole workflow after a successful release
+
+**It will fail at `create-release`, by design.** Reusing a *draft* is the
+re-run case and is allowed; reusing a *published* release is refused, because
+the build jobs would `--clobber` new assets into something users and
+apt-charliek can already see, mid-run.
+
+To re-dispatch apt or rebuild the appcast after a successful publish, re-run
+**those individual jobs**. To genuinely rebuild a published version,
+`gh release delete vX.Y.Z --yes` first, or cut a new tag.
+
+### A post-publication job failed — the cases after the point of no return
+
+The release is already live and correct: users can download it. `appcast` and
+`dispatch-apt-charliek` are **parallel siblings** of `publish-release`, so the
+apt dispatch may have fired, may be running, or may itself have failed —
+check it separately rather than assuming. Only `docs/appcast.xml` is stale, so
+existing macOS installs will not be offered the update until it is fixed.
+**Nothing is broken for new users; in-app updates are simply not offered
+yet.**
+
+`dispatch-apt-charliek` can fail here too, and independently. Its own row in
+the symptom table covers it; the short version is that apt-charliek re-scans
+on its next scheduled run, so a missed dispatch self-heals where a missed
+appcast does not.
+
+For `appcast`: re-run just that job. It re-downloads `sparkle-sign` from the same
+workflow run, and `update-appcast.py` dedupes by version and preserves the
+prior `pubDate`, so re-runs are safe and idempotent. Two failure modes worth
+telling apart:
+
+- **the DMG URL check failed** — the asset is not actually on the published
+  release, so contrary to the paragraph above **this release is not fine**:
+  macOS users have nothing to download. `publish-release` asserts the DMG is
+  present, so reaching this state means it was removed afterward, or the CDN
+  has not caught up. Re-upload the DMG (`gh release upload <tag>
+  Roost-X.Y.Z.dmg --clobber`), confirm the public URL resolves, then re-run.
+- **the push loop exhausted its 3 attempts** — main moved faster than the
+  retry. Just re-run.
+
+Last resort: run `mac/scripts/update-appcast.py` locally and open a normal
+PR. The bot exists only because of main's ruleset, not because the change is
+special.
 
 ## Version files this repo owns
 
@@ -65,7 +151,7 @@ build identity beyond "last released" is needed (e.g. for `roostctl
 |---|---|---|
 | `RELEASE_BOT_APP_ID` | `charliek-release-bot` GitHub App ID (3902108) | required — bot push of signed appcast + apt-charliek dispatch |
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required — same |
-| `SPARKLE_ED_PRIVATE_KEY` | EdDSA signing key for Sparkle appcast, base64-encoded | required for stable releases (a `*-beta`/`*-rc` build skips signing) |
+| `SPARKLE_ED_PRIVATE_KEY` | EdDSA signing key for Sparkle appcast, base64-encoded | **required for every release, prereleases included** — the mac job's signing step fails hard without it. Only the separate *throwaway-key guard* is prerelease-exempt |
 | `APT_DISPATCH_TOKEN` | Legacy PAT — superseded by the release-bot App; can be removed once you're sure the App-based dispatch is working | optional / deprecated |
 | `MACOS_CERTIFICATE_P12_BASE64` + `MACOS_CERTIFICATE_PASSWORD` + `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD` + `ROOST_DEVELOPER_ID_IDENTITY` | Mac code-signing + notarization | **set** (2026-06-28; #83 closed) — DMG is Developer ID signed + notarized. All six are gated together as `CAN_NOTARIZE` (all-or-nothing); any one unset → ad-hoc-signed DMG with the Gatekeeper-bypass note |
 
@@ -80,7 +166,7 @@ new machine; source `apple.env` for a local notarized build.
 `required_status_checks=['ci-success']`. Two bypass actors:
 
 - `charliek-release-bot` (App id `3902108`, type `Integration`) — lets the
-  bot push the appcast commit after the mac job builds + signs the DMG
+  bot push the appcast commit from the `appcast` job
 - Admin role (id `5`, type `RepositoryRole`) — lets `/release-workflows:release`'s
   push of the changelog + version commits + tag land before `ci-success`
   exists on those new commits
@@ -91,12 +177,12 @@ Inspect or edit at https://github.com/charliek/roost/rules.
 
 The Sparkle appcast is at `docs/appcast.xml`, served by GitHub Pages from
 `https://charliek.github.io/roost/appcast.xml` via `docs.yml`'s mkdocs
-deploy. The mac job's appcast steps mutate that file in place, commit it
-as the release-bot, and push to main; `docs.yml` redeploys Pages
-shortly after.
+deploy. The `appcast` job mutates that file in place, commits it as the
+release-bot, and pushes to main; `docs.yml` redeploys Pages shortly after.
 
 The appcast updater script is `mac/scripts/update-appcast.py`. It reads
-`ROOST_VERSION`, `ROOST_TAG`, and `ROOST_SIGN_FILE` from the environment
+`ROOST_VERSION`, `ROOST_TAG`, `ROOST_REPO`, and `ROOST_SIGN_FILE` from the
+environment
 (the sign output of Sparkle's `sign_update`), dedupes by version, and
 preserves the existing `pubDate` if re-running against an unchanged version
 (so workflow re-runs produce a byte-empty diff and the "nothing to push"
@@ -110,8 +196,14 @@ guard fires correctly).
 | `scripts/release/update-version.sh` not found | Convention not adopted | Run `/release-workflows:setup` |
 | `update-version.sh` aborts: "Cargo.toml's version did not update" | Someone reformatted `[workspace.package]` away from the column-aligned style this script expects | Either restore the alignment, or change the sed replacement in `scripts/release/update-version.sh` to vanilla single-space style |
 | Tag pushed, `version-check` fails | Tagged a commit that didn't run `update-version.sh` | Re-bump locally + cut a fresh patch tag (don't force-update an existing tag) |
-| `mac` job fails at "Sign DMG + append appcast entry" with `SPARKLE_ED_PRIVATE_KEY secret is unset` | Stable release without the signing secret | Set the secret; re-run the mac job, OR cut the release as `vX.Y.Z-beta1` (the throwaway-key guard at the top of the mac job only enforces the real key for stable tags) |
-| `mac` job fails at "Push signed appcast" with `protected branch hook declined` | App removed from ruleset bypass | Re-add `{ actor_id: 3902108, actor_type: "Integration" }` to `main-protection`'s `bypass_actors` |
+| `mac` job fails at "Sign the DMG for Sparkle" with `SPARKLE_ED_PRIVATE_KEY secret is unset` | The signing secret is not set | Set the secret and re-run the mac job. Cutting a prerelease does **not** help — signing is unconditional; only the separate throwaway-*key* guard is prerelease-exempt |
+| `appcast` job fails at "Push signed appcast" with `protected branch hook declined` | App removed from ruleset bypass | Re-add `{ actor_id: 3902108, actor_type: "Integration" }` to `main-protection`'s `bypass_actors` |
+| `create-release` fails: "already exists and is PUBLISHED" | Re-running the whole workflow for a tag that already shipped | Deliberate (fail-closed). Re-run the individual job you need, or `gh release delete vX.Y.Z --yes` to rebuild from scratch |
+| `publish-release` fails: "expected exactly one asset named …" | A build job uploaded nothing, or uploaded the same name twice | The draft is untouched. Inspect with `gh release view vX.Y.Z --json assets`, fix, re-run |
+| `publish-release` fails: "unexpected assets on vX.Y.Z" | A reused draft still carries an asset from an earlier attempt or an older version | Delete the stale asset (`gh release delete-asset vX.Y.Z <name>`) and re-run. This matters: apt-charliek globs `roost_*.deb`, so a stale one would ship |
+| `publish-release` fails: "… looks truncated" | An upload was interrupted | Re-run the job that produced it; `--clobber` overwrites |
+| `appcast` fails: "does not resolve — refusing to publish an appcast entry that points at a 404" | The DMG is not on the published release | Re-upload it (`gh release upload vX.Y.Z Roost-X.Y.Z.dmg --clobber`), confirm the public URL resolves, then re-run just the `appcast` job. Re-running `appcast` alone cannot fix a missing asset — and until it is back, macOS users have nothing to download |
+| Release is stuck as a draft | `publish-release` never ran or never passed | See [Draft-until-complete](#draft-until-complete-and-how-to-recover) |
 | Appcast not visible at `https://charliek.github.io/roost/appcast.xml` after a release | `docs.yml` didn't redeploy | Check `docs.yml`'s most recent run; re-trigger via Actions UI if needed |
 | `dispatch-apt-charliek` shows a warning about missing token | `RELEASE_BOT_APP_ID` unset OR the App is not installed on `charliek/apt-charliek` | Confirm via `sanity-check-app.yml`'s "Token can reach charliek/apt-charliek" block; if missing, install the App on apt-charliek. Otherwise wait for apt-charliek's next scheduled re-scan (it picks up new .debs automatically) |
 | v0.0.5 incident: mac job failed at appcast step because `Cargo.lock` drifted during the build | `/release:release` didn't bump `Cargo.lock` (legacy plugin); the staged-set assertion in the bot push step caught the drift | Now solved: `/release-workflows:release` runs `update-version.sh` which always regenerates `Cargo.lock`. |
@@ -128,9 +220,13 @@ in the framework repo. It defines the contract every file in this repo's
   releases" step is a transitional safety net from the Sparkle 2 spike
   (issue #122). It only fires on stable tags; prereleases bypass it
   intentionally so the throwaway-key path can be tested.
-- The Sparkle appcast steps live INSIDE the mac job (not as a separate
-  `appcast` job). The framework's job-sparkle-appcast template assumes a
-  cross-job sign_update binary; roost keeps it inline because the mac job
-  has the SwiftPM artifacts already and a separate job would need to
-  rebuild or cross-job-cache them. Trade-off: a failure in just the
-  appcast step requires re-running the whole mac job (~5 min).
+- Sparkle appcast publishing is **split across two jobs**. Signing stays in
+  `mac` — it is the only job holding the SwiftPM artifacts that carry
+  `sign_update`, and a separate job would have to rebuild or cross-job-cache
+  them. Writing the feed lives in `appcast`, which cannot run until the
+  Release is published, because the enclosure URL is a public
+  `/releases/download/` link that a draft's assets do not answer. The whole
+  `sign.txt` travels between them as a build artifact: it carries both
+  `sparkle:edSignature` and `length`, and the updater needs both. Upside over
+  the old inline arrangement: an appcast failure now costs a ~1-minute job
+  re-run instead of the whole ~5-minute mac job.
