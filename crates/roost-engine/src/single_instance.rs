@@ -182,6 +182,54 @@ mod tests {
         assert!(second.lock_path().exists());
     }
 
+    // flock(2) locks live on the *open file description*, not on the fd
+    // or the process. A fork()ed child inherits a duplicate of the lock
+    // fd and keeps that description — and therefore the lock — alive
+    // until the fd closes. `File`'s drop only calls close(2), so if a
+    // sibling test in this same binary forks while we hold the lock
+    // (`git_metrics` and `process` both exec subprocesses), our drop
+    // does NOT release the flock and the next acquire() sees WouldBlock
+    // -> AlreadyHeld(our own pid). That is the #324 flake, made
+    // deterministic here by clearing FD_CLOEXEC so the child provably
+    // keeps the description open past exec.
+    #[test]
+    #[ignore = "reproduces #324: Drop closes the fd but never flock(LOCK_UN)s, so an \
+                inherited fd keeps the lock alive. Un-ignored by the fix commit."]
+    fn drop_releases_even_when_a_forked_child_inherited_the_fd() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roost.lock");
+        let lock = acquire(&path).unwrap();
+
+        // SAFETY: plain fcntl on an fd we own; clearing FD_CLOEXEC is
+        // what makes the child inherit the lock's open file description.
+        let cleared = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_SETFD, 0) };
+        assert_eq!(cleared, 0, "failed to clear FD_CLOEXEC on the lock fd");
+
+        // Reaped on every exit path: a panic between here and the
+        // assertions would otherwise leave the child holding the
+        // inherited description for the rest of its 30s sleep.
+        struct ReapOnDrop(std::process::Child);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _child = ReapOnDrop(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn /bin/sleep"),
+        );
+
+        drop(lock);
+
+        match acquire(&path) {
+            Ok(second) => assert!(second.lock_path().exists()),
+            Err(err) => panic!("drop must release the flock even with an inherited fd: {err:?}"),
+        }
+    }
+
     #[test]
     fn release_unlinks_the_lock_file() {
         let dir = tempdir().unwrap();
