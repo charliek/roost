@@ -104,6 +104,40 @@ pub struct Style {
     pub inverse: bool,
 }
 
+/// How a cell participates in double-width text. Mirrors
+/// `GhosttyCellWide`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CellWide {
+    #[default]
+    Narrow,
+    /// Carries a double-width grapheme; the next column is its
+    /// [`CellWide::SpacerTail`].
+    Wide,
+    /// Placeholder occupying the second column of a wide grapheme.
+    SpacerTail,
+    /// Placeholder at the end of a row where a wide grapheme did not
+    /// fit and wrapped to the next row.
+    SpacerHead,
+}
+
+impl CellWide {
+    fn from_raw(raw: sys::GhosttyCellWide) -> Self {
+        match raw {
+            sys::GhosttyCellWide_GHOSTTY_CELL_WIDE_WIDE => Self::Wide,
+            sys::GhosttyCellWide_GHOSTTY_CELL_WIDE_SPACER_TAIL => Self::SpacerTail,
+            sys::GhosttyCellWide_GHOSTTY_CELL_WIDE_SPACER_HEAD => Self::SpacerHead,
+            _ => Self::Narrow,
+        }
+    }
+
+    /// True for the placeholder cells that carry no text of their own.
+    /// Text extraction skips them so a wide grapheme contributes one
+    /// grapheme, not a grapheme plus a phantom space.
+    pub fn is_spacer(self) -> bool {
+        matches!(self, Self::SpacerTail | Self::SpacerHead)
+    }
+}
+
 /// Per-cell data the renderer needs. Background / foreground are
 /// `Option` because cells often inherit the terminal default (None →
 /// renderer paints with `Colors::foreground` / `Colors::background`).
@@ -120,6 +154,8 @@ pub struct Cell {
     /// SGR style bits (bold / italic / inverse). Default-style cells
     /// carry `Style::default()` — all bits clear.
     pub style: Style,
+    /// Double-width role. Spacers are textless placeholders, not blanks.
+    pub wide: CellWide,
 }
 
 /// Global dirty state after `update`. Maps `GhosttyRenderStateDirty`.
@@ -577,7 +613,43 @@ impl RenderState {
             fg,
             text,
             style,
+            wide: self.read_cells_wide(),
         }
+    }
+
+    /// Double-width role of the cell the row-cells iterator is on.
+    /// Read from the raw cell value rather than inferred from the
+    /// grapheme's display width, so it can never disagree with the
+    /// engine's own width table. Anything unreadable falls back to
+    /// `Narrow`, which keeps the cell's text.
+    fn read_cells_wide(&self) -> CellWide {
+        let mut raw: sys::GhosttyCell = 0;
+        // SAFETY: row_cells handle non-null; `raw` is a real local
+        // matching the RAW datum's type.
+        let rc = unsafe {
+            sys::ghostty_render_state_row_cells_get(
+                self.row_cells,
+                sys::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+                (&mut raw) as *mut sys::GhosttyCell as *mut _,
+            )
+        };
+        if Error::from_result(rc).is_err() {
+            return CellWide::Narrow;
+        }
+        let mut wide: sys::GhosttyCellWide = 0;
+        // SAFETY: `raw` is the cell value libghostty just handed back;
+        // `wide` is a real local matching the WIDE datum's type.
+        let rc = unsafe {
+            sys::ghostty_cell_get(
+                raw,
+                sys::GhosttyCellData_GHOSTTY_CELL_DATA_WIDE,
+                (&mut wide) as *mut sys::GhosttyCellWide as *mut _,
+            )
+        };
+        if Error::from_result(rc).is_err() {
+            return CellWide::Narrow;
+        }
+        CellWide::from_raw(wide)
     }
 
     fn read_u32(&self, data: sys::GhosttyRenderStateData) -> Result<u32> {

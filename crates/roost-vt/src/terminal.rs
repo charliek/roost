@@ -90,10 +90,13 @@ pub enum PointTag {
     /// Visible viewport. 0 = top of what's currently on screen;
     /// changes as the user scrolls.
     Viewport,
-    /// Full screen including scrollback. 0 = top of scrollback. Rows
-    /// here are stable as long as the row has not aged out of the
-    /// scrollback buffer, which makes this the recommended coordinate
-    /// space for storing long-lived selection endpoints.
+    /// Full screen including scrollback. 0 = top of scrollback, so a
+    /// screen row is stable only while nothing has been evicted from the
+    /// top: once `max_scrollback` saturates, every evicted row shifts all
+    /// stored screen coordinates down by one relative to the content they
+    /// named. Still the best space available for long-lived selection
+    /// endpoints — libghostty's tracked pins would fix the drift, but the
+    /// C API does not export them.
     Screen,
     /// Scrollback history only — the area above the active region.
     /// 0 = top of scrollback.
@@ -168,11 +171,22 @@ impl Point {
 /// For long-lived position tracking (e.g. selection state), do not
 /// store `GridRef` directly. Convert to a [`Point`] with
 /// [`PointTag::Screen`] via [`Terminal::convert_point`] and store
-/// that — screen coordinates remain stable until the row ages out of
-/// scrollback.
+/// that — see [`PointTag::Screen`] for how far that stability actually
+/// goes (it ends when scrollback saturates and rows start being
+/// evicted).
 #[cfg(feature = "ffi")]
 #[derive(Debug, Clone, Copy)]
 pub struct GridRef(sys::GhosttyGridRef);
+
+#[cfg(feature = "ffi")]
+impl GridRef {
+    /// Raw pin, for in-crate wrappers that hand it straight back to
+    /// libghostty (see `formatter::selection_text`). Same transience
+    /// contract as the type itself.
+    pub(crate) fn as_sys(&self) -> sys::GhosttyGridRef {
+        self.0
+    }
+}
 
 pub struct Terminal {
     handle: sys::GhosttyTerminal,

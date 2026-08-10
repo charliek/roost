@@ -3285,6 +3285,7 @@ mod tests {
             bg,
             text: String::new(),
             style,
+            wide: roost_vt::CellWide::Narrow,
         }
     }
 

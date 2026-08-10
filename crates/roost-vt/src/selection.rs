@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{Point, PointTag, RenderState, Result, Terminal};
+use crate::formatter;
+use crate::{CellWide, Point, PointTag, RenderState, Result, Terminal};
 
 /// A terminal row rendered as exact grapheme text plus reversible mappings
 /// between Unicode scalar indices and terminal cell columns.
@@ -277,7 +278,56 @@ impl TerminalSelection {
         Ok(RowTextProjection::from_cells(cols, cells))
     }
 
+    /// Text covered by the selection, or `None` if nothing is selected.
+    ///
+    /// A selection entirely inside the viewport is read from the render
+    /// state; anything reaching into scrollback goes through libghostty's
+    /// formatter, which is the only API that can see rows the viewport
+    /// does not show.
     pub fn selected_text(
+        &self,
+        terminal: &Terminal,
+        render_state: &mut RenderState,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Option<String>> {
+        let Some(selection) = self.active.filter(|selection| selection.is_visible()) else {
+            return Ok(None);
+        };
+        let (_, start_y, _, end_y) = selection.normalized();
+        if end_y == start_y {
+            return Ok(None);
+        }
+        // The viewport is a contiguous window over screen rows, so both
+        // edges being visible means every row between them is too.
+        let fully_visible = viewport_row(terminal, start_y, rows).is_some()
+            && viewport_row(terminal, end_y.saturating_sub(1), rows).is_some();
+        if fully_visible {
+            return self.viewport_text(terminal, render_state, cols, rows);
+        }
+
+        // Raw anchor/cursor cells: the formatter's range is inclusive on
+        // both ends, unlike `normalized`'s half-open one, and it orders
+        // reversed endpoints itself. Columns are clamped because a column
+        // equal to `cols` has no cell to pin and libghostty would reject
+        // the whole selection — `set` accepts IPC-supplied coordinates
+        // without validating the column.
+        let last_col = cols.saturating_sub(1);
+        let text = formatter::selection_text(
+            terminal,
+            Point::screen(
+                selection.anchor_col.min(last_col),
+                selection.anchor_screen_y,
+            ),
+            Point::screen(
+                selection.cursor_col.min(last_col),
+                selection.cursor_screen_y,
+            ),
+        )?;
+        Ok(text.filter(|text| !text.is_empty()))
+    }
+
+    fn viewport_text(
         &self,
         terminal: &Terminal,
         render_state: &mut RenderState,
@@ -302,35 +352,92 @@ impl TerminalSelection {
             return Ok(None);
         }
 
-        let mut lines = vec![String::new(); total];
+        let mut lines = vec![SelectedRow::default(); total];
+        // Text of the cell just before a row's first selected column,
+        // kept so a selection starting on a wide grapheme's spacer can
+        // reach back and pick the grapheme up — libghostty's formatter
+        // applies the same rule to its start column.
+        let mut preceding = String::new();
         render_state.update(terminal)?;
         render_state.walk(terminal, |row, cell| {
             let Some(&offset) = visible.get(&row) else {
                 return;
             };
             let (col0, col1) = column_range(offset, total, start_col, end_col, cols);
+            if cell.col.saturating_add(1) == col0 {
+                preceding.clear();
+                preceding.push_str(&cell.text);
+            }
             if cell.col < col0 || cell.col >= col1 {
                 return;
             }
+            // Spacers are placeholders for a wide grapheme, not blank
+            // cells: emitting anything for them would double-space every
+            // wide character.
+            if cell.wide.is_spacer() {
+                if cell.col != col0 {
+                    return;
+                }
+                match cell.wide {
+                    // The grapheme lives one column back, inside the
+                    // selection's intent even though its cell is not.
+                    CellWide::SpacerTail if !preceding.is_empty() => {
+                        lines[offset].text.push_str(&preceding);
+                        lines[offset].has_text = true;
+                    }
+                    // A grapheme that did not fit wrapped to the next
+                    // row, leaving nothing here to select.
+                    CellWide::SpacerHead => lines[offset].skipped = true,
+                    _ => {}
+                }
+                return;
+            }
             if cell.text.is_empty() {
-                lines[offset].push(' ');
+                lines[offset].text.push(' ');
             } else {
-                lines[offset].push_str(&cell.text);
+                lines[offset].text.push_str(&cell.text);
+                lines[offset].has_text = true;
             }
         })?;
 
-        let mut lines: Vec<String> = lines
-            .into_iter()
-            .map(|line| line.trim_end().to_string())
-            .collect();
-        while matches!(lines.first(), Some(line) if line.is_empty()) {
-            lines.remove(0);
+        // Same shape as libghostty's formatter so the two paths cannot
+        // disagree: rows with no text at all are held back as pending
+        // newlines and only flushed once a later row has text, which
+        // preserves leading and interior blanks while dropping trailing
+        // ones. A row whose only text is spaces counts as having text —
+        // it trims to nothing but still ends a line.
+        let mut out = String::new();
+        let mut pending_newlines = 0_usize;
+        for line in lines {
+            if line.skipped {
+                continue;
+            }
+            if !line.has_text {
+                pending_newlines += 1;
+                continue;
+            }
+            for _ in 0..pending_newlines {
+                out.push('\n');
+            }
+            pending_newlines = 1;
+            // Only 0x20 is trimmed — the formatter leaves every other
+            // whitespace codepoint alone.
+            out.push_str(line.text.trim_end_matches(' '));
         }
-        while matches!(lines.last(), Some(line) if line.is_empty()) {
-            lines.pop();
-        }
-        Ok((!lines.is_empty()).then(|| lines.join("\n")))
+        Ok((!out.is_empty()).then_some(out))
     }
+}
+
+/// One row of a selection while it is being assembled from the viewport.
+#[derive(Debug, Default, Clone)]
+struct SelectedRow {
+    text: String,
+    /// True once a cell with actual content lands in the row — a space
+    /// counts, an empty cell does not.
+    has_text: bool,
+    /// The row starts on a wrapped grapheme's placeholder, so it
+    /// contributes nothing at all — not even a line break.
+    skipped: bool,
 }
 
 fn screen_y(terminal: &Terminal, viewport_row: u16) -> Option<u32> {
