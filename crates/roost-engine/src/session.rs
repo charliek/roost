@@ -89,6 +89,9 @@ impl TabSession {
                             break;
                         }
                     }
+                    // Stopping here is safe: the supervisor's reader
+                    // task publishes `Exit` after the last bytes it
+                    // read, so nothing is left behind (#255).
                     Ok(PtyOutputEvent::Exit(status)) => {
                         let _ = output_tx.send(TabOutput::Exit {
                             status,
@@ -96,6 +99,13 @@ impl TabSession {
                         });
                         break;
                     }
+                    // The other way a tab's output can be truncated,
+                    // independent of the #255 ordering fix: this drain
+                    // fell far enough behind that the broadcast
+                    // dropped `n` messages. Out of scope there —
+                    // fixing it means resizing or redesigning the
+                    // channel (see `PTY_OUTPUT_BROADCAST_CAPACITY`).
+                    // Surfaced rather than swallowed.
                     Err(RecvError::Lagged(n)) => {
                         let _ = output_tx.send(TabOutput::Error(format!(
                             "broadcast lagged: dropped {n} message(s)"

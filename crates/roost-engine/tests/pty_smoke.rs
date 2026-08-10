@@ -8,33 +8,29 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::sleep;
 
-/// Drain a tab's output channel until the sending side closes, returning
-/// everything the PTY produced plus the exit status.
+/// Drain a tab's output channel until the PTY reports `Exit`, returning
+/// everything it produced plus the exit status.
 ///
-/// `Exit` does NOT mean "no more bytes". It is published by the reap task the
-/// moment `child.wait()` returns, while the reader task may still be draining
-/// the PTY — two independent producers on one broadcast channel, so their
-/// relative order is not guaranteed. A loop that breaks on `Exit` therefore
-/// truncates the capture at whatever the reader happened to have flushed.
-/// That is invisible on a dev box, where a short command's output arrives in
-/// one read, and reproducible on CI, where the runner's `env` spans many
-/// chunks and the capture stopped mid-variable at `CARGO_PKG_DESCRIPTION`.
+/// `Exit` means "no more bytes": the reader task publishes it after the last
+/// `Bytes` it read, so a single producer puts them on the channel in that
+/// order and a broadcast receiver hands them out in the order they were sent
+/// (#255). Stopping here therefore captures everything. That used to be
+/// false — the reap task published `Exit` the moment `child.wait()` returned,
+/// racing the reader — which was invisible on a dev box, where a short
+/// command's output arrives in one read, and reproducible on CI, where the
+/// runner's `env` spans many chunks and the capture stopped mid-variable at
+/// `CARGO_PKG_DESCRIPTION`.
 ///
-/// `Closed` is the ideal ending: broadcast hands out every buffered message
-/// before reporting it, so it means "the PTY is finished and everything it
-/// produced has been handed over". But it depends on the reader task's
-/// blocking `read` unblocking and dropping its sender clone, which is not
-/// bounded by any wall-clock guarantee — requiring it within a fixed budget
-/// turned this into a CI flake (5s was enough locally, in a shed VM, and on
-/// the PR run, then wasn't on a loaded GitHub runner).
+/// The exception is `pty.rs`'s bounded fallback: a reader that never reaches
+/// EOF (a background descendant can hold the slave fd open indefinitely) has
+/// `Exit` published for it on a deadline, and bytes can still follow. Nothing
+/// here spawns such a descendant; `pty_exit_order_test.rs` covers that case.
 ///
-/// So the budget expiring returns what was collected rather than failing here,
-/// and correctness rests on the callers instead: each asserts BOTH the exit
-/// status and the expected content. A truncated capture fails those assertions
-/// — which is what caught the original `Exit`-races-`Bytes` bug — and a run
-/// that never saw `Exit` fails on `exit_status`. That keeps the guarantee
-/// without betting on teardown timing.
-async fn collect_until_closed(
+/// The budget expiring returns what was collected rather than failing here,
+/// so correctness still rests on the callers: each asserts BOTH the exit
+/// status and the expected content. A run that never saw `Exit` fails on
+/// `exit_status`, and a truncated capture fails the content assertion.
+async fn collect_until_exit(
     output: &mut broadcast::Receiver<PtyOutputEvent>,
     budget: Duration,
 ) -> (Vec<u8>, Option<i32>) {
@@ -42,7 +38,7 @@ async fn collect_until_closed(
     let mut collected = Vec::new();
     let mut exit_status = None;
 
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && exit_status.is_none() {
         match output.try_recv() {
             Ok(PtyOutputEvent::Bytes(bytes)) => collected.extend_from_slice(&bytes),
             Ok(PtyOutputEvent::Exit(status)) => exit_status = Some(status),
@@ -77,10 +73,10 @@ async fn pty_echo_emits_bytes_and_exit() {
         )
         .expect("spawn");
 
-    let (collected, exit_status) = collect_until_closed(&mut output, Duration::from_secs(5)).await;
+    let (collected, exit_status) = collect_until_exit(&mut output, Duration::from_secs(5)).await;
     // Assert on the actual payload, not just "some bytes arrived": the helper
-    // stops on a budget rather than insisting the channel closes, so content
-    // is what proves nothing was truncated.
+    // gives up on a budget as well as on `Exit`, so content is what proves
+    // nothing was truncated.
     let text = String::from_utf8_lossy(&collected);
     assert!(
         text.contains("hi"),
@@ -118,7 +114,7 @@ async fn pty_injects_roost_env_vars() {
         .spawn(99, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
         .expect("spawn");
 
-    let (collected, exit_status) = collect_until_closed(&mut output, Duration::from_secs(5)).await;
+    let (collected, exit_status) = collect_until_exit(&mut output, Duration::from_secs(5)).await;
     assert_eq!(exit_status, Some(0), "expected clean exit");
     let text = String::from_utf8_lossy(&collected);
     assert!(

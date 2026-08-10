@@ -27,6 +27,16 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, warn};
 
+/// Depth of a tab's output fan-out. A consumer that falls this far
+/// behind gets `RecvError::Lagged` and the skipped bytes are gone for
+/// good — a *second*, independent way a tab's output can be truncated,
+/// unrelated to the exit ordering fixed in #255 (that one is about
+/// ordering, this one about capacity). Deliberately left alone:
+/// closing it means resizing or redesigning the channel, and the only
+/// production consumer (`session.rs`) forwards straight onto an
+/// unbounded mpsc, so it can only lag if the UI's drain stalls. When it
+/// does, `session.rs` reports it as `TabOutput::Error` rather than
+/// silently swallowing it.
 const PTY_OUTPUT_BROADCAST_CAPACITY: usize = 256;
 const PTY_INPUT_CHANNEL_CAPACITY: usize = 64;
 const PTY_OUTPUT_CHUNK_SIZE: usize = 4096;
@@ -34,6 +44,12 @@ const PTY_OUTPUT_CHUNK_SIZE: usize = 4096;
 /// Matches the Mac side's 20×10ms teardown window in
 /// `PtySupervisor.swift`.
 const KILL_GRACE: Duration = Duration::from_millis(200);
+/// How long each side of the exit handshake waits on the other before
+/// publishing `Exit` itself (#255). Long enough that the normal path —
+/// the reader hitting EOF within microseconds of the child being
+/// reaped — always wins; short enough that a tab whose reader never
+/// EOFs still reports its exit promptly.
+const EXIT_PUBLISH_GRACE: Duration = Duration::from_millis(250);
 
 /// What a subscriber gets back from `PtySupervisor::subscribe`.
 #[derive(Debug, Clone)]
@@ -44,7 +60,12 @@ pub enum PtyOutputEvent {
     /// per-frame chunks are small and the broadcast clone is cheap
     /// enough at the workloads roost runs).
     Bytes(Vec<u8>),
-    /// PTY child exited with this status.
+    /// PTY child exited with this status. Published by the reader task
+    /// after the last `Bytes` it read, so a consumer that stops here
+    /// has the tab's complete output (#255). The one exception is the
+    /// bounded fallback described on `PtySupervisor::spawn`: a reader
+    /// that never reaches EOF gets `Exit` published out from under it
+    /// on a deadline.
     Exit(i32),
 }
 
@@ -179,6 +200,21 @@ impl PtySupervisor {
     /// into the child as `ROOST_SOCKET` so `roostctl` invoked from
     /// inside the tab dials the right UI.
     ///
+    /// Exit ordering (#255): the reader task publishes `Exit`, after
+    /// the last `Bytes` it read. One producer makes "every byte, then
+    /// the exit" structural instead of a race between the reader and
+    /// the reap task — the shape that used to drop a shell's final
+    /// output. The reap task hands the status over and then waits for
+    /// the reader to finish, but only for `EXIT_PUBLISH_GRACE`: a
+    /// reader can legitimately never reach EOF (a background
+    /// descendant holding the slave fd keeps the master readable
+    /// forever), and an unbounded wait would mean the tab never
+    /// reports its exit. Past the deadline the reap task publishes
+    /// `Exit` itself, and bytes may still follow it — the one
+    /// documented exception to the ordering guarantee. Whichever side
+    /// gets there first, `publish_exit_once` makes it exactly one
+    /// `Exit`.
+    ///
     /// Errors:
     /// * [`PtyError::DuplicateTab`] — `tab_id` already has a live
     ///   session. Caller must `close()` the prior session first.
@@ -293,10 +329,40 @@ impl PtySupervisor {
 
         let master = pair.master;
 
-        // Reader: blocking read off the master fd, push to broadcast.
+        // The two halves of the exit handshake (#255). `status_*`
+        // carries the reaped status to the reader so it can publish
+        // `Exit` after its final `Bytes`; `reader_alive_*` carries
+        // nothing — the reap task's wait ends on the reader task
+        // dropping its sender, which is precisely "the reader is
+        // done". `exit_published` keeps the two sides to one `Exit`.
+        let (status_tx, status_rx) = std::sync::mpsc::channel::<i32>();
+        let (reader_alive_tx, reader_alive_rx) = std::sync::mpsc::channel::<()>();
+        let exit_published = Arc::new(AtomicBool::new(false));
+
+        // Reader: blocking read off the master fd, push to broadcast,
+        // then publish the exit.
         tokio::task::spawn_blocking({
             let output_tx = output_tx.clone();
-            move || pty_reader_loop(reader_handle, &output_tx, tab_id)
+            let exit_published = exit_published.clone();
+            move || {
+                let _reader_alive = reader_alive_tx;
+                pty_reader_loop(reader_handle, &output_tx, tab_id);
+                // EOF: everything the PTY produced is on the channel,
+                // so `Exit` published from here can only follow it.
+                // The status normally lands within microseconds (the
+                // reap task's `waitpid` is already blocked when the
+                // child dies); if it doesn't, the reap task publishes
+                // once it does, still after this EOF.
+                match status_rx.recv_timeout(EXIT_PUBLISH_GRACE) {
+                    Ok(status) => {
+                        publish_exit_once(&output_tx, &exit_published, status);
+                    }
+                    Err(_) => debug!(
+                        tab_id,
+                        "pty reader finished before the child was reaped; reap task publishes Exit"
+                    ),
+                }
+            }
         });
 
         // Writer + resizer: a single ordered loop over the unified
@@ -323,13 +389,15 @@ impl PtySupervisor {
             debug!(tab_id, "pty input loop ended");
         });
 
-        // Wait for the child to exit; forward the exit status onto
-        // the output channel AND the lifecycle channel so both
-        // per-tab consumers and the workspace converge.
+        // Wait for the child to exit; hand the status to the reader
+        // task (which publishes it onto the output channel) and send
+        // it on the lifecycle channel so both per-tab consumers and
+        // the workspace converge.
         let output_tx_exit = output_tx.clone();
         let lifecycle_tx = self.lifecycle.clone();
         let sessions_for_reap = self.sessions.clone();
         let reaped_for_wait = reaped.clone();
+        let exit_published_for_wait = exit_published.clone();
         tokio::task::spawn_blocking(move || {
             let status = match child.wait() {
                 Ok(status) => status.exit_code() as i32,
@@ -339,24 +407,39 @@ impl PtySupervisor {
                 }
             };
             // Mark reaped first so a concurrent `close()` SIGKILL
-            // watchdog stands down, then publish exit and drop the
-            // dead session so later writes get `NotFound` instead of
-            // silently succeeding against a closed PTY.
+            // watchdog stands down, then hand the status to the reader
+            // and drop the dead session so later writes get `NotFound`
+            // instead of silently succeeding against a closed PTY.
             reaped_for_wait.store(true, Ordering::SeqCst);
-            let _ = output_tx_exit.send(PtyOutputEvent::Exit(status));
+            let _ = status_tx.send(status);
             let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status });
-            // Only remove the session if THIS waiter still owns it.
-            // `close()` frees the slot synchronously, so the same
-            // tab_id can be re-spawned before a stale waiter fires;
-            // matching the per-spawn `reaped` identity prevents
-            // evicting a newer live session (#80).
-            let mut sessions = sessions_for_reap.lock().unwrap();
-            let owns = sessions
-                .get(&tab_id)
-                .map(|s| Arc::ptr_eq(&s.reaped, &reaped_for_wait))
-                .unwrap_or(false);
-            if owns {
-                sessions.remove(&tab_id);
+            {
+                // Only remove the session if THIS waiter still owns it.
+                // `close()` frees the slot synchronously, so the same
+                // tab_id can be re-spawned before a stale waiter fires;
+                // matching the per-spawn `reaped` identity prevents
+                // evicting a newer live session (#80). Scoped so the
+                // deadline wait below never holds the sessions lock.
+                let mut sessions = sessions_for_reap.lock().unwrap();
+                let owns = sessions
+                    .get(&tab_id)
+                    .map(|s| Arc::ptr_eq(&s.reaped, &reaped_for_wait))
+                    .unwrap_or(false);
+                if owns {
+                    sessions.remove(&tab_id);
+                }
+            }
+            // Backstop for a reader that never reaches EOF (#255).
+            // Ends as soon as the reader task drops its sender —
+            // by then it has published `Exit` and this is a no-op —
+            // or on the deadline, when publishing here is the only
+            // way the tab ever reports its exit.
+            let _ = reader_alive_rx.recv_timeout(EXIT_PUBLISH_GRACE);
+            if publish_exit_once(&output_tx_exit, &exit_published_for_wait, status) {
+                debug!(
+                    tab_id,
+                    "pty reader had not finished; published Exit on the deadline path"
+                );
             }
         });
 
@@ -799,6 +882,26 @@ fn build_command(
         }
     }
     cmd
+}
+
+/// Publish a tab's `Exit` event, at most once per spawn. Both the
+/// reader task (the normal path) and the reap task's deadline backstop
+/// call this; the compare-exchange decides which one gets to send, so
+/// a consumer never sees two exits for one child. Returns whether this
+/// call was the one that published.
+fn publish_exit_once(
+    output_tx: &broadcast::Sender<PtyOutputEvent>,
+    published: &AtomicBool,
+    status: i32,
+) -> bool {
+    if published
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    let _ = output_tx.send(PtyOutputEvent::Exit(status));
+    true
 }
 
 fn pty_reader_loop(
