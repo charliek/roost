@@ -1077,13 +1077,22 @@ jobs:
       # tab/project reorder that replaced GTK DnD (whose Wayland drag-icon
       # surface aborted in gdksurface-wayland.c:frame_callback). Self-contained —
       # it starts its OWN Xvfb + throwaway Roost — so it runs as its own step,
-      # NOT under xvfb-run. continue-on-error while we gather signal on XTEST-
-      # under-Xvfb reliability on shared runners; promote to a required gate once
-      # proven stable. ROOST_REQUIRE_REAL_INPUT turns the script's self-skip into
-      # a failure here (xdotool/Xvfb are installed, so a skip means a real setup
+      # NOT under xvfb-run.
+      #
+      # REQUIRED as of plan 024. This job is in `ci-success`, so a soft step
+      # inside it made the required gate only a partial one. The
+      # gather-signal period is over and XTEST-under-Xvfb held up: 21
+      # consecutive `main` runs (2026-07-31 → 2026-08-09), every one ending
+      # `PASS: focus + core-sync …, drag reorder …, palette chrome-click
+      # no-storm all verified`, with zero failures and zero skips. Measured
+      # from the step LOGS — with `continue-on-error` set, both the job
+      # conclusion and the REST API's step `conclusion` report success no
+      # matter what the step actually did, so neither is evidence.
+      #
+      # ROOST_REQUIRE_REAL_INPUT turns the script's self-skip into a failure
+      # here (xdotool/Xvfb are installed, so a skip means a real setup
       # problem, not "unsupported").
       - name: Real-input regressions (Xvfb + xdotool)
-        continue-on-error: true
         env:
           GDK_BACKEND: x11
           ROOST_TEST_MODE: "1"
@@ -1117,14 +1126,23 @@ jobs:
   # drag-icon-surface frame_callback abort that crashed tab reorder on
   # COSMIC) are invisible to it.
   #
-  # NON-BLOCKING for now (continue-on-error + absent from ci-success) while
-  # we triage the real-runner Wayland pass profile — Wayland clipboard +
-  # selection semantics differ from X11, so a few OSC52/selection tests may
-  # legitimately diverge. Promote into ci-success once the profile is clean
-  # (mirrors the "real-click focus regression" gather-signal-then-promote
-  # pattern above). weston headless drives the IPC suite, not pointer input;
-  # the real pointer-DRAG guard lives in the separate e2e-gtk-wayland-drag job
-  # (cage + /dev/uinput) below.
+  # REQUIRED (in ci-success) as of plan 024. The gather-signal period is over
+  # and the signal was clean: 21 consecutive `main` runs between 2026-07-31
+  # and 2026-08-09, every one ending `N passed, M skipped` with zero failures,
+  # runtime stable at 19-31s.
+  #
+  # HOW that was measured matters, because the obvious methods lie. A step
+  # carrying `continue-on-error` is reported by the REST jobs API with
+  # `conclusion: success` no matter what it did — that API exposes
+  # `conclusion` and not `outcome`. So both "the job went green 21 times" and
+  # a step-level query saying "all steps ok" were true and meaningless. The
+  # only honest signal is the step's log body, which is where the numbers
+  # above come from. Do not promote anything here on job- or step-conclusion
+  # evidence again.
+  #
+  # weston headless drives the IPC suite, not pointer input; the real
+  # pointer-DRAG guard lives in the separate e2e-gtk-wayland-drag job (cage +
+  # /dev/uinput) below, which is deliberately NOT promoted — see its comment.
   e2e-gtk-wayland:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
@@ -1181,7 +1199,6 @@ jobs:
         run: cargo build -p roost-linux -p roost-cli
 
       - name: Run E2E (GTK under headless Wayland / weston)
-        continue-on-error: true
         timeout-minutes: 15
         env:
           RUST_LOG: warn
@@ -1198,7 +1215,8 @@ jobs:
         # this cap), and those paths test integration semantics that diverge
         # X11↔Wayland — not the GDK-Wayland backend this job exists to cover.
         # `timeout-minutes` is the belt-and-suspenders cap so a future hang can
-        # never run away again (continue-on-error swallows the timed-out step).
+        # never run away again — and now that this step is required, a hang
+        # reds the gate instead of being swallowed.
         # --timeout: per-test hard cap (pytest-timeout) so one hung test fails
         # fast instead of consuming the whole step (that's what ran the job to
         # 22m). Derived from the same ROOST_TEST_TIMEOUT_SCALE the harness uses
@@ -1238,13 +1256,30 @@ jobs:
   # real-input job can only exercise the gesture *logic*, not the GDK-Wayland
   # backend where the old GtkDnD drag-icon surface crashed.
   #
-  # NON-BLOCKING (continue-on-error + absent from ci-success): synthetic Wayland
-  # input + the seat/libinput/uinput plumbing is new and may be flaky on shared
-  # runners. The check SKIPs cleanly if a dep is missing and reports a clear
-  # FAIL otherwise (ROOST_REQUIRE_REAL_INPUT=1). Promote to a gate once it has
-  # green history on main (same gather-signal pattern as the jobs above). The
-  # developer confirms the real COSMIC/cosmic-comp behavior separately; cage is
-  # generic wlroots Wayland, which is where the crash lived.
+  # STILL NON-BLOCKING (continue-on-error + absent from ci-success), and this
+  # is now a measured decision rather than a pending one.
+  #
+  # Plan 024 re-checked the history from the step LOGS — the only signal that
+  # survives `continue-on-error`, since both the job conclusion and the REST
+  # API's step `conclusion` report success regardless. Its sibling
+  # e2e-gtk-wayland came back 21/21 clean and was promoted. This lane did not:
+  # 3 of the same 21 runs FAILED with
+  #
+  #     FAIL (real-input required): window_metrics returned no window size
+  #
+  # (runs 31134306062, 31144935154, 31151407004 — all within one ~5h window on
+  # 2026-08-07, so plausibly a runner-image or seat/uinput blip rather than a
+  # steady 14% rate, but a gate cannot be promoted on a hypothesis).
+  #
+  # The failure is harness-shaped, not product-shaped: the injector never got
+  # a window geometry back, so it could not aim the pointer. Two candidates
+  # worth investigating before promoting — cage not having the surface mapped
+  # when the harness asks (needs a wait/retry rather than a single probe), or
+  # the best-effort `modprobe uinput` + seatd step below silently not taking,
+  # in which case this should SKIP loudly rather than FAIL. See #328.
+  #
+  # The developer confirms the real COSMIC/cosmic-comp behavior separately;
+  # cage is generic wlroots Wayland, which is where the crash lived.
   e2e-gtk-wayland-drag:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
@@ -1433,34 +1468,61 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, iced-build-e2e, iced-release, e2e-gtk, e2e-mac]
+    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, iced-build-e2e, iced-release, e2e-gtk, e2e-gtk-wayland, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Verify no required job failed
+        # Membership is DERIVED from `needs`, not restated. It used to be
+        # written out twice — once in `needs:` and once in a hand-built
+        # `results` string — and the two drifted twice. `toJSON(needs)` makes
+        # the duplication impossible rather than adding a third thing to keep
+        # in sync.
+        #
+        # Passed through `env:` and never interpolated into the shell body:
+        # `${{ }}` inside `run:` is textual substitution, which is a script
+        # injection surface.
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          # `changes` is first for a reason: it gates every other job, so if it
-          # fails, all of them report `skipped` — which the allowlist below
-          # accepts — and this gate went GREEN with nothing having been built.
-          # Same greenwash shape as the #306 incident, one level further up.
-          # `release.yml`'s ci-gate trusts this check, so that hole reached the
-          # release path.
-          results="${{ needs.changes.result }} ${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.iced-release.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
-          echo "job results: ${results}"
+          set -euo pipefail
+          echo "${NEEDS}" | jq -r 'to_entries[] | "  \(.key): \(.value.result)"'
+
+          # A `needs:` list that somehow arrived empty would make every check
+          # below vacuous, and this gate is what `release.yml`'s ci-gate
+          # trusts.
+          count="$(echo "${NEEDS}" | jq -r 'length')"
+          if [ "${count}" -lt 2 ]; then
+            echo "::error::ci-success saw ${count} upstream jobs — the needs list is wrong"
+            exit 1
+          fi
+
           # Allowlist, not a denylist. A denylist of failure/cancelled let
           # `abandoned` through — the status GitHub assigns when its own
           # infrastructure kills a job — so a run where 7 of 9 jobs never
           # executed reported this gate GREEN. Observed on PR #306 during a
           # GitHub "Failed to resolve action download info" incident.
           # Anything that is not an actual pass now fails the gate.
-          for r in ${results}; do
-            case "${r}" in
-              success|skipped) ;;
-              *)
-                echo "::error::a required CI job did not pass: '${r}' (${results})"
-                exit 1
-                ;;
-            esac
-          done
+          bad="$(echo "${NEEDS}" | jq -r '
+            [to_entries[]
+             | select(.value.result != "success" and .value.result != "skipped")
+             | "\(.key)=\(.value.result)"]
+            | join(" ")')"
+          if [ -n "${bad}" ]; then
+            echo "::error::a required CI job did not pass: ${bad}"
+            exit 1
+          fi
+
+          # `changes` gates every other job, so if IT fails they all report
+          # `skipped` — which the allowlist accepts — and this gate would go
+          # green with nothing having been built. Same greenwash shape as
+          # #306, one level further up. Its result is already covered above
+          # (it is in `needs`), but assert it explicitly rather than relying on
+          # a reader noticing why a `skipped` allowance is safe here.
+          changes_result="$(echo "${NEEDS}" | jq -r '.changes.result')"
+          if [ "${changes_result}" != "success" ]; then
+            echo "::error::the 'changes' job did not succeed (${changes_result}) — every other job's 'skipped' is meaningless"
+            exit 1
+          fi
           echo "all good"
