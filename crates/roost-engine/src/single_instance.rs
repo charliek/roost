@@ -17,13 +17,22 @@
 //!    diagnostics + an "activate the running window" hint).
 //!
 //! The returned [`InstanceLock`] holds the open file descriptor.
-//! Dropping it releases the flock.
+//! Dropping it flock(LOCK_UN)s explicitly and then closes — closing
+//! alone is not enough, because the lock belongs to the open file
+//! description and any fork()ed child that inherited the fd would keep
+//! it alive until exec (issue #324).
+//!
+//! One residual window survives that and cannot be closed from here:
+//! if the process is SIGKILLed (so `Drop` never runs) while a just-
+//! forked child has not yet reached `exec`, that child's inherited
+//! description keeps the lock until it does. The window is the length
+//! of a fork→exec, it self-heals, and closing it would mean changing
+//! how every subprocess in the tree is spawned.
 //!
 //! M6 hardens this with the explicit stale-socket recovery loop.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -45,35 +54,19 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        // Drop releases the flock via `_file`'s File drop — that's
-        // the only signal that matters for "this instance is gone."
-        //
-        // We deliberately do NOT unlink the lock file here, because
-        // the file handle is dropped AFTER this body returns (drop
-        // order: fields drop in declaration order *after* the drop
-        // impl runs, with `_file` listed first → released first,
-        // but `remove_file(&path)` still risks racing with another
-        // process that has already opened the file by name).
-        //
-        // Stale lock files left behind after a clean exit are
-        // harmless: the next `acquire()` overwrites the PID
-        // contents after successfully taking the flock. Callers
-        // that want explicit cleanup can call `release()`.
-    }
-}
+        // Closing the fd is NOT enough (issue #324). flock(2) locks
+        // live on the open file description, so a fork()ed child that
+        // inherited the fd keeps the lock alive until it execs — and
+        // in that window our drop silently fails to release. LOCK_UN
+        // clears the lock on the description itself, which every
+        // inheriting fd shares, so release is unconditional.
+        let _ = self._file.unlock();
 
-impl InstanceLock {
-    /// Explicit consuming cleanup: drop the file handle (releases
-    /// the flock), then unlink the lock file. Safe because the
-    /// flock is gone before we touch the path.
-    pub fn release(self) -> std::io::Result<()> {
-        let path = self.path.clone();
-        drop(self);
-        match std::fs::remove_file(&path) {
-            Ok(_) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        }
+        // We deliberately do NOT unlink the lock file here: another
+        // process may already have opened it by name and be waiting on
+        // the flock. Stale lock files left behind after a clean exit
+        // are harmless — the next `acquire()` overwrites the PID
+        // contents after successfully taking the flock.
     }
 }
 
@@ -97,7 +90,7 @@ pub fn acquire(lock_path: impl AsRef<Path>) -> Result<InstanceLock, AcquireError
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         // Don't truncate at open — we may still need to read the
         // prior holder's PID below if the flock attempt fails.
@@ -112,27 +105,29 @@ pub fn acquire(lock_path: impl AsRef<Path>) -> Result<InstanceLock, AcquireError
     if let Err(err) = file.try_lock_exclusive() {
         // Read whatever PID the previous holder wrote (best-effort).
         let pid = read_pid(&file).unwrap_or(0);
-        // Suppress the unused fd warning on platforms where we
-        // don't reference `_raw_fd` directly.
-        let _raw_fd = file.as_raw_fd();
         return Err(match err.kind() {
             std::io::ErrorKind::WouldBlock => AcquireError::AlreadyHeld(pid),
             _ => AcquireError::Io(err),
         });
     }
 
-    // We own the lock — write our PID into the file. Truncate
-    // first to clear stale PID bytes from a prior holder.
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    let pid = std::process::id();
-    writeln!(file, "{pid}")?;
-    file.flush()?;
-
-    Ok(InstanceLock {
+    // Wrap the locked file BEFORE anything fallible, so every `?`
+    // below releases through `Drop`'s LOCK_UN rather than dropping a
+    // bare `File` that a forked child could still be holding open.
+    let mut lock = InstanceLock {
         _file: file,
         path: lock_path,
-    })
+    };
+
+    // We own the lock — write our PID into the file. Truncate
+    // first to clear stale PID bytes from a prior holder.
+    lock._file.set_len(0)?;
+    lock._file.seek(SeekFrom::Start(0))?;
+    let pid = std::process::id();
+    writeln!(lock._file, "{pid}")?;
+    lock._file.flush()?;
+
+    Ok(lock)
 }
 
 fn read_pid(file: &File) -> std::io::Result<i32> {
@@ -148,7 +143,20 @@ fn read_pid(file: &File) -> std::io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
+    use std::os::unix::io::AsRawFd;
     use tempfile::tempdir;
+
+    /// Kills and reaps on every exit path, so a panic mid-test can't
+    /// leave a child holding an inherited lock description.
+    struct ReapOnDrop(std::process::Child);
+
+    impl Drop for ReapOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     #[test]
     fn first_acquire_succeeds() {
@@ -182,19 +190,15 @@ mod tests {
         assert!(second.lock_path().exists());
     }
 
-    // flock(2) locks live on the *open file description*, not on the fd
-    // or the process. A fork()ed child inherits a duplicate of the lock
-    // fd and keeps that description — and therefore the lock — alive
-    // until the fd closes. `File`'s drop only calls close(2), so if a
-    // sibling test in this same binary forks while we hold the lock
-    // (`git_metrics` and `process` both exec subprocesses), our drop
-    // does NOT release the flock and the next acquire() sees WouldBlock
-    // -> AlreadyHeld(our own pid). That is the #324 flake, made
-    // deterministic here by clearing FD_CLOEXEC so the child provably
-    // keeps the description open past exec.
+    // Regression guard for #324. flock(2) locks live on the *open file
+    // description*, not on the fd or the process, so a fork()ed child
+    // that inherited the fd keeps the lock alive until it execs. Before
+    // the explicit LOCK_UN in `Drop`, a sibling test in this binary
+    // spawning a subprocess during our lock window made `drop` a no-op
+    // and the next acquire() see WouldBlock -> AlreadyHeld(our own pid).
+    // Clearing FD_CLOEXEC makes that window deterministic instead of
+    // ~2%-of-runs.
     #[test]
-    #[ignore = "reproduces #324: Drop closes the fd but never flock(LOCK_UN)s, so an \
-                inherited fd keeps the lock alive. Un-ignored by the fix commit."]
     fn drop_releases_even_when_a_forked_child_inherited_the_fd() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("roost.lock");
@@ -205,16 +209,6 @@ mod tests {
         let cleared = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_SETFD, 0) };
         assert_eq!(cleared, 0, "failed to clear FD_CLOEXEC on the lock fd");
 
-        // Reaped on every exit path: a panic between here and the
-        // assertions would otherwise leave the child holding the
-        // inherited description for the rest of its 30s sleep.
-        struct ReapOnDrop(std::process::Child);
-        impl Drop for ReapOnDrop {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
         let _child = ReapOnDrop(
             std::process::Command::new("/bin/sleep")
                 .arg("30")
@@ -230,14 +224,63 @@ mod tests {
         }
     }
 
+    // The same-process test above exercises RAII drop; this one
+    // exercises process exit, which is the property the UI actually
+    // relies on after a crash. Neither subsumes the other.
     #[test]
-    fn release_unlinks_the_lock_file() {
+    fn a_dead_process_releases_the_lock() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("roost.lock");
-        let lock = acquire(&path).unwrap();
-        assert!(path.exists());
-        lock.release().unwrap();
-        assert!(!path.exists(), "release() must unlink the lock file");
+
+        let holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("single_instance::tests::hold_the_lock_until_killed")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("ROOST_TEST_LOCK_PATH", &path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the lock holder");
+        let mut holder = ReapOnDrop(holder);
+
+        // The child prints a line once it owns the flock; waiting on
+        // that instead of sleeping keeps the test deterministic. Its
+        // libtest banner comes out first, so scan rather than take the
+        // first line.
+        let stdout = std::io::BufReader::new(holder.0.stdout.take().unwrap());
+        let ready = stdout
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.trim() == "locked");
+        assert!(ready, "the holder never reported that it took the lock");
+
+        match acquire(&path) {
+            Err(AcquireError::AlreadyHeld(pid)) => {
+                assert_eq!(pid as u32, holder.0.id(), "should report the holder's pid");
+            }
+            other => panic!("expected AlreadyHeld while the child lives, got {other:?}"),
+        }
+
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        acquire(&path).expect("the lock must be free once the holder is gone");
+    }
+
+    /// Helper process for [`a_dead_process_releases_the_lock`]: takes
+    /// the lock, announces it, then waits to be killed. `#[ignore]`
+    /// keeps it out of the normal run; without the env var (a bare
+    /// `--include-ignored` sweep) it is a no-op rather than a hang.
+    #[test]
+    #[ignore = "helper process for a_dead_process_releases_the_lock"]
+    fn hold_the_lock_until_killed() {
+        let Ok(path) = std::env::var("ROOST_TEST_LOCK_PATH") else {
+            return;
+        };
+        let _lock = acquire(&path).expect("holder must take the lock");
+        println!("locked");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        // Bounded so a stranded helper cannot outlive the suite.
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
 
     #[test]

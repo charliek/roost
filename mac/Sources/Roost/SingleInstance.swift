@@ -61,7 +61,10 @@ final class SingleInstance: @unchecked Sendable {
         }
     }
 
-    private let lockFD: Int32
+    /// Module-internal rather than private so `SingleInstanceTests`
+    /// can hand the fd to a child process and prove the LOCK_UN in
+    /// `deinit` (issue #324).
+    let lockFD: Int32
     let lockPath: String
 
     private init(lockFD: Int32, lockPath: String) {
@@ -70,8 +73,15 @@ final class SingleInstance: @unchecked Sendable {
     }
 
     deinit {
-        // Closing the fd releases the flock automatically (BSD
-        // flock semantics). We do NOT unlink the lockfile —
+        // LOCK_UN first, then close. Closing alone is not enough:
+        // flock(2) locks belong to the open file description, so a
+        // fork()ed child that inherited the fd — every PTY spawn, in
+        // the window between fork and exec — keeps the lock alive past
+        // our close. LOCK_UN clears it on the description all those
+        // fds share. Same defect and same fix as the Rust side
+        // (issue #324, `crates/roost-engine/src/single_instance.rs`).
+        _ = roost_flock(lockFD, LOCK_UN)
+        // We do NOT unlink the lockfile —
         // unlinking on shutdown would race with a concurrent second
         // launch that already opened the same path; the GTK side
         // uses the same "leave it on disk" convention. The PID in
