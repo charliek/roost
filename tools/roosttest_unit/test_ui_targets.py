@@ -350,13 +350,32 @@ class BootRefusalTests(unittest.TestCase):
 
     def test_mac_refusal_reads_the_app_log_only_while_nothing_runs(self) -> None:
         log = self._log(f"{self.REFUSAL}\n")
-        with patch("ui._mac_ui_log_path", return_value=log):
+        # Offset 0 == "this launch starts at the top of the file", which is
+        # what _launch_mac records for a log that did not exist yet.
+        with patch("ui._mac_ui_log_path", return_value=log), patch("ui._MAC_LOG_OFFSET", 0):
             with patch("ui._roost_running", return_value=True):
                 self.assertIsNone(ui._boot_refusal("mac"))
             with patch("ui._roost_running", return_value=False):
                 message = ui._boot_refusal("mac")
         assert message is not None
         self.assertIn("pid 4242", message)
+
+    def test_mac_refusal_is_silent_when_the_harness_never_launched_the_app(self) -> None:
+        """A refusal line from a previous day is not this run's refusal.
+
+        Without the `None` sentinel the offset defaulted to 0, so
+        `_launch_output("mac")` read the developer's whole accumulated
+        `~/Library/Logs/<label>/roost.log` and any historical refusal would
+        surface as this launch's, masking the real timeout.
+        """
+        log = self._log(f"{self.REFUSAL}\n")
+        with (
+            patch("ui._mac_ui_log_path", return_value=log),
+            patch("ui._MAC_LOG_OFFSET", None),
+            patch("ui._roost_running", return_value=False),
+        ):
+            self.assertEqual(ui._launch_output("mac"), "")
+            self.assertIsNone(ui._boot_refusal("mac"))
 
     def test_wait_alive_raises_the_refusal_instead_of_timing_out(self) -> None:
         with tempfile.TemporaryDirectory() as root:

@@ -48,7 +48,11 @@ _ICED_LOG: Path | None = None
 # `~/Library/Logs/<label>/roost.log`, which persists across launches. The
 # offset is what makes "what this launch said" separable from the developer's
 # accumulated log.
-_MAC_LOG_OFFSET = 0
+# Byte offset into the Mac app's persistent log, recorded at each launch
+# attempt. `None` means the harness has not launched the Mac UI in this
+# process — distinct from 0, which would mean "read the whole file" and
+# would let a refusal line from a previous day satisfy `_boot_refusal`.
+_MAC_LOG_OFFSET: int | None = None
 
 # The UI's own words when it refuses to start because another process holds
 # the state lock (`crates/roost-{iced,linux}/src/main.rs`,
@@ -250,6 +254,11 @@ def _launch_output(target: str) -> str:
     this UI.
     """
     if target == "mac":
+        # Mirrors the `proc is None` guard below: no recorded offset means
+        # this process never launched the Mac UI, so nothing in that log is
+        # ours to read.
+        if _MAC_LOG_OFFSET is None:
+            return ""
         log: Path | None = _mac_ui_log_path()
         offset = _MAC_LOG_OFFSET
     else:
@@ -696,7 +705,7 @@ def _launch_mac(app: Path, *, state_dir: Path | None = None) -> None:
     """
     global _MAC_LOG_OFFSET
     last: TimeoutError | None = None
-    for attempt in (1, 2):
+    for _attempt in (1, 2):
         _mac_cleanup()
         # Everything after this point in the app's persistent log belongs to
         # this attempt, so a boot failure (including a state-lock refusal) is
