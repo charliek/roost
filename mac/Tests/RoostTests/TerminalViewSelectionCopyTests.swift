@@ -200,6 +200,148 @@ func bothPathsAgree() {
     // A wide glyph that cannot fit in the last column wraps, leaving a
     // spacer head behind on the row it did not fit on.
     assertPathsAgree(["1234567890123456789\u{754c}", "bravo", "charlie"])
+    // Soft-wrapped content: the rows the terminal broke for itself.
+    assertPathsAgree(["abcdefghijklmnopqrstuvwxyz0123", "bravo", "charlie"])
+    assertPathsAgree(["alpha", "abcdefghijklmnopqrstuvwxyz0123", "charlie"])
+    assertPathsAgree(["alpha", "bravo", "abcdefghijklmnopqrstuvwxyz0123"])
+    assertPathsAgree([
+        "alpha        ", "bravo",
+        "\u{4f60}\u{597d}\u{4f60}\u{597d}\u{4f60}\u{597d}\u{4f60}\u{597d}\u{4f60}\u{597d}abc",
+    ])
+}
+
+// MARK: - Soft-wrap unwrapping (plan 024 D4.4)
+
+/// Write `input`, select `anchor...cursor`, and require the same text
+/// both while the selection is visible (the render-state walk) and once
+/// it has been pushed into scrollback (libghostty's formatter).
+///
+/// `joined` is what the copy should be with
+/// `SelectionFormatter.unwrapSoftWrappedLines` on, `perRow` with it off,
+/// so every case pins the behavior either way the constant is set.
+@MainActor
+private func assertWrappedCopy(
+    _ input: String,
+    anchor: (col: Int, row: Int),
+    cursor: (col: Int, row: Int),
+    joined: String,
+    perRow: String
+) {
+    let expected = SelectionFormatter.unwrapSoftWrappedLines ? joined : perRow
+    let view = makeView()
+    write(view, input)
+    #expect(view.setSelection(
+        anchorCol: anchor.col, anchorRow: anchor.row,
+        cursorCol: cursor.col, cursorRow: cursor.row
+    ))
+    #expect(copied(view) == expected, "visible copy of \(input.debugDescription)")
+
+    scrollOut(view, 30)
+    #expect(copied(view) == expected, "scrollback copy of \(input.debugDescription)")
+}
+
+/// 30 narrow cells at 20 columns: rows 0 and 1 are one logical line.
+private let wrap2 = "abcdefghijklmnopqrstuvwxyz0123"
+/// 45 narrow cells: rows 0, 1 and 2 are one logical line.
+private let wrap3 = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI"
+
+@Test @MainActor
+func aLineWrappedAcrossTwoRowsCopiesAsOneLine() {
+    assertWrappedCopy(
+        wrap2,
+        anchor: (0, 0), cursor: (selectionCopyCols - 1, 1),
+        joined: "abcdefghijklmnopqrstuvwxyz0123",
+        perRow: "abcdefghijklmnopqrst\nuvwxyz0123"
+    )
+}
+
+@Test @MainActor
+func aLineWrappedAcrossThreeRowsCopiesAsOneLine() {
+    assertWrappedCopy(
+        wrap3,
+        anchor: (0, 0), cursor: (selectionCopyCols - 1, 2),
+        joined: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI",
+        perRow: "abcdefghijklmnopqrst\nuvwxyz0123456789ABCD\nEFGHI"
+    )
+}
+
+/// The wrap lands inside a word, which is the normal case — a terminal
+/// breaks on the column, not on whitespace. Rejoining has to put the
+/// word back together with nothing inserted between the halves.
+@Test @MainActor
+func aWrapInsideAWordRejoinsTheWord() {
+    assertWrappedCopy(
+        "wrapped-word-boundary-check",
+        anchor: (0, 0), cursor: (selectionCopyCols - 1, 1),
+        joined: "wrapped-word-boundary-check",
+        perRow: "wrapped-word-boundar\ny-check"
+    )
+}
+
+/// A real newline after a soft-wrapped line still breaks the copy. Only
+/// the wrap is absorbed.
+@Test @MainActor
+func aHardNewlineAfterAWrappedLineSurvives() {
+    assertWrappedCopy(
+        "abcdefghijklmnopqrstuvwxyz0123\r\ntail",
+        anchor: (0, 0), cursor: (selectionCopyCols - 1, 2),
+        joined: "abcdefghijklmnopqrstuvwxyz0123\ntail",
+        perRow: "abcdefghijklmnopqrst\nuvwxyz0123\ntail"
+    )
+}
+
+/// Starting the selection part-way through a wrapped line keeps the rest
+/// of that line on one line rather than breaking it at the screen edge.
+@Test @MainActor
+func aSelectionStartingMidWrappedLineStillJoinsTheRest() {
+    assertWrappedCopy(
+        wrap2,
+        anchor: (5, 0), cursor: (selectionCopyCols - 1, 1),
+        joined: "fghijklmnopqrstuvwxyz0123",
+        perRow: "fghijklmnopqrst\nuvwxyz0123"
+    )
+}
+
+/// A row of nothing but wide glyphs fills all 20 columns exactly and
+/// wraps into the next row.
+@Test @MainActor
+func aWrappedLineOfWideGlyphsCopiesAsOneLine() {
+    let cjk = String(repeating: "\u{4f60}\u{597d}", count: 5)
+    assertWrappedCopy(
+        cjk + "abc",
+        anchor: (0, 0), cursor: (selectionCopyCols - 1, 1),
+        joined: cjk + "abc",
+        perRow: cjk + "\nabc"
+    )
+}
+
+/// A wide grapheme that does not fit in the last column wraps whole,
+/// leaving a placeholder behind. The rejoined line must carry the
+/// grapheme exactly once and put nothing where the placeholder was.
+@Test @MainActor
+func aWideGraphemeStraddlingTheWrapBoundaryCopiesOnce() {
+    assertWrappedCopy(
+        "1234567890123456789\u{754c}XY",
+        anchor: (0, 0), cursor: (3, 1),
+        joined: "1234567890123456789\u{754c}XY",
+        perRow: "1234567890123456789\n\u{754c}XY"
+    )
+}
+
+/// Ending the selection ON that placeholder is the case libghostty
+/// handles by reaching into the next row for the grapheme that wrapped
+/// (`PageFormatter.formatWithState`'s spacer-head adjustment). The
+/// viewport walk cannot mirror that reach — the limit is page-relative —
+/// so it hands the selection back to the formatter, which is why the two
+/// scroll positions still agree.
+@Test @MainActor
+func aSelectionEndingOnAWrappedWidePlaceholderPicksUpTheGrapheme() {
+    assertWrappedCopy(
+        "1234567890123456789\u{754c}XY",
+        anchor: (0, 0), cursor: (selectionCopyCols - 1, 0),
+        joined: "1234567890123456789\u{754c}",
+        perRow: "1234567890123456789"
+    )
 }
 
 /// Write `input` into a fresh view, select all of it, and require

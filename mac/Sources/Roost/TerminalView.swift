@@ -1836,11 +1836,12 @@ final class TerminalView: NSView {
         // The viewport is a contiguous window over screen rows, so both
         // edges being visible means every row between them is too.
         if viewportRow(forScreenY: n.startY) != nil,
-           viewportRow(forScreenY: n.endY &- 1) != nil
+           viewportRow(forScreenY: n.endY &- 1) != nil,
+           case let .text(text) = viewportSelectedText(
+               terminal: terminal, normalized: n, totalRowSpan: totalRowSpan
+           )
         {
-            return viewportSelectedText(
-                terminal: terminal, normalized: n, totalRowSpan: totalRowSpan
-            )
+            return text
         }
 
         // Raw anchor/cursor cells: the formatter's range is inclusive on
@@ -1871,6 +1872,36 @@ final class TerminalView: NSView {
         /// The row starts on a wrapped grapheme's placeholder, so it
         /// contributes nothing at all — not even a line break.
         var skipped = false
+        /// Textless cells seen before the row's first text cell. Held
+        /// apart from `text` because the formatter emits them only after
+        /// whatever carried over from a soft-wrapped predecessor.
+        var leadingBlanks = 0
+        /// Textless cells seen since the row's last text cell. Dropped
+        /// at the end of a line; carried into the next row when that row
+        /// continues this one's soft wrap.
+        var pendingBlanks = 0
+
+        /// Append a cell's text, materializing any textless cells that
+        /// turned out to be interior rather than trailing.
+        mutating func push(_ cellText: String) {
+            if hasText {
+                text += String(repeating: " ", count: pendingBlanks)
+            } else {
+                leadingBlanks = pendingBlanks
+            }
+            pendingBlanks = 0
+            text += cellText
+            hasText = true
+        }
+    }
+
+    /// What the viewport fast path came back with.
+    private enum ViewportCopy {
+        /// The selection's text (`nil` once every row turned out blank).
+        case text(String?)
+        /// The walk cannot mirror the formatter for this selection, so
+        /// the caller has to use the formatter itself.
+        case unsupported
     }
 
     /// Render-state walk for a selection that is entirely on screen.
@@ -1881,7 +1912,7 @@ final class TerminalView: NSView {
         terminal: GhosttyTerminal,
         normalized n: (startY: UInt32, startCol: Int, endY: UInt32, endCol: Int),
         totalRowSpan: Int
-    ) -> String? {
+    ) -> ViewportCopy {
         renderState.update(terminal: terminal)
 
         var offsetForViewportRow: [Int: Int] = [:]
@@ -1890,7 +1921,7 @@ final class TerminalView: NSView {
                 offsetForViewportRow[vRow] = offset
             }
         }
-        if offsetForViewportRow.isEmpty { return nil }
+        if offsetForViewportRow.isEmpty { return .text(nil) }
 
         var rows = [SelectedRow](repeating: SelectedRow(), count: totalRowSpan)
         // Text of the cell just before a row's first selected column,
@@ -1898,7 +1929,11 @@ final class TerminalView: NSView {
         // reach back and pick the grapheme up — libghostty's formatter
         // applies the same rule to its start column.
         var preceding = ""
+        // Whether the selection's very last cell is the placeholder a
+        // wide grapheme left behind when it did not fit and wrapped.
+        var endsOnSpacerHead = false
         let cols = Int(self.cols)
+        let lastCol = min(n.endCol, cols) - 1
         renderState.walk { cell in
             guard let offset = offsetForViewportRow[cell.row] else { return }
             let (startCol, endCol) = TerminalView.colRange(
@@ -1908,6 +1943,9 @@ final class TerminalView: NSView {
                 cols: cols
             )
             if cell.col + 1 == startCol { preceding = cell.text }
+            if offset == totalRowSpan - 1, cell.col == lastCol {
+                endsOnSpacerHead = cell.wide == .spacerHead
+            }
             guard cell.col >= startCol, cell.col < endCol else { return }
             // Spacers are placeholders for a wide grapheme, not blank
             // cells: emitting anything for them would double-space
@@ -1918,8 +1956,7 @@ final class TerminalView: NSView {
                 // The grapheme lives one column back, inside the
                 // selection's intent even though its cell is not.
                 case .spacerTail where !preceding.isEmpty:
-                    rows[offset].text += preceding
-                    rows[offset].hasText = true
+                    rows[offset].push(preceding)
                 // A grapheme that did not fit wrapped to the next row,
                 // leaving nothing here to select.
                 case .spacerHead:
@@ -1930,32 +1967,63 @@ final class TerminalView: NSView {
                 return
             }
             if cell.text.isEmpty {
-                rows[offset].text += " "
+                rows[offset].pendingBlanks += 1
             } else {
-                rows[offset].text += cell.text
-                rows[offset].hasText = true
+                rows[offset].push(cell.text)
+            }
+        }
+
+        // When unwrapping, a selection ending on a spacer head reaches
+        // into the row BELOW for the grapheme that wrapped — and how far
+        // it may reach is decided in page coordinates the viewport walk
+        // cannot see (`PageFormatter.formatWithState`, which declines
+        // the reach at a page boundary). Rather than guess, hand these
+        // back to the formatter, which is authoritative by construction.
+        if SelectionFormatter.unwrapSoftWrappedLines, endsOnSpacerHead {
+            return .unsupported
+        }
+
+        var wraps = [RenderState.RowWrap](repeating: RenderState.RowWrap(), count: totalRowSpan)
+        if SelectionFormatter.unwrapSoftWrappedLines {
+            let byViewportRow = renderState.rowWraps()
+            for (vRow, offset) in offsetForViewportRow
+            where vRow >= 0 && vRow < byViewportRow.count {
+                wraps[offset] = byViewportRow[vRow]
             }
         }
 
         // Same shape as libghostty's formatter so the two paths cannot
-        // disagree: rows with no text at all are held back as pending
+        // disagree. Rows with no text at all are held back as pending
         // newlines and only flushed once a later row has text, which
         // preserves leading and interior blanks while dropping trailing
         // ones. A row whose only text is spaces counts as having text —
-        // it trims to nothing but still ends a line.
+        // it trims to nothing but still ends a line. A soft-wrapped row
+        // contributes no newline at all when unwrapping, and its
+        // trailing blank cells carry into the continuation row instead
+        // of being dropped, so the rejoined line keeps its interior
+        // spacing.
         var out = ""
         var pendingNewlines = 0
-        for row in rows {
+        var carriedBlanks = 0
+        for (offset, row) in rows.enumerated() {
             if row.skipped { continue }
             if !row.hasText {
                 pendingNewlines += 1
                 continue
             }
             out += String(repeating: "\n", count: pendingNewlines)
-            pendingNewlines = 1
-            out += SelectionFormatter.trimTrailingSpaces(row.text)
+            let unwrapping = SelectionFormatter.unwrapSoftWrappedLines
+            pendingNewlines = unwrapping && wraps[offset].wrap ? 0 : 1
+            if !(unwrapping && wraps[offset].wrapContinuation) { carriedBlanks = 0 }
+            out += String(repeating: " ", count: carriedBlanks + row.leadingBlanks)
+            out += row.text
+            carriedBlanks = row.pendingBlanks
         }
-        return out.isEmpty ? nil : out
+        // Only U+0020 is trimmed, and only at the end of a line — which
+        // when unwrapping means the end of the JOINED line, so a wrapped
+        // row's trailing spaces are interior and survive.
+        let trimmed = SelectionFormatter.trimTrailingSpaces(out)
+        return .text(trimmed.isEmpty ? nil : trimmed)
     }
 
     /// Compute `[startCol, endCol)` for a single row of a multi-row

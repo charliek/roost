@@ -25,6 +25,23 @@ import CGhosttyVT
 import Foundation
 
 enum SelectionFormatter {
+    /// Join soft-wrapped rows into one line when copying.
+    ///
+    /// Plan 024 D4.4. This is a **deliberate, visible behavior change**:
+    /// a line the terminal wrapped across several rows copies as one
+    /// long line, the way Ghostty and every other modern terminal copy
+    /// it, instead of as one line per screen row. Flip it to `false` to
+    /// restore per-row copying.
+    ///
+    /// Both copy paths honor this constant — libghostty's formatter
+    /// here, and `TerminalView.viewportSelectedText`'s render-state walk
+    /// that handles a selection entirely inside the viewport — so the
+    /// two agree whichever way it is set, and a copy never depends on
+    /// scroll position. Its Rust twin is
+    /// `roost_vt::UNWRAP_SOFT_WRAPPED_LINES`; the two must match or the
+    /// Mac and Linux UIs copy differently.
+    static let unwrapSoftWrappedLines = true
+
     /// Format the inclusive cell range `start...end` of the active
     /// screen as plain text.
     ///
@@ -60,7 +77,7 @@ enum SelectionFormatter {
             var options = GhosttyFormatterTerminalOptions()
             options.size = MemoryLayout<GhosttyFormatterTerminalOptions>.size
             options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN
-            options.unwrap = false
+            options.unwrap = unwrapSoftWrappedLines
             // Roost does want trailing spaces gone, but not
             // libghostty's version of it: its trim treats any cell
             // whose base codepoint is a space as blank, so a space
@@ -102,6 +119,11 @@ enum SelectionFormatter {
     /// a `\r\n` pair (one Swift `Character`) still splits on its `\n`
     /// and a space carrying a combining mark is not mistaken for a
     /// bare space.
+    ///
+    /// Shared with the viewport walk so both paths trim identically.
+    /// With `unwrapSoftWrappedLines` on, "line" means the joined logical
+    /// line: a wrapped row's trailing spaces sit mid-line and survive,
+    /// which is what keeps the rejoin from eating characters.
     static func trimTrailingSpaces(_ text: String) -> String {
         var out = String.UnicodeScalarView()
         var pendingSpaces = 0

@@ -291,6 +291,67 @@ final class RenderState {
         }
     }
 
+    /// A row's soft-wrap flags, from `GHOSTTY_ROW_DATA_WRAP` and
+    /// `GHOSTTY_ROW_DATA_WRAP_CONTINUATION`.
+    struct RowWrap {
+        /// The row soft-wraps into the next one: there is no line break
+        /// between them, only a screen edge.
+        var wrap = false
+        /// The row is itself the continuation of the row above.
+        var wrapContinuation = false
+    }
+
+    /// Soft-wrap flags for every viewport row, in row order.
+    ///
+    /// A separate pass rather than a field on `Cell`: the flags are
+    /// row-level, so hanging them off every cell would repeat them
+    /// `cols` times for the one consumer that reads them. Rebinds the
+    /// shared row iterator, so it must not be called from inside a
+    /// `walk` callback.
+    func rowWraps() -> [RowWrap] {
+        guard let rs, let rowIter else { return [] }
+
+        if withUnsafeMutablePointer(to: &self.rowIter, { ptr in
+            ghostty_render_state_get(
+                rs,
+                GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+                UnsafeMutableRawPointer(ptr)
+            )
+        }).rawValue != 0 {
+            return []
+        }
+
+        var wraps: [RowWrap] = []
+        while ghostty_render_state_row_iterator_next(rowIter) {
+            wraps.append(readRowWrap())
+        }
+        return wraps
+    }
+
+    /// Soft-wrap flags of the row the iterator sits on. Anything
+    /// unreadable reports "not wrapped", which leaves the row on its own
+    /// line — copy loses a join it should have made, never joins two
+    /// lines that were really separate.
+    private func readRowWrap() -> RowWrap {
+        guard let rowIter else { return RowWrap() }
+        var raw: GhosttyRow = 0
+        guard ghostty_render_state_row_get(
+            rowIter,
+            GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
+            &raw
+        ).rawValue == 0 else { return RowWrap() }
+        return RowWrap(
+            wrap: readRowFlag(raw, GHOSTTY_ROW_DATA_WRAP),
+            wrapContinuation: readRowFlag(raw, GHOSTTY_ROW_DATA_WRAP_CONTINUATION)
+        )
+    }
+
+    private func readRowFlag(_ row: GhosttyRow, _ data: GhosttyRowData) -> Bool {
+        var out = false
+        guard ghostty_row_get(row, data, &out).rawValue == 0 else { return false }
+        return out
+    }
+
     /// Double-width role of the cell the row-cells iterator is on.
     /// Read from the raw cell value rather than inferred from the
     /// grapheme's display width, so it can never disagree with the

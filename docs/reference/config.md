@@ -83,15 +83,30 @@ encoder as ⌘V / Ctrl+Shift+V, so an `nvim` or `fish` that enables
 DECSET 2004 receives `ESC[200~ … ESC[201~` wrappers around the
 selection.
 
+### Soft-wrapped lines
+
+A line too long for the window is **soft-wrapped**: the terminal breaks
+it across several screen rows purely to fit, with no newline in the
+data. Copying rejoins those rows, so a wrapped line comes back as the
+one long line it always was — the same thing Ghostty does. Paste it into
+an editor and you get one line, not one per screen row, and a word split
+across the break comes back whole.
+
+Only the wraps the terminal made are absorbed. A newline the program
+actually wrote still breaks the copy, and a wide (CJK / emoji) glyph
+that had to move to the next row to fit copies once, in the right place.
+
 ### Trimming
 
 The text written to either clipboard has trailing **spaces** stripped
-per row (matches Ghostty's `clipboard-trim-trailing-spaces` default
+per line (matches Ghostty's `clipboard-trim-trailing-spaces` default
 behavior). Only `U+0020` is stripped — any other whitespace codepoint in
-a cell is content the program deliberately wrote. Entirely-blank trailing
-rows are dropped so a multi-row selection doesn't carry stray newlines;
-leading and interior blank rows are kept, since they are part of what was
-selected.
+a cell is content the program deliberately wrote. "Line" means the
+rejoined line, so spaces sitting at a soft-wrap boundary are interior
+and survive; trimming them would glue two words together. Entirely-blank
+trailing rows are dropped so a multi-row selection doesn't carry stray
+newlines; leading and interior blank rows are kept, since they are part
+of what was selected.
 
 A selection that extends beyond the visible viewport copies **in full**,
 including rows scrolled off-screen ([#249](https://github.com/charliek/roost/issues/249)).

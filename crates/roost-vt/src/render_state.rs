@@ -158,6 +158,17 @@ pub struct Cell {
     pub wide: CellWide,
 }
 
+/// A row's soft-wrap flags, from `GHOSTTY_ROW_DATA_WRAP` and
+/// `GHOSTTY_ROW_DATA_WRAP_CONTINUATION`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RowWrap {
+    /// The row soft-wraps into the next one: there is no line break
+    /// between them, only a screen edge.
+    pub wrap: bool,
+    /// The row is itself the continuation of the row above.
+    pub wrap_continuation: bool,
+}
+
 /// Global dirty state after `update`. Maps `GhosttyRenderStateDirty`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dirty {
@@ -359,6 +370,26 @@ impl RenderState {
             }
         }
         Ok(())
+    }
+
+    /// Soft-wrap flags for every viewport row, in row order.
+    ///
+    /// A separate pass rather than a field on [`Cell`]: the flags are
+    /// row-level, so hanging them off every cell would repeat them
+    /// `cols` times for the one consumer that reads them. Like
+    /// [`Self::dirty_rows`] it rebinds the cached row iterator, so it
+    /// must not be called from inside a `walk` / `walk_dirty` callback.
+    pub fn row_wraps(&mut self, terminal: &Terminal) -> Result<Vec<RowWrap>> {
+        self.bind_row_iterator()?;
+        // Keep `terminal` alive across the walk (see `walk`).
+        let _ = terminal;
+
+        let mut wraps = Vec::new();
+        // SAFETY: iter handle non-null.
+        while unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
+            wraps.push(self.read_row_wrap());
+        }
+        Ok(wraps)
     }
 
     /// Global dirty state. Pure read — clears nothing.
@@ -652,6 +683,33 @@ impl RenderState {
         CellWide::from_raw(wide)
     }
 
+    /// Soft-wrap flags of the row the iterator sits on. Anything
+    /// unreadable reports "not wrapped", which leaves the row on its own
+    /// line — copy loses a join it should have made, never joins two
+    /// lines that were really separate.
+    fn read_row_wrap(&self) -> RowWrap {
+        let mut raw: sys::GhosttyRow = 0;
+        // SAFETY: iter handle non-null; `raw` is a real local matching
+        // the RAW datum's type.
+        let rc = unsafe {
+            sys::ghostty_render_state_row_get(
+                self.row_iter,
+                sys::GhosttyRenderStateRowData_GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
+                (&mut raw) as *mut sys::GhosttyRow as *mut _,
+            )
+        };
+        if Error::from_result(rc).is_err() {
+            return RowWrap::default();
+        }
+        RowWrap {
+            wrap: read_row_flag(raw, sys::GhosttyRowData_GHOSTTY_ROW_DATA_WRAP),
+            wrap_continuation: read_row_flag(
+                raw,
+                sys::GhosttyRowData_GHOSTTY_ROW_DATA_WRAP_CONTINUATION,
+            ),
+        }
+    }
+
     fn read_u32(&self, data: sys::GhosttyRenderStateData) -> Result<u32> {
         let mut out: u32 = 0;
         // SAFETY: handle non-null; out is local.
@@ -732,6 +790,15 @@ impl RenderState {
             Err(_) => None,
         }
     }
+}
+
+/// Read one boolean row flag out of a raw `GhosttyRow` value.
+fn read_row_flag(row: sys::GhosttyRow, data: sys::GhosttyRowData) -> bool {
+    let mut out: bool = false;
+    // SAFETY: `row` is the value libghostty just handed back; `out` is a
+    // real local matching every boolean row datum's type.
+    let rc = unsafe { sys::ghostty_row_get(row, data, (&mut out) as *mut bool as *mut _) };
+    Error::from_result(rc).is_ok() && out
 }
 
 impl Drop for RenderState {

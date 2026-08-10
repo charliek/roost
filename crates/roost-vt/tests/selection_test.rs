@@ -305,6 +305,168 @@ fn both_paths_agree() {
     // A wide glyph that cannot fit in the last column wraps, leaving a
     // spacer head behind on the row it did not fit on.
     assert_paths_agree(["1234567890123456789\u{754c}", "bravo", "charlie"]);
+    // Soft-wrapped content: the rows the terminal broke for itself.
+    assert_paths_agree(["abcdefghijklmnopqrstuvwxyz0123", "bravo", "charlie"]);
+    assert_paths_agree(["alpha", "abcdefghijklmnopqrstuvwxyz0123", "charlie"]);
+    assert_paths_agree(["alpha", "bravo", "abcdefghijklmnopqrstuvwxyz0123"]);
+    assert_paths_agree([
+        "alpha        ",
+        "bravo",
+        "\u{4f60}\u{597d}\u{4f60}\u{597d}\u{4f60}\u{597d}\u{4f60}\u{597d}\u{4f60}\u{597d}abc",
+    ]);
+}
+
+// ============================================================================
+// Soft-wrap unwrapping (plan 024 D4.4)
+// ============================================================================
+
+/// Write `input`, select `anchor..=cursor`, and require the same text
+/// both while the selection is visible (the render-state walk) and once
+/// it has been pushed into scrollback (libghostty's formatter).
+///
+/// `joined` is what the copy should be with
+/// [`roost_vt::UNWRAP_SOFT_WRAPPED_LINES`] on, `per_row` with it off, so
+/// every case pins the behavior either way the constant is set.
+fn assert_wrapped_copy(
+    input: &str,
+    anchor: (u16, u16),
+    cursor: (u16, u16),
+    joined: &str,
+    per_row: &str,
+) {
+    let expected = if roost_vt::UNWRAP_SOFT_WRAPPED_LINES {
+        joined
+    } else {
+        per_row
+    };
+    let (mut terminal, mut render_state) = sized_terminal(4096);
+    terminal.vt_write(input.as_bytes());
+    let mut selection = TerminalSelection::new();
+    assert!(selection.set(&terminal, anchor, cursor));
+    assert_eq!(
+        text(&selection, &terminal, &mut render_state),
+        Some(expected.into()),
+        "visible copy of {input:?}"
+    );
+
+    scroll_out(&mut terminal, 30);
+    assert_eq!(
+        text(&selection, &terminal, &mut render_state),
+        Some(expected.into()),
+        "scrollback copy of {input:?}"
+    );
+}
+
+/// 30 narrow cells at 20 columns: rows 0 and 1 are one logical line.
+const WRAP_2: &str = "abcdefghijklmnopqrstuvwxyz0123";
+/// 45 narrow cells: rows 0, 1 and 2 are one logical line.
+const WRAP_3: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI";
+
+#[test]
+fn a_line_wrapped_across_two_rows_copies_as_one_line() {
+    assert_wrapped_copy(
+        WRAP_2,
+        (0, 0),
+        (COLS - 1, 1),
+        "abcdefghijklmnopqrstuvwxyz0123",
+        "abcdefghijklmnopqrst\nuvwxyz0123",
+    );
+}
+
+#[test]
+fn a_line_wrapped_across_three_rows_copies_as_one_line() {
+    assert_wrapped_copy(
+        WRAP_3,
+        (0, 0),
+        (COLS - 1, 2),
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI",
+        "abcdefghijklmnopqrst\nuvwxyz0123456789ABCD\nEFGHI",
+    );
+}
+
+/// The wrap lands inside a word, which is the normal case — a terminal
+/// breaks on the column, not on whitespace. Rejoining has to put the
+/// word back together with nothing inserted between the halves.
+#[test]
+fn a_wrap_inside_a_word_rejoins_the_word() {
+    assert_wrapped_copy(
+        "wrapped-word-boundary-check",
+        (0, 0),
+        (COLS - 1, 1),
+        "wrapped-word-boundary-check",
+        "wrapped-word-boundar\ny-check",
+    );
+}
+
+/// A real newline after a soft-wrapped line still breaks the copy. Only
+/// the wrap is absorbed.
+#[test]
+fn a_hard_newline_after_a_wrapped_line_survives() {
+    assert_wrapped_copy(
+        "abcdefghijklmnopqrstuvwxyz0123\r\ntail",
+        (0, 0),
+        (COLS - 1, 2),
+        "abcdefghijklmnopqrstuvwxyz0123\ntail",
+        "abcdefghijklmnopqrst\nuvwxyz0123\ntail",
+    );
+}
+
+/// Starting the selection part-way through a wrapped line keeps the rest
+/// of that line on one line rather than breaking it at the screen edge.
+#[test]
+fn a_selection_starting_mid_wrapped_line_still_joins_the_rest() {
+    assert_wrapped_copy(
+        WRAP_2,
+        (5, 0),
+        (COLS - 1, 1),
+        "fghijklmnopqrstuvwxyz0123",
+        "fghijklmnopqrst\nuvwxyz0123",
+    );
+}
+
+/// A row of nothing but wide glyphs fills all 20 columns exactly and
+/// wraps into the next row.
+#[test]
+fn a_wrapped_line_of_wide_glyphs_copies_as_one_line() {
+    let cjk = "\u{4f60}\u{597d}".repeat(5);
+    assert_wrapped_copy(
+        &format!("{cjk}abc"),
+        (0, 0),
+        (COLS - 1, 1),
+        &format!("{cjk}abc"),
+        &format!("{cjk}\nabc"),
+    );
+}
+
+/// A wide grapheme that does not fit in the last column wraps whole,
+/// leaving a placeholder behind. The rejoined line must carry the
+/// grapheme exactly once and put nothing where the placeholder was.
+#[test]
+fn a_wide_grapheme_straddling_the_wrap_boundary_copies_once() {
+    assert_wrapped_copy(
+        "1234567890123456789\u{754c}XY",
+        (0, 0),
+        (3, 1),
+        "1234567890123456789\u{754c}XY",
+        "1234567890123456789\n\u{754c}XY",
+    );
+}
+
+/// Ending the selection ON that placeholder is the case libghostty
+/// handles by reaching into the next row for the grapheme that wrapped
+/// (`PageFormatter.formatWithState`'s spacer-head adjustment). The
+/// viewport walk cannot mirror that reach — the limit is page-relative —
+/// so it hands the selection back to the formatter, which is why the two
+/// scroll positions still agree.
+#[test]
+fn a_selection_ending_on_a_wrapped_wide_placeholder_picks_up_the_grapheme() {
+    assert_wrapped_copy(
+        "1234567890123456789\u{754c}XY",
+        (0, 0),
+        (COLS - 1, 0),
+        "1234567890123456789\u{754c}",
+        "1234567890123456789",
+    );
 }
 
 /// The three cases the viewport walk used to get wrong. Asserted as exact

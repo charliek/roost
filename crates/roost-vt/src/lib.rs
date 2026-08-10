@@ -122,6 +122,8 @@ mod selection;
 mod terminal;
 
 #[cfg(feature = "ffi")]
+pub use formatter::UNWRAP_SOFT_WRAPPED_LINES;
+#[cfg(feature = "ffi")]
 pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
 #[cfg(feature = "ffi")]
 pub use mouse_encoder::{
@@ -129,7 +131,7 @@ pub use mouse_encoder::{
 };
 #[cfg(feature = "ffi")]
 pub use render_state::{
-    Cell, CellWide, Colors, CursorInfo, CursorVisualStyle, Dirty, RenderState, Style,
+    Cell, CellWide, Colors, CursorInfo, CursorVisualStyle, Dirty, RenderState, RowWrap, Style,
 };
 #[cfg(feature = "ffi")]
 pub use scroll::{PageDirection, PageRoute, ScrollDirection, ScrollRoute, TerminalScroll};

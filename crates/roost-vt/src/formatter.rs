@@ -24,6 +24,22 @@ use std::ptr;
 use crate::sys;
 use crate::{Error, Point, Result, Terminal};
 
+/// Join soft-wrapped rows into one line when copying.
+///
+/// Plan 024 D4.4. This is a **deliberate, visible behavior change**: a
+/// line the terminal wrapped across several rows copies as one long
+/// line, the way Ghostty and every other modern terminal copy it,
+/// instead of as one line per screen row. Flip it to `false` to restore
+/// per-row copying.
+///
+/// Both copy paths honor this constant — libghostty's formatter here,
+/// and the render-state walk in `selection.rs` that handles a selection
+/// entirely inside the viewport — so the two agree whichever way it is
+/// set, and a copy never depends on scroll position. Its Swift twin is
+/// `SelectionFormatter.unwrapSoftWrappedLines`; the two must match or
+/// the Mac and Linux UIs copy differently.
+pub const UNWRAP_SOFT_WRAPPED_LINES: bool = true;
+
 /// RAII owner of a `GhosttyFormatter` handle. Private so a formatter can
 /// never be stored across a terminal mutation (see the module docs).
 struct Formatter(sys::GhosttyFormatter);
@@ -79,7 +95,7 @@ pub(crate) fn selection_text(
     let options = sys::GhosttyFormatterTerminalOptions {
         size: std::mem::size_of::<sys::GhosttyFormatterTerminalOptions>(),
         emit: sys::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN,
-        unwrap: false,
+        unwrap: UNWRAP_SOFT_WRAPPED_LINES,
         // Roost does want trailing spaces gone, but not libghostty's
         // version of it: its trim treats any cell whose base codepoint is
         // a space as blank, so a space carrying a combining mark loses the
@@ -139,7 +155,12 @@ pub(crate) fn selection_text(
 
 /// Drop trailing `0x20` from every line. Only spaces — every other
 /// whitespace codepoint is content a terminal cell holds deliberately.
-fn trim_trailing_spaces(text: &str) -> String {
+///
+/// Shared with the viewport walk so both paths trim identically. With
+/// [`UNWRAP_SOFT_WRAPPED_LINES`] on, "line" means the joined logical
+/// line: a wrapped row's trailing spaces sit mid-line and survive,
+/// which is what keeps the rejoin from eating characters.
+pub(crate) fn trim_trailing_spaces(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for (i, line) in text.split('\n').enumerate() {
         if i > 0 {
