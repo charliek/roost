@@ -92,6 +92,53 @@ struct SingleInstanceTests {
         }
     }
 
+    // Regression guard for #324, mirroring the Rust
+    // `drop_releases_even_when_a_forked_child_inherited_the_fd`.
+    // flock(2) locks belong to the open file description, not the fd
+    // or the process, so a fork()ed child that inherited the fd keeps
+    // the lock alive past our close(2). The app forks on every PTY
+    // spawn. Clearing FD_CLOEXEC makes the fork→exec window
+    // deterministic instead of intermittent.
+    //
+    // Foundation's `Process` is deliberately NOT used here: on Darwin it
+    // spawns with POSIX_SPAWN_CLOEXEC_DEFAULT, which closes every fd in
+    // the child regardless of FD_CLOEXEC, so the test would pass
+    // vacuously. Plain `posix_spawn` inherits normally.
+    @Test func releaseOnDeinitSurvivesAForkedChildHoldingTheFD() throws {
+        let path = uniqueLockPath()
+        defer { unlink(path) }
+
+        var child: pid_t = 0
+        defer {
+            if child > 0 {
+                kill(child, SIGKILL)
+                var status: Int32 = 0
+                waitpid(child, &status, 0)
+            }
+        }
+
+        do {
+            let first = try SingleInstance.acquire(lockPath: path)
+            guard case .acquired(let inst) = first else {
+                Issue.record("first acquire failed: \(first)")
+                return
+            }
+            #expect(fcntl(inst.lockFD, F_SETFD, 0) == 0)
+
+            var argv: [UnsafeMutablePointer<CChar>?] = [strdup("/bin/sleep"), strdup("30"), nil]
+            defer { argv.forEach { free($0) } }
+            #expect(posix_spawn(&child, "/bin/sleep", nil, nil, &argv, environ) == 0)
+        }
+
+        switch try SingleInstance.acquire(lockPath: path) {
+        case .acquired: break
+        case .alreadyHeld(let pid):
+            Issue.record("an inherited fd blocked re-acquire: alreadyHeld(\(pid))")
+        case .bypassed:
+            Issue.record("expected re-acquire, got bypassed")
+        }
+    }
+
     private func uniqueLockPath() -> String {
         let id = UUID().uuidString
         return "/tmp/roost-tests-\(id).lock"

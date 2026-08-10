@@ -14,6 +14,7 @@ tools/
     linux/          uinput key/pointer + clipboard + single-monitor (COSMIC/Wayland).
     (mac/)          CGEvent equivalent — planned.
   perf/           Render-path cost — a sibling axis, not a layer (see intro above).
+  repro/          (non-tier — on-demand drivers for intermittent bugs; see repro/README.md)
   roosttest_unit/ (non-tier — fast unit tests for the harness wiring itself)
   shed/           (non-tier — Apple VZ Linux microVM driver for Linux testing from a Mac)
   wayland/        (non-tier — Wayland-specific test support)
