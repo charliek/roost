@@ -9,35 +9,40 @@
 // on Darwin, and wrong the moment the same rule meets Linux, where
 // connect(2) to an AF_UNIX stream socket with a full accept backlog
 // returns EAGAIN from a live listener.
+//
+// XCTest, not swift-testing, deliberately: this is a swarm of
+// instantaneous value checks, which is the shape that aborts
+// swiftpm-testing-helper on Xcode 26.x (issue #289, signal 6 killing the
+// whole runner mid-suite). Adding these under swift-testing reproduced
+// it on CI while passing locally. Do not "modernize" this file.
 
 import Darwin
-import Testing
+import XCTest
 
 @testable import Roost
 
-@Suite("Socket liveness errno rule")
-struct SocketLivenessTests {
-    @Test func aSuccessfulConnectIsLive() {
-        #expect(IPCServer.classifyConnect(result: 0, errnoValue: 0) == .live)
+final class SocketLivenessTests: XCTestCase {
+    func testASuccessfulConnectIsLive() {
+        XCTAssertEqual(IPCServer.classifyConnect(result: 0, errnoValue: 0), .live)
     }
 
-    @Test func onlyRefusedAndAbsentAreStale() {
-        #expect(IPCServer.classifyConnect(result: -1, errnoValue: ECONNREFUSED) == .stale)
-        #expect(IPCServer.classifyConnect(result: -1, errnoValue: ENOENT) == .stale)
+    func testOnlyRefusedAndAbsentAreStale() {
+        XCTAssertEqual(IPCServer.classifyConnect(result: -1, errnoValue: ECONNREFUSED), .stale)
+        XCTAssertEqual(IPCServer.classifyConnect(result: -1, errnoValue: ENOENT), .stale)
     }
 
     /// The case that forces the rule: a live listener whose accept
     /// backlog is full. Treating it as stale would unlink a running
     /// UI's socket out from under it.
-    @Test func aFullAcceptBacklogIsLiveNotStale() {
-        #expect(IPCServer.classifyConnect(result: -1, errnoValue: EAGAIN) == .live)
-        #expect(IPCServer.classifyConnect(result: -1, errnoValue: EWOULDBLOCK) == .live)
+    func testAFullAcceptBacklogIsLiveNotStale() {
+        XCTAssertEqual(IPCServer.classifyConnect(result: -1, errnoValue: EAGAIN), .live)
+        XCTAssertEqual(IPCServer.classifyConnect(result: -1, errnoValue: EWOULDBLOCK), .live)
     }
 
-    @Test func unexpectedErrnosStayOnTheSafeSide() {
+    func testUnexpectedErrnosStayOnTheSafeSide() {
         for code in [EACCES, EPERM, EINTR, ETIMEDOUT, ENOMEM, EADDRINUSE] {
-            #expect(
-                IPCServer.classifyConnect(result: -1, errnoValue: code) == .live,
+            XCTAssertEqual(
+                IPCServer.classifyConnect(result: -1, errnoValue: code), .live,
                 "errno \(code) must not authorize an unlink")
         }
     }
