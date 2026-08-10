@@ -31,11 +31,9 @@
 //!
 //! M6 hardens this with the explicit stale-socket recovery loop.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-
-use fs2::FileExt;
 
 /// Live single-instance lock. Drop releases the flock.
 #[derive(Debug)]
@@ -101,13 +99,14 @@ pub fn acquire(lock_path: impl AsRef<Path>) -> Result<InstanceLock, AcquireError
         .write(true)
         .open(&lock_path)?;
 
-    // `fs2::FileExt::try_lock_exclusive` is `flock(LOCK_EX | LOCK_NB)`.
-    if let Err(err) = file.try_lock_exclusive() {
-        // Read whatever PID the previous holder wrote (best-effort).
-        let pid = read_pid(&file).unwrap_or(0);
-        return Err(match err.kind() {
-            std::io::ErrorKind::WouldBlock => AcquireError::AlreadyHeld(pid),
-            _ => AcquireError::Io(err),
+    // `File::try_lock` is `flock(LOCK_EX | LOCK_NB)` on unix, and unlike
+    // the io::Error it replaces it distinguishes contention from a real
+    // failure in the type rather than by errno.
+    if let Err(err) = file.try_lock() {
+        return Err(match err {
+            // Read whatever PID the previous holder wrote (best-effort).
+            TryLockError::WouldBlock => AcquireError::AlreadyHeld(read_pid(&file).unwrap_or(0)),
+            TryLockError::Error(err) => AcquireError::Io(err),
         });
     }
 
