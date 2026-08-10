@@ -215,6 +215,12 @@ impl PtySupervisor {
     /// gets there first, `publish_exit_once` makes it exactly one
     /// `Exit`.
     ///
+    /// Session lifetime: the session is installed before the reap task
+    /// starts, and the reap task removes it before it reports the exit
+    /// on either channel. So a session always has a waiter that will
+    /// take it back out, and by the time a consumer sees `Exit` (or
+    /// `TabExited`) the tab is already gone from the map.
+    ///
     /// Errors:
     /// * [`PtyError::DuplicateTab`] — `tab_id` already has a live
     ///   session. Caller must `close()` the prior session first.
@@ -389,15 +395,59 @@ impl PtySupervisor {
             debug!(tab_id, "pty input loop ended");
         });
 
-        // Wait for the child to exit; hand the status to the reader
-        // task (which publishes it onto the output channel) and send
-        // it on the lifecycle channel so both per-tab consumers and
-        // the workspace converge.
         let output_tx_exit = output_tx.clone();
         let lifecycle_tx = self.lifecycle.clone();
         let sessions_for_reap = self.sessions.clone();
         let reaped_for_wait = reaped.clone();
         let exit_published_for_wait = exit_published.clone();
+
+        let session = Session {
+            cmd_tx,
+            output_tx,
+            killer: Mutex::new(killer),
+            pid,
+            reaped,
+            initial_rx: Some(initial_rx),
+        };
+        // Promote the slot from pending → sessions atomically, BEFORE
+        // the reap task exists (see below).
+        //
+        // If `close(tab_id)` ran while we were building the PTY it
+        // removed our entry from `pending` as a cancellation signal.
+        // Detect that here and hand the session back instead of
+        // installing it; the caller-visible teardown happens after the
+        // reap task is started, so the child is still reaped.
+        let cancelled = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap();
+            if pending.remove(&tab_id) {
+                sessions.insert(tab_id, session);
+                None
+            } else {
+                Some(session)
+            }
+        };
+        // Either branch consumed the pending entry (ours, or the one
+        // `close()` already took), so the guard has nothing left to do.
+        slot.armed = false;
+
+        // Wait for the child to exit; hand the status to the reader
+        // task (which publishes it onto the output channel) and send
+        // it on the lifecycle channel so both per-tab consumers and
+        // the workspace converge.
+        //
+        // Started only now that the promotion has run, because this
+        // task's identity-checked removal is the ONLY thing that ever
+        // takes the session back out. Starting it earlier meant a
+        // child that exited during the promotion window got reaped
+        // first: the removal found no session and removed nothing,
+        // then the promotion installed a session whose child was
+        // already dead — `has()` kept answering yes and `write()` kept
+        // accepting input for a PTY nobody was reading. Ordering it
+        // after the insert makes "a reaped child leaves no session"
+        // structural. It also means no `Exit` can be published before
+        // the session is reachable: the reader only publishes once
+        // this task hands it a status.
         tokio::task::spawn_blocking(move || {
             let status = match child.wait() {
                 Ok(status) => status.exit_code() as i32,
@@ -407,12 +457,15 @@ impl PtySupervisor {
                 }
             };
             // Mark reaped first so a concurrent `close()` SIGKILL
-            // watchdog stands down, then hand the status to the reader
-            // and drop the dead session so later writes get `NotFound`
-            // instead of silently succeeding against a closed PTY.
+            // watchdog stands down, then drop the dead session so
+            // later writes get `NotFound` instead of silently
+            // succeeding against a closed PTY — and only then tell
+            // anyone the child exited. Removing ahead of both the
+            // status handoff and `TabExited` means the tab is already
+            // unreachable by the time either channel reports the exit,
+            // so a consumer reacting to `Exit` can never find a live
+            // session for a dead child.
             reaped_for_wait.store(true, Ordering::SeqCst);
-            let _ = status_tx.send(status);
-            let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status });
             {
                 // Only remove the session if THIS waiter still owns it.
                 // `close()` frees the slot synchronously, so the same
@@ -429,6 +482,8 @@ impl PtySupervisor {
                     sessions.remove(&tab_id);
                 }
             }
+            let _ = status_tx.send(status);
+            let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status });
             // Backstop for a reader that never reaches EOF (#255).
             // Ends as soon as the reader task drops its sender —
             // by then it has published `Exit` and this is a no-op —
@@ -443,45 +498,17 @@ impl PtySupervisor {
             }
         });
 
-        let session = Session {
-            cmd_tx,
-            output_tx,
-            killer: Mutex::new(killer),
-            pid,
-            reaped,
-            initial_rx: Some(initial_rx),
-        };
-        // Promote the slot from pending → sessions atomically.
-        // If `close(tab_id)` ran while we were building the PTY it
-        // removed our entry from `pending` as a cancellation
-        // signal. Detect that here, kill the freshly-spawned
-        // child, and don't insert into `sessions`. The killer was
-        // moved into the wait task already, so we reach for the
-        // copy we stashed in `session` below — actually the
-        // session struct already holds the killer, so we tear it
-        // back down via `terminate_child` (SIGHUP→SIGKILL) and drop
-        // `session` (which drops the input/resize channels, the
-        // writer task exits, and the wait task reaps once the
-        // signal lands).
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            let mut pending = self.pending.lock().unwrap();
-            if !pending.remove(&tab_id) {
-                // Cancelled by close(). Kill the child rather than
-                // returning a usable receiver.
-                drop(pending);
-                drop(sessions);
-                terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
-                drop(session);
-                // SlotGuard is no longer needed — pending was
-                // already cleared by close(); we already cleaned
-                // up the child.
-                slot.armed = false;
-                return Err(PtyError::Cancelled(tab_id).into());
-            }
-            sessions.insert(tab_id, session);
+        if let Some(session) = cancelled {
+            // Cancelled by close(). Kill the child rather than
+            // returning a usable receiver: `terminate_child` sends
+            // SIGHUP (SIGKILL on the watchdog), and the reap task
+            // started above reaps whatever the signal lands on.
+            // Dropping `session` drops the input/resize channels, so
+            // the writer task exits too.
+            terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
+            drop(session);
+            return Err(PtyError::Cancelled(tab_id).into());
         }
-        slot.armed = false;
 
         Ok(early_rx)
     }

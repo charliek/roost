@@ -221,21 +221,14 @@ async fn write_after_exit_returns_not_found() {
         }
     }
 
-    // The wait task removes the dead session right after publishing
-    // Exit; poll until the write is rejected with NotFound.
-    let probe_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match sup.write(7, b"x".to_vec()).await {
-            Err(roost_engine::PtyError::NotFound(7)) => break,
-            other => {
-                assert!(
-                    std::time::Instant::now() < probe_deadline,
-                    "write to a dead tab never became NotFound: {other:?}"
-                );
-                sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
+    // No poll: the wait task removes the dead session BEFORE it hands
+    // the status to the reader, so having seen `Exit` (or the channel
+    // closing behind it) already means the session is gone.
+    let result = sup.write(7, b"x".to_vec()).await;
+    assert!(
+        matches!(result, Err(roost_engine::PtyError::NotFound(7))),
+        "write to a dead tab must be NotFound, got {result:?}"
+    );
 }
 
 /// #80 A2: a shell that ignores SIGHUP must still be reaped by

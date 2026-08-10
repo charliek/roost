@@ -89,9 +89,20 @@ impl TabSession {
                             break;
                         }
                     }
-                    // Stopping here is safe: the supervisor's reader
-                    // task publishes `Exit` after the last bytes it
-                    // read, so nothing is left behind (#255).
+                    // Stopping here is safe on the normal path: the
+                    // supervisor's reader task publishes `Exit` after
+                    // the last bytes it read, so nothing is left
+                    // behind (#255).
+                    //
+                    // The exception is `pty.rs`'s bounded deadline
+                    // fallback. A reader that never reaches EOF — a
+                    // background descendant holding the slave fd keeps
+                    // the master readable forever — has `Exit`
+                    // published out from under it after
+                    // `EXIT_PUBLISH_GRACE`, and the bytes it reads
+                    // afterwards are dropped by the `break` below.
+                    // That is the deliberate trade: a tab that never
+                    // reports its exit would never auto-close.
                     Ok(PtyOutputEvent::Exit(status)) => {
                         let _ = output_tx.send(TabOutput::Exit {
                             status,

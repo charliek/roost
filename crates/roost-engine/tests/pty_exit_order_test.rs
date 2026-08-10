@@ -7,14 +7,19 @@
 //! reader had not flushed yet. Now the reader publishes `Exit` after its
 //! final `Bytes`, so the ordering is structural.
 //!
-//! Both tests consume through the production `TabSession`, i.e. the same
-//! path the UIs use.
+//! The other half of the exit path is session lifetime: the reap task's
+//! identity-checked removal is the only thing that takes a session out
+//! of the supervisor's map, so it must start after the session is in
+//! there and must remove it before anyone learns the child exited.
+//!
+//! Every test here consumes through the production `TabSession`, i.e.
+//! the same path the UIs use.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use roost_engine::session::{TabOutput, TabSession};
-use roost_engine::PtySupervisor;
+use roost_engine::{PtyError, PtySupervisor};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::sleep;
 
@@ -149,18 +154,13 @@ async fn exit_arrives_while_a_descendant_holds_the_pty_open() {
     let (bytes, status, _) = drain_until_exit(&mut out_rx, Duration::from_secs(10)).await;
     let elapsed = started.elapsed();
     sup.close(700);
-
-    // Release the PTY so the reader's blocking read can return.
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    if let Some(pid) = text
-        .split("ROOST_HOLDER_PID=")
-        .nth(1)
-        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|digits| digits.parse::<i32>().ok())
-    {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
 
+    // Assert the bound BEFORE signalling anything. `sleep 5` is only
+    // guaranteed to still be alive while the drain stayed inside its
+    // deadline; if the drain burned its full 10s budget the holder has
+    // long exited and its pid may have been recycled onto an unrelated
+    // process, so the SIGKILL below must not run.
     assert_eq!(
         status,
         Some(0),
@@ -170,4 +170,68 @@ async fn exit_arrives_while_a_descendant_holds_the_pty_open() {
         elapsed < Duration::from_secs(3),
         "Exit took {elapsed:?}, well past the bounded deadline"
     );
+
+    // Bounded path only: release the PTY so the reader's blocking read
+    // can return. On the failing path the assertions above already
+    // panicked and `sleep 5` reaps itself.
+    if let Some(pid) = text
+        .split("ROOST_HOLDER_PID=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<i32>().ok())
+    {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// A child that exits essentially immediately must not leave its
+/// session behind.
+///
+/// The reap task used to be spawned before `spawn()` promoted the
+/// session into the supervisor's map. Its identity-checked removal
+/// (#80) is the only thing that ever takes a session back out, so a
+/// child reaped inside that window removed nothing and the promotion
+/// then installed a session for an already-dead PTY: `has()` kept
+/// answering yes and `write()` kept accepting input for a PTY nobody
+/// was reading. The session is installed before the reap task starts
+/// now, so every session has a waiter that will remove it.
+///
+/// The assertions are deterministic, not timing-based: the reap task
+/// removes the session *before* it hands the status to the reader, so
+/// observing `Exit` already implies the removal happened. What is not
+/// deterministic is provoking the original race — it needs the child
+/// reaped inside a promotion window microseconds wide, which is why the
+/// loop runs the fast-exit path repeatedly rather than once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fast_child_leaves_no_session_behind() {
+    let socket = std::path::PathBuf::from("/tmp/roost-pty-exit-fast-child.sock");
+    let sup = Arc::new(PtySupervisor::new());
+    for tab_id in 800..825 {
+        let pty_rx = sup
+            .spawn(
+                tab_id,
+                "/tmp",
+                &["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                80,
+                24,
+                &socket,
+            )
+            .expect("spawn");
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _session = TabSession::attach_with_receiver(sup.clone(), tab_id, pty_rx, out_tx, None);
+
+        let (_, status, _) = drain_until_exit(&mut out_rx, Duration::from_secs(10)).await;
+        assert_eq!(status, Some(7), "tab {tab_id}: no Exit event");
+        assert!(
+            !sup.has(tab_id),
+            "tab {tab_id}: the session outlived its reaped child"
+        );
+        assert!(
+            matches!(
+                sup.write(tab_id, b"x".to_vec()).await,
+                Err(PtyError::NotFound(id)) if id == tab_id
+            ),
+            "tab {tab_id}: write() accepted input for an exited PTY"
+        );
+    }
 }
