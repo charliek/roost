@@ -4,7 +4,11 @@
 //! re-exports the type as a compatibility shim until the daemon
 //! goes away in M7. The Swift companion at
 //! `mac/Sources/Roost/BundleProfile.swift` mirrors this resolver
-//! byte-for-byte; the two implementations are tested in lockstep.
+//! byte-for-byte **on macOS** — the only OS it runs on — and the two
+//! implementations are tested in lockstep there. Off macOS this
+//! resolver diverges by design: the Gtk profile's app id collapses
+//! onto the production `ai.stridelabs.Roost`, matching how its paths
+//! already collapse.
 //!
 //! # Two locks
 //!
@@ -46,9 +50,13 @@ use anyhow::Context;
 pub enum BundleProfileKind {
     /// The Swift `Roost.app`. App id: `ai.stridelabs.Roost`.
     Mac,
-    /// The gtk4-rs `roost-linux` binary. App id:
-    /// `ai.stridelabs.Roost.gtk`. The production Linux UI; on macOS
-    /// this is the dev-mode side-by-side variant.
+    /// The gtk4-rs `roost-linux` binary. The production Linux UI; on
+    /// macOS this is the dev-mode side-by-side variant. Its app id is
+    /// platform-resolved: `ai.stridelabs.Roost` on Linux, shared with
+    /// the Mac profile that can never run there and that already
+    /// shares the production path namespace; `ai.stridelabs.Roost.gtk`
+    /// on macOS, where the side-by-side dev matrix needs the three
+    /// profiles to stay distinct.
     Gtk,
     /// The Rust + Iced proof of concept. App id:
     /// `ai.stridelabs.Roost.iced`. Always isolated from the production
@@ -81,7 +89,12 @@ pub struct BundleProfile {
     /// and GTK and the isolated `roost-iced/` namespace for Iced.
     pub app_label: &'static str,
     /// Reverse-DNS application identifier (`CFBundleIdentifier` on
-    /// macOS, gtk `application_id` on Linux).
+    /// macOS, gtk `application_id` on Linux). Stable per kind except
+    /// for Gtk, which resolves per platform — `ai.stridelabs.Roost` on
+    /// Linux (shared with the Mac profile, which never runs there and
+    /// already shares the production path namespace) and
+    /// `ai.stridelabs.Roost.gtk` on macOS (the side-by-side dev matrix
+    /// requires distinct ids).
     pub app_id: &'static str,
     pub socket_path: PathBuf,
     pub state_dir: PathBuf,
@@ -93,7 +106,14 @@ impl BundleProfile {
     pub fn for_kind(kind: BundleProfileKind) -> anyhow::Result<BundleProfile> {
         let (app_label, app_id) = match kind {
             BundleProfileKind::Mac => ("Roost", "ai.stridelabs.Roost"),
-            BundleProfileKind::Gtk => ("Roost-gtk", "ai.stridelabs.Roost.gtk"),
+            BundleProfileKind::Gtk => (
+                "Roost-gtk",
+                if cfg!(target_os = "macos") {
+                    "ai.stridelabs.Roost.gtk"
+                } else {
+                    "ai.stridelabs.Roost"
+                },
+            ),
             BundleProfileKind::Iced => ("Roost-iced", "ai.stridelabs.Roost.iced"),
         };
         let (socket_path, state_dir, log_dir) = resolve_paths(kind, app_label)?;
@@ -347,7 +367,10 @@ mod tests {
         let gtk = BundleProfile::gtk().expect("gtk profile");
         let iced = BundleProfile::iced().expect("iced profile");
         assert_eq!(mac.app_id, "ai.stridelabs.Roost");
+        #[cfg(target_os = "macos")]
         assert_eq!(gtk.app_id, "ai.stridelabs.Roost.gtk");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(gtk.app_id, "ai.stridelabs.Roost");
         assert_eq!(iced.app_id, "ai.stridelabs.Roost.iced");
         assert_eq!(mac.app_label, "Roost");
         assert_eq!(gtk.app_label, "Roost-gtk");
@@ -445,6 +468,11 @@ mod tests {
         assert!(mac.socket_path.to_string_lossy().contains("/Roost/"));
         assert!(gtk.socket_path.to_string_lossy().contains("/Roost-gtk/"));
         assert!(iced.socket_path.to_string_lossy().contains("/Roost-iced/"));
+        // The side-by-side dev matrix needs distinct ids too, not just
+        // distinct paths: macOS keys the running instance by app id.
+        assert_ne!(mac.app_id, gtk.app_id);
+        assert_ne!(mac.app_id, iced.app_id);
+        assert_ne!(gtk.app_id, iced.app_id);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -460,6 +488,8 @@ mod tests {
         assert_ne!(gtk.state_dir, iced.state_dir);
         assert_ne!(gtk.log_dir, iced.log_dir);
         assert!(iced.socket_path.to_string_lossy().contains("roost-iced"));
+        assert_eq!(gtk.app_id, "ai.stridelabs.Roost");
+        assert_ne!(gtk.app_id, iced.app_id);
     }
 
     // ROOST_STATE_DIR override policy (pure helper — no env mutation).

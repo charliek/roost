@@ -1,5 +1,6 @@
 # StartupWMClass matches the app id the packaged (iced) binary announces —
-# unchanged from the prior GTK package so the icon/taskbar association holds.
+# renamed to the production id in the first iced release (#320). The legacy
+# `.gtk` name lives on as the NoDisplay alias in roost-gtk-alias.desktop.
 [Desktop Entry]
 Type=Application
 Name=Roost
@@ -11,4 +12,4 @@ Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;shell;multiplexer;tabs;claude;codex;
 StartupNotify=true
-StartupWMClass=ai.stridelabs.Roost.gtk
+StartupWMClass=ai.stridelabs.Roost

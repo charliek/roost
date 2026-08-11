@@ -76,6 +76,9 @@ struct BundleProfile: Sendable {
         kind: BundleProfileKind,
         environment env: [String: String] = ProcessInfo.processInfo.environment
     ) -> BundleProfile {
+        // Matches Rust's `paths.rs` on macOS, the only OS this runs on.
+        // There the Gtk id is platform-resolved and collapses onto
+        // `ai.stridelabs.Roost` on Linux; `.gtk` is the macOS answer.
         let (appLabel, appID): (String, String) = {
             switch kind {
             case .mac: return ("Roost", "ai.stridelabs.Roost")

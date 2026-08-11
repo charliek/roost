@@ -89,6 +89,7 @@ active_project=1
 active_tab=5
 ui_version=0.1.0
 proto_version=1
+app_id=ai.stridelabs.Roost
 ```
 
 Prints `key=value` lines, not JSON. Useful for verifying the socket is reachable and the env vars are wired correctly.

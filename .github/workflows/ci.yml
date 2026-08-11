@@ -775,6 +775,14 @@ jobs:
           sudo tar -C /usr/local/bin -xzf /tmp/nfpm.tgz nfpm
           nfpm --version
 
+      # smoke-deb.sh validates the staged .desktop entries with
+      # desktop-file-validate; only the deb path stages any.
+      - name: Install desktop-file-utils
+        if: needs.changes.outputs.deb == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils
+
       # One build, not two — and now enforced rather than assumed.
       # [profile.release] is `lto = "thin"` + `codegen-units = 1`, so a second
       # cold LTO link would blow this job's 45-minute budget. build-deb.sh's

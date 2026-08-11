@@ -1,0 +1,17 @@
+# Legacy alias. v0.0.17 and earlier installed the desktop entry as
+# ai.stridelabs.Roost.gtk.desktop; a launcher pin created then references
+# that desktop-file id forever. This alias keeps such pins launching —
+# and grouping, on shells that match pins through StartupWMClass — with
+# no duplicate menu entry (NoDisplay). Deletable in some future release;
+# the worst case then is a dead pin for someone who never re-pinned.
+[Desktop Entry]
+Type=Application
+Name=Roost
+Comment=Multi-project terminal multiplexer for AI coding agents
+Exec=roost %F
+Icon=roost
+Terminal=false
+NoDisplay=true
+Categories=System;TerminalEmulator;
+StartupNotify=true
+StartupWMClass=ai.stridelabs.Roost

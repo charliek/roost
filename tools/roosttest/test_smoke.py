@@ -6,7 +6,18 @@ docs/development/claude-testing.md.
 
 from __future__ import annotations
 
+import sys
 import uuid
+
+
+# The Gtk id is platform-resolved: on Linux it collapses onto the
+# production id (the Swift UI can never run there), on macOS it stays
+# distinct so the three dev profiles can run side by side.
+EXPECTED_APP_IDS = {
+    "mac": "ai.stridelabs.Roost",
+    "iced": "ai.stridelabs.Roost.iced",
+    "gtk": "ai.stridelabs.Roost.gtk" if sys.platform == "darwin" else "ai.stridelabs.Roost",
+}
 
 
 def _wait_flag(roost, tab_id, key, value, timeout=4.0):
@@ -42,6 +53,12 @@ def test_notification_set_and_clear(roost, project):
     _wait_flag(roost, a, "has_notification", True)
     roost.clear_notification(a)
     _wait_flag(roost, a, "has_notification", False)
+
+
+def test_identify_reports_the_target_app_id(roost, target):
+    # Exact equality, never a prefix check: the macOS gtk id
+    # `ai.stridelabs.Roost.gtk` has the production id as a prefix.
+    assert roost.identify()["app_id"] == EXPECTED_APP_IDS[target]
 
 
 def test_focus_sets_active_tab(roost, project):
