@@ -59,9 +59,6 @@ use roost_ipc::{IpcClient, IpcServer};
 
 use crate::app::App;
 
-// Matches `BundleProfile::gtk().app_id` (roost-common).
-const APP_ID: &str = "ai.stridelabs.Roost.gtk";
-
 /// Rate-limit window for the glib log writer. Within each window at most
 /// [`LOG_MAX_PER_WINDOW`] messages reach the default writer; the overflow is
 /// counted and collapsed into one summary line. This bounds the blast radius
@@ -348,7 +345,9 @@ fn main() -> anyhow::Result<()> {
 
     let client = LocalClient::new(workspace, supervisor, socket_path);
 
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = Application::builder()
+        .application_id(profile.app_id)
+        .build();
     let client_for_activate = client.clone();
     // `connect_activate` is `Fn`, but the UI receiver isn't Clone and is
     // consumed once. Wrap it so the first (only) GTK activation hands it

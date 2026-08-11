@@ -564,13 +564,14 @@ async fn main() -> Result<()> {
         Cmd::Identify => {
             let resp = identify(&mut client).await?;
             println!(
-                "socket={}\npid={}\nactive_project={}\nactive_tab={}\nui_version={}\nproto_version={}",
+                "socket={}\npid={}\nactive_project={}\nactive_tab={}\nui_version={}\nproto_version={}\napp_id={}",
                 resp.socket_path,
                 resp.pid,
                 resp.active_project_id,
                 resp.active_tab_id,
                 resp.ui_version,
-                resp.protocol_version
+                resp.protocol_version,
+                resp.app_id
             );
         }
         Cmd::Wait {
