@@ -454,6 +454,22 @@ open_tab "${alpha_id}" /root alpha-two >/dev/null
 open_tab "${beta_id}"  /root beta-one  >/dev/null
 echo "authored projects ${alpha_id} (upgrade-alpha) + ${beta_id} (upgrade-beta) with 3 explicit tabs."
 
+# Give a tab to any project that has none — in practice the default project
+# the UI creates for itself on first launch. A project persisted with an
+# EMPTY tab list is re-seeded with one fresh tab by the next restore (see
+# roost-engine/src/persistence.rs: "no saved tabs" -> the UI seeds a single
+# tab on restore), so such a project's layout legitimately changes across
+# any relaunch. Measured: an old -> old relaunch with no upgrade in it
+# produces exactly the same delta. Leaving one in the fixture would fail the
+# byte-identical diff below on something the upgrade did not cause.
+empty_project_ids="$("${ROOSTCTL}" tab list --json | jq -r '.projects[] | select((.tabs // []) | length == 0) | .id')" \
+  || die "roostctl tab list --json failed against the old UI."
+while read -r empty_id; do
+  [ -n "${empty_id}" ] || continue
+  open_tab "${empty_id}" /tmp "seeded-${empty_id}" >/dev/null
+  echo "gave project ${empty_id} a tab (it had none, and an empty project is re-seeded on every restore)."
+done <<<"${empty_project_ids}"
+
 # Lock EVERY tab's title, including the ones the UI seeded itself. `tab open
 # --title` leaves the title a placeholder (`user_titled=false`), which the
 # model is free to re-derive from the cwd on the first post-relaunch shell
