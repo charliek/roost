@@ -634,6 +634,18 @@ passes and the installed entry's `StartupWMClass` matches the WM_CLASS
 the packaged binary announces. Cutting an actual release remains a
 separate, manual step — not part of this work and not yet done.
 
+**Shipped identity rename (2026-08-10, plan 025, #320).** The first
+iced release renamed the shipped Linux app id from
+`ai.stridelabs.Roost.gtk` to `ai.stridelabs.Roost`: packaging now
+installs the canonical `ai.stridelabs.Roost.desktop` plus a
+`NoDisplay=true` alias at the old `ai.stridelabs.Roost.gtk.desktop`
+name (`StartupWMClass` pointed at the new class) so upgraders with a
+pre-rename pin (taskbar, `.desktop` override) still resolve. macOS dev
+ids are unchanged — the `Mac`/`Gtk`/`Iced` side-by-side matrix still
+needs three distinct ids there. The `gtk` CLI target string and the
+`Gtk` `BundleProfileKind` variant name are kept deliberately, even
+though the shipped id they resolve to on Linux is no longer `.gtk`.
+
 Entry-criteria status (2026-08-05): the real-input criterion is **met** —
 PR #301 removed the last harness workaround (the seam-press dwell) and the
 full Iced drag/clipboard guard passes in the shed and on CI.
