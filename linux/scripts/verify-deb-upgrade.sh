@@ -400,17 +400,26 @@ LAYOUT_JQ='[ .projects // [] | sort_by(.position)[] | { name, cwd, tabs: [ .tabs
 
 # v0.0.17 put state.json in $XDG_DATA_HOME/roost (state_dir), with the log in
 # $XDG_STATE_HOME/roost — an easy pair to mix up, so both trees are searched
-# and the winner is printed instead of assumed.
+# and the winner is printed instead of assumed. The path is discovered ONCE
+# and pinned in STATE_JSON: if the second snapshot re-ran the search and the
+# new UI persisted to a different location, the diff would compare the old
+# file against itself and pass without the new UI restoring anything.
+STATE_JSON=""
 snapshot_layout() {
-  local out="$1" found
-  found="$(find "${XDG_DATA_HOME}" "${XDG_STATE_HOME}" -name state.json -type f 2>/dev/null | sort | head -n1 || true)"
-  if [ -z "${found}" ]; then
+  local out="$1"
+  if [ -z "${STATE_JSON}" ]; then
+    STATE_JSON="$(find "${XDG_DATA_HOME}" "${XDG_STATE_HOME}" -name state.json -type f 2>/dev/null | sort | head -n1 || true)"
+    if [ -z "${STATE_JSON}" ]; then
+      find "${XDG_DATA_HOME}" "${XDG_STATE_HOME}" 2>/dev/null || true
+      die "no state.json anywhere under ${XDG_DATA_HOME} or ${XDG_STATE_HOME} — the UI persisted nothing (tree listing above)."
+    fi
+    echo "layout source: ${STATE_JSON} (pinned for both snapshots)"
+  elif [ ! -f "${STATE_JSON}" ]; then
     find "${XDG_DATA_HOME}" "${XDG_STATE_HOME}" 2>/dev/null || true
-    die "no state.json anywhere under ${XDG_DATA_HOME} or ${XDG_STATE_HOME} — the UI persisted nothing (tree listing above)."
+    die "pinned state.json ${STATE_JSON} is gone after the upgrade — the new UI abandoned the old state location (tree listing above)."
   fi
-  echo "layout source: ${found}"
-  jq -S "${LAYOUT_JQ}" "${found}" >"${out}" \
-    || die "jq could not project ${found} into a layout snapshot — the state.json schema changed or the file is malformed."
+  jq -S "${LAYOUT_JQ}" "${STATE_JSON}" >"${out}" \
+    || die "jq could not project ${STATE_JSON} into a layout snapshot — the state.json schema changed or the file is malformed."
 }
 
 # ---------------------------------------------------------------- install old
