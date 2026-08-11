@@ -96,6 +96,8 @@ contents:
   - src: ./dist/roostctl
     dst: /usr/bin/roostctl
   - src: ./packaging/roost.desktop
+    dst: /usr/share/applications/ai.stridelabs.Roost.desktop
+  - src: ./packaging/roost-gtk-alias.desktop
     dst: /usr/share/applications/ai.stridelabs.Roost.gtk.desktop
   - src: ./packaging/icons/hicolor/256x256/apps/roost.png
     dst: /usr/share/icons/hicolor/256x256/apps/roost.png

@@ -200,7 +200,8 @@ jobs:
             mesa-vulkan-drivers \
             xvfb \
             xdotool \
-            zsh
+            zsh \
+            desktop-file-utils
 
       - name: Install nfpm
         env:

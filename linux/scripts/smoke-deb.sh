@@ -15,8 +15,8 @@
 #
 # What it does NOT check is the dependency closure — see verify-deb-closure.sh.
 #
-# Prerequisites: dpkg-deb, dpkg, xvfb-run (Ubuntu: dpkg-dev is already there;
-# `apt-get install -y xvfb`).
+# Prerequisites: dpkg-deb, dpkg, xvfb-run, desktop-file-validate (Ubuntu:
+# dpkg-dev is already there; `apt-get install -y xvfb desktop-file-utils`).
 #
 # Usage:
 #   ./linux/scripts/smoke-deb.sh out/roost_0.0.18_amd64.deb
@@ -66,6 +66,8 @@ done
 [ -n "${deb}" ] || { usage >&2; die "missing <deb-path>"; }
 [ -f "${deb}" ] || die "no such .deb: ${deb}"
 require_tools dpkg-deb dpkg xvfb-run
+command -v desktop-file-validate >/dev/null 2>&1 \
+  || die "desktop-file-validate is not on PATH — install it: apt-get install desktop-file-utils"
 deb="$(abspath "${deb}")"
 
 # ---------------------------------------------------------------- work dir
@@ -134,12 +136,13 @@ dpkg-deb -x "${deb}" "${payload}"
 
 # Every `dst:` in packaging/nfpm.yaml — that file is the source of truth, this
 # list is kept in sync by hand (parsing the YAML would mean a yq dependency in
-# the release path for seven constants).
+# the release path for eight constants).
 expect_exec=(
   usr/bin/roost
   usr/bin/roostctl
 )
 expect_file=(
+  usr/share/applications/ai.stridelabs.Roost.desktop
   usr/share/applications/ai.stridelabs.Roost.gtk.desktop
   usr/share/icons/hicolor/256x256/apps/roost.png
   usr/share/icons/hicolor/512x512/apps/roost.png
@@ -153,6 +156,33 @@ for f in "${expect_file[@]}"; do
   [ -f "${payload}/${f}" ] || die "${f} missing inside ${deb}"
 done
 echo "payload: all $(( ${#expect_exec[@]} + ${#expect_file[@]} )) packaged destinations present."
+
+# ---------------------------------------------------------- desktop entries
+# desktop-file-validate over every staged .desktop, then exact-line content
+# asserts. Plain `grep` is unsafe here: the legacy id
+# `ai.stridelabs.Roost.gtk` contains the new id `ai.stridelabs.Roost` as a
+# literal prefix, so a substring grep for the new StartupWMClass value would
+# also match the old file. `grep -qxF` matches the whole line, not a
+# substring, so the two ids can't be confused for each other.
+desktop-file-validate "${payload}"/usr/share/applications/*.desktop \
+  || die "desktop-file-validate rejected a staged .desktop file"
+
+canonical_desktop="${payload}/usr/share/applications/ai.stridelabs.Roost.desktop"
+grep -qxF "StartupWMClass=ai.stridelabs.Roost" "${canonical_desktop}" \
+  || die "${canonical_desktop} missing exact line 'StartupWMClass=ai.stridelabs.Roost'"
+# `if`, not `&& die`: under `set -e` a failing grep (the desired outcome
+# here) would kill the script through the `&&` list with no message.
+if grep -qxF "NoDisplay=true" "${canonical_desktop}"; then
+  die "${canonical_desktop} is the canonical entry and must not carry NoDisplay=true"
+fi
+
+alias_desktop="${payload}/usr/share/applications/ai.stridelabs.Roost.gtk.desktop"
+grep -qxF "NoDisplay=true" "${alias_desktop}" \
+  || die "${alias_desktop} missing exact line 'NoDisplay=true' (legacy alias must not appear in menus)"
+grep -qxF "StartupWMClass=ai.stridelabs.Roost" "${alias_desktop}" \
+  || die "${alias_desktop} missing exact line 'StartupWMClass=ai.stridelabs.Roost'"
+
+echo "desktop entries: canonical + legacy alias both valid and correctly identified."
 
 UI="${payload}/usr/bin/roost"
 ROOSTCTL="${payload}/usr/bin/roostctl"
@@ -202,6 +232,13 @@ if [ "${ok}" -ne 1 ]; then
   fail_with_log "roostctl identify never succeeded against the packaged /usr/bin/roost after 30s — the UI never came up (or never opened its IPC socket)."
 fi
 printf '%s\n' "${identify_out}"
+
+# Exact-line match for the same prefix-trap reason as the desktop-entry
+# checks above: `ai.stridelabs.Roost.gtk` starts with `ai.stridelabs.Roost`,
+# so a substring grep here would pass even if the packaged binary still
+# announced the legacy id.
+grep -qxF "app_id=ai.stridelabs.Roost" <<<"${identify_out}" \
+  || fail_with_log "packaged roost's 'identify' output has no exact 'app_id=ai.stridelabs.Roost' line: ${identify_out}"
 
 socket_path="$(printf '%s\n' "${identify_out}" | awk -F= '/^socket=/{print $2}')"
 if [ -z "${socket_path}" ]; then
