@@ -19,8 +19,10 @@ All tests use the `tab.feed_pty_bytes` (to enable a mode) +
 
 Cross-platform behavioral-parity gate: every case runs against
 `--roost-target mac` (PR A wiring) and `--roost-target gtk`
-(PR B wiring). A regression on either side fails the matching
-job in CI.
+(PR B wiring) and `--roost-target iced`. A regression on any
+side fails the matching job in CI. The same-cell drag-gate cases
+are the one exception — the gate is wired from iced only (plan
+026 D11), so they skip on mac and gtk.
 """
 
 from __future__ import annotations
@@ -167,6 +169,98 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
     # suppressed by the throttle's `lastCell` check.
     reports = captured.count(b"\x1b[<35;11;6M")
     assert reports == 1, f"expected 1 throttled report, got {reports}: {captured!r}"
+
+
+def _skip_unless_iced(target) -> None:
+    """The same-cell drag gate is wired from iced only (plan 026 D11):
+    AppKit and X11 never synthesize a same-cell drag, so mac and GTK
+    forward what they are given. Adopting the gate there is a later
+    parity choice; until then these cases are iced-scoped."""
+    if target != "iced":
+        pytest.skip("same-cell drag gate is iced-wired only (plan 026 D11)")
+
+
+def _enable_drag_reporting(roost, project) -> int:
+    """Open a tab with modes 1002 (button-event-drag) + 1006 (SGR)
+    enabled and the input drain emptied."""
+    tab = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, tab)
+    roost.tab_feed_pty_bytes(tab, b"\x1b[?1002h\x1b[?1006h")
+    drain(roost, tab)
+    return tab
+
+
+def test_same_cell_drag_is_suppressed(roost, project, target):
+    """Button-held motion that never leaves the press cell emits no
+    report. winit delivers sub-pixel `CursorMoved` events during a
+    stationary click, so without the cell gate every click sent
+    press + `\\x1b[<32;x;yM` + release and crossterm read the drag as
+    a new gesture — breaking strix's double-click detection."""
+    _skip_unless_iced(target)
+    tab = _enable_drag_reporting(roost, project)
+
+    roost.tab_dispatch_mouse_event(
+        tab, kind="press", button="left", cell_x=5, cell_y=3
+    )
+    for _ in range(5):
+        roost.tab_dispatch_mouse_event(
+            tab, kind="motion", button="left", cell_x=5, cell_y=3
+        )
+    roost.tab_dispatch_mouse_event(
+        tab, kind="release", button="left", cell_x=5, cell_y=3
+    )
+
+    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4m", timeout=2.0)
+    assert captured == b"\x1b[<0;6;4M\x1b[<0;6;4m", captured
+    assert b"\x1b[<32;" not in captured, ("same-cell drag leaked", captured)
+
+
+def test_cross_cell_drag_is_reported(roost, project, target):
+    """The gate is a cell-crossing gate, not a mute: a drag that
+    leaves the press cell reports the crossing with the drag bit
+    (+32) set."""
+    _skip_unless_iced(target)
+    tab = _enable_drag_reporting(roost, project)
+
+    roost.tab_dispatch_mouse_event(
+        tab, kind="press", button="left", cell_x=5, cell_y=3
+    )
+    roost.tab_dispatch_mouse_event(
+        tab, kind="motion", button="left", cell_x=5, cell_y=3
+    )
+    roost.tab_dispatch_mouse_event(
+        tab, kind="motion", button="left", cell_x=7, cell_y=3
+    )
+    roost.tab_dispatch_mouse_event(
+        tab, kind="release", button="left", cell_x=7, cell_y=3
+    )
+
+    captured = drain_until_match(roost, tab, rb"\x1b\[<0;8;4m", timeout=2.0)
+    assert captured == b"\x1b[<0;6;4M\x1b[<32;8;4M\x1b[<0;8;4m", captured
+
+
+def test_return_to_origin_reports_every_crossing(roost, project, target):
+    """press A → motion A (suppressed) → motion B → motion A →
+    release: the return to the press cell is a crossing and reports.
+    A time throttle would have swallowed it."""
+    _skip_unless_iced(target)
+    tab = _enable_drag_reporting(roost, project)
+
+    roost.tab_dispatch_mouse_event(
+        tab, kind="press", button="left", cell_x=5, cell_y=3
+    )
+    for cell_x in (5, 7, 5):
+        roost.tab_dispatch_mouse_event(
+            tab, kind="motion", button="left", cell_x=cell_x, cell_y=3
+        )
+    roost.tab_dispatch_mouse_event(
+        tab, kind="release", button="left", cell_x=5, cell_y=3
+    )
+
+    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4m", timeout=2.0)
+    assert captured == (
+        b"\x1b[<0;6;4M\x1b[<32;8;4M\x1b[<32;6;4M\x1b[<0;6;4m"
+    ), captured
 
 
 def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):

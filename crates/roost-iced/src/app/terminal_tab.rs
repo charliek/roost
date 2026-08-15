@@ -202,6 +202,9 @@ pub(super) struct TerminalTab {
     mouse_encoder: MouseEncoder,
     pub(super) scroll: TerminalScroll,
     motion_emitter: MotionEmitter,
+    /// Suppresses the same-cell drag winit's sub-pixel `CursorMoved` events
+    /// would otherwise inject into every stationary click.
+    drag_gate: DragCellGate,
     pub(super) tracking_pointer: Option<PointerButton>,
     pub(super) local_pointer_gesture: Option<LocalPointerGesture>,
     pub(super) last_pointer_cell: Option<(u16, u16)>,
@@ -301,6 +304,7 @@ impl TerminalTab {
             mouse_encoder,
             scroll: TerminalScroll::new(),
             motion_emitter: MotionEmitter::new(),
+            drag_gate: DragCellGate::new(),
             tracking_pointer: None,
             local_pointer_gesture: None,
             last_pointer_cell: None,
@@ -478,6 +482,7 @@ impl TerminalTab {
 
     pub(super) fn commit_pointer_cancel(&mut self, release: Vec<u8>) {
         self.session.send_input(release);
+        self.drag_gate.reset();
         self.tracking_pointer = None;
         self.local_pointer_gesture = None;
         self.last_pointer_cell = None;
@@ -499,6 +504,14 @@ impl TerminalTab {
         if motion_without_button && !self.motion_emitter.would_emit(col, row, now) {
             return Ok(());
         }
+        if !self.drag_gate.would_dispatch(action, button, (col, row)) {
+            return Ok(());
+        }
+        // A release ends the gesture whether or not it encodes, so its
+        // memory clear cannot wait behind the byte check below.
+        if action == PointerAction::Release {
+            self.drag_gate.commit_dispatched(action, button, (col, row));
+        }
 
         let bytes = self.encode_pointer(action, button, col, row, mods)?;
         if bytes.is_empty() {
@@ -506,6 +519,8 @@ impl TerminalTab {
         }
         if motion_without_button {
             self.motion_emitter.commit(col, row, now);
+        } else {
+            self.drag_gate.commit_dispatched(action, button, (col, row));
         }
         self.session.send_input(bytes);
         Ok(())
@@ -784,6 +799,7 @@ impl TerminalTab {
     }
 
     pub(super) fn reset_pointer_state(&mut self) -> bool {
+        self.drag_gate.reset();
         let gesture = self.local_pointer_gesture.take();
         let tracking = self.tracking_pointer.take();
         let cell = self.last_pointer_cell.take();

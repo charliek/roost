@@ -20,7 +20,7 @@ use roost_engine::ipc::{
     SelectionData, UiRequest,
 };
 use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter};
-use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
+use roost_engine::pointer::{DragCellGate, MotionEmitter, PointerAction, PointerButton};
 use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLocks;

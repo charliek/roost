@@ -3749,6 +3749,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_gesture_suppresses_same_cell_drag_reports() {
+        // winit emits sub-pixel CursorMoved events while a button is held, so
+        // this is what a stationary click looks like on the capture path the
+        // IPC op bypasses.
+        let (mut tab, supervisor) = attached_test_terminal(403);
+        tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+
+        native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (2, 2),
+            1,
+            true,
+            false,
+        );
+        for _ in 0..3 {
+            native_pointer(
+                &mut tab,
+                PointerAction::Motion,
+                None,
+                (2, 2),
+                0,
+                true,
+                false,
+            );
+        }
+        native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (2, 2),
+            0,
+            true,
+            false,
+        );
+
+        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        assert_eq!(captured, b"\x1b[<0;3;3M\x1b[<0;3;3m".to_vec());
+
+        // A real crossing still reports, and returning to the press cell
+        // reports again — this is a cell gate, not a time throttle.
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (2, 2),
+            1,
+            true,
+            false,
+        );
+        for cell in [(2, 2), (4, 2), (4, 2), (2, 2)] {
+            native_pointer(&mut tab, PointerAction::Motion, None, cell, 0, true, false);
+        }
+        native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (2, 2),
+            0,
+            true,
+            false,
+        );
+
+        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            b"\x1b[<0;3;3M\x1b[<32;5;3M\x1b[<32;3;3M\x1b[<0;3;3m".to_vec()
+        );
+        supervisor.close(403);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn geometry_transaction_defers_in_band_reports_until_commit() {
         let (mut tab, supervisor) = attached_test_terminal(92);
         tab.write_vt(b"\x1b[?2048h");
