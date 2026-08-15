@@ -342,6 +342,11 @@ pub struct TerminalWidget {
     /// computes it as "the keyboard route is this tab and the window is
     /// focused". Only then does the widget ask the platform for an IME.
     pub ime_active: bool,
+    /// Whether the window has keyboard focus. Only the active tab's
+    /// widget is built per view pass, so this is the window's own focus
+    /// state; an unfocused window draws the cursor hollow (mac parity,
+    /// `TerminalView.cursorRenderMode`).
+    pub focused: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -941,7 +946,12 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 let point =
                     cell_position(bounds.position(), cursor.col as u16, cursor.row, metrics);
                 let cursor_color = color(cursor.color.unwrap_or(self.snapshot.foreground));
-                match cursor.visual_style {
+                let visual_style = if self.focused {
+                    cursor.visual_style
+                } else {
+                    CursorVisualStyle::BlockHollow
+                };
+                match visual_style {
                     CursorVisualStyle::Block => fill_quad(
                         renderer,
                         Rectangle::new(point, Size::new(metrics.cell_width, metrics.cell_height)),
@@ -1184,6 +1194,7 @@ mod tests {
             metrics: metrics(),
             metric_generation: 1,
             ime_active: false,
+            focused: true,
         }
     }
 

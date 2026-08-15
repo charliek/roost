@@ -46,13 +46,19 @@ pub enum CursorVisualStyle {
 
 impl CursorVisualStyle {
     fn from_u32(v: u32) -> Self {
-        // The bindgen-generated constant names are long; we depend on
-        // the underlying integer codes (Ghostty's header file fixes
-        // these). 0=block, 1=bar, 2=underline, 3=block-hollow.
+        use sys::{
+            GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR as BAR,
+            GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK as BLOCK,
+            GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW as BLOCK_HOLLOW,
+            GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE as UNDERLINE,
+        };
         match v {
-            1 => Self::Bar,
-            2 => Self::Underline,
-            3 => Self::BlockHollow,
+            BAR => Self::Bar,
+            BLOCK => Self::Block,
+            UNDERLINE => Self::Underline,
+            BLOCK_HOLLOW => Self::BlockHollow,
+            // Unknown code from a future libghostty: a block is the safe
+            // default, never the bar that code 0 happens to name.
             _ => Self::Block,
         }
     }
@@ -318,7 +324,9 @@ impl RenderState {
             .unwrap_or(false);
         let style = self
             .read_u32(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE)
-            .unwrap_or(0);
+            .unwrap_or(
+                sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK,
+            );
 
         let cursor_has_color = self
             .read_bool(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_COLOR_CURSOR_HAS_VALUE)
@@ -952,5 +960,82 @@ mod tests {
             "Y cell (post-reset) must not carry bold, got {:?}",
             y_cell.2
         );
+    }
+
+    /// Pins the style codes against the vendored header
+    /// (`third_party/ghostty/out/include/ghostty/vt/render.h`):
+    /// BAR=0, BLOCK=1, UNDERLINE=2, BLOCK_HOLLOW=3. A prior mapping had
+    /// bar and block transposed, so every default (block) cursor drew as
+    /// a bar in both Rust UIs and DECSCUSR 1/2 vs 5/6 were swapped.
+    #[test]
+    fn cursor_visual_style_matches_header_codes() {
+        assert_eq!(CursorVisualStyle::from_u32(0), CursorVisualStyle::Bar);
+        assert_eq!(CursorVisualStyle::from_u32(1), CursorVisualStyle::Block);
+        assert_eq!(CursorVisualStyle::from_u32(2), CursorVisualStyle::Underline);
+        assert_eq!(
+            CursorVisualStyle::from_u32(3),
+            CursorVisualStyle::BlockHollow
+        );
+        assert_eq!(CursorVisualStyle::from_u32(99), CursorVisualStyle::Block);
+
+        assert_eq!(
+            sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR,
+            0
+        );
+        assert_eq!(
+            sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK,
+            1
+        );
+        assert_eq!(
+            sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE,
+            2
+        );
+        assert_eq!(
+            sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW,
+            3
+        );
+    }
+
+    /// DECSCUSR end-to-end: the style libghostty reports for each
+    /// `CSI Ps SP q` must reach the renderer as the style the spec names.
+    #[test]
+    fn decscusr_round_trips_through_render_state() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 20,
+            rows: 5,
+            max_scrollback: 10,
+        })
+        .expect("Terminal::new");
+        let mut render_state = RenderState::new().expect("RenderState::new");
+
+        let mut style_after = |terminal: &mut Terminal, bytes: &[u8]| {
+            terminal.vt_write(bytes);
+            render_state.update(terminal).expect("update");
+            render_state.cursor().expect("cursor").visual_style
+        };
+
+        // Default (nothing written yet) is a block.
+        assert_eq!(
+            style_after(&mut terminal, b""),
+            CursorVisualStyle::Block,
+            "fresh terminal should report a block cursor"
+        );
+        for (bytes, expected) in [
+            (&b"\x1b[0 q"[..], CursorVisualStyle::Block),
+            (&b"\x1b[1 q"[..], CursorVisualStyle::Block),
+            (&b"\x1b[2 q"[..], CursorVisualStyle::Block),
+            (&b"\x1b[3 q"[..], CursorVisualStyle::Underline),
+            (&b"\x1b[4 q"[..], CursorVisualStyle::Underline),
+            (&b"\x1b[5 q"[..], CursorVisualStyle::Bar),
+            (&b"\x1b[6 q"[..], CursorVisualStyle::Bar),
+        ] {
+            assert_eq!(
+                style_after(&mut terminal, bytes),
+                expected,
+                "DECSCUSR {:?} should render as {:?}",
+                String::from_utf8_lossy(bytes),
+                expected
+            );
+        }
     }
 }

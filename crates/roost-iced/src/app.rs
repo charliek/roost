@@ -2079,6 +2079,7 @@ impl App {
                     active_tab,
                     self.window_focused,
                 ),
+                focused: self.window_focused,
             }
             .into(),
             _ => container(text("Starting terminal…"))
