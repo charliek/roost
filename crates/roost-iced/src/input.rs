@@ -9,6 +9,7 @@ use roost_vt::{key_action, mods, KeyEncoder, KeyEvent, PageDirection, Terminal};
 pub(crate) fn accelerator(event: &keyboard::Event) -> Option<Accel> {
     let keyboard::Event::KeyPressed {
         key,
+        modified_key,
         physical_key,
         modifiers,
         ..
@@ -17,16 +18,27 @@ pub(crate) fn accelerator(event: &keyboard::Event) -> Option<Accel> {
         return None;
     };
     let logical = key.as_ref();
-    let key = match logical {
-        // Prefer the logical value for ASCII so shifted punctuation keeps its
-        // shared GTK-style name (`+` -> `plus`, `{` -> `braceleft`). Physical
-        // Latin is only a layout fallback; taking it first collapses `+` to
-        // `equal` and makes configured punctuation aliases unreachable.
-        Key::Character(value) if value.is_ascii() => canonical_character(value),
-        _ => key
-            .to_latin(*physical_key)
-            .map(|value| canonical_character(&value.to_string()))
-            .or_else(|| accelerator_key(&logical))?,
+    // A toolkit that reports the control transform as the logical key would
+    // otherwise bind `\u{1}` — the ASCII arm below accepts it — and no
+    // configured ctrl+letter or ctrl+punctuation keybind could ever match.
+    // The press's `text` is deliberately not consulted here, and the chord's
+    // unshifted identity is what names the binding: the accelerator grammar
+    // names the key, not the bytes it produced, so `ctrl+shift+[` stays
+    // `bracketleft` on either event shape rather than becoming `braceleft`.
+    let mut recovered = [0u8; 4];
+    let key = match control_chord(&logical, &modified_key.as_ref(), *modifiers, None) {
+        Some(chord) => canonical_character(chord.key.encode_utf8(&mut recovered)),
+        None => match logical {
+            // Prefer the logical value for ASCII so shifted punctuation keeps its
+            // shared GTK-style name (`+` -> `plus`, `{` -> `braceleft`). Physical
+            // Latin is only a layout fallback; taking it first collapses `+` to
+            // `equal` and makes configured punctuation aliases unreachable.
+            Key::Character(value) if value.is_ascii() => canonical_character(value),
+            _ => key
+                .to_latin(*physical_key)
+                .map(|value| canonical_character(&value.to_string()))
+                .or_else(|| accelerator_key(&logical))?,
+        },
     };
     Some(Accel {
         modifiers: accelerator_modifiers(*modifiers),
@@ -136,6 +148,112 @@ fn accelerator_key(key: &Key<&str>) -> Option<String> {
     Some(name.to_string())
 }
 
+/// A control-transformed press, split into the two characters it stands
+/// for: the text it would have typed and the key that typed it.
+struct ControlChord {
+    /// What libghostty receives as the press's utf8 — shift included, since
+    /// the transform's own table is keyed on the typed character
+    /// (`ctrl+shift+-` has to arrive as `_` to fold into 0x1f).
+    text: char,
+    /// What identifies the key: the unshifted character, so the key enum,
+    /// the unshifted codepoint and the accelerator name agree with the
+    /// press shape where the layout character arrives intact.
+    key: char,
+}
+
+/// The printable characters behind a control-transformed press, or `None`
+/// when the press is not a chord whose C0 byte inverts unambiguously.
+///
+/// The platform applies the control transform for us and hands the C0 back
+/// in a field that varies: macOS puts it in `text` (`NSEvent.characters`)
+/// while the logical key keeps the layout's character, and xkb does the same
+/// through `text_with_all_modifiers`; a toolkit that instead reports the C0
+/// as the logical key inverts the same way. libghostty keys its
+/// control-sequence table on the *printable* byte, so forwarding the C0 as
+/// utf8 misses the table and falls through to CSI-u — ctrl+a reaches the PTY
+/// as `\x1b[1;5u` instead of 0x01. The Swift and GTK encoders never forward
+/// C0 text for the same reason (`KeyEncoder.swift::printableUTF8`,
+/// `key_encoder.rs`'s `to_unicode` filter).
+///
+/// Only the unambiguous chords invert: the letters and `[ \ ] _`. NUL
+/// (ctrl+shift+2), DEL, RS (ctrl+shift+6) and every named key — ctrl+Enter's
+/// `\r`, ctrl+space's NUL — keep today's encoding. `modified_key`, the press
+/// with every modifier except ctrl applied, wins whenever it agrees with the
+/// C0 so a shifted chord keeps the character the layout typed (ctrl+shift+-
+/// → `_`, ctrl+shift+a → `A`); the canonical inverse is the layout-blind
+/// fallback that still recovers non-Latin layouts (ctrl+ф → `a`).
+fn control_chord(
+    key: &Key<&str>,
+    modified_key: &Key<&str>,
+    modifiers: keyboard::Modifiers,
+    text: Option<&str>,
+) -> Option<ControlChord> {
+    if !modifiers.control() || !matches!(key, Key::Character(_)) {
+        return None;
+    }
+    let c0 = [text.and_then(sole_char), sole_key_char(key)]
+        .into_iter()
+        .flatten()
+        .find(|value| value.is_control())?;
+    let canonical = match c0 {
+        '\u{1}'..='\u{1a}' => char::from(b'a' + c0 as u8 - 1),
+        '\u{1b}' => '[',
+        '\u{1c}' => '\\',
+        '\u{1d}' => ']',
+        '\u{1f}' => '_',
+        _ => return None,
+    };
+    Some(ControlChord {
+        text: sole_key_char(modified_key)
+            .filter(|value| control_transform(*value) == Some(c0))
+            .unwrap_or(canonical),
+        key: unshifted_character(canonical),
+    })
+}
+
+/// The unshifted character that types `value`: `_` is shift plus the minus
+/// key, and `{ } |` are the shifted brackets and backslash. Letters
+/// lowercase. Keeping the key identity unshifted is what makes both event
+/// shapes name the same key — `ctrl+shift+-` reports the minus key on the
+/// shape that hands us `-` and on the one that hands us the C0.
+fn unshifted_character(value: char) -> char {
+    match value {
+        '_' => '-',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        _ => value.to_ascii_lowercase(),
+    }
+}
+
+/// The C0 byte a platform produces for ctrl plus this character, for the
+/// chords [`control_chord`] can invert.
+fn control_transform(value: char) -> Option<char> {
+    let byte = u8::try_from(value).ok()?;
+    Some(char::from(match byte {
+        b'a'..=b'z' => byte - b'a' + 1,
+        b'A'..=b'Z' => byte - b'A' + 1,
+        b'[' | b'{' => 0x1b,
+        b'\\' | b'|' => 0x1c,
+        b']' | b'}' => 0x1d,
+        b'_' => 0x1f,
+        _ => return None,
+    }))
+}
+
+fn sole_char(value: &str) -> Option<char> {
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    chars.next().is_none().then_some(first)
+}
+
+fn sole_key_char(key: &Key<&str>) -> Option<char> {
+    match key {
+        Key::Character(value) => sole_char(value),
+        _ => None,
+    }
+}
+
 fn canonical_character(value: &str) -> String {
     let name = match value {
         "[" => "bracketleft",
@@ -169,6 +287,7 @@ pub fn encode_press(
 ) -> Vec<u8> {
     let keyboard::Event::KeyPressed {
         key,
+        modified_key,
         physical_key,
         modifiers,
         text,
@@ -179,23 +298,50 @@ pub fn encode_press(
         return Vec::new();
     };
 
+    let chord = control_chord(
+        &key.as_ref(),
+        &modified_key.as_ref(),
+        modifiers,
+        text.as_deref(),
+    );
     let latin = key.to_latin(physical_key);
     let key = key.as_ref();
-    let Some(keycode) = ghostty_key(&key) else {
+    // A logical key that is the C0 itself carries no libghostty key enum and
+    // no usable unshifted codepoint; the chord's unshifted character supplies
+    // both, so this shape reports the same key as the shape that keeps the
+    // layout character in `key`.
+    let recovered_key = chord
+        .as_ref()
+        .map(|chord| chord.key)
+        .filter(|_| sole_key_char(&key).is_some_and(char::is_control));
+    let Some(keycode) = recovered_key
+        .map(character_key_char)
+        .or_else(|| ghostty_key(&key))
+    else {
         return Vec::new();
     };
     let Some(mut event) = new_key_event() else {
         return Vec::new();
     };
-    let utf8 = text.as_deref().unwrap_or("").as_bytes();
-    let unshifted = latin.map_or_else(
-        || match key {
-            Key::Character(value) => value.chars().next().map_or(0, u32::from),
-            Key::Named(Named::Space) => u32::from(' '),
-            _ => 0,
-        },
-        u32::from,
-    );
+    // The control transform goes back to the character it came from — the
+    // byte libghostty's control-sequence table is keyed on.
+    let mut control_buf = [0u8; 4];
+    let utf8 = chord
+        .map(|chord| &*chord.text.encode_utf8(&mut control_buf))
+        .or(text.as_deref())
+        .unwrap_or("")
+        .as_bytes();
+    let unshifted = match recovered_key {
+        Some(value) => u32::from(value),
+        None => latin.map_or_else(
+            || match key {
+                Key::Character(value) => value.chars().next().map_or(0, u32::from),
+                Key::Named(Named::Space) => u32::from(' '),
+                _ => 0,
+            },
+            u32::from,
+        ),
+    };
     event
         .set_action(if repeat {
             key_action::REPEAT
@@ -297,8 +443,12 @@ fn ghostty_key(key: &Key<&str>) -> Option<u32> {
 }
 
 fn character_key(value: &str) -> Option<u32> {
+    Some(character_key_char(value.chars().next()?))
+}
+
+fn character_key_char(value: char) -> u32 {
     use ghostty::*;
-    Some(match value.chars().next()?.to_ascii_lowercase() {
+    match value.to_ascii_lowercase() {
         'a' => GhosttyKey_GHOSTTY_KEY_A,
         'b' => GhosttyKey_GHOSTTY_KEY_B,
         'c' => GhosttyKey_GHOSTTY_KEY_C,
@@ -351,7 +501,7 @@ fn character_key(value: &str) -> Option<u32> {
         // without a physical-key enum (CJK, emoji, composed input, etc.).
         // Dropping them here would make the terminal ASCII-only.
         _ => GhosttyKey_GHOSTTY_KEY_UNIDENTIFIED,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -376,15 +526,75 @@ mod tests {
         physical_key: Physical,
         modifiers: keyboard::Modifiers,
     ) -> keyboard::Event {
+        press(key.clone(), key, physical_key, modifiers, None)
+    }
+
+    /// A press with every field the encoder reads set independently, so a
+    /// platform's real event shape can be replayed on any host.
+    fn press(
+        key: Key,
+        modified_key: Key,
+        physical_key: Physical,
+        modifiers: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> keyboard::Event {
         keyboard::Event::KeyPressed {
-            modified_key: key.clone(),
             key,
+            modified_key,
             physical_key,
             location: Location::Standard,
             modifiers,
-            text: None,
+            text: text.map(Into::into),
             repeat: false,
         }
+    }
+
+    /// A character press that carries `text`, the field a platform hands the
+    /// control transform back in.
+    fn chord(
+        key: &str,
+        modified_key: &str,
+        physical: Code,
+        modifiers: keyboard::Modifiers,
+        text: &str,
+    ) -> keyboard::Event {
+        press(
+            character(key),
+            character(modified_key),
+            Physical::Code(physical),
+            modifiers,
+            Some(text),
+        )
+    }
+
+    fn character(value: &str) -> Key {
+        Key::Character(value.into())
+    }
+
+    /// The chord's `(text, key)` pair — the character libghostty is handed
+    /// and the unshifted character that identifies the key.
+    fn recovered(
+        key: &str,
+        modified_key: &str,
+        modifiers: keyboard::Modifiers,
+        text: &str,
+    ) -> Option<(char, char)> {
+        control_chord(
+            &character(key).as_ref(),
+            &character(modified_key).as_ref(),
+            modifiers,
+            Some(text),
+        )
+        .map(|chord| (chord.text, chord.key))
+    }
+
+    fn kitty_encoder_pair() -> (KeyEncoder, Terminal) {
+        let (mut encoder, mut terminal) = encoder_pair();
+        // CSI > 1 u — the flags a Kitty-protocol app pushes; production
+        // re-syncs the encoder from the terminal on every keystroke.
+        terminal.vt_write(b"\x1b[>1u");
+        encoder.sync_from_terminal(&terminal);
+        (encoder, terminal)
     }
 
     #[test]
@@ -661,5 +871,285 @@ mod tests {
             );
         }
         assert!(encode_ime_commit(&mut encoder, &terminal, "").is_empty());
+    }
+
+    /// The event shape macOS really delivers, captured from a live
+    /// `roost-iced` (winit 0.30 / iced 0.14): `key` is winit's
+    /// `key_without_modifiers` so it stays the layout's unshifted
+    /// character, `modified_key` is the press with shift applied, and
+    /// `text` (`NSEvent.characters`) carries the control transform. Passing
+    /// that C0 through as utf8 is what made ctrl+a reach the PTY as
+    /// `\x1b[1;5u`.
+    #[test]
+    fn mac_control_chords_encode_the_legacy_control_bytes() {
+        let (mut encoder, terminal) = encoder_pair();
+        let ctrl = keyboard::Modifiers::CTRL;
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for (key, modified, physical, modifiers, text, expected) in [
+            ("a", "a", Code::KeyA, ctrl, "\u{1}", b"\x01".as_slice()),
+            ("k", "k", Code::KeyK, ctrl, "\u{b}", b"\x0b"),
+            ("c", "c", Code::KeyC, ctrl, "\u{3}", b"\x03"),
+            ("\\", "\\", Code::Backslash, ctrl, "\u{1c}", b"\x1c"),
+            ("]", "]", Code::BracketRight, ctrl, "\u{1d}", b"\x1d"),
+            // macOS types US on both the bare and the shifted minus.
+            ("-", "_", Code::Minus, ctrl_shift, "\u{1f}", b"\x1f"),
+            ("-", "-", Code::Minus, ctrl, "\u{1f}", b"\x1f"),
+        ] {
+            let event = chord(key, modified, physical, modifiers, text);
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false),
+                expected.to_vec(),
+                "ctrl chord on {key:?}"
+            );
+        }
+    }
+
+    /// ctrl+[ is the one chord in D3's set libghostty deliberately refuses
+    /// to fold into a C0: `[`, `i` and `m` are commented out of its
+    /// `ctrlSeq` table per fixterms so applications can tell ctrl+[ from
+    /// Escape, ctrl+i from Tab and ctrl+m from Enter. Recovery still fixes
+    /// the byte we were sending — the CSI-u entry now reports the key that
+    /// was actually pressed (91 = `[`) instead of the transform's codepoint
+    /// (27 = ESC). The Swift app sends NOTHING here (verified live: it
+    /// strips the C0 and libghostty has no sequence left to build), so this
+    /// is a strict improvement over both prior behaviors.
+    #[test]
+    fn control_bracket_left_reports_the_bracket_not_the_escape_codepoint() {
+        let (mut encoder, terminal) = encoder_pair();
+        let ctrl = keyboard::Modifiers::CTRL;
+        let event = chord("[", "[", Code::BracketLeft, ctrl, "\u{1b}");
+        assert_eq!(
+            encode_press(&mut encoder, &terminal, event, false),
+            b"\x1b[91;5u".to_vec()
+        );
+    }
+
+    /// The shape the plan assumed and a toolkit change could still produce:
+    /// the C0 arrives as the logical key itself. It has no libghostty key
+    /// enum (`character_key` answers UNIDENTIFIED) and no usable unshifted
+    /// codepoint, so recovery has to supply both — and the bytes must match
+    /// the captured macOS shape above exactly.
+    #[test]
+    fn control_transformed_logical_keys_encode_the_same_bytes() {
+        let (mut encoder, terminal) = encoder_pair();
+        let ctrl = keyboard::Modifiers::CTRL;
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for (c0, modified, physical, modifiers, expected) in [
+            ("\u{1}", "a", Code::KeyA, ctrl, b"\x01".as_slice()),
+            ("\u{b}", "k", Code::KeyK, ctrl, b"\x0b"),
+            ("\u{1c}", "\\", Code::Backslash, ctrl, b"\x1c"),
+            ("\u{1d}", "]", Code::BracketRight, ctrl, b"\x1d"),
+            ("\u{1f}", "_", Code::Minus, ctrl_shift, b"\x1f"),
+            ("\u{1b}", "[", Code::BracketLeft, ctrl, b"\x1b[91;5u"),
+        ] {
+            let event = chord(c0, modified, physical, modifiers, c0);
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false),
+                expected.to_vec(),
+                "control-transformed logical key {c0:?}"
+            );
+        }
+    }
+
+    /// A non-Latin layout types its own character while macOS still applies
+    /// the Latin control transform; `modified_key` cannot confirm the C0, so
+    /// the canonical inverse carries the chord.
+    #[test]
+    fn non_latin_layouts_recover_the_latin_control_chord() {
+        let (mut encoder, terminal) = encoder_pair();
+        let event = chord("ф", "ф", Code::KeyA, keyboard::Modifiers::CTRL, "\u{1}");
+        assert_eq!(
+            encode_press(&mut encoder, &terminal, event, false),
+            b"\x01".to_vec()
+        );
+    }
+
+    /// The shapes that must not move: a toolkit that reports the printable
+    /// character as `text` (GTK's keyval path, and winit wherever the
+    /// platform declines to control-transform), plain typing, option-
+    /// transformed text, and the C0 forms outside the invertible set —
+    /// NUL, RS, and the named keys that own their own encoding.
+    #[test]
+    fn presses_outside_the_recoverable_chords_encode_unchanged() {
+        let (mut encoder, terminal) = encoder_pair();
+        let ctrl = keyboard::Modifiers::CTRL;
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let empty = keyboard::Modifiers::empty();
+        let alt = keyboard::Modifiers::ALT;
+        for (key, modified, physical, modifiers, text, expected) in [
+            // Printable text alongside ctrl — the byte is unchanged either
+            // way, which is what makes the fix safe for the platforms that
+            // never transform.
+            ("a", "a", Code::KeyA, ctrl, "a", b"\x01".as_slice()),
+            ("a", "a", Code::KeyA, empty, "a", b"a"),
+            // Option-transformed text: no ctrl, so nothing is recovered.
+            ("b", "∫", Code::KeyB, alt, "∫", "∫".as_bytes()),
+            // NUL (ctrl+shift+2) and RS (ctrl+shift+6) stay where they were.
+            ("2", "@", Code::Digit2, ctrl_shift, "\u{0}", b"\x1b[0;5u"),
+            ("6", "^", Code::Digit6, ctrl_shift, "\u{1e}", b"\x1b[30;5u"),
+        ] {
+            let event = chord(key, modified, physical, modifiers, text);
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false),
+                expected.to_vec(),
+                "{key:?} + {modifiers:?}"
+            );
+        }
+
+        // Named keys own their encoding, C0 text and all.
+        for (named, physical, text, expected) in [
+            (Named::Enter, Code::Enter, "\r", b"\x1b[27;5;13~".as_slice()),
+            (Named::Space, Code::Space, "\u{0}", b"\x1b[0;5u"),
+        ] {
+            let key = Key::Named(named);
+            let event = press(key.clone(), key, Physical::Code(physical), ctrl, Some(text));
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false),
+                expected.to_vec(),
+                "{named:?}"
+            );
+        }
+    }
+
+    /// Kitty-ON canonical shape, pinned: the CSI-u entry reports the
+    /// letter's codepoint (97) because recovery feeds libghostty a real
+    /// unshifted codepoint — the GTK shape, and what
+    /// `roost-vt/tests/key_encoder_test.rs::ctrl_a_under_kitty_exact_bytes`
+    /// pins from the other side. The Swift app zeroes the codepoint for a
+    /// C0 press instead; plan 026 D3 accepts that divergence because the
+    /// legacy bytes agree.
+    #[test]
+    fn mac_control_chords_under_kitty_report_the_letter_codepoint() {
+        let (mut encoder, terminal) = kitty_encoder_pair();
+        let event = chord("a", "a", Code::KeyA, keyboard::Modifiers::CTRL, "\u{1}");
+        assert_eq!(
+            encode_press(&mut encoder, &terminal, event, false),
+            b"\x1b[97;5u".to_vec()
+        );
+    }
+
+    /// The CSI-u entry names the key, so a shifted chord must report the
+    /// unshifted codepoint (97 for `a`, 45 for the minus key) on BOTH event
+    /// shapes — the identity cannot drift to the shifted character (65, 95)
+    /// just because the platform handed us the C0 as the logical key.
+    #[test]
+    fn shifted_control_chords_report_one_identity_under_kitty() {
+        let (mut encoder, terminal) = kitty_encoder_pair();
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for (mac, transformed, modified, physical, expected) in [
+            ("a", "\u{1}", "A", Code::KeyA, b"\x1b[97;6u".as_slice()),
+            ("-", "\u{1f}", "_", Code::Minus, b"\x1b[45;6u"),
+        ] {
+            let from_mac = encode_press(
+                &mut encoder,
+                &terminal,
+                chord(mac, modified, physical, ctrl_shift, transformed),
+                false,
+            );
+            let from_transformed = encode_press(
+                &mut encoder,
+                &terminal,
+                chord(transformed, modified, physical, ctrl_shift, transformed),
+                false,
+            );
+            assert_eq!(from_mac, expected.to_vec(), "ctrl+shift chord on {mac:?}");
+            assert_eq!(
+                from_transformed, from_mac,
+                "both event shapes must encode {mac:?} identically"
+            );
+        }
+    }
+
+    #[test]
+    fn control_chord_recovery_is_limited_to_invertible_chords() {
+        let ctrl = keyboard::Modifiers::CTRL;
+        let ctrl_shift = ctrl | keyboard::Modifiers::SHIFT;
+        assert_eq!(recovered("a", "a", ctrl, "\u{1}"), Some(('a', 'a')));
+        assert_eq!(
+            recovered("a", "a", keyboard::Modifiers::empty(), "\u{1}"),
+            None,
+            "a C0 without ctrl is not ours to invert"
+        );
+        for text in ["\u{0}", "\u{1e}", "\u{7f}", "a"] {
+            assert_eq!(
+                recovered("a", "a", ctrl, text),
+                None,
+                "{text:?} must keep today's encoding"
+            );
+        }
+        // A shifted chord types the shifted character but still identifies
+        // the unshifted key.
+        assert_eq!(recovered("-", "_", ctrl_shift, "\u{1f}"), Some(('_', '-')));
+        assert_eq!(recovered("a", "A", ctrl_shift, "\u{1}"), Some(('A', 'a')));
+        assert_eq!(recovered("[", "{", ctrl_shift, "\u{1b}"), Some(('{', '[')));
+        // The C0-as-logical shape resolves to the same pair.
+        assert_eq!(
+            recovered("\u{1f}", "_", ctrl_shift, "\u{1f}"),
+            Some(('_', '-'))
+        );
+        let named = Key::Named(Named::Enter);
+        assert_eq!(
+            control_chord(&named.as_ref(), &named.as_ref(), ctrl, Some("\r"))
+                .map(|chord| chord.key),
+            None,
+            "named keys own their encoding"
+        );
+    }
+
+    /// Configured ctrl+letter and ctrl+punctuation keybinds must resolve on
+    /// both event shapes — the captured macOS one (where the logical key is
+    /// already the letter) and the control-transformed logical key — and to
+    /// the SAME name, which is why the accelerator takes the chord's
+    /// unshifted key rather than the shifted character it typed.
+    #[test]
+    fn accelerators_resolve_control_transformed_presses() {
+        let ctrl = keyboard::Modifiers::CTRL;
+        let ctrl_shift = ctrl | keyboard::Modifiers::SHIFT;
+        for (key, modified, physical, modifiers, text, expected) in [
+            ("a", "a", Code::KeyA, ctrl, "\u{1}", "a"),
+            ("[", "[", Code::BracketLeft, ctrl, "\u{1b}", "bracketleft"),
+            ("\u{1}", "a", Code::KeyA, ctrl, "\u{1}", "a"),
+            (
+                "\u{1b}",
+                "[",
+                Code::BracketLeft,
+                ctrl,
+                "\u{1b}",
+                "bracketleft",
+            ),
+            ("\u{1c}", "\\", Code::Backslash, ctrl, "\u{1c}", "\\"),
+            // Shifted chords, both shapes: the shifted character the layout
+            // typed must never rename the binding.
+            (
+                "[",
+                "{",
+                Code::BracketLeft,
+                ctrl_shift,
+                "\u{1b}",
+                "bracketleft",
+            ),
+            (
+                "\u{1b}",
+                "{",
+                Code::BracketLeft,
+                ctrl_shift,
+                "\u{1b}",
+                "bracketleft",
+            ),
+            ("-", "_", Code::Minus, ctrl_shift, "\u{1f}", "minus"),
+            ("\u{1f}", "_", Code::Minus, ctrl_shift, "\u{1f}", "minus"),
+            ("a", "A", Code::KeyA, ctrl_shift, "\u{1}", "a"),
+            ("\u{1}", "A", Code::KeyA, ctrl_shift, "\u{1}", "a"),
+        ] {
+            let event = chord(key, modified, physical, modifiers, text);
+            assert_eq!(
+                accelerator(&event),
+                Some(Accel {
+                    modifiers: accelerator_modifiers(modifiers),
+                    key: expected.into(),
+                }),
+                "accelerator for {key:?} + {modifiers:?}"
+            );
+        }
     }
 }
