@@ -39,7 +39,7 @@ $(GHOSTTY_LIB):
 
 # ---- build ------------------------------------------------------------
 
-.PHONY: build build-iced build-mac bundle build-all
+.PHONY: build build-iced build-mac bundle bundle-iced build-all
 build: $(GHOSTTY_LIB)  ## cargo build the workspace (GTK UI + roostctl)
 	cargo build
 
@@ -51,6 +51,9 @@ build-mac: $(GHOSTTY_LIB)  ## swift build the Mac app
 
 bundle: $(GHOSTTY_LIB)  ## Build + assemble Roost.app (debug)
 	cd $(MAC_DIR) && ./scripts/bundle.sh debug
+
+bundle-iced: $(GHOSTTY_LIB)  ## Build + assemble Roost-Iced.app (debug)
+	cd $(MAC_DIR) && ./scripts/bundle-iced.sh debug
 
 build-all: build bundle  ## Build both UIs + the Mac bundle
 

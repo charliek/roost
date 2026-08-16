@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for Roost-Iced.app — M6 6a evaluation bundle.
+
+  `mac/scripts/bundle-iced.sh` copies this file into the .app bundle
+  and substitutes @VERSION@ with the workspace version (see
+  `roost_workspace_version` in bundle-lib.sh). This bundle exists so
+  the iced UI (`crates/roost-iced`) can be evaluated against the
+  Swift app side by side: Sparkle (6c), UNUserNotificationCenter
+  (6e), and TCC testing all require a bundled, signed .app — see
+  `docs/development/iced-migration-roadmap.md` § M6.
+
+  Distinct identity from Roost.app (Info.plist.template) so the two
+  can be installed and run in parallel: CFBundleIdentifier carries a
+  `.iced` suffix, and CFBundleName/CFBundleDisplayName/
+  CFBundleExecutable are "Roost-Iced" so Dock/Cmd-Tab/Finder show
+  them as separate apps and `pgrep/pkill -x Roost` can never hit this
+  process. `app_label` on the wire stays `Roost-iced` (roost-ipc's
+  BundleProfile, untouched by this plist).
+
+  No Sparkle keys (SUFeedURL / SUPublicEDKey / SUEnableAutomaticChecks):
+  deliberately omitted. Sparkle auto-update is a 6c decision, not made
+  here, and the two apps must never be able to offer each other's
+  updates — an iced bundle carrying the Swift app's feed URL/key could
+  install a Swift-app-shaped update over an iced binary (or vice
+  versa) were 6c to ever share the appcast naively. Until 6c designs
+  a channel-scoped feed, the iced bundle simply doesn't check.
+
+  Device-permission purpose strings (NSMicrophone/Camera/AppleEvents
+  UsageDescription): paired with the capture entitlements in
+  Roost-Iced.entitlements. macOS shows these when a program hosted in
+  a Roost-Iced tab requests the microphone/camera (the request is
+  attributed to Roost-Iced, the TCC responsible app). Both must be
+  present — the entitlement to permit the request under the hardened
+  runtime, the string for the prompt — matching Roost.app, ghostty,
+  and cmux.
+
+  Icon: reuses the same AppIcon art as Roost.app (shared art is a
+  recorded decision, plan 027 § W2) — the display name is what
+  disambiguates the Dock tile until a distinct Roost-Iced icon exists
+  (future work).
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleIdentifier</key>
+  <string>ai.stridelabs.Roost.iced</string>
+  <key>CFBundleName</key>
+  <string>Roost-Iced</string>
+  <key>CFBundleDisplayName</key>
+  <string>Roost-Iced</string>
+  <key>CFBundleExecutable</key>
+  <string>Roost-Iced</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>15.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+  <key>LSUIElement</key>
+  <false/>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>A program running in Roost-Iced would like to use the microphone.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>A program running in Roost-Iced would like to use the camera.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>A program running in Roost-Iced would like to use AppleScript.</string>
+</dict>
+</plist>

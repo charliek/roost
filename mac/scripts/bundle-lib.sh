@@ -45,6 +45,43 @@ roost_workspace_version() {
   echo "${cargo_version:-0.0.0}"
 }
 
+# roost_assemble_skeleton APP_DIR
+#
+# Fresh bundle skeleton: Contents/MacOS + Contents/Resources. Both
+# bundle scripts wipe and recreate on every run (no incremental
+# state) so a stale bundle can't wear a previous build's leftovers.
+roost_assemble_skeleton() {
+  local app_dir="$1"
+  echo "==> Assembling ${app_dir}"
+  rm -rf "${app_dir}"
+  mkdir -p "${app_dir}/Contents/MacOS"
+  mkdir -p "${app_dir}/Contents/Resources"
+}
+
+# roost_stamp_plist TEMPLATE_PLIST APP_DIR VERSION
+#
+# Info.plist with version substitution. `sed -e s/.../.../g` is
+# portable across BSD + GNU sed; quoting `@VERSION@` and using a
+# unique-enough sentinel keeps the substitution unambiguous.
+roost_stamp_plist() {
+  local template_plist="$1"
+  local app_dir="$2"
+  local version="$3"
+  echo "==> Stamping Info.plist (version=${version})"
+  sed -e "s/@VERSION@/${version}/g" "${template_plist}" \
+    > "${app_dir}/Contents/Info.plist"
+}
+
+# roost_write_pkginfo APP_DIR
+#
+# Classic four-byte PkgInfo so Finder recognizes the bundle type
+# without leaning on Info.plist alone. macOS tolerates a missing
+# PkgInfo nowadays but Spotlight prefers it.
+roost_write_pkginfo() {
+  local app_dir="$1"
+  printf "APPL????" > "${app_dir}/Contents/PkgInfo"
+}
+
 # roost_install_app_icon ICON_COMPOSER_SRC ICON_SRC APP_DIR
 #
 # App icon. On macOS 26 (Tahoe) a loose .icns is treated as legacy and
@@ -151,6 +188,13 @@ roost_build_and_embed_roostctl() {
   # caches (e.g. sccache + CI matrices that fan out across configs)
   # routinely override the default `<repo>/target/` location.
   local cargo_target="${CARGO_TARGET_DIR:-${repo_root}/target}"
+  # Cargo resolves a relative CARGO_TARGET_DIR from its own CWD (the
+  # repo root, where the build subshell cd's) — anchor discovery the
+  # same way so the two can't diverge.
+  case "${cargo_target}" in
+    /*) ;;
+    *) cargo_target="${repo_root}/${cargo_target}" ;;
+  esac
   local roostctl_src="${cargo_target}/${cargo_profile_dir}/roostctl"
   if [ ! -x "${roostctl_src}" ]; then
     echo "error: cargo build did not produce ${roostctl_src}" >&2

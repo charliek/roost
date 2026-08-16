@@ -95,25 +95,13 @@ if [ ! -x "${SWIFT_BUILD_BIN}" ]; then
   exit 1
 fi
 
-echo "==> Assembling ${APP_DIR}"
-rm -rf "${APP_DIR}"
-mkdir -p "${APP_DIR}/Contents/MacOS"
-mkdir -p "${APP_DIR}/Contents/Resources"
+roost_assemble_skeleton "${APP_DIR}"
 
 cp "${SWIFT_BUILD_BIN}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
-# Info.plist with version substitution. `sed -e s/.../.../g` is
-# portable across BSD + GNU sed; quoting `@VERSION@` and using a
-# unique-enough sentinel keeps the substitution unambiguous.
-echo "==> Stamping Info.plist (version=${VERSION})"
-sed -e "s/@VERSION@/${VERSION}/g" "${TEMPLATE_PLIST}" \
-  > "${APP_DIR}/Contents/Info.plist"
-
-# Classic four-byte PkgInfo so Finder recognizes the bundle type
-# without leaning on Info.plist alone. macOS tolerates a missing
-# PkgInfo nowadays but Spotlight prefers it.
-printf "APPL????" > "${APP_DIR}/Contents/PkgInfo"
+roost_stamp_plist "${TEMPLATE_PLIST}" "${APP_DIR}" "${VERSION}"
+roost_write_pkginfo "${APP_DIR}"
 
 # Resource bundles SwiftPM emits — the .app ships them so the running
 # app can read its resources. `Roost_Roost.bundle` carries our theme
