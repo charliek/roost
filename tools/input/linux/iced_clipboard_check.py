@@ -54,6 +54,11 @@ SCALE = float(os.environ.get("ROOST_TEST_TIMEOUT_SCALE", "1") or "1")
 SIDEBAR_ROW_HEIGHT = 32
 SIDEBAR_ROW_SPACING = 2
 SIDEBAR_BODY_TOP_PADDING = 4
+# crates/roost-iced/src/chrome.rs ACCENT: the focused inline-editor border,
+# drag borders, and notification dots all share the one accent since plan
+# 026 flipped #4e9af1 to the Mac's #007aff. Named so the next flip is a
+# one-line edit here.
+ACCENT = (0x00, 0x7A, 0xFF)
 # crates/roost-iced/src/terminal_widget.rs: the grid is edge-pinned, so a cell
 # offset is measured straight off the terminal widget's origin. Named rather
 # than folded away so the next inset change stays a one-line edit here.
@@ -445,7 +450,7 @@ def _wait_for_inline_editor_focus(
     """Wait for the renderer-owned focused border before sending replacement text."""
     _wait_until(
         lambda: _screenshot_color_count(
-            launch, (0x4E, 0x9A, 0xF1), f"{name}-focused"
+            launch, ACCENT, f"{name}-focused"
         )
         >= baseline + 40,
         f"{name} focused inline editor",
@@ -457,7 +462,7 @@ def _wait_for_inline_editor_closed(
 ) -> None:
     _wait_until(
         lambda: _screenshot_color_count(
-            launch, (0x4E, 0x9A, 0xF1), f"{name}-closed"
+            launch, ACCENT, f"{name}-closed"
         )
         <= baseline + 10,
         f"{name} inline editor closed",
@@ -466,7 +471,7 @@ def _wait_for_inline_editor_closed(
 
 def _open_inline_editor_with_key(launch: Launch, combo: str, name: str) -> None:
     baseline = _screenshot_color_count(
-        launch, (0x4E, 0x9A, 0xF1), f"{name}-baseline"
+        launch, ACCENT, f"{name}-baseline"
     )
     launch.key(combo)
     _wait_for_inline_editor_focus(launch, baseline, name)
@@ -885,7 +890,7 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     )
     _drain_tabs(launch, [home_tab])
     project_editor_baseline = _screenshot_color_count(
-        launch, (0x4E, 0x9A, 0xF1), "rename-project-baseline"
+        launch, ACCENT, "rename-project-baseline"
     )
     launch.key("alt+shift+r")
     _wait_until(
@@ -907,7 +912,7 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     _assert_no_pty_input(launch, [home_tab], "Rename Project shortcut")
 
     rename_tab_baseline = _screenshot_color_count(
-        launch, (0x4E, 0x9A, 0xF1), "rename-tab-baseline"
+        launch, ACCENT, "rename-tab-baseline"
     )
     launch.key("alt+r")
     _wait_for_inline_editor_focus(launch, rename_tab_baseline, "rename-tab")
@@ -923,7 +928,7 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     # The inactive first tab selector is owned by the stable-ID strip gesture,
     # so its double-click must select that ID before opening the same editor.
     double_click_baseline = _screenshot_color_count(
-        launch, (0x4E, 0x9A, 0xF1), "double-click-tab-baseline"
+        launch, ACCENT, "double-click-tab-baseline"
     )
     metrics = launch.client.window_metrics()
     _double_click_window_control(
@@ -954,7 +959,7 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     # stable project ID.
     launch.client.focus(home_tab)
     project_double_baseline = _screenshot_color_count(
-        launch, (0x4E, 0x9A, 0xF1), "double-click-project-baseline"
+        launch, ACCENT, "double-click-project-baseline"
     )
     _double_click_window_control(launch, 100, 52)
     _wait_until(
@@ -978,7 +983,7 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     # Escape and terminal click-away both discard the draft and clear pending
     # editor focus. The next ordinary key must route to the terminal.
     cancel_project_baseline = _screenshot_color_count(
-        launch, (0x4E, 0x9A, 0xF1), "cancel-project-baseline"
+        launch, ACCENT, "cancel-project-baseline"
     )
     launch.key("alt+shift+r")
     _wait_for_inline_editor_focus(
@@ -1106,7 +1111,7 @@ def _direct_tab_reorder(
             metrics = launch.client.window_metrics()
             band = min(round(launch.client.terminal_top(metrics)), height)
             left = max(0, round(float(metrics["sidebar_width"])))
-            accent = (0x4E, 0x9A, 0xF1)
+            accent = ACCENT
             runs: list[tuple[int, int]] = []
             for row in range(band):
                 start: int | None = None
@@ -1143,6 +1148,18 @@ def _direct_tab_reorder(
                     == source,
                     f"{label} press selects its stable ID",
                 )
+            # Plan 026 deferred the accent border to the real drag
+            # threshold (strip_reorder DRAG_THRESHOLD = 8px), so a bare
+            # press renders nothing. Cross the threshold with a small
+            # nudge toward the target first; the drag-began border then
+            # serves the same causal purpose — Iced has consumed the
+            # press and armed the drag before the trajectory runs. Once
+            # dragging, backtracking never un-arms, so a step-1 position
+            # behind the nudge is safe.
+            nudge_x = x0 + (12 if target_x >= x0 else -12)
+            launch.terminal_pointer(
+                ["mousemove", "--window", launch.window, str(nudge_x), str(y)]
+            )
             pressed_capture: list[bytes] = []
 
             def source_press_rendered() -> bool:
@@ -1155,9 +1172,6 @@ def _direct_tab_reorder(
                 pressed_capture[:] = [png]
                 return True
 
-            # The held-source accent is a product-visible causal fence: Iced
-            # has consumed the native press at the intended stable-ID pill
-            # before the first trajectory sample can change cursor position.
             _wait_until(source_press_rendered, f"{label} source press render")
             if capture_root:
                 (capture_dir / f"{capture_name}-pressed.png").write_bytes(

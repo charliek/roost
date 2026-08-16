@@ -35,9 +35,14 @@ roost-vt = { path = "../roost-vt", features = ["ffi"] }
 
 # Released and exact-pinned for a reproducible long-lived POC. Both renderers
 # are compiled: wgpu is primary, tiny-skia is the software/headless fallback.
+# `image-without-codecs` rather than `image`: the only raster we draw is the
+# embedded app icon in the close-project confirm, and we hand it to iced as
+# already-decoded RGBA (the `png` crate below does the decode), so pulling
+# `image`'s full codec set in would be dead weight.
 iced = { version = "=0.14.0", default-features = false, features = [
     "advanced",
     "crisp",
+    "image-without-codecs",
     "tiny-skia",
     "tokio",
     "wayland",

@@ -142,8 +142,18 @@ pub(super) fn collect_tab_output(
         return;
     };
     match output {
+        // The session attaches with the OSC opt-in, so PTY output
+        // arrives already scanned: its color-query replies left from the
+        // drain (that is D10's whole point) and what reaches here is the
+        // remaining actions. `Bytes` is the un-opted-in shape — GTK's —
+        // and cannot occur on this path; treat it as a chunk with no
+        // actions rather than asserting.
         TabOutput::Bytes(bytes) => {
-            let actions = tab.write_vt(&bytes);
+            tab.write_vt(&bytes);
+            collected.touched.insert(tab_id);
+        }
+        TabOutput::Scanned { data, actions } => {
+            tab.write_vt(&data);
             // Most chunks of a flood carry no OSC at all; an empty entry
             // would still cost a push and an `apply_osc_actions` hop.
             if !actions.is_empty() {
@@ -191,6 +201,7 @@ impl App {
         // `Resync` and this rebuild is what heals it: deltas are an
         // optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        self.request_exit_if_empty();
         reconcile_confirm_delete(&mut self.confirm_delete, &self.projects);
         self.reconcile_tab_drag_preview();
         self.reconcile_project_drag_preview();
@@ -207,6 +218,7 @@ impl App {
         self.tabs.retain(|tab_id, _| live_ids.contains(tab_id));
         self.pending_attachments.retain_live(&live_ids);
         let active_tab_id = self.workspace.active().1;
+        self.request_tab_reveal(active_tab_id);
         for (tab_id, tab) in &mut self.tabs {
             if *tab_id != active_tab_id && tab.reset_pointer_state() {
                 refresh_or_warn(*tab_id, tab, "pointer reset after active tab changed");
@@ -223,6 +235,37 @@ impl App {
             }
             self.attach_tab_tracked(*tab_id, now);
         }
+    }
+
+    /// Mac parity: an empty workspace ends the app (App.swift closes the
+    /// window on `.projectDeleted` with no projects left, and the process
+    /// terminates behind it). Hooked to the reconciled SNAPSHOT rather
+    /// than to the `ProjectDeleted` event: a lagged broadcast collapses
+    /// into a `Resync`, which carries no per-project event to react to.
+    /// Reading the snapshot instead covers every route by construction —
+    /// closing the last tab (the engine cascades tab → project), the
+    /// confirm dialog, the palette, and raw `project.delete` over IPC.
+    ///
+    /// Boot is safe: `hydrate_workspace` seeds a default project before
+    /// the first reconcile, so the workspace is never observed empty
+    /// except after the user emptied it.
+    fn request_exit_if_empty(&mut self) {
+        if self.exit_state.observe(self.projects.is_empty()) {
+            tracing::info!("last project closed; exiting");
+        }
+    }
+
+    /// Queue a strip reveal when the OBSERVED active tab changed. Hooked
+    /// to reconcile rather than to a focus helper on purpose: `tab.focus`
+    /// over IPC mutates the workspace in its handler and reaches the UI
+    /// only as a broadcast, so a UI-side funnel would miss exactly the
+    /// path the missing reveal was reported on.
+    fn request_tab_reveal(&mut self, active_tab_id: i64) {
+        if self.revealed_tab_id == Some(active_tab_id) {
+            return;
+        }
+        self.revealed_tab_id = Some(active_tab_id);
+        self.tab_reveal_request = Some(active_tab_id);
     }
 
     /// One attach attempt for a tab the workspace lists but the UI has no
@@ -718,8 +761,10 @@ impl App {
                 // lookup is the price of handing `self` to `apply_osc_actions`.
                 let result = if !self.test_mode {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
-                } else if let Some(actions) =
-                    self.tabs.get_mut(&tab_id).map(|tab| tab.write_vt(&data))
+                } else if let Some(actions) = self
+                    .tabs
+                    .get_mut(&tab_id)
+                    .map(|tab| tab.scan_and_write_vt(&data))
                 {
                     task = task.then(self.apply_osc_actions(tab_id, actions));
                     self.tabs
@@ -1370,6 +1415,35 @@ mod tests {
         supervisor.close(70);
     }
 
+    /// What the OSC opt-in actually delivers: the bytes still write
+    /// through, and the actions the drain did NOT consume (it keeps the
+    /// query replies) ride along for the batch tail to apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scanned_output_writes_through_and_carries_its_actions() {
+        let (mut tabs, supervisor) = attached(75);
+        let mut collected = TabOutputBatch::default();
+
+        collect_tab_output(
+            &mut tabs,
+            &mut collected,
+            75,
+            TabOutput::Scanned {
+                data: b"\x1b[2J\x1b[Hhello".to_vec(),
+                actions: vec![OscAction::PointerShape("pointer".into())],
+            },
+        );
+
+        assert_eq!(collected.touched, HashSet::from([75]));
+        assert_eq!(
+            collected.osc_actions,
+            vec![(75, vec![OscAction::PointerShape("pointer".into())])]
+        );
+        let tab = tabs.get_mut(&75).expect("the tab is still attached");
+        tab.refresh_snapshot().expect("refresh the touched tab");
+        assert_eq!(tab.snapshot.grid[0].text, "hello");
+        supervisor.close(75);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn output_for_a_tab_that_is_gone_is_dropped() {
         let (mut tabs, supervisor) = attached(71);
@@ -1463,7 +1537,11 @@ mod tests {
         while Instant::now() < deadline && !seen.contains(needle) {
             let mut batch = EngineBatch::default();
             while let Some(item) = rx.try_next(&mut batch) {
-                if let EngineFeed::Tab(id, TabOutput::Bytes(bytes)) = item {
+                if let EngineFeed::Tab(
+                    id,
+                    TabOutput::Bytes(bytes) | TabOutput::Scanned { data: bytes, .. },
+                ) = item
+                {
                     if id == tab_id {
                         seen.push_str(&String::from_utf8_lossy(&bytes));
                     }

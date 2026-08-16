@@ -227,24 +227,101 @@ Slices, each sized for one gauntlet pass:
   `e2e-iced`/`e2e-iced-ci` gate on `WAYLAND_DISPLAY`, documented in
   `ci.yml`). Exit condition: an iced/winit release that delivers any of
   these becomes its own adoption slice.
-* **3h. Polish parity II (user-directed).** The remainder of 3e's
-  original scope, split out by plan 016 (W8) once batch 1 (chrome
-  parity) shipped: typography glyph-baseline comparison; cursor/
-  selection/link pixel geometry; empty/loading/error states, including
-  the empty-workspace state after the last project is deleted (today
-  iced lands in the engine's empty workspace state while both shipped
-  UIs close their window instead); confirm-overlay pointer modality
-  tightening (it blocks presses but, like the palette, passes wheel/
-  hover through); hover/focus/disabled state styles; the frosted/
-  translucent window-vibrancy spike (likely `window-vibrancy` over a
-  transparent iced window on macOS, compositor-dependent on Linux —
-  decision is Charlie's); agent-row height/typography distinctness;
-  tab status dot/label geometry; the hover-close decision (note: the
-  shipped Mac shows × only on the active pill with no hover reveal —
-  App.swift:4747 — so adding hover-close to iced would be a *product*
-  decision, not a parity port); and offscreen-tab reveal after
-  programmatic selection. **Plan this slice with the user in the
-  loop — they want to give detailed direction here,** as with 3e.
+* **3h. Polish parity II — mostly complete (plan 026,
+  `feature/plan-026-mac-polish`).** The remainder of 3e's original
+  scope, split out by plan 016 (W8), was resolved item-by-item in a
+  guided side-by-side walkthrough with Charlie on 2026-08-15 (Swift +
+  iced dev builds, main@0a72119) that produced sixteen work items; the
+  full record is
+  `~/.claude/plans/roost/026-mac-polish/walkthrough-verdicts.md`.
+  Shipped, all Charlie-directed: the cursor visual-style mapping was
+  TRANSPOSED against the vendored header (bar/block swapped, so
+  DECSCUSR 1/2 vs 5/6 rendered swapped too) — fixed at the roost-vt
+  source, so GTK inherits the correction — plus a hollow-outline cursor
+  on window-unfocus threaded into `TerminalWidget` (mac parity; cursor
+  color stays theme/OSC-12-driven, no hardcoded constant); ctrl+letter
+  and ctrl+[ \ ] _ chords recovered from winit's control-transformed
+  `text` field via a `ControlChord` split, byte-identical to the Swift
+  app for every chord it emits (ctrl+[ is the one exception — see
+  below); same-cell drag reports suppressed via a `DragCellGate` beside
+  `MotionEmitter` (fixes strix's double-click detection; iced-wired
+  only, GTK/mac don't exhibit the bug); OSC 10/11/12/4 query replies
+  moved to the PTY-drain path (0.1–0.5 ms, mac parity, was 1–12 ms —
+  fixes a `prox status` reply leaking into the shell prompt as
+  `11;rgb:…`); tab strip: active-tab reveal on every observed
+  activation (keyboard, palette, click, or IPC) via `reconcile()`, pill
+  truncation at mac's min 80 / max 220 with a real tail ellipsis, the
+  bare-click accent-border flash removed (the visual drag state now
+  waits for a real drag threshold instead of arming on press), pill
+  hover recolor replaced with a red tint on the × glyph only (no
+  pill-background hover), notification dot 8→9px; one `ACCENT`
+  (`#007aff`) replacing the `NOTIFICATION`/`NOTIFICATION_BADGE` split
+  (closes [#321]); the rename editor gets the mac near-black editing
+  field plus an accent focus ring/selection; the confirm-delete overlay
+  restyled to the mac `closeActiveProject` alert (bundled app icon,
+  "Close \<name\>?" copy, a live tab count, Cancel/Close Project
+  buttons) and now SURVIVES window focus loss (a `FocusTeardown` policy
+  table keeps `confirm_delete` alive while rename/drag/IME still
+  cancel); exit-on-empty-workspace (last tab closes its project via the
+  existing engine cascade; last project close/delete — from the UI,
+  palette, keybind, or IPC — exits the app, matching the Swift window-
+  close policy; the check lives in `reconcile()` and an `UiTask::Exit`
+  variant so App drops and flushes `state.json` on every path) with the
+  "Starting terminal…" placeholder replaced by a plain background fill;
+  U+23FA and similar default-text-presentation, no-VS16 codepoints now
+  render monochrome instead of falling into Apple Color Emoji's
+  cosmic-text cascade; and footer/label/palette measured against the
+  live mac and matched (footer 8px/12px chip padding, active/inactive
+  project-label color, palette row insets, scrollbar hidden, the
+  filter-input divider removed, top-row scroll-clipping fixed).
+  Typography glyph-baseline comparison, selection geometry, link hover,
+  sidebar-row hover, and agent-row presentation all PASSED as-is in the
+  walkthrough (byte/pixel evidence in the record) — no code needed.
+  Decisions recorded: hover-close stays ×-on-the-active-pill-only with
+  a red hover tint — no hover-reveal on inactive pills, since that
+  would be a *product* change rather than a parity port, per the
+  original 3e framing; click-outside-cancel on the confirm overlay is
+  KEPT (deliberate, re-pinned); ctrl+[ now emits the fixterms-canonical
+  `\x1b[91;5u` (libghostty's `ctrlSeq` deliberately excludes `[ i m`;
+  the Swift app emits NOTHING for the chord) — whether iced should
+  special-case bare ESC instead is an OPEN PRODUCT QUESTION for
+  Charlie, filed as [#343] rather than decided here.
+  Deferred, tracked: right-click context menus ([#338]); the tab-drag
+  press-jump flicker — a timeboxed investigation (D13) found the root
+  cause (an iced pill's width depends on `active`, so its reserved
+  ×-slot shifts every following pill 24px the instant selection
+  changes, before any pointer motion — the drag gesture just makes it
+  obvious because it lands mid-gesture) but the fix is a visible
+  pill-metrics change that wants Charlie's eyeball rather than a blind
+  landing, so the diagnosis plus fix directions are filed as [#339]
+  instead of landed; the DnD ghost-image + insertion-line redesign
+  stays deferred by decision (move-the-pill ships for v0.0.18);
+  copy-on-select plus a primary-selection-style paste buffer ([#340])
+  and option-as-meta for ⌥-letter readline chords ([#341]) are both
+  confirmed parity (neither app has either today) and are product
+  questions, not gaps; a mac-only gap — selection drag doesn't
+  auto-scroll at the window edge — is filed as [#342] (iced is
+  explicitly not required to copy it).
+  The frosted/translucent window-vibrancy spike is MOVED OUT of this
+  slice to **M6 §6f** (below) — Charlie's call: it is not needed for
+  the Linux release, and 6f already owns the AppKit-side groundwork
+  (no `NSVisualEffectView` in the Swift source to port from) it would
+  build on.
+  Left genuinely open, low priority: D7's confirm-overlay wheel/hover
+  pass-through was explicitly left untightened by decision (recorded,
+  matching the palette's existing pass-through — W7 landed everything
+  else); no keyboard focus ring or sidebar-row-hover-distinct-from-
+  active state landed (neither was among the sixteen walkthrough items
+  in the first place). All minor — pick up in a future pass if they
+  surface again.
+
+[#321]: https://github.com/charliek/roost/issues/321
+[#338]: https://github.com/charliek/roost/issues/338
+[#339]: https://github.com/charliek/roost/issues/339
+[#340]: https://github.com/charliek/roost/issues/340
+[#341]: https://github.com/charliek/roost/issues/341
+[#342]: https://github.com/charliek/roost/issues/342
+[#343]: https://github.com/charliek/roost/issues/343
 
 Slice order is deliberate: 3b closed the honest `Err("… not available in
 Iced yet")` stubs — the grep now has zero hits — and 3c closed the last
@@ -834,9 +911,12 @@ Slices:
   run-iced`. Match `mac/Sources/Roost/DesktopNotifications.swift`
   semantics. Replace-by-server-id becomes UN's stable per-tab identifier,
   which is simpler than the D-Bus version.
-* **6f. Window vibrancy.** May partly land in 3h, which already owns the
-  spike. Worth knowing before starting: there is **no `NSVisualEffectView`
-  anywhere in the Swift source** — the sidebar's translucency is AppKit's
+* **6f. Window vibrancy.** Moved here from 3h by plan 026 (2026-08-15,
+  Charlie's call, Q9): the frosted/translucent spike is an M6 mac-parity
+  exploration item, not something the Linux release needs, so it no
+  longer lives in the M3 3h polish-parity slice. Worth knowing before
+  starting: there is **no `NSVisualEffectView` anywhere in the Swift
+  source** — the sidebar's translucency is AppKit's
   implicit source-list material (`outline.style = .sourceList` plus
   `scrollView.drawsBackground = false` and no pane fill), and the Swift
   code only ever works *around* it. So there is nothing to port 1:1;

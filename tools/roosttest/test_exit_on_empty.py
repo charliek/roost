@@ -1,0 +1,123 @@
+"""Exit-on-empty E2E — deleting the last project ends the Iced app.
+
+Plan 026 D8/C7. Mac parity: the Swift app closes its window when
+`.projectDeleted` leaves no projects and the process terminates behind it
+(App.swift `applicationShouldTerminateAfterLastWindowClosed`); Iced now
+does the same from `reconcile()`'s snapshot, so every route reaches it —
+UI close, palette, the confirm dialog, the last tab's PTY exit (the engine
+cascades tab → project, workspace.rs), and raw `project.delete` over IPC.
+
+**Its own pytest invocation, on purpose** (Makefile `e2e-iced-exit`, its
+own CI step). This test kills the UI it drives, so it cannot live in the
+shared-session iced lane: the session-scoped harness fixture launches ONE
+instance for the whole invocation, and a mid-suite exit would leave every
+later module without a UI. It is deliberately absent from Makefile
+`ICED_E2E_TESTS` and from the three enumerated ci.yml iced lists — and it
+enforces that itself (`_runs_alone`) rather than trusting those lists.
+
+GTK is unchanged by this slice (divergence recorded in the plan, per the
+plan-016 stance) and Mac has always terminated on the last project's
+window close, so both skip.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+import ui
+from client import scaled_timeout
+from util import is_fresh
+
+
+def _project_ids(roost) -> list[int]:
+    return [int(p["id"]) for p in roost.list()]
+
+
+def _runs_alone(request) -> bool:
+    """Whether this module is the whole invocation.
+
+    Self-enforcing version of the lane rule above: collected beside other
+    modules (a whole-directory run, or a stale edit to `ICED_E2E_TESTS`),
+    ending the UI here would fail every test that comes after. Skipping is
+    loud — `pytest_terminal_summary` prints every skip with its reason.
+    """
+    return {item.path for item in request.session.items} == {request.node.path}
+
+
+def test_deleting_the_last_project_exits_cleanly_and_flushes_state(roost, target, request):
+    """Delete every project over IPC and assert the three things the exit
+    path owes: the deleting client gets its success reply (the socket does
+    NOT tear down under an in-flight request), the process ends itself with
+    status 0, and `state.json` is intact and holds the emptied workspace.
+
+    Status 0 is the observable half of the flush-on-drop requirement: the
+    run loop returned, which is what drops `App` and runs `Drop::drop`'s
+    fsync-ing `workspace.flush()` — a killed or panicking process could not
+    produce it. (The flush itself logs `workspace state flushed on
+    shutdown` at INFO, which the lanes run too quiet to assert on.)
+    """
+    if target != "iced":
+        pytest.skip(
+            "exit-on-empty is an iced behavior this slice: mac already "
+            "terminates on the last project's window close, and GTK keeps "
+            "its empty-workspace state (recorded divergence)"
+        )
+    if not _runs_alone(request):
+        pytest.skip(
+            "ends the UI it drives, so it must be its own pytest "
+            "invocation (`make e2e-iced-exit`) — collected beside other "
+            "modules it would strand every test after it"
+        )
+    if not is_fresh():
+        pytest.skip(
+            "deletes every project in the workspace and ends the UI — "
+            "requires a fresh, harness-owned instance (--roost-fresh)"
+        )
+    process = ui.owned_process(target)
+    state_dir = ui.session_state_dir()
+    assert process is not None and state_dir is not None, (
+        "fresh mode must have launched the UI itself; without the child "
+        "handle there is no way to observe the exit"
+    )
+
+    # A second project makes the "still alive with one project left" step
+    # meaningful whatever the bootstrap seeded (normally exactly one).
+    survivor = roost.create_project(name="pytest-exit-on-empty", cwd="/tmp")
+    roost._wait(
+        lambda: survivor in _project_ids(roost),
+        4.0,
+        "the extra project appears before anything is deleted",
+    )
+
+    for project_id in _project_ids(roost):
+        if project_id == survivor:
+            continue
+        roost.delete_project(project_id)
+    roost._wait(
+        lambda: _project_ids(roost) == [survivor],
+        5.0,
+        "every project but the survivor is gone",
+    )
+    assert process.poll() is None, (
+        "a non-empty workspace must not exit — exit is gated on the "
+        "snapshot being empty, not on a project being deleted"
+    )
+
+    # The reply for THIS call is the assertion: `Roost.call` raises on an
+    # error envelope and on a socket that closes mid-response, so a normal
+    # return is proof the success frame was written before teardown.
+    roost.delete_project(survivor)
+
+    exit_code = process.wait(timeout=scaled_timeout(20.0))
+    assert exit_code == 0, (
+        f"the UI must end its run loop normally (exit {exit_code}); a "
+        "non-zero status means the process was killed or panicked instead "
+        "of dropping App and flushing state"
+    )
+    assert not ui.is_alive(target), "the IPC socket must not answer after the exit"
+
+    state = json.loads((state_dir / "state.json").read_text())
+    assert state["projects"] == [], (
+        f"state.json must record the emptied workspace, got {state['projects']!r}"
+    )

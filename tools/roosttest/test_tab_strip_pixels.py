@@ -88,7 +88,7 @@ MUTED_TEXT = (0xA0, 0xA4, 0xB0)
 # to the Mac's `controlAccentColor` (#311); nothing else in the chrome wears
 # it, which is what makes a bare color search a valid locator here.
 NOTIFICATION_BADGE = (0x00, 0x7A, 0xFF)
-NOTIFICATION_DOT_SIZE = 8.0
+NOTIFICATION_DOT_SIZE = 9.0
 
 # Antialiasing crumbs around the badge circle that 4-connectivity could
 # strand as their own 1-2px component. None appear today (the tol-2 match is

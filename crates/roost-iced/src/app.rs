@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
@@ -11,7 +12,7 @@ use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, stack, text, text_input,
+    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Space,
 };
 use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
 use roost_engine::git_metrics;
@@ -19,8 +20,8 @@ use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
     SelectionData, UiRequest,
 };
-use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter};
-use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
+use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot};
+use roost_engine::pointer::{DragCellGate, MotionEmitter, PointerAction, PointerButton};
 use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLocks;
@@ -113,6 +114,17 @@ const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
 /// outlive its deadline by up to one of these.
 pub(crate) const STATUS_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const CONFIRM_PANEL_WIDTH: f32 = 420.0;
+/// The inline tab-rename field's width. It stands in for the measured
+/// title width while a pill is being renamed, so an editing pill sizes by
+/// the same rule as every other one.
+const RENAME_FIELD_WIDTH: f32 = 140.0;
+
+/// The tab pill the strip reveal scrolls to. Keyed by tab id alone: the
+/// pill for a tab is one container wherever the strip reorders it to, and
+/// a reveal issued for an id that has since closed simply finds nothing.
+fn tab_pill_id(tab_id: i64) -> Id {
+    Id::from(format!("tab-pill:{tab_id}"))
+}
 
 #[derive(Debug, Default)]
 struct StatusBanner {
@@ -150,6 +162,7 @@ impl StatusBanner {
 struct ConfirmDeleteProject {
     project_id: i64,
     name: String,
+    tab_count: usize,
 }
 
 fn confirm_delete_target(projects: &[Project], project_id: i64) -> Option<ConfirmDeleteProject> {
@@ -159,6 +172,7 @@ fn confirm_delete_target(projects: &[Project], project_id: i64) -> Option<Confir
         .map(|project| ConfirmDeleteProject {
             project_id: project.id,
             name: project.name.clone(),
+            tab_count: project.tabs.len(),
         })
 }
 
@@ -166,8 +180,49 @@ fn reconcile_confirm_delete(confirm: &mut Option<ConfirmDeleteProject>, projects
     if let Some(open) = confirm.as_ref() {
         // Re-resolve rather than only checking liveness: an external
         // rename while the dialog is open must not leave the user
-        // approving a deletion under a stale label.
+        // approving a deletion under a stale label. The tab count rides
+        // the same re-resolve — the Mac snapshots it when the alert opens
+        // (App.swift:3145-3182), but its alert is modal so nothing can
+        // close a tab underneath it; ours stays open across IPC traffic,
+        // and quoting a count the project no longer has would be a lie.
         *confirm = confirm_delete_target(projects, open.project_id);
+    }
+}
+
+/// What a window-focus transition tears down. A table rather than a
+/// straight-line body because the interesting part of the policy is what it
+/// leaves ALONE, and `App` needs a bound IPC socket plus a real `state.json`
+/// to construct — this is the only seam a unit test can pin it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FocusTeardown {
+    rename_completion_key: bool,
+    drags: bool,
+    /// Always false. The delete confirmation is an answer the user still
+    /// owes; unfocus dropping it (a click into another app, a screenshot
+    /// tool stealing focus) read as the app having crashed. The Mac's
+    /// `NSAlert` is application-modal and equally unaffected.
+    confirm_delete: bool,
+    ime_composition: bool,
+    /// Refocus only: macOS discards marked text when the window loses
+    /// focus, so a commit arriving after refocus is fresh input (emoji
+    /// picker), not residue of the composition the unfocus cancel dropped.
+    ime_discard: bool,
+}
+
+fn focus_teardown(focused: bool) -> FocusTeardown {
+    if focused {
+        FocusTeardown {
+            ime_discard: true,
+            ..FocusTeardown::default()
+        }
+    } else {
+        FocusTeardown {
+            rename_completion_key: true,
+            drags: true,
+            confirm_delete: false,
+            ime_composition: true,
+            ime_discard: false,
+        }
     }
 }
 
@@ -816,6 +871,54 @@ pub enum UiTask {
         measurement_generation: u64,
         reveal: bool,
     },
+    /// Scroll the tab strip so the newly activated pill is fully on
+    /// screen — the same scroll-into-view operation the palette uses,
+    /// walked along the strip's horizontal axis.
+    RevealTab {
+        scroll_id: Id,
+        pill_id: Id,
+    },
+    /// The workspace has no projects left: end the run loop so `App` is
+    /// dropped and its `Drop` flushes state (mac parity — the Swift app
+    /// closes its window on the last project's deletion). Deliberately
+    /// NOT `iced::exit()` at the point of request: `main` turns this into
+    /// one more message round-trip so the deleting IPC client's reply is
+    /// written before the loop tears the socket down.
+    Exit,
+}
+
+/// Where the app is in the exit-on-empty sequence. A plain flag would
+/// re-arm on every subsequent `reconcile()` (the workspace stays empty
+/// until the process is gone), so the request latches.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ExitState {
+    #[default]
+    Running,
+    Requested,
+    Dispatched,
+}
+
+impl ExitState {
+    /// The snapshot side. Returns whether THIS observation raised the
+    /// request, so the log line lands on the edge rather than on every
+    /// reconcile that follows it.
+    fn observe(&mut self, projects_empty: bool) -> bool {
+        if *self != Self::Running || !projects_empty {
+            return false;
+        }
+        *self = Self::Requested;
+        true
+    }
+
+    /// The drain side: a raised request is handed out exactly once, so a
+    /// second reconcile in the same teardown cannot queue a second exit.
+    fn take(&mut self) -> bool {
+        if *self != Self::Requested {
+            return false;
+        }
+        *self = Self::Dispatched;
+        true
+    }
 }
 
 /// A dispatched engine mutation: the Iced task that will deliver its
@@ -926,6 +1029,14 @@ pub struct App {
     palette_selected_in_view: Option<bool>,
     palette_visibility_request: PaletteVisibilityRequest,
     palette_visibility_retries: u8,
+    tab_strip_scroll_id: Id,
+    /// The active tab the strip has already been scrolled to. Compared
+    /// against the workspace's active tab in `reconcile()`, which is what
+    /// makes the reveal fire for every activation route — including raw
+    /// IPC, which never touches a UI focus helper.
+    revealed_tab_id: Option<i64>,
+    tab_reveal_request: Option<i64>,
+    exit_state: ExitState,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -1088,6 +1199,10 @@ impl App {
             palette_reveal_attempts: 0,
             palette_selected_in_view: None,
             palette_visibility_request: PaletteVisibilityRequest::None,
+            tab_strip_scroll_id: Id::unique(),
+            revealed_tab_id: None,
+            tab_reveal_request: None,
+            exit_state: ExitState::default(),
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -1280,6 +1395,32 @@ impl App {
 
     pub fn palette_retry_pending(&self) -> bool {
         self.palette_visibility_request.is_pending()
+    }
+
+    /// Hand out the pending strip reveal, if any. Held back until the
+    /// window exists so a boot-time activation (state.json restoring a
+    /// tab that is not the first) still reveals once there is a layout to
+    /// measure, instead of being dropped against an empty widget tree.
+    pub fn take_tab_reveal_task(&mut self) -> UiTask {
+        if self.window_id.is_none() {
+            return UiTask::None;
+        }
+        let Some(tab_id) = self.tab_reveal_request.take() else {
+            return UiTask::None;
+        };
+        UiTask::RevealTab {
+            scroll_id: self.tab_strip_scroll_id.clone(),
+            pill_id: tab_pill_id(tab_id),
+        }
+    }
+
+    /// Hand out the exit request `reconcile()` latched, once.
+    pub fn take_exit_task(&mut self) -> UiTask {
+        if self.exit_state.take() {
+            UiTask::Exit
+        } else {
+            UiTask::None
+        }
     }
 
     /// A tab whose budget ran out stays tracked but stops arming this.
@@ -1631,15 +1772,20 @@ impl App {
     }
 
     pub fn set_window_focus(&mut self, focused: bool) {
-        if !focused {
+        let teardown = focus_teardown(focused);
+        if teardown.rename_completion_key {
             self.rename_completion_key = None;
+        }
+        if teardown.drags {
             self.cancel_drags();
+        }
+        if teardown.confirm_delete {
             self.cancel_confirm_delete();
+        }
+        if teardown.ime_composition {
             self.cancel_ime_composition();
-        } else {
-            // macOS discards marked text when the window loses focus, so a
-            // commit arriving after refocus is fresh input (emoji picker),
-            // not residue of the composition the unfocus cancel discarded.
+        }
+        if teardown.ime_discard {
             self.ime_discard.disarm();
         }
         self.window_focused = focused;
@@ -1654,24 +1800,42 @@ impl App {
         let Some(confirm) = &self.confirm_delete else {
             return content;
         };
+        // Copy and structure follow the Mac's `closeActiveProject` NSAlert
+        // (App.swift:3145-3182) verbatim, plural "tabs" included.
+        let message = column![
+            text(format!("Close {}?", confirm.name))
+                .size(15)
+                .font(chrome::chrome_font(font::Weight::Semibold)),
+            text(format!(
+                "This will close {} tabs in this project. The action can't be undone.",
+                confirm.tab_count
+            ))
+            .size(12)
+            .color(chrome::MUTED_TEXT),
+        ]
+        .spacing(6);
+        let heading: Element<'_, Message> = match chrome::app_icon() {
+            Some(icon) => row![
+                image(icon)
+                    .width(chrome::APP_ICON_SIZE)
+                    .height(chrome::APP_ICON_SIZE),
+                message
+            ]
+            .spacing(14)
+            .align_y(Alignment::Start)
+            .into(),
+            None => message.into(),
+        };
         let panel = container(
             column![
-                text("Delete project?")
-                    .size(15)
-                    .font(chrome::chrome_font(font::Weight::Semibold)),
-                text(format!(
-                    "“{}” and all of its tabs will be deleted. This cannot be undone.",
-                    confirm.name
-                ))
-                .size(12)
-                .color(chrome::MUTED_TEXT),
+                heading,
                 row![
                     iced::widget::Space::new().width(Fill),
                     button(text("Cancel").size(12))
                         .padding([4, 12])
                         .style(chrome::transparent_button)
                         .on_press(Message::ConfirmDeleteCancel),
-                    button(text("Delete").size(12))
+                    button(text("Close Project").size(12))
                         .padding([4, 12])
                         .style(chrome::danger_button)
                         .on_press(Message::ConfirmDeleteConfirm)
@@ -1679,7 +1843,7 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center)
             ]
-            .spacing(12),
+            .spacing(16),
         )
         .width(Fill)
         .max_width(CONFIRM_PANEL_WIDTH)
@@ -1731,6 +1895,7 @@ impl App {
                     .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
             );
             let notifying = project.tabs.iter().any(|tab| tab.has_notification);
+            let active = project.id == active_project;
             let stripe = container(
                 iced::widget::Space::new()
                     .width(chrome::PROJECT_STRIPE_WIDTH)
@@ -1772,8 +1937,13 @@ impl App {
                 // pill instead — a fill spacer beside it would halve the
                 // field, and no dot renders beside the editor.
                 _ => {
+                    let label_color = if active {
+                        chrome::PROJECT_LABEL_ACTIVE
+                    } else {
+                        chrome::PROJECT_LABEL_INACTIVE
+                    };
                     let mut label_row = row![
-                        text(&project.name).size(13),
+                        text(&project.name).size(13).color(label_color),
                         iced::widget::Space::new().width(Fill)
                     ]
                     .align_y(Alignment::Center);
@@ -1800,7 +1970,7 @@ impl App {
                     left: chrome::PROJECT_LABEL_INSET,
                 })
                 .style(chrome::project_pill(
-                    project.id == active_project,
+                    active,
                     dragged_project == Some(project.id),
                 ));
             // The rail sits at the row's leading edge, inside the pill's own
@@ -1871,10 +2041,15 @@ impl App {
                 .style(chrome::footer_chip_button)
                 .on_press(Message::NewProject),
         )
-        .height(chrome::BAND_HEIGHT)
+        .height(chrome::FOOTER_BAND_HEIGHT)
         .width(Fill)
         .center_x(Fill)
-        .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
+        .padding(iced::Padding {
+            top: chrome::FOOTER_PADDING_TOP,
+            right: 8.0,
+            bottom: chrome::FOOTER_PADDING_BOTTOM,
+            left: 8.0,
+        })
         .style(chrome::band);
         // The strip delegates layout to its content, so its layout node is the
         // column's: one child per project group, which is what the gesture's
@@ -1927,6 +2102,10 @@ impl App {
             })
             .collect::<Vec<_>>();
         let collapsed = self.workspace.sidebar_collapsed();
+        // `TabDragPreview::drags` waits for the strip's drag threshold:
+        // `StripEvent::Started` fires on a bare press, so styling off
+        // preview presence alone painted the accent drag border for a
+        // frame on every ordinary click. Same rule the sidebar rows use.
         let mut tab_pills = row![].spacing(6);
         for tab in active_project_tabs {
             let title = if tab.title.is_empty() {
@@ -1935,6 +2114,10 @@ impl App {
                 &tab.title
             };
             let active = tab.id == active_tab;
+            let editing = self
+                .rename_editor
+                .as_ref()
+                .filter(|editor| editor.target == RenameTarget::Tab(tab.id));
             let lifecycle = agent::effective_lifecycle(&tab.agent_state());
             let status_color = tab_status_color(lifecycle);
             let dot = container(
@@ -1947,11 +2130,33 @@ impl App {
                     .background(status_color)
                     .border(iced::border::rounded(4))
             });
-            let select: Element<'_, Message> = if let Some(editor) = self
-                .rename_editor
-                .as_ref()
-                .filter(|editor| editor.target == RenameTarget::Tab(tab.id))
-            {
+            // What the pill spends beyond its chrome and title: the close
+            // affordance on the active pill, the badge on a notified
+            // inactive one. Both are laid out trailing, so both come out
+            // of the title's width budget.
+            let trailing_width = if active {
+                chrome::PILL_HEIGHT
+            } else if tab.has_notification {
+                chrome::NOTIFICATION_DOT_SIZE
+            } else {
+                0.0
+            };
+            let title_font = chrome::chrome_font(if active {
+                font::Weight::Medium
+            } else {
+                font::Weight::Normal
+            });
+            let title_budget =
+                chrome::TAB_PILL_MAX_WIDTH - chrome::TAB_PILL_CHROME_WIDTH - trailing_width;
+            let (label, label_width) = if editing.is_some() {
+                (Cow::Borrowed(title), RENAME_FIELD_WIDTH)
+            } else {
+                chrome::elide_to_width(title, title_font, chrome::TAB_TITLE_SIZE, title_budget)
+            };
+            let pill_width = (chrome::TAB_PILL_CHROME_WIDTH + trailing_width + label_width)
+                .ceil()
+                .clamp(chrome::TAB_PILL_MIN_WIDTH, chrome::TAB_PILL_MAX_WIDTH);
+            let select: Element<'_, Message> = if let Some(editor) = editing {
                 container(
                     row![
                         dot,
@@ -1959,45 +2164,55 @@ impl App {
                             .id(self.rename_input_id.clone())
                             .on_input(Message::RenameDraftChanged)
                             .on_submit(Message::RenameSubmit)
-                            .width(140)
-                            .size(12)
+                            .width(RENAME_FIELD_WIDTH)
+                            .size(chrome::TAB_TITLE_SIZE)
                             // Same integral-height rationale as the project
                             // rename editor above.
                             .line_height(iced::widget::text::LineHeight::Absolute(18.0.into(),))
                             .padding([1, 3])
                             .style(chrome::inline_rename_input)
                     ]
-                    .spacing(6)
+                    .spacing(chrome::TAB_PILL_LABEL_SPACING)
                     .align_y(Alignment::Center),
                 )
                 .height(chrome::PILL_HEIGHT)
-                .padding([2, 7])
+                .padding([2.0, chrome::TAB_PILL_LABEL_PADDING_X])
                 .into()
             } else {
                 container(
                     row![
                         dot,
-                        text(title)
-                            .size(12)
+                        text(label)
+                            .size(chrome::TAB_TITLE_SIZE)
                             .color(if active {
                                 chrome::TEXT
                             } else {
                                 chrome::MUTED_TEXT
                             })
-                            .font(chrome::chrome_font(if active {
-                                font::Weight::Medium
-                            } else {
-                                font::Weight::Normal
-                            }))
+                            .font(title_font)
+                            // Elision measured with Advanced shaping; the
+                            // default Auto drops to Basic for ASCII and
+                            // sums unkerned advances a hair wider than
+                            // the measured budget.
+                            .shaping(iced::widget::text::Shaping::Advanced)
+                            // The pill is a fixed width now, so an
+                            // unwrapped run is what keeps a title one line
+                            // tall when the elision lands a hair long.
+                            .wrapping(iced::widget::text::Wrapping::None)
                     ]
-                    .spacing(6)
+                    .spacing(chrome::TAB_PILL_LABEL_SPACING)
                     .align_y(Alignment::Center),
                 )
                 .height(chrome::PILL_HEIGHT)
-                .padding([2, 7])
+                .padding([2.0, chrome::TAB_PILL_LABEL_PADDING_X])
                 .into()
             };
-            let mut pill = row![select].align_y(Alignment::Center);
+            // The spacer pins the badge and the close affordance to the
+            // pill's trailing edge once `TAB_PILL_MIN_WIDTH` gives a short
+            // title more room than it asked for; at natural width it
+            // resolves to nothing.
+            let mut pill =
+                row![select, iced::widget::Space::new().width(Fill)].align_y(Alignment::Center);
             if tab.has_notification && !active {
                 pill = pill.push(
                     container(
@@ -2014,14 +2229,16 @@ impl App {
                         .width(chrome::PILL_HEIGHT)
                         .height(chrome::PILL_HEIGHT)
                         .padding(2)
-                        .style(chrome::transparent_button)
+                        .style(chrome::close_button)
                         .on_press(Message::CloseTab(tab.id)),
                 );
             }
             tab_pills = tab_pills.push(
                 container(pill)
+                    .id(tab_pill_id(tab.id))
+                    .width(pill_width)
                     .height(chrome::PILL_HEIGHT)
-                    .padding([0, 2])
+                    .padding([0.0, chrome::TAB_PILL_PADDING_X])
                     .style(chrome::tab_pill(
                         active,
                         self.tab_drag_preview
@@ -2057,6 +2274,7 @@ impl App {
         // the stock 10px filled rail, and even a 2px hover sliver, both did.
         // Wheel/trackpad scrolling is independent of the scrollbar's size.
         let tab_scroller = scrollable(tab_strip_row)
+            .id(self.tab_strip_scroll_id.clone())
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::hidden(),
             ))
@@ -2079,13 +2297,29 @@ impl App {
                     active_tab,
                     self.window_focused,
                 ),
+                focused: self.window_focused,
             }
             .into(),
-            _ => container(text("Starting terminal…"))
-                .center(Fill)
-                .width(Fill)
-                .height(Fill)
-                .into(),
+            // No frame to draw yet (the tab is spawning, or attached but
+            // still without applied metrics). The mac shows the terminal
+            // background until the first frame; text here flashes on every
+            // fast spawn. An attached tab answers from its own snapshot, so
+            // the theme parse is bounded to the pre-attach window.
+            _ => {
+                let background = self
+                    .tabs
+                    .get(&active_tab)
+                    .map(|tab| tab.snapshot.background)
+                    .unwrap_or_else(|| Theme::load_bundled(&self.active_theme_name).background);
+                container(Space::new())
+                    .width(Fill)
+                    .height(Fill)
+                    .style(move |_| {
+                        container::Style::default()
+                            .background(crate::terminal_widget::color(background))
+                    })
+                    .into()
+            }
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
         let content: Element<'_, Message> = if collapsed {
@@ -2232,42 +2466,47 @@ impl App {
             };
             let row = button(label)
                 .width(Fill)
-                .padding([6, 10])
+                .padding([6.0, chrome::PALETTE_ROW_PADDING_X])
                 .style(chrome::palette_row(selected, actionable));
             let row = if actionable {
                 row.on_press(Message::PaletteActivate(item.id))
             } else {
                 row
             };
-            items = items.push(container(row).id(palette_row_id(
-                self.palette_session,
-                self.palette_layout_revision,
-                index,
-            )));
+            // The outer padding — beyond the row's own — pulls the
+            // selection highlight in from the panel edge to match the
+            // mac's inset look (chrome::PALETTE_ROW_OUTER_INSET's doc
+            // comment has the measured mac numbers); the id stays on this
+            // outer wrapper so the reveal/clip-snap geometry pass in
+            // palette_scroll.rs sees the row's full allocated height.
+            items = items.push(
+                container(row)
+                    .padding([0.0, chrome::PALETTE_ROW_OUTER_INSET])
+                    .id(palette_row_id(
+                        self.palette_session,
+                        self.palette_layout_revision,
+                        index,
+                    )),
+            );
         }
+        // Hidden like the tab strip (app.rs:2260-2264, #281): wheel/trackpad
+        // scroll stays live, but no rail overlays the rows. W-K.2.
         let list = scrollable(items)
             .id(self.palette_scroll_id.clone())
             .on_scroll(|_| Message::PaletteScrolled)
             .direction(scrollable::Direction::Vertical(
-                scrollable::Scrollbar::new()
-                    .width(2)
-                    .scroller_width(4)
-                    .margin(2),
+                scrollable::Scrollbar::hidden(),
             ))
-            .style(chrome::overlay_scrollable)
             .height(Shrink);
-        let divider = container(
-            container(iced::widget::Space::new().height(1))
-                .width(Fill)
-                .style(chrome::palette_divider),
-        )
-        .padding([8, 2]);
-        let panel = container(column![input, divider, list].spacing(0))
+        // W-K.3: the mac's own divider (PalettePanel.swift:188-202) doesn't
+        // carry over — Charlie called the iced rendering of it out as
+        // visual clutter under the filter input; a plain gap replaces it.
+        let panel = container(column![input, list].spacing(8))
             .width(Fill)
             .max_width(chrome::PALETTE_WIDTH)
             .height(Shrink)
             .max_height(chrome::PALETTE_MAX_HEIGHT)
-            .padding(10)
+            .padding(chrome::PALETTE_PANEL_PADDING)
             .style(chrome::palette_panel);
         let overlay = container(mouse_area(panel).on_press(Message::PaletteCardPressed))
             .width(Fill)
@@ -2664,6 +2903,10 @@ impl Drop for App {
         // Freeze and fsync the authoritative layout before PTY-exit tasks can
         // observe teardown and attempt a later persistence write.
         self.workspace.flush();
+        // The one observable proof that the run loop dropped `App` rather
+        // than the process being killed under it — the exit-on-empty path
+        // depends on this running.
+        tracing::info!("workspace state flushed on shutdown");
     }
 }
 
@@ -2758,6 +3001,29 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_workspace_requests_exactly_one_exit() {
+        let mut state = ExitState::default();
+        assert!(!state.take(), "a running app has no exit to drain");
+
+        assert!(state.observe(true));
+        // Every later reconcile sees the same empty workspace (nothing can
+        // refill it once the exit is under way) — none of them may re-raise.
+        assert!(!state.observe(true));
+
+        assert!(state.take());
+        assert!(!state.take(), "the exit is dispatched once");
+        assert!(!state.observe(true));
+    }
+
+    #[test]
+    fn a_populated_workspace_never_requests_an_exit() {
+        let mut state = ExitState::default();
+        assert!(!state.observe(false));
+        assert!(!state.take());
+        assert_eq!(state, ExitState::Running);
+    }
 
     #[test]
     fn terminal_geometry_never_produces_zero_grid() {
@@ -3474,23 +3740,49 @@ mod tests {
     fn confirm_delete_targets_only_projects_present_in_the_snapshot() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
+        workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        workspace.open_tab(project.id, "/tmp", "two").unwrap();
         let snapshot = workspace.snapshot();
 
         assert_eq!(
             confirm_delete_target(&snapshot, project.id),
             Some(ConfirmDeleteProject {
                 project_id: project.id,
-                name: "doomed".into()
+                name: "doomed".into(),
+                tab_count: 2,
             })
         );
         assert_eq!(confirm_delete_target(&snapshot, 0), None);
         assert_eq!(confirm_delete_target(&snapshot, project.id + 1), None);
     }
 
+    /// The dialog quotes the Mac's `closeActiveProject` alert verbatim
+    /// (App.swift:3145-3182), plural "tabs" and all — the Mac has no
+    /// singular form, so neither do we.
+    #[test]
+    fn the_confirm_body_reads_exactly_as_the_mac_alert_does() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("polish", "/tmp").unwrap();
+        workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        let snapshot = workspace.snapshot();
+        let confirm = confirm_delete_target(&snapshot, project.id).expect("target");
+
+        assert_eq!(format!("Close {}?", confirm.name), "Close polish?");
+        assert_eq!(
+            format!(
+                "This will close {} tabs in this project. The action can't be undone.",
+                confirm.tab_count
+            ),
+            "This will close 1 tabs in this project. The action can't be undone."
+        );
+    }
+
     #[test]
     fn a_confirm_whose_project_vanished_externally_is_auto_dismissed() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
+        let tab = workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        workspace.open_tab(project.id, "/tmp", "two").unwrap();
         let snapshot = workspace.snapshot();
         let mut confirm = confirm_delete_target(&snapshot, project.id);
 
@@ -3505,9 +3797,40 @@ mod tests {
             "an external rename must relabel the open confirm"
         );
 
+        workspace.close_tab(tab.id).unwrap();
+        reconcile_confirm_delete(&mut confirm, &workspace.snapshot());
+        assert_eq!(
+            confirm.as_ref().map(|confirm| confirm.tab_count),
+            Some(1),
+            "a tab closing under the open dialog must not leave it quoting a stale count"
+        );
+
         workspace.delete_project(project.id).unwrap();
         reconcile_confirm_delete(&mut confirm, &workspace.snapshot());
         assert_eq!(confirm, None);
+    }
+
+    #[test]
+    fn losing_window_focus_drops_gestures_and_ime_but_never_the_delete_confirm() {
+        let unfocus = focus_teardown(false);
+        assert!(
+            !unfocus.confirm_delete,
+            "the delete confirmation outlives an unfocus — dropping it read as a crash"
+        );
+        assert!(unfocus.drags, "a drag cannot continue under another window");
+        assert!(unfocus.rename_completion_key);
+        assert!(unfocus.ime_composition);
+        assert!(!unfocus.ime_discard);
+
+        let refocus = focus_teardown(true);
+        assert_eq!(
+            refocus,
+            FocusTeardown {
+                ime_discard: true,
+                ..FocusTeardown::default()
+            },
+            "refocus only disarms the IME discard latch"
+        );
     }
 
     #[test]

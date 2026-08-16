@@ -123,6 +123,10 @@ enum Message {
         reveal: bool,
         visibility: palette_scroll::Visibility,
     },
+    /// End the run loop. Sent by `UiTask::Exit` rather than exiting where
+    /// the request is raised, so the exit is processed on a LATER update
+    /// than the one that observed the empty workspace — see `map_task`.
+    Exit,
 }
 
 /// The compiled-in default profile, and only the default:
@@ -270,7 +274,22 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
     }
 }
 
+/// Every message goes through here so the tab-strip reveal and the
+/// exit-on-empty request have exactly one drain each: `reconcile()` queues
+/// them, and it is reached through too many paths (click, keybind, palette,
+/// notification click, raw IPC) for each of them to remember to carry the
+/// task itself. Batched rather than chained — the dispatched task may be a
+/// long-lived engine future, and neither drain must wait behind it.
 fn update(app: &mut App, message: Message) -> Task<Message> {
+    let dispatched = dispatch(app, message);
+    Task::batch([
+        dispatched,
+        app.take_tab_reveal_task().map_task(),
+        app.take_exit_task().map_task(),
+    ])
+}
+
+fn dispatch(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::EngineReady => app.service_engine_ready().map_task(),
         Message::EngineOp(result) => {
@@ -394,6 +413,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             );
             Task::none()
         }
+        // Ending the run loop drops the program state, so `App::drop`
+        // (workspace flush + fsync) runs — no `process::exit` anywhere on
+        // this path.
+        Message::Exit => iced::exit(),
         message @ (Message::ProjectSelected(_)
         | Message::BeginRenameProject(_)
         | Message::AgentSelected(_)
@@ -655,16 +678,41 @@ impl UiTask for app::UiTask {
                 };
                 if reveal {
                     iced::advanced::widget::operate(palette_scroll::ensure_visible(
-                        scroll_id, row_id,
+                        palette_scroll::Axis::Vertical,
+                        scroll_id,
+                        row_id,
                     ))
                     .map(message)
                 } else {
                     iced::advanced::widget::operate(palette_scroll::measure_visible(
-                        scroll_id, row_id,
+                        palette_scroll::Axis::Vertical,
+                        scroll_id,
+                        row_id,
                     ))
                     .map(message)
                 }
             }
+            // Fire-and-forget: the outcome carries no state the app needs
+            // (nothing retries — the next activation issues a fresh
+            // reveal), and the operation logs its own geometry pass under
+            // `RUST_LOG=roost_iced=debug`.
+            app::UiTask::RevealTab { scroll_id, pill_id } => {
+                iced::advanced::widget::operate(palette_scroll::ensure_visible(
+                    palette_scroll::Axis::Horizontal,
+                    scroll_id,
+                    pill_id,
+                ))
+                .discard()
+            }
+            // One message hop before `iced::exit()`, deliberately. The
+            // `project.delete` that emptied the workspace is served on the
+            // engine runtime: its handler mutates the workspace (which
+            // publishes the broadcast this exit rides in on) and only then
+            // writes the reply frame. Exiting inside the same update would
+            // put the socket teardown in a race with that write; the hop
+            // pushes the exit to a later update, after the runtime has been
+            // round-tripped.
+            app::UiTask::Exit => Task::done(Message::Exit),
         }
     }
 }

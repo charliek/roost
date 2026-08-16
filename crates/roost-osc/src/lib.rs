@@ -51,7 +51,12 @@
 //!     (`crates/roost-linux/src/app.rs` drain task,
 //!     `mac/Sources/Roost/TerminalView.swift::appendBytes`); the
 //!     scanner stays dependency-free and just surfaces the event so
-//!     callers control what color to answer with.
+//!     callers control what color to answer with. The matching SET and
+//!     RESET forms (10/11/12, 4, 110/111/112, 104) are surfaced too —
+//!     not because the scanner applies them, but so a consumer that
+//!     answers queries *ahead* of libghostty (iced's drain-side
+//!     router, `roost-engine::osc::OscColorState`) can track the same
+//!     colors the terminal will end up with.
 
 use std::str;
 
@@ -92,13 +97,37 @@ pub enum OscEvent {
     /// caller decides whether to route back to the UI or drop.
     ColorQuery(u8),
 
+    /// OSC 10 / 11 / 12 with a color spec body — set the foreground
+    /// (10), background (11), or cursor (12) color. libghostty applies
+    /// these to the terminal itself; they are surfaced so a scanner
+    /// that answers queries *ahead* of the terminal (the drain-side
+    /// router) can keep its own color state coherent. Malformed specs
+    /// are dropped, never surfaced as a set.
+    ColorSet { number: u8, color: (u8, u8, u8) },
+
+    /// OSC 110 / 111 / 112 — reset the foreground / background /
+    /// cursor color to the configured default. Carries the OSC number
+    /// verbatim so the consumer maps it back to the channel.
+    ColorReset(u8),
+
     /// OSC 4 palette query — `4;Ps;?`, optionally repeated
     /// (`4;0;?;1;?;…`). Carries the queried palette indices (`Ps`,
     /// 0..=255). Like [`OscEvent::ColorQuery`], the scanner doesn't
     /// synthesise the reply — the UI answers each index from the live
-    /// palette (with a theme fallback). Set forms (`4;Ps;rgb:…`) are
-    /// libghostty's to apply and are not surfaced here.
+    /// palette (with a theme fallback).
     PaletteQuery(Vec<u8>),
+
+    /// OSC 4 palette set — `4;Ps;<spec>` pairs, in body order.
+    /// libghostty applies these; the drain-side router mirrors them so
+    /// its palette answers match. A body may carry both sets and
+    /// queries (`4;0;rgb:…;1;?`), in which case the set event is
+    /// emitted first.
+    PaletteSet(Vec<(u8, (u8, u8, u8))>),
+
+    /// OSC 104 — reset palette entries to their defaults. An empty
+    /// vector is the parameterless form (`OSC 104`), which resets the
+    /// whole palette; otherwise it carries the listed indices.
+    PaletteReset(Vec<u8>),
 
     /// OSC 133 shell-integration prompt/command mark. Carries the raw
     /// body after `133;` — `A` (prompt start), `B` (prompt end), `C`
@@ -319,12 +348,39 @@ impl OscScanner {
                 }
             }
             "10" | "11" | "12" => {
-                if body != "?" {
+                // The arm matched one of the literals, so the parse holds.
+                let n: u8 = num.parse().unwrap_or(0);
+                if body == "?" {
+                    self.pending.push(OscEvent::ColorQuery(n));
+                } else if let Some(color) = parse_color_spec(body) {
+                    // Unparseable specs (`rgbi:`, garbage, multi-color
+                    // bodies) drop silently: the consumer's color state
+                    // must not move on something it could not read.
+                    self.pending.push(OscEvent::ColorSet { number: n, color });
+                }
+            }
+            "110" | "111" | "112" => {
+                self.pending
+                    .push(OscEvent::ColorReset(num.parse().unwrap_or(0)));
+            }
+            "104" => {
+                // `OSC 104` (no body) resets the whole palette; a body
+                // lists the indices to reset. A body whose indices are
+                // all unparseable drops entirely rather than escalating
+                // to the reset-everything form.
+                if body.is_empty() {
+                    self.pending.push(OscEvent::PaletteReset(Vec::new()));
                     return;
                 }
-                let n: u8 = num.parse().unwrap_or(0);
-                if n == 10 || n == 11 || n == 12 {
-                    self.pending.push(OscEvent::ColorQuery(n));
+                // A present body — even one that is only separators —
+                // never escalates to the reset-everything form.
+                let indices: Vec<u8> = body
+                    .split(';')
+                    .filter(|field| !field.is_empty())
+                    .filter_map(|field| field.parse().ok())
+                    .collect();
+                if !indices.is_empty() {
+                    self.pending.push(OscEvent::PaletteReset(indices));
                 }
             }
             "22" => {
@@ -361,20 +417,24 @@ impl OscScanner {
                 }
             }
             "4" => {
-                // Palette color query: `Ps;?` pairs, optionally
-                // repeated (`4;0;?;1;?;…`). Surface the queried indices;
-                // the UI answers each from the live palette (theme
-                // fallback). Set forms (`4;Ps;rgb:…`) are libghostty's
-                // to apply and aren't surfaced here.
-                let indices = parse_osc4_query(body);
-                if !indices.is_empty() {
-                    self.pending.push(OscEvent::PaletteQuery(indices));
+                // Palette pairs: `Ps;?` (query) and `Ps;<spec>` (set),
+                // optionally repeated (`4;0;?;1;rgb:…`). Sets are
+                // surfaced ahead of queries in the same body — a
+                // consumer that answers from a chunk-start snapshot is
+                // unaffected by the order, and one that does not gets
+                // xterm's left-to-right result.
+                let (sets, queries) = parse_osc4(body);
+                if !sets.is_empty() {
+                    self.pending.push(OscEvent::PaletteSet(sets));
+                }
+                if !queries.is_empty() {
+                    self.pending.push(OscEvent::PaletteQuery(queries));
                 }
             }
             _ => {
                 // Unhandled OSC command. libghostty handles many
-                // others (8 = hyperlink, 110/111 = reset colors, …);
-                // we don't need to route those daemon-side.
+                // others (8 = hyperlink, …); we don't need to route
+                // those daemon-side.
             }
         }
     }
@@ -529,27 +589,88 @@ pub fn format_color_query_response(n: u8, color: (u8, u8, u8)) -> Option<Vec<u8>
     )
 }
 
-/// Parse an OSC 4 query body into the queried palette indices.
+/// Parse an OSC 4 body into its set pairs and its queried indices.
 ///
 /// Body is `Ps;Pc[;Ps;Pc…]`: each `Ps` is a palette index (0..=255)
-/// and `Pc` is `?` (query) or a color spec (set). Only `?` (query)
-/// pairs are returned — set pairs are libghostty's to apply.
-/// Out-of-range / unparseable indices and a trailing unpaired field
-/// are skipped.
-fn parse_osc4_query(body: &str) -> Vec<u8> {
+/// and `Pc` is `?` (query) or a color spec (set). Out-of-range /
+/// unparseable indices, unparseable color specs, and a trailing
+/// unpaired field are all skipped.
+#[allow(clippy::type_complexity)]
+fn parse_osc4(body: &str) -> (Vec<(u8, (u8, u8, u8))>, Vec<u8>) {
     let mut fields = body.split(';');
-    let mut indices = Vec::new();
+    let mut sets = Vec::new();
+    let mut queries = Vec::new();
     while let Some(idx) = fields.next() {
         let Some(spec) = fields.next() else {
             break; // trailing unpaired field
         };
+        let Ok(n) = idx.parse::<u8>() else {
+            continue;
+        };
         if spec == "?" {
-            if let Ok(n) = idx.parse::<u8>() {
-                indices.push(n);
-            }
+            queries.push(n);
+        } else if let Some(color) = parse_color_spec(spec) {
+            sets.push((n, color));
         }
     }
-    indices
+    (sets, queries)
+}
+
+/// Parse an XParseColor-style color spec into 8-bit RGB.
+///
+/// Accepts the two forms terminal programs actually emit: `rgb:` with
+/// 1-4 hex digits per channel (`rgb:a/b/c`, `rgb:de/ad/be`,
+/// `rgb:dede/adad/bebe`) and the `#`-prefixed form with 3, 6, 9, or 12
+/// hex digits total. Wider channels are truncated to their high byte,
+/// narrower ones are replicated — the same scaling
+/// [`format_color_query_response`] inverts when it doubles each byte.
+/// Everything else (`rgbi:` floats, X11 color names, garbage) returns
+/// `None`; a consumer tracking color state must leave it unchanged
+/// rather than guess.
+fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
+    if let Some(rest) = spec.strip_prefix("rgb:") {
+        let mut parts = rest.split('/');
+        let r = scale_hex_channel(parts.next()?)?;
+        let g = scale_hex_channel(parts.next()?)?;
+        let b = scale_hex_channel(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some((r, g, b));
+    }
+    if let Some(rest) = spec.strip_prefix('#') {
+        // Byte-offset slicing below — a non-ASCII spec would panic on a
+        // char boundary, and hostile bytes arrive here straight off the
+        // PTY (`cat` of a crafted file reaches this parser on the drain).
+        if !rest.is_ascii() || rest.len() % 3 != 0 || rest.is_empty() || rest.len() > 12 {
+            return None;
+        }
+        let width = rest.len() / 3;
+        let r = scale_hex_channel(&rest[..width])?;
+        let g = scale_hex_channel(&rest[width..width * 2])?;
+        let b = scale_hex_channel(&rest[width * 2..])?;
+        return Some((r, g, b));
+    }
+    None
+}
+
+/// Convert a 1-4 digit hex channel to 8 bits, matching XParseColor's
+/// scaling: the value is left-aligned in its width, so `f` is 0xff and
+/// `f000` is 0xf0.
+fn scale_hex_channel(digits: &str) -> Option<u8> {
+    if digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for byte in digits.as_bytes() {
+        value = (value << 4) | u32::from(hex_digit(*byte)?);
+    }
+    Some(match digits.len() {
+        1 => (value * 0x11) as u8,
+        2 => value as u8,
+        3 => (value >> 4) as u8,
+        _ => (value >> 8) as u8,
+    })
 }
 
 /// Format an OSC 4 palette-query reply:
@@ -826,11 +947,110 @@ mod tests {
         assert_eq!(events, vec![OscEvent::ColorQuery(11)]);
     }
 
+    // OSC 10/11/12 sets + 110/111/112 resets. libghostty still applies
+    // these to the terminal; they are surfaced so a drain-side consumer
+    // can mirror the same state.
+
     #[test]
-    fn osc10_set_dropped() {
-        // Set-color body shouldn't emit (libghostty handles).
-        let events = feed_all(b"\x1b]10;rgb:00/00/00\x07");
-        assert!(events.is_empty());
+    fn osc10_11_12_sets_emit_their_channel() {
+        // One case per channel, across both terminators and both spec
+        // forms.
+        for (payload, number, color) in [
+            (
+                b"\x1b]10;rgb:aa/bb/cc\x07".as_slice(),
+                10,
+                (0xaa, 0xbb, 0xcc),
+            ),
+            (
+                b"\x1b]11;rgb:00/11/22\x1b\\".as_slice(),
+                11,
+                (0x00, 0x11, 0x22),
+            ),
+            (
+                b"\x1b]12;#de00ad00be00\x07".as_slice(),
+                12,
+                (0xde, 0xad, 0xbe),
+            ),
+        ] {
+            assert_eq!(
+                feed_all(payload),
+                vec![OscEvent::ColorSet { number, color }],
+                "payload {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn color_set_accepts_every_channel_width() {
+        // XParseColor scaling: a channel is left-aligned in its width.
+        for (spec, expected) in [
+            ("rgb:f/0/8", (0xff, 0x00, 0x88)),
+            ("rgb:de/ad/be", (0xde, 0xad, 0xbe)),
+            ("rgb:dea/adb/bec", (0xde, 0xad, 0xbe)),
+            ("rgb:dede/adad/bebe", (0xde, 0xad, 0xbe)),
+            ("#f08", (0xff, 0x00, 0x88)),
+            ("#deadbe", (0xde, 0xad, 0xbe)),
+            ("#deaadbbec", (0xde, 0xad, 0xbe)),
+        ] {
+            let payload = format!("\x1b]11;{spec}\x07");
+            assert_eq!(
+                feed_all(payload.as_bytes()),
+                vec![OscEvent::ColorSet {
+                    number: 11,
+                    color: expected,
+                }],
+                "spec {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_color_set_is_ignored() {
+        // Anything the parser cannot read must produce no event at all:
+        // a consumer tracking color state has to leave it unchanged
+        // rather than guess.
+        for spec in [
+            "rgb:zz/00/00",
+            "rgb:00/00",
+            "rgb:00/00/00/00",
+            "rgb:00000/0/0",
+            "rgbi:1.0/0.0/0.0",
+            "#deadb",
+            "#",
+            "#aébcd",
+            "#ééé",
+            "red",
+            "",
+        ] {
+            let payload = format!("\x1b]11;{spec}\x07");
+            assert_eq!(
+                feed_all(payload.as_bytes()),
+                Vec::<OscEvent>::new(),
+                "spec {spec:?} must not surface a set"
+            );
+        }
+    }
+
+    #[test]
+    fn osc110_111_112_emit_resets() {
+        assert_eq!(feed_all(b"\x1b]110\x07"), vec![OscEvent::ColorReset(110)]);
+        assert_eq!(feed_all(b"\x1b]111\x1b\\"), vec![OscEvent::ColorReset(111)]);
+        // Some emitters send the empty-body form.
+        assert_eq!(feed_all(b"\x1b]112;\x07"), vec![OscEvent::ColorReset(112)]);
+    }
+
+    #[test]
+    fn set_then_query_in_one_body_stream_emits_both_in_order() {
+        assert_eq!(
+            feed_all(b"\x1b]11;rgb:00/11/22\x07\x1b]11;?\x07"),
+            vec![
+                OscEvent::ColorSet {
+                    number: 11,
+                    color: (0x00, 0x11, 0x22),
+                },
+                OscEvent::ColorQuery(11),
+            ]
+        );
     }
 
     // -- format_color_query_response: byte-exact response shape for
@@ -893,16 +1113,60 @@ mod tests {
     }
 
     #[test]
-    fn osc4_set_dropped() {
-        // Set form is libghostty's to apply — not surfaced.
+    fn osc4_set_emits_palette_set() {
         let events = feed_all(b"\x1b]4;2;rgb:de/ad/be\x07");
-        assert!(events.is_empty());
+        assert_eq!(
+            events,
+            vec![OscEvent::PaletteSet(vec![(2, (0xde, 0xad, 0xbe))])]
+        );
     }
 
     #[test]
-    fn osc4_mixed_set_and_query_surfaces_only_query() {
+    fn osc4_mixed_set_and_query_surfaces_both_sets_first() {
         let events = feed_all(b"\x1b]4;0;rgb:11/22/33;1;?\x07");
-        assert_eq!(events, vec![OscEvent::PaletteQuery(vec![1])]);
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::PaletteSet(vec![(0, (0x11, 0x22, 0x33))]),
+                OscEvent::PaletteQuery(vec![1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn osc4_malformed_set_spec_skipped_without_losing_the_pairs_after_it() {
+        let events = feed_all(b"\x1b]4;0;bogus;1;rgb:11/22/33;2;?\x07");
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::PaletteSet(vec![(1, (0x11, 0x22, 0x33))]),
+                OscEvent::PaletteQuery(vec![2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn osc104_resets_whole_palette_or_named_indices() {
+        assert_eq!(
+            feed_all(b"\x1b]104\x07"),
+            vec![OscEvent::PaletteReset(vec![])]
+        );
+        assert_eq!(
+            feed_all(b"\x1b]104;\x07"),
+            vec![OscEvent::PaletteReset(vec![])]
+        );
+        assert_eq!(
+            feed_all(b"\x1b]104;1;2;255\x1b\\"),
+            vec![OscEvent::PaletteReset(vec![1, 2, 255])]
+        );
+    }
+
+    #[test]
+    fn osc104_all_unparseable_indices_drops() {
+        // A body that named only garbage — or only separators — must
+        // NOT collapse into the reset-everything form.
+        assert_eq!(feed_all(b"\x1b]104;999;zz\x07"), Vec::<OscEvent>::new());
+        assert_eq!(feed_all(b"\x1b]104;;;\x07"), Vec::<OscEvent>::new());
     }
 
     #[test]

@@ -440,6 +440,23 @@ def owned_session_config_path() -> Path | None:
     return path
 
 
+def owned_process(target: str) -> "subprocess.Popen[bytes] | None":
+    """The harness-launched Rust UI child for `target`, or None.
+
+    The lifecycle tests that assert on the UI *process* (it exits on its
+    own) need the handle the harness already holds — polling by pid would
+    race a replacement onto the same number.
+    """
+    return {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+
+
+def session_state_dir() -> Path | None:
+    """The throwaway `ROOST_STATE_DIR` of a harness-owned session, or None
+    when the harness is reusing a developer's UI (whose state is never
+    read by a test)."""
+    return _SESSION_STATE_DIR
+
+
 def start_session(target: str, *, fresh: bool) -> bool:
     """Ensure a UI is running for the test session. Returns True if the
     harness started (and therefore owns) it — the caller quits it at

@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc::UnboundedSender;
 
+use crate::osc::{OscAction, OscColorSnapshot, OscColorState, OscRouter};
 use crate::{PtyOutputEvent, PtySupervisor};
 
 /// Shared buffer used by the `tab.capture_pty_input` test op to
@@ -32,8 +34,20 @@ pub type OutputReceiver = tokio::sync::mpsc::UnboundedReceiver<TabOutput>;
 
 #[derive(Debug)]
 pub enum TabOutput {
-    /// PTY emitted bytes; route into `Terminal::vt_write`.
+    /// PTY emitted bytes; route into `Terminal::vt_write`. The UI owns
+    /// the OSC scan for these — the default path, and the only one GTK
+    /// ever sees.
     Bytes(Vec<u8>),
+    /// PTY emitted bytes and this session's drain already scanned them
+    /// (the `attach_scanned` opt-in). The bytes still route into
+    /// `Terminal::vt_write` unchanged; `actions` carries what the scan
+    /// produced MINUS the query replies, which the drain has already
+    /// enqueued onto the PTY input channel. The UI must not run a
+    /// second router over these bytes.
+    Scanned {
+        data: Vec<u8>,
+        actions: Vec<OscAction>,
+    },
     /// PTY exited (shell quit, supervisor closed it).
     Exit { status: i32, reason: String },
     /// Drain-level error (broadcast lag, etc.).
@@ -47,6 +61,16 @@ enum PtyCommand {
     Resize { cols: u16, rows: u16 },
 }
 
+/// The drain-side OSC scan, shared by the forwarding task and the
+/// handle. Both hold it briefly: the task per PTY chunk, the handle for
+/// `scan_osc` (the test-mode byte injector) and `reseed_osc_colors` (a
+/// theme change). One mutex keeps the scanner's streaming state and the
+/// color state it answers from moving together.
+struct OscDrain {
+    router: OscRouter,
+    colors: OscColorState,
+}
+
 /// Per-tab handle. Owns the sender of a per-tab serial command
 /// channel; a single drain task applies each command to the
 /// supervisor in submission order so keystrokes never reorder.
@@ -57,8 +81,9 @@ pub struct TabSession {
     #[allow(dead_code)]
     pub tab_id: i64,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<PtyCommand>,
-    /// Test-mode tap: when set, every `send_input` payload is also
-    /// appended here before being enqueued. `None` in production —
+    /// Test-mode tap: when set, every payload enqueued onto the serial
+    /// channel — from `send_input` OR from the drain's own OSC replies
+    /// — is appended here first. `None` in production —
     /// allocated by `App` when `ROOST_TEST_MODE=1` so the
     /// `tab.capture_pty_input` IPC op can observe keystrokes,
     /// paste, and synthesised OSC replies that flow out to the
@@ -66,6 +91,78 @@ pub struct TabSession {
     /// captures the bytes whether or not the supervisor write
     /// later succeeds — exactly what a test wants to assert on.
     input_capture: Option<InputCapture>,
+    /// `Some` only under the `attach_scanned` opt-in (iced). `None` —
+    /// the default, and what GTK attaches with — leaves this session's
+    /// forwarding task a pure byte pump, bit-identical to what it was
+    /// before the opt-in existed.
+    osc: Option<Arc<Mutex<OscDrain>>>,
+}
+
+/// Enqueue one payload onto a tab's serial PTY channel, mirroring it
+/// into the test-mode capture first.
+///
+/// The capture lock is held ACROSS the send so the capture's order is
+/// the channel's order even with the drain task and the UI thread
+/// enqueuing concurrently — `tab.capture_pty_input`'s contract. The
+/// send never blocks (unbounded), so the lock is held for a push.
+///
+/// A poisoned lock means a prior panic in this process; the enqueue
+/// still happens, only the observation is lost.
+fn enqueue_input(
+    cmd_tx: &UnboundedSender<PtyCommand>,
+    capture: Option<&InputCapture>,
+    data: Vec<u8>,
+) {
+    if data.is_empty() {
+        return;
+    }
+    // Bound to a local so the guard is still held at the send below —
+    // that is what makes capture order channel order.
+    let mut guard = capture.map(|capture| capture.lock());
+    if let Some(Ok(buffer)) = &mut guard {
+        buffer.extend_from_slice(&data);
+    }
+    let _ = cmd_tx.send(PtyCommand::Input(data));
+}
+
+/// Take the drain lock, recovering from poisoning: a poisoned mutex
+/// means a prior panic somewhere else in the process, and a tab that
+/// stops answering color queries for the rest of the session is a worse
+/// outcome than continuing with the state we have.
+fn lock_osc(osc: &Mutex<OscDrain>) -> std::sync::MutexGuard<'_, OscDrain> {
+    osc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Scan one chunk with a tab's drain-side router, then split what it
+/// produced: query replies go straight onto the PTY input channel,
+/// everything else is returned to travel to the UI with the bytes.
+///
+/// The scan AND its replies happen under one hold of the drain lock.
+/// Releasing it in between would let a second scanner (the PTY drain
+/// and a test-mode `scan_osc` are separate threads) interleave its
+/// enqueue between this scan and this enqueue, putting replies on the
+/// channel in the opposite order to the bytes that asked for them.
+///
+/// Lock order is `OscDrain` → `InputCapture`, and only here: every
+/// other capture holder (`enqueue_input`, and each UI's
+/// `tab.capture_pty_input` reader) takes the capture alone, so no site
+/// can invert it.
+fn scan_and_reply(
+    osc: &Mutex<OscDrain>,
+    cmd_tx: &UnboundedSender<PtyCommand>,
+    capture: Option<&InputCapture>,
+    bytes: &[u8],
+) -> Vec<OscAction> {
+    let mut drain = lock_osc(osc);
+    let OscDrain { router, colors } = &mut *drain;
+    let mut forwarded = Vec::new();
+    for action in router.feed_stateful(bytes, colors) {
+        match action {
+            OscAction::PtyInput(reply) => enqueue_input(cmd_tx, capture, reply),
+            other => forwarded.push(other),
+        }
+    }
+    forwarded
 }
 
 impl TabSession {
@@ -77,15 +174,69 @@ impl TabSession {
     pub fn attach_with_receiver(
         supervisor: Arc<PtySupervisor>,
         tab_id: i64,
-        mut output_rx: broadcast::Receiver<PtyOutputEvent>,
+        output_rx: broadcast::Receiver<PtyOutputEvent>,
         output_tx: OutputSender,
         input_capture: Option<InputCapture>,
     ) -> Self {
+        Self::attach_with_receiver_scanned(
+            supervisor,
+            tab_id,
+            output_rx,
+            output_tx,
+            input_capture,
+            None,
+        )
+    }
+
+    /// [`TabSession::attach_with_receiver`] plus the OSC opt-in.
+    ///
+    /// With `osc_seed` set, this session's forwarding task owns the
+    /// SOLE `OscRouter` for the tab: it scans each PTY chunk as it
+    /// arrives, enqueues color-query replies onto the same serial input
+    /// channel keystrokes use — before the bytes have even reached the
+    /// UI — and forwards the chunk as [`TabOutput::Scanned`] with the
+    /// remaining actions. That is the whole point of the opt-in: a
+    /// program that queries and exits (Go termenv's 1-frame probe) gets
+    /// its answer off the drain instead of one event-loop turn later,
+    /// which is where the reply used to leak into the shell prompt.
+    ///
+    /// `osc_seed` is the theme the tab launched with; see
+    /// [`OscColorState`] for why the drain tracks colors itself.
+    pub fn attach_with_receiver_scanned(
+        supervisor: Arc<PtySupervisor>,
+        tab_id: i64,
+        mut output_rx: broadcast::Receiver<PtyOutputEvent>,
+        output_tx: OutputSender,
+        input_capture: Option<InputCapture>,
+        osc_seed: Option<OscColorSnapshot>,
+    ) -> Self {
+        // The serial channel is created first: the forwarding task
+        // needs its sender to enqueue replies from the drain.
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PtyCommand>();
+        let osc = osc_seed.map(|seed| {
+            Arc::new(Mutex::new(OscDrain {
+                router: OscRouter::new(),
+                colors: OscColorState::new(seed),
+            }))
+        });
+        // Everything the scan needs travels as one option so the
+        // default path takes nothing extra — not even a second sender
+        // on the serial channel, whose lifetime ends the writer task.
+        let scan = osc
+            .clone()
+            .map(|osc| (osc, cmd_tx.clone(), input_capture.clone()));
         tokio::spawn(async move {
             loop {
                 match output_rx.recv().await {
                     Ok(PtyOutputEvent::Bytes(data)) => {
-                        if output_tx.send(TabOutput::Bytes(data)).is_err() {
+                        let output = match &scan {
+                            Some((osc, cmd_tx, capture)) => {
+                                let actions = scan_and_reply(osc, cmd_tx, capture.as_ref(), &data);
+                                TabOutput::Scanned { data, actions }
+                            }
+                            None => TabOutput::Bytes(data),
+                        };
+                        if output_tx.send(output).is_err() {
                             break;
                         }
                     }
@@ -131,8 +282,8 @@ impl TabSession {
         // supervisor in the exact order they were submitted. The
         // shared channel guarantees keystrokes (and resizes relative
         // to them) never reorder. Ends when the last `cmd_tx` drops
-        // (TabSession dropped).
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PtyCommand>();
+        // (TabSession dropped) — the forwarding task holds one too, so
+        // a drain-side reply can never race the handle's teardown.
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -153,6 +304,7 @@ impl TabSession {
             tab_id,
             cmd_tx,
             input_capture,
+            osc,
         }
     }
 
@@ -170,49 +322,95 @@ impl TabSession {
         output_tx: OutputSender,
         input_capture: Option<InputCapture>,
     ) -> Result<Self> {
+        Self::attach_scanned(supervisor, tab_id, output_tx, input_capture, None)
+    }
+
+    /// [`TabSession::attach`] plus the OSC opt-in — see
+    /// [`TabSession::attach_with_receiver_scanned`].
+    pub fn attach_scanned(
+        supervisor: Arc<PtySupervisor>,
+        tab_id: i64,
+        output_tx: OutputSender,
+        input_capture: Option<InputCapture>,
+        osc_seed: Option<OscColorSnapshot>,
+    ) -> Result<Self> {
         let rx = supervisor
             .take_initial_receiver(tab_id)
             .or_else(|| supervisor.subscribe_output(tab_id))
             .ok_or_else(|| anyhow::anyhow!("no live PTY for tab {tab_id}"))?;
-        Ok(Self::attach_with_receiver(
+        Ok(Self::attach_with_receiver_scanned(
             supervisor,
             tab_id,
             rx,
             output_tx,
             input_capture,
+            osc_seed,
         ))
     }
 
+    /// Scan a chunk of terminal output that did NOT come from the PTY
+    /// — today only `tab.feed_pty_bytes`, the test-mode byte injector.
+    ///
+    /// It runs the SAME router and the SAME color state the drain does,
+    /// so an injected chunk is indistinguishable from a real one: query
+    /// replies are enqueued here, the caller writes the bytes into its
+    /// terminal and applies the returned actions. Without the OSC
+    /// opt-in there is nothing to scan with and the caller keeps its
+    /// own router — no actions come back.
+    ///
+    /// **Callers must not race live PTY output.** Injected bytes and
+    /// PTY bytes are two producers into one streaming scanner and one
+    /// terminal, and the two orderings are independent: the injected
+    /// chunk can be scanned between a PTY chunk's scan and its
+    /// `vt_write`, or — worse — land inside a half-parsed sequence and
+    /// corrupt both. Nothing here can order them, because the injector
+    /// deliberately bypasses the drain (that is what makes it useful
+    /// for tests). It is sound because `tab.feed_pty_bytes` is
+    /// `ROOST_TEST_MODE=1`-gated and its tests drive quiet tabs, which
+    /// the harness already requires for its own reasons
+    /// (`wait_tab_quiet`, `tools/roosttest/README.md`). Production has
+    /// exactly one scanner: the forwarding task.
+    pub fn scan_osc(&self, bytes: &[u8]) -> Vec<OscAction> {
+        let Some(osc) = &self.osc else {
+            return Vec::new();
+        };
+        scan_and_reply(osc, &self.cmd_tx, self.input_capture.as_ref(), bytes)
+    }
+
+    /// Re-seed the drain-local color state after a theme change. A
+    /// no-op without the OSC opt-in.
+    pub fn reseed_osc_colors(&self, seed: OscColorSnapshot) {
+        if let Some(osc) = &self.osc {
+            lock_osc(osc).colors.reseed(seed);
+        }
+    }
+
     pub fn send_input(&self, data: Vec<u8>) {
-        if data.is_empty() {
-            return;
-        }
-        // Test-mode tap: mirror into the capture buffer before
-        // enqueuing. Capture order matches submission order because
-        // `send_input` is only ever called from the UI adapter's main
-        // thread (the terminal view's input handler runs there, the
-        // OSC drain runs there on the adapter's main-loop task, paste
-        // runs there). No concurrent producers → the capture
-        // observes the same byte order the cmd_rx drain enqueues.
+        // One serial PTY writer, several enqueue sources.
         //
-        // Captured BEFORE the send so a `tab.capture_pty_input`
-        // assertion reflects what the UI tried to write, even if a
-        // later supervisor write fails — the test wants to see
-        // intent, not what the kernel ultimately accepted.
+        // The single consumer is the `cmd_rx` task above: it is the
+        // only thing that writes to the tab's master fd, so bytes reach
+        // the PTY in exactly the order they were enqueued. What is NOT
+        // single is the producer side — the UI adapter's main thread
+        // (keystrokes, paste, resize, terminal replies) and, under the
+        // OSC opt-in, this session's own drain task (color-query
+        // replies, which is the point: they leave without waiting for
+        // the UI's event loop). Both funnel through `enqueue_input`.
         //
-        // Lock-poisoning is silently swallowed — a poisoned mutex
-        // means a prior panic in this test process; nothing useful
-        // to do here.
-        if let Some(cap) = &self.input_capture {
-            if let Ok(mut buf) = cap.lock() {
-                buf.extend_from_slice(&data);
-            }
-        }
-        // Enqueue on the per-tab serial channel. `unbounded_send`
-        // never blocks the UI adapter's main thread and preserves
-        // submission order; the prior per-call `tokio::spawn` could
-        // reorder keystrokes under the multi-thread runtime.
-        let _ = self.cmd_tx.send(PtyCommand::Input(data));
+        // The ordering contract that follows from that: enqueue order
+        // IS observed order, and user input may interleave with
+        // synthesised replies. `tab.capture_pty_input` observes the
+        // same order — its buffer is written under a lock held across
+        // the enqueue — so a test may assert on the presence and
+        // relative order of what it caused, never on the absence of an
+        // interleaving it did not.
+        //
+        // The capture is written BEFORE the supervisor write so an
+        // assertion reflects what the session tried to write, even if
+        // the write later fails — the test wants intent, not what the
+        // kernel ultimately accepted. Empty payloads are dropped on
+        // both paths.
+        enqueue_input(&self.cmd_tx, self.input_capture.as_ref(), data);
     }
 
     pub fn send_resize(&self, cols: u16, rows: u16) {

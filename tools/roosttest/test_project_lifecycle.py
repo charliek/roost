@@ -6,10 +6,17 @@ drive `project.create` / `project.delete` / `project.reorder` directly
 `app.sidebar_dump`, so the same test runs against mac/gtk/iced and pins
 op-level behavior all three engines share. A couple of tests are
 Iced-only because they exercise UI-flow behavior that has no cross-target
-analog (the full palette-dispatch path) or that would be destructive on
-the other UIs (Mac quits the whole process when the last project's
-window closes — see `Workspace.deleteProject`/App.swift's
+analog (the full palette-dispatch path) or that diverges by UI (Mac quits
+the whole process when the last project's window closes — see
+`Workspace.deleteProject`/App.swift's
 `applicationShouldTerminateAfterLastWindowClosed`).
+
+Nothing here empties the workspace. Iced now exits when the last project
+goes (plan 026 D8, mac parity), and this suite shares ONE session-scoped
+UI with every other module in the invocation — an exit mid-suite would
+strand them. The last-project case therefore lives in
+`test_exit_on_empty.py`, which runs in its own pytest invocation
+(Makefile `e2e-iced-exit`) against its own instance.
 
 Engine references (verified this session, see plan 010 §2):
 - `project.create` never changes the active selection on ANY UI — the
@@ -48,7 +55,6 @@ import re
 import pytest
 
 from client import RoostError
-from util import is_fresh
 
 
 def _project_ids(roost) -> list[int]:
@@ -312,75 +318,47 @@ def test_iced_palette_new_project_creates_active_project_with_one_tab(roost, tar
         _cleanup_project(roost, pid)
 
 
-def test_iced_deleting_every_project_lands_in_empty_state_and_ui_survives(roost, target):
-    """Deleting every project (including the conftest bootstrap default)
-    lands in the engine's pre-existing empty-workspace state — the same
-    state reachable today by closing the last tab — with no crash and IPC
-    still serviceable. Iced-only: Mac's last-project delete quits the
-    whole app (window-close cascades to `applicationWillTerminate`), and
-    the empty-state UI itself is out of scope for GTK in this slice.
+def test_iced_deleting_a_project_keeps_the_remaining_workspace_live(roost, target):
+    """Deleting projects down to the LAST remaining one leaves the UI
+    running and serviceable — the counterpart to `test_exit_on_empty.py`,
+    which owns the last-project case (the app exits there, so it cannot be
+    asserted from inside this shared-session suite).
 
-    Requires a fresh, harness-owned instance: this deletes EVERY project
-    currently in the workspace, which would nuke a developer's real
-    projects on an ad-hoc dev UI.
-
-    Deliberately leaves ONE recovery project behind at the end (created,
-    never deleted) rather than restoring to zero. A CI leg's
-    `--roost-fresh` UI is shared across every test file that runs in the
-    same pytest invocation — stranding the workspace at zero projects
-    here would leave every test that runs afterward without the baseline
-    project a fresh bootstrap normally provides (hydrate only seeds a
-    default project at launch, not mid-session, so there's no other way
-    to restore it once emptied).
+    Iced-only: this walks the same delete path the exit policy hangs off,
+    and pins that the exit is gated on the workspace becoming EMPTY rather
+    than on any project deletion. Mac terminates on the last project's
+    window close; GTK keeps its empty-workspace state (recorded
+    divergence).
     """
     if target != "iced":
         pytest.skip(
-            "last-project delete's empty-state + IPC-liveness assertions "
-            "are iced-specific — Mac terminates the whole process when the "
-            "last project's window closes"
-        )
-    if not is_fresh():
-        pytest.skip(
-            "deletes every project in the workspace — requires a fresh, "
-            "harness-owned instance (--roost-fresh) so it can't nuke a "
-            "developer's real projects"
+            "pins iced's exit-on-empty gate (empty workspace, not any "
+            "delete); mac terminates on the last window close and GTK "
+            "keeps its empty state"
         )
 
-    for pid in _project_ids(roost):
-        _cleanup_project(roost, pid)
+    a = roost.create_project(name="pytest-live-a", cwd="/tmp")
+    b = roost.create_project(name="pytest-live-b", cwd="/tmp")
+    try:
+        roost._wait(
+            lambda: {a, b} <= set(_project_ids(roost)),
+            4.0,
+            "both throwaway projects appear",
+        )
+        _cleanup_project(roost, a)
+        _cleanup_project(roost, b)
 
-    roost._wait(
-        lambda: roost.list() == [],
-        5.0,
-        "deleting every project empties the workspace snapshot",
-    )
-
-    # `identify` is its own surface, independently refreshed from
-    # tab.list — poll it rather than assuming it already settled to
-    # (0, 0) the instant the snapshot emptied.
-    roost._wait(
-        lambda: roost.identify()["active_project_id"] == 0
-        and roost.identify()["active_tab_id"] == 0,
-        5.0,
-        "active selection settles to (0, 0) once the workspace is empty",
-    )
-
-    # The UI survives: `identify` already answered above; a subsequent
-    # create must also still work (IPC + workspace both alive). NOT
-    # cleaned up — see the docstring: this is the session's recovery
-    # baseline for whatever test file runs next.
-    recovery_pid = roost.create_project(name="", cwd="/tmp")
-    roost._wait(
-        lambda: roost.project(recovery_pid) is not None,
-        4.0,
-        "project.create works again after emptying the workspace",
-    )
-    # A bare project is not the bootstrap baseline: seed and focus one
-    # tab so later test files inherit a live active selection.
-    recovery_tab = roost.open_tab(recovery_pid, cwd="/tmp")
-    roost.focus(recovery_tab)
-    roost._wait(
-        lambda: roost.identify()["active_tab_id"] == recovery_tab,
-        4.0,
-        "the recovery project holds the session's active tab baseline",
-    )
+        # Projects remain (this suite never empties the workspace), so the
+        # UI must still be answering — no exit, no cascade past the delete.
+        assert _project_ids(roost), "the shared session must keep a project"
+        roost._wait(
+            lambda: a not in _project_ids(roost) and b not in _project_ids(roost),
+            5.0,
+            "the deleted projects are gone from the workspace snapshot",
+        )
+        assert roost.identify()["active_project_id"] in _project_ids(roost), (
+            "active selection falls back to a remaining project"
+        )
+    finally:
+        for pid in (a, b):
+            _cleanup_project(roost, pid)

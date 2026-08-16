@@ -1,5 +1,9 @@
-use iced::widget::{button, container, scrollable, text_input};
-use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use iced::advanced::text::{self as advanced_text, Paragraph as _};
+use iced::widget::{button, container, image, text_input};
+use iced::{Background, Border, Color, Font, Pixels, Shadow, Size, Theme, Vector};
 
 /// One application-owned band height keeps the sidebar header and tab strip
 /// on the same seam. Native window decorations remain outside this geometry.
@@ -10,6 +14,17 @@ pub const PILL_HEIGHT: f32 = 24.0;
 /// band — shared by the sidebar footer and the tab strip so both bands stay
 /// in sync if either height changes.
 pub const BAND_PILL_PADDING_Y: f32 = (BAND_HEIGHT - PILL_HEIGHT) / 2.0;
+/// The sidebar footer's own band, separate from `BAND_HEIGHT` (which stays
+/// pinned to the sidebar header + tab strip, both covered by
+/// `test_tab_strip_pixels.py`). The mac gives its `+ New Project` button
+/// 8pt above / 12pt below rather than centering it (App.swift:841-853:
+/// `scrollView.bottomAnchor = addProject.topAnchor - 8`,
+/// `addProject.bottomAnchor = pane.bottomAnchor - 12`) — measured live for
+/// plan 026 C9 (mac pixel-sampled footer band: 8px fill, 24px button,
+/// 12px fill, matching the source exactly).
+pub const FOOTER_PADDING_TOP: f32 = 8.0;
+pub const FOOTER_PADDING_BOTTOM: f32 = 12.0;
+pub const FOOTER_BAND_HEIGHT: f32 = PILL_HEIGHT + FOOTER_PADDING_TOP + FOOTER_PADDING_BOTTOM;
 /// The agent-rollup rail: 3px at the project row's leading edge, gapped 5px
 /// top and bottom (Mac `SidebarRowView.drawBackground`, App.swift:5402-5405)
 /// so adjacent active projects read as discrete segments rather than one
@@ -28,9 +43,46 @@ pub const PROJECT_LABEL_INSET: f32 = 18.0;
 pub const PROJECT_DOT_INSET: f32 = 8.0;
 pub const AGENT_DOT_INSET: f32 = 25.0;
 pub const TAB_STATUS_SIZE: f32 = 7.0;
-pub const NOTIFICATION_DOT_SIZE: f32 = 8.0;
+pub const NOTIFICATION_DOT_SIZE: f32 = 9.0;
+/// Tab-pill width band, from the Mac (`App.swift:4757-4763`, config
+/// `tabMaxWidth`): a pill never shrinks below `TAB_PILL_MIN_WIDTH` however
+/// short its title, and a long title is tail-elided to keep the pill inside
+/// `TAB_PILL_MAX_WIDTH` rather than letting one tab own the strip.
+pub const TAB_PILL_MIN_WIDTH: f32 = 80.0;
+pub const TAB_PILL_MAX_WIDTH: f32 = 220.0;
+/// The pill's own horizontal inset, and the label block's inside it.
+pub const TAB_PILL_PADDING_X: f32 = 2.0;
+pub const TAB_PILL_LABEL_PADDING_X: f32 = 7.0;
+/// Gap between the status dot and the title.
+pub const TAB_PILL_LABEL_SPACING: f32 = 6.0;
+pub const TAB_TITLE_SIZE: f32 = 12.0;
+/// Everything a pill spends on chrome before its title gets a pixel: both
+/// containers' side padding, the status dot, and the gap after it. Derived
+/// rather than measured so the elision budget cannot drift from the layout
+/// it is eliding for.
+pub const TAB_PILL_CHROME_WIDTH: f32 = 2.0 * TAB_PILL_PADDING_X
+    + 2.0 * TAB_PILL_LABEL_PADDING_X
+    + TAB_STATUS_SIZE
+    + TAB_PILL_LABEL_SPACING;
 pub const PALETTE_WIDTH: f32 = 660.0;
 pub const PALETTE_MAX_HEIGHT: f32 = 500.0;
+/// The palette card's own outer padding (`app.rs`'s `palette_panel`
+/// container) — hoisted so the row-inset constants below can be checked
+/// against it in one place.
+pub const PALETTE_PANEL_PADDING: f32 = 10.0;
+/// Extra inset around each row, beyond `PALETTE_PANEL_PADDING`, so the
+/// selection highlight doesn't run edge-to-edge with the card — matches the
+/// mac `NSTableView`'s scroll-view gutter (`PalettePanel.swift:204-207`,
+/// scroll inset 8 from the card) less the panel's own share of it. Measured
+/// live for plan 026 C9: mac's highlight sits 14px from the card edge
+/// (gutter 8 + `drawSelection`'s `insetBy(dx: 6)`, PalettePanel.swift:529).
+pub const PALETTE_ROW_OUTER_INSET: f32 = 4.0;
+/// Row label's own left/right padding, inside the highlight box. Mac insets
+/// its row text 14px from the row edge (`PaletteCellView`,
+/// PalettePanel.swift:568,:571) on top of the same 8px gutter, for 22px
+/// from the card edge; `PALETTE_PANEL_PADDING + PALETTE_ROW_OUTER_INSET +
+/// PALETTE_ROW_PADDING_X` reproduces that total (see the pinning test).
+pub const PALETTE_ROW_PADDING_X: f32 = 8.0;
 
 /// The chrome's bundled sans (`third_party/inter/`, loaded via
 /// `include_bytes!` in `main.rs`). This is the exact name-table family
@@ -56,16 +108,26 @@ pub const HOVER: Color = Color::from_rgb8(0x39, 0x39, 0x39);
 pub const ACTIVE_AGENT: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
 pub const TEXT: Color = Color::from_rgb8(0xf2, 0xf2, 0xf2);
 pub const MUTED_TEXT: Color = Color::from_rgb8(0xa0, 0xa4, 0xb0);
-pub const NOTIFICATION: Color = Color::from_rgb8(0x4e, 0x9a, 0xf1);
-/// Both notification dots — the tab-pill badge and the sidebar
-/// project-row dot. Pinned to the Mac's `NSColor.controlAccentColor`
-/// (#007aff), which both Mac surfaces use (`App.swift:4772`, `:5207`)
-/// and which GTK hardcodes for its tab badge
+/// Sidebar project label: the mac reads "bolder" when active, but both
+/// platforms use the same regular 13pt weight — the difference is COLOR
+/// (`SidebarRowView.applyLabelColor`, App.swift:5333-5342: white when
+/// selected/emphasized, `NSColor(white: 0.82)` otherwise). Measured live
+/// for plan 026 C9 (mac pixel-sampled: active text 255,255,255; inactive
+/// peak 209,209,209 — 0.82 * 255 rounds to 209, i.e. `0xd1`).
+pub const PROJECT_LABEL_ACTIVE: Color = Color::WHITE;
+pub const PROJECT_LABEL_INACTIVE: Color = Color::from_rgb8(0xd1, 0xd1, 0xd1);
+/// The chrome's one accent color: the notification dots (tab-pill badge +
+/// sidebar project-row dot), the dragged-pill border, and the inline-rename
+/// focus ring + selection all share it. Pinned to the Mac's
+/// `NSColor.controlAccentColor` (#007aff), which both Mac surfaces use
+/// (`App.swift:4772`, `:5207`) and which GTK hardcodes for its tab badge
 /// (`crates/roost-linux/src/resources/style.css:277-288`) rather than
-/// tracking the desktop accent — on COSMIC `@accent_bg_color` renders
-/// teal. Deliberately separate from `NOTIFICATION`: only the dots have a
-/// cited reference value (#311).
-pub const NOTIFICATION_BADGE: Color = Color::from_rgb8(0x00, 0x7a, 0xff);
+/// tracking the desktop accent — on COSMIC `@accent_bg_color` renders teal.
+/// Was two constants (`NOTIFICATION` #4e9af1 generic blue, `NOTIFICATION_BADGE`
+/// #007aff mac accent) until the drag/rename surfaces flipped to the mac
+/// accent too (#321), at which point both names pinned the same value and
+/// were merged.
+pub const ACCENT: Color = Color::from_rgb8(0x00, 0x7a, 0xff);
 pub const DRAGGED_PILL: Color = Color::from_rgba8(0x55, 0x68, 0x7b, 0.65);
 pub const PALETTE_SURFACE: Color = Color::from_rgb8(0x2d, 0x2d, 0x33);
 pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
@@ -81,6 +143,105 @@ pub fn chrome_font(weight: iced::font::Weight) -> Font {
         family: iced::font::Family::Name(CHROME_FONT_FAMILY),
         weight,
         ..Font::default()
+    }
+}
+
+/// The app icon, embedded from the very PNG the Linux package installs into
+/// hicolor. An `NSAlert` gets the app icon for free from the bundle; iced has
+/// no bundle to read one from on either platform, so the bytes ride along
+/// like the Inter faces do.
+const APP_ICON_PNG: &[u8] =
+    include_bytes!("../../../packaging/icons/hicolor/256x256/apps/roost.png");
+
+/// Icon edge in the confirm dialog, matching the 64pt `NSAlert` draws.
+pub const APP_ICON_SIZE: f32 = 64.0;
+
+/// Decoded once and cloned: `Handle::from_rgba` mints a fresh id per call, so
+/// building the handle inside `view` would re-upload the texture every frame.
+static APP_ICON: LazyLock<Option<image::Handle>> = LazyLock::new(decode_app_icon);
+
+/// `None` only if the embedded asset stops being 8-bit RGBA, in which case
+/// the dialog simply renders without an icon (pinned by a unit test).
+pub fn app_icon() -> Option<image::Handle> {
+    APP_ICON.clone()
+}
+
+fn decode_app_icon() -> Option<image::Handle> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(APP_ICON_PNG))
+        .read_info()
+        .ok()?;
+    if reader.output_color_type() != (png::ColorType::Rgba, png::BitDepth::Eight) {
+        return None;
+    }
+    let mut pixels = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    pixels.truncate(info.buffer_size());
+    Some(image::Handle::from_rgba(info.width, info.height, pixels))
+}
+
+/// The tail marker an elided label ends with.
+pub const ELLIPSIS: &str = "…";
+
+/// Shaped width of one chrome text run, measured through the very
+/// `Paragraph` type the renderer lays it out with (the same seam
+/// `TerminalMetrics::measure_with_font` uses for the cell grid), so a
+/// budget computed here matches what will be drawn.
+pub fn text_width(content: &str, font: Font, size: f32) -> f32 {
+    if content.is_empty() {
+        return 0.0;
+    }
+    type Paragraph = <iced::Renderer as advanced_text::Renderer>::Paragraph;
+    Paragraph::with_text(advanced_text::Text {
+        content,
+        bounds: Size::INFINITE,
+        size: Pixels(size),
+        line_height: advanced_text::LineHeight::default(),
+        font,
+        align_x: advanced_text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: advanced_text::Shaping::Advanced,
+        wrapping: advanced_text::Wrapping::None,
+    })
+    .min_bounds()
+    .width
+}
+
+/// Tail-elide `content` to `max_width`, returning what to draw and how wide
+/// it measures. Iced 0.14's text widget has no ellipsis mode — an
+/// overlong label just stops mid-glyph at its clip edge, which reads as a
+/// rendering fault — so the string itself is shortened and marked, the way
+/// the Mac's tab pills show `/Users/charliek/project…`.
+pub fn elide_to_width(content: &str, font: Font, size: f32, max_width: f32) -> (Cow<'_, str>, f32) {
+    let full = text_width(content, font, size);
+    if full <= max_width {
+        return (Cow::Borrowed(content), full);
+    }
+    // Cut points are char boundaries: no grapheme segmenter is in the
+    // dependency set, so a cut can drop a trailing combining mark — never
+    // split a code point, and never produce invalid UTF-8.
+    let cuts: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
+    // Largest prefix whose marked form still fits. Shaped width is
+    // non-decreasing in prefix length, which is what makes the search
+    // sound; the full string is already known not to fit, so it is not a
+    // candidate.
+    let (mut low, mut high) = (0usize, cuts.len());
+    let mut best: Option<(String, f32)> = None;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = format!("{}{ELLIPSIS}", &content[..cuts[mid]]);
+        let width = text_width(&candidate, font, size);
+        if width <= max_width {
+            best = Some((candidate, width));
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    match best {
+        Some((elided, width)) => (Cow::Owned(elided), width),
+        // Not even the marker fits. Drawing it anyway keeps the pill
+        // honest about having dropped something.
+        None => (Cow::Borrowed(ELLIPSIS), text_width(ELLIPSIS, font, size)),
     }
 }
 
@@ -106,11 +267,7 @@ fn pill(active_background: Color, radius: f32, active: bool, dragging: bool) -> 
         style = style.background(active_background);
     }
     style.border = Border {
-        color: if dragging {
-            NOTIFICATION
-        } else {
-            Color::TRANSPARENT
-        },
+        color: if dragging { ACCENT } else { Color::TRANSPARENT },
         width: if dragging { 1.0 } else { 0.0 },
         radius: radius.into(),
     };
@@ -123,7 +280,7 @@ pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::S
 
 pub fn badge(_: &Theme) -> container::Style {
     container::Style::default()
-        .background(NOTIFICATION_BADGE)
+        .background(ACCENT)
         .border(Border::default().rounded(NOTIFICATION_DOT_SIZE / 2.0))
 }
 
@@ -137,6 +294,26 @@ pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
     chrome_button(None, status, 4.0)
+}
+
+/// The active tab pill's `×`. Deliberately NOT a `chrome_button`: a filled
+/// `HOVER` rect on a 24px control inside a 24px pill recolors the pill's
+/// whole trailing end, which is the hover Charlie called out (Q3). The
+/// glyph reddens instead and the pill's own fill is left alone. `ERROR_TEXT`
+/// is the chrome's text-weight red — the `DANGER` fills read near-black at
+/// glyph weight.
+pub fn close_button(_: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: None,
+        text_color: match status {
+            button::Status::Hovered | button::Status::Pressed => ERROR_TEXT,
+            button::Status::Active => TEXT,
+            button::Status::Disabled => MUTED_TEXT.scale_alpha(0.5),
+        },
+        border: Border::default().rounded(4),
+        shadow: Shadow::default(),
+        snap: true,
+    }
 }
 
 /// The sidebar-footer "+ New Project" chip: a centered rounded button with
@@ -210,10 +387,6 @@ pub fn status_toast(_: &Theme) -> container::Style {
     }
 }
 
-pub fn palette_divider(_: &Theme) -> container::Style {
-    container::Style::default().background(Color::from_rgba8(0xff, 0xff, 0xff, 0.10))
-}
-
 pub fn palette_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(Color::TRANSPARENT),
@@ -225,41 +398,24 @@ pub fn palette_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     }
 }
 
+/// The mac reference field goes near-black while editing (a dark fill, not
+/// the transparent one that let the selection pill's blue show through and
+/// read as a blue field — W6). `DIVIDER` is the darkest existing chrome
+/// neutral, so the field reads as its own surface rather than a new hex.
 pub fn inline_rename_input(_: &Theme, status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused { .. });
     text_input::Style {
-        background: Background::Color(Color::TRANSPARENT),
+        background: Background::Color(DIVIDER),
         border: Border {
-            color: if focused { NOTIFICATION } else { MUTED_TEXT },
+            color: if focused { ACCENT } else { MUTED_TEXT },
             width: 1.0,
             radius: 3.0.into(),
         },
         icon: MUTED_TEXT,
         placeholder: MUTED_TEXT,
         value: TEXT,
-        selection: NOTIFICATION.scale_alpha(0.65),
+        selection: ACCENT.scale_alpha(0.65),
     }
-}
-
-/// Overlay-style scrollbar: no rail fill, just a translucent scroller. The
-/// stock iced style always paints a full-length rail, which reads as a solid
-/// band wherever it overlays short content — used by the palette list below.
-/// The tab strip needs zero chrome instead (its own `Scrollbar::hidden()` in
-/// `app.rs`, #281): even this style's translucent scroller was too visible
-/// overlaying the 24px tab pills.
-pub fn overlay_scrollable(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
-    let mut style = scrollable::default(theme, status);
-    let rail = scrollable::Rail {
-        background: None,
-        border: Border::default(),
-        scroller: scrollable::Scroller {
-            background: Background::Color(PALETTE_PLACEHOLDER.scale_alpha(0.35)),
-            border: Border::default().rounded(2),
-        },
-    };
-    style.vertical_rail = rail;
-    style.horizontal_rail = rail;
-    style
 }
 
 pub fn palette_row(
@@ -314,6 +470,25 @@ fn chrome_button(selected: Option<Color>, status: button::Status, radius: f32) -
 mod tests {
     use super::*;
 
+    /// The confirm dialog silently drops the icon if the embedded asset ever
+    /// stops being 8-bit RGBA, so the decode gets pinned here instead.
+    #[test]
+    fn the_embedded_app_icon_decodes_to_rgba_pixels() {
+        let handle = app_icon().expect("the embedded app icon decodes");
+        match handle {
+            image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            } => {
+                assert_eq!((width, height), (256, 256));
+                assert_eq!(pixels.len(), 256 * 256 * 4);
+            }
+            other => panic!("expected decoded pixels, got {other:?}"),
+        }
+    }
+
     #[test]
     fn active_rows_and_pills_use_roost_selection_colors() {
         let theme = Theme::Dark;
@@ -321,7 +496,7 @@ mod tests {
         assert_eq!(active.background, Some(Background::Color(ACTIVE_BLUE)));
         assert_eq!(
             project_pill(true, true)(&theme).border.color,
-            NOTIFICATION,
+            ACCENT,
             "the dragged project row is outlined like the dragged tab pill"
         );
         assert_eq!(
@@ -383,7 +558,123 @@ mod tests {
         let project_text = PROJECT_PILL_INSET_X + PROJECT_LABEL_INSET;
         assert!((project_text - AGENT_DOT_INSET).abs() <= 1.0);
         assert_eq!(TAB_STATUS_SIZE, 7.0);
-        assert_eq!(NOTIFICATION_DOT_SIZE, 8.0);
+        assert_eq!(NOTIFICATION_DOT_SIZE, 9.0);
+    }
+
+    #[test]
+    fn tab_pill_chrome_leaves_the_title_the_rest_of_its_width_band() {
+        assert_eq!(TAB_PILL_CHROME_WIDTH, 31.0);
+        assert_eq!(
+            TAB_PILL_MIN_WIDTH.min(TAB_PILL_MAX_WIDTH),
+            TAB_PILL_MIN_WIDTH
+        );
+        // Even the narrowest pill has room for a title beside its chrome.
+        assert!((TAB_PILL_MIN_WIDTH - TAB_PILL_CHROME_WIDTH).max(0.0) > 0.0);
+    }
+
+    #[test]
+    fn the_close_affordance_reddens_its_glyph_instead_of_filling_the_pill() {
+        let theme = Theme::Dark;
+        for status in [button::Status::Hovered, button::Status::Pressed] {
+            let style = close_button(&theme, status);
+            assert_eq!(
+                style.background, None,
+                "no pill-recoloring fill in any state"
+            );
+            assert_eq!(style.text_color, ERROR_TEXT);
+        }
+        let resting = close_button(&theme, button::Status::Active);
+        assert_eq!(resting.background, None);
+        assert_eq!(resting.text_color, TEXT);
+    }
+
+    #[test]
+    fn elision_keeps_short_labels_verbatim_and_marks_what_it_drops() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let size = TAB_TITLE_SIZE;
+
+        let (empty, width) = elide_to_width("", font, size, 100.0);
+        assert_eq!(empty, "");
+        assert_eq!(width, 0.0);
+
+        let short = "shell";
+        let natural = text_width(short, font, size);
+        assert!(natural > 0.0);
+        let (kept, kept_width) = elide_to_width(short, font, size, natural + 40.0);
+        assert_eq!(kept, short, "a label with room to spare is untouched");
+        assert_eq!(kept_width, natural);
+
+        // Exact fit: the budget is the measured width itself, so nothing
+        // may be dropped and no marker may appear.
+        let (exact, exact_width) = elide_to_width(short, font, size, natural);
+        assert_eq!(exact, short);
+        assert_eq!(exact_width, natural);
+    }
+
+    #[test]
+    fn elision_cuts_long_labels_to_a_marked_prefix_inside_the_budget() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let size = TAB_TITLE_SIZE;
+        let long = "/Users/charliek/projects/roost/crates/roost-iced/src/chrome.rs";
+        let budget = 120.0;
+        let (elided, width) = elide_to_width(long, font, size, budget);
+
+        assert!(
+            width <= budget,
+            "elided to {width}px, over the {budget}px budget"
+        );
+        assert!(
+            elided.ends_with(ELLIPSIS),
+            "no visible tail marker in {elided:?}"
+        );
+        assert!(elided.len() < long.len());
+        let head = elided.strip_suffix(ELLIPSIS).expect("marked tail");
+        assert!(
+            long.starts_with(head),
+            "{elided:?} is not a tail-elided {long:?}"
+        );
+        // Maximal: one more char would have overflowed.
+        let next = long[head.len()..]
+            .chars()
+            .next()
+            .expect("more label to drop");
+        let overflowing = format!("{head}{next}{ELLIPSIS}");
+        assert!(text_width(&overflowing, font, size) > budget);
+    }
+
+    #[test]
+    fn elision_of_wide_glyphs_stays_on_code_point_boundaries() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let size = TAB_TITLE_SIZE;
+        let cjk = "日本語のタブタイトルはとても長いことがあります";
+        let budget = 60.0;
+        let (elided, width) = elide_to_width(cjk, font, size, budget);
+
+        assert!(width <= budget);
+        assert!(elided.ends_with(ELLIPSIS));
+        let head = elided.strip_suffix(ELLIPSIS).expect("marked tail");
+        assert!(cjk.starts_with(head));
+        // Wide glyphs cost more per character, so the same budget keeps
+        // fewer of them than it does of ASCII — but only when the runner
+        // actually has a CJK face; a font-less CI box shapes them as
+        // narrow fallback boxes, so the comparison is gated on the
+        // measured widths, not assumed.
+        if text_width("日", font, size) > text_width("a", font, size) {
+            let ascii = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let (ascii_elided, _) = elide_to_width(ascii, font, size, budget);
+            assert!(
+                head.chars().count()
+                    < ascii_elided
+                        .strip_suffix(ELLIPSIS)
+                        .expect("marked tail")
+                        .chars()
+                        .count()
+            );
+        }
+
+        // A budget too small even for the marker still says something was
+        // dropped rather than rendering a bare truncation.
+        assert_eq!(elide_to_width(cjk, font, size, 0.0).0, ELLIPSIS);
     }
 
     #[test]
@@ -398,20 +689,6 @@ mod tests {
             3.0,
             "the rail clears the pill's leading edge"
         );
-    }
-
-    #[test]
-    fn overlay_scrollable_never_fills_a_rail() {
-        let theme = Theme::Dark;
-        let style = overlay_scrollable(
-            &theme,
-            scrollable::Status::Active {
-                is_horizontal_scrollbar_disabled: false,
-                is_vertical_scrollbar_disabled: false,
-            },
-        );
-        assert_eq!(style.horizontal_rail.background, None);
-        assert_eq!(style.vertical_rail.background, None);
     }
 
     #[test]
@@ -440,6 +717,46 @@ mod tests {
         assert_eq!(disabled.text_color, PALETTE_PLACEHOLDER.scale_alpha(0.6));
     }
 
+    /// Plan 026 C9: mac's highlight sits 14px from the card edge, its row
+    /// text 22px — see `PALETTE_ROW_OUTER_INSET`'s doc comment for the mac
+    /// source split. `app.rs` composes these three constants (panel padding,
+    /// the row's own outer container padding, the row button's padding) to
+    /// reproduce both totals; pinned here so the three can't silently drift
+    /// apart.
+    #[test]
+    fn palette_row_insets_match_the_measured_mac_card() {
+        let highlight_inset = PALETTE_PANEL_PADDING + PALETTE_ROW_OUTER_INSET;
+        let text_inset = highlight_inset + PALETTE_ROW_PADDING_X;
+        assert_eq!(highlight_inset, 14.0);
+        assert_eq!(text_inset, 22.0);
+    }
+
+    /// Plan 026 C9: the footer band is its own height/padding split from
+    /// `BAND_HEIGHT` (sidebar header + tab strip stay pinned at 32 for
+    /// `test_tab_strip_pixels.py`) — see `FOOTER_PADDING_TOP`'s doc comment
+    /// for the mac source + measured values.
+    #[test]
+    fn footer_band_matches_the_measured_mac_padding() {
+        assert_eq!(FOOTER_PADDING_TOP, 8.0);
+        assert_eq!(FOOTER_PADDING_BOTTOM, 12.0);
+        assert_eq!(FOOTER_BAND_HEIGHT, PILL_HEIGHT + 20.0);
+        assert_ne!(
+            FOOTER_BAND_HEIGHT, BAND_HEIGHT,
+            "the footer band is deliberately taller than the header/tab-strip band"
+        );
+    }
+
+    /// Plan 026 C9: both platforms use the same regular 13pt weight for the
+    /// project label — the mac's "bolder" active read is color, not weight
+    /// (`PROJECT_LABEL_ACTIVE`'s doc comment has the App.swift source +
+    /// measured pixel values).
+    #[test]
+    fn project_label_colors_differ_only_the_mac_way() {
+        assert_eq!(PROJECT_LABEL_ACTIVE, Color::WHITE);
+        assert_eq!(PROJECT_LABEL_INACTIVE, Color::from_rgb8(0xd1, 0xd1, 0xd1));
+        assert_ne!(PROJECT_LABEL_ACTIVE, PROJECT_LABEL_INACTIVE);
+    }
+
     #[test]
     fn danger_button_always_paints_a_destructive_fill() {
         let theme = Theme::Dark;
@@ -466,28 +783,53 @@ mod tests {
     }
 
     #[test]
-    fn notification_dots_pin_the_mac_accent_and_leave_the_generic_accent_alone() {
-        // Literals, not the constants themselves: comparing a constant to
-        // itself passes for any value and would not catch a re-flip.
-        assert_eq!(NOTIFICATION_BADGE, Color::from_rgb8(0x00, 0x7a, 0xff));
-        assert_eq!(NOTIFICATION, Color::from_rgb8(0x4e, 0x9a, 0xf1));
+    fn accent_pins_the_mac_value_and_wires_every_surface_that_shares_it() {
+        // Literal, not the constant itself: comparing a constant to itself
+        // passes for any value and would not catch a re-flip (#321 flipped
+        // this from #4e9af1 to the Mac's #007aff).
+        assert_eq!(ACCENT, Color::from_rgb8(0x00, 0x7a, 0xff));
 
-        // Wiring, not color: this one is tautological on its own (it would
-        // hold for any value of the constant). It exists to catch `badge()`
-        // being repointed at a *different* constant; the literals above are
-        // what pin the value.
+        // Wiring, not color: these are tautological on their own (they'd
+        // hold for any value of the constant). They exist to catch a call
+        // site being repointed at a *different* color; the literal above is
+        // what pins the value.
         let theme = Theme::Dark;
         assert_eq!(
             badge(&theme).background,
-            Some(Background::Color(NOTIFICATION_BADGE)),
-            "both notification dots render the Mac accent"
+            Some(Background::Color(ACCENT)),
+            "both notification dots render the accent"
+        );
+        assert_eq!(
+            pill(ACTIVE_TAB, 6.0, false, true).border.color,
+            ACCENT,
+            "the dragged-pill border renders the accent"
         );
 
-        // The generic accent keeps its other uses — nothing in #311's scope
-        // touches the rename affordances.
         let focused =
             inline_rename_input(&theme, text_input::Status::Focused { is_hovered: false });
-        assert_eq!(focused.border.color, NOTIFICATION);
-        assert_eq!(focused.selection, NOTIFICATION.scale_alpha(0.65));
+        assert_eq!(focused.border.color, ACCENT);
+        assert_eq!(focused.selection, ACCENT.scale_alpha(0.65));
+    }
+
+    #[test]
+    fn rename_editor_uses_a_dark_field_not_the_pill_background() {
+        let theme = Theme::Dark;
+        let focused =
+            inline_rename_input(&theme, text_input::Status::Focused { is_hovered: false });
+        assert_eq!(
+            focused.background,
+            Background::Color(DIVIDER),
+            "field reads as its own dark surface, not the transparent pill blue"
+        );
+        let unfocused = inline_rename_input(&theme, text_input::Status::Active);
+        assert_eq!(
+            unfocused.background,
+            Background::Color(DIVIDER),
+            "background stays dark whether or not the field is focused"
+        );
+        assert_eq!(
+            unfocused.border.color, MUTED_TEXT,
+            "only the border, not the background, reacts to focus"
+        );
     }
 }

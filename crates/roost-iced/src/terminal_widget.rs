@@ -101,6 +101,87 @@ impl TerminalMetrics {
     }
 }
 
+/// Misc Technical (U+2300-23FF), Geometric Shapes (U+25A0-25FF), and Misc
+/// Symbols (U+2600-26FF) codepoints whose Unicode default is TEXT
+/// presentation (`Emoji_Presentation=No` in UTS #51's `emoji-data.txt`).
+/// These render monochrome everywhere except cosmic-text's fallback
+/// cascade, which resolves them to Apple Color Emoji on macOS (the ⏺ bug).
+/// This is a curated range list, not an embedded UCD table: it excludes
+/// the specific sub-ranges/codepoints within these three blocks that
+/// emoji-data.txt marks `Emoji_Presentation=Yes` (so they keep the
+/// emoji-cascade path, matching their Unicode default), and it does not
+/// attempt to cover astral-plane or other BMP symbol blocks — narrowed to
+/// what shows up in terminal output (spinners, media-control glyphs like
+/// ⏺⏸⏵, status dots, misc technical icons).
+fn is_default_text_presentation(c: char) -> bool {
+    let cp = c as u32;
+    match cp {
+        0x2300..=0x23FF => !matches!(cp, 0x231A..=0x231B | 0x23E9..=0x23EC | 0x23F0 | 0x23F3),
+        0x25A0..=0x25FF => !matches!(cp, 0x25FD..=0x25FE),
+        0x2600..=0x26FF => !matches!(
+            cp,
+            0x2614..=0x2615
+                | 0x2648..=0x2653
+                | 0x267F
+                | 0x2693
+                | 0x26A1
+                | 0x26AA..=0x26AB
+                | 0x26BD..=0x26BE
+                | 0x26C4..=0x26C5
+                | 0x26CE
+                | 0x26D4
+                | 0x26EA
+                | 0x26F2..=0x26F3
+                | 0x26F5
+                | 0x26FA
+                | 0x26FD
+        ),
+        _ => false,
+    }
+}
+
+/// A cluster wants the monochrome-capable fallback family when its base
+/// codepoint defaults to text presentation and the cluster carries no
+/// U+FE0F (VS16) — VS16 is an explicit request for the emoji glyph and
+/// must keep today's cascade-to-color-emoji behavior.
+fn wants_monochrome_fallback(text: &str) -> bool {
+    const VS16: char = '\u{FE0F}';
+    text.chars()
+        .next()
+        .is_some_and(is_default_text_presentation)
+        && !text.contains(VS16)
+}
+
+/// Platform-specific monochrome-capable family for
+/// [`wants_monochrome_fallback`] clusters, picked empirically (no
+/// per-platform font-availability probe at runtime — cosmic-text's
+/// cascade falls through gracefully if the named family is absent).
+///
+/// macOS: "Apple Symbols" was tried first (matches the mac app's own
+/// cascade intuition) but does not actually cover U+23FA (`fc-list
+/// ":charset=23fa" family` on a stock macOS install lists only `Apple
+/// Color Emoji`, `STIX Two Math`, and `.LastResort`), so cosmic-text fell
+/// through past it to color emoji anyway. "STIX Two Math" does cover it
+/// and was confirmed monochrome by screenshot + pixel scan (no
+/// blue-dominant pixels in the glyph's cell, vs. hundreds when routed
+/// through the emoji cascade).
+///
+/// Linux: DejaVu Sans is the existing fallback family in this codebase's
+/// terminal font list (`roost-ui-model::typography`) and has broad Misc
+/// Technical/Symbols coverage; not independently re-verified here (no
+/// fontconfig database for it on this dev Mac) — the Linux-box pass
+/// (brief §3) is the place to confirm it visually.
+fn monochrome_fallback_family() -> iced::font::Family {
+    #[cfg(target_os = "macos")]
+    {
+        iced::font::Family::Name("STIX Two Math")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        iced::font::Family::Name("DejaVu Sans")
+    }
+}
+
 fn draw_font(base: Font, text: &str, bold: bool, italic: bool) -> Font {
     Font {
         family: if UnicodeWidthStr::width(text) > 1 {
@@ -111,6 +192,8 @@ fn draw_font(base: Font, text: &str, bold: bool, italic: bool) -> Font {
             // allotted cells without changing the grid. Ordinary and
             // combining cells must retain the configured renderer family.
             iced::font::Family::SansSerif
+        } else if wants_monochrome_fallback(text) {
+            monochrome_fallback_family()
         } else {
             base.family
         },
@@ -342,6 +425,11 @@ pub struct TerminalWidget {
     /// computes it as "the keyboard route is this tab and the window is
     /// focused". Only then does the widget ask the platform for an IME.
     pub ime_active: bool,
+    /// Whether the window has keyboard focus. Only the active tab's
+    /// widget is built per view pass, so this is the window's own focus
+    /// state; an unfocused window draws the cursor hollow (mac parity,
+    /// `TerminalView.cursorRenderMode`).
+    pub focused: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -941,7 +1029,12 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 let point =
                     cell_position(bounds.position(), cursor.col as u16, cursor.row, metrics);
                 let cursor_color = color(cursor.color.unwrap_or(self.snapshot.foreground));
-                match cursor.visual_style {
+                let visual_style = if self.focused {
+                    cursor.visual_style
+                } else {
+                    CursorVisualStyle::BlockHollow
+                };
+                match visual_style {
                     CursorVisualStyle::Block => fill_quad(
                         renderer,
                         Rectangle::new(point, Size::new(metrics.cell_width, metrics.cell_height)),
@@ -1184,6 +1277,7 @@ mod tests {
             metrics: metrics(),
             metric_generation: 1,
             ime_active: false,
+            focused: true,
         }
     }
 
@@ -1219,6 +1313,94 @@ mod tests {
             iced::font::Family::SansSerif,
             "wide cells retain the intentional platform fallback policy"
         );
+        assert_eq!(
+            draw_font(metrics.font, "你", false, false).family,
+            iced::font::Family::SansSerif,
+            "wide cells retain the intentional platform fallback policy"
+        );
+        assert_eq!(
+            draw_font(metrics.font, "a", false, false).family,
+            selected.family,
+            "ordinary ascii keeps the configured renderer family"
+        );
+    }
+
+    #[test]
+    fn default_text_presentation_clusters_route_to_the_monochrome_family() {
+        let selected = Font::with_name("Roost Test Family");
+        assert_eq!(
+            draw_font(selected, "⏺", false, false).family,
+            monochrome_fallback_family(),
+            "U+23FA has no VS16 and defaults to text presentation \
+             (the W16 bug repro — Apple Color Emoji picks it up from any \
+             base family in cosmic-text's cascade)"
+        );
+    }
+
+    #[test]
+    fn vs16_clusters_keep_the_emoji_cascade_path() {
+        // unicode-width already treats any VS16 (U+FE0F) cluster as width
+        // 2, so this hits draw_font's pre-existing wide-cluster branch
+        // (SansSerif) before ever reaching wants_monochrome_fallback --
+        // the assertion that matters is that it is NOT the monochrome
+        // family, i.e. VS16's explicit request for the emoji glyph is
+        // honored either way.
+        let selected = Font::with_name("Roost Test Family");
+        let family = draw_font(selected, "⏺\u{FE0F}", false, false).family;
+        assert_ne!(
+            family,
+            monochrome_fallback_family(),
+            "VS16 is an explicit request for the emoji glyph; it must not \
+             be routed to the monochrome-capable family"
+        );
+        assert_eq!(family, iced::font::Family::SansSerif);
+    }
+
+    #[test]
+    fn default_emoji_presentation_codepoints_are_unaffected() {
+        // Same reasoning as the VS16 case: unicode-width already scores
+        // Emoji_Presentation=Yes BMP codepoints like U+231A as width 2, so
+        // draw_font's wide-cluster branch (SansSerif) claims it first.
+        // is_default_text_presentation's own exclusion of these codepoints
+        // (tested directly below) is what would matter if that ever
+        // changed.
+        let selected = Font::with_name("Roost Test Family");
+        let family = draw_font(selected, "\u{231A}", false, false).family;
+        assert_ne!(
+            family,
+            monochrome_fallback_family(),
+            "U+231A (watch) defaults to EMOJI presentation per \
+             emoji-data.txt; it must keep cascading to color emoji, not \
+             get routed to the monochrome family"
+        );
+        assert_eq!(family, iced::font::Family::SansSerif);
+    }
+
+    #[test]
+    fn is_default_text_presentation_curated_ranges() {
+        // Bare media-control glyphs terminal apps actually emit.
+        assert!(is_default_text_presentation('⏺')); // U+23FA record button
+        assert!(is_default_text_presentation('⏸')); // U+23F8 pause bar
+        assert!(is_default_text_presentation('⏵')); // U+23F5 play triangle
+
+        // Emoji_Presentation=Yes exclusions within the curated blocks stay
+        // on the emoji-cascade path.
+        assert!(!is_default_text_presentation('\u{231A}')); // watch
+        assert!(!is_default_text_presentation('\u{26A1}')); // high voltage
+        assert!(!is_default_text_presentation('\u{26AA}')); // white circle
+
+        // Outside the curated blocks entirely.
+        assert!(!is_default_text_presentation('a'));
+        assert!(!is_default_text_presentation('你'));
+        assert!(!is_default_text_presentation('\u{1F600}')); // 😀, astral
+    }
+
+    #[test]
+    fn wants_monochrome_fallback_requires_no_vs16() {
+        assert!(wants_monochrome_fallback("⏺"));
+        assert!(!wants_monochrome_fallback("⏺\u{FE0F}"));
+        assert!(!wants_monochrome_fallback("a"));
+        assert!(!wants_monochrome_fallback(""));
     }
 
     #[test]

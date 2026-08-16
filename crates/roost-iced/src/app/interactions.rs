@@ -378,6 +378,12 @@ pub(super) struct TabDragPreview {
     pub(super) context: TabDragContext,
     pub(super) original_ids: Vec<i64>,
     pub(super) ordered_ids: Vec<i64>,
+    /// Whether the gesture has crossed the strip's drag threshold. The
+    /// preview arms on the bare press — the reorder machinery needs the
+    /// original order from the first event — but the pill must not *look*
+    /// dragged until there is a drag, or every click flashes the accent
+    /// border for a frame. Mirrors `ProjectDragPreview::dragging`.
+    pub(super) dragging: bool,
     /// Set once the reorder is dispatched. It marks the preview as
     /// already settled — no second release can re-commit it — and it is
     /// the id the completion must quote to be allowed to clear it.
@@ -389,7 +395,7 @@ impl TabDragPreview {
     /// outlives the gesture only to hold the order: the pointer is up, so
     /// the drag styling comes off at the release, as it always did.
     pub(super) fn drags(&self, tab_id: i64) -> bool {
-        self.pending_op.is_none() && self.context.source_id == tab_id
+        self.dragging && self.pending_op.is_none() && self.context.source_id == tab_id
     }
 }
 
@@ -520,6 +526,24 @@ fn clear_dispatched_preview<T>(
     owned
 }
 
+/// Threshold crossing for the tab strip, the sibling of
+/// `mark_project_drag_dragging`: only the gesture that armed the live
+/// preview, under the current generation, may promote it to dragging.
+fn mark_tab_drag_dragging(
+    preview: &mut Option<TabDragPreview>,
+    strip_generation: u64,
+    context: &TabDragContext,
+) -> bool {
+    let Some(current) = preview.as_mut() else {
+        return false;
+    };
+    let owned = context.generation == strip_generation && current.context == *context;
+    if owned {
+        current.dragging = true;
+    }
+    owned
+}
+
 fn end_tab_drag_preview_if_owned(
     preview: &mut Option<TabDragPreview>,
     authoritative_ids: &[i64],
@@ -588,8 +612,26 @@ impl App {
             },
             ordered_ids: original_ids.clone(),
             original_ids,
+            dragging: false,
             pending_op: None,
         });
+    }
+
+    /// The gesture crossed the drag threshold: from here the carried pill
+    /// may look dragged.
+    fn begin_tab_drag(&mut self, project_id: i64, source_id: i64, context_generation: u64) {
+        let context = TabDragContext {
+            project_id,
+            source_id,
+            generation: context_generation,
+        };
+        if !mark_tab_drag_dragging(
+            &mut self.tab_drag_preview,
+            self.tab_strip_generation,
+            &context,
+        ) {
+            self.cancel_tab_drag();
+        }
     }
 
     fn preview_tab_drag(
@@ -782,10 +824,14 @@ impl App {
                 );
                 UiTask::None
             }
-            // Tab visuals key off preview presence, so the threshold
-            // crossing changes nothing here; the event exists for the
-            // project strip's agent-row hiding.
-            StripEvent::DragBegan { .. } => UiTask::None,
+            StripEvent::DragBegan {
+                scope_id: project_id,
+                source_id,
+                context_generation,
+            } => {
+                self.begin_tab_drag(project_id, source_id, context_generation);
+                UiTask::None
+            }
             StripEvent::Preview {
                 scope_id: project_id,
                 source_id,
@@ -2253,6 +2299,7 @@ mod tests {
             },
             original_ids: vec![10, 20, 30],
             ordered_ids,
+            dragging: true,
             pending_op: None,
         }
     }
@@ -2347,6 +2394,7 @@ mod tests {
             },
             original_ids: vec![10, 20, 30],
             ordered_ids: vec![20, 10, 30],
+            dragging: false,
             pending_op: None,
         };
         let stale = TabDragCommitRequest {
@@ -2454,6 +2502,7 @@ mod tests {
             context: context.clone(),
             original_ids: original.clone(),
             ordered_ids: original.clone(),
+            dragging: false,
             pending_op: None,
         };
         let mut exact = Some(preview.clone());
@@ -2518,6 +2567,43 @@ mod tests {
             dragging,
             pending_op: None,
         }
+    }
+
+    #[test]
+    fn tab_drag_threshold_gates_the_pills_drag_styling() {
+        let context = TabDragContext {
+            project_id: 7,
+            source_id: 10,
+            generation: 4,
+        };
+        let pressed = TabDragPreview {
+            dragging: false,
+            ..tab_drag_preview_at(4, vec![10, 20, 30])
+        };
+        assert!(
+            !pressed.drags(10),
+            "a bare press must not paint the drag border"
+        );
+
+        let mut armed = Some(pressed.clone());
+        assert!(mark_tab_drag_dragging(&mut armed, 4, &context));
+        assert!(armed.expect("still armed").drags(10));
+
+        // Only this gesture, only under the live generation.
+        let mut stale = Some(pressed.clone());
+        assert!(!mark_tab_drag_dragging(&mut stale, 5, &context));
+        assert!(!mark_tab_drag_dragging(
+            &mut stale,
+            4,
+            &TabDragContext {
+                source_id: 20,
+                ..context.clone()
+            }
+        ));
+        assert!(!stale.expect("untouched").drags(10));
+
+        let mut absent = None;
+        assert!(!mark_tab_drag_dragging(&mut absent, 4, &context));
     }
 
     #[test]
@@ -2644,6 +2730,7 @@ mod tests {
             },
             original_ids: vec![101, 102],
             ordered_ids: vec![102, 101],
+            dragging: false,
             pending_op: None,
         });
         let mut tab_generation = 4;
@@ -3746,6 +3833,81 @@ mod tests {
         let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
         assert!(captured.windows(3).any(|bytes| bytes == b"\x1b[<"));
         supervisor.close(91);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_gesture_suppresses_same_cell_drag_reports() {
+        // winit emits sub-pixel CursorMoved events while a button is held, so
+        // this is what a stationary click looks like on the capture path the
+        // IPC op bypasses.
+        let (mut tab, supervisor) = attached_test_terminal(403);
+        tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+
+        native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (2, 2),
+            1,
+            true,
+            false,
+        );
+        for _ in 0..3 {
+            native_pointer(
+                &mut tab,
+                PointerAction::Motion,
+                None,
+                (2, 2),
+                0,
+                true,
+                false,
+            );
+        }
+        native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (2, 2),
+            0,
+            true,
+            false,
+        );
+
+        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        assert_eq!(captured, b"\x1b[<0;3;3M\x1b[<0;3;3m".to_vec());
+
+        // A real crossing still reports, and returning to the press cell
+        // reports again — this is a cell gate, not a time throttle.
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (2, 2),
+            1,
+            true,
+            false,
+        );
+        for cell in [(2, 2), (4, 2), (4, 2), (2, 2)] {
+            native_pointer(&mut tab, PointerAction::Motion, None, cell, 0, true, false);
+        }
+        native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (2, 2),
+            0,
+            true,
+            false,
+        );
+
+        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            b"\x1b[<0;3;3M\x1b[<32;5;3M\x1b[<32;3;3M\x1b[<0;3;3m".to_vec()
+        );
+        supervisor.close(403);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

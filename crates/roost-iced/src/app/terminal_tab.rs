@@ -202,6 +202,9 @@ pub(super) struct TerminalTab {
     mouse_encoder: MouseEncoder,
     pub(super) scroll: TerminalScroll,
     motion_emitter: MotionEmitter,
+    /// Suppresses the same-cell drag winit's sub-pixel `CursorMoved` events
+    /// would otherwise inject into every stationary click.
+    drag_gate: DragCellGate,
     pub(super) tracking_pointer: Option<PointerButton>,
     pub(super) local_pointer_gesture: Option<LocalPointerGesture>,
     pub(super) last_pointer_cell: Option<(u16, u16)>,
@@ -214,7 +217,6 @@ pub(super) struct TerminalTab {
     output_forwarder: tokio::task::AbortHandle,
     reply_buffer: Arc<Mutex<Vec<u8>>>,
     pub(super) input_capture: Option<InputCapture>,
-    osc_router: OscRouter,
     pub(super) pointer_shape: String,
     pub(super) theme: Theme,
     /// The live platform-IME composition, mirrored into every snapshot
@@ -258,10 +260,27 @@ impl Drop for TerminalTab {
     }
 }
 
+/// The drain-side scanner's color seed for a theme.
+///
+/// This is what the terminal itself is seeded with at attach
+/// (`set_color_foreground` and friends) and re-seeded with on every
+/// theme application, so the drain's answers and the terminal's
+/// rendering start from the same colors and are moved by the same OSC
+/// sequences from there.
+fn theme_osc_colors(theme: &Theme) -> OscColorSnapshot {
+    let rgb = |color: roost_vt::ColorRgb| (color.r, color.g, color.b);
+    OscColorSnapshot::new(
+        rgb(theme.foreground),
+        rgb(theme.background),
+        rgb(theme.cursor),
+        theme.palette.map(rgb),
+    )
+}
+
 impl TerminalTab {
     /// Attach the UI to a spawned PTY. Must be called inside the app
-    /// runtime (`Runtime::enter`): both `TabSession::attach` and the
-    /// output forwarder this spawns bind to the ambient runtime.
+    /// runtime (`Runtime::enter`): both `TabSession::attach_scanned` and
+    /// the output forwarder this spawns bind to the ambient runtime.
     pub(super) fn attach(
         supervisor: Arc<PtySupervisor>,
         tab_id: i64,
@@ -288,7 +307,17 @@ impl TerminalTab {
         let mouse_encoder = MouseEncoder::new()?;
         let input_capture = test_mode.then(|| Arc::new(Mutex::new(Vec::new())));
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
-        let session = TabSession::attach(supervisor, tab_id, output_tx, input_capture.clone())?;
+        // The OSC opt-in: this session's forwarding task owns the sole
+        // router for the tab and answers color queries straight off the
+        // drain. `TerminalTab` keeps no router of its own — a second
+        // one would double every reply.
+        let session = TabSession::attach_scanned(
+            supervisor,
+            tab_id,
+            output_tx,
+            input_capture.clone(),
+            Some(theme_osc_colors(&theme)),
+        )?;
         // The per-tab channel stays — only its drain moves. This forwarder
         // is what puts PTY output in the same arrival order as everything
         // else the app reacts to, and what arms the feed's wake for it.
@@ -301,6 +330,7 @@ impl TerminalTab {
             mouse_encoder,
             scroll: TerminalScroll::new(),
             motion_emitter: MotionEmitter::new(),
+            drag_gate: DragCellGate::new(),
             tracking_pointer: None,
             local_pointer_gesture: None,
             last_pointer_cell: None,
@@ -313,7 +343,6 @@ impl TerminalTab {
             output_forwarder,
             reply_buffer,
             input_capture,
-            osc_router: OscRouter::new(),
             pointer_shape: "default".into(),
             theme,
             preedit: None,
@@ -333,36 +362,28 @@ impl TerminalTab {
         })
     }
 
-    pub(super) fn write_vt(&mut self, bytes: &[u8]) -> Vec<OscAction> {
-        let colors = self.osc_colors();
-        let actions = self.osc_router.feed(bytes, &colors);
+    /// Apply a chunk of terminal output that has ALREADY been scanned
+    /// — everything arriving from the PTY, which the session's drain
+    /// scanned as it read it.
+    pub(super) fn write_vt(&mut self, bytes: &[u8]) {
         self.terminal.vt_write(bytes);
         self.drain_terminal_replies();
-        actions
     }
 
-    fn osc_colors(&self) -> OscColorSnapshot {
-        let fallback_foreground = self.theme.foreground;
-        let fallback_background = self.theme.background;
-        let (foreground, background, cursor) = self
-            .terminal
-            .live_colors()
-            .map(|colors| {
-                (
-                    colors.foreground,
-                    colors.background,
-                    colors.cursor.unwrap_or(self.theme.cursor),
-                )
-            })
-            .unwrap_or((fallback_foreground, fallback_background, self.theme.cursor));
-        let palette = self.terminal.live_palette().unwrap_or(self.theme.palette);
-        let rgb = |color: roost_vt::ColorRgb| (color.r, color.g, color.b);
-        OscColorSnapshot::new(
-            rgb(foreground),
-            rgb(background),
-            rgb(cursor),
-            palette.map(rgb),
-        )
+    /// Apply a chunk that has NOT been scanned yet: `tab.feed_pty_bytes`
+    /// injects bytes on the UI thread, so they never pass the drain.
+    ///
+    /// Routing them through `scan_osc` puts them through the same
+    /// router and the same color state the drain uses — same streaming
+    /// scan position, same chunk-start snapshot contract, replies
+    /// enqueued on the same serial channel — so the OSC end-to-end
+    /// tests still exercise the production pipeline rather than a
+    /// UI-side replica of it. The returned actions are the non-reply
+    /// ones, exactly as `TabOutput::Scanned` carries them.
+    pub(super) fn scan_and_write_vt(&mut self, bytes: &[u8]) -> Vec<OscAction> {
+        let actions = self.session.scan_osc(bytes);
+        self.write_vt(bytes);
+        actions
     }
 
     fn drain_terminal_replies(&self) {
@@ -478,6 +499,7 @@ impl TerminalTab {
 
     pub(super) fn commit_pointer_cancel(&mut self, release: Vec<u8>) {
         self.session.send_input(release);
+        self.drag_gate.reset();
         self.tracking_pointer = None;
         self.local_pointer_gesture = None;
         self.last_pointer_cell = None;
@@ -499,6 +521,14 @@ impl TerminalTab {
         if motion_without_button && !self.motion_emitter.would_emit(col, row, now) {
             return Ok(());
         }
+        if !self.drag_gate.would_dispatch(action, button, (col, row)) {
+            return Ok(());
+        }
+        // A release ends the gesture whether or not it encodes, so its
+        // memory clear cannot wait behind the byte check below.
+        if action == PointerAction::Release {
+            self.drag_gate.commit_dispatched(action, button, (col, row));
+        }
 
         let bytes = self.encode_pointer(action, button, col, row, mods)?;
         if bytes.is_empty() {
@@ -506,6 +536,8 @@ impl TerminalTab {
         }
         if motion_without_button {
             self.motion_emitter.commit(col, row, now);
+        } else {
+            self.drag_gate.commit_dispatched(action, button, (col, row));
         }
         self.session.send_input(bytes);
         Ok(())
@@ -784,6 +816,7 @@ impl TerminalTab {
     }
 
     pub(super) fn reset_pointer_state(&mut self) -> bool {
+        self.drag_gate.reset();
         let gesture = self.local_pointer_gesture.take();
         let tracking = self.tracking_pointer.take();
         let cell = self.last_pointer_cell.take();
@@ -958,6 +991,11 @@ impl TerminalTab {
         self.terminal.set_color_background(theme.background)?;
         self.terminal.set_color_cursor(theme.cursor)?;
         self.terminal.set_color_palette(&theme.palette)?;
+        // The drain answers color queries from its own state, so it has
+        // to learn about a theme the same moment the terminal does —
+        // including on `set_theme`'s rollback, which is why this sits
+        // in the one place every application lands.
+        self.session.reseed_osc_colors(theme_osc_colors(theme));
         self.refresh_snapshot()
     }
 
