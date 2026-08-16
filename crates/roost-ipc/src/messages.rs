@@ -765,6 +765,23 @@ pub struct AppSelectedTabIdResult {
     pub tab_id: i64,
 }
 
+/// `app.dock_badge` request: read the macOS Dock tile's live badge
+/// label. Gated like `tab.feed_pty_bytes` (ROOST_TEST_MODE=1), and
+/// implemented only by the macOS iced UI — every other UI answers
+/// `not-implemented`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppDockBadgeParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDockBadgeResult {
+    /// The badge text AppKit currently holds — the notification-inbox
+    /// count as a decimal string, or `null` when the badge is cleared
+    /// (the UI writes `nil` at zero, matching `App.swift`). Read back
+    /// off the Dock tile, never recomputed from the inbox.
+    pub label: Option<String>,
+}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -1354,6 +1371,13 @@ pub mod ops {
     /// logical keyboard route. This is independent of native toplevel or
     /// compositor focus and becomes false while an in-app overlay owns input.
     pub const APP_ACTIVE_TERMINAL_FOCUSED: &str = "app.active_terminal_focused";
+
+    /// Test-only read of the macOS Dock tile's badge label. Same gate
+    /// as `tab.feed_pty_bytes`; the e2e suite drives a notification and
+    /// asserts the badge AppKit actually holds, which no unit test can
+    /// observe. macOS iced only — every other UI answers
+    /// `not-implemented`.
+    pub const APP_DOCK_BADGE: &str = "app.dock_badge";
 
     /// `app.selected_tab_id` — the active project's on-screen selected
     /// tab id (UI truth), for asserting the core and the displayed tab
@@ -2143,6 +2167,21 @@ mod tests {
         round_trip(&AppActiveTerminalFocusedResult { focused: false });
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppActiveTerminalFocusedParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_dock_badge_round_trips() {
+        round_trip(&AppDockBadgeParams {});
+        round_trip(&AppDockBadgeResult {
+            label: Some("3".into()),
+        });
+        round_trip(&AppDockBadgeResult { label: None });
+        // The cleared badge is `null`, not an omitted or empty field —
+        // the e2e distinguishes "no badge" from "a badge reading ''".
+        let cleared = serde_json::to_string(&AppDockBadgeResult { label: None }).unwrap();
+        assert_eq!(cleared, r#"{"label":null}"#);
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppDockBadgeParams>(bad).is_err());
     }
 
     #[test]

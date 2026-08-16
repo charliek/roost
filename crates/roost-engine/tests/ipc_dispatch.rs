@@ -251,6 +251,42 @@ async fn tab_feed_ime_rejects_unknown_action() {
     }
 }
 
+/// `app.dock_badge` takes no params, and the empty param struct denies
+/// unknown fields. Asserting `unknown-field` (rather than the
+/// `internal` / "no UI attached" this handler would give — it has no
+/// `ui_tx`) proves the decode happens at the dispatcher, ahead of the
+/// UI round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_dock_badge_rejects_unknown_params() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    let err = client
+        .call_raw(ops::APP_DOCK_BADGE, serde_json::json!({"label": "3"}))
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "unknown-field"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
 /// Connect to a freshly-bound server with bounded retries instead of
 /// a flat sleep. CI runners under load can take more than 50ms to
 /// schedule the accept loop; a bounded retry is robust without

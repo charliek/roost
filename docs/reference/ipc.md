@@ -679,6 +679,35 @@ folds one refresh and one draw into a single pass, so `refresh_*` and
 `draw_*` always advance together there, unlike iced where the two are
 scheduled independently. CLI: `roostctl render-stats [--reset]`.
 
+### `app.dock_badge` *(test-only — gated, macOS iced only)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Reads the macOS Dock
+tile's live badge label — the parity port of `App.swift`'s
+`refreshDockBadge()`, which mirrors the notification-inbox count onto
+`NSApp.dockTile.badgeLabel` and writes `nil` at zero.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"label": "3"}
+```
+
+`label` is `null` when the badge is cleared. The handler reads AppKit
+on the main thread and deliberately does **not** re-derive the label
+from the inbox first: recomputing would assert the count→label mapping
+(which unit tests already pin) while proving nothing about whether the
+write reached the Dock. Because the badge write rides the update loop
+asynchronously, callers poll rather than reading once —
+`tools/roosttest/test_dock_badge.py` is the reference use.
+
+Implemented only by the iced UI on macOS. The GTK UI, the iced UI on
+Linux, and the Swift Mac app (which has no case for it, so its
+dispatcher answers `unknown-op`) do not implement it; the first two
+answer `not-implemented`. There is no Dock off macOS, and answering a
+plausible `null` there would read as "the badge is cleared" and pass a
+test that never ran.
+
 ### `sidebar.set_width` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**

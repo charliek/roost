@@ -194,6 +194,25 @@ fn notification_activation(
     Some(window_id.map_or(UiTask::None, UiTask::Focus))
 }
 
+/// The `app.dock_badge` read, on the main thread. The IPC drain runs in
+/// the iced update loop, so the marker is obtainable; `None` would be an
+/// invariant break, and surfacing it as an error is what makes the e2e
+/// fail loudly instead of reading a plausible "badge cleared".
+#[cfg(target_os = "macos")]
+fn read_dock_badge() -> Result<Option<String>, String> {
+    let mtm = objc2::MainThreadMarker::new()
+        .ok_or("app.dock_badge serviced off the main thread (AppKit is main-thread-only)")?;
+    Ok(crate::macos::dock_badge::read(mtm))
+}
+
+/// The iced UI also builds for Linux, where there is no Dock. Same
+/// verdict as the GTK arm: reject, so the op can never report a cleared
+/// badge on a platform that has none.
+#[cfg(not(target_os = "macos"))]
+fn read_dock_badge() -> Result<Option<String>, String> {
+    Err("app.dock_badge is not supported on this UI (macOS iced only)".into())
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // A full authoritative snapshot on every reconcile is the recovery
@@ -207,6 +226,12 @@ impl App {
         self.reconcile_project_drag_preview();
         self.reconcile_rename_editor();
         self.reconcile_notification_inbox();
+        // Immediately after the inbox reconcile, not on the fire/clear
+        // edges: this is the authoritative resync, so hanging the badge
+        // off it covers fire, clear, tab close and project delete by
+        // construction — the same reason the palette refresh below sits
+        // here.
+        self.sync_dock_badge();
         self.refresh_notification_palette();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
@@ -611,6 +636,30 @@ impl App {
         }
     }
 
+    /// Mirror the notification-inbox count onto the macOS Dock tile —
+    /// the parity port of `mac/Sources/Roost/App.swift`'s
+    /// `refreshDockBadge()`. A no-op on every other host.
+    ///
+    /// Both callers (this reconcile and `window_opened`) run in the iced
+    /// update loop, which is the main thread — the seam's
+    /// `MainThreadMarker` acquisition is what enforces that, per
+    /// CLAUDE.md's threading table. Nothing off the update loop may call
+    /// this.
+    pub(super) fn sync_dock_badge(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            // Bootstrap's initial reconcile() runs before iced constructs
+            // the winit event loop, and winit documents
+            // NSApplication::sharedApplication before EventLoop::new as
+            // unsupported — so no AppKit until the window exists. The
+            // window_opened initial sync covers boot.
+            if self.window_id.is_none() {
+                return;
+            }
+            crate::macos::dock_badge::sync(self.notification_inbox.count());
+        }
+    }
+
     fn refresh_sidebar_agents(&mut self) {
         let active_tab = self.workspace.active().1;
         let now = agent_palette::now_unix();
@@ -945,6 +994,20 @@ impl App {
             }
             UiRequest::AppSelectedTabId { reply } => {
                 let _ = reply.send(Ok(self.workspace.active().1));
+            }
+            UiRequest::AppDockBadge { reply } => {
+                // Reads AppKit, deliberately without re-deriving the
+                // label from the inbox first: the op exists to prove the
+                // badge write reached the Dock, and a resync here would
+                // make it prove only the mapping. Platform rejection
+                // outranks the test-mode gate so non-macOS iced answers
+                // not-implemented like GTK does, not not-enabled.
+                let result = if cfg!(target_os = "macos") && !self.test_mode {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                } else {
+                    read_dock_badge()
+                };
+                let _ = reply.send(result);
             }
             UiRequest::Screenshot { scale, reply } => {
                 self.screenshots.enqueue(scale, reply);

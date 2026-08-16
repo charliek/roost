@@ -75,8 +75,23 @@ fn collapse_home(path: &str, home: &str) -> String {
 /// Emptiness follows the Swift check exactly (no trimming), so a
 /// whitespace-only project name renders as-is rather than falling back.
 pub fn window_title(project_name: &str, cwd: &str, home: &str) -> String {
+    window_title_with_fallback(DEFAULT_WINDOW_TITLE, project_name, cwd, home)
+}
+
+/// [`window_title`] with the app-identity fallback supplied by the caller.
+///
+/// Roost ships under more than one display name — the macOS Iced bundle is
+/// `Roost-Iced` — and the titlebar should read as the app the user launched
+/// when no project name is available. Composition is otherwise identical, so
+/// the fallback is the only thing an adapter has to decide.
+pub fn window_title_with_fallback(
+    fallback: &str,
+    project_name: &str,
+    cwd: &str,
+    home: &str,
+) -> String {
     let name = if project_name.is_empty() {
-        DEFAULT_WINDOW_TITLE
+        fallback
     } else {
         project_name
     };
@@ -180,6 +195,35 @@ mod tests {
     fn empty_project_name_falls_back_to_roost() {
         assert_eq!(window_title("", "", HOME), "Roost");
         assert_eq!(window_title("", "/tmp", HOME), "Roost – /tmp");
+    }
+
+    #[test]
+    fn a_caller_supplied_fallback_replaces_the_default() {
+        assert_eq!(
+            window_title_with_fallback("Roost-Iced", "", "", HOME),
+            "Roost-Iced"
+        );
+        assert_eq!(
+            window_title_with_fallback("Roost-Iced", "", "/tmp", HOME),
+            "Roost-Iced – /tmp"
+        );
+    }
+
+    /// The fallback is exactly that: a named project always wins.
+    #[test]
+    fn a_project_name_wins_over_the_fallback() {
+        assert_eq!(
+            window_title_with_fallback("Roost-Iced", "roost", "/tmp", HOME),
+            "roost – /tmp"
+        );
+    }
+
+    #[test]
+    fn window_title_delegates_with_the_default_fallback() {
+        assert_eq!(
+            window_title("", "/tmp", HOME),
+            window_title_with_fallback(DEFAULT_WINDOW_TITLE, "", "/tmp", HOME)
+        );
     }
 
     #[test]

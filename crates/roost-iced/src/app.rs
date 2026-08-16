@@ -33,7 +33,7 @@ use roost_ipc::messages::{
     AppRenderStatsResult, PaletteItemView, PalettePresentResult, PaletteStateResult, Project,
     SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
 };
-use roost_ipc::paths::BundleProfile;
+use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
 use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
@@ -968,6 +968,30 @@ fn prepare_window_opened(
     }
 }
 
+/// App-identity name the window title falls back to when no project supplies
+/// one.
+///
+/// Keyed off the resolved profile, not the OS: the macOS Iced bundle and the
+/// Linux *dev* iced profile both announce `Roost-Iced` (matching the bundle's
+/// `CFBundleName`), while the packaged Linux build resolves `Gtk` and keeps
+/// the production `Roost` users already see.
+/// Pure half of [`App::window_title`]: `project` is the active project's
+/// `(name, effective cwd)`, `None` when no project is active. Split out so
+/// tests can pin that BOTH branches thread the profile-chosen fallback.
+fn compose_window_title(fallback: &str, project: Option<(&str, &str)>, home: &str) -> String {
+    match project {
+        None => fallback.to_string(),
+        Some((name, cwd)) => window_title::window_title_with_fallback(fallback, name, cwd, home),
+    }
+}
+
+fn title_fallback(kind: BundleProfileKind) -> &'static str {
+    match kind {
+        BundleProfileKind::Iced => "Roost-Iced",
+        BundleProfileKind::Mac | BundleProfileKind::Gtk => window_title::DEFAULT_WINDOW_TITLE,
+    }
+}
+
 pub struct App {
     workspace: Arc<Workspace>,
     supervisor: Arc<PtySupervisor>,
@@ -985,6 +1009,9 @@ pub struct App {
     /// `state.json` on every frame.
     sidebar_drag_width: Option<f32>,
     window_focused: bool,
+    /// App-identity name the window title falls back to, fixed at bootstrap
+    /// from the resolved profile — see [`title_fallback`].
+    title_fallback: &'static str,
     ime_discard: ImeDiscard,
     modifiers: keyboard::Modifiers,
     test_mode: bool,
@@ -1161,6 +1188,7 @@ impl App {
             window_size: Size::new(1100.0, 720.0),
             sidebar_drag_width: None,
             window_focused: true,
+            title_fallback: title_fallback(profile.kind),
             ime_discard: ImeDiscard::default(),
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
@@ -1229,6 +1257,11 @@ impl App {
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
+        // The initial Dock-badge sync: `App::new`'s reconcile runs before
+        // iced has a window, i.e. before there is an app to badge. From
+        // here on the reconcile owns it, and a repeat from a later
+        // `WindowFocus` is an idempotent rewrite of the same label.
+        self.sync_dock_badge();
         prepare_window_opened(
             &mut self.window_id,
             &mut self.pending_window_resize,
@@ -2822,17 +2855,17 @@ impl App {
     /// OSC 7 only.
     pub fn window_title(&self, home: &str) -> String {
         let (project_id, tab_id) = self.workspace.active();
-        let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
-            return window_title::DEFAULT_WINDOW_TITLE.to_string();
-        };
-        let cwd = project
-            .tabs
-            .iter()
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.cwd.as_str())
-            .filter(|cwd| !cwd.is_empty())
-            .unwrap_or(project.cwd.as_str());
-        window_title::window_title(&project.name, cwd, home)
+        let project = self.projects.iter().find(|p| p.id == project_id).map(|p| {
+            let cwd = p
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.cwd.as_str())
+                .filter(|cwd| !cwd.is_empty())
+                .unwrap_or(p.cwd.as_str());
+            (p.name.as_str(), cwd)
+        });
+        compose_window_title(self.title_fallback, project, home)
     }
 
     fn launch_cwd(&self, project_id: i64) -> String {
@@ -3023,6 +3056,38 @@ mod tests {
         assert!(!state.observe(false));
         assert!(!state.take());
         assert_eq!(state, ExitState::Running);
+    }
+
+    #[test]
+    fn the_iced_profile_titles_itself_roost_iced() {
+        assert_eq!(title_fallback(BundleProfileKind::Iced), "Roost-Iced");
+        assert_eq!(title_fallback(BundleProfileKind::Mac), "Roost");
+        assert_eq!(
+            title_fallback(BundleProfileKind::Gtk),
+            "Roost",
+            "the packaged Linux build resolves Gtk and keeps the production name"
+        );
+    }
+
+    /// The fallback has to reach BOTH `App::window_title` branches — the
+    /// no-project early return and the composed title — through the same
+    /// `compose_window_title` the method calls, so neither branch can
+    /// quietly revert to a hardcoded "Roost".
+    #[test]
+    fn the_iced_fallback_composes_into_the_full_title() {
+        let fallback = title_fallback(BundleProfileKind::Iced);
+        assert_eq!(
+            compose_window_title(fallback, None, "/Users/me"),
+            "Roost-Iced"
+        );
+        assert_eq!(
+            compose_window_title(fallback, Some(("", "/tmp")), "/Users/me"),
+            "Roost-Iced – /tmp"
+        );
+        assert_eq!(
+            compose_window_title(fallback, Some(("strix", "/Users/me/w")), "/Users/me"),
+            "strix – ~/w"
+        );
     }
 
     #[test]

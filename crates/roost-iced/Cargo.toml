@@ -66,6 +66,39 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 unicode-width = { workspace = true }
 
+# Main-bundle-identity probe only (`CFBundle::main_bundle().identifier()`),
+# not AppKit surface. The version rides the objc2 0.6 generation that
+# arboard + softbuffer already pull in (winit still rides objc2 0.5) and
+# must move with THAT pair: a bump that shifts objc2-core-foundation's
+# major would otherwise resolve a second copy of the crate into the lock.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFBundle",
+    "CFString",
+] }
+
+# The macOS native seam (`src/macos/`, roadmap M6 § 6b — decided by the
+# plan-027 spike). Same coupling policy as `objc2-core-foundation` above:
+# these ride the objc2 0.6 generation arboard + softbuffer already pull in
+# (winit still rides objc2 0.5) and must move with THAT pair — a bump that
+# shifts the major would resolve a second copy of the ecosystem into the
+# lock. Features are the Dock-badge consumer's minimum, not the crates'
+# defaults: `objc2-app-kit`'s `default` turns on ~250 of them.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSObject",
+    "NSString",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSDockTile",
+    # `NSApplication`'s superclass; the class item does not exist without it.
+    "NSResponder",
+] }
+
 # The desktop-notification backend is per-OS: this one talks
 # `org.freedesktop.Notifications` over D-Bus. `z-with-tokio` keeps zbus on
 # the app's tokio runtime instead of pulling in async-io/smol.
