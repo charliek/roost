@@ -655,17 +655,22 @@ mod tests {
         let head = elided.strip_suffix(ELLIPSIS).expect("marked tail");
         assert!(cjk.starts_with(head));
         // Wide glyphs cost more per character, so the same budget keeps
-        // fewer of them than it does of ASCII.
-        let ascii = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (ascii_elided, _) = elide_to_width(ascii, font, size, budget);
-        assert!(
-            head.chars().count()
-                < ascii_elided
-                    .strip_suffix(ELLIPSIS)
-                    .expect("marked tail")
-                    .chars()
-                    .count()
-        );
+        // fewer of them than it does of ASCII — but only when the runner
+        // actually has a CJK face; a font-less CI box shapes them as
+        // narrow fallback boxes, so the comparison is gated on the
+        // measured widths, not assumed.
+        if text_width("日", font, size) > text_width("a", font, size) {
+            let ascii = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let (ascii_elided, _) = elide_to_width(ascii, font, size, budget);
+            assert!(
+                head.chars().count()
+                    < ascii_elided
+                        .strip_suffix(ELLIPSIS)
+                        .expect("marked tail")
+                        .chars()
+                        .count()
+            );
+        }
 
         // A budget too small even for the marker still says something was
         // dropped rather than rendering a bare truncation.
