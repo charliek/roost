@@ -1219,6 +1219,8 @@ fn map_test_op_err(err: String) -> HandlerError {
         || err.contains("no menu item")
         || err.contains("ambiguous menu")
         || err.contains("is disabled")
+        || err.contains("has no submenu")
+        || err.contains("must not be empty")
     {
         HandlerError::invalid_param(err)
     } else if err.contains("not supported on this UI") {

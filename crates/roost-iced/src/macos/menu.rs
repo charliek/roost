@@ -181,7 +181,14 @@ pub(crate) fn accel_to_key_equivalent(accel: &Accel) -> Option<(String, usize)> 
 
 fn key_equivalent(key: &str) -> Option<String> {
     if key.chars().count() == 1 {
-        return Some(key.to_lowercase());
+        // ASCII-only: Unicode lowercasing can expand one char into
+        // several (İ → i̇), which AppKit would treat as an invalid
+        // multi-char keyEquivalent. An exotic binding renders as a
+        // bare title instead, same as any other unmappable key.
+        if !key.is_ascii() {
+            return None;
+        }
+        return Some(key.to_ascii_lowercase());
     }
     let mapped = match key {
         "plus" => "+",
