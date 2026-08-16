@@ -368,12 +368,17 @@ impl OscScanner {
                 // lists the indices to reset. A body whose indices are
                 // all unparseable drops entirely rather than escalating
                 // to the reset-everything form.
-                let mut fields = body.split(';').filter(|field| !field.is_empty()).peekable();
-                if fields.peek().is_none() {
+                if body.is_empty() {
                     self.pending.push(OscEvent::PaletteReset(Vec::new()));
                     return;
                 }
-                let indices: Vec<u8> = fields.filter_map(|field| field.parse().ok()).collect();
+                // A present body — even one that is only separators —
+                // never escalates to the reset-everything form.
+                let indices: Vec<u8> = body
+                    .split(';')
+                    .filter(|field| !field.is_empty())
+                    .filter_map(|field| field.parse().ok())
+                    .collect();
                 if !indices.is_empty() {
                     self.pending.push(OscEvent::PaletteReset(indices));
                 }
@@ -634,7 +639,10 @@ fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
         return Some((r, g, b));
     }
     if let Some(rest) = spec.strip_prefix('#') {
-        if rest.len() % 3 != 0 || rest.is_empty() || rest.len() > 12 {
+        // Byte-offset slicing below — a non-ASCII spec would panic on a
+        // char boundary, and hostile bytes arrive here straight off the
+        // PTY (`cat` of a crafted file reaches this parser on the drain).
+        if !rest.is_ascii() || rest.len() % 3 != 0 || rest.is_empty() || rest.len() > 12 {
             return None;
         }
         let width = rest.len() / 3;
@@ -1009,6 +1017,8 @@ mod tests {
             "rgbi:1.0/0.0/0.0",
             "#deadb",
             "#",
+            "#aébcd",
+            "#ééé",
             "red",
             "",
         ] {
@@ -1153,9 +1163,10 @@ mod tests {
 
     #[test]
     fn osc104_all_unparseable_indices_drops() {
-        // A body that named only garbage must NOT collapse into the
-        // reset-everything form.
+        // A body that named only garbage — or only separators — must
+        // NOT collapse into the reset-everything form.
         assert_eq!(feed_all(b"\x1b]104;999;zz\x07"), Vec::<OscEvent>::new());
+        assert_eq!(feed_all(b"\x1b]104;;;\x07"), Vec::<OscEvent>::new());
     }
 
     #[test]

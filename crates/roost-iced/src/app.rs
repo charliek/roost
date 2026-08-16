@@ -2190,6 +2190,11 @@ impl App {
                                 chrome::MUTED_TEXT
                             })
                             .font(title_font)
+                            // Elision measured with Advanced shaping; the
+                            // default Auto drops to Basic for ASCII and
+                            // sums unkerned advances a hair wider than
+                            // the measured budget.
+                            .shaping(iced::widget::text::Shaping::Advanced)
                             // The pill is a fixed width now, so an
                             // unwrapped run is what keeps a title one line
                             // tall when the elision lands a hair long.
