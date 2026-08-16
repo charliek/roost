@@ -827,9 +827,12 @@ macOS side-by-side evaluation" note. Two standing consequences:
    from M5 (Iced replaces Swift vs. Rust under Swift); keep them separate
    so the frozen thing stays frozen.
 
-**Entry gate:** E5 (plan 020) and E7 (plan 019) are both complete;
-remaining: release-profile CI coverage for Iced, and the
-parity-inventory audit clean. Note the reference bar here is the **Swift
+**Entry gate: met.** E5 (plan 020) and E7 (plan 019) are both complete;
+release-profile CI coverage for Iced shipped as the `iced-release` job
+(plan 022 C2, ci.yml), and the parity-inventory audit is clean (refresh
+audit 2026-08-07, plan 021, main@166d2d6 — see the M4 section above: open
+P0 none, remaining P1s are Charlie-directed 3h polish + #302-blocked file
+drops, not inventory gaps). Note the reference bar here is the **Swift
 app**, which is consistently stricter than M4's GTK bar — the inventory
 tracks both, and M6 is the superset.
 
@@ -879,12 +882,166 @@ Slices:
   output, not fix in code: `claude install` writes `self_exe()`, so with
   two bundles the hook file points at whichever `roostctl` ran it last.
   Two bundle ids also mean two entries in System Settings › Notifications.
+
+**Shipped (plan 027, 2026-08-16).** `mac/scripts/bundle-lib.sh` (new)
+carries the toolkit-agnostic stages — version derivation, libghostty-vt
+precondition, icon pipeline, roostctl build+embed, signing —
+out of `bundle.sh`, verified behavior-preserving (byte-identical file
+set/plist/entitlements before/after). `mac/scripts/bundle-iced.sh` (new)
+sources the same lib and assembles `mac/build/Roost-Iced.app` from
+`cargo build -p roost-iced` (`make bundle-iced`): ad-hoc/dev-id signing
+(same `ROOST_DEVELOPER_ID_IDENTITY`/`ROOST_ALLOW_UNSIGNED` defaults as
+the Swift bundle), no Sparkle keys and no `Contents/Frameworks/`, all
+three TCC purpose strings kept (Roost-Iced is the TCC-responsible app
+for its own tab children), `cs.disable-library-validation` omitted
+(no embedded frameworks to need it), roostctl embedded, and the
+existing AppIcon art reused as-is — a **distinct icon is recorded
+future work**, not shipped; display name disambiguates the Dock for
+now. Live parallel-install was verified on-machine: the bundle
+launched via `open`, answered `identify`/`screenshot` on its own
+`Roost-iced` socket while the production `Roost.app` kept answering on
+its own, and quit was confirmed by pid.
+
+The bundle-id-aware default profile (W3) lands as a macOS-only
+`CFBundleGetMainBundle` probe via `objc2-core-foundation` (already
+resolved in the lock through winit — no new toolchain), feeding a
+pure, table-tested mapping: `ai.stridelabs.Roost.iced` → `Iced`, and
+everything else — including the production id — also resolves `Iced`
+today (the production-id cutover mapping is deliberately **not**
+taken; that's 6c). `ROOST_BUNDLE_PROFILE` still wins over the probe,
+and the detected identity is logged at startup regardless of which
+arm fires, so the probe is behaviorally a no-op now but proven wired
+for 6c.
+
+Window title: **the earlier "window title should match" decision is
+narrowed** to the *fallback* title only — the composed title stays
+`project – cwd`; app identity comes from `CFBundleName`/
+`CFBundleDisplayName`, not the titlebar. The fallback itself is keyed
+off resolved profile kind, not OS: `Iced` → `"Roost-Iced"`, else
+`"Roost"` — which means the Linux **dev** iced profile now also
+titles `"Roost-Iced"` (a consistent dev identity; no harness asserts
+on it). Packaged Linux is unaffected: it resolves the `Gtk` kind →
+`"Roost"`, unchanged.
+
+The harness gained a bundle-launch path: `ROOST_ICED_APP` in
+`tools/roosttest/ui.py` drives the iced target through
+LaunchServices (`open --env`) with an enumerated env allowlist
+(deliberately **not** forwarding `ROOST_BUNDLE_PROFILE` — the
+bundle-id path above is the thing under test), pid-based
+teardown-with-proof-of-death, and a test-mode canary so a dropped
+`ROOST_TEST_MODE` fails loudly. `make e2e-iced-bundle` assembles the
+bundle and runs the curated smoke + walking-skeleton modules against
+it. CI: a narrow `macbundle` path filter (bundle scripts, the iced
+plist/entitlements, the shared icon + roostctl-entitlements inputs)
+OR'd into `iced-build-e2e`'s condition, so Swift-only PRs never pay
+the 2×2 iced matrix; the macOS cells gained assemble + mechanical
+bundle-identity assertion (bundle id, executable name, stamped
+version, absence of all `SU*` keys and `Contents/Frameworks/`, deep
+codesign verify, entitlements present-and-true minus
+disable-library-validation, hardened runtime, system-only `otool -L`
+closure) + bundle-smoke steps, `ICED_BACKEND` forwarded from the
+renderer matrix.
+
+**Caveat carried forward, not fixed here**: ad-hoc signatures change
+CDHash every rebuild, so any TCC grants made to `ai.stridelabs.Roost.iced`
+reset on the next `make bundle-iced`. Not a 6a blocker (nothing here
+exercises mic/camera), but it will bite dev-bundle TCC testing at 6e/6g.
+
 * **6b. Native shim seam.** One decision with three consumers (6c/6d/6e):
   call AppKit via `objc2` (already in the lockfile through winit) or
-  build a small Swift static library behind a C ABI. Leaning Swift lib —
-  it amortizes across Sparkle, menus, and notifications, and the Swift
-  toolchain is already a build dependency. Decide with a spike, not in
-  the abstract.
+  build a small Swift static library behind a C ABI. Decide with a
+  spike, not in the abstract. (The earlier "leaning Swift lib" framing
+  below was the pre-spike prior — the spike below reversed it.)
+
+**6b decision — native macOS seam: objc2** (decided 2026-08-16)
+
+The seam is `crates/roost-iced/src/macos/`, `cfg(target_os = "macos")`,
+built on the `objc2` 0.6 generation (`objc2 0.6.4`, `objc2-app-kit 0.3.2`,
+`objc2-foundation 0.3.2`) with **minimal feature sets** rather than the
+crates' broad defaults. No Swift shim, no `build.rs`, no second toolchain.
+
+Both routes were **built and run live** on macOS 26 / Xcode 26 (Apple
+Swift 6.3.2), not one built and one argued. Full evidence — commands,
+outputs, diffs — in the plan artifact folder (`c6-spike-evidence.md`,
+`~/.claude/plans/roost/027-mac-iced-bundle/`).
+
+| Criterion | objc2 | Swift static lib |
+|---|---|---|
+| Build/CI complexity | +3 `Cargo.lock` lines, **0 new packages**; no build.rs; no new toolchain | new `build.rs` invoking `swiftc`; Swift becomes a hard `cargo check` requirement on `rust-build` (macOS cell), `iced-build-e2e` ×2 and every dev Mac; new build-order dependency inside the cargo graph |
+| Consumer coverage (6c–6g) | 6d ✔, 6e ✔ (`objc2-user-notifications 0.3.2`, same generation), 6f ✔, 6g ✔ proven; 6c Sparkle hand-written `msg_send!` | all ✔, but every callback needs a hand-matched `@_cdecl` + `@convention(c)` pair — cost scales with menu items / notification actions; 6c needs a vendored `Sparkle.framework` (SwiftPM cannot be consumed by a bare `swiftc` from build.rs) |
+| Maintenance surface | 5 `unsafe` in a 163-line probe; **0 `unsafe` in the dock-badge consumer**; clippy clean under workspace lints | no Rust `unsafe`, but an unchecked C ABI wall maintained by hand in two languages, plus a toolchain to pin |
+| Dependency-bar fit | pure Rust; the 0.6 generation is **already** in the graph via `arboard` + `softbuffer` | a second language toolchain in the crate whose premise is replacing Swift |
+| Compile friction to first clean build | 2 iterations (1 error; the compiler named the fix) | 2 iterations (1 `rustc-check-cfg` placement warning) |
+
+**objc2 probe results (8/8 pass, screen locked throughout):**
+`iced::window::run` → `RawWindowHandle::AppKit` (non-null `ns_view`) →
+`MainThreadMarker::new()` returns `Some` **inside** the callback →
+retained `NSView` (class `WinitView`) → `view.window()` non-nil, title
+read back. `NSApp.dockTile.badgeLabel` round-trips (`"3"` → `"3"`;
+`None` → nil). A Rust class declared with `define_class!`, installed as
+an `NSMenuItem` target/action and set as `NSApp.mainMenu`, had its
+**Rust method body execute** under both `performActionForItemAtIndex:`
+and `NSApp.sendAction:to:from:` — the retained-delegate-calls-back-into-
+Rust mechanism 6d and 6e both depend on. No disqualifier was hit
+(marker obtainable, handle lifetime scoped to the callback with
+nothing retained escaping, no version conflict, callback proof passed
+twice).
+
+**Swift probe results:** `swiftc -emit-library -static` produced a
+3.7 KB archive in 0.5 s (a realistic 57-line AppKit + UserNotifications
+shim: 35.9 KB, 3.3 s); linked positionally via `cargo:rustc-link-arg`
+following `roost-vt/build.rs`; `roost_shim_probe()` returned **42** at
+runtime and a Swift `NSMenuItem` action called back into a Rust
+`extern "C"` fn. No dyld issues — Swift's autolink records name
+`/usr/lib/swift/*.dylib` absolutely, so **neither `-L /usr/lib/swift`
+nor an rpath is needed**; `-static-stdlib` is a hard error on Apple
+platforms now. Linux inertness was proven by running the build script
+with `CARGO_CFG_TARGET_OS=linux` and `PATH=/nonexistent`: it exits 0
+without spawning `swiftc` and without emitting `rustc-cfg`, so the
+`extern "C"` block and its call sites vanish. The route is viable — it
+just costs a toolchain to buy ergonomics that stop at the C ABI wall.
+
+**Decision rationale.** Criterion (a) decides it: objc2 adds three
+lockfile edge lines and nothing else, while the Swift route adds a
+build script, a compiler, a CI requirement and a build-order dependency
+— to the crate whose purpose in M6 is to stop depending on Swift.
+Criterion (b) reinforces it: 6d and 6e are fine-grained callback APIs,
+exactly the shape where objc2's one `define_class!` beats N hand-
+matched C-ABI trampolines. The (c) worry that motivated the spike —
+`msg_send!` unsafety — did not materialize: the first shipped consumer
+needs **zero** `unsafe`. And (d) is settled by the graph itself:
+`arboard` and `softbuffer` already compile this exact objc2 generation
+into every macOS build.
+
+**What 6c/6d/6e inherit.** The seam is a flat `macos` module with
+`MainThreadMarker` acquired on the iced update loop (no background-
+thread AppKit anywhere) — `window::run` is only needed where a real
+`NSView`/`NSWindow` is (6f vibrancy), not for the badge or the menu
+bar. 6d and 6e get a proven `define_class!` delegate pattern with typed
+`Retained<_>` payloads. 6e adds `objc2-user-notifications 0.3.2` and
+must stay on the 0.6 generation — the coupling policy is pinned in a
+`Cargo.toml` comment: these versions move with `arboard`/`softbuffer`,
+never independently, or the lock resolves a second copy. 6c (Sparkle)
+remains an open question on either route: no generated bindings exist,
+so it will be a small hand-written `extern_class!` + `msg_send!`
+wrapper over `SPUStandardUpdaterController`.
+
+**Shipped as the seam's first consumer: the dock badge**, pulled
+forward from 6g (see 6g below — this piece of it is now done, the
+rest is still open). `crates/roost-iced/src/macos/dock_badge.rs`
+mirrors the notification-inbox count onto `NSApp.dockTile.badgeLabel`
+exactly as `App.swift:1961-1968`'s `refreshDockBadge()` does (`nil` at
+zero), synced after `WindowOpened` and after every
+`reconcile_notification_inbox()` — all on the iced update loop via
+`MainThreadMarker`, zero `unsafe` in the consumer itself. A test-mode
+iced-only IPC op, `app.dock_badge` (`{"label": string|null}`, pinned
+wire schema, documented in `docs/reference/ipc.md`), reads the live
+AppKit badge without re-deriving it from the inbox; GTK rejects in its
+exhaustive match, non-macOS iced rejects not-implemented. A new
+`tools/roosttest/test_dock_badge.py` (darwin+iced only) drives
+notification → badge count → clear → nil against a bundle launch and
+is wired into `ICED_E2E_TESTS` and all three `ci.yml` iced lane lists.
+
 * **6c. Sparkle auto-update.** `mac/Package.swift` + `App.swift` use
   ~two API calls (`SPUStandardUpdaterController`, `checkForUpdates(_:)`);
   `bundle.sh` already embeds and inside-out-signs the framework, and
@@ -934,11 +1091,13 @@ Slices:
   `device.audio-input` / `device.camera` / `automation.apple-events` a
   `/voice` or `osascript` in a tab fails **silently** — no prompt, no
   error (see the rationale comment in `mac/Resources/Roost.entitlements`,
-  including which entitlements we deliberately omit). Then: Dock badge +
-  dock menu, `NSApplicationDelegate` lifecycle (reopen-from-Dock,
-  open-file/URL, graceful terminate), activation policy, and Secure
-  Keyboard Entry (`EnableSecureEventInput` — a terminal convention
-  neither app has today).
+  including which entitlements we deliberately omit). **Dock badge:
+  done** — pulled forward as 6b's seam proof-consumer (2026-08-16, see
+  6b above for the implementation + test coverage). Still open: dock
+  menu, `NSApplicationDelegate` lifecycle (reopen-from-Dock, open-file/
+  URL, graceful terminate), activation policy, and Secure Keyboard Entry
+  (`EnableSecureEventInput` — a terminal convention neither app has
+  today).
 * **6h. macOS verification tier.** What makes the parity claim honest
   instead of hand-verified: a CGEvent real-input harness ([#285] — the
   uinput tier is Linux-only, a gap that matters far more once Mac is a
