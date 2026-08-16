@@ -79,16 +79,18 @@ pub const HOVER: Color = Color::from_rgb8(0x39, 0x39, 0x39);
 pub const ACTIVE_AGENT: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
 pub const TEXT: Color = Color::from_rgb8(0xf2, 0xf2, 0xf2);
 pub const MUTED_TEXT: Color = Color::from_rgb8(0xa0, 0xa4, 0xb0);
-pub const NOTIFICATION: Color = Color::from_rgb8(0x4e, 0x9a, 0xf1);
-/// Both notification dots — the tab-pill badge and the sidebar
-/// project-row dot. Pinned to the Mac's `NSColor.controlAccentColor`
-/// (#007aff), which both Mac surfaces use (`App.swift:4772`, `:5207`)
-/// and which GTK hardcodes for its tab badge
+/// The chrome's one accent color: the notification dots (tab-pill badge +
+/// sidebar project-row dot), the dragged-pill border, and the inline-rename
+/// focus ring + selection all share it. Pinned to the Mac's
+/// `NSColor.controlAccentColor` (#007aff), which both Mac surfaces use
+/// (`App.swift:4772`, `:5207`) and which GTK hardcodes for its tab badge
 /// (`crates/roost-linux/src/resources/style.css:277-288`) rather than
-/// tracking the desktop accent — on COSMIC `@accent_bg_color` renders
-/// teal. Deliberately separate from `NOTIFICATION`: only the dots have a
-/// cited reference value (#311).
-pub const NOTIFICATION_BADGE: Color = Color::from_rgb8(0x00, 0x7a, 0xff);
+/// tracking the desktop accent — on COSMIC `@accent_bg_color` renders teal.
+/// Was two constants (`NOTIFICATION` #4e9af1 generic blue, `NOTIFICATION_BADGE`
+/// #007aff mac accent) until the drag/rename surfaces flipped to the mac
+/// accent too (#321), at which point both names pinned the same value and
+/// were merged.
+pub const ACCENT: Color = Color::from_rgb8(0x00, 0x7a, 0xff);
 pub const DRAGGED_PILL: Color = Color::from_rgba8(0x55, 0x68, 0x7b, 0.65);
 pub const PALETTE_SURFACE: Color = Color::from_rgb8(0x2d, 0x2d, 0x33);
 pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
@@ -195,11 +197,7 @@ fn pill(active_background: Color, radius: f32, active: bool, dragging: bool) -> 
         style = style.background(active_background);
     }
     style.border = Border {
-        color: if dragging {
-            NOTIFICATION
-        } else {
-            Color::TRANSPARENT
-        },
+        color: if dragging { ACCENT } else { Color::TRANSPARENT },
         width: if dragging { 1.0 } else { 0.0 },
         radius: radius.into(),
     };
@@ -212,7 +210,7 @@ pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::S
 
 pub fn badge(_: &Theme) -> container::Style {
     container::Style::default()
-        .background(NOTIFICATION_BADGE)
+        .background(ACCENT)
         .border(Border::default().rounded(NOTIFICATION_DOT_SIZE / 2.0))
 }
 
@@ -334,19 +332,23 @@ pub fn palette_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     }
 }
 
+/// The mac reference field goes near-black while editing (a dark fill, not
+/// the transparent one that let the selection pill's blue show through and
+/// read as a blue field — W6). `DIVIDER` is the darkest existing chrome
+/// neutral, so the field reads as its own surface rather than a new hex.
 pub fn inline_rename_input(_: &Theme, status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused { .. });
     text_input::Style {
-        background: Background::Color(Color::TRANSPARENT),
+        background: Background::Color(DIVIDER),
         border: Border {
-            color: if focused { NOTIFICATION } else { MUTED_TEXT },
+            color: if focused { ACCENT } else { MUTED_TEXT },
             width: 1.0,
             radius: 3.0.into(),
         },
         icon: MUTED_TEXT,
         placeholder: MUTED_TEXT,
         value: TEXT,
-        selection: NOTIFICATION.scale_alpha(0.65),
+        selection: ACCENT.scale_alpha(0.65),
     }
 }
 
@@ -430,7 +432,7 @@ mod tests {
         assert_eq!(active.background, Some(Background::Color(ACTIVE_BLUE)));
         assert_eq!(
             project_pill(true, true)(&theme).border.color,
-            NOTIFICATION,
+            ACCENT,
             "the dragged project row is outlined like the dragged tab pill"
         );
         assert_eq!(
@@ -686,28 +688,53 @@ mod tests {
     }
 
     #[test]
-    fn notification_dots_pin_the_mac_accent_and_leave_the_generic_accent_alone() {
-        // Literals, not the constants themselves: comparing a constant to
-        // itself passes for any value and would not catch a re-flip.
-        assert_eq!(NOTIFICATION_BADGE, Color::from_rgb8(0x00, 0x7a, 0xff));
-        assert_eq!(NOTIFICATION, Color::from_rgb8(0x4e, 0x9a, 0xf1));
+    fn accent_pins_the_mac_value_and_wires_every_surface_that_shares_it() {
+        // Literal, not the constant itself: comparing a constant to itself
+        // passes for any value and would not catch a re-flip (#321 flipped
+        // this from #4e9af1 to the Mac's #007aff).
+        assert_eq!(ACCENT, Color::from_rgb8(0x00, 0x7a, 0xff));
 
-        // Wiring, not color: this one is tautological on its own (it would
-        // hold for any value of the constant). It exists to catch `badge()`
-        // being repointed at a *different* constant; the literals above are
-        // what pin the value.
+        // Wiring, not color: these are tautological on their own (they'd
+        // hold for any value of the constant). They exist to catch a call
+        // site being repointed at a *different* color; the literal above is
+        // what pins the value.
         let theme = Theme::Dark;
         assert_eq!(
             badge(&theme).background,
-            Some(Background::Color(NOTIFICATION_BADGE)),
-            "both notification dots render the Mac accent"
+            Some(Background::Color(ACCENT)),
+            "both notification dots render the accent"
+        );
+        assert_eq!(
+            pill(ACTIVE_TAB, 6.0, false, true).border.color,
+            ACCENT,
+            "the dragged-pill border renders the accent"
         );
 
-        // The generic accent keeps its other uses — nothing in #311's scope
-        // touches the rename affordances.
         let focused =
             inline_rename_input(&theme, text_input::Status::Focused { is_hovered: false });
-        assert_eq!(focused.border.color, NOTIFICATION);
-        assert_eq!(focused.selection, NOTIFICATION.scale_alpha(0.65));
+        assert_eq!(focused.border.color, ACCENT);
+        assert_eq!(focused.selection, ACCENT.scale_alpha(0.65));
+    }
+
+    #[test]
+    fn rename_editor_uses_a_dark_field_not_the_pill_background() {
+        let theme = Theme::Dark;
+        let focused =
+            inline_rename_input(&theme, text_input::Status::Focused { is_hovered: false });
+        assert_eq!(
+            focused.background,
+            Background::Color(DIVIDER),
+            "field reads as its own dark surface, not the transparent pill blue"
+        );
+        let unfocused = inline_rename_input(&theme, text_input::Status::Active);
+        assert_eq!(
+            unfocused.background,
+            Background::Color(DIVIDER),
+            "background stays dark whether or not the field is focused"
+        );
+        assert_eq!(
+            unfocused.border.color, MUTED_TEXT,
+            "only the border, not the background, reacts to focus"
+        );
     }
 }
