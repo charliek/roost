@@ -1150,19 +1150,45 @@ def _direct_tab_reorder(
                 )
             # Plan 026 deferred the accent border to the real drag
             # threshold (strip_reorder DRAG_THRESHOLD = 8px), so a bare
-            # press renders nothing. Cross the threshold with a small
-            # nudge toward the target first; the drag-began border then
-            # serves the same causal purpose — Iced has consumed the
-            # press and armed the drag before the trajectory runs. Once
-            # dragging, backtracking never un-arms, so a step-1 position
-            # behind the nudge is safe.
+            # press renders nothing. Cross the threshold before fencing;
+            # the drag-began border then serves the same causal purpose —
+            # Iced has consumed the press and armed the drag before the
+            # trajectory runs.
+            #
+            # One nudge is not enough. Iced evaluates every event in a
+            # redraw batch against the *latest* cursor position, so a
+            # press that changes nothing on screen (re-pressing the pill
+            # that is already active) need not force a redraw between
+            # itself and the nudge that follows: both land in one batch,
+            # the gesture records the nudge's own x as its origin, and
+            # `origin.distance(current)` is 0 — the drag can never arm,
+            # however long the fence waits. That is what made this
+            # deterministic on CI's loaded tiny-skia runner and invisible
+            # on an idle box.
+            #
+            # Alternating between two points 12px apart makes arming
+            # independent of which of them the press was attributed to:
+            # whichever one it lands on, the other is a threshold
+            # crossing. Both stay inside the source pill, so a coalesced
+            # press still hits the intended child, and each capture's
+            # render is a batch boundary between moves. Once dragging,
+            # moving back never un-arms, so the trajectory below is
+            # unaffected.
             nudge_x = x0 + (12 if target_x >= x0 else -12)
-            launch.terminal_pointer(
-                ["mousemove", "--window", launch.window, str(nudge_x), str(y)]
-            )
+            arming = [nudge_x, x0]
             pressed_capture: list[bytes] = []
 
             def source_press_rendered() -> bool:
+                launch.terminal_pointer(
+                    [
+                        "mousemove",
+                        "--window",
+                        launch.window,
+                        str(arming[0]),
+                        str(y),
+                    ]
+                )
+                arming.reverse()
                 run, png = preview_accent_capture()
                 if run is None:
                     return False
