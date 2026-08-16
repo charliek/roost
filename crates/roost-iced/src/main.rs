@@ -151,15 +151,83 @@ fn default_profile_kind(packaged: bool, linux: bool) -> BundleProfileKind {
     }
 }
 
-/// The two `cfg!`s `main` actually resolves its profile from, hoisted to
+/// `CFBundleIdentifier` of the macOS Iced bundle (`mac/Resources/
+/// Info-iced.plist.template`), the only id this mapping recognizes.
+const ICED_BUNDLE_ID: &str = "ai.stridelabs.Roost.iced";
+
+/// The macOS default profile, decided from the app bundle the binary is
+/// running out of rather than from compile-time flags.
+///
+/// Behaviorally a no-op today — every input maps to `Iced`, which is already
+/// what `default_profile_kind` yields on macOS. What it buys is the seam plus
+/// the logged identity: 6c's cutover has to map an id onto a kind, and the id
+/// it will map (`ai.stridelabs.Roost`, the Swift app's) is deliberately NOT
+/// recognized here, because deciding what the production id resolves to is
+/// 6c's call, not this slice's.
+///
+/// `None` is the ordinary case for a bare `target/debug/roost-iced`: an
+/// unbundled process still has a main `CFBundle`, but its identifier is nil.
+fn mac_bundle_default_kind(bundle_id: Option<&str>) -> BundleProfileKind {
+    match bundle_id {
+        Some(ICED_BUNDLE_ID) => BundleProfileKind::Iced,
+        _ => BundleProfileKind::Iced,
+    }
+}
+
+/// The compiled-in default `main` starts from, per host OS. macOS defers to
+/// the bundle probe; every other host keeps the `linux-package` logic above
+/// untouched, so a packaged Linux build still resolves `Gtk`.
+fn host_default_kind(
+    packaged: bool,
+    linux: bool,
+    macos: bool,
+    bundle_id: Option<&str>,
+) -> BundleProfileKind {
+    if macos {
+        mac_bundle_default_kind(bundle_id)
+    } else {
+        default_profile_kind(packaged, linux)
+    }
+}
+
+/// Read the running process's main-bundle identifier. `None` when the binary
+/// is not running out of a `.app` (or the bundle declares no identifier).
+///
+/// A `CFBundle` identifier read is not AppKit surface, so this stays correct
+/// whatever the M6 6b native-seam decision turns out to be.
+#[cfg(target_os = "macos")]
+fn main_bundle_identifier() -> Option<String> {
+    objc2_core_foundation::CFBundle::main_bundle()?
+        .identifier()
+        .map(|id| id.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main_bundle_identifier() -> Option<String> {
+    None
+}
+
+/// The three `cfg!`s `main` actually resolves its profile from, hoisted to
 /// consts so a test can assert against the same values rather than
 /// re-evaluating its own copy (which would pass even if these drifted).
 const PACKAGED: bool = cfg!(feature = "linux-package");
 const PACKAGED_PLATFORM: bool = cfg!(target_os = "linux");
+const HOST_MACOS: bool = cfg!(target_os = "macos");
 
 fn main() -> anyhow::Result<()> {
-    let profile = BundleProfile::resolve(default_profile_kind(PACKAGED, PACKAGED_PLATFORM))?;
+    let bundle_id = main_bundle_identifier();
+    let profile = BundleProfile::resolve(host_default_kind(
+        PACKAGED,
+        PACKAGED_PLATFORM,
+        HOST_MACOS,
+        bundle_id.as_deref(),
+    ))?;
     init_logging(&profile)?;
+    tracing::info!(
+        bundle_id = bundle_id.as_deref().unwrap_or("unbundled"),
+        profile = profile.kind.as_str(),
+        "resolved bundle identity"
+    );
     roost_engine::crash::install_panic_hook(
         profile.log_dir.clone(),
         profile.app_label,
@@ -870,6 +938,66 @@ mod tests {
         assert_eq!(default_profile_kind(true, false), BundleProfileKind::Iced);
         assert_eq!(default_profile_kind(false, true), BundleProfileKind::Iced);
         assert_eq!(default_profile_kind(false, false), BundleProfileKind::Iced);
+    }
+
+    /// Every cell is `Iced` on purpose — see `mac_bundle_default_kind`. The
+    /// table exists so a later change to any one of these rows (6c mapping
+    /// the production id) is a visible, deliberate edit rather than a silent
+    /// behavior shift.
+    #[test]
+    fn the_mac_bundle_probe_resolves_iced_for_every_identity() {
+        assert_eq!(
+            mac_bundle_default_kind(Some(ICED_BUNDLE_ID)),
+            BundleProfileKind::Iced
+        );
+        assert_eq!(
+            mac_bundle_default_kind(Some("ai.stridelabs.Roost")),
+            BundleProfileKind::Iced,
+            "the Swift app's id is not mapped here — that cutover is 6c's"
+        );
+        assert_eq!(
+            mac_bundle_default_kind(Some("com.example.Other")),
+            BundleProfileKind::Iced
+        );
+        assert_eq!(
+            mac_bundle_default_kind(None),
+            BundleProfileKind::Iced,
+            "a bare binary has no main-bundle identifier"
+        );
+    }
+
+    /// The probe must not reach the non-macOS default: a packaged Linux
+    /// build still resolves `Gtk` no matter what the (always-`None`) bundle
+    /// id says.
+    #[test]
+    fn only_macos_defers_to_the_bundle_probe() {
+        assert_eq!(
+            host_default_kind(true, true, false, None),
+            BundleProfileKind::Gtk
+        );
+        assert_eq!(
+            host_default_kind(true, true, false, Some(ICED_BUNDLE_ID)),
+            BundleProfileKind::Gtk
+        );
+        assert_eq!(
+            host_default_kind(true, true, true, None),
+            BundleProfileKind::Iced,
+            "on macOS the bundle probe decides, not the packaging feature"
+        );
+        assert_eq!(
+            host_default_kind(false, false, false, None),
+            BundleProfileKind::Iced
+        );
+    }
+
+    /// A bare `cargo test` binary is never inside a `.app`, so the probe must
+    /// report `None` rather than picking up some ambient bundle. On Linux
+    /// this is the stub; on macOS it is the real CFBundle read, which is the
+    /// case worth pinning (an unbundled process HAS a main bundle — only its
+    /// identifier is nil).
+    #[test]
+    fn an_unbundled_process_reports_no_identifier() {
+        assert_eq!(main_bundle_identifier(), None);
     }
 
     /// The four-cell test above never compiles the feature, so it passes

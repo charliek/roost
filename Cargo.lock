@@ -3139,6 +3139,7 @@ dependencies = [
  "arboard",
  "iced",
  "notify-rust",
+ "objc2-core-foundation",
  "png",
  "roost-engine",
  "roost-ipc",
