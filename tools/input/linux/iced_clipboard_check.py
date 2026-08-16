@@ -1148,6 +1148,18 @@ def _direct_tab_reorder(
                     == source,
                     f"{label} press selects its stable ID",
                 )
+            # Plan 026 deferred the accent border to the real drag
+            # threshold (strip_reorder DRAG_THRESHOLD = 8px), so a bare
+            # press renders nothing. Cross the threshold with a small
+            # nudge toward the target first; the drag-began border then
+            # serves the same causal purpose — Iced has consumed the
+            # press and armed the drag before the trajectory runs. Once
+            # dragging, backtracking never un-arms, so a step-1 position
+            # behind the nudge is safe.
+            nudge_x = x0 + (12 if target_x >= x0 else -12)
+            launch.terminal_pointer(
+                ["mousemove", "--window", launch.window, str(nudge_x), str(y)]
+            )
             pressed_capture: list[bytes] = []
 
             def source_press_rendered() -> bool:
@@ -1160,9 +1172,6 @@ def _direct_tab_reorder(
                 pressed_capture[:] = [png]
                 return True
 
-            # The held-source accent is a product-visible causal fence: Iced
-            # has consumed the native press at the intended stable-ID pill
-            # before the first trajectory sample can change cursor position.
             _wait_until(source_press_rendered, f"{label} source press render")
             if capture_root:
                 (capture_dir / f"{capture_name}-pressed.png").write_bytes(
