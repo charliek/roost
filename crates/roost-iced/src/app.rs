@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{
-    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input,
+    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Space,
 };
 use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
 use roost_engine::git_metrics;
@@ -878,6 +878,47 @@ pub enum UiTask {
         scroll_id: Id,
         pill_id: Id,
     },
+    /// The workspace has no projects left: end the run loop so `App` is
+    /// dropped and its `Drop` flushes state (mac parity — the Swift app
+    /// closes its window on the last project's deletion). Deliberately
+    /// NOT `iced::exit()` at the point of request: `main` turns this into
+    /// one more message round-trip so the deleting IPC client's reply is
+    /// written before the loop tears the socket down.
+    Exit,
+}
+
+/// Where the app is in the exit-on-empty sequence. A plain flag would
+/// re-arm on every subsequent `reconcile()` (the workspace stays empty
+/// until the process is gone), so the request latches.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ExitState {
+    #[default]
+    Running,
+    Requested,
+    Dispatched,
+}
+
+impl ExitState {
+    /// The snapshot side. Returns whether THIS observation raised the
+    /// request, so the log line lands on the edge rather than on every
+    /// reconcile that follows it.
+    fn observe(&mut self, projects_empty: bool) -> bool {
+        if *self != Self::Running || !projects_empty {
+            return false;
+        }
+        *self = Self::Requested;
+        true
+    }
+
+    /// The drain side: a raised request is handed out exactly once, so a
+    /// second reconcile in the same teardown cannot queue a second exit.
+    fn take(&mut self) -> bool {
+        if *self != Self::Requested {
+            return false;
+        }
+        *self = Self::Dispatched;
+        true
+    }
 }
 
 /// A dispatched engine mutation: the Iced task that will deliver its
@@ -995,6 +1036,7 @@ pub struct App {
     /// IPC, which never touches a UI focus helper.
     revealed_tab_id: Option<i64>,
     tab_reveal_request: Option<i64>,
+    exit_state: ExitState,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -1160,6 +1202,7 @@ impl App {
             tab_strip_scroll_id: Id::unique(),
             revealed_tab_id: None,
             tab_reveal_request: None,
+            exit_state: ExitState::default(),
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -1368,6 +1411,15 @@ impl App {
         UiTask::RevealTab {
             scroll_id: self.tab_strip_scroll_id.clone(),
             pill_id: tab_pill_id(tab_id),
+        }
+    }
+
+    /// Hand out the exit request `reconcile()` latched, once.
+    pub fn take_exit_task(&mut self) -> UiTask {
+        if self.exit_state.take() {
+            UiTask::Exit
+        } else {
+            UiTask::None
         }
     }
 
@@ -2232,11 +2284,26 @@ impl App {
                 focused: self.window_focused,
             }
             .into(),
-            _ => container(text("Starting terminal…"))
-                .center(Fill)
-                .width(Fill)
-                .height(Fill)
-                .into(),
+            // No frame to draw yet (the tab is spawning, or attached but
+            // still without applied metrics). The mac shows the terminal
+            // background until the first frame; text here flashes on every
+            // fast spawn. An attached tab answers from its own snapshot, so
+            // the theme parse is bounded to the pre-attach window.
+            _ => {
+                let background = self
+                    .tabs
+                    .get(&active_tab)
+                    .map(|tab| tab.snapshot.background)
+                    .unwrap_or_else(|| Theme::load_bundled(&self.active_theme_name).background);
+                container(Space::new())
+                    .width(Fill)
+                    .height(Fill)
+                    .style(move |_| {
+                        container::Style::default()
+                            .background(crate::terminal_widget::color(background))
+                    })
+                    .into()
+            }
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
         let content: Element<'_, Message> = if collapsed {
@@ -2815,6 +2882,10 @@ impl Drop for App {
         // Freeze and fsync the authoritative layout before PTY-exit tasks can
         // observe teardown and attempt a later persistence write.
         self.workspace.flush();
+        // The one observable proof that the run loop dropped `App` rather
+        // than the process being killed under it — the exit-on-empty path
+        // depends on this running.
+        tracing::info!("workspace state flushed on shutdown");
     }
 }
 
@@ -2909,6 +2980,29 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_workspace_requests_exactly_one_exit() {
+        let mut state = ExitState::default();
+        assert!(!state.take(), "a running app has no exit to drain");
+
+        assert!(state.observe(true));
+        // Every later reconcile sees the same empty workspace (nothing can
+        // refill it once the exit is under way) — none of them may re-raise.
+        assert!(!state.observe(true));
+
+        assert!(state.take());
+        assert!(!state.take(), "the exit is dispatched once");
+        assert!(!state.observe(true));
+    }
+
+    #[test]
+    fn a_populated_workspace_never_requests_an_exit() {
+        let mut state = ExitState::default();
+        assert!(!state.observe(false));
+        assert!(!state.take());
+        assert_eq!(state, ExitState::Running);
+    }
 
     #[test]
     fn terminal_geometry_never_produces_zero_grid() {

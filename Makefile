@@ -68,7 +68,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-exit e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py
 # `selection.*` reads UI state over IPC and never touches the host
@@ -76,6 +76,11 @@ ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walkin
 # under headless Wayland too. Only files that read/write the real
 # clipboard go here.
 ICED_CLIPBOARD_TESTS := tools/roosttest/test_osc52.py
+# Its OWN invocation, never a member of ICED_E2E_TESTS: this module deletes
+# the last project, which now ends the app (plan 026 D8) — inside the shared
+# session it would strand every module that runs after it. Always fresh: it
+# empties the workspace, so it must own the instance it drives.
+ICED_EXIT_E2E_TESTS := tools/roosttest/test_exit_on_empty.py
 # The release-profile lane's curated subset, not the full ICED_E2E_TESTS
 # list: startup, the core op set, the VT pipeline, and font shaping/glyph
 # rasterization — the last two because the one release-only bug this stack
@@ -111,6 +116,9 @@ e2e-iced:  ## Required functional E2E against Iced
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
 	uv run --group test pytest $$tests --roost-target iced
+
+e2e-iced-exit:  ## Iced exit-on-empty E2E in its own lane (DESTRUCTIVE: force-quits a running Iced UI, and the UI it launches exits)
+	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_EXIT_E2E_TESTS) --roost-target iced --roost-fresh
 
 e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not headless Wayland)
 	uv run --group test pytest $(ICED_CLIPBOARD_TESTS) --roost-target iced

@@ -201,6 +201,7 @@ impl App {
         // `Resync` and this rebuild is what heals it: deltas are an
         // optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        self.request_exit_if_empty();
         reconcile_confirm_delete(&mut self.confirm_delete, &self.projects);
         self.reconcile_tab_drag_preview();
         self.reconcile_project_drag_preview();
@@ -233,6 +234,24 @@ impl App {
                 continue;
             }
             self.attach_tab_tracked(*tab_id, now);
+        }
+    }
+
+    /// Mac parity: an empty workspace ends the app (App.swift closes the
+    /// window on `.projectDeleted` with no projects left, and the process
+    /// terminates behind it). Hooked to the reconciled SNAPSHOT rather
+    /// than to the `ProjectDeleted` event: a lagged broadcast collapses
+    /// into a `Resync`, which carries no per-project event to react to.
+    /// Reading the snapshot instead covers every route by construction —
+    /// closing the last tab (the engine cascades tab → project), the
+    /// confirm dialog, the palette, and raw `project.delete` over IPC.
+    ///
+    /// Boot is safe: `hydrate_workspace` seeds a default project before
+    /// the first reconcile, so the workspace is never observed empty
+    /// except after the user emptied it.
+    fn request_exit_if_empty(&mut self) {
+        if self.exit_state.observe(self.projects.is_empty()) {
+            tracing::info!("last project closed; exiting");
         }
     }
 

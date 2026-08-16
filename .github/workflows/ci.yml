@@ -594,6 +594,24 @@ jobs:
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
+      # Its own invocation, after the shared-session lane above: this
+      # module deletes the last project, which ends the app (plan 026 D8),
+      # so it must own the instance it drives.
+      - name: Run Iced exit-on-empty E2E (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-exit-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-exit-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_exit_on_empty.py
+          --roost-target iced --roost-fresh -v
+
       - name: Run Iced real-input clipboard (Linux X11)
         if: runner.os == 'Linux'
         env:
@@ -644,6 +662,21 @@ jobs:
           tools/roosttest/test_mouse_tracking.py
           --roost-target iced --roost-fresh -v
 
+      - name: Run Iced exit-on-empty E2E (Linux Wayland)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-exit-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-exit-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_exit_on_empty.py
+          --roost-target iced --roost-fresh -v
+
       - name: Run Iced functional E2E (macOS)
         if: runner.os == 'macOS'
         env:
@@ -674,13 +707,33 @@ jobs:
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
+      - name: Run Iced exit-on-empty E2E (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-exit-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-exit-logs
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_exit_on_empty.py
+          --roost-target iced --roost-fresh -v
+
       - name: Collect Iced diagnostics
         if: always()
         shell: bash
         run: |
           mkdir -p diagnostics
-          find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-logs/*.log' \
-            -exec cp '{}' diagnostics/ \; 2>/dev/null || true
+          # Every lane's capture file is named `roost-iced-ui.log`, so name
+          # the copy after its lane directory (as the screenshots below
+          # already do) — otherwise the lanes in this job overwrite one
+          # another and only the last one's log survives.
+          while IFS= read -r log; do
+            suite="$(basename "$(dirname "${log}")")"
+            cp "${log}" "diagnostics/${suite}-$(basename "${log}")"
+          done < <(find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-logs/*.log' 2>/dev/null)
           while IFS= read -r screenshot; do
             suite="$(basename "$(dirname "${screenshot}")")"
             cp "${screenshot}" "diagnostics/${suite}-$(basename "${screenshot}")"
