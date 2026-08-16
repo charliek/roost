@@ -3,6 +3,11 @@ mod chrome;
 mod engine_feed;
 mod font_registry;
 mod input;
+/// The AppKit seam. `cfg`'d whole rather than stubbed per-function: every
+/// call site pairs with a `not(macos)` no-op of its own, so nothing outside
+/// macOS ever names an AppKit type.
+#[cfg(target_os = "macos")]
+mod macos;
 mod notifications;
 mod palette_scroll;
 mod paste_image;

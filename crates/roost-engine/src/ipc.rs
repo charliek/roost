@@ -22,16 +22,17 @@ use std::sync::Arc;
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppRenderStatsParams, AppRenderStatsResult,
-    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
-    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
+    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
+    AppSetWindowFocusParams, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
+    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
+    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
+    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, SidebarDumpParams, SidebarDumpResult,
+    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
@@ -350,6 +351,14 @@ pub enum UiRequest {
     /// selected tab id (UI truth). Ungated (read-only).
     AppSelectedTabId {
         reply: tokio::sync::oneshot::Sender<Result<i64, String>>,
+    },
+    /// `app.dock_badge` — read the macOS Dock tile's live badge label
+    /// (`None` when cleared). The UI reads AppKit rather than
+    /// recomputing from its notification inbox, so the op proves the
+    /// badge write actually landed. Gated like `TabFeedPtyBytes`
+    /// (ROOST_TEST_MODE=1); macOS iced only — the other UIs reject.
+    AppDockBadge {
+        reply: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
     },
 }
 
@@ -1091,6 +1100,14 @@ async fn dispatch(
                 .map_err(|e| HandlerError::new("internal", e))?;
             encode(&AppSelectedTabIdResult { tab_id })
         }
+        ops::APP_DOCK_BADGE => {
+            let _: AppDockBadgeParams = decode(params)?;
+            let label = h
+                .ui_call(|reply| UiRequest::AppDockBadge { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&AppDockBadgeResult { label })
+        }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -1146,7 +1163,9 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 ///     holds the keyboard route → `invalid-param` — the caller asked
 ///     to feed the wrong tab, not a server failure.
 ///   * an op a UI hasn't wired up yet (`tab.feed_ime` on GTK, still
-///     iced-only) → `not-implemented`, mirroring `events.subscribe`.
+///     iced-only), or one that is structurally unavailable there
+///     (`app.dock_badge` off macOS — there is no Dock) →
+///     `not-implemented`, mirroring `events.subscribe`.
 ///   * anything else (capture buffer poisoned, feed channel closed)
 ///     → `internal`, so a real failure surfaces clearly rather than
 ///     being mistaken for a missing tab.

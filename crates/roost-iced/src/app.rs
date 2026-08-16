@@ -1257,6 +1257,11 @@ impl App {
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
+        // The initial Dock-badge sync: `App::new`'s reconcile runs before
+        // iced has a window, i.e. before there is an app to badge. From
+        // here on the reconcile owns it, and a repeat from a later
+        // `WindowFocus` is an idempotent rewrite of the same label.
+        self.sync_dock_badge();
         prepare_window_opened(
             &mut self.window_id,
             &mut self.pending_window_resize,

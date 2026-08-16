@@ -558,6 +558,21 @@ class Roost:
         res = self.call("app.selected_tab_id", {})
         return int(res["tab_id"])
 
+    def app_dock_badge(self) -> str | None:
+        """Return the macOS Dock tile's live badge label, or `None` when
+        the badge is cleared. Read straight off AppKit — the UI does not
+        re-derive it from its notification inbox first, so this asserts
+        the badge write actually landed.
+
+        Gated by ROOST_TEST_MODE=1 (raises `RoostError('not-enabled')`
+        when off) and macOS-iced-only: every other UI, and the iced UI on
+        Linux, answers `RoostError('not-implemented')`."""
+        res = self.call("app.dock_badge", {})
+        # Direct key access: a missing field is a protocol violation, and
+        # `.get` would read it as "badge cleared" — the exact state the
+        # badge tests wait for.
+        return res["label"]
+
     def tab_expand_selection_at(
         self,
         tab_id: int,

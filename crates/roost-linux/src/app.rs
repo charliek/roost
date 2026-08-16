@@ -1111,6 +1111,17 @@ impl App {
                                 "tab.feed_ime is not supported on this UI (iced only)".into(),
                             ));
                         }
+                        // No Dock on Linux, and no AppKit wiring in the
+                        // macOS dev build of this UI either. Reject
+                        // rather than answer a plausible `null`, which
+                        // would read as "the badge is cleared" and pass
+                        // a badge test that never ran.
+                        UiRequest::AppDockBadge { reply } => {
+                            let _ = reply.send(Err(
+                                "app.dock_badge is not supported on this UI (macOS iced only)"
+                                    .into(),
+                            ));
+                        }
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
                         }
