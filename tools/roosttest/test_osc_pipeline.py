@@ -219,20 +219,21 @@ class TestOscPipeline:
         captured = drain_until_match(roost, tab, rb"\x1b\]4;5;rgb:dede/adad/bebe")
         assert b"\x1b]4;5;rgb:dede/adad/bebe" in captured, captured
 
-    @pytest.mark.skip(
-        reason=(
-            "known #145 limitation: vt_write happens AFTER scanner.feed in the "
-            "drain, so SET in the same chunk as QUERY isn't visible to the "
-            "color-query reply yet. PR slot for the eventual fix — when the "
-            "drain reorders, removing this skip makes the assertion pass."
-        )
-    )
-    def test_osc11_same_chunk_set_query_known_stale(self, roost, project):
-        """Regression slot: feed SET + QUERY as one chunk. The reply
-        currently encodes the STALE theme bg because the OSC scanner
-        runs before libghostty's vt_write. Documented in #145's PR
-        body as out-of-scope; this test stays here so a future
-        reordering surfaces by unskipping."""
+    def test_osc11_same_chunk_set_query_replies_pre_chunk_color(self, roost, project):
+        """SET + QUERY in ONE chunk answers from the chunk-start
+        colors — pinned behavior on all three UIs, not an accident of
+        one implementation.
+
+        This used to be a skipped "known #145 limitation" slot,
+        described as the scanner running before `vt_write`. Plan 026's
+        D10 moved iced's scan onto the PTY drain, where the ordering
+        argument no longer applies, and pinned the SAME semantics
+        explicitly: `OscRouter::feed`'s contract (a SET affects a LATER
+        chunk's query; SET+QUERY in one chunk sees the pre-chunk value)
+        is what all three UIs implement. Asserting only the negative —
+        the just-set color is NOT echoed — keeps this target-agnostic
+        without hard-coding a theme color.
+        """
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(
@@ -240,11 +241,27 @@ class TestOscPipeline:
             b"\x1b]11;rgb:00/11/22\x07\x1b]11;?\x07",
         )
         captured = drain_until_match(roost, tab, rb"\x1b\]11;rgb:")
-        # When this is FIXED, the assertion should flip to check
-        # that the post-set color (0000/1111/2222) appears AND
-        # the stale theme color (1e1e/1e1e/1e1e) does not.
-        assert b"0000/1111/2222" in captured, captured
-        assert b"1e1e/1e1e/1e1e" not in captured, captured
+        assert b"0000/1111/2222" not in captured, captured
+
+    def test_osc11_query_reply_needs_no_dump_or_refresh(self, roost, project):
+        """The D10 property: a color-query reply must not depend on
+        anything the UI does after the bytes land.
+
+        Every other case here polls `tab.capture_pty_input` (via
+        `drain_until_match`), which is already refresh-free — this test
+        exists to say so out loud, and to fail if a future change makes
+        the reply wait on a dump, a refresh, or any other UI-side
+        round-trip. `prox`/termenv exits within a frame of its probe;
+        anything slower than the drain leaks the answer into the shell
+        prompt.
+        """
+        tab = roost.open_tab(project, cwd="/tmp")
+        wait_tab_attached(roost, tab)
+        roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
+        captured = drain_until_match(
+            roost, tab, rb"\x1b\]11;rgb:[0-9a-f]{4}/[0-9a-f]{4}/[0-9a-f]{4}"
+        )
+        assert b"\x1b]11;rgb:" in captured, captured
 
     # ----- parity coverage for OSC routing (title / cwd / notif) --------
 

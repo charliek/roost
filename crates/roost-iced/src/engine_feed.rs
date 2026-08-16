@@ -95,7 +95,10 @@ impl EngineFeedReceiver {
         let item = self.rx.try_recv().ok()?;
         batch.items += 1;
         let workspace = matches!(item, EngineFeed::Workspace(_));
-        let tab_bytes = matches!(item, EngineFeed::Tab(_, TabOutput::Bytes(_)));
+        let tab_bytes = matches!(
+            item,
+            EngineFeed::Tab(_, TabOutput::Bytes(_) | TabOutput::Scanned { .. })
+        );
         batch.workspace_events |= workspace;
         batch.non_tab_bytes |= !tab_bytes;
         batch.workspace_dirty |= workspace;

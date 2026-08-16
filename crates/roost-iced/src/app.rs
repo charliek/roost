@@ -19,7 +19,7 @@ use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
     SelectionData, UiRequest,
 };
-use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter};
+use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot};
 use roost_engine::pointer::{DragCellGate, MotionEmitter, PointerAction, PointerButton};
 use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};

@@ -2803,7 +2803,12 @@ impl App {
                 let mut osc_router = roost_engine::osc::OscRouter::new();
                 while let Some(msg) = output_rx.recv().await {
                     match msg {
-                        TabOutput::Bytes(data) => {
+                        // `Scanned` is iced's `attach_scanned` opt-in —
+                        // this attach never passes a seed, so the arm is
+                        // here to keep the match total, not because the
+                        // GTK drain can see one. Either shape is the
+                        // same bytes through the same router.
+                        TabOutput::Bytes(data) | TabOutput::Scanned { data, .. } => {
                             // Read renderer-owned live colors before applying
                             // this chunk. The shared router stays renderer-free
                             // and returns ordered, explicit actions.

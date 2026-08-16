@@ -142,8 +142,18 @@ pub(super) fn collect_tab_output(
         return;
     };
     match output {
+        // The session attaches with the OSC opt-in, so PTY output
+        // arrives already scanned: its color-query replies left from the
+        // drain (that is D10's whole point) and what reaches here is the
+        // remaining actions. `Bytes` is the un-opted-in shape — GTK's —
+        // and cannot occur on this path; treat it as a chunk with no
+        // actions rather than asserting.
         TabOutput::Bytes(bytes) => {
-            let actions = tab.write_vt(&bytes);
+            tab.write_vt(&bytes);
+            collected.touched.insert(tab_id);
+        }
+        TabOutput::Scanned { data, actions } => {
+            tab.write_vt(&data);
             // Most chunks of a flood carry no OSC at all; an empty entry
             // would still cost a push and an `apply_osc_actions` hop.
             if !actions.is_empty() {
@@ -718,8 +728,10 @@ impl App {
                 // lookup is the price of handing `self` to `apply_osc_actions`.
                 let result = if !self.test_mode {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
-                } else if let Some(actions) =
-                    self.tabs.get_mut(&tab_id).map(|tab| tab.write_vt(&data))
+                } else if let Some(actions) = self
+                    .tabs
+                    .get_mut(&tab_id)
+                    .map(|tab| tab.scan_and_write_vt(&data))
                 {
                     task = task.then(self.apply_osc_actions(tab_id, actions));
                     self.tabs
@@ -1370,6 +1382,35 @@ mod tests {
         supervisor.close(70);
     }
 
+    /// What the OSC opt-in actually delivers: the bytes still write
+    /// through, and the actions the drain did NOT consume (it keeps the
+    /// query replies) ride along for the batch tail to apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scanned_output_writes_through_and_carries_its_actions() {
+        let (mut tabs, supervisor) = attached(75);
+        let mut collected = TabOutputBatch::default();
+
+        collect_tab_output(
+            &mut tabs,
+            &mut collected,
+            75,
+            TabOutput::Scanned {
+                data: b"\x1b[2J\x1b[Hhello".to_vec(),
+                actions: vec![OscAction::PointerShape("pointer".into())],
+            },
+        );
+
+        assert_eq!(collected.touched, HashSet::from([75]));
+        assert_eq!(
+            collected.osc_actions,
+            vec![(75, vec![OscAction::PointerShape("pointer".into())])]
+        );
+        let tab = tabs.get_mut(&75).expect("the tab is still attached");
+        tab.refresh_snapshot().expect("refresh the touched tab");
+        assert_eq!(tab.snapshot.grid[0].text, "hello");
+        supervisor.close(75);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn output_for_a_tab_that_is_gone_is_dropped() {
         let (mut tabs, supervisor) = attached(71);
@@ -1463,7 +1504,11 @@ mod tests {
         while Instant::now() < deadline && !seen.contains(needle) {
             let mut batch = EngineBatch::default();
             while let Some(item) = rx.try_next(&mut batch) {
-                if let EngineFeed::Tab(id, TabOutput::Bytes(bytes)) = item {
+                if let EngineFeed::Tab(
+                    id,
+                    TabOutput::Bytes(bytes) | TabOutput::Scanned { data: bytes, .. },
+                ) = item
+                {
                     if id == tab_id {
                         seen.push_str(&String::from_utf8_lossy(&bytes));
                     }

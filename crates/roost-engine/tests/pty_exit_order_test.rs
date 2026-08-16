@@ -48,7 +48,9 @@ async fn drain_until_exit(
     let mut error = None;
     while Instant::now() < deadline && status.is_none() {
         match rx.try_recv() {
-            Ok(TabOutput::Bytes(b)) => bytes.extend_from_slice(&b),
+            Ok(TabOutput::Bytes(b) | TabOutput::Scanned { data: b, .. }) => {
+                bytes.extend_from_slice(&b)
+            }
             Ok(TabOutput::Exit { status: s, .. }) => status = Some(s),
             Ok(TabOutput::Error(e)) => error = Some(e),
             Err(TryRecvError::Empty) => sleep(Duration::from_millis(5)).await,

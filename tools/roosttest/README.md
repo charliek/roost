@@ -199,13 +199,40 @@ to drive the shell into emitting the sequence. They require
 ```python
 def test_osc11_set_then_query_replies_with_new_bg(roost, project):
     tab = roost.open_tab(project, cwd="/tmp")
-    # SET in one chunk so libghostty processes it before the next
-    # scanner.feed sees the QUERY.
+    # SET in one chunk, QUERY in the next: a SET affects a LATER chunk's
+    # query, while SET+QUERY in ONE chunk answers the pre-chunk color.
     roost.tab_feed_pty_bytes(tab, b"\x1b]11;rgb:00/11/22\x07")
     roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
     reply = roost.tab_capture_pty_input(tab, drain=True)
     assert b"0000/1111/2222" in reply
 ```
+
+**What `tab.feed_pty_bytes` exercises on iced.** Since plan 026's D10,
+iced's OSC scan lives in the PTY drain (`TabSession`'s forwarding task
+owns the tab's only `OscRouter` and answers color queries there, ahead
+of the UI's event loop — that latency is what leaked replies into the
+shell prompt). `tab.feed_pty_bytes` injects on the UI thread, so it
+cannot go through the drain; it routes through
+`TerminalTab::scan_and_write_vt`, which hands the bytes to the SAME
+router and the SAME color state via `TabSession::scan_osc` before
+writing them to the terminal. So these tests still walk the production
+scan, the production color state and the production input channel — but
+they cannot prove the reply left *without* the UI. That property has its
+own test at the engine level:
+`crates/roost-engine/tests/osc_drain_reply_test.rs`. GTK and Mac keep
+their own UI-side routers, and `feed_pty_bytes` is their production path
+by construction.
+
+**Corollary — feed a quiet tab.** Because the injector bypasses the
+drain, injected bytes and live PTY bytes are two producers into one
+streaming scanner: a chunk fed while the shell is still writing can be
+scanned out of terminal order, or land mid-sequence and corrupt the
+parse for both. The `wait_tab_quiet` rule above (already required so a
+prompt doesn't overwrite seeded rows) covers this too — it is the reason
+it applies to OSC-only feeds on iced as well, not just to tests that
+seed viewport content. Production is unaffected: `tab.feed_pty_bytes` is
+`ROOST_TEST_MODE=1`-gated and the forwarding task is the only scanner
+otherwise.
 
 **Seed only after the tab goes quiet.** `tab.feed_pty_bytes` applies its
 bytes as soon as the UI services the op and does *not* serialize with PTY
