@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
@@ -113,6 +114,17 @@ const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
 /// outlive its deadline by up to one of these.
 pub(crate) const STATUS_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const CONFIRM_PANEL_WIDTH: f32 = 420.0;
+/// The inline tab-rename field's width. It stands in for the measured
+/// title width while a pill is being renamed, so an editing pill sizes by
+/// the same rule as every other one.
+const RENAME_FIELD_WIDTH: f32 = 140.0;
+
+/// The tab pill the strip reveal scrolls to. Keyed by tab id alone: the
+/// pill for a tab is one container wherever the strip reorders it to, and
+/// a reveal issued for an id that has since closed simply finds nothing.
+fn tab_pill_id(tab_id: i64) -> Id {
+    Id::from(format!("tab-pill:{tab_id}"))
+}
 
 #[derive(Debug, Default)]
 struct StatusBanner {
@@ -816,6 +828,13 @@ pub enum UiTask {
         measurement_generation: u64,
         reveal: bool,
     },
+    /// Scroll the tab strip so the newly activated pill is fully on
+    /// screen — the same scroll-into-view operation the palette uses,
+    /// walked along the strip's horizontal axis.
+    RevealTab {
+        scroll_id: Id,
+        pill_id: Id,
+    },
 }
 
 /// A dispatched engine mutation: the Iced task that will deliver its
@@ -926,6 +945,13 @@ pub struct App {
     palette_selected_in_view: Option<bool>,
     palette_visibility_request: PaletteVisibilityRequest,
     palette_visibility_retries: u8,
+    tab_strip_scroll_id: Id,
+    /// The active tab the strip has already been scrolled to. Compared
+    /// against the workspace's active tab in `reconcile()`, which is what
+    /// makes the reveal fire for every activation route — including raw
+    /// IPC, which never touches a UI focus helper.
+    revealed_tab_id: Option<i64>,
+    tab_reveal_request: Option<i64>,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -1088,6 +1114,9 @@ impl App {
             palette_reveal_attempts: 0,
             palette_selected_in_view: None,
             palette_visibility_request: PaletteVisibilityRequest::None,
+            tab_strip_scroll_id: Id::unique(),
+            revealed_tab_id: None,
+            tab_reveal_request: None,
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -1280,6 +1309,23 @@ impl App {
 
     pub fn palette_retry_pending(&self) -> bool {
         self.palette_visibility_request.is_pending()
+    }
+
+    /// Hand out the pending strip reveal, if any. Held back until the
+    /// window exists so a boot-time activation (state.json restoring a
+    /// tab that is not the first) still reveals once there is a layout to
+    /// measure, instead of being dropped against an empty widget tree.
+    pub fn take_tab_reveal_task(&mut self) -> UiTask {
+        if self.window_id.is_none() {
+            return UiTask::None;
+        }
+        let Some(tab_id) = self.tab_reveal_request.take() else {
+            return UiTask::None;
+        };
+        UiTask::RevealTab {
+            scroll_id: self.tab_strip_scroll_id.clone(),
+            pill_id: tab_pill_id(tab_id),
+        }
     }
 
     /// A tab whose budget ran out stays tracked but stops arming this.
@@ -1927,6 +1973,10 @@ impl App {
             })
             .collect::<Vec<_>>();
         let collapsed = self.workspace.sidebar_collapsed();
+        // `TabDragPreview::drags` waits for the strip's drag threshold:
+        // `StripEvent::Started` fires on a bare press, so styling off
+        // preview presence alone painted the accent drag border for a
+        // frame on every ordinary click. Same rule the sidebar rows use.
         let mut tab_pills = row![].spacing(6);
         for tab in active_project_tabs {
             let title = if tab.title.is_empty() {
@@ -1935,6 +1985,10 @@ impl App {
                 &tab.title
             };
             let active = tab.id == active_tab;
+            let editing = self
+                .rename_editor
+                .as_ref()
+                .filter(|editor| editor.target == RenameTarget::Tab(tab.id));
             let lifecycle = agent::effective_lifecycle(&tab.agent_state());
             let status_color = tab_status_color(lifecycle);
             let dot = container(
@@ -1947,11 +2001,33 @@ impl App {
                     .background(status_color)
                     .border(iced::border::rounded(4))
             });
-            let select: Element<'_, Message> = if let Some(editor) = self
-                .rename_editor
-                .as_ref()
-                .filter(|editor| editor.target == RenameTarget::Tab(tab.id))
-            {
+            // What the pill spends beyond its chrome and title: the close
+            // affordance on the active pill, the badge on a notified
+            // inactive one. Both are laid out trailing, so both come out
+            // of the title's width budget.
+            let trailing_width = if active {
+                chrome::PILL_HEIGHT
+            } else if tab.has_notification {
+                chrome::NOTIFICATION_DOT_SIZE
+            } else {
+                0.0
+            };
+            let title_font = chrome::chrome_font(if active {
+                font::Weight::Medium
+            } else {
+                font::Weight::Normal
+            });
+            let title_budget =
+                chrome::TAB_PILL_MAX_WIDTH - chrome::TAB_PILL_CHROME_WIDTH - trailing_width;
+            let (label, label_width) = if editing.is_some() {
+                (Cow::Borrowed(title), RENAME_FIELD_WIDTH)
+            } else {
+                chrome::elide_to_width(title, title_font, chrome::TAB_TITLE_SIZE, title_budget)
+            };
+            let pill_width = (chrome::TAB_PILL_CHROME_WIDTH + trailing_width + label_width)
+                .ceil()
+                .clamp(chrome::TAB_PILL_MIN_WIDTH, chrome::TAB_PILL_MAX_WIDTH);
+            let select: Element<'_, Message> = if let Some(editor) = editing {
                 container(
                     row![
                         dot,
@@ -1959,45 +2035,50 @@ impl App {
                             .id(self.rename_input_id.clone())
                             .on_input(Message::RenameDraftChanged)
                             .on_submit(Message::RenameSubmit)
-                            .width(140)
-                            .size(12)
+                            .width(RENAME_FIELD_WIDTH)
+                            .size(chrome::TAB_TITLE_SIZE)
                             // Same integral-height rationale as the project
                             // rename editor above.
                             .line_height(iced::widget::text::LineHeight::Absolute(18.0.into(),))
                             .padding([1, 3])
                             .style(chrome::inline_rename_input)
                     ]
-                    .spacing(6)
+                    .spacing(chrome::TAB_PILL_LABEL_SPACING)
                     .align_y(Alignment::Center),
                 )
                 .height(chrome::PILL_HEIGHT)
-                .padding([2, 7])
+                .padding([2.0, chrome::TAB_PILL_LABEL_PADDING_X])
                 .into()
             } else {
                 container(
                     row![
                         dot,
-                        text(title)
-                            .size(12)
+                        text(label)
+                            .size(chrome::TAB_TITLE_SIZE)
                             .color(if active {
                                 chrome::TEXT
                             } else {
                                 chrome::MUTED_TEXT
                             })
-                            .font(chrome::chrome_font(if active {
-                                font::Weight::Medium
-                            } else {
-                                font::Weight::Normal
-                            }))
+                            .font(title_font)
+                            // The pill is a fixed width now, so an
+                            // unwrapped run is what keeps a title one line
+                            // tall when the elision lands a hair long.
+                            .wrapping(iced::widget::text::Wrapping::None)
                     ]
-                    .spacing(6)
+                    .spacing(chrome::TAB_PILL_LABEL_SPACING)
                     .align_y(Alignment::Center),
                 )
                 .height(chrome::PILL_HEIGHT)
-                .padding([2, 7])
+                .padding([2.0, chrome::TAB_PILL_LABEL_PADDING_X])
                 .into()
             };
-            let mut pill = row![select].align_y(Alignment::Center);
+            // The spacer pins the badge and the close affordance to the
+            // pill's trailing edge once `TAB_PILL_MIN_WIDTH` gives a short
+            // title more room than it asked for; at natural width it
+            // resolves to nothing.
+            let mut pill =
+                row![select, iced::widget::Space::new().width(Fill)].align_y(Alignment::Center);
             if tab.has_notification && !active {
                 pill = pill.push(
                     container(
@@ -2014,14 +2095,16 @@ impl App {
                         .width(chrome::PILL_HEIGHT)
                         .height(chrome::PILL_HEIGHT)
                         .padding(2)
-                        .style(chrome::transparent_button)
+                        .style(chrome::close_button)
                         .on_press(Message::CloseTab(tab.id)),
                 );
             }
             tab_pills = tab_pills.push(
                 container(pill)
+                    .id(tab_pill_id(tab.id))
+                    .width(pill_width)
                     .height(chrome::PILL_HEIGHT)
-                    .padding([0, 2])
+                    .padding([0.0, chrome::TAB_PILL_PADDING_X])
                     .style(chrome::tab_pill(
                         active,
                         self.tab_drag_preview
@@ -2057,6 +2140,7 @@ impl App {
         // the stock 10px filled rail, and even a 2px hover sliver, both did.
         // Wheel/trackpad scrolling is independent of the scrollbar's size.
         let tab_scroller = scrollable(tab_strip_row)
+            .id(self.tab_strip_scroll_id.clone())
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::hidden(),
             ))

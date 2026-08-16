@@ -217,6 +217,7 @@ impl App {
         self.tabs.retain(|tab_id, _| live_ids.contains(tab_id));
         self.pending_attachments.retain_live(&live_ids);
         let active_tab_id = self.workspace.active().1;
+        self.request_tab_reveal(active_tab_id);
         for (tab_id, tab) in &mut self.tabs {
             if *tab_id != active_tab_id && tab.reset_pointer_state() {
                 refresh_or_warn(*tab_id, tab, "pointer reset after active tab changed");
@@ -233,6 +234,19 @@ impl App {
             }
             self.attach_tab_tracked(*tab_id, now);
         }
+    }
+
+    /// Queue a strip reveal when the OBSERVED active tab changed. Hooked
+    /// to reconcile rather than to a focus helper on purpose: `tab.focus`
+    /// over IPC mutates the workspace in its handler and reaches the UI
+    /// only as a broadcast, so a UI-side funnel would miss exactly the
+    /// path the missing reveal was reported on.
+    fn request_tab_reveal(&mut self, active_tab_id: i64) {
+        if self.revealed_tab_id == Some(active_tab_id) {
+            return;
+        }
+        self.revealed_tab_id = Some(active_tab_id);
+        self.tab_reveal_request = Some(active_tab_id);
     }
 
     /// One attach attempt for a tab the workspace lists but the UI has no

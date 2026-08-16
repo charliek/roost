@@ -1,5 +1,8 @@
+use std::borrow::Cow;
+
+use iced::advanced::text::{self as advanced_text, Paragraph as _};
 use iced::widget::{button, container, scrollable, text_input};
-use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
+use iced::{Background, Border, Color, Font, Pixels, Shadow, Size, Theme, Vector};
 
 /// One application-owned band height keeps the sidebar header and tab strip
 /// on the same seam. Native window decorations remain outside this geometry.
@@ -28,7 +31,27 @@ pub const PROJECT_LABEL_INSET: f32 = 18.0;
 pub const PROJECT_DOT_INSET: f32 = 8.0;
 pub const AGENT_DOT_INSET: f32 = 25.0;
 pub const TAB_STATUS_SIZE: f32 = 7.0;
-pub const NOTIFICATION_DOT_SIZE: f32 = 8.0;
+pub const NOTIFICATION_DOT_SIZE: f32 = 9.0;
+/// Tab-pill width band, from the Mac (`App.swift:4757-4763`, config
+/// `tabMaxWidth`): a pill never shrinks below `TAB_PILL_MIN_WIDTH` however
+/// short its title, and a long title is tail-elided to keep the pill inside
+/// `TAB_PILL_MAX_WIDTH` rather than letting one tab own the strip.
+pub const TAB_PILL_MIN_WIDTH: f32 = 80.0;
+pub const TAB_PILL_MAX_WIDTH: f32 = 220.0;
+/// The pill's own horizontal inset, and the label block's inside it.
+pub const TAB_PILL_PADDING_X: f32 = 2.0;
+pub const TAB_PILL_LABEL_PADDING_X: f32 = 7.0;
+/// Gap between the status dot and the title.
+pub const TAB_PILL_LABEL_SPACING: f32 = 6.0;
+pub const TAB_TITLE_SIZE: f32 = 12.0;
+/// Everything a pill spends on chrome before its title gets a pixel: both
+/// containers' side padding, the status dot, and the gap after it. Derived
+/// rather than measured so the elision budget cannot drift from the layout
+/// it is eliding for.
+pub const TAB_PILL_CHROME_WIDTH: f32 = 2.0 * TAB_PILL_PADDING_X
+    + 2.0 * TAB_PILL_LABEL_PADDING_X
+    + TAB_STATUS_SIZE
+    + TAB_PILL_LABEL_SPACING;
 pub const PALETTE_WIDTH: f32 = 660.0;
 pub const PALETTE_MAX_HEIGHT: f32 = 500.0;
 
@@ -81,6 +104,72 @@ pub fn chrome_font(weight: iced::font::Weight) -> Font {
         family: iced::font::Family::Name(CHROME_FONT_FAMILY),
         weight,
         ..Font::default()
+    }
+}
+
+/// The tail marker an elided label ends with.
+pub const ELLIPSIS: &str = "…";
+
+/// Shaped width of one chrome text run, measured through the very
+/// `Paragraph` type the renderer lays it out with (the same seam
+/// `TerminalMetrics::measure_with_font` uses for the cell grid), so a
+/// budget computed here matches what will be drawn.
+pub fn text_width(content: &str, font: Font, size: f32) -> f32 {
+    if content.is_empty() {
+        return 0.0;
+    }
+    type Paragraph = <iced::Renderer as advanced_text::Renderer>::Paragraph;
+    Paragraph::with_text(advanced_text::Text {
+        content,
+        bounds: Size::INFINITE,
+        size: Pixels(size),
+        line_height: advanced_text::LineHeight::default(),
+        font,
+        align_x: advanced_text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: advanced_text::Shaping::Advanced,
+        wrapping: advanced_text::Wrapping::None,
+    })
+    .min_bounds()
+    .width
+}
+
+/// Tail-elide `content` to `max_width`, returning what to draw and how wide
+/// it measures. Iced 0.14's text widget has no ellipsis mode — an
+/// overlong label just stops mid-glyph at its clip edge, which reads as a
+/// rendering fault — so the string itself is shortened and marked, the way
+/// the Mac's tab pills show `/Users/charliek/project…`.
+pub fn elide_to_width(content: &str, font: Font, size: f32, max_width: f32) -> (Cow<'_, str>, f32) {
+    let full = text_width(content, font, size);
+    if full <= max_width {
+        return (Cow::Borrowed(content), full);
+    }
+    // Cut points are char boundaries: no grapheme segmenter is in the
+    // dependency set, so a cut can drop a trailing combining mark — never
+    // split a code point, and never produce invalid UTF-8.
+    let cuts: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
+    // Largest prefix whose marked form still fits. Shaped width is
+    // non-decreasing in prefix length, which is what makes the search
+    // sound; the full string is already known not to fit, so it is not a
+    // candidate.
+    let (mut low, mut high) = (0usize, cuts.len());
+    let mut best: Option<(String, f32)> = None;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = format!("{}{ELLIPSIS}", &content[..cuts[mid]]);
+        let width = text_width(&candidate, font, size);
+        if width <= max_width {
+            best = Some((candidate, width));
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    match best {
+        Some((elided, width)) => (Cow::Owned(elided), width),
+        // Not even the marker fits. Drawing it anyway keeps the pill
+        // honest about having dropped something.
+        None => (Cow::Borrowed(ELLIPSIS), text_width(ELLIPSIS, font, size)),
     }
 }
 
@@ -137,6 +226,26 @@ pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
     chrome_button(None, status, 4.0)
+}
+
+/// The active tab pill's `×`. Deliberately NOT a `chrome_button`: a filled
+/// `HOVER` rect on a 24px control inside a 24px pill recolors the pill's
+/// whole trailing end, which is the hover Charlie called out (Q3). The
+/// glyph reddens instead and the pill's own fill is left alone. `ERROR_TEXT`
+/// is the chrome's text-weight red — the `DANGER` fills read near-black at
+/// glyph weight.
+pub fn close_button(_: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: None,
+        text_color: match status {
+            button::Status::Hovered | button::Status::Pressed => ERROR_TEXT,
+            button::Status::Active => TEXT,
+            button::Status::Disabled => MUTED_TEXT.scale_alpha(0.5),
+        },
+        border: Border::default().rounded(4),
+        shadow: Shadow::default(),
+        snap: true,
+    }
 }
 
 /// The sidebar-footer "+ New Project" chip: a centered rounded button with
@@ -383,7 +492,118 @@ mod tests {
         let project_text = PROJECT_PILL_INSET_X + PROJECT_LABEL_INSET;
         assert!((project_text - AGENT_DOT_INSET).abs() <= 1.0);
         assert_eq!(TAB_STATUS_SIZE, 7.0);
-        assert_eq!(NOTIFICATION_DOT_SIZE, 8.0);
+        assert_eq!(NOTIFICATION_DOT_SIZE, 9.0);
+    }
+
+    #[test]
+    fn tab_pill_chrome_leaves_the_title_the_rest_of_its_width_band() {
+        assert_eq!(TAB_PILL_CHROME_WIDTH, 31.0);
+        assert_eq!(
+            TAB_PILL_MIN_WIDTH.min(TAB_PILL_MAX_WIDTH),
+            TAB_PILL_MIN_WIDTH
+        );
+        // Even the narrowest pill has room for a title beside its chrome.
+        assert!((TAB_PILL_MIN_WIDTH - TAB_PILL_CHROME_WIDTH).max(0.0) > 0.0);
+    }
+
+    #[test]
+    fn the_close_affordance_reddens_its_glyph_instead_of_filling_the_pill() {
+        let theme = Theme::Dark;
+        for status in [button::Status::Hovered, button::Status::Pressed] {
+            let style = close_button(&theme, status);
+            assert_eq!(
+                style.background, None,
+                "no pill-recoloring fill in any state"
+            );
+            assert_eq!(style.text_color, ERROR_TEXT);
+        }
+        let resting = close_button(&theme, button::Status::Active);
+        assert_eq!(resting.background, None);
+        assert_eq!(resting.text_color, TEXT);
+    }
+
+    #[test]
+    fn elision_keeps_short_labels_verbatim_and_marks_what_it_drops() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let size = TAB_TITLE_SIZE;
+
+        let (empty, width) = elide_to_width("", font, size, 100.0);
+        assert_eq!(empty, "");
+        assert_eq!(width, 0.0);
+
+        let short = "shell";
+        let natural = text_width(short, font, size);
+        assert!(natural > 0.0);
+        let (kept, kept_width) = elide_to_width(short, font, size, natural + 40.0);
+        assert_eq!(kept, short, "a label with room to spare is untouched");
+        assert_eq!(kept_width, natural);
+
+        // Exact fit: the budget is the measured width itself, so nothing
+        // may be dropped and no marker may appear.
+        let (exact, exact_width) = elide_to_width(short, font, size, natural);
+        assert_eq!(exact, short);
+        assert_eq!(exact_width, natural);
+    }
+
+    #[test]
+    fn elision_cuts_long_labels_to_a_marked_prefix_inside_the_budget() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let size = TAB_TITLE_SIZE;
+        let long = "/Users/charliek/projects/roost/crates/roost-iced/src/chrome.rs";
+        let budget = 120.0;
+        let (elided, width) = elide_to_width(long, font, size, budget);
+
+        assert!(
+            width <= budget,
+            "elided to {width}px, over the {budget}px budget"
+        );
+        assert!(
+            elided.ends_with(ELLIPSIS),
+            "no visible tail marker in {elided:?}"
+        );
+        assert!(elided.len() < long.len());
+        let head = elided.strip_suffix(ELLIPSIS).expect("marked tail");
+        assert!(
+            long.starts_with(head),
+            "{elided:?} is not a tail-elided {long:?}"
+        );
+        // Maximal: one more char would have overflowed.
+        let next = long[head.len()..]
+            .chars()
+            .next()
+            .expect("more label to drop");
+        let overflowing = format!("{head}{next}{ELLIPSIS}");
+        assert!(text_width(&overflowing, font, size) > budget);
+    }
+
+    #[test]
+    fn elision_of_wide_glyphs_stays_on_code_point_boundaries() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let size = TAB_TITLE_SIZE;
+        let cjk = "日本語のタブタイトルはとても長いことがあります";
+        let budget = 60.0;
+        let (elided, width) = elide_to_width(cjk, font, size, budget);
+
+        assert!(width <= budget);
+        assert!(elided.ends_with(ELLIPSIS));
+        let head = elided.strip_suffix(ELLIPSIS).expect("marked tail");
+        assert!(cjk.starts_with(head));
+        // Wide glyphs cost more per character, so the same budget keeps
+        // fewer of them than it does of ASCII.
+        let ascii = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (ascii_elided, _) = elide_to_width(ascii, font, size, budget);
+        assert!(
+            head.chars().count()
+                < ascii_elided
+                    .strip_suffix(ELLIPSIS)
+                    .expect("marked tail")
+                    .chars()
+                    .count()
+        );
+
+        // A budget too small even for the marker still says something was
+        // dropped rather than rendering a bare truncation.
+        assert_eq!(elide_to_width(cjk, font, size, 0.0).0, ELLIPSIS);
     }
 
     #[test]

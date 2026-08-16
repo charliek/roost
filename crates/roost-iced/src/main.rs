@@ -270,7 +270,19 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
     }
 }
 
+/// Every message goes through here so the tab-strip reveal has exactly one
+/// drain: `reconcile()` queues it on an observed active-tab change, and
+/// activation reaches the app through too many paths (click, keybind,
+/// palette, notification click, raw IPC) for each of them to remember to
+/// carry the task itself. Batched rather than chained — the dispatched
+/// task may be a long-lived engine future, and the reveal must not wait
+/// behind it.
 fn update(app: &mut App, message: Message) -> Task<Message> {
+    let dispatched = dispatch(app, message);
+    Task::batch([dispatched, app.take_tab_reveal_task().map_task()])
+}
+
+fn dispatch(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::EngineReady => app.service_engine_ready().map_task(),
         Message::EngineOp(result) => {
@@ -655,15 +667,31 @@ impl UiTask for app::UiTask {
                 };
                 if reveal {
                     iced::advanced::widget::operate(palette_scroll::ensure_visible(
-                        scroll_id, row_id,
+                        palette_scroll::Axis::Vertical,
+                        scroll_id,
+                        row_id,
                     ))
                     .map(message)
                 } else {
                     iced::advanced::widget::operate(palette_scroll::measure_visible(
-                        scroll_id, row_id,
+                        palette_scroll::Axis::Vertical,
+                        scroll_id,
+                        row_id,
                     ))
                     .map(message)
                 }
+            }
+            // Fire-and-forget: the outcome carries no state the app needs
+            // (nothing retries — the next activation issues a fresh
+            // reveal), and the operation logs its own geometry pass under
+            // `RUST_LOG=roost_iced=debug`.
+            app::UiTask::RevealTab { scroll_id, pill_id } => {
+                iced::advanced::widget::operate(palette_scroll::ensure_visible(
+                    palette_scroll::Axis::Horizontal,
+                    scroll_id,
+                    pill_id,
+                ))
+                .discard()
             }
         }
     }
