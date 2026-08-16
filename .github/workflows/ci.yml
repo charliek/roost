@@ -26,6 +26,7 @@ jobs:
       tests: ${{ steps.filter.outputs.tests }}
       ci: ${{ steps.filter.outputs.ci }}
       deb: ${{ steps.filter.outputs.deb }}
+      macbundle: ${{ steps.filter.outputs.macbundle }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -97,6 +98,23 @@ jobs:
               - 'crates/*/Cargo.toml'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
+            # Narrow on purpose: gates the `iced-build-e2e` macOS cells'
+            # bundle-assembly + bundle-smoke steps. The broad `mac` output
+            # folds in *rustcore, so using it here would make every
+            # Swift-only PR pay the 2x2 iced matrix. `Makefile` is
+            # deliberately not repeated — it's already in `tests`, which
+            # is already OR'd into iced-build-e2e's `if`.
+            macbundle:
+              - 'mac/scripts/bundle-lib.sh'
+              - 'mac/scripts/bundle-iced.sh'
+              - 'mac/Resources/Info-iced.plist.template'
+              # Direct bundle-iced.sh inputs shared with the Swift bundle —
+              # without them an icon- or helper-entitlements-only PR would
+              # skip the job that assembles Roost-Iced.app.
+              - 'mac/Resources/roostctl.entitlements'
+              - 'mac/Resources/AppIcon.icns'
+              - 'mac/AppIcon.icon/**'
+              - 'mac/Resources/Roost-Iced.entitlements'
 
   rust-lint:
     needs: changes
@@ -479,14 +497,21 @@ jobs:
   # software Vulkan implementation when the runner exposes no physical GPU.
   iced-build-e2e:
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.macbundle == 'true'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         renderer: [wgpu, tiny-skia]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Was 30. The macOS cells now run a second e2e pass (bundle assembly +
+    # assert + a 2-module smoke) after their existing full functional-E2E +
+    # exit-on-empty passes; the Linux cells are unchanged (four lanes:
+    # X11 functional, X11 exit, X11 real-input clipboard, Wayland
+    # functional + exit). Bumped rather than risk the macOS cells timing
+    # out under load — the plan explicitly prefers a timeout bump over
+    # silently dropping the walking-skeleton module from the smoke subset.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -721,6 +746,116 @@ jobs:
           tools/roosttest/test_exit_on_empty.py
           --roost-target iced --roost-fresh -v
 
+      # M6 6a (plan 027 W5): the two steps above only ever exercise the bare
+      # `roost-iced` cargo binary. This assembles + smoke-tests the actual
+      # macOS deliverable (Roost-Iced.app) so a bundling regression (wrong
+      # bundle id, missing entitlements, an accidental Frameworks embed) is
+      # caught here rather than only by a human running `make bundle-iced`
+      # locally. Debug profile only — never "upgrade" this to release; the
+      # release-profile lane is `iced-release`, not this job.
+      - name: Assemble Roost-Iced.app
+        if: runner.os == 'macOS'
+        run: ./mac/scripts/bundle-iced.sh debug
+
+      - name: Assert bundle contents
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          APP="mac/build/Roost-Iced.app"
+          BIN="$APP/Contents/MacOS/Roost-Iced"
+          INFO="$APP/Contents/Info.plist"
+
+          plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true; }
+          has_key() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" >/dev/null 2>&1; }
+
+          [ "$(plist_value "$INFO" CFBundleIdentifier)" = "ai.stridelabs.Roost.iced" ] \
+            || { echo "FAIL: CFBundleIdentifier != ai.stridelabs.Roost.iced"; exit 1; }
+          echo "OK: CFBundleIdentifier is ai.stridelabs.Roost.iced"
+
+          [ "$(plist_value "$INFO" CFBundleExecutable)" = "Roost-Iced" ] \
+            || { echo "FAIL: CFBundleExecutable != Roost-Iced"; exit 1; }
+          echo "OK: CFBundleExecutable is Roost-Iced"
+
+          version="$(plist_value "$INFO" CFBundleShortVersionString)"
+          [ -n "$(echo "$version" | tr -d '[:space:]')" ] \
+            || { echo "FAIL: CFBundleShortVersionString is empty"; exit 1; }
+          [ "$version" != "@VERSION@" ] \
+            || { echo "FAIL: CFBundleShortVersionString still has the unsubstituted @VERSION@ placeholder"; exit 1; }
+          echo "OK: CFBundleShortVersionString is '$version'"
+
+          # No Sparkle parity for the iced bundle (6c decision, not made
+          # here) — assert none of the keys leaked in from the Swift plist.
+          for key in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks; do
+            if has_key "$INFO" "$key"; then
+              echo "FAIL: Info.plist unexpectedly carries $key"; exit 1
+            fi
+          done
+          echo "OK: no Sparkle (SU*) keys present"
+
+          [ ! -d "$APP/Contents/Frameworks" ] \
+            || { echo "FAIL: $APP/Contents/Frameworks exists (this bundle embeds no frameworks)"; exit 1; }
+          echo "OK: no Contents/Frameworks dir"
+
+          codesign --verify --deep --strict "$APP"
+          echo "OK: codesign --verify --deep --strict passed"
+
+          # Extract entitlements as a real plist (codesign's text dump
+          # format is unstable across macOS versions) and parse with
+          # PlistBuddy for exact, substring-proof key lookup — same
+          # technique as the swift-mac job's TCC-entitlements check.
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          ent="$work/entitlements.plist"
+          codesign -d --entitlements - --xml "$APP" 2>/dev/null > "$ent"
+          for key in \
+            com.apple.security.device.audio-input \
+            com.apple.security.device.camera \
+            com.apple.security.automation.apple-events; do
+            # Present is not enough — a `false` value would pass a key
+            # check while leaving TCC capture ineffective.
+            val=$(/usr/libexec/PlistBuddy -c "Print :$key" "$ent" 2>/dev/null) \
+              || { echo "FAIL: entitlements missing $key"; exit 1; }
+            [ "$val" = "true" ] \
+              || { echo "FAIL: entitlement $key is '$val', want true"; exit 1; }
+          done
+          echo "OK: entitlements carry the three capture keys (all true)"
+          if has_key "$ent" com.apple.security.cs.disable-library-validation; then
+            echo "FAIL: entitlements unexpectedly carry com.apple.security.cs.disable-library-validation"; exit 1
+          fi
+          echo "OK: entitlements do not carry cs.disable-library-validation"
+
+          codesign -dv "$APP" 2>&1 | grep -q 'flags=.*runtime' \
+            || { echo "FAIL: hardened runtime flag not present"; exit 1; }
+          echo "OK: hardened runtime flag present"
+
+          # Capture otool's output first WITHOUT masking: a missing or
+          # non-Mach-O binary must fail here, not read as "no deps".
+          deps=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}')
+          [ -n "$deps" ] || { echo "FAIL: otool -L returned no dependencies for $BIN"; exit 1; }
+          bad=$(printf '%s\n' "$deps" | grep -vE '^(/usr/lib/|/System/)' || true)
+          if [ -n "$bad" ]; then
+            echo "FAIL: otool -L closure contains non-system paths:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: otool -L closure contains only /usr/lib and /System paths"
+
+      - name: Run Iced bundle smoke (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_ICED_APP: mac/build/Roost-Iced.app
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-bundle-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-bundle-logs
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_iced_walking_skeleton.py
+          --roost-target iced --roost-fresh -v
+
       - name: Collect Iced diagnostics
         if: always()
         shell: bash
@@ -739,7 +874,17 @@ jobs:
             cp "${screenshot}" "diagnostics/${suite}-$(basename "${screenshot}")"
           done < <(find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-artifacts/*.png' 2>/dev/null)
           if [ "${RUNNER_OS}" = "macOS" ]; then
+            # Bundle-mode launches write the persistent profile log (and any
+            # crash reports) under ~/Library/Logs/Roost-iced, not the
+            # harness's ROOST_E2E_LOG_DIR — collect them explicitly or a
+            # bundle boot failure leaves no log artifact.
+            cp "$HOME"/Library/Logs/Roost-iced/roost.log diagnostics/roost-iced-bundle-persistent.log 2>/dev/null || true
+            cp "$HOME"/Library/Logs/Roost-iced/crash-*.txt diagnostics/ 2>/dev/null || true
             cp "$HOME"/Library/Logs/DiagnosticReports/roost-iced*.ips diagnostics/ 2>/dev/null || true
+            # fnmatch is case-sensitive; the bundled process is named
+            # `Roost-Iced` (CFBundleExecutable), not `roost-iced`, so its
+            # crash reports need their own glob.
+            cp "$HOME"/Library/Logs/DiagnosticReports/Roost-Iced*.ips diagnostics/ 2>/dev/null || true
           fi
           ls -la diagnostics || true
 
