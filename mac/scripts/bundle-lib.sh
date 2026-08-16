@@ -142,24 +142,14 @@ roost_install_app_icon() {
   fi
 }
 
-# roost_build_and_embed_roostctl REPO_ROOT APP_DIR CONFIG
+# roost_find_cargo
 #
-# Embed roostctl under Contents/Resources/bin/ so `claude install`
-# invoked from inside the bundled app writes hook paths that point at
-# the bundled binary, not a dev-machine target/ path. The CLI build is
-# fast and tracked through the same Cargo cache as any cargo build
-# invocation; rebuilding here keeps the bundle in lockstep with
-# whatever roost-cli source the developer has checked out.
-#
-# Discovers `cargo` on PATH instead of hardcoding ~/.cargo/bin/cargo.
-# Release runners may have cargo at a different prefix (toolchain
-# managed by mise / rustup / system package). Falling back to the
-# literal path preserves the prior behavior for the common dev case.
-roost_build_and_embed_roostctl() {
-  local repo_root="$1"
-  local app_dir="$2"
-  local config="$3"
-
+# Prints the cargo to invoke. Discovers `cargo` on PATH instead of
+# hardcoding ~/.cargo/bin/cargo — release runners may have cargo at a
+# different prefix (toolchain managed by mise / rustup / system
+# package). Falling back to the literal path preserves the prior
+# behavior for the common dev case.
+roost_find_cargo() {
   local cargo_bin
   cargo_bin="$(command -v cargo || true)"
   if [ -z "${cargo_bin}" ] && [ -x "${HOME}/.cargo/bin/cargo" ]; then
@@ -169,13 +159,59 @@ roost_build_and_embed_roostctl() {
     echo "error: cargo not found on PATH or at ~/.cargo/bin/cargo" >&2
     exit 1
   fi
+  echo "${cargo_bin}"
+}
 
-  local cargo_profile_flag="--release"
-  local cargo_profile_dir="release"
-  if [ "${config}" = "debug" ]; then
-    cargo_profile_flag=""
-    cargo_profile_dir="debug"
+# roost_setup_cargo_profile CONFIG
+#
+# Sets ROOST_CARGO_PROFILE_FLAG (word-split deliberately; empty for
+# debug) and ROOST_CARGO_PROFILE_DIR in the caller's scope — the same
+# caller-scope convention roost_setup_signing uses.
+roost_setup_cargo_profile() {
+  ROOST_CARGO_PROFILE_FLAG="--release"
+  ROOST_CARGO_PROFILE_DIR="release"
+  if [ "$1" = "debug" ]; then
+    ROOST_CARGO_PROFILE_FLAG=""
+    ROOST_CARGO_PROFILE_DIR="debug"
   fi
+}
+
+# roost_cargo_target_dir REPO_ROOT
+#
+# Prints the artifact root, honoring CARGO_TARGET_DIR — shared caches
+# (e.g. sccache + CI matrices that fan out across configs) routinely
+# override the default `<repo>/target/` location. Cargo resolves a
+# relative CARGO_TARGET_DIR from its own CWD (the repo root, where the
+# build subshells cd) — discovery anchors the same way so the two
+# can't diverge.
+roost_cargo_target_dir() {
+  local repo_root="$1"
+  local cargo_target="${CARGO_TARGET_DIR:-${repo_root}/target}"
+  case "${cargo_target}" in
+    /*) ;;
+    *) cargo_target="${repo_root}/${cargo_target}" ;;
+  esac
+  echo "${cargo_target}"
+}
+
+# roost_build_and_embed_roostctl REPO_ROOT APP_DIR CONFIG
+#
+# Embed roostctl under Contents/Resources/bin/ so `claude install`
+# invoked from inside the bundled app writes hook paths that point at
+# the bundled binary, not a dev-machine target/ path. The CLI build is
+# fast and tracked through the same Cargo cache as any cargo build
+# invocation; rebuilding here keeps the bundle in lockstep with
+# whatever roost-cli source the developer has checked out.
+roost_build_and_embed_roostctl() {
+  local repo_root="$1"
+  local app_dir="$2"
+  local config="$3"
+
+  local cargo_bin
+  cargo_bin="$(roost_find_cargo)"
+  roost_setup_cargo_profile "${config}"
+  local cargo_profile_flag="${ROOST_CARGO_PROFILE_FLAG}"
+  local cargo_profile_dir="${ROOST_CARGO_PROFILE_DIR}"
   echo "==> Building roostctl (cargo build -p roost-cli --${cargo_profile_dir})"
   (
     # shellcheck disable=SC2164  # callers run this lib under `set -e`
@@ -184,17 +220,8 @@ roost_build_and_embed_roostctl() {
     "${cargo_bin}" build -p roost-cli ${cargo_profile_flag}
   )
 
-  # Respect CARGO_TARGET_DIR for the artifact-discovery step. Shared
-  # caches (e.g. sccache + CI matrices that fan out across configs)
-  # routinely override the default `<repo>/target/` location.
-  local cargo_target="${CARGO_TARGET_DIR:-${repo_root}/target}"
-  # Cargo resolves a relative CARGO_TARGET_DIR from its own CWD (the
-  # repo root, where the build subshell cd's) — anchor discovery the
-  # same way so the two can't diverge.
-  case "${cargo_target}" in
-    /*) ;;
-    *) cargo_target="${repo_root}/${cargo_target}" ;;
-  esac
+  local cargo_target
+  cargo_target="$(roost_cargo_target_dir "${repo_root}")"
   local roostctl_src="${cargo_target}/${cargo_profile_dir}/roostctl"
   if [ ! -x "${roostctl_src}" ]; then
     echo "error: cargo build did not produce ${roostctl_src}" >&2

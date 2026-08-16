@@ -35,8 +35,9 @@
 #     the two bundles (6c decision, not made here); see the header
 #     comment in Info-iced.plist.template for why the Sparkle plist
 #     keys are absent too.
-#   * Code-sign with a Developer ID certificate (ad-hoc until #83,
-#     same as bundle.sh).
+#
+# Deferred the same way bundle.sh defers them (shared posture, not a
+# difference):
 #   * Notarize via `notarytool`.
 #   * Build a DMG (out of scope — plan 027 scope brief: local build
 #     only, no release.yml wiring).
@@ -95,42 +96,18 @@ APP_DIR="${OUT_DIR}/${APP_NAME}.app"
 
 roost_check_libghostty_archive "${REPO_ROOT}"
 
-CARGO_BIN="$(command -v cargo || true)"
-if [ -z "${CARGO_BIN}" ] && [ -x "${HOME}/.cargo/bin/cargo" ]; then
-  CARGO_BIN="${HOME}/.cargo/bin/cargo"
-fi
-if [ -z "${CARGO_BIN}" ]; then
-  echo "error: cargo not found on PATH or at ~/.cargo/bin/cargo" >&2
-  exit 1
-fi
+CARGO_BIN="$(roost_find_cargo)"
+roost_setup_cargo_profile "${CONFIG}"
 
-CARGO_PROFILE_FLAG="--release"
-CARGO_PROFILE_DIR="release"
-if [ "${CONFIG}" = "debug" ]; then
-  CARGO_PROFILE_FLAG=""
-  CARGO_PROFILE_DIR="debug"
-fi
-
-echo "==> Building roost-iced (cargo build -p roost-iced --${CARGO_PROFILE_DIR})"
+echo "==> Building roost-iced (cargo build -p roost-iced --${ROOST_CARGO_PROFILE_DIR})"
 (
   cd "${REPO_ROOT}"
-  # shellcheck disable=SC2086  # CARGO_PROFILE_FLAG must word-split (empty => no flag)
-  "${CARGO_BIN}" build -p roost-iced ${CARGO_PROFILE_FLAG}
+  # shellcheck disable=SC2086  # ROOST_CARGO_PROFILE_FLAG must word-split (empty => no flag)
+  "${CARGO_BIN}" build -p roost-iced ${ROOST_CARGO_PROFILE_FLAG}
 )
 
-# Respect CARGO_TARGET_DIR for artifact discovery, exactly like the
-# roostctl embed step in bundle-lib.sh — shared caches (sccache, CI
-# matrices fanning out across configs) routinely override the default
-# `<repo>/target/` location.
-CARGO_TARGET="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
-# Cargo resolves a relative CARGO_TARGET_DIR from its own CWD (the repo
-# root, where the build subshell cd's) — anchor discovery the same way so
-# the two can't diverge.
-case "${CARGO_TARGET}" in
-  /*) ;;
-  *) CARGO_TARGET="${REPO_ROOT}/${CARGO_TARGET}" ;;
-esac
-ICED_BUILD_BIN="${CARGO_TARGET}/${CARGO_PROFILE_DIR}/roost-iced"
+CARGO_TARGET="$(roost_cargo_target_dir "${REPO_ROOT}")"
+ICED_BUILD_BIN="${CARGO_TARGET}/${ROOST_CARGO_PROFILE_DIR}/roost-iced"
 if [ ! -x "${ICED_BUILD_BIN}" ]; then
   echo "error: cargo build did not produce ${ICED_BUILD_BIN}" >&2
   exit 1

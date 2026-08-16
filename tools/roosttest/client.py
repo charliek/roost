@@ -565,8 +565,10 @@ class Roost:
         the badge write actually landed.
 
         Gated by ROOST_TEST_MODE=1 (raises `RoostError('not-enabled')`
-        when off) and macOS-iced-only: every other UI, and the iced UI on
-        Linux, answers `RoostError('not-implemented')`."""
+        when off) and macOS-iced-only: the GTK UI and the iced UI on
+        Linux answer `RoostError('not-implemented')`; the Swift Mac app
+        has no dispatcher case at all and answers
+        `RoostError('unknown-op')` (same as `tab.feed_ime`)."""
         res = self.call("app.dock_badge", {})
         # Direct key access: a missing field is a protocol violation, and
         # `.get` would read it as "badge cleared" — the exact state the

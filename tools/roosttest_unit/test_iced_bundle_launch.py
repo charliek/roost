@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -22,7 +23,14 @@ ROOSTTEST_DIR = Path(__file__).resolve().parents[1] / "roosttest"
 sys.path.insert(0, str(ROOSTTEST_DIR))
 
 import ui  # noqa: E402
+
 from client import RoostError  # noqa: E402
+
+
+def _absent_log_path() -> Path:
+    """A unique path that is never created — mocks the UI log location
+    without `tempfile.mktemp`'s predictable-name hazard (ruff S306)."""
+    return Path(tempfile.gettempdir()) / f"roost-absent-{uuid.uuid4().hex}.log"
 
 
 def _make_bundle(root: Path, executable_name: str = "Roost-Iced") -> Path:
@@ -284,7 +292,7 @@ class BundlePidVerificationTests(unittest.TestCase):
 
     def test_mismatched_process_name_refuses_to_adopt_the_pid(self) -> None:
         with (
-            patch("ui._iced_bundle_ui_log_path", return_value=Path(tempfile.mktemp())),
+            patch("ui._iced_bundle_ui_log_path", return_value=_absent_log_path()),
             patch("ui.subprocess.run"),
             patch("ui.wait_alive"),
             patch("ui._answering_pid", return_value=4242),
@@ -309,7 +317,7 @@ class BundlePidVerificationTests(unittest.TestCase):
                 },
                 clear=True,
             ),
-            patch("ui._iced_bundle_ui_log_path", return_value=Path(tempfile.mktemp())),
+            patch("ui._iced_bundle_ui_log_path", return_value=_absent_log_path()),
             patch("ui.subprocess.run") as run,
             patch("ui.wait_alive"),
             patch("ui._answering_pid", return_value=4242),
@@ -340,8 +348,12 @@ class BundlePidVerificationTests(unittest.TestCase):
 
     def _launch_argv_with_env(self, env: dict[str, str]) -> list[str]:
         with (
+            tempfile.TemporaryDirectory() as temp_dir,
             patch.dict(os.environ, env, clear=True),
-            patch("ui._iced_bundle_ui_log_path", return_value=Path(tempfile.mktemp())),
+            patch(
+                "ui._iced_bundle_ui_log_path",
+                return_value=Path(temp_dir) / "iced-ui.log",
+            ),
             patch("ui.subprocess.run") as run,
             patch("ui.wait_alive"),
             patch("ui._answering_pid", return_value=4242),
@@ -372,7 +384,7 @@ class BundlePidVerificationTests(unittest.TestCase):
         e.g. a `Roost-Iced` on $PATH from an unrelated build. Must not be
         adopted even though the process-name check alone would pass."""
         with (
-            patch("ui._iced_bundle_ui_log_path", return_value=Path(tempfile.mktemp())),
+            patch("ui._iced_bundle_ui_log_path", return_value=_absent_log_path()),
             patch("ui.subprocess.run"),
             patch("ui.wait_alive"),
             patch("ui._answering_pid", return_value=4242),
@@ -393,7 +405,7 @@ class LaunchFailureTeardownTests(unittest.TestCase):
         self,
     ) -> None:
         with (
-            patch("ui._iced_bundle_ui_log_path", return_value=Path(tempfile.mktemp())),
+            patch("ui._iced_bundle_ui_log_path", return_value=_absent_log_path()),
             patch("ui.subprocess.run") as run,
             patch("ui.wait_alive"),
             patch("ui._answering_pid", return_value=4242),
@@ -411,7 +423,7 @@ class LaunchFailureTeardownTests(unittest.TestCase):
         down through the pid-based path, not a name-based `pkill`."""
         with (
             patch.dict(os.environ, {"ROOST_TEST_MODE": "1"}, clear=True),
-            patch("ui._iced_bundle_ui_log_path", return_value=Path(tempfile.mktemp())),
+            patch("ui._iced_bundle_ui_log_path", return_value=_absent_log_path()),
             patch("ui.subprocess.run") as run,
             patch("ui.wait_alive"),
             patch("ui._answering_pid", return_value=4242),
