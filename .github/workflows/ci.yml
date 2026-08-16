@@ -617,6 +617,7 @@ jobs:
           tools/roosttest/test_selection.py
           tools/roosttest/test_mouse_tracking.py
           tools/roosttest/test_dock_badge.py
+          tools/roosttest/test_menu_bar.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
@@ -636,6 +637,29 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1920x1080x24"
           uv run --group test pytest
           tools/roosttest/test_exit_on_empty.py
+          --roost-target iced --roost-fresh -v
+
+      # Also app-ending (the menu's Quit item), so it needs the same "own
+      # invocation" isolation as the step above — but not the SAME
+      # invocation: the session-scoped harness fixture launches one UI per
+      # pytest run, so bundling two exit-ending modules together would
+      # strand the second. `app.menu_activate` is macOS-iced-only (plan
+      # 028 § 3.12), so this self-skips on every non-macOS lane; kept in
+      # all three lanes anyway for structural symmetry with the
+      # exit-on-empty step above.
+      - name: Run Iced menu-Quit E2E (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-menu-quit-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-menu-quit-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_menu_quit.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced real-input clipboard (Linux X11)
@@ -687,6 +711,7 @@ jobs:
           tools/roosttest/test_selection.py
           tools/roosttest/test_mouse_tracking.py
           tools/roosttest/test_dock_badge.py
+          tools/roosttest/test_menu_bar.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
@@ -702,6 +727,23 @@ jobs:
           tools/wayland/weston-run.sh
           uv run --group test pytest
           tools/roosttest/test_exit_on_empty.py
+          --roost-target iced --roost-fresh -v
+
+      # See the Linux X11 lane's comment above the same-named step: kept
+      # in every lane for structural symmetry, self-skips off macOS.
+      - name: Run Iced menu-Quit E2E (Linux Wayland)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-menu-quit-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-menu-quit-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_menu_quit.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (macOS)
@@ -732,6 +774,7 @@ jobs:
           tools/roosttest/test_selection.py
           tools/roosttest/test_mouse_tracking.py
           tools/roosttest/test_dock_badge.py
+          tools/roosttest/test_menu_bar.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
@@ -747,6 +790,25 @@ jobs:
         run: >
           uv run --group test pytest
           tools/roosttest/test_exit_on_empty.py
+          --roost-target iced --roost-fresh -v
+
+      # Also app-ending (the menu's Quit item) — see the Linux X11 lane's
+      # comment above its same-named step. This is the lane where it
+      # actually runs (macOS-iced-only); the bare `roost-iced` binary
+      # installs its native menu bar the same as a bundled app (plan 028
+      # § 3.13 — "NSMenu installs fine on an unbundled process").
+      - name: Run Iced menu-Quit E2E (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-menu-quit-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-menu-quit-logs
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_menu_quit.py
           --roost-target iced --roost-fresh -v
 
       # M6 6a (plan 027 W5): the two steps above only ever exercise the bare
@@ -857,6 +919,7 @@ jobs:
           uv run --group test pytest
           tools/roosttest/test_smoke.py
           tools/roosttest/test_iced_walking_skeleton.py
+          tools/roosttest/test_menu_bar.py
           --roost-target iced --roost-fresh -v
 
       - name: Collect Iced diagnostics

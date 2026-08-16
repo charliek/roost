@@ -1122,6 +1122,20 @@ impl App {
                                     .into(),
                             ));
                         }
+                        // No native NSMenu on this UI either — same
+                        // reasoning as `AppDockBadge` above.
+                        UiRequest::AppMenuDump { reply } => {
+                            let _ = reply.send(Err(
+                                "app.menu_dump is not supported on this UI (macOS iced only)"
+                                    .into(),
+                            ));
+                        }
+                        UiRequest::AppMenuActivate { path: _, reply } => {
+                            let _ = reply.send(Err(
+                                "app.menu_activate is not supported on this UI (macOS iced only)"
+                                    .into(),
+                            ));
+                        }
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
                         }

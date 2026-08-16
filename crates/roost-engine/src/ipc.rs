@@ -23,16 +23,16 @@ use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
-    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
-    AppSetWindowFocusParams, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SidebarDumpParams, SidebarDumpResult,
-    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppRenderStatsParams,
+    AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams,
+    ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
@@ -359,6 +359,21 @@ pub enum UiRequest {
     /// (ROOST_TEST_MODE=1); macOS iced only — the other UIs reject.
     AppDockBadge {
         reply: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
+    },
+    /// `app.menu_dump` — read back the live native menu bar the macOS
+    /// iced UI installed, walking `NSApp.mainMenu` itself rather than
+    /// re-deriving from the keybind table. Gated + macOS-iced-only like
+    /// `AppDockBadge`.
+    AppMenuDump {
+        reply: tokio::sync::oneshot::Sender<Result<AppMenuDumpResult, String>>,
+    },
+    /// `app.menu_activate` — resolve `path` through the live native
+    /// menu bar by title and fire it via
+    /// `performActionForItemAtIndex:`, the same dispatch a real click
+    /// takes. Gated + macOS-iced-only like `AppDockBadge`.
+    AppMenuActivate {
+        path: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -1108,6 +1123,24 @@ async fn dispatch(
                 .map_err(map_test_op_err)?;
             encode(&AppDockBadgeResult { label })
         }
+        ops::APP_MENU_DUMP => {
+            let _: AppMenuDumpParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppMenuDump { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&result)
+        }
+        ops::APP_MENU_ACTIVATE => {
+            let p: AppMenuActivateParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::AppMenuActivate {
+                path: p.path,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -1162,13 +1195,17 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 ///   * `tab.feed_ime`'s `tab_id` not matching the tab that currently
 ///     holds the keyboard route → `invalid-param` — the caller asked
 ///     to feed the wrong tab, not a server failure.
+///   * `app.menu_activate`'s path resolution failing (unknown path,
+///     ambiguous title, or a disabled item) → `invalid-param` — the
+///     caller asked for a path the live menu bar doesn't support.
 ///   * an op a UI hasn't wired up yet (`tab.feed_ime` on GTK, still
 ///     iced-only), or one that is structurally unavailable there
 ///     (`app.dock_badge` off macOS — there is no Dock) →
 ///     `not-implemented`, mirroring `events.subscribe`.
-///   * anything else (capture buffer poisoned, feed channel closed)
-///     → `internal`, so a real failure surfaces clearly rather than
-///     being mistaken for a missing tab.
+///   * anything else (capture buffer poisoned, feed channel closed,
+///     the native menu bar not installed yet) → `internal`, so a real
+///     failure surfaces clearly rather than being mistaken for a
+///     missing tab.
 ///
 /// The substring contract is the simplest seam between the UI and
 /// the dispatcher while the surface stays small; bumping to a typed
@@ -1178,7 +1215,11 @@ fn map_test_op_err(err: String) -> HandlerError {
         HandlerError::new("not-enabled", err)
     } else if err.contains("has no live terminal") || err.contains("no word/line span") {
         HandlerError::not_found(err)
-    } else if err.contains("is not the active terminal") {
+    } else if err.contains("is not the active terminal")
+        || err.contains("no menu item")
+        || err.contains("ambiguous menu")
+        || err.contains("is disabled")
+    {
         HandlerError::invalid_param(err)
     } else if err.contains("not supported on this UI") {
         HandlerError::new("not-implemented", err)

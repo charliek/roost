@@ -213,6 +213,52 @@ fn read_dock_badge() -> Result<Option<String>, String> {
     Err("app.dock_badge is not supported on this UI (macOS iced only)".into())
 }
 
+/// The `app.menu_dump` read, on the main thread — same reasoning as
+/// [`read_dock_badge`]: a missing marker here is an invariant break
+/// (the IPC drain runs in the iced update loop), so it surfaces as an
+/// error rather than a plausible empty dump.
+#[cfg(target_os = "macos")]
+fn read_menu_dump() -> Result<AppMenuDumpResult, String> {
+    let mtm = objc2::MainThreadMarker::new()
+        .ok_or("app.menu_dump serviced off the main thread (AppKit is main-thread-only)")?;
+    crate::macos::menu::dump(mtm)
+}
+
+/// There is no native menu bar off macOS. Same verdict as
+/// [`read_dock_badge`]'s Linux arm.
+#[cfg(not(target_os = "macos"))]
+fn read_menu_dump() -> Result<AppMenuDumpResult, String> {
+    Err("app.menu_dump is not supported on this UI (macOS iced only)".into())
+}
+
+/// The `app.menu_activate` dispatch, on the main thread.
+#[cfg(target_os = "macos")]
+fn activate_menu(path: &[String]) -> Result<(), String> {
+    let mtm = objc2::MainThreadMarker::new()
+        .ok_or("app.menu_activate serviced off the main thread (AppKit is main-thread-only)")?;
+    crate::macos::menu::activate(mtm, path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_menu(_path: &[String]) -> Result<(), String> {
+    Err("app.menu_activate is not supported on this UI (macOS iced only)".into())
+}
+
+/// The shared precedence for `app.dock_badge`/`app.menu_dump`/
+/// `app.menu_activate`: platform rejection outranks the test-mode
+/// gate, so non-macOS iced answers not-implemented (from `read` itself)
+/// like GTK does, not not-enabled.
+fn macos_test_gated<T>(
+    test_mode: bool,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if cfg!(target_os = "macos") && !test_mode {
+        Err("ROOST_TEST_MODE=1 is required".into())
+    } else {
+        read()
+    }
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // A full authoritative snapshot on every reconcile is the recovery
@@ -1108,14 +1154,16 @@ impl App {
                 // Reads AppKit, deliberately without re-deriving the
                 // label from the inbox first: the op exists to prove the
                 // badge write reached the Dock, and a resync here would
-                // make it prove only the mapping. Platform rejection
-                // outranks the test-mode gate so non-macOS iced answers
-                // not-implemented like GTK does, not not-enabled.
-                let result = if cfg!(target_os = "macos") && !self.test_mode {
-                    Err("ROOST_TEST_MODE=1 is required".into())
-                } else {
-                    read_dock_badge()
-                };
+                // make it prove only the mapping.
+                let result = macos_test_gated(self.test_mode, read_dock_badge);
+                let _ = reply.send(result);
+            }
+            UiRequest::AppMenuDump { reply } => {
+                let result = macos_test_gated(self.test_mode, read_menu_dump);
+                let _ = reply.send(result);
+            }
+            UiRequest::AppMenuActivate { path, reply } => {
+                let result = macos_test_gated(self.test_mode, || activate_menu(&path));
                 let _ = reply.send(result);
             }
             UiRequest::Screenshot { scale, reply } => {

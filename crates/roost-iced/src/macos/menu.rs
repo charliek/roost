@@ -27,14 +27,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObject, Sel};
+use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSMenu,
     NSMenuItem,
 };
 use objc2_foundation::NSString;
-use roost_ipc::messages::Project;
+use roost_ipc::messages::{AppMenuDumpResult, MenuDump, MenuItemDump, Project};
 use roost_ui_model::keybind::{menu_accel_for_action, Accel, AccelMods, KeybindAction};
 
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
@@ -713,6 +713,221 @@ fn set_key_equivalent(item: &NSMenuItem, key: Option<(String, usize)>) {
     let (key, mask) = key.unwrap_or_default();
     item.setKeyEquivalent(&NSString::from_str(&key));
     item.setKeyEquivalentModifierMask(NSEventModifierFlags::from_bits_retain(mask));
+}
+
+// ---------------------------------------------------------------------
+// Test-mode introspection: `app.menu_dump` / `app.menu_activate`
+// ---------------------------------------------------------------------
+
+/// The `app.menu_dump` payload: every top-level menu with its items,
+/// read straight off the LIVE `NSApp.mainMenu` — never re-derived from
+/// the keybind table, so the read proves what AppKit actually holds
+/// (plan 028 § 3.12).
+pub(crate) fn dump(_mtm: MainThreadMarker) -> Result<AppMenuDumpResult, String> {
+    MENU.with(|cell| {
+        let slot = cell.borrow();
+        let menu = slot
+            .as_ref()
+            .ok_or_else(|| "the native menu bar is not installed yet".to_string())?;
+        let menus = menu
+            .root
+            .itemArray()
+            .iter()
+            .map(|top| dump_menu(menu, &top))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AppMenuDumpResult { menus })
+    })
+}
+
+fn dump_menu(menu: &MainMenu, top: &NSMenuItem) -> Result<MenuDump, String> {
+    let sub = top
+        .submenu()
+        .ok_or_else(|| "a menu bar item has no submenu — the menu bar is malformed".to_string())?;
+    let items = sub
+        .itemArray()
+        .iter()
+        .map(|item| dump_item(menu, &item))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MenuDump {
+        title: sub.title().to_string(),
+        items,
+    })
+}
+
+fn dump_item(menu: &MainMenu, item: &NSMenuItem) -> Result<MenuItemDump, String> {
+    if item.isSeparatorItem() {
+        return Ok(MenuItemDump {
+            title: String::new(),
+            key_equivalent: String::new(),
+            modifiers: Vec::new(),
+            enabled: item.isEnabled(),
+            state: "off".into(),
+            separator: true,
+            action: None,
+        });
+    }
+    let state = if item.state() == NSControlStateValueOff {
+        "off"
+    } else if item.state() == NSControlStateValueOn {
+        "on"
+    } else {
+        return Err(format!(
+            "menu item {:?} has a mixed checkbox state, which nothing in this menu bar sets",
+            item.title().to_string()
+        ));
+    };
+    let key_equivalent = item.keyEquivalent().to_string();
+    // AppKit's `keyEquivalentModifierMask` defaults to Command even on an
+    // item that never had a key equivalent set at all (`disabled_item`'s
+    // Cut/Select All/Check for Updates…, which never call
+    // `set_key_equivalent`) — a phantom modifier on a nonexistent
+    // shortcut. Report no modifiers when there is no key to modify,
+    // rather than leaking that AppKit default into the wire contract.
+    let modifiers = if key_equivalent.is_empty() {
+        Vec::new()
+    } else {
+        modifier_names(item.keyEquivalentModifierMask())
+    };
+    Ok(MenuItemDump {
+        title: item_display_title(item),
+        key_equivalent,
+        modifiers,
+        enabled: item.isEnabled(),
+        state: state.into(),
+        separator: false,
+        action: item_action_name(menu, item),
+    })
+}
+
+/// A leaf item's own title, or — for a submenu-holding item — its
+/// submenu's title. The one rule both [`dump_item`] and [`resolve`]
+/// use, so a menu name resolves to the same string in both directions
+/// (and the App-menu carrier's title is whatever [`build`] set it to —
+/// the profile display name — with no separate normalization step).
+fn item_display_title(item: &NSMenuItem) -> String {
+    item.submenu()
+        .map(|sub| sub.title().to_string())
+        .unwrap_or_else(|| item.title().to_string())
+}
+
+fn modifier_names(mask: NSEventModifierFlags) -> Vec<String> {
+    let mut names = Vec::new();
+    for (flag, name) in [
+        (NSEventModifierFlags::Shift, "shift"),
+        (NSEventModifierFlags::Control, "ctrl"),
+        (NSEventModifierFlags::Option, "alt"),
+        (NSEventModifierFlags::Command, "super"),
+    ] {
+        if mask.contains(flag) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The wire `action` for an item: our own bound events resolve
+/// through [`MainMenu::events`] by tag; a nil-target AppKit standard
+/// item reports its selector; anything else (an inert item — Cut,
+/// Select All, Check for Updates…) has none.
+fn item_action_name(menu: &MainMenu, item: &NSMenuItem) -> Option<String> {
+    if is_our_target(menu, item) {
+        let index = usize::try_from(item.tag()).ok()?;
+        menu.events.get(index).map(menu_event_wire_name)
+    } else {
+        item.action().map(|sel| format!("appkit:{sel}"))
+    }
+}
+
+/// Whether `item`'s target is this module's own dispatch target — the
+/// only reliable way to tell a table-bound/Window-row item (whose tag
+/// indexes [`MainMenu::events`]) apart from a standard AppKit item
+/// (nil target, action left on the responder chain), since either can
+/// carry an incidental tag value.
+fn is_our_target(menu: &MainMenu, item: &NSMenuItem) -> bool {
+    let Some(target) = item.target() else {
+        return false;
+    };
+    let ours: *const AnyObject = Retained::as_ptr(&menu.target).cast();
+    let theirs: *const AnyObject = Retained::as_ptr(&target);
+    core::ptr::eq(ours, theirs)
+}
+
+fn menu_event_wire_name(event: &MenuEvent) -> String {
+    match event {
+        MenuEvent::Action(action) => action.to_wire_name(),
+        MenuEvent::Quit => "quit".into(),
+        MenuEvent::SelectProject(id) => format!("select_project:{id}"),
+        MenuEvent::SelectTab(id) => format!("select_tab:{id}"),
+    }
+}
+
+/// Resolve `path` through the live native menu bar by title and fire
+/// it via `performActionForItemAtIndex:` — the same dispatch a real
+/// click takes.
+///
+/// Never holds the [`MENU`] borrow while firing: [`resolve`] only
+/// needs a clone of the root `NSMenu`, released immediately after,
+/// because the action fires synchronously and re-enters this module
+/// through [`dispatch_tag`]'s `try_borrow` — a held borrow here would
+/// make the click silently drop.
+pub(crate) fn activate(_mtm: MainThreadMarker, path: &[String]) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("app.menu_activate path must not be empty".into());
+    }
+    let root = MENU.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|menu| menu.root.clone())
+            .ok_or_else(|| "the native menu bar is not installed yet".to_string())
+    })?;
+    let (parent, index) = resolve(root, path)?;
+    let item = parent
+        .itemAtIndex(index)
+        .ok_or_else(|| "resolved menu item vanished between lookup and dispatch".to_string())?;
+    // `performActionForItemAtIndex:` runs NO validation of its own
+    // (Apple's docs) — this enabled check is the only thing standing
+    // between the op and silently firing a greyed-out item.
+    if !item.isEnabled() {
+        return Err(format!("menu item at {path:?} is disabled"));
+    }
+    parent.performActionForItemAtIndex(index);
+    Ok(())
+}
+
+/// Walk `container` by title, one path segment per level, returning
+/// the parent `NSMenu` and the resolved leaf's index. Both a missing
+/// title and a duplicate title at the same level are errors — dynamic
+/// Window rows (project/tab names) can collide, so callers must seed
+/// unique names rather than rely on "first match wins".
+fn resolve(
+    mut container: Retained<NSMenu>,
+    path: &[String],
+) -> Result<(Retained<NSMenu>, isize), String> {
+    for (depth, segment) in path.iter().enumerate() {
+        let items = container.itemArray();
+        let mut matching = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item_display_title(item) == *segment);
+        let Some((index, item)) = matching.next() else {
+            return Err(format!("no menu item found for path {:?}", &path[..=depth]));
+        };
+        if matching.next().is_some() {
+            return Err(format!(
+                "ambiguous menu path {:?}: multiple items are titled {segment:?}",
+                &path[..depth]
+            ));
+        }
+        drop(matching);
+        let index = isize::try_from(index).unwrap_or(-1);
+        if depth + 1 == path.len() {
+            return Ok((container, index));
+        }
+        container = item
+            .submenu()
+            .ok_or_else(|| format!("{segment:?} has no submenu to descend into"))?;
+    }
+    unreachable!("path is checked non-empty before this loop runs")
 }
 
 #[cfg(test)]

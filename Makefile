@@ -71,12 +71,13 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-exit e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
-ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py
-# `test_dock_badge.py` self-skips unless the host is macOS AND the target is
-# iced (the Dock badge is the M6 6b seam's consumer), so it costs a skip line
-# on the Linux lanes and runs for real on the macOS ones.
+ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py
+# `test_dock_badge.py` and `test_menu_bar.py` self-skip unless the host is
+# macOS AND the target is iced (the native menu bar + Dock badge are both
+# macOS-iced-only seams — plan 027 § 6b / plan 028 § 6d), so they cost a
+# skip line on the Linux lanes and run for real on the macOS ones.
 # `selection.*` reads UI state over IPC and never touches the host
 # pasteboard, so `test_selection.py` belongs in the list above and runs
 # under headless Wayland too. Only files that read/write the real
@@ -87,6 +88,13 @@ ICED_CLIPBOARD_TESTS := tools/roosttest/test_osc52.py
 # session it would strand every module that runs after it. Always fresh: it
 # empties the workspace, so it must own the instance it drives.
 ICED_EXIT_E2E_TESTS := tools/roosttest/test_exit_on_empty.py
+# `test_menu_quit.py` (plan 028 C3) is ALSO app-ending (the menu's Quit
+# item), so it needs the same "own invocation" isolation `ICED_EXIT_E2E_TESTS`
+# gets — but not the SAME invocation as that list: the session-scoped
+# harness fixture launches exactly one UI for the whole pytest run, so
+# whichever exit-ending module ran first would strand the other. Kept as
+# its own list/target/CI steps rather than folded into ICED_EXIT_E2E_TESTS.
+ICED_MENU_QUIT_E2E_TESTS := tools/roosttest/test_menu_quit.py
 # The release-profile lane's curated subset, not the full ICED_E2E_TESTS
 # list: startup, the core op set, the VT pipeline, and font shaping/glyph
 # rasterization — the last two because the one release-only bug this stack
@@ -126,6 +134,9 @@ e2e-iced:  ## Required functional E2E against Iced
 e2e-iced-exit:  ## Iced exit-on-empty E2E in its own lane (DESTRUCTIVE: force-quits a running Iced UI, and the UI it launches exits)
 	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_EXIT_E2E_TESTS) --roost-target iced --roost-fresh
 
+e2e-iced-menu-quit:  ## Iced menu-Quit E2E in its own lane (DESTRUCTIVE: force-quits a running Iced UI, and the UI it launches exits via the menu). macOS-iced-only; self-skips elsewhere.
+	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_MENU_QUIT_E2E_TESTS) --roost-target iced --roost-fresh
+
 e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not headless Wayland)
 	uv run --group test pytest $(ICED_CLIPBOARD_TESTS) --roost-target iced
 
@@ -155,7 +166,7 @@ e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost
 e2e-iced-bundle:  ## macOS-only: assemble Roost-Iced.app + run the curated bundle smoke against it (ROOST_ICED_APP)
 	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-bundle is macOS-only: it launches Roost-Iced.app via LaunchServices (open)"; exit 1; }
 	$(MAKE) bundle-iced
-	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py --roost-target iced --roost-fresh
+	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_menu_bar.py --roost-target iced --roost-fresh
 
 smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
 	tools/screenshot/smoke.sh gtk

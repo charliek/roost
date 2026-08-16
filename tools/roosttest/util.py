@@ -75,6 +75,22 @@ def is_fresh() -> bool:
     return os.environ.get("ROOST_TEST_FRESH") == "1"
 
 
+def runs_alone(request) -> bool:
+    """Whether this module is the whole pytest invocation.
+
+    Self-enforcing check for app-ending tests (deleting the last project,
+    firing the menu's Quit item, …): the session-scoped harness fixture
+    launches exactly one UI for the whole invocation, so a test that ends
+    that UI must be certain it's the only module collected — collected
+    beside others (a whole-directory run, or a stale test-list edit),
+    ending the UI here would fail every test that comes after. Skipping
+    is loud — `pytest_terminal_summary` prints every skip with its
+    reason. Originally duplicated verbatim between `test_exit_on_empty.py`
+    and `test_menu_quit.py`; consolidated here per this module's own
+    history note above."""
+    return {item.path for item in request.session.items} == {request.node.path}
+
+
 def skip_on_ci(reason: str, alt_coverage: str | None = None) -> None:
     """Skip a test on CI (`CI=true`) with a justification. Reserve this for
     tests that genuinely can't run remotely (e.g. a quit→relaunch lifecycle

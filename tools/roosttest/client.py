@@ -575,6 +575,32 @@ class Roost:
         # badge tests wait for.
         return res["label"]
 
+    def app_menu_dump(self) -> list[dict]:
+        """Read back the macOS iced UI's live native menu bar — walks the
+        actual `NSApp.mainMenu`, not a re-derivation from the keybind
+        table. Returns the `menus` list: `[{"title", "items": [{"title",
+        "key_equivalent", "modifiers", "enabled", "state", "separator",
+        "action"}, ...]}, ...]`.
+
+        Gated by ROOST_TEST_MODE=1 (raises `RoostError('not-enabled')`
+        when off) and macOS-iced-only, same as `app_dock_badge`."""
+        res = self.call("app.menu_dump", {})
+        return res["menus"]
+
+    def app_menu_activate(self, path: list[str]) -> None:
+        """Resolve `path` (a title path, e.g. `["File", "New Tab"]`,
+        real U+2026 ellipses — never `...`) through the live native menu
+        bar and fire it via `performActionForItemAtIndex:`, the same
+        dispatch a real click takes.
+
+        Raises `RoostError('invalid-param')` for an unknown path, an
+        ambiguous one (two items sharing a title at the same level), or
+        a disabled item. The fired event lands on a later update turn —
+        callers must condition-wait on the observable effect, never
+        assert synchronously on this call returning. Gated by
+        ROOST_TEST_MODE=1, macOS-iced-only, same as `app_dock_badge`."""
+        self.call("app.menu_activate", {"path": path})
+
     def tab_expand_selection_at(
         self,
         tab_id: int,

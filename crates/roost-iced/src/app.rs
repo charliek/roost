@@ -30,8 +30,9 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AppRenderStatsResult, PaletteItemView, PalettePresentResult, PaletteStateResult, Project,
-    SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
+    AppMenuDumpResult, AppRenderStatsResult, PaletteItemView, PalettePresentResult,
+    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult,
+    WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;
