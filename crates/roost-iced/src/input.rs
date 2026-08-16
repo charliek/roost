@@ -983,7 +983,13 @@ mod tests {
             ("a", "a", Code::KeyA, ctrl, "a", b"\x01".as_slice()),
             ("a", "a", Code::KeyA, empty, "a", b"a"),
             // Option-transformed text: no ctrl, so nothing is recovered.
+            // What libghostty then EMITS is platform-compiled: macOS
+            // writes the transformed text; elsewhere alt is an ESC prefix
+            // on the base key.
+            #[cfg(target_os = "macos")]
             ("b", "∫", Code::KeyB, alt, "∫", "∫".as_bytes()),
+            #[cfg(not(target_os = "macos"))]
+            ("b", "∫", Code::KeyB, alt, "∫", b"\x1bb".as_slice()),
             // NUL (ctrl+shift+2) and RS (ctrl+shift+6) stay where they were.
             ("2", "@", Code::Digit2, ctrl_shift, "\u{0}", b"\x1b[0;5u"),
             ("6", "^", Code::Digit6, ctrl_shift, "\u{1e}", b"\x1b[30;5u"),
