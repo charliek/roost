@@ -20,6 +20,7 @@
 //!   plain data back; no `Retained<_>` crosses out of this module.
 //!
 //! First consumer: [`dock_badge`], the parity port of `App.swift`'s
-//! `refreshDockBadge()`.
+//! `refreshDockBadge()`. Second: [`menu`], the native menu bar.
 
 pub(crate) mod dock_badge;
+pub(crate) mod menu;

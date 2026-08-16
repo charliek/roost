@@ -903,7 +903,15 @@ impl ExitState {
     /// request, so the log line lands on the edge rather than on every
     /// reconcile that follows it.
     fn observe(&mut self, projects_empty: bool) -> bool {
-        if *self != Self::Running || !projects_empty {
+        projects_empty && self.request()
+    }
+
+    /// Latch the request — from the empty-workspace observation above, or
+    /// directly from the menu's Quit, which has no empty workspace to
+    /// observe. Returns whether THIS call raised it, so a second request
+    /// while the first is in flight cannot queue a second exit.
+    fn request(&mut self) -> bool {
+        if *self != Self::Running {
             return false;
         }
         *self = Self::Requested;
@@ -1064,6 +1072,10 @@ pub struct App {
     revealed_tab_id: Option<i64>,
     tab_reveal_request: Option<i64>,
     exit_state: ExitState,
+    /// The gating value last pushed to the native menu bar, so the seam is
+    /// touched only when the keyboard route actually moved.
+    #[cfg(target_os = "macos")]
+    menu_gating: crate::macos::menu::MenuGating,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -1231,6 +1243,8 @@ impl App {
             revealed_tab_id: None,
             tab_reveal_request: None,
             exit_state: ExitState::default(),
+            #[cfg(target_os = "macos")]
+            menu_gating: crate::macos::menu::MenuGating::default(),
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -1262,13 +1276,14 @@ impl App {
         // here on the reconcile owns it, and a repeat from a later
         // `WindowFocus` is an idempotent rewrite of the same label.
         self.sync_dock_badge();
-        prepare_window_opened(
+        let opened = prepare_window_opened(
             &mut self.window_id,
             &mut self.pending_window_resize,
             &mut self.screenshots,
             id,
-        )
-        .task
+        );
+        self.install_main_menu();
+        opened.task
     }
 
     pub fn window_resized(&mut self, id: window::Id, size: Size) -> UiTask {
@@ -1684,6 +1699,54 @@ impl App {
     pub fn captured_enter_release(&mut self) {
         if self.rename_completion_key == Some(RenameCompletionKey::Enter) {
             self.rename_completion_key = None;
+        }
+    }
+
+    /// What the menu bar's enabled-state should currently be — the whole
+    /// keyboard-route → menu mapping in one place, read both by the seam
+    /// push and by the dispatch-side gate below.
+    #[cfg(target_os = "macos")]
+    fn menu_gating(&self) -> crate::macos::menu::MenuGating {
+        crate::macos::menu::MenuGating {
+            palette_open: self.palette.is_some(),
+            text_capture: self.rename_editor.is_some()
+                || self.confirm_delete.is_some()
+                || self.terminal_composing(),
+        }
+    }
+
+    /// Route a native menu activation into the paths a keystroke takes.
+    ///
+    /// `repeat` is always `false`: a held chord is now AppKit's menu
+    /// repeat rather than iced's key repeat, so the per-action repeat
+    /// suppression `dispatch_keybind_action` applies has nothing to see
+    /// (plan 028 § 3.5, an accepted behavior change).
+    ///
+    /// The gate here mirrors [`Self::menu_gating`] one layer down, because
+    /// the item's enabled-state is not authoritative by the time the event
+    /// is dispatched: the activation rides the feed and lands a turn
+    /// later, and `performActionForItemAtIndex:` — the route the test op
+    /// takes — does not consult enabled-state at all.
+    #[cfg(target_os = "macos")]
+    pub fn menu_event(&mut self, event: crate::macos::menu::MenuEvent) -> UiTask {
+        use crate::macos::menu::{is_palette_toggle, MenuEvent};
+
+        match event {
+            MenuEvent::Action(action) => {
+                let gating = self.menu_gating();
+                if gating.text_capture || (gating.palette_open && !is_palette_toggle(action)) {
+                    return UiTask::None;
+                }
+                self.dispatch_keybind_action(action, false)
+            }
+            // Quit is never gated — it is the one command that must work
+            // while a modal or a palette owns the keyboard, and the Swift
+            // app agrees (its `validateMenuItem` gates only the items
+            // targeting the app delegate, not `NSApplication`'s Quit).
+            MenuEvent::Quit => {
+                self.exit_state.request();
+                UiTask::None
+            }
         }
     }
 

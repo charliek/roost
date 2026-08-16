@@ -444,6 +444,19 @@ impl App {
                     // above — if it ran — predates that.
                     batch.mark_dirty();
                 }
+                // Same shape as the IPC arm above, for the same reason: a
+                // menu command acts on `self.projects`, so a mutation
+                // already in this batch is folded in before it runs, and
+                // whatever it mutates itself still owes a reconcile.
+                #[cfg(target_os = "macos")]
+                EngineFeed::Menu(event) => {
+                    if batch.workspace_dirty() {
+                        self.reconcile();
+                        batch.mark_reconciled();
+                    }
+                    task = task.then(self.menu_event(event));
+                    batch.mark_dirty();
+                }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab_id } => {
@@ -657,6 +670,65 @@ impl App {
                 return;
             }
             crate::macos::dock_badge::sync(self.notification_inbox.count());
+        }
+    }
+
+    /// Install the native menu bar — the parity port of `App.swift`'s
+    /// `installMainMenu()`. A no-op on every other host.
+    ///
+    /// Called from `window_opened` for the same reason the Dock badge is:
+    /// AppKit before winit has built the event loop is unsupported, and a
+    /// focus-regain re-entry is idempotent (the seam installs once).
+    pub(super) fn install_main_menu(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = objc2::MainThreadMarker::new() else {
+                tracing::error!(
+                    "menu install ran off the main thread; skipping (AppKit is main-thread-only)"
+                );
+                return;
+            };
+            let built = crate::macos::menu::install(
+                mtm,
+                self.title_fallback,
+                &self.keybindings,
+                self.feed_tx.clone(),
+            );
+            if built {
+                // A freshly built menu is all-enabled. Reset the cache to
+                // match so `sync_menu_gating` — which runs later in this
+                // same update turn — pushes whatever route the app is
+                // actually in (an IPC `palette.present` can beat the first
+                // window).
+                self.menu_gating = crate::macos::menu::MenuGating::default();
+            }
+        }
+    }
+
+    /// Push the current keyboard route onto the menu bar, when it moved.
+    ///
+    /// The one call site is `update()`'s post-dispatch drain, so every
+    /// route transition — palette open/close, rename begin/commit, confirm
+    /// modal, IME composition start/end — is covered without a call site
+    /// per transition (plan 028 § 3.5).
+    pub fn sync_menu_gating(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let gating = self.menu_gating();
+            if self.menu_gating == gating {
+                return;
+            }
+            let Some(mtm) = objc2::MainThreadMarker::new() else {
+                tracing::error!(
+                    "menu gating ran off the main thread; skipping (AppKit is main-thread-only)"
+                );
+                return;
+            };
+            self.menu_gating = gating;
+            crate::macos::menu::sync_gating(gating, mtm);
         }
     }
 

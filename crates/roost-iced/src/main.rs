@@ -352,9 +352,13 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// them, and it is reached through too many paths (click, keybind, palette,
 /// notification click, raw IPC) for each of them to remember to carry the
 /// task itself. Batched rather than chained — the dispatched task may be a
-/// long-lived engine future, and neither drain must wait behind it.
+/// long-lived engine future, and neither drain must wait behind it. The
+/// macOS menu-bar gate rides here for the same reason: every route
+/// transition passes through some message, and only one of them is the
+/// one that moved it.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
+    app.sync_menu_gating();
     Task::batch([
         dispatched,
         app.take_tab_reveal_task().map_task(),

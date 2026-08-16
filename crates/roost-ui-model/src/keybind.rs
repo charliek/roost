@@ -8,9 +8,10 @@
 //! shared with the Mac UI so config files apply verbatim across both UIs.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Every recognized action. Adding a new action: extend the enum,
-/// extend `Self::name`, extend `Self::from_name`, and provide a
+/// extend `Self::from_name`, extend `Self::to_wire_name`, and provide a
 /// handler in `App::install_keybinds`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeybindAction {
@@ -126,6 +127,39 @@ impl KeybindAction {
                     None
                 }
             }
+        }
+    }
+
+    /// The config-file / wire spelling of this action — the exact inverse
+    /// of [`Self::from_name`], so a name that round-trips through both is
+    /// unchanged. Surfaces (menus, introspection ops) name actions with
+    /// this rather than with `Debug`, which is a Rust identifier and not a
+    /// contract.
+    pub fn to_wire_name(self) -> String {
+        match self {
+            Self::NewTab => "new_tab".into(),
+            Self::CloseTab => "close_tab".into(),
+            Self::NewProject => "new_project".into(),
+            Self::RenameProject => "rename_project".into(),
+            Self::RenameTab => "rename_tab".into(),
+            Self::CloseProject => "close_project".into(),
+            Self::JumpToUnread => "jump_to_unread".into(),
+            Self::CycleTabPrev => "cycle_tab_prev".into(),
+            Self::CycleTabNext => "cycle_tab_next".into(),
+            Self::Copy => "copy".into(),
+            Self::Paste => "paste".into(),
+            Self::ToggleSidebar => "toggle_sidebar".into(),
+            Self::ToggleSidebarAgents => "toggle_sidebar_agents".into(),
+            Self::FontIncrease => "font_increase".into(),
+            Self::FontDecrease => "font_decrease".into(),
+            Self::FontReset => "font_reset".into(),
+            Self::CommandPalette => "command_palette".into(),
+            Self::CommandLauncher => "command_launcher".into(),
+            Self::CustomPalette => "custom_palette".into(),
+            Self::AgentPalette => "agent_palette".into(),
+            Self::Unbind => "unbind".into(),
+            Self::SwitchProject(n) => format!("switch_project_{n}"),
+            Self::SwitchTab(n) => format!("switch_tab_{n}"),
         }
     }
 }
@@ -457,9 +491,262 @@ pub fn canonicalize_bindings(
     map
 }
 
+/// Declaration order of [`default_bindings`], for
+/// [`menu_accel_for_action`]'s tie-break. Built once — the table is fixed
+/// for the life of the process.
+static DEFAULT_ORDER: LazyLock<HashMap<Accel, usize>> = LazyLock::new(|| {
+    default_bindings()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (accel, _))| (accel, index))
+        .collect()
+});
+
+/// Which single accel a surface should *display* for `action`.
+///
+/// The canonicalized map is many-accels-to-one-action by design (Copy is
+/// `super+c` AND `ctrl+shift+c`; FontIncrease is `plus` AND `equal`; the
+/// tab-cycle pair have bracket AND brace variants), so an inversion needs
+/// a total order — otherwise the shown shortcut follows `HashMap`
+/// iteration order, which is what makes the Mac app's `accel(for:)`
+/// (`App.swift:4326`) nondeterministic. Pinned rule, in order:
+///
+/// 1. prefer an accel carrying SUPER (the app modifier on macOS),
+/// 2. then the earlier [`default_bindings`] declaration,
+/// 3. then the canonical trigger spelling, for user-added accels that are
+///    in no default table.
+///
+/// Returns `None` when the action has no binding at all — a user's
+/// `unbind` leaves a bare menu title rather than a stale shortcut.
+pub fn menu_accel_for_action(
+    action: KeybindAction,
+    bindings: &HashMap<Accel, KeybindAction>,
+) -> Option<Accel> {
+    bindings
+        .iter()
+        .filter(|(_, bound)| **bound == action)
+        .map(|(accel, _)| accel)
+        .min_by_key(|accel| {
+            (
+                u8::from(!accel.modifiers.contains(AccelMods::SUPER)),
+                DEFAULT_ORDER.get(*accel).copied().unwrap_or(usize::MAX),
+                canonical_trigger(accel),
+            )
+        })
+        .cloned()
+}
+
+/// One deterministic spelling of an accel — [`menu_accel_for_action`]'s
+/// last tie-break, and a stable label for logs.
+pub fn canonical_trigger(accel: &Accel) -> String {
+    let mut out = String::new();
+    for (flag, name) in [
+        (AccelMods::CTRL, "ctrl"),
+        (AccelMods::ALT, "alt"),
+        (AccelMods::SHIFT, "shift"),
+        (AccelMods::SUPER, "super"),
+    ] {
+        if accel.modifiers.contains(flag) {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    out.push_str(&accel.key);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accel(trigger: &str) -> Accel {
+        parse_trigger(trigger).expect("trigger parses")
+    }
+
+    fn canonical_defaults() -> HashMap<Accel, KeybindAction> {
+        canonicalize_bindings(default_bindings(), Vec::new(), |_| {})
+    }
+
+    /// Every action name a config file may carry survives the round trip,
+    /// so a surface that prints [`KeybindAction::to_wire_name`] prints
+    /// something [`KeybindAction::from_name`] accepts.
+    #[test]
+    fn action_names_round_trip() {
+        let mut actions = vec![
+            KeybindAction::NewTab,
+            KeybindAction::CloseTab,
+            KeybindAction::NewProject,
+            KeybindAction::RenameProject,
+            KeybindAction::RenameTab,
+            KeybindAction::CloseProject,
+            KeybindAction::JumpToUnread,
+            KeybindAction::CycleTabPrev,
+            KeybindAction::CycleTabNext,
+            KeybindAction::Copy,
+            KeybindAction::Paste,
+            KeybindAction::ToggleSidebar,
+            KeybindAction::ToggleSidebarAgents,
+            KeybindAction::FontIncrease,
+            KeybindAction::FontDecrease,
+            KeybindAction::FontReset,
+            KeybindAction::CommandPalette,
+            KeybindAction::CommandLauncher,
+            KeybindAction::CustomPalette,
+            KeybindAction::AgentPalette,
+            KeybindAction::Unbind,
+        ];
+        actions.extend((1..=9u8).map(KeybindAction::SwitchProject));
+        actions.extend((1..=9u8).map(KeybindAction::SwitchTab));
+        for action in actions {
+            let name = action.to_wire_name();
+            assert_eq!(
+                KeybindAction::from_name(&name),
+                Some(action),
+                "{name} does not round-trip"
+            );
+        }
+        // Every default binding's action is covered by the list above —
+        // a new variant that forgets `to_wire_name` fails here.
+        for (_, action) in default_bindings() {
+            assert_eq!(
+                KeybindAction::from_name(&action.to_wire_name()),
+                Some(action)
+            );
+        }
+    }
+
+    /// Copy and Paste each carry a SUPER default and a `ctrl+shift`
+    /// alias; the menu must always advertise the Cmd one.
+    #[test]
+    fn a_super_accel_wins_over_a_ctrl_alias() {
+        let bindings = canonical_defaults();
+        let (copy, paste) = if cfg!(target_os = "macos") {
+            ("super+c", "super+v")
+        } else {
+            ("alt+c", "alt+v")
+        };
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::Copy, &bindings),
+            Some(accel(copy))
+        );
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::Paste, &bindings),
+            Some(accel(paste))
+        );
+    }
+
+    /// Both FontIncrease defaults carry the same modifier, so declaration
+    /// order decides — `plus` is declared before `equal`. Same for the
+    /// bracket/brace pair the cycle actions bind.
+    #[test]
+    fn declaration_order_breaks_a_modifier_tie() {
+        let bindings = canonical_defaults();
+        let primary = if cfg!(target_os = "macos") {
+            "super"
+        } else {
+            "alt"
+        };
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::FontIncrease, &bindings),
+            Some(accel(&format!("{primary}+plus")))
+        );
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::CycleTabPrev, &bindings),
+            Some(accel(&format!("{primary}+shift+bracketleft")))
+        );
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::CycleTabNext, &bindings),
+            Some(accel(&format!("{primary}+shift+bracketright")))
+        );
+    }
+
+    /// The rule is a function of the map's contents, never of how the map
+    /// was built: the same bindings inserted in a different order — and
+    /// therefore laid out differently in the `HashMap` — pick the same
+    /// accel.
+    #[test]
+    fn the_choice_is_independent_of_insertion_order() {
+        let user: Vec<(String, String)> = vec![
+            ("super+shift+z".into(), "new_tab".into()),
+            ("super+shift+a".into(), "new_tab".into()),
+            ("ctrl+alt+n".into(), "new_tab".into()),
+        ];
+        let forward = canonicalize_bindings(Vec::new(), user.clone(), |_| {});
+        let reversed = canonicalize_bindings(Vec::new(), user.into_iter().rev().collect(), |_| {});
+        let chosen = menu_accel_for_action(KeybindAction::NewTab, &forward);
+        assert_eq!(
+            chosen,
+            menu_accel_for_action(KeybindAction::NewTab, &reversed)
+        );
+        // SUPER first, then the canonical spelling among the two SUPER
+        // accels ("shift+super+a" < "shift+super+z").
+        assert_eq!(chosen, Some(accel("super+shift+a")));
+    }
+
+    /// A rebind shows up wherever the accel is displayed — the point of
+    /// reading the canonicalized table rather than a mirrored copy.
+    #[test]
+    fn a_user_rebind_replaces_the_default() {
+        // Same modifier as the platform default, so the SUPER preference
+        // is not what decides this case — declaration order is.
+        let (default_new_tab, rebind) = if cfg!(target_os = "macos") {
+            ("super+t", "super+shift+n")
+        } else {
+            ("alt+t", "alt+shift+n")
+        };
+        let bindings = canonicalize_bindings(
+            default_bindings(),
+            vec![(rebind.into(), "new_tab".into())],
+            |_| {},
+        );
+        // The default survives alongside the addition, and is declared
+        // first, so it still wins.
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::NewTab, &bindings),
+            Some(accel(default_new_tab))
+        );
+
+        // Unbind the default and only the rebind is left.
+        let bindings = canonicalize_bindings(
+            default_bindings(),
+            vec![
+                (default_new_tab.into(), "unbind".into()),
+                (rebind.into(), "new_tab".into()),
+            ],
+            |_| {},
+        );
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::NewTab, &bindings),
+            Some(accel(rebind))
+        );
+    }
+
+    #[test]
+    fn an_unbound_action_has_no_accel() {
+        let toggle_sidebar = if cfg!(target_os = "macos") {
+            "super+b"
+        } else {
+            "alt+b"
+        };
+        let bindings = canonicalize_bindings(
+            default_bindings(),
+            vec![(toggle_sidebar.into(), "unbind".into())],
+            |_| {},
+        );
+        assert_eq!(
+            menu_accel_for_action(KeybindAction::ToggleSidebar, &bindings),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_trigger_orders_modifiers_the_same_way_every_time() {
+        assert_eq!(
+            canonical_trigger(&accel("super+shift+ctrl+alt+x")),
+            "ctrl+alt+shift+super+x"
+        );
+        assert_eq!(canonical_trigger(&accel("cmd+t")), "super+t");
+    }
 
     #[test]
     fn parse_link_modifier_accepts_aliases() {
