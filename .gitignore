@@ -14,6 +14,9 @@
 /third_party/ghostty/src/
 /third_party/ghostty/.cache/
 
+# Fetched Sparkle stage (third_party/sparkle/fetch.sh; pinned version+SHA)
+/third_party/sparkle/out/
+
 # Mac (Xcode + SwiftPM) build artifacts
 /mac/build/
 /mac/.build/

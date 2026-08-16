@@ -25,18 +25,27 @@
     Roost.entitlements, ghostty, and cmux, which all carry the same
     capture set.
 
-    com.apple.security.cs.disable-library-validation — DELIBERATELY
-    OMITTED here (present in Roost.entitlements). That entitlement
-    exists solely to let Roost.app load the ad-hoc-signed
-    Sparkle.framework it embeds (see the comment block in
-    Roost.entitlements). Roost-Iced.app embeds no frameworks — the
-    iced binary links libghostty-vt as a static archive and has no
-    Sparkle stage (plan 027 § W2: no auto-update parity between the
-    two bundles) — so there is nothing here that needs library
-    validation relaxed. If a future hardened-runtime launch turns out
-    to need it for some dlopen'd system path, add it back with a
-    comment explaining the observed failure — decide from the
-    observed launch, not speculatively.
+    com.apple.security.cs.disable-library-validation
+
+    The case this file previously reserved the entitlement for has
+    arrived (plan 028, M6 6c): bundle-iced.sh now embeds an
+    ad-hoc-signed Sparkle.framework, dlopen'd at runtime under the
+    hardened runtime. Library validation insists every loaded library
+    be signed by the SAME Team ID as the main executable (or be a
+    platform binary). Roost-Iced ships ad-hoc-signed (no Team ID
+    yet), so without this entitlement the hardened runtime would
+    refuse the framework — for a dlopen that's a load failure at
+    updater-init time (the link-time case aborts the whole launch
+    with a code-signature (LV) kill; cf. Roost.entitlements, same
+    entitlement for the same embedded framework).
+
+    REMOVE THIS once the bundle is team-signed (Developer ID +
+    notarization, the Swift side's #83 equivalent): when Roost-Iced
+    and Sparkle.framework are both signed by our Team ID, same-team
+    signing satisfies library validation and the entitlement is no
+    longer needed (cf. Ghostty, which is team-signed and carries no
+    LV-disable). Keeping it past that point needlessly weakens the
+    hardened runtime.
 
     What we still INTENTIONALLY do not need (same reasoning as
     Roost.entitlements):
@@ -64,6 +73,8 @@
   <key>com.apple.security.device.camera</key>
   <true/>
   <key>com.apple.security.automation.apple-events</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
 </dict>
 </plist>

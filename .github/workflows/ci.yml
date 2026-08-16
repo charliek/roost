@@ -115,6 +115,9 @@ jobs:
               - 'mac/Resources/AppIcon.icns'
               - 'mac/AppIcon.icon/**'
               - 'mac/Resources/Roost-Iced.entitlements'
+              # Sparkle pin (version+SHA in fetch.sh) — a bump must re-run
+              # the bundle lanes that embed + sign the framework.
+              - 'third_party/sparkle/**'
 
   rust-lint:
     needs: changes
@@ -814,10 +817,21 @@ jobs:
       # M6 6a (plan 027 W5): the two steps above only ever exercise the bare
       # `roost-iced` cargo binary. This assembles + smoke-tests the actual
       # macOS deliverable (Roost-Iced.app) so a bundling regression (wrong
-      # bundle id, missing entitlements, an accidental Frameworks embed) is
-      # caught here rather than only by a human running `make bundle-iced`
-      # locally. Debug profile only — never "upgrade" this to release; the
+      # bundle id, missing entitlements, a broken Sparkle embed or signing
+      # chain) is caught here rather than only by a human running
+      # `make bundle-iced` locally. Debug profile only — never "upgrade" this to release; the
       # release-profile lane is `iced-release`, not this job.
+      # The Sparkle stage is version+SHA pinned inside fetch.sh, so
+      # hashFiles on the script is an exact cache key for out/ — a pin
+      # bump changes the key, and a GitHub release-asset outage can't
+      # flake the assemble step on a warm cache (plan 028 § 3.10).
+      - name: Cache Sparkle stage
+        if: runner.os == 'macOS'
+        uses: actions/cache@v5
+        with:
+          path: third_party/sparkle/out
+          key: sparkle-stage-${{ hashFiles('third_party/sparkle/fetch.sh') }}
+
       - name: Assemble Roost-Iced.app
         if: runner.os == 'macOS'
         run: ./mac/scripts/bundle-iced.sh debug
@@ -848,21 +862,83 @@ jobs:
             || { echo "FAIL: CFBundleShortVersionString still has the unsubstituted @VERSION@ placeholder"; exit 1; }
           echo "OK: CFBundleShortVersionString is '$version'"
 
-          # No Sparkle parity for the iced bundle (6c decision, not made
-          # here) — assert none of the keys leaked in from the Swift plist.
-          for key in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks; do
+          # 6c posture (plan 028): Sparkle MECHANICS ship, feed
+          # deliberately absent. The default assemble must never carry a
+          # feed URL or public key — the two apps must not be able to
+          # offer each other's updates, and feed enablement is the
+          # explicit ROOST_ICED_SPARKLE_* env pair at bundle time.
+          for key in SUFeedURL SUPublicEDKey; do
             if has_key "$INFO" "$key"; then
-              echo "FAIL: Info.plist unexpectedly carries $key"; exit 1
+              echo "FAIL: Info.plist unexpectedly carries $key (default assemble must stay feedless)"; exit 1
             fi
           done
-          echo "OK: no Sparkle (SU*) keys present"
+          echo "OK: no SUFeedURL / SUPublicEDKey"
 
-          [ ! -d "$APP/Contents/Frameworks" ] \
-            || { echo "FAIL: $APP/Contents/Frameworks exists (this bundle embeds no frameworks)"; exit 1; }
-          echo "OK: no Contents/Frameworks dir"
+          # Present AND false — with the updater instantiated, an absent
+          # key would trigger Sparkle's first-run auto-check prompt;
+          # checks stay strictly user-invoked.
+          [ "$(plist_value "$INFO" SUEnableAutomaticChecks)" = "false" ] \
+            || { echo "FAIL: SUEnableAutomaticChecks missing or not false"; exit 1; }
+          echo "OK: SUEnableAutomaticChecks present and false"
+
+          FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
+          [ -d "$FRAMEWORK" ] \
+            || { echo "FAIL: $FRAMEWORK missing (6c embeds Sparkle)"; exit 1; }
+          # The runtime dlopen resolves the stable top-level
+          # Sparkle.framework/Sparkle symlink — a flattened copy (one
+          # that lost the Versions/ symlink farm) would sign fine but
+          # break the load path.
+          { [ -L "$FRAMEWORK/Sparkle" ] && [ -f "$FRAMEWORK/Sparkle" ]; } \
+            || { echo "FAIL: $FRAMEWORK/Sparkle top-level symlink missing or dangling"; exit 1; }
+          echo "OK: Sparkle.framework embedded with its symlink farm intact"
 
           codesign --verify --deep --strict "$APP"
           echo "OK: codesign --verify --deep --strict passed"
+
+          # Strict-chain proof (plan 028 § 3.10): deep-verify alone
+          # cannot prove the per-component inner→outer signing order —
+          # verify each Sparkle component's own signature individually,
+          # AND prove our re-sign actually ran: the vendor ships every
+          # component already ad-hoc+runtime signed, so a skipped (or
+          # --deep'd-then-skipped) chain would pass --verify on the
+          # vendor signatures alone. Our --force re-sign necessarily
+          # changes each component's CDHash away from the pristine
+          # staged copy fetch.sh downloaded — compare against it.
+          # Downloader.xpc is exempt from the CDHash comparison: our
+          # ad-hoc re-sign with --preserve-metadata=entitlements
+          # reproduces the vendor's CodeDirectory byte-for-byte
+          # (verified locally — identical CDHash), because ad-hoc
+          # signing is deterministic and every input it hashes is
+          # preserved. Its chain proof is instead the
+          # entitlements-present-and-clean check below, which a --deep
+          # clobber (drops the preserved blob) or an entitlements
+          # injection would each fail. The other components' re-sign
+          # provably changes the CDHash (--force replaces the vendor's
+          # designated requirements); if a Sparkle bump ever makes one
+          # of them deterministic too, this fails LOUD, not silent.
+          STAGED="third_party/sparkle/out/Sparkle.framework"
+          cdhash() { codesign -dvvv "$1" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}'; }
+          codesign --verify --strict "$FRAMEWORK/Versions/B/XPCServices/Downloader.xpc" \
+            || { echo "FAIL: codesign --verify --strict failed for Downloader.xpc"; exit 1; }
+          for rel in \
+            "Versions/B/XPCServices/Installer.xpc" \
+            "Versions/B/Autoupdate" \
+            "Versions/B/Updater.app"; do
+            component="$FRAMEWORK/$rel"
+            codesign --verify --strict "$component" \
+              || { echo "FAIL: codesign --verify --strict failed for $component"; exit 1; }
+            embedded_hash=$(cdhash "$component")
+            vendor_hash=$(cdhash "$STAGED/$rel")
+            [ -n "$embedded_hash" ] && [ -n "$vendor_hash" ] \
+              || { echo "FAIL: could not read CDHash for $rel"; exit 1; }
+            [ "$embedded_hash" != "$vendor_hash" ] \
+              || { echo "FAIL: $rel still carries the vendor CDHash — the strict re-sign chain did not run on it"; exit 1; }
+          done
+          embedded_hash=$(cdhash "$FRAMEWORK")
+          vendor_hash=$(cdhash "$STAGED")
+          [ -n "$embedded_hash" ] && [ "$embedded_hash" != "$vendor_hash" ] \
+            || { echo "FAIL: Sparkle.framework itself still carries the vendor CDHash"; exit 1; }
+          echo "OK: Sparkle components individually verify AND the re-sign chain provably ran (CDHash differs from the staged vendor copy; Downloader proven via preserved entitlements)"
 
           # Extract entitlements as a real plist (codesign's text dump
           # format is unstable across macOS versions) and parse with
@@ -884,12 +960,41 @@ jobs:
               || { echo "FAIL: entitlement $key is '$val', want true"; exit 1; }
           done
           echo "OK: entitlements carry the three capture keys (all true)"
-          if has_key "$ent" com.apple.security.cs.disable-library-validation; then
-            echo "FAIL: entitlements unexpectedly carry com.apple.security.cs.disable-library-validation"; exit 1
-          fi
-          echo "OK: entitlements do not carry cs.disable-library-validation"
+          # Required by the ad-hoc-signed embedded Sparkle under the
+          # hardened runtime (Roost-Iced.entitlements rationale;
+          # REMOVE-once-team-signed).
+          val=$(/usr/libexec/PlistBuddy -c "Print :com.apple.security.cs.disable-library-validation" "$ent" 2>/dev/null) \
+            || { echo "FAIL: entitlements missing com.apple.security.cs.disable-library-validation"; exit 1; }
+          [ "$val" = "true" ] \
+            || { echo "FAIL: cs.disable-library-validation is '$val', want true"; exit 1; }
+          echo "OK: entitlements carry cs.disable-library-validation (true)"
 
-          codesign -dv "$APP" 2>&1 | grep -q 'flags=.*runtime' \
+          # Downloader.xpc must keep its OWN preserved entitlements
+          # (--preserve-metadata=entitlements; empty since Sparkle ≥2.6
+          # removed its sandbox — sparkle-project/Sparkle#2511). The
+          # app's entitlements being stamped onto it is exactly the
+          # clobbering that signs+notarizes clean but breaks at
+          # update-apply time.
+          dent="$work/downloader-entitlements.plist"
+          codesign -d --entitlements - --xml \
+            "$FRAMEWORK/Versions/B/XPCServices/Downloader.xpc" 2>/dev/null > "$dent"
+          for key in \
+            com.apple.security.device.audio-input \
+            com.apple.security.device.camera \
+            com.apple.security.automation.apple-events \
+            com.apple.security.cs.disable-library-validation; do
+            if grep -q "$key" "$dent"; then
+              echo "FAIL: Downloader.xpc entitlements unexpectedly carry $key (app entitlements leaked into the Sparkle chain)"; exit 1
+            fi
+          done
+          echo "OK: Downloader.xpc keeps its own preserved (non-Roost) entitlements"
+
+          # Capture first, then grep: `codesign -dv | grep -q` trips
+          # pipefail (grep -q exits on match, codesign's remaining
+          # unbuffered writes take SIGPIPE/141) — deterministic locally
+          # once the Sparkle embed grew the CodeDirectory.
+          sign_info=$(codesign -dv "$APP" 2>&1)
+          printf '%s\n' "$sign_info" | grep -q 'flags=.*runtime' \
             || { echo "FAIL: hardened runtime flag not present"; exit 1; }
           echo "OK: hardened runtime flag present"
 

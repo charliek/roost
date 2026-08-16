@@ -72,6 +72,52 @@ roost_stamp_plist() {
     > "${app_dir}/Contents/Info.plist"
 }
 
+# roost_insert_sparkle_feed APP_DIR FEED_URL ED_PUBLIC_KEY
+#
+# Optional Sparkle feed enablement for the iced bundle (plan 028 § 3.9).
+# The template plist deliberately ships NO SUFeedURL/SUPublicEDKey — the
+# feed-enabled configuration is opt-in at bundle time via the
+# ROOST_ICED_SPARKLE_FEED_URL + ROOST_ICED_SPARKLE_ED_PUBLIC_KEY env
+# pair, which bundle-iced.sh passes through here. Both empty is today's
+# posture (no keys inserted, byte-identical plist); both set inserts the
+# pair into the already-stamped Info.plist; exactly one set is a hard
+# error — a feed URL without its EdDSA public key (or vice versa) is a
+# misconfigured build that would either never verify an update or never
+# check at all, and must not sign+ship looking healthy.
+#
+# Call after roost_stamp_plist (this edits the stamped Info.plist, not
+# the template).
+roost_insert_sparkle_feed() {
+  local app_dir="$1"
+  local feed_url="$2"
+  local ed_public_key="$3"
+  local plist="${app_dir}/Contents/Info.plist"
+
+  if [ -z "${feed_url}" ] && [ -z "${ed_public_key}" ]; then
+    return 0
+  fi
+  if [ -z "${feed_url}" ] || [ -z "${ed_public_key}" ]; then
+    echo "error: ROOST_ICED_SPARKLE_FEED_URL and ROOST_ICED_SPARKLE_ED_PUBLIC_KEY" >&2
+    echo "       must be set together (both, or neither) — a feed without its" >&2
+    echo "       public key (or vice versa) is a misconfigured Sparkle build." >&2
+    exit 1
+  fi
+  # PlistBuddy parses its -c string itself: an embedded double quote
+  # unbalances it, and PlistBuddy then exits 0 on the parse error — so
+  # under set -e the build would continue with only ONE key inserted,
+  # silently violating the both-or-neither contract. No legitimate feed
+  # URL or base64 EdDSA key contains a quote; reject rather than escape.
+  case "${feed_url}${ed_public_key}" in
+    *\"*)
+      echo "error: Sparkle feed URL / public key must not contain double quotes" >&2
+      exit 1
+      ;;
+  esac
+  echo "==> Inserting Sparkle feed keys (SUFeedURL=${feed_url})"
+  /usr/libexec/PlistBuddy -c "Add :SUFeedURL string ${feed_url}" "${plist}"
+  /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string ${ed_public_key}" "${plist}"
+}
+
 # roost_write_pkginfo APP_DIR
 #
 # Classic four-byte PkgInfo so Finder recognizes the bundle type
@@ -247,9 +293,9 @@ roost_build_and_embed_roostctl() {
 # case where Xcode CLT codesign is missing.
 #
 # Sets SIGN_IDENTITY, TS_FLAG, and ROOST_SIGN_ENT_FILE in the caller's
-# scope, and defines the codesign_or_die / codesign_framework_or_die
-# functions (also in the caller's scope — this is bash, functions
-# defined here are global to the sourcing script).
+# scope, and defines the codesign_or_die / codesign_framework_or_die /
+# codesign_sparkle_or_die functions (also in the caller's scope — this
+# is bash, functions defined here are global to the sourcing script).
 # ROOST_SIGN_ENT_FILE stays global (not a local) because
 # codesign_or_die's default-entitlements argument reads it after this
 # function has already returned. Returns 1 (without exiting) when
@@ -352,6 +398,107 @@ roost_setup_signing() {
     fi
     echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
     exit 1
+  }
+
+  # One component of the strict Sparkle chain (codesign_sparkle_or_die
+  # below). No --entitlements ever — Sparkle's helpers must keep their
+  # own (empty, since Sparkle ≥2.6 removed its sandbox —
+  # sparkle-project/Sparkle#2511) entitlements, not inherit the app's
+  # TCC set. Extra per-component flags (Downloader.xpc's
+  # --preserve-metadata=entitlements) arrive as additional arguments.
+  #
+  # Returns 1 (without exiting) when ROOST_ALLOW_UNSIGNED=1 bypassed a
+  # failure: the caller must then ABANDON the remaining chain. Warning
+  # per component and continuing would leave a half-Roost-signed chain
+  # sealed under the outer signature — worse than a wholly vendor-signed
+  # framework, and exactly the breaks-at-update-apply case the chain
+  # exists to prevent.
+  # shellcheck disable=SC2329  # invoked by codesign_sparkle_or_die after this function returns
+  roost__codesign_sparkle_component() {
+    local target="$1"
+    shift
+    # shellcheck disable=SC2086  # TS_FLAG must word-split (empty => no flag)
+    if codesign --force --sign "${SIGN_IDENTITY}" \
+         --options runtime \
+         ${TS_FLAG} \
+         "$@" \
+         "${target}"
+    then
+      return 0
+    fi
+    if [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
+      echo "    warn: codesign(${target}) failed; ROOST_ALLOW_UNSIGNED=1 set — abandoning the rest of the Sparkle chain (partial re-signing breaks Sparkle at update-apply time)"
+      return 1
+    fi
+    echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
+    exit 1
+  }
+
+  # codesign_sparkle_or_die FRAMEWORK_PATH
+  #
+  # Signs an embedded Sparkle.framework via the strict inner→outer
+  # chain, one component at a time, NO --deep anywhere:
+  #
+  #   Versions/B/XPCServices/Installer.xpc
+  #   Versions/B/XPCServices/Downloader.xpc   (--preserve-metadata=entitlements)
+  #   Versions/B/Autoupdate
+  #   Versions/B/Updater.app
+  #   the framework itself                     (no entitlements)
+  #
+  # then the caller signs the outer .app (with the app's entitlements)
+  # after this returns — inner→outer to the end.
+  #
+  # This DELIBERATELY deviates from codesign_framework_or_die above,
+  # whose comment says --deep is safe on a framework. That holds for
+  # the Swift bundle's use (where it has shipped working updates and is
+  # deliberately left as-is — Swift path untouched, recorded as a
+  # future hygiene pass in plan 028 § 9), but the shed reference
+  # embedding demonstrated the sharper truth: --deep, or a wrong
+  # signing order, produces a bundle that signs AND notarizes clean yet
+  # breaks at update-apply time — Sparkle's Installer/Downloader XPC
+  # handshake rejects helpers whose signatures were clobbered from the
+  # outside. Failure at the latest possible moment, on the user's
+  # machine, mid-update. The iced path therefore adopts the strict
+  # per-component chain. Downloader.xpc alone gets
+  # --preserve-metadata=entitlements: Sparkle ≥2.6 removed its sandbox
+  # (sparkle-project/Sparkle#2511), and preserving whatever
+  # entitlements the component itself shipped keeps us correct across
+  # Sparkle releases without ever stamping our own onto it.
+  # shellcheck disable=SC2329  # invoked by the sourcing script after this function returns
+  codesign_sparkle_or_die() {
+    local fw="$1"
+    local versions="${fw}/Versions/B"
+
+    # The chain only protects what it actually signs — a missing
+    # component means a truncated/flattened framework copy, and
+    # signing the remainder would seal a broken bundle. Fail loudly.
+    local component
+    for component in \
+      "${versions}/XPCServices/Installer.xpc" \
+      "${versions}/XPCServices/Downloader.xpc" \
+      "${versions}/Updater.app"
+    do
+      if [ ! -d "${component}" ]; then
+        echo "    error: Sparkle component missing: ${component} (broken framework copy?)" >&2
+        exit 1
+      fi
+    done
+    if [ ! -f "${versions}/Autoupdate" ]; then
+      echo "    error: Sparkle component missing: ${versions}/Autoupdate (broken framework copy?)" >&2
+      exit 1
+    fi
+
+    echo "==> Signing Sparkle.framework (strict inner→outer chain, no --deep)"
+    # A component failure under ROOST_ALLOW_UNSIGNED=1 returns 1: stop
+    # the chain right there rather than sealing a half-re-signed
+    # framework under the outer signature (see the helper's comment).
+    roost__codesign_sparkle_component "${versions}/XPCServices/Installer.xpc" \
+      && roost__codesign_sparkle_component "${versions}/XPCServices/Downloader.xpc" \
+           --preserve-metadata=entitlements \
+      && roost__codesign_sparkle_component "${versions}/Autoupdate" \
+      && roost__codesign_sparkle_component "${versions}/Updater.app" \
+      && roost__codesign_sparkle_component "${fw}" \
+      || true
   }
 
   return 0
