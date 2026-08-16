@@ -1076,6 +1076,10 @@ pub struct App {
     /// touched only when the keyboard route actually moved.
     #[cfg(target_os = "macos")]
     menu_gating: crate::macos::menu::MenuGating,
+    /// The Window menu's dynamic rows as last built, so a reconcile that
+    /// moved no project or tab never touches AppKit.
+    #[cfg(target_os = "macos")]
+    menu_window_rows: crate::macos::menu::WindowRows,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -1245,6 +1249,8 @@ impl App {
             exit_state: ExitState::default(),
             #[cfg(target_os = "macos")]
             menu_gating: crate::macos::menu::MenuGating::default(),
+            #[cfg(target_os = "macos")]
+            menu_window_rows: crate::macos::menu::WindowRows::default(),
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -1283,6 +1289,10 @@ impl App {
             id,
         );
         self.install_main_menu();
+        // A freshly installed menu has no Window rows yet, and the next
+        // reconcile may be a while off (nothing forces one on the turn a
+        // window opens).
+        self.sync_window_menu();
         opened.task
     }
 
@@ -1729,15 +1739,32 @@ impl App {
     /// takes — does not consult enabled-state at all.
     #[cfg(target_os = "macos")]
     pub fn menu_event(&mut self, event: crate::macos::menu::MenuEvent) -> UiTask {
-        use crate::macos::menu::{is_palette_toggle, MenuEvent};
+        use crate::macos::menu::{command_enabled, is_palette_toggle, MenuEvent};
 
         match event {
             MenuEvent::Action(action) => {
-                let gating = self.menu_gating();
-                if gating.text_capture || (gating.palette_open && !is_palette_toggle(action)) {
+                if !command_enabled(self.menu_gating(), is_palette_toggle(action)) {
                     return UiTask::None;
                 }
                 self.dispatch_keybind_action(action, false)
+            }
+            // The Window menu's rows take the same paths the sidebar and
+            // tab strip take (`Message::ProjectSelected`/`TabSelected`) —
+            // including their lack of Swift's `ensureSidebarVisible`,
+            // which no iced selection route performs.
+            MenuEvent::SelectProject(project_id) => {
+                if !command_enabled(self.menu_gating(), false) {
+                    return UiTask::None;
+                }
+                self.select_project(project_id);
+                UiTask::None
+            }
+            MenuEvent::SelectTab(tab_id) => {
+                if !command_enabled(self.menu_gating(), false) {
+                    return UiTask::None;
+                }
+                self.select_tab(tab_id);
+                UiTask::None
             }
             // Quit is never gated — it is the one command that must work
             // while a modal or a palette owns the keyboard, and the Swift

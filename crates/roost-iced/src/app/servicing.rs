@@ -232,6 +232,10 @@ impl App {
         // construction — the same reason the palette refresh below sits
         // here.
         self.sync_dock_badge();
+        // Same reasoning, one surface over: the Window menu's rows are
+        // project/tab state, so hanging them off the authoritative resync
+        // covers open, close, rename, reorder and select by construction.
+        self.sync_window_menu();
         self.refresh_notification_palette();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
@@ -704,7 +708,40 @@ impl App {
                 // actually in (an IPC `palette.present` can beat the first
                 // window).
                 self.menu_gating = crate::macos::menu::MenuGating::default();
+                // Ditto for the Window rows: the menu was built with none.
+                self.menu_window_rows = crate::macos::menu::WindowRows::default();
             }
+        }
+    }
+
+    /// Rebuild the Window menu's project/tab rows when the rows moved.
+    ///
+    /// Reconcile is where this hangs (the Dock badge's reasoning), and
+    /// reconcile runs on every drain — so the diff against the last-built
+    /// model, not the AppKit rebuild, is what the common case costs.
+    pub(super) fn sync_window_menu(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let (active_project_id, active_tab_id) = self.workspace.active();
+            let rows = crate::macos::menu::WindowRows::derive(
+                &self.projects,
+                active_project_id,
+                active_tab_id,
+            );
+            if self.menu_window_rows == rows {
+                return;
+            }
+            let Some(mtm) = objc2::MainThreadMarker::new() else {
+                tracing::error!(
+                    "window-menu rebuild ran off the main thread; skipping (AppKit is main-thread-only)"
+                );
+                return;
+            };
+            crate::macos::menu::sync_window_menu(mtm, &rows, &self.keybindings, self.menu_gating());
+            self.menu_window_rows = rows;
         }
     }
 

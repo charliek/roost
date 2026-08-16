@@ -29,8 +29,12 @@ use std::collections::HashMap;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, Sel};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
+use objc2_app_kit::{
+    NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSMenu,
+    NSMenuItem,
+};
 use objc2_foundation::NSString;
+use roost_ipc::messages::Project;
 use roost_ui_model::keybind::{menu_accel_for_action, Accel, AccelMods, KeybindAction};
 
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
@@ -47,6 +51,13 @@ pub(crate) enum MenuEvent {
     /// `Workspace::flush()`'s clean-exit fsync, so Quit takes the same
     /// graceful exit path exit-on-empty uses (plan 028 § 3.2).
     Quit,
+    /// A Window-menu project row. Carries the project's **stable id**, not
+    /// its row position: the activation rides the feed and is acted on a
+    /// turn later, by which time a position could name a different project
+    /// (plan 028 § 3.3).
+    SelectProject(i64),
+    /// A Window-menu tab row, by stable tab id — same reasoning.
+    SelectTab(i64),
 }
 
 /// Which surface currently owns the keyboard, as far as the menu bar
@@ -63,6 +74,67 @@ pub(crate) struct MenuGating {
     /// key today (`app.rs`'s `KeyboardRoute::Editor`/`Confirm` arms), so
     /// no command may fire from the menu behind them either.
     pub(crate) text_capture: bool,
+}
+
+/// Whether a custom-action item is live under `gating`. The one rule,
+/// read by the seam when it writes an item's enabled-state and by the
+/// App when it re-checks a dispatched activation against the route it
+/// landed in.
+pub(crate) fn command_enabled(gating: MenuGating, palette_toggle: bool) -> bool {
+    !gating.text_capture && (!gating.palette_open || palette_toggle)
+}
+
+/// One dynamic Window-menu row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowRow {
+    /// The workspace id the row selects — stable, never a position, for
+    /// [`MenuEvent::SelectProject`]'s reason.
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    /// Renders as the row's checkmark.
+    pub(crate) active: bool,
+}
+
+/// The Window menu's dynamic half as plain data: what the seam renders,
+/// and what the App diffs against the last model it built so a reconcile
+/// that moved nothing never touches AppKit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WindowRows {
+    pub(crate) projects: Vec<WindowRow>,
+    /// The tabs of the ACTIVE project only — `App.swift:3852`'s
+    /// `tabsForActiveProject()`.
+    pub(crate) tabs: Vec<WindowRow>,
+}
+
+impl WindowRows {
+    /// The parity port of `rebuildWindowMenu`'s two loops
+    /// (`App.swift:3830-3869`): projects by name, then the active
+    /// project's tabs as "Tab N" — the position the user counts, not the
+    /// tab's own title.
+    pub(crate) fn derive(projects: &[Project], active_project_id: i64, active_tab_id: i64) -> Self {
+        Self {
+            projects: projects
+                .iter()
+                .map(|project| WindowRow {
+                    id: project.id,
+                    title: project.name.clone(),
+                    active: project.id == active_project_id,
+                })
+                .collect(),
+            tabs: projects
+                .iter()
+                .find(|project| project.id == active_project_id)
+                .into_iter()
+                .flat_map(|project| project.tabs.iter())
+                .enumerate()
+                .map(|(index, tab)| WindowRow {
+                    id: tab.id,
+                    title: format!("Tab {}", index + 1),
+                    active: tab.id == active_tab_id,
+                })
+                .collect(),
+        }
+    }
 }
 
 // AppKit's modifier bits, as `NSEventModifierFlags` raw values. Named here
@@ -172,9 +244,21 @@ struct MainMenu {
     /// keeping the action target alive is this field.
     target: Retained<MenuTarget>,
     root: Retained<NSMenu>,
+    /// The Window menu, kept because its rows are rebuilt in place
+    /// whenever the workspace's projects or tabs move.
+    window: Retained<NSMenu>,
     /// Indexed by the item's tag.
     events: Vec<MenuEvent>,
+    /// Tags below this belong to the static menus and never move. A
+    /// Window rebuild truncates back to here and re-pushes, so the whole
+    /// reassignment happens under one `borrow_mut` — a tag is never
+    /// briefly stale.
+    static_events: usize,
     gated: Vec<GatedItem>,
+    /// The Window menu's dynamic rows. Separate from `gated` only so a
+    /// rebuild can drop them wholesale; [`sync_gating`] treats both the
+    /// same.
+    window_gated: Vec<GatedItem>,
     /// The app's one inbound channel. A menu activation is just another
     /// item on it, so it lands in the same FIFO — and the same reconcile
     /// bookkeeping — as an IPC request or a workspace event.
@@ -263,9 +347,10 @@ pub(crate) fn sync_gating(gating: MenuGating, _mtm: MainThreadMarker) {
             return;
         };
         let blank_clipboard = gating.text_capture || gating.palette_open;
-        for entry in &menu.gated {
-            let enabled = !gating.text_capture && (!gating.palette_open || entry.palette_toggle);
-            entry.item.setEnabled(enabled);
+        for entry in menu.gated.iter().chain(&menu.window_gated) {
+            entry
+                .item
+                .setEnabled(command_enabled(gating, entry.palette_toggle));
             if let Some((key, mask)) = entry.clipboard_equivalent.as_ref() {
                 let (key, mask) = if blank_clipboard {
                     ("", 0)
@@ -292,8 +377,11 @@ fn build(
     let mut menu = MainMenu {
         target,
         root: submenu(mtm, ""),
+        window: submenu(mtm, "Window"),
         events: Vec::new(),
+        static_events: 0,
         gated: Vec::new(),
+        window_gated: Vec::new(),
         feed,
     };
 
@@ -389,7 +477,146 @@ fn build(
     edit_menu.addItem(&disabled_item(mtm, "Select All"));
     attach(mtm, &menu.root, &edit_menu);
 
+    attach(mtm, &menu.root, &menu.window);
+    menu.static_events = menu.events.len();
+    // The rows come from the workspace, which no menu install may read:
+    // `reconcile()` owns that and fills them in on the turn after this.
+    populate_window(
+        mtm,
+        &mut menu,
+        &WindowRows::default(),
+        keybindings,
+        MenuGating::default(),
+    );
+
     menu
+}
+
+/// Rebuild the Window menu's dynamic rows from `rows`, in place.
+///
+/// The whole tag reassignment happens under this one `borrow_mut`, which
+/// is what [`dispatch_tag`]'s `try_borrow` guards: a click that lands
+/// mid-rebuild is dropped loudly rather than resolved against a table
+/// that is half old and half new.
+pub(crate) fn sync_window_menu(
+    mtm: MainThreadMarker,
+    rows: &WindowRows,
+    keybindings: &HashMap<Accel, KeybindAction>,
+    gating: MenuGating,
+) {
+    MENU.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(menu) = slot.as_mut() else {
+            return;
+        };
+        populate_window(mtm, menu, rows, keybindings, gating);
+    });
+}
+
+/// Projects, tabs of the active project, then Minimize/Zoom — the
+/// item-for-item port of `rebuildWindowMenu` (`App.swift:3820-3886`),
+/// including its rule that each dynamic group is followed by a separator
+/// only when the group is non-empty.
+///
+/// Fresh rows are born with `gating` already applied rather than waiting
+/// for the next [`sync_gating`]: the gate is edge-triggered on the App
+/// side, and a rebuild that landed between two edges would otherwise
+/// leave live rows behind a palette.
+fn populate_window(
+    mtm: MainThreadMarker,
+    menu: &mut MainMenu,
+    rows: &WindowRows,
+    keybindings: &HashMap<Accel, KeybindAction>,
+    gating: MenuGating,
+) {
+    let window = menu.window.clone();
+    window.removeAllItems();
+    menu.events.truncate(menu.static_events);
+    menu.window_gated.clear();
+
+    for (index, row) in rows.projects.iter().enumerate() {
+        let key = positional_accel(index, KeybindAction::SwitchProject, keybindings);
+        add_window_row(
+            mtm,
+            menu,
+            &window,
+            row,
+            MenuEvent::SelectProject(row.id),
+            key,
+            gating,
+        );
+    }
+    if !rows.projects.is_empty() {
+        window.addItem(&NSMenuItem::separatorItem(mtm));
+    }
+
+    for (index, row) in rows.tabs.iter().enumerate() {
+        let key = positional_accel(index, KeybindAction::SwitchTab, keybindings);
+        add_window_row(
+            mtm,
+            menu,
+            &window,
+            row,
+            MenuEvent::SelectTab(row.id),
+            key,
+            gating,
+        );
+    }
+    if !rows.tabs.is_empty() {
+        window.addItem(&NSMenuItem::separatorItem(mtm));
+    }
+
+    window.addItem(&standard_item(
+        mtm,
+        "Minimize",
+        sel!(performMiniaturize:),
+        Some(("m", MOD_COMMAND)),
+    ));
+    window.addItem(&standard_item(mtm, "Zoom", sel!(performZoom:), None));
+}
+
+/// The key equivalent for the row at `index`, from the table — so a user
+/// who rebound `switch_tab_3` sees their own chord. Rows past the ninth
+/// get none, exactly as Swift's `index < 9` guard does.
+///
+/// These stay POSITIONAL where the row's action is by id: the
+/// `switch_project_N`/`switch_tab_N` bindings name a position by
+/// definition, and a key press is dispatched now rather than a turn
+/// later.
+fn positional_accel(
+    index: usize,
+    action: fn(u8) -> KeybindAction,
+    keybindings: &HashMap<Accel, KeybindAction>,
+) -> Option<(String, usize)> {
+    let position = u8::try_from(index + 1).ok().filter(|n| *n <= 9)?;
+    menu_accel_for_action(action(position), keybindings)
+        .and_then(|accel| accel_to_key_equivalent(&accel))
+}
+
+fn add_window_row(
+    mtm: MainThreadMarker,
+    menu: &mut MainMenu,
+    parent: &NSMenu,
+    row: &WindowRow,
+    event: MenuEvent,
+    key: Option<(String, usize)>,
+    gating: MenuGating,
+) {
+    let item = plain_item(mtm, &row.title);
+    bind_event(menu, &item, event);
+    set_key_equivalent(&item, key);
+    item.setState(if row.active {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    item.setEnabled(command_enabled(gating, false));
+    parent.addItem(&item);
+    menu.window_gated.push(GatedItem {
+        item,
+        palette_toggle: false,
+        clipboard_equivalent: None,
+    });
 }
 
 /// `None` adds a separator; `Some` adds a keybind-table-bound item.
@@ -490,12 +717,51 @@ fn set_key_equivalent(item: &NSMenuItem, key: Option<(String, usize)>) {
 
 #[cfg(test)]
 mod tests {
+    use roost_ipc::messages::{Tab, TabState};
     use roost_ui_model::keybind::parse_trigger;
 
     use super::*;
 
     fn accel(trigger: &str) -> Accel {
         parse_trigger(trigger).expect("trigger parses")
+    }
+
+    fn tab(id: i64, project_id: i64) -> Tab {
+        Tab {
+            id,
+            project_id,
+            title: format!("tab-{id}"),
+            cwd: "/tmp".into(),
+            state: TabState::None,
+            has_notification: false,
+            is_active: false,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: Default::default(),
+            agent_lifecycle: Default::default(),
+            ownership: None,
+        }
+    }
+
+    fn project(id: i64, name: &str, tabs: Vec<Tab>) -> Project {
+        Project {
+            id,
+            name: name.into(),
+            cwd: "/tmp".into(),
+            position: 0,
+            created_at: 0,
+            tabs,
+        }
+    }
+
+    fn workspace() -> Vec<Project> {
+        vec![
+            project(1, "alpha", vec![tab(10, 1), tab(11, 1)]),
+            project(2, "beta", vec![tab(20, 2)]),
+        ]
     }
 
     /// The constants [`accel_to_key_equivalent`] emits are AppKit's, and
@@ -590,5 +856,135 @@ mod tests {
         ] {
             assert!(!is_palette_toggle(action), "{action:?}");
         }
+    }
+
+    /// The one enabled-state rule, in both directions: a palette spares
+    /// the four toggles, text capture spares nothing.
+    #[test]
+    fn text_capture_outranks_the_palette_exemption() {
+        let open = MenuGating {
+            palette_open: true,
+            text_capture: false,
+        };
+        assert!(command_enabled(open, true));
+        assert!(!command_enabled(open, false));
+
+        let capture = MenuGating {
+            palette_open: false,
+            text_capture: true,
+        };
+        assert!(!command_enabled(capture, true));
+        assert!(!command_enabled(capture, false));
+
+        assert!(command_enabled(MenuGating::default(), false));
+    }
+
+    /// Projects in snapshot order; tabs of the ACTIVE project only, named
+    /// by position rather than by title (`App.swift:3856`).
+    #[test]
+    fn the_rows_are_every_project_and_the_active_projects_tabs() {
+        let rows = WindowRows::derive(&workspace(), 1, 11);
+
+        let projects: Vec<_> = rows
+            .projects
+            .iter()
+            .map(|row| (row.id, row.title.as_str(), row.active))
+            .collect();
+        assert_eq!(projects, vec![(1, "alpha", true), (2, "beta", false)]);
+
+        let tabs: Vec<_> = rows
+            .tabs
+            .iter()
+            .map(|row| (row.id, row.title.as_str(), row.active))
+            .collect();
+        assert_eq!(tabs, vec![(10, "Tab 1", false), (11, "Tab 2", true)]);
+    }
+
+    /// Selecting the other project re-aims the tab rows at ITS tabs.
+    #[test]
+    fn switching_project_switches_which_tabs_the_rows_show() {
+        let rows = WindowRows::derive(&workspace(), 2, 20);
+        assert_eq!(
+            rows.tabs.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert!(rows.projects[1].active && !rows.projects[0].active);
+    }
+
+    /// A workspace with no project the active id names (mid-delete, or an
+    /// empty workspace) renders projects with no checkmark and no tabs —
+    /// never a panic and never a row pointing at a project that is gone.
+    #[test]
+    fn an_unknown_active_project_leaves_the_tab_rows_empty() {
+        let rows = WindowRows::derive(&workspace(), 99, 10);
+        assert_eq!(rows.projects.len(), 2);
+        assert!(rows.projects.iter().all(|row| !row.active));
+        assert!(rows.tabs.is_empty());
+        assert_eq!(WindowRows::derive(&[], 0, 0), WindowRows::default());
+    }
+
+    /// The change detection reconcile leans on: every field the menu
+    /// renders is part of the comparison, and nothing else is.
+    #[test]
+    fn the_model_compares_equal_only_when_the_menu_would_look_the_same() {
+        let base = WindowRows::derive(&workspace(), 1, 10);
+        assert_eq!(base, WindowRows::derive(&workspace(), 1, 10));
+
+        // A tab's own title is not rendered, so churning it is not a
+        // rebuild; its cwd and position aren't either.
+        let mut untouched = workspace();
+        untouched[0].tabs[0].title = "renamed by the shell".into();
+        untouched[0].tabs[0].cwd = "/elsewhere".into();
+        assert_eq!(base, WindowRows::derive(&untouched, 1, 10));
+
+        // Everything the menu does render is.
+        let mut renamed = workspace();
+        renamed[0].name = "renamed".into();
+        assert_ne!(base, WindowRows::derive(&renamed, 1, 10));
+
+        let mut reordered = workspace();
+        reordered.swap(0, 1);
+        assert_ne!(base, WindowRows::derive(&reordered, 1, 10));
+
+        let mut closed = workspace();
+        closed[0].tabs.pop();
+        assert_ne!(base, WindowRows::derive(&closed, 1, 10));
+
+        assert_ne!(base, WindowRows::derive(&workspace(), 1, 11));
+        assert_ne!(base, WindowRows::derive(&workspace(), 2, 10));
+    }
+
+    /// Rows are bound from the table, so a rebind reaches the menu; only
+    /// the first nine of each group get a chord at all.
+    #[test]
+    fn row_accels_come_from_the_table_and_stop_after_nine() {
+        let bindings = roost_ui_model::keybind::canonicalize_bindings(
+            roost_ui_model::keybind::default_bindings(),
+            Vec::new(),
+            |_| {},
+        );
+        assert_eq!(
+            positional_accel(0, KeybindAction::SwitchProject, &bindings),
+            Some(("1".into(), MOD_COMMAND))
+        );
+        assert_eq!(
+            positional_accel(8, KeybindAction::SwitchTab, &bindings),
+            Some(("9".into(), MOD_CONTROL))
+        );
+        assert_eq!(
+            positional_accel(9, KeybindAction::SwitchTab, &bindings),
+            None
+        );
+
+        let rebound = roost_ui_model::keybind::canonicalize_bindings(
+            roost_ui_model::keybind::default_bindings(),
+            vec![("super+shift+2".into(), "switch_tab_2".into())],
+            |_| {},
+        );
+        assert_eq!(
+            positional_accel(1, KeybindAction::SwitchTab, &rebound),
+            Some(("2".into(), MOD_COMMAND | MOD_SHIFT)),
+            "a user's own binding reaches the row, not the default"
+        );
     }
 }
