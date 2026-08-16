@@ -151,14 +151,63 @@ impl Operation<Visibility> for Locate {
             Decision::Missing => Outcome::Some(Visibility::Missing),
             Decision::Visible => Outcome::Some(Visibility::Visible(true)),
             Decision::Clipped => Outcome::Some(Visibility::Visible(false)),
-            Decision::ScrollTo(offset) => Outcome::Chain(Box::new(ApplyScroll {
-                axis: self.axis,
-                scroll_id: self.scroll_id.clone(),
-                row_id: self.row_id.clone(),
-                offset,
-            })),
+            Decision::ScrollTo(offset) => {
+                // W-K.4: bottom-aligning a row deep in a long list (the
+                // common case once you've arrowed halfway down the
+                // palette) leaves whatever sits at the viewport's leading
+                // edge — a DIFFERENT row than the one just revealed —
+                // wherever the alignment math happens to land it, which is
+                // essentially never on that row's own boundary. The
+                // symptom Charlie flagged is a sliver of that row's
+                // descenders hugging the divider. `decide()`/`is_visible()`
+                // stay untouched (still exactly right for the tab strip's
+                // horizontal reveal, which nobody's flagged): this is a
+                // vertical-only, palette-specific snap, keyed off the
+                // just-revealed row's own bounds as the grid — its leading
+                // edge is a boundary by construction, so any multiple of
+                // its height from there is too, as long as the rows above
+                // it share its height (true for the plain command/theme
+                // list this was reproduced on; a mixed-height frame like
+                // notifications degrades to today's unsnapped behavior,
+                // never worse than before this fix).
+                let offset = if self.axis == Axis::Vertical {
+                    snap_to_row_grid(geometry, offset)
+                } else {
+                    offset
+                };
+                Outcome::Chain(Box::new(ApplyScroll {
+                    axis: self.axis,
+                    scroll_id: self.scroll_id.clone(),
+                    row_id: self.row_id.clone(),
+                    offset,
+                }))
+            }
         }
     }
+}
+
+/// Round `desired` up to the nearest row-height multiple of `geometry.row`'s
+/// own leading edge, so the viewport's leading edge always lands on a row
+/// boundary instead of mid-row. Only ever moves the offset further from the
+/// minimal reveal (never re-hides the just-revealed row): for a top-aligned
+/// reveal `desired` already equals the row's own leading edge, a multiple of
+/// itself, so this is a no-op there.
+fn snap_to_row_grid(geometry: Geometry, desired: f32) -> f32 {
+    let (_, viewport_extent) = Axis::Vertical.span(geometry.viewport);
+    let (content_start, content_extent) = Axis::Vertical.span(geometry.content);
+    let (row_start, row_extent) = Axis::Vertical.span(geometry.row);
+    if row_extent <= 0.0 {
+        return desired;
+    }
+    let row_leading = row_start - content_start;
+    let remainder = (desired - row_leading).rem_euclid(row_extent);
+    let snapped = if remainder <= GEOMETRY_EPSILON {
+        desired - remainder
+    } else {
+        desired - remainder + row_extent
+    };
+    let max_offset = (content_extent - viewport_extent).max(0.0);
+    snapped.clamp(0.0, max_offset)
 }
 
 struct ApplyScroll {
@@ -286,6 +335,45 @@ mod tests {
             decide(geometry(0.0, 500.0, 36.0), Axis::Vertical, true),
             Decision::ScrollTo(116.0)
         );
+    }
+
+    /// `decide()` itself is untouched (the assertion above still holds) —
+    /// `snap_to_row_grid` is a separate post-process `Locate::finish` only
+    /// applies on `Axis::Vertical`, composed here directly. 116 isn't a
+    /// multiple of the row's own 36px height measured from its leading edge
+    /// (500): the un-snapped offset would leave the row above the revealed
+    /// one showing a 24px sliver at the viewport's top (W-K.4). Snapping
+    /// rounds up to 140 — still ≤ the clamp ceiling (900-420=480) — which
+    /// lands the viewport's top exactly on a row boundary instead.
+    #[test]
+    fn snap_rounds_a_bottom_aligned_reveal_up_to_a_row_boundary() {
+        let geometry = geometry(0.0, 500.0, 36.0);
+        assert_eq!(snap_to_row_grid(geometry, 116.0), 140.0);
+    }
+
+    /// A top-aligned reveal's `desired` is already the row's own leading
+    /// edge — a boundary by construction — so snapping is a no-op.
+    #[test]
+    fn snap_does_not_move_an_already_aligned_top_reveal() {
+        let geometry = geometry(200.0, 120.0, 36.0);
+        assert_eq!(snap_to_row_grid(geometry, 120.0), 120.0);
+    }
+
+    /// An offset already sitting within epsilon of a boundary (floating
+    /// point noise from a prior scroll) settles onto that boundary rather
+    /// than jumping a full row further.
+    #[test]
+    fn snap_treats_near_boundary_offsets_as_already_aligned() {
+        let geometry = geometry(0.0, 500.0, 36.0);
+        assert!((snap_to_row_grid(geometry, 140.2) - 140.0).abs() < 0.01);
+    }
+
+    /// The snapped offset never exceeds the content's own scroll ceiling,
+    /// even when rounding up would otherwise overshoot it.
+    #[test]
+    fn snap_clamps_to_the_max_scroll_offset() {
+        let geometry = geometry(0.0, 500.0, 36.0);
+        assert_eq!(snap_to_row_grid(geometry, 470.0), 480.0);
     }
 
     #[test]

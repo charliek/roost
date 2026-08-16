@@ -1895,6 +1895,7 @@ impl App {
                     .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
             );
             let notifying = project.tabs.iter().any(|tab| tab.has_notification);
+            let active = project.id == active_project;
             let stripe = container(
                 iced::widget::Space::new()
                     .width(chrome::PROJECT_STRIPE_WIDTH)
@@ -1936,8 +1937,13 @@ impl App {
                 // pill instead — a fill spacer beside it would halve the
                 // field, and no dot renders beside the editor.
                 _ => {
+                    let label_color = if active {
+                        chrome::PROJECT_LABEL_ACTIVE
+                    } else {
+                        chrome::PROJECT_LABEL_INACTIVE
+                    };
                     let mut label_row = row![
-                        text(&project.name).size(13),
+                        text(&project.name).size(13).color(label_color),
                         iced::widget::Space::new().width(Fill)
                     ]
                     .align_y(Alignment::Center);
@@ -1964,7 +1970,7 @@ impl App {
                     left: chrome::PROJECT_LABEL_INSET,
                 })
                 .style(chrome::project_pill(
-                    project.id == active_project,
+                    active,
                     dragged_project == Some(project.id),
                 ));
             // The rail sits at the row's leading edge, inside the pill's own
@@ -2035,10 +2041,15 @@ impl App {
                 .style(chrome::footer_chip_button)
                 .on_press(Message::NewProject),
         )
-        .height(chrome::BAND_HEIGHT)
+        .height(chrome::FOOTER_BAND_HEIGHT)
         .width(Fill)
         .center_x(Fill)
-        .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
+        .padding(iced::Padding {
+            top: chrome::FOOTER_PADDING_TOP,
+            right: 8.0,
+            bottom: chrome::FOOTER_PADDING_BOTTOM,
+            left: 8.0,
+        })
         .style(chrome::band);
         // The strip delegates layout to its content, so its layout node is the
         // column's: one child per project group, which is what the gesture's
@@ -2450,42 +2461,47 @@ impl App {
             };
             let row = button(label)
                 .width(Fill)
-                .padding([6, 10])
+                .padding([6.0, chrome::PALETTE_ROW_PADDING_X])
                 .style(chrome::palette_row(selected, actionable));
             let row = if actionable {
                 row.on_press(Message::PaletteActivate(item.id))
             } else {
                 row
             };
-            items = items.push(container(row).id(palette_row_id(
-                self.palette_session,
-                self.palette_layout_revision,
-                index,
-            )));
+            // The outer padding — beyond the row's own — pulls the
+            // selection highlight in from the panel edge to match the
+            // mac's inset look (chrome::PALETTE_ROW_OUTER_INSET's doc
+            // comment has the measured mac numbers); the id stays on this
+            // outer wrapper so the reveal/clip-snap geometry pass in
+            // palette_scroll.rs sees the row's full allocated height.
+            items = items.push(
+                container(row)
+                    .padding([0.0, chrome::PALETTE_ROW_OUTER_INSET])
+                    .id(palette_row_id(
+                        self.palette_session,
+                        self.palette_layout_revision,
+                        index,
+                    )),
+            );
         }
+        // Hidden like the tab strip (app.rs:2260-2264, #281): wheel/trackpad
+        // scroll stays live, but no rail overlays the rows. W-K.2.
         let list = scrollable(items)
             .id(self.palette_scroll_id.clone())
             .on_scroll(|_| Message::PaletteScrolled)
             .direction(scrollable::Direction::Vertical(
-                scrollable::Scrollbar::new()
-                    .width(2)
-                    .scroller_width(4)
-                    .margin(2),
+                scrollable::Scrollbar::hidden(),
             ))
-            .style(chrome::overlay_scrollable)
             .height(Shrink);
-        let divider = container(
-            container(iced::widget::Space::new().height(1))
-                .width(Fill)
-                .style(chrome::palette_divider),
-        )
-        .padding([8, 2]);
-        let panel = container(column![input, divider, list].spacing(0))
+        // W-K.3: the mac's own divider (PalettePanel.swift:188-202) doesn't
+        // carry over — Charlie called the iced rendering of it out as
+        // visual clutter under the filter input; a plain gap replaces it.
+        let panel = container(column![input, list].spacing(8))
             .width(Fill)
             .max_width(chrome::PALETTE_WIDTH)
             .height(Shrink)
             .max_height(chrome::PALETTE_MAX_HEIGHT)
-            .padding(10)
+            .padding(chrome::PALETTE_PANEL_PADDING)
             .style(chrome::palette_panel);
         let overlay = container(mouse_area(panel).on_press(Message::PaletteCardPressed))
             .width(Fill)

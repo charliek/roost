@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use iced::advanced::text::{self as advanced_text, Paragraph as _};
-use iced::widget::{button, container, image, scrollable, text_input};
+use iced::widget::{button, container, image, text_input};
 use iced::{Background, Border, Color, Font, Pixels, Shadow, Size, Theme, Vector};
 
 /// One application-owned band height keeps the sidebar header and tab strip
@@ -14,6 +14,17 @@ pub const PILL_HEIGHT: f32 = 24.0;
 /// band — shared by the sidebar footer and the tab strip so both bands stay
 /// in sync if either height changes.
 pub const BAND_PILL_PADDING_Y: f32 = (BAND_HEIGHT - PILL_HEIGHT) / 2.0;
+/// The sidebar footer's own band, separate from `BAND_HEIGHT` (which stays
+/// pinned to the sidebar header + tab strip, both covered by
+/// `test_tab_strip_pixels.py`). The mac gives its `+ New Project` button
+/// 8pt above / 12pt below rather than centering it (App.swift:841-853:
+/// `scrollView.bottomAnchor = addProject.topAnchor - 8`,
+/// `addProject.bottomAnchor = pane.bottomAnchor - 12`) — measured live for
+/// plan 026 C9 (mac pixel-sampled footer band: 8px fill, 24px button,
+/// 12px fill, matching the source exactly).
+pub const FOOTER_PADDING_TOP: f32 = 8.0;
+pub const FOOTER_PADDING_BOTTOM: f32 = 12.0;
+pub const FOOTER_BAND_HEIGHT: f32 = PILL_HEIGHT + FOOTER_PADDING_TOP + FOOTER_PADDING_BOTTOM;
 /// The agent-rollup rail: 3px at the project row's leading edge, gapped 5px
 /// top and bottom (Mac `SidebarRowView.drawBackground`, App.swift:5402-5405)
 /// so adjacent active projects read as discrete segments rather than one
@@ -55,6 +66,23 @@ pub const TAB_PILL_CHROME_WIDTH: f32 = 2.0 * TAB_PILL_PADDING_X
     + TAB_PILL_LABEL_SPACING;
 pub const PALETTE_WIDTH: f32 = 660.0;
 pub const PALETTE_MAX_HEIGHT: f32 = 500.0;
+/// The palette card's own outer padding (`app.rs`'s `palette_panel`
+/// container) — hoisted so the row-inset constants below can be checked
+/// against it in one place.
+pub const PALETTE_PANEL_PADDING: f32 = 10.0;
+/// Extra inset around each row, beyond `PALETTE_PANEL_PADDING`, so the
+/// selection highlight doesn't run edge-to-edge with the card — matches the
+/// mac `NSTableView`'s scroll-view gutter (`PalettePanel.swift:204-207`,
+/// scroll inset 8 from the card) less the panel's own share of it. Measured
+/// live for plan 026 C9: mac's highlight sits 14px from the card edge
+/// (gutter 8 + `drawSelection`'s `insetBy(dx: 6)`, PalettePanel.swift:529).
+pub const PALETTE_ROW_OUTER_INSET: f32 = 4.0;
+/// Row label's own left/right padding, inside the highlight box. Mac insets
+/// its row text 14px from the row edge (`PaletteCellView`,
+/// PalettePanel.swift:568,:571) on top of the same 8px gutter, for 22px
+/// from the card edge; `PALETTE_PANEL_PADDING + PALETTE_ROW_OUTER_INSET +
+/// PALETTE_ROW_PADDING_X` reproduces that total (see the pinning test).
+pub const PALETTE_ROW_PADDING_X: f32 = 8.0;
 
 /// The chrome's bundled sans (`third_party/inter/`, loaded via
 /// `include_bytes!` in `main.rs`). This is the exact name-table family
@@ -80,6 +108,14 @@ pub const HOVER: Color = Color::from_rgb8(0x39, 0x39, 0x39);
 pub const ACTIVE_AGENT: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
 pub const TEXT: Color = Color::from_rgb8(0xf2, 0xf2, 0xf2);
 pub const MUTED_TEXT: Color = Color::from_rgb8(0xa0, 0xa4, 0xb0);
+/// Sidebar project label: the mac reads "bolder" when active, but both
+/// platforms use the same regular 13pt weight — the difference is COLOR
+/// (`SidebarRowView.applyLabelColor`, App.swift:5333-5342: white when
+/// selected/emphasized, `NSColor(white: 0.82)` otherwise). Measured live
+/// for plan 026 C9 (mac pixel-sampled: active text 255,255,255; inactive
+/// peak 209,209,209 — 0.82 * 255 rounds to 209, i.e. `0xd1`).
+pub const PROJECT_LABEL_ACTIVE: Color = Color::WHITE;
+pub const PROJECT_LABEL_INACTIVE: Color = Color::from_rgb8(0xd1, 0xd1, 0xd1);
 /// The chrome's one accent color: the notification dots (tab-pill badge +
 /// sidebar project-row dot), the dragged-pill border, and the inline-rename
 /// focus ring + selection all share it. Pinned to the Mac's
@@ -351,10 +387,6 @@ pub fn status_toast(_: &Theme) -> container::Style {
     }
 }
 
-pub fn palette_divider(_: &Theme) -> container::Style {
-    container::Style::default().background(Color::from_rgba8(0xff, 0xff, 0xff, 0.10))
-}
-
 pub fn palette_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(Color::TRANSPARENT),
@@ -384,27 +416,6 @@ pub fn inline_rename_input(_: &Theme, status: text_input::Status) -> text_input:
         value: TEXT,
         selection: ACCENT.scale_alpha(0.65),
     }
-}
-
-/// Overlay-style scrollbar: no rail fill, just a translucent scroller. The
-/// stock iced style always paints a full-length rail, which reads as a solid
-/// band wherever it overlays short content — used by the palette list below.
-/// The tab strip needs zero chrome instead (its own `Scrollbar::hidden()` in
-/// `app.rs`, #281): even this style's translucent scroller was too visible
-/// overlaying the 24px tab pills.
-pub fn overlay_scrollable(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
-    let mut style = scrollable::default(theme, status);
-    let rail = scrollable::Rail {
-        background: None,
-        border: Border::default(),
-        scroller: scrollable::Scroller {
-            background: Background::Color(PALETTE_PLACEHOLDER.scale_alpha(0.35)),
-            border: Border::default().rounded(2),
-        },
-    };
-    style.vertical_rail = rail;
-    style.horizontal_rail = rail;
-    style
 }
 
 pub fn palette_row(
@@ -676,20 +687,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_scrollable_never_fills_a_rail() {
-        let theme = Theme::Dark;
-        let style = overlay_scrollable(
-            &theme,
-            scrollable::Status::Active {
-                is_horizontal_scrollbar_disabled: false,
-                is_vertical_scrollbar_disabled: false,
-            },
-        );
-        assert_eq!(style.horizontal_rail.background, None);
-        assert_eq!(style.vertical_rail.background, None);
-    }
-
-    #[test]
     fn palette_styles_use_reference_neutrals_without_stock_primary_fill() {
         let theme = Theme::Dark;
         assert_eq!(
@@ -713,6 +710,46 @@ mod tests {
         let disabled = palette_row(false, false)(&theme, button::Status::Hovered);
         assert_eq!(disabled.background, None);
         assert_eq!(disabled.text_color, PALETTE_PLACEHOLDER.scale_alpha(0.6));
+    }
+
+    /// Plan 026 C9: mac's highlight sits 14px from the card edge, its row
+    /// text 22px — see `PALETTE_ROW_OUTER_INSET`'s doc comment for the mac
+    /// source split. `app.rs` composes these three constants (panel padding,
+    /// the row's own outer container padding, the row button's padding) to
+    /// reproduce both totals; pinned here so the three can't silently drift
+    /// apart.
+    #[test]
+    fn palette_row_insets_match_the_measured_mac_card() {
+        let highlight_inset = PALETTE_PANEL_PADDING + PALETTE_ROW_OUTER_INSET;
+        let text_inset = highlight_inset + PALETTE_ROW_PADDING_X;
+        assert_eq!(highlight_inset, 14.0);
+        assert_eq!(text_inset, 22.0);
+    }
+
+    /// Plan 026 C9: the footer band is its own height/padding split from
+    /// `BAND_HEIGHT` (sidebar header + tab strip stay pinned at 32 for
+    /// `test_tab_strip_pixels.py`) — see `FOOTER_PADDING_TOP`'s doc comment
+    /// for the mac source + measured values.
+    #[test]
+    fn footer_band_matches_the_measured_mac_padding() {
+        assert_eq!(FOOTER_PADDING_TOP, 8.0);
+        assert_eq!(FOOTER_PADDING_BOTTOM, 12.0);
+        assert_eq!(FOOTER_BAND_HEIGHT, PILL_HEIGHT + 20.0);
+        assert_ne!(
+            FOOTER_BAND_HEIGHT, BAND_HEIGHT,
+            "the footer band is deliberately taller than the header/tab-strip band"
+        );
+    }
+
+    /// Plan 026 C9: both platforms use the same regular 13pt weight for the
+    /// project label — the mac's "bolder" active read is color, not weight
+    /// (`PROJECT_LABEL_ACTIVE`'s doc comment has the App.swift source +
+    /// measured pixel values).
+    #[test]
+    fn project_label_colors_differ_only_the_mac_way() {
+        assert_eq!(PROJECT_LABEL_ACTIVE, Color::WHITE);
+        assert_eq!(PROJECT_LABEL_INACTIVE, Color::from_rgb8(0xd1, 0xd1, 0xd1));
+        assert_ne!(PROJECT_LABEL_ACTIVE, PROJECT_LABEL_INACTIVE);
     }
 
     #[test]
