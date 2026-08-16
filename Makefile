@@ -71,7 +71,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-exit e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-exit e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py
 # `selection.*` reads UI state over IPC and never touches the host
@@ -148,6 +148,11 @@ e2e-iced-release-ci:  ## Release-profile Iced E2E gate: curated subset against a
 
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh
+
+e2e-iced-bundle:  ## macOS-only: assemble Roost-Iced.app + run the curated bundle smoke against it (ROOST_ICED_APP)
+	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-bundle is macOS-only: it launches Roost-Iced.app via LaunchServices (open)"; exit 1; }
+	$(MAKE) bundle-iced
+	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py --roost-target iced --roost-fresh
 
 smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
 	tools/screenshot/smoke.sh gtk
