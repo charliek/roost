@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, stack, text, text_input,
+    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input,
 };
 use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
 use roost_engine::git_metrics;
@@ -162,6 +162,7 @@ impl StatusBanner {
 struct ConfirmDeleteProject {
     project_id: i64,
     name: String,
+    tab_count: usize,
 }
 
 fn confirm_delete_target(projects: &[Project], project_id: i64) -> Option<ConfirmDeleteProject> {
@@ -171,6 +172,7 @@ fn confirm_delete_target(projects: &[Project], project_id: i64) -> Option<Confir
         .map(|project| ConfirmDeleteProject {
             project_id: project.id,
             name: project.name.clone(),
+            tab_count: project.tabs.len(),
         })
 }
 
@@ -178,8 +180,49 @@ fn reconcile_confirm_delete(confirm: &mut Option<ConfirmDeleteProject>, projects
     if let Some(open) = confirm.as_ref() {
         // Re-resolve rather than only checking liveness: an external
         // rename while the dialog is open must not leave the user
-        // approving a deletion under a stale label.
+        // approving a deletion under a stale label. The tab count rides
+        // the same re-resolve — the Mac snapshots it when the alert opens
+        // (App.swift:3145-3182), but its alert is modal so nothing can
+        // close a tab underneath it; ours stays open across IPC traffic,
+        // and quoting a count the project no longer has would be a lie.
         *confirm = confirm_delete_target(projects, open.project_id);
+    }
+}
+
+/// What a window-focus transition tears down. A table rather than a
+/// straight-line body because the interesting part of the policy is what it
+/// leaves ALONE, and `App` needs a bound IPC socket plus a real `state.json`
+/// to construct — this is the only seam a unit test can pin it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FocusTeardown {
+    rename_completion_key: bool,
+    drags: bool,
+    /// Always false. The delete confirmation is an answer the user still
+    /// owes; unfocus dropping it (a click into another app, a screenshot
+    /// tool stealing focus) read as the app having crashed. The Mac's
+    /// `NSAlert` is application-modal and equally unaffected.
+    confirm_delete: bool,
+    ime_composition: bool,
+    /// Refocus only: macOS discards marked text when the window loses
+    /// focus, so a commit arriving after refocus is fresh input (emoji
+    /// picker), not residue of the composition the unfocus cancel dropped.
+    ime_discard: bool,
+}
+
+fn focus_teardown(focused: bool) -> FocusTeardown {
+    if focused {
+        FocusTeardown {
+            ime_discard: true,
+            ..FocusTeardown::default()
+        }
+    } else {
+        FocusTeardown {
+            rename_completion_key: true,
+            drags: true,
+            confirm_delete: false,
+            ime_composition: true,
+            ime_discard: false,
+        }
     }
 }
 
@@ -1677,15 +1720,20 @@ impl App {
     }
 
     pub fn set_window_focus(&mut self, focused: bool) {
-        if !focused {
+        let teardown = focus_teardown(focused);
+        if teardown.rename_completion_key {
             self.rename_completion_key = None;
+        }
+        if teardown.drags {
             self.cancel_drags();
+        }
+        if teardown.confirm_delete {
             self.cancel_confirm_delete();
+        }
+        if teardown.ime_composition {
             self.cancel_ime_composition();
-        } else {
-            // macOS discards marked text when the window loses focus, so a
-            // commit arriving after refocus is fresh input (emoji picker),
-            // not residue of the composition the unfocus cancel discarded.
+        }
+        if teardown.ime_discard {
             self.ime_discard.disarm();
         }
         self.window_focused = focused;
@@ -1700,24 +1748,42 @@ impl App {
         let Some(confirm) = &self.confirm_delete else {
             return content;
         };
+        // Copy and structure follow the Mac's `closeActiveProject` NSAlert
+        // (App.swift:3145-3182) verbatim, plural "tabs" included.
+        let message = column![
+            text(format!("Close {}?", confirm.name))
+                .size(15)
+                .font(chrome::chrome_font(font::Weight::Semibold)),
+            text(format!(
+                "This will close {} tabs in this project. The action can't be undone.",
+                confirm.tab_count
+            ))
+            .size(12)
+            .color(chrome::MUTED_TEXT),
+        ]
+        .spacing(6);
+        let heading: Element<'_, Message> = match chrome::app_icon() {
+            Some(icon) => row![
+                image(icon)
+                    .width(chrome::APP_ICON_SIZE)
+                    .height(chrome::APP_ICON_SIZE),
+                message
+            ]
+            .spacing(14)
+            .align_y(Alignment::Start)
+            .into(),
+            None => message.into(),
+        };
         let panel = container(
             column![
-                text("Delete project?")
-                    .size(15)
-                    .font(chrome::chrome_font(font::Weight::Semibold)),
-                text(format!(
-                    "“{}” and all of its tabs will be deleted. This cannot be undone.",
-                    confirm.name
-                ))
-                .size(12)
-                .color(chrome::MUTED_TEXT),
+                heading,
                 row![
                     iced::widget::Space::new().width(Fill),
                     button(text("Cancel").size(12))
                         .padding([4, 12])
                         .style(chrome::transparent_button)
                         .on_press(Message::ConfirmDeleteCancel),
-                    button(text("Delete").size(12))
+                    button(text("Close Project").size(12))
                         .padding([4, 12])
                         .style(chrome::danger_button)
                         .on_press(Message::ConfirmDeleteConfirm)
@@ -1725,7 +1791,7 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center)
             ]
-            .spacing(12),
+            .spacing(16),
         )
         .width(Fill)
         .max_width(CONFIRM_PANEL_WIDTH)
@@ -3559,23 +3625,49 @@ mod tests {
     fn confirm_delete_targets_only_projects_present_in_the_snapshot() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
+        workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        workspace.open_tab(project.id, "/tmp", "two").unwrap();
         let snapshot = workspace.snapshot();
 
         assert_eq!(
             confirm_delete_target(&snapshot, project.id),
             Some(ConfirmDeleteProject {
                 project_id: project.id,
-                name: "doomed".into()
+                name: "doomed".into(),
+                tab_count: 2,
             })
         );
         assert_eq!(confirm_delete_target(&snapshot, 0), None);
         assert_eq!(confirm_delete_target(&snapshot, project.id + 1), None);
     }
 
+    /// The dialog quotes the Mac's `closeActiveProject` alert verbatim
+    /// (App.swift:3145-3182), plural "tabs" and all — the Mac has no
+    /// singular form, so neither do we.
+    #[test]
+    fn the_confirm_body_reads_exactly_as_the_mac_alert_does() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("polish", "/tmp").unwrap();
+        workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        let snapshot = workspace.snapshot();
+        let confirm = confirm_delete_target(&snapshot, project.id).expect("target");
+
+        assert_eq!(format!("Close {}?", confirm.name), "Close polish?");
+        assert_eq!(
+            format!(
+                "This will close {} tabs in this project. The action can't be undone.",
+                confirm.tab_count
+            ),
+            "This will close 1 tabs in this project. The action can't be undone."
+        );
+    }
+
     #[test]
     fn a_confirm_whose_project_vanished_externally_is_auto_dismissed() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
+        let tab = workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        workspace.open_tab(project.id, "/tmp", "two").unwrap();
         let snapshot = workspace.snapshot();
         let mut confirm = confirm_delete_target(&snapshot, project.id);
 
@@ -3590,9 +3682,40 @@ mod tests {
             "an external rename must relabel the open confirm"
         );
 
+        workspace.close_tab(tab.id).unwrap();
+        reconcile_confirm_delete(&mut confirm, &workspace.snapshot());
+        assert_eq!(
+            confirm.as_ref().map(|confirm| confirm.tab_count),
+            Some(1),
+            "a tab closing under the open dialog must not leave it quoting a stale count"
+        );
+
         workspace.delete_project(project.id).unwrap();
         reconcile_confirm_delete(&mut confirm, &workspace.snapshot());
         assert_eq!(confirm, None);
+    }
+
+    #[test]
+    fn losing_window_focus_drops_gestures_and_ime_but_never_the_delete_confirm() {
+        let unfocus = focus_teardown(false);
+        assert!(
+            !unfocus.confirm_delete,
+            "the delete confirmation outlives an unfocus — dropping it read as a crash"
+        );
+        assert!(unfocus.drags, "a drag cannot continue under another window");
+        assert!(unfocus.rename_completion_key);
+        assert!(unfocus.ime_composition);
+        assert!(!unfocus.ime_discard);
+
+        let refocus = focus_teardown(true);
+        assert_eq!(
+            refocus,
+            FocusTeardown {
+                ime_discard: true,
+                ..FocusTeardown::default()
+            },
+            "refocus only disarms the IME discard latch"
+        );
     }
 
     #[test]

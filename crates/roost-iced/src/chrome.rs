@@ -1,7 +1,8 @@
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 use iced::advanced::text::{self as advanced_text, Paragraph as _};
-use iced::widget::{button, container, scrollable, text_input};
+use iced::widget::{button, container, image, scrollable, text_input};
 use iced::{Background, Border, Color, Font, Pixels, Shadow, Size, Theme, Vector};
 
 /// One application-owned band height keeps the sidebar header and tab strip
@@ -107,6 +108,39 @@ pub fn chrome_font(weight: iced::font::Weight) -> Font {
         weight,
         ..Font::default()
     }
+}
+
+/// The app icon, embedded from the very PNG the Linux package installs into
+/// hicolor. An `NSAlert` gets the app icon for free from the bundle; iced has
+/// no bundle to read one from on either platform, so the bytes ride along
+/// like the Inter faces do.
+const APP_ICON_PNG: &[u8] =
+    include_bytes!("../../../packaging/icons/hicolor/256x256/apps/roost.png");
+
+/// Icon edge in the confirm dialog, matching the 64pt `NSAlert` draws.
+pub const APP_ICON_SIZE: f32 = 64.0;
+
+/// Decoded once and cloned: `Handle::from_rgba` mints a fresh id per call, so
+/// building the handle inside `view` would re-upload the texture every frame.
+static APP_ICON: LazyLock<Option<image::Handle>> = LazyLock::new(decode_app_icon);
+
+/// `None` only if the embedded asset stops being 8-bit RGBA, in which case
+/// the dialog simply renders without an icon (pinned by a unit test).
+pub fn app_icon() -> Option<image::Handle> {
+    APP_ICON.clone()
+}
+
+fn decode_app_icon() -> Option<image::Handle> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(APP_ICON_PNG))
+        .read_info()
+        .ok()?;
+    if reader.output_color_type() != (png::ColorType::Rgba, png::BitDepth::Eight) {
+        return None;
+    }
+    let mut pixels = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    pixels.truncate(info.buffer_size());
+    Some(image::Handle::from_rgba(info.width, info.height, pixels))
 }
 
 /// The tail marker an elided label ends with.
@@ -424,6 +458,25 @@ fn chrome_button(selected: Option<Color>, status: button::Status, radius: f32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The confirm dialog silently drops the icon if the embedded asset ever
+    /// stops being 8-bit RGBA, so the decode gets pinned here instead.
+    #[test]
+    fn the_embedded_app_icon_decodes_to_rgba_pixels() {
+        let handle = app_icon().expect("the embedded app icon decodes");
+        match handle {
+            image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            } => {
+                assert_eq!((width, height), (256, 256));
+                assert_eq!(pixels.len(), 256 * 256 * 4);
+            }
+            other => panic!("expected decoded pixels, got {other:?}"),
+        }
+    }
 
     #[test]
     fn active_rows_and_pills_use_roost_selection_colors() {
