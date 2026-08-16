@@ -325,7 +325,10 @@ class BundlePidVerificationTests(unittest.TestCase):
         open_argv = run.call_args_list[0].args[0]
         self.assertEqual(open_argv[0], "open")
         self.assertIn("ROOST_TEST_MODE=1", open_argv)
-        self.assertIn("RUST_LOG=debug", open_argv)
+        # A filter that doesn't name roost_iced gets the info floor: the
+        # launch path asserts the INFO-level identity line, so a session
+        # RUST_LOG=warn (CI's e2e default) must not silence it.
+        self.assertIn("RUST_LOG=debug,roost_iced=info", open_argv)
         self.assertFalse(
             any(arg.startswith("ROOST_BUNDLE_PROFILE=") for arg in open_argv),
             f"ROOST_BUNDLE_PROFILE must never be forwarded into the bundle "
@@ -334,6 +337,35 @@ class BundlePidVerificationTests(unittest.TestCase):
         )
         assert_identity.assert_called_once()
         assert_canary.assert_called_once_with("iced")
+
+    def _launch_argv_with_env(self, env: dict[str, str]) -> list[str]:
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("ui._iced_bundle_ui_log_path", return_value=Path(tempfile.mktemp())),
+            patch("ui.subprocess.run") as run,
+            patch("ui.wait_alive"),
+            patch("ui._answering_pid", return_value=4242),
+            patch(
+                "ui._process_command",
+                return_value="/Applications/Roost-Iced.app/Contents/MacOS/Roost-Iced",
+            ),
+            patch("ui._assert_bundle_identity_logged"),
+            patch("ui._assert_test_mode_canary"),
+        ):
+            try:
+                ui._launch_iced_bundle(Path("/Applications/Roost-Iced.app"))
+            finally:
+                ui._ICED_BUNDLE_PID = None
+        return run.call_args_list[0].args[0]
+
+    def test_an_explicit_roost_iced_rust_log_is_kept_verbatim(self) -> None:
+        argv = self._launch_argv_with_env({"RUST_LOG": "warn,roost_iced=debug"})
+        self.assertIn("RUST_LOG=warn,roost_iced=debug", argv)
+        self.assertFalse(any("roost_iced=info" in a for a in argv))
+
+    def test_unset_rust_log_is_not_forwarded(self) -> None:
+        argv = self._launch_argv_with_env({})
+        self.assertFalse(any(a.startswith("RUST_LOG=") for a in argv))
 
     def test_executable_outside_the_bundle_refuses_to_adopt_the_pid(self) -> None:
         """Same executable *name* as the bundle, but not living inside it —

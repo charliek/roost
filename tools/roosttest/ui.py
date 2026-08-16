@@ -843,8 +843,18 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
     # Deliberately NOT forwarded: ROOST_BUNDLE_PROFILE — the bundle-id-derived
     # default profile (W3) is the thing this launch path exists to exercise;
     # forwarding an override would bypass the very path under test.
-    for name in ("ROOST_TEST_MODE", "RUST_LOG", "ROOST_TEST_TIMEOUT_SCALE", "ICED_BACKEND"):
+    for name in ("ROOST_TEST_MODE", "ROOST_TEST_TIMEOUT_SCALE", "ICED_BACKEND"):
         _forward_env(argv, name)
+    # RUST_LOG is forwarded with a floor: the launch path asserts the
+    # INFO-level "resolved bundle identity" line after boot, so a session
+    # filter like RUST_LOG=warn (CI's default for e2e steps) must not
+    # silence the very line the assertion requires. Anything already
+    # naming roost_iced keeps the operator's explicit choice.
+    rust_log = os.environ.get("RUST_LOG")
+    if rust_log is not None:
+        if "roost_iced" not in rust_log:
+            rust_log = f"{rust_log},roost_iced=info"
+        argv += ["--env", f"RUST_LOG={rust_log}"]
     argv += [str(app)]
     subprocess.run(argv, check=True)
 
