@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use iced::advanced::text::{self as advanced_text, Paragraph as _};
 use iced::widget::{button, container, image, text_input};
@@ -212,8 +213,10 @@ pub fn text_width(content: &str, font: Font, size: f32) -> f32 {
 /// rendering fault — so the string itself is shortened and marked, the way
 /// the Mac's tab pills show `/Users/charliek/project…`.
 pub fn elide_to_width(content: &str, font: Font, size: f32, max_width: f32) -> (Cow<'_, str>, f32) {
+    let started = Instant::now();
     let full = text_width(content, font, size);
     if full <= max_width {
+        crate::perf::record_elide(started.elapsed());
         return (Cow::Borrowed(content), full);
     }
     // Cut points are char boundaries: no grapheme segmenter is in the
@@ -237,12 +240,14 @@ pub fn elide_to_width(content: &str, font: Font, size: f32, max_width: f32) -> (
             high = mid;
         }
     }
-    match best {
+    let result = match best {
         Some((elided, width)) => (Cow::Owned(elided), width),
         // Not even the marker fits. Drawing it anyway keeps the pill
         // honest about having dropped something.
         None => (Cow::Borrowed(ELLIPSIS), text_width(ELLIPSIS, font, size)),
-    }
+    };
+    crate::perf::record_elide(started.elapsed());
+    result
 }
 
 pub fn band(_: &Theme) -> container::Style {

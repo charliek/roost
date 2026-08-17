@@ -6,13 +6,14 @@ Measures the **cost** of the Iced UI's render path — not correctness.
 that ladder: those three verify *behavior*; this measures *how much CPU
 work it took*.
 
-Two readouts, backed by the counters `crates/roost-iced/src/perf.rs`
+Three readouts, backed by the counters `crates/roost-iced/src/perf.rs`
 instruments:
 
 | Readout | What it reads | Needs a running UI? |
 |---|---|---|
 | `cargo test -p roost-iced --release -- --ignored --nocapture` | Per-tab `TabRenderStats` (`refresh_calls`, `refresh_nanos`, `rows_rebuilt`, `cells_walked`) | No — an in-crate `#[ignore]`d test |
 | `tools/perf/render-stats.sh <target>` (→ `roostctl render-stats`) | The process-global aggregate, same fields plus `draw_calls` / `draw_nanos` / `fill_text_calls` | Yes |
+| `tools/perf/echo-latency.py` | `view_calls` / `view_nanos` / `elide_calls` / `elide_nanos` — the `App::view()` rebuild and its `chrome::elide_to_width` tab-pill eliding (plan 029, the F1 typing-latency regression) | Yes |
 
 ## The in-crate test: `cargo test -p roost-iced --release -- --ignored --nocapture`
 
@@ -113,6 +114,53 @@ This is the *only* way to read `draw_calls` / `draw_nanos` /
 running UI has. `refresh_*` / `rows_rebuilt` / `cells_walked` are also
 available here (same fields the in-crate test prints), aggregated across
 every tab in the process rather than per-tab.
+
+## The typing-latency probe: `tools/perf/echo-latency.py`
+
+```bash
+tools/perf/echo-latency.py                                       # attach to the running dev-profile iced UI
+tools/perf/echo-latency.py --socket /path/to/roost.sock           # attach elsewhere
+tools/perf/echo-latency.py --launch target/debug/roost-iced       # quit + launch + probe a specific binary
+tools/perf/echo-latency.py --launch target/release/roost-iced     # same, release profile
+```
+
+Python 3 stdlib only, no build/run of its own. Opens a scratch `/bin/cat`
+tab titled `echo-latency-probe`, lets it settle for 2s, resets
+`app.render_stats`, drives ~240 single-character `tab.write` echoes at
+~30/s, reads `app.render_stats` again, and prints one JSON line:
+
+```json
+{"view_calls": 240, "view_avg_us": 163.8, "elide_calls": 0,
+ "elide_avg_us_per_view": 0.0, "keystrokes": 240}
+```
+
+`view_avg_us` is `view_nanos / view_calls`, converted to microseconds —
+the per-keystroke cost of `App::view()`. `elide_avg_us_per_view` is the
+time `chrome::elide_to_width` spent *per `view()` call* (not per elide
+call): near-zero means the memoized tab-pill cache (plan 029 C2) is
+serving hits; a value close to `view_avg_us` means every keystroke is
+re-shaping every pill's title, which is the F1 regression this probe
+exists to catch. The scratch tab is always closed in a `finally` block,
+and a `--launch`ed process is always terminated, even on error.
+
+**Note on methodology**: `tab.write` over IPC is a `UiRequest`, which
+marks the iced UI's event batch dirty and forces a `reconcile()` on
+every keystroke — unlike a real winit keystroke, which does not
+(`crates/roost-iced/src/engine_feed.rs`). This makes the IPC path
+*stricter* than real typing (every keystroke pays the full reconcile +
+view cost), which is why the guard and this probe both ride it rather
+than trying to synthesize real key events.
+
+**Caveat — absolute numbers are not portable.** They depend on the
+machine, the build profile (debug vs. release; whether
+`[profile.dev.package."*"]` opt-level tuning is present), and the
+profile's existing tab-pill titles (a long title elides to more
+candidate widths than a short one). Never compare a number from this
+probe against a number from a different machine, a different day, or a
+cited figure in a plan doc. The signal is the **A/B delta on one
+machine, one run to the next** — run it before and after a change,
+same binary build flow, same existing tabs, and diff the two JSON
+lines.
 
 ## Two traps to know about before trusting a number
 

@@ -1943,8 +1943,10 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        let started = Instant::now();
         let content = self.view_body();
         let Some(confirm) = &self.confirm_delete else {
+            crate::perf::record_view(started.elapsed());
             return content;
         };
         // Copy and structure follow the Mac's `closeActiveProject` NSAlert
@@ -2002,10 +2004,12 @@ impl App {
             .center(Fill);
         let catcher = mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
             .on_press(Message::ConfirmDeleteCancel);
-        stack![content, catcher, overlay]
+        let result = stack![content, catcher, overlay]
             .width(Fill)
             .height(Fill)
-            .into()
+            .into();
+        crate::perf::record_view(started.elapsed());
+        result
     }
 
     fn view_body(&self) -> Element<'_, Message> {

@@ -66,3 +66,13 @@ pub(crate) fn record_refresh(elapsed: Duration, rows_rebuilt: u64, cells_walked:
 pub(crate) fn record_draw(elapsed: Duration, fill_text_calls: u64) {
     AGGREGATE.record_draw(elapsed, fill_text_calls);
 }
+
+/// Fold one `App::view()` call into the global aggregate.
+pub(crate) fn record_view(elapsed: Duration) {
+    AGGREGATE.record_view(elapsed);
+}
+
+/// Fold one `chrome::elide_to_width` call into the global aggregate.
+pub(crate) fn record_elide(elapsed: Duration) {
+    AGGREGATE.record_elide(elapsed);
+}

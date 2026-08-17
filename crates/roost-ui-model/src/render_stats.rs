@@ -23,6 +23,10 @@ pub struct RenderStats {
     pub draw_calls: u64,
     pub draw_nanos: u64,
     pub fill_text_calls: u64,
+    pub view_calls: u64,
+    pub view_nanos: u64,
+    pub elide_calls: u64,
+    pub elide_nanos: u64,
 }
 
 /// Per-tab counters, folded into a UI's global aggregate on every
@@ -68,6 +72,10 @@ pub struct RenderStatsAggregate {
     draw_calls: AtomicU64,
     draw_nanos: AtomicU64,
     fill_text_calls: AtomicU64,
+    view_calls: AtomicU64,
+    view_nanos: AtomicU64,
+    elide_calls: AtomicU64,
+    elide_nanos: AtomicU64,
 }
 
 impl RenderStatsAggregate {
@@ -80,6 +88,10 @@ impl RenderStatsAggregate {
             draw_calls: AtomicU64::new(0),
             draw_nanos: AtomicU64::new(0),
             fill_text_calls: AtomicU64::new(0),
+            view_calls: AtomicU64::new(0),
+            view_nanos: AtomicU64::new(0),
+            elide_calls: AtomicU64::new(0),
+            elide_nanos: AtomicU64::new(0),
         }
     }
 
@@ -93,6 +105,10 @@ impl RenderStatsAggregate {
             draw_calls: self.draw_calls.load(Ordering::Relaxed),
             draw_nanos: self.draw_nanos.load(Ordering::Relaxed),
             fill_text_calls: self.fill_text_calls.load(Ordering::Relaxed),
+            view_calls: self.view_calls.load(Ordering::Relaxed),
+            view_nanos: self.view_nanos.load(Ordering::Relaxed),
+            elide_calls: self.elide_calls.load(Ordering::Relaxed),
+            elide_nanos: self.elide_nanos.load(Ordering::Relaxed),
         }
     }
 
@@ -106,6 +122,10 @@ impl RenderStatsAggregate {
         self.draw_calls.store(0, Ordering::Relaxed);
         self.draw_nanos.store(0, Ordering::Relaxed);
         self.fill_text_calls.store(0, Ordering::Relaxed);
+        self.view_calls.store(0, Ordering::Relaxed);
+        self.view_nanos.store(0, Ordering::Relaxed);
+        self.elide_calls.store(0, Ordering::Relaxed);
+        self.elide_nanos.store(0, Ordering::Relaxed);
     }
 
     /// Fold one refresh (walk / cache-rebuild) phase into the aggregate.
@@ -124,5 +144,20 @@ impl RenderStatsAggregate {
             .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
         self.fill_text_calls
             .fetch_add(fill_text_calls, Ordering::Relaxed);
+    }
+
+    /// Fold one `App::view()` call into the aggregate.
+    pub fn record_view(&self, elapsed: Duration) {
+        Self::fold(&self.view_calls, &self.view_nanos, elapsed);
+    }
+
+    /// Fold one `elide_to_width` call into the aggregate.
+    pub fn record_elide(&self, elapsed: Duration) {
+        Self::fold(&self.elide_calls, &self.elide_nanos, elapsed);
+    }
+
+    fn fold(calls: &AtomicU64, nanos: &AtomicU64, elapsed: Duration) {
+        calls.fetch_add(1, Ordering::Relaxed);
+        nanos.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
     }
 }

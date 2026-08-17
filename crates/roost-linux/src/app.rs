@@ -1169,6 +1169,14 @@ impl App {
                                 draw_calls: stats.draw_calls as i64,
                                 draw_nanos: stats.draw_nanos as i64,
                                 fill_text_calls: stats.fill_text_calls as i64,
+                                // GTK never calls view()/elide_to_width (those
+                                // are iced-only) — these stay 0 because the
+                                // aggregate they're read from is never fed,
+                                // not because they're hardcoded here.
+                                view_calls: stats.view_calls as i64,
+                                view_nanos: stats.view_nanos as i64,
+                                elide_calls: stats.elide_calls as i64,
+                                elide_nanos: stats.elide_nanos as i64,
                             }));
                         }
                         UiRequest::SidebarDump { reply } => {

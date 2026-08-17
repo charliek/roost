@@ -242,6 +242,13 @@ fn render_stats_vector_decodes_into_its_typed_params() {
     assert_eq!(result.draw_calls, 377);
     assert_eq!(result.draw_nanos, 94_250_000);
     assert_eq!(result.fill_text_calls, 9_048);
+    // The fixture deliberately omits view_*/elide_* — it models the mac
+    // Swift handler's response, which doesn't send them — so decoding it
+    // must default those fields to 0 rather than fail.
+    assert_eq!(result.view_calls, 0);
+    assert_eq!(result.view_nanos, 0);
+    assert_eq!(result.elide_calls, 0);
+    assert_eq!(result.elide_nanos, 0);
 }
 
 #[test]
