@@ -601,6 +601,33 @@ class Roost:
         ROOST_TEST_MODE=1, macOS-iced-only, same as `app_dock_badge`."""
         self.call("app.menu_activate", {"path": path})
 
+    def app_update_status(self) -> dict:
+        """Read back the macOS iced UI's Sparkle updater state:
+        `{"framework_loaded": bool, "updater": "started"|"unavailable",
+        "reason": str|None, "check_id": int, "last_check": None |
+        {"outcome": "found"|"none"|"error", "version": str|None,
+        "detail": str|None}}`.
+
+        `check_id` increments once per completed check, so callers
+        condition-wait on it advancing rather than on `last_check`
+        becoming non-null — otherwise a poll can pass on the previous
+        check's result. Gated by ROOST_TEST_MODE=1, macOS-iced-only,
+        same as `app_dock_badge`."""
+        return self.call("app.update_status", {})
+
+    def app_update_check(self) -> None:
+        """Start a non-interactive Sparkle check
+        (`checkForUpdateInformation` — no UI, no download). Returns as
+        soon as the check is dispatched; the result lands in
+        `app_update_status` via the updater delegate, so callers
+        condition-wait on `check_id` advancing.
+
+        Raises `RoostError('internal')` when the updater is unavailable
+        (no framework beside the executable, or it refused to start).
+        Gated by ROOST_TEST_MODE=1, macOS-iced-only, same as
+        `app_dock_badge`."""
+        self.call("app.update_check", {})
+
     def tab_expand_selection_at(
         self,
         tab_id: int,

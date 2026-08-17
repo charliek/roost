@@ -1136,6 +1136,23 @@ impl App {
                                     .into(),
                             ));
                         }
+                        // Sparkle is the macOS updater, and this UI never
+                        // loads it — same reasoning as `AppDockBadge`:
+                        // reject rather than answer a plausible
+                        // "unavailable", which would pass a test that
+                        // never exercised the seam.
+                        UiRequest::AppUpdateStatus { reply } => {
+                            let _ = reply.send(Err(
+                                "app.update_status is not supported on this UI (macOS iced only)"
+                                    .into(),
+                            ));
+                        }
+                        UiRequest::AppUpdateCheck { reply } => {
+                            let _ = reply.send(Err(
+                                "app.update_check is not supported on this UI (macOS iced only)"
+                                    .into(),
+                            ));
+                        }
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
                         }

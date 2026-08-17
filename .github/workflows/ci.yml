@@ -621,6 +621,7 @@ jobs:
           tools/roosttest/test_mouse_tracking.py
           tools/roosttest/test_dock_badge.py
           tools/roosttest/test_menu_bar.py
+          tools/roosttest/test_sparkle.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
@@ -715,6 +716,7 @@ jobs:
           tools/roosttest/test_mouse_tracking.py
           tools/roosttest/test_dock_badge.py
           tools/roosttest/test_menu_bar.py
+          tools/roosttest/test_sparkle.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
@@ -778,6 +780,7 @@ jobs:
           tools/roosttest/test_mouse_tracking.py
           tools/roosttest/test_dock_badge.py
           tools/roosttest/test_menu_bar.py
+          tools/roosttest/test_sparkle.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
@@ -1025,6 +1028,44 @@ jobs:
           tools/roosttest/test_smoke.py
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_menu_bar.py
+          --roost-target iced --roost-fresh -v
+
+      # Deliberately AFTER the keyless assemble + its assertion block:
+      # this step re-assembles mac/build/Roost-Iced.app in place, with
+      # the fixture's TEST-ONLY SUPublicEDKey and a dead placeholder
+      # SUFeedURL, so the shipped-posture assertions above must already
+      # have run against the keyless bundle. Mirrors `make
+      # e2e-iced-sparkle` (plan 028 § 3.11); cargo artifacts are already
+      # built, so the re-assemble is cheap.
+      - name: Assemble test-keyed Roost-Iced.app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          ROOST_ICED_SPARKLE_FEED_URL: http://127.0.0.1:1/placeholder
+        run: |
+          set -euo pipefail
+          key_file=tools/roosttest/fixtures/sparkle/TEST-ONLY-public-ed-key.txt
+          test -f "$key_file" || { echo "missing $key_file"; exit 1; }
+          ROOST_ICED_SPARKLE_ED_PUBLIC_KEY="$(cat "$key_file")" \
+            ./mac/scripts/bundle-iced.sh debug
+          plist="mac/build/Roost-Iced.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" >/dev/null \
+            || { echo "FAIL: test-keyed bundle has no SUPublicEDKey"; exit 1; }
+          echo "OK: test-keyed bundle carries SUFeedURL + SUPublicEDKey"
+
+      - name: Run Iced Sparkle E2E (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_ICED_APP: mac/build/Roost-Iced.app
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-sparkle-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-sparkle-logs
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_sparkle.py
           --roost-target iced --roost-fresh -v
 
       - name: Collect Iced diagnostics

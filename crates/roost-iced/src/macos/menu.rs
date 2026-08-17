@@ -58,6 +58,13 @@ pub(crate) enum MenuEvent {
     SelectProject(i64),
     /// A Window-menu tab row, by stable tab id — same reasoning.
     SelectTab(i64),
+    /// The App menu's "Check for Updates…". Like [`MenuEvent::Quit`] it
+    /// is deliberately outside the command gating: Swift's item targets
+    /// the updater controller, not the app delegate, so its
+    /// `validateMenuItem` self-targeting gate never sees it. What DOES
+    /// gate it is the updater's own `canCheckForUpdates`
+    /// ([`sync_update_item`]).
+    CheckForUpdates,
 }
 
 /// Which surface currently owns the keyboard, as far as the menu bar
@@ -254,6 +261,10 @@ struct MainMenu {
     /// The Window menu, kept because its rows are rebuilt in place
     /// whenever the workspace's projects or tabs move.
     window: Retained<NSMenu>,
+    /// "Check for Updates…", kept because its enabled state tracks the
+    /// Sparkle updater rather than the keyboard route — the one item
+    /// [`sync_gating`] must never touch.
+    updates: Retained<NSMenuItem>,
     /// Indexed by the item's tag.
     events: Vec<MenuEvent>,
     /// Tags below this belong to the static menus and never move. A
@@ -373,6 +384,24 @@ pub(crate) fn sync_gating(gating: MenuGating, _mtm: MainThreadMarker) {
     });
 }
 
+/// Push the Sparkle updater's readiness onto "Check for Updates…".
+///
+/// Its own axis, deliberately separate from [`sync_gating`]: the item is
+/// ungated by the keyboard route (Quit's reasoning — Swift's version
+/// targets the updater controller, which `validateMenuItem` never
+/// gates), and gated instead by `SPUUpdater.canCheckForUpdates`, which
+/// is false both when no updater started and while a check is already
+/// in flight (plan 028 § 3.8).
+pub(crate) fn sync_update_item(_mtm: MainThreadMarker, can_check: bool) {
+    MENU.with(|cell| {
+        let slot = cell.borrow();
+        let Some(menu) = slot.as_ref() else {
+            return;
+        };
+        menu.updates.setEnabled(can_check);
+    });
+}
+
 fn build(
     mtm: MainThreadMarker,
     app_name: &str,
@@ -385,6 +414,7 @@ fn build(
         target,
         root: submenu(mtm, ""),
         window: submenu(mtm, "Window"),
+        updates: plain_item(mtm, "Check for Updates\u{2026}"),
         events: Vec::new(),
         static_events: 0,
         gated: Vec::new(),
@@ -401,10 +431,16 @@ fn build(
         sel!(orderFrontStandardAboutPanel:),
         None,
     ));
-    // Present but inert: 6c wires it to Sparkle. A disabled item with no
-    // action is exactly what Swift renders when its updater failed to
-    // start (`App.swift:3950-3956`, nil target).
-    app_menu.addItem(&disabled_item(mtm, "Check for Updates\u{2026}"));
+    // Born disabled: the Sparkle seam initializes AFTER the menu install
+    // (both from `window_opened`), so nothing yet knows whether there is
+    // an updater to check with. `sync_update_item` is what turns it on —
+    // and in a bare-binary build, never does, which is precisely Swift's
+    // "updater failed to start ⇒ greyed item" behavior
+    // (`App.swift:3950-3956`, nil target).
+    let updates = menu.updates.clone();
+    updates.setEnabled(false);
+    bind_event(&mut menu, &updates, MenuEvent::CheckForUpdates);
+    app_menu.addItem(&updates);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&standard_item(
         mtm,
@@ -679,8 +715,7 @@ fn plain_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
 }
 
 /// An item that is permanently dead: no action, no key equivalent, and no
-/// entry in `gated`, so nothing ever re-enables it (Cut, Select All,
-/// Check for Updates…).
+/// entry in `gated`, so nothing ever re-enables it (Cut, Select All).
 fn disabled_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
     let item = plain_item(mtm, title);
     item.setEnabled(false);
@@ -785,11 +820,11 @@ fn dump_item(menu: &MainMenu, item: &NSMenuItem) -> Result<MenuItemDump, String>
     };
     let key_equivalent = item.keyEquivalent().to_string();
     // AppKit's `keyEquivalentModifierMask` defaults to Command even on an
-    // item that never had a key equivalent set at all (`disabled_item`'s
-    // Cut/Select All/Check for Updates…, which never call
-    // `set_key_equivalent`) — a phantom modifier on a nonexistent
-    // shortcut. Report no modifiers when there is no key to modify,
-    // rather than leaking that AppKit default into the wire contract.
+    // item that never had a key equivalent set at all (Cut, Select All and
+    // Check for Updates…, none of which call `set_key_equivalent`) — a
+    // phantom modifier on a nonexistent shortcut. Report no modifiers when
+    // there is no key to modify, rather than leaking that AppKit default
+    // into the wire contract.
     let modifiers = if key_equivalent.is_empty() {
         Vec::new()
     } else {
@@ -835,7 +870,7 @@ fn modifier_names(mask: NSEventModifierFlags) -> Vec<String> {
 /// The wire `action` for an item: our own bound events resolve
 /// through [`MainMenu::events`] by tag; a nil-target AppKit standard
 /// item reports its selector; anything else (an inert item — Cut,
-/// Select All, Check for Updates…) has none.
+/// Select All) has none.
 fn item_action_name(menu: &MainMenu, item: &NSMenuItem) -> Option<String> {
     if is_our_target(menu, item) {
         let index = usize::try_from(item.tag()).ok()?;
@@ -863,6 +898,7 @@ fn menu_event_wire_name(event: &MenuEvent) -> String {
     match event {
         MenuEvent::Action(action) => action.to_wire_name(),
         MenuEvent::Quit => "quit".into(),
+        MenuEvent::CheckForUpdates => "check_for_updates".into(),
         MenuEvent::SelectProject(id) => format!("select_project:{id}"),
         MenuEvent::SelectTab(id) => format!("select_tab:{id}"),
     }

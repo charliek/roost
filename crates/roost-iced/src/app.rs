@@ -30,9 +30,9 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AppMenuDumpResult, AppRenderStatsResult, PaletteItemView, PalettePresentResult,
-    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult,
-    WindowMetricsResult,
+    AppMenuDumpResult, AppRenderStatsResult, AppUpdateStatusResult, PaletteItemView,
+    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
+    SidebarDumpResult, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;
@@ -1081,6 +1081,11 @@ pub struct App {
     /// moved no project or tab never touches AppKit.
     #[cfg(target_os = "macos")]
     menu_window_rows: crate::macos::menu::WindowRows,
+    /// `SPUUpdater.canCheckForUpdates` as last pushed onto the "Check
+    /// for Updates…" item. `None` before the first push, so boot writes
+    /// the item's state even when it is already correct.
+    #[cfg(target_os = "macos")]
+    menu_can_check_updates: Option<bool>,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -1252,6 +1257,8 @@ impl App {
             menu_gating: crate::macos::menu::MenuGating::default(),
             #[cfg(target_os = "macos")]
             menu_window_rows: crate::macos::menu::WindowRows::default(),
+            #[cfg(target_os = "macos")]
+            menu_can_check_updates: None,
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -1290,6 +1297,10 @@ impl App {
             id,
         );
         self.install_main_menu();
+        // After the menu install, so the "Check for Updates…" item
+        // already exists for the readiness push below (plan 028 § 3.8).
+        self.init_sparkle();
+        self.sync_update_menu_item();
         // A freshly installed menu has no Window rows yet, and the next
         // reconcile may be a while off (nothing forces one on the turn a
         // window opens).
@@ -1773,6 +1784,18 @@ impl App {
             // targeting the app delegate, not `NSApplication`'s Quit).
             MenuEvent::Quit => {
                 self.exit_state.request();
+                UiTask::None
+            }
+            // Ungated for Quit's reason, and additionally guarded by the
+            // updater itself: the item is only enabled while
+            // `canCheckForUpdates` holds, and Sparkle re-checks that on
+            // its own side. Everything past this point — panels, errors,
+            // the download flow — is Sparkle's UI, not ours.
+            MenuEvent::CheckForUpdates => {
+                if let Some(mtm) = servicing::seam_on_main("interactive update check") {
+                    crate::macos::sparkle::check_for_updates(mtm);
+                    self.sync_update_menu_item();
+                }
                 UiTask::None
             }
         }

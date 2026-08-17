@@ -843,7 +843,16 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
     # Deliberately NOT forwarded: ROOST_BUNDLE_PROFILE — the bundle-id-derived
     # default profile (W3) is the thing this launch path exists to exercise;
     # forwarding an override would bypass the very path under test.
-    for name in ("ROOST_TEST_MODE", "ROOST_TEST_TIMEOUT_SCALE", "ICED_BACKEND"):
+    # `ROOST_SPARKLE_FEED_URL` is the Sparkle lane's loopback appcast
+    # (test_sparkle.py binds a port at import time, before this launch).
+    # It only takes effect in the bundle when ROOST_TEST_MODE=1 was
+    # forwarded too — the seam checks both (plan 028 § 3.9).
+    for name in (
+        "ROOST_TEST_MODE",
+        "ROOST_TEST_TIMEOUT_SCALE",
+        "ICED_BACKEND",
+        "ROOST_SPARKLE_FEED_URL",
+    ):
         _forward_env(argv, name)
     # RUST_LOG is forwarded with a floor: the launch path asserts the
     # INFO-level "resolved bundle identity" line after boot, so a session

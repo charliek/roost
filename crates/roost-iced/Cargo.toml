@@ -72,6 +72,11 @@ unicode-width = { workspace = true }
 # must move with THAT pair: a bump that shifts objc2-core-foundation's
 # major would otherwise resolve a second copy of the crate into the lock.
 [target.'cfg(target_os = "macos")'.dependencies]
+# `dlopen`/`dlerror` for the Sparkle seam (plan 028 § 3.8) — the
+# framework is loaded at runtime from inside the bundle, never linked,
+# so no build machinery may depend on it. Already in the workspace's
+# graph via roost-ipc + roost-engine.
+libc = "0.2"
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "CFBundle",

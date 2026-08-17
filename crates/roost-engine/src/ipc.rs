@@ -25,7 +25,8 @@ use roost_ipc::messages::{
     AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
     AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppRenderStatsParams,
     AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams,
-    ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
+    AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult, ClipboardDumpParams,
+    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
     NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
     PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
     PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
@@ -373,6 +374,19 @@ pub enum UiRequest {
     /// takes. Gated + macOS-iced-only like `AppDockBadge`.
     AppMenuActivate {
         path: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// `app.update_status` — read back the macOS iced UI's Sparkle
+    /// updater state (framework loaded, updater started, last completed
+    /// check). Gated + macOS-iced-only like `AppDockBadge`.
+    AppUpdateStatus {
+        reply: tokio::sync::oneshot::Sender<Result<AppUpdateStatusResult, String>>,
+    },
+    /// `app.update_check` — start a non-interactive
+    /// `checkForUpdateInformation` on the Sparkle updater. Results land
+    /// in `AppUpdateStatus`. Gated + macOS-iced-only like
+    /// `AppDockBadge`.
+    AppUpdateCheck {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
@@ -1139,6 +1153,21 @@ async fn dispatch(
             })
             .await?
             .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::APP_UPDATE_STATUS => {
+            let _: AppUpdateStatusParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppUpdateStatus { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&result)
+        }
+        ops::APP_UPDATE_CHECK => {
+            let _: AppUpdateCheckParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::AppUpdateCheck { reply })
+                .await?
+                .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
         ops::EVENTS_SUBSCRIBE => {

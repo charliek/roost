@@ -37,6 +37,7 @@ import os
 import re
 import sys
 import uuid
+from unittest.mock import ANY
 
 import pytest
 
@@ -49,6 +50,10 @@ TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 # the App menu's title is set to this at install time, so no separate
 # CFBundleName-substitution case exists to test.
 APP = "Roost-Iced"
+
+# The Sparkle item, shared with `test_sparkle.py` — the two modules pin
+# different halves of it (binding here, enabled state there).
+UPDATES_ITEM = "Check for Updates…"
 
 
 @pytest.fixture(autouse=True)
@@ -89,7 +94,11 @@ _WINDOW_STATIC_TAIL_TITLES = {"Minimize", "Zoom"}
 STATIC_MENUS: dict[str, list[tuple | None]] = {
     APP: [
         (f"About {APP}", "", [], True, "appkit:orderFrontStandardAboutPanel:"),
-        ("Check for Updates…", "", [], False, None),
+        # `ANY` for exactly one field: this item's enabled state tracks the
+        # Sparkle updater (started only in the bundle lanes, where the
+        # framework ships), not anything this module builds.
+        # `test_sparkle.py` asserts it per lane.
+        (UPDATES_ITEM, "", [], ANY, "check_for_updates"),
         None,
         (f"Hide {APP}", "h", ["super"], True, "appkit:hide:"),
         ("Hide Others", "h", ["alt", "super"], True, "appkit:hideOtherApplications:"),
@@ -237,9 +246,13 @@ class TestMenuShape:
             assert edit[title]["enabled"] is False
             assert edit[title]["key_equivalent"] == ""
 
-    def test_check_for_updates_is_disabled(self, roost):
+    def test_check_for_updates_is_bound_to_the_sparkle_seam(self, roost):
+        """Its ENABLED state is the updater's, not the menu's, so it is
+        `test_sparkle.py` that pins it per lane (plan 028 AC7). What is
+        invariant here is the binding: the item is a live custom-action
+        item, never inert."""
         app_menu = _items_by_title(_menus_by_title(roost.app_menu_dump())[APP])
-        assert app_menu["Check for Updates…"]["enabled"] is False
+        assert app_menu[UPDATES_ITEM]["action"] == "check_for_updates"
 
 
 class TestKeyEquivalents:
