@@ -172,8 +172,21 @@ def _row(item: dict) -> tuple | None:
     )
 
 
+# Items AppKit injects into our menus on its own, on SOME macOS
+# versions (CI's macos-latest injects Enter Full Screen into any menu
+# titled "View"; local macOS 26 does not). They are environment-
+# dependent OS furniture, not part of the pinned inventory — the Swift
+# app's View menu receives the same injection, so leaving them in place
+# IS parity; the tests just must not assert on their presence/absence.
+OS_INJECTED_ACTIONS = {"appkit:toggleFullScreen:"}
+
+
+def _ours(item: dict) -> bool:
+    return item.get("action") not in OS_INJECTED_ACTIONS
+
+
 def _rows(menu: dict) -> list[tuple | None]:
-    return [_row(item) for item in menu["items"]]
+    return [_row(item) for item in menu["items"] if _ours(item)]
 
 
 def _items_by_title(menu: dict) -> dict[str, dict]:
@@ -226,7 +239,7 @@ class TestMenuShape:
     def test_static_actionable_item_count_is_28_plus_minimize_zoom(self, roost):
         menus = _menus_by_title(roost.app_menu_dump())
         static_count = sum(
-            len([i for i in menus[t]["items"] if not i["separator"]])
+            len([i for i in menus[t]["items"] if not i["separator"] and _ours(i)])
             for t in (APP, "File", "View", "Edit")
         )
         assert static_count == 28
