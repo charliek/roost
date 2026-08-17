@@ -419,7 +419,10 @@ pub fn inline_rename_input(_: &Theme, status: text_input::Status) -> text_input:
         icon: MUTED_TEXT,
         placeholder: MUTED_TEXT,
         value: TEXT,
-        selection: ACCENT.scale_alpha(0.65),
+        // Opaque, matching the mac field editor's rendered selection —
+        // sampled live at RGB(0,122,255) with white glyphs (plan 029 F5);
+        // a translucent tint over the dark field reads darker than mac.
+        selection: ACCENT,
     }
 }
 
@@ -813,7 +816,7 @@ mod tests {
         let focused =
             inline_rename_input(&theme, text_input::Status::Focused { is_hovered: false });
         assert_eq!(focused.border.color, ACCENT);
-        assert_eq!(focused.selection, ACCENT.scale_alpha(0.65));
+        assert_eq!(focused.selection, ACCENT);
     }
 
     #[test]
