@@ -72,6 +72,11 @@ unicode-width = { workspace = true }
 # must move with THAT pair: a bump that shifts objc2-core-foundation's
 # major would otherwise resolve a second copy of the crate into the lock.
 [target.'cfg(target_os = "macos")'.dependencies]
+# `dlopen`/`dlerror` for the Sparkle seam (plan 028 § 3.8) — the
+# framework is loaded at runtime from inside the bundle, never linked,
+# so no build machinery may depend on it. Already in the workspace's
+# graph via roost-ipc + roost-engine.
+libc = "0.2"
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "CFBundle",
@@ -83,8 +88,9 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 # these ride the objc2 0.6 generation arboard + softbuffer already pull in
 # (winit still rides objc2 0.5) and must move with THAT pair — a bump that
 # shifts the major would resolve a second copy of the ecosystem into the
-# lock. Features are the Dock-badge consumer's minimum, not the crates'
-# defaults: `objc2-app-kit`'s `default` turns on ~250 of them.
+# lock. Features are the seam consumers' minimum, not the crates' defaults:
+# `objc2-app-kit`'s `default` turns on ~250 of them, so each consumer adds
+# only what it names.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -94,7 +100,13 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSApplication",
+    # `NSControlStateValue` — the Window menu's active-row checkmark.
+    "NSCell",
     "NSDockTile",
+    # `NSEventModifierFlags` — menu key-equivalent modifier masks.
+    "NSEvent",
+    "NSMenu",
+    "NSMenuItem",
     # `NSApplication`'s superclass; the class item does not exist without it.
     "NSResponder",
 ] }

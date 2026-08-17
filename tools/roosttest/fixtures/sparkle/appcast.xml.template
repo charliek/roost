@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Test-only Sparkle appcast for tools/roosttest/test_sparkle.py.
+
+  Rendered at test time by substituting the placeholders below and
+  served from a loopback http.server the test owns. Placeholders:
+
+    @VERSION@    the offered version (deliberately far above any real
+                 Roost version, so the check can only ever report
+                 "found" — never a version comparison that drifts as
+                 the workspace version moves)
+    @PORT@       the ephemeral port the test's server bound
+    @SIGNATURE@  the EdDSA signature attribute pair for the enclosure
+                 (`sparkle:edSignature="..." length="..."`), or empty
+                 when the unsigned arm is in use — see README.md
+
+  The enclosure is never downloaded: `app.update_check` drives
+  `checkForUpdateInformation`, which stops after the version
+  comparison.
+-->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Roost-Iced Test Appcast</title>
+    <link>http://127.0.0.1:@PORT@/appcast.xml</link>
+    <description>TEST-ONLY appcast served from loopback by the roosttest suite.</description>
+    <language>en</language>
+    <item>
+      <title>Version @VERSION@</title>
+      <pubDate>Mon, 16 Aug 2027 12:00:00 +0000</pubDate>
+      <sparkle:version>@VERSION@</sparkle:version>
+      <sparkle:shortVersionString>@VERSION@</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <enclosure url="http://127.0.0.1:@PORT@/Roost-Iced-@VERSION@.zip"
+                 sparkle:os="macos"
+                 type="application/octet-stream"@SIGNATURE@ />
+    </item>
+  </channel>
+</rss>

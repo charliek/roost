@@ -708,6 +708,164 @@ answer `not-implemented`. There is no Dock off macOS, and answering a
 plausible `null` there would read as "the badge is cleared" and pass a
 test that never ran.
 
+### `app.menu_dump` *(test-only — gated, macOS iced only)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Reads back the macOS
+iced UI's live native menu bar — walks the actual `NSApp.mainMenu`
+AppKit holds, not a re-derivation from the keybind table, so the
+e2e suite can assert table↔menu agreement rather than trusting the
+menu-building code to have gotten it right.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{
+  "menus": [
+    {
+      "title": "File",
+      "items": [
+        {
+          "title": "New Tab",
+          "key_equivalent": "t",
+          "modifiers": ["super"],
+          "enabled": true,
+          "state": "off",
+          "separator": false,
+          "action": "new_tab"
+        },
+        {
+          "title": "",
+          "key_equivalent": "",
+          "modifiers": [],
+          "enabled": true,
+          "state": "off",
+          "separator": true,
+          "action": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+`modifiers` uses the fixed vocabulary `["shift","ctrl","alt","super"]`,
+always in that order. `key_equivalent` is the raw `keyEquivalent`
+string AppKit holds (empty when the item has none, or while the
+gating seam has blanked it — see `sync_gating` in
+`crates/roost-iced/src/macos/menu.rs`). `state` is `"on"` or `"off"`;
+`NSControlStateValueMixed` never appears — nothing in this menu bar
+ever sets it, and a dump that saw it would fail with `internal`.
+`action` is `KeybindAction::to_wire_name()` for a table-bound item, a
+`"select_project:<id>"` / `"select_tab:<id>"` marker for a Window-menu
+row (by stable id, not position), the `"quit"` marker for the App
+menu's Quit item, the `"check_for_updates"` marker for the App menu's
+Sparkle item, `"appkit:<selector>"` for a standard AppKit item
+(About, Hide, Minimize, Zoom, …), or `null` for an inert item (Cut,
+Select All, and every separator). The App menu's title is the profile
+display name (set at install time — no separate runtime substitution to
+account for).
+
+Implemented only by the iced UI on macOS, same as `app.dock_badge`;
+the GTK UI and the iced UI on Linux answer `not-implemented`.
+
+### `app.menu_activate` *(test-only — gated, macOS iced only)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Resolves a title path
+through the live native menu bar (the same tree `app.menu_dump`
+reads) and fires it via `performActionForItemAtIndex:` — the same
+dispatch a real click takes, so the op exercises the full
+AppKit → channel → update-loop path, not a shortcut around it.
+
+Request:
+
+```json
+{"params": {"path": ["File", "New Tab"]}}
+```
+
+Response: `{}`.
+
+Titles carry real ellipsis characters (U+2026, e.g. `"Rename Tab…"`),
+not three literal periods. `performActionForItemAtIndex:` performs no
+validation of its own (Apple's docs), so the handler checks the
+resolved item's `isEnabled` itself and errors rather than firing a
+greyed-out item. Errors (`invalid-param`): an unknown path, an
+ambiguous one (two items sharing a title at the same level — the
+dynamic Window menu's project/tab rows can collide, so seed unique
+names), or a disabled item. Because the fired `MenuEvent` rides the
+same async engine-feed channel a real click does, its effect lands on
+a later update turn — callers must condition-wait on the observable
+result (e.g. `tab.list` growing), never assert synchronously on the
+reply.
+
+Implemented only by the iced UI on macOS, same as `app.menu_dump`.
+
+### `app.update_status` *(test-only — gated, macOS iced only)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Reads back the Sparkle
+updater's state from the macOS iced UI's seam
+(`crates/roost-iced/src/macos/sparkle.rs`).
+
+Request: `{"params": {}}`. Response:
+
+```json
+{
+  "framework_loaded": true,
+  "updater": "started",
+  "reason": null,
+  "check_id": 1,
+  "last_check": {"outcome": "found", "version": "99.0.0", "detail": null}
+}
+```
+
+`framework_loaded` is whether `Contents/Frameworks/Sparkle.framework/
+Sparkle` was found beside the executable and `dlopen`ed — false for
+every bare-binary build, because the framework only ever ships inside
+`Roost-Iced.app`. `updater` is `"started"` once `-startUpdater:`
+succeeded and `"unavailable"` otherwise, with `reason` carrying the
+why (no framework, a refused start). `last_check` is `null` until a
+check completes; its `outcome` is `"found"` (a newer version is in the
+appcast, `version` set from `SUAppcastItem.displayVersionString`),
+`"none"` (the feed parsed and offered nothing newer) or `"error"` (no
+feed, an unreachable one, a malformed appcast), with `detail` carrying
+the reporting error's `localizedDescription`.
+
+`check_id` increments once per **completed** check. Condition-wait on
+it advancing rather than on `last_check` becoming non-null: the latter
+can pass on a previous check's result.
+
+The "Check for Updates…" menu item's enabled state mirrors
+`updater == "started"` plus Sparkle's own `canCheckForUpdates`, so
+`app.menu_dump` and this op agree by construction.
+
+Implemented only by the iced UI on macOS, same as `app.menu_dump`.
+
+### `app.update_check` *(test-only — gated, macOS iced only)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Starts a non-interactive
+`-[SPUUpdater checkForUpdateInformation]`: feed fetch, appcast parse
+and version comparison, with **no** UI panel and no download. (The
+menu item drives the interactive `checkForUpdates` instead; nothing
+automated does.)
+
+Request: `{"params": {}}`. Response: `{}`.
+
+The reply returns as soon as the check is dispatched. Results land in
+`app.update_status` through the updater delegate's callbacks, so
+callers condition-wait on `check_id` advancing. Errors (`internal`)
+when the updater is unavailable.
+
+In test mode the seam's updater delegate overrides the feed URL from
+`ROOST_SPARKLE_FEED_URL`, which is how `tools/roosttest/test_sparkle.py`
+points a check at a loopback appcast. **Both** conditions are required
+(`ROOST_TEST_MODE=1` at launch *and* the variable): a production bundle
+ignores the variable entirely.
+
+Implemented only by the iced UI on macOS, same as `app.menu_dump`.
+
 ### `sidebar.set_width` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**

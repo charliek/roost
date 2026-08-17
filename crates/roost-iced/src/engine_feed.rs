@@ -41,6 +41,13 @@ pub(crate) enum EngineFeed {
     UiRequest(UiRequest),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
+    /// The user picked an item off the native macOS menu bar. Not an
+    /// engine event, but it wants exactly what one wants: the App-side
+    /// receiver, the wake, and a place in the same FIFO — so a menu click
+    /// is ordered against the workspace events around it instead of
+    /// racing them on a channel of its own.
+    #[cfg(target_os = "macos")]
+    Menu(crate::macos::menu::MenuEvent),
     /// The user clicked the OS notification banner for this tab. It travels
     /// the feed like every other engine → UI item so the jump it triggers is
     /// ordered against the events that may have closed the tab meanwhile.

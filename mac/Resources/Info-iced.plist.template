@@ -20,13 +20,25 @@
   process. `app_label` on the wire stays `Roost-iced` (roost-ipc's
   BundleProfile, untouched by this plist).
 
-  No Sparkle keys (SUFeedURL / SUPublicEDKey / SUEnableAutomaticChecks):
-  deliberately omitted. Sparkle auto-update is a 6c decision, not made
-  here, and the two apps must never be able to offer each other's
-  updates — an iced bundle carrying the Swift app's feed URL/key could
-  install a Swift-app-shaped update over an iced binary (or vice
-  versa) were 6c to ever share the appcast naively. Until 6c designs
-  a channel-scoped feed, the iced bundle simply doesn't check.
+  Sparkle (M6 6c, plan 028): the update MECHANICS ship — bundle-iced.sh
+  embeds + strictly signs Sparkle.framework — but NO SUFeedURL and NO
+  SUPublicEDKey, by design. A build with no feed never checks, so a
+  public key in today's builds buys nothing, and the two apps must
+  never be able to offer each other's updates — an iced bundle
+  carrying the Swift app's feed URL/key could install a
+  Swift-app-shaped update over an iced binary (or vice versa). At
+  enablement time the design mandates a SEPARATE feed URL and a
+  SEPARATE EdDSA keypair from the Swift app's
+  (charliek.github.io/roost/appcast.xml + its SUPublicEDKey stay
+  Swift-only). SUEnableAutomaticChecks is present and false: with the
+  updater instantiated, an ABSENT key would trigger Sparkle's
+  first-run "check automatically?" permission prompt — the explicit
+  false suppresses scheduled checks and that prompt; checks stay
+  strictly user-invoked. Enablement recipe: set both
+  ROOST_ICED_SPARKLE_FEED_URL and ROOST_ICED_SPARKLE_ED_PUBLIC_KEY at
+  bundle time and bundle-iced.sh PlistBuddy-inserts the two keys into
+  the stamped plist (exactly one set is a hard error; see
+  roost_insert_sparkle_feed in bundle-lib.sh).
 
   Device-permission purpose strings (NSMicrophone/Camera/AppleEvents
   UsageDescription): paired with the capture entitlements in
@@ -75,6 +87,8 @@
   <key>NSSupportsAutomaticGraphicsSwitching</key>
   <true/>
   <key>LSUIElement</key>
+  <false/>
+  <key>SUEnableAutomaticChecks</key>
   <false/>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>

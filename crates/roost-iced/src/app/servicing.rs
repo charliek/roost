@@ -194,14 +194,32 @@ fn notification_activation(
     Some(window_id.map_or(UiTask::None, UiTask::Focus))
 }
 
-/// The `app.dock_badge` read, on the main thread. The IPC drain runs in
-/// the iced update loop, so the marker is obtainable; `None` would be an
-/// invariant break, and surfacing it as an error is what makes the e2e
-/// fail loudly instead of reading a plausible "badge cleared".
+/// The main-thread marker an IPC-serviced macOS seam call needs. The
+/// IPC drain runs in the iced update loop, so the marker is obtainable;
+/// `None` would be an invariant break, and surfacing it as an op error
+/// is what makes the e2e fail loudly instead of reading a plausible
+/// "badge cleared" / empty dump.
+#[cfg(target_os = "macos")]
+fn serviced_on_main(op: &str) -> Result<objc2::MainThreadMarker, String> {
+    objc2::MainThreadMarker::new()
+        .ok_or_else(|| format!("{op} serviced off the main thread (AppKit is main-thread-only)"))
+}
+
+/// The same marker for the fire-and-forget seam syncs, which have no
+/// reply to fail: log and skip.
+#[cfg(target_os = "macos")]
+pub(super) fn seam_on_main(what: &str) -> Option<objc2::MainThreadMarker> {
+    let mtm = objc2::MainThreadMarker::new();
+    if mtm.is_none() {
+        tracing::error!("{what} ran off the main thread; skipping (AppKit is main-thread-only)");
+    }
+    mtm
+}
+
+/// The `app.dock_badge` read, on the main thread.
 #[cfg(target_os = "macos")]
 fn read_dock_badge() -> Result<Option<String>, String> {
-    let mtm = objc2::MainThreadMarker::new()
-        .ok_or("app.dock_badge serviced off the main thread (AppKit is main-thread-only)")?;
+    let mtm = serviced_on_main("app.dock_badge")?;
     Ok(crate::macos::dock_badge::read(mtm))
 }
 
@@ -211,6 +229,78 @@ fn read_dock_badge() -> Result<Option<String>, String> {
 #[cfg(not(target_os = "macos"))]
 fn read_dock_badge() -> Result<Option<String>, String> {
     Err("app.dock_badge is not supported on this UI (macOS iced only)".into())
+}
+
+/// The `app.menu_dump` read, on the main thread.
+#[cfg(target_os = "macos")]
+fn read_menu_dump() -> Result<AppMenuDumpResult, String> {
+    let mtm = serviced_on_main("app.menu_dump")?;
+    crate::macos::menu::dump(mtm)
+}
+
+/// There is no native menu bar off macOS. Same verdict as
+/// [`read_dock_badge`]'s Linux arm.
+#[cfg(not(target_os = "macos"))]
+fn read_menu_dump() -> Result<AppMenuDumpResult, String> {
+    Err("app.menu_dump is not supported on this UI (macOS iced only)".into())
+}
+
+/// The `app.menu_activate` dispatch, on the main thread.
+#[cfg(target_os = "macos")]
+fn activate_menu(path: &[String]) -> Result<(), String> {
+    let mtm = serviced_on_main("app.menu_activate")?;
+    crate::macos::menu::activate(mtm, path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_menu(_path: &[String]) -> Result<(), String> {
+    Err("app.menu_activate is not supported on this UI (macOS iced only)".into())
+}
+
+/// The `app.update_status` read, on the main thread — the Sparkle seam
+/// keeps its state in main-thread `thread_local!`s, so the marker is
+/// what makes the read well-defined at all, not just a convention.
+#[cfg(target_os = "macos")]
+fn read_update_status() -> Result<AppUpdateStatusResult, String> {
+    let mtm = serviced_on_main("app.update_status")?;
+    Ok(crate::macos::sparkle::status(mtm))
+}
+
+/// Sparkle is macOS-only. Same verdict as [`read_dock_badge`]'s Linux
+/// arm: reject, so the op can never report a plausible "unavailable"
+/// on a platform whose seam was never compiled.
+#[cfg(not(target_os = "macos"))]
+fn read_update_status() -> Result<AppUpdateStatusResult, String> {
+    Err("app.update_status is not supported on this UI (macOS iced only)".into())
+}
+
+/// The `app.update_check` dispatch, on the main thread.
+#[cfg(target_os = "macos")]
+fn start_update_check() -> Result<(), String> {
+    let mtm = serviced_on_main("app.update_check")?;
+    crate::macos::sparkle::check_for_update_information(mtm)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_update_check() -> Result<(), String> {
+    Err("app.update_check is not supported on this UI (macOS iced only)".into())
+}
+
+/// The shared precedence for the five macOS-iced-only test ops
+/// (`app.dock_badge`, `app.menu_dump`, `app.menu_activate`,
+/// `app.update_status`, `app.update_check`): platform rejection
+/// outranks the test-mode gate, so non-macOS iced answers
+/// not-implemented (from `read` itself) like GTK does, not
+/// not-enabled.
+fn macos_test_gated<T>(
+    test_mode: bool,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if cfg!(target_os = "macos") && !test_mode {
+        Err("ROOST_TEST_MODE=1 is required".into())
+    } else {
+        read()
+    }
 }
 
 impl App {
@@ -232,6 +322,10 @@ impl App {
         // construction — the same reason the palette refresh below sits
         // here.
         self.sync_dock_badge();
+        // Same reasoning, one surface over: the Window menu's rows are
+        // project/tab state, so hanging them off the authoritative resync
+        // covers open, close, rename, reorder and select by construction.
+        self.sync_window_menu();
         self.refresh_notification_palette();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
@@ -442,6 +536,19 @@ impl App {
                     // The request may itself have mutated the workspace
                     // (`tab.open`, `palette.activate`), and the reconcile
                     // above — if it ran — predates that.
+                    batch.mark_dirty();
+                }
+                // Same shape as the IPC arm above, for the same reason: a
+                // menu command acts on `self.projects`, so a mutation
+                // already in this batch is folded in before it runs, and
+                // whatever it mutates itself still owes a reconcile.
+                #[cfg(target_os = "macos")]
+                EngineFeed::Menu(event) => {
+                    if batch.workspace_dirty() {
+                        self.reconcile();
+                        batch.mark_reconciled();
+                    }
+                    task = task.then(self.menu_event(event));
                     batch.mark_dirty();
                 }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
@@ -658,6 +765,148 @@ impl App {
             }
             crate::macos::dock_badge::sync(self.notification_inbox.count());
         }
+    }
+
+    /// Install the native menu bar — the parity port of `App.swift`'s
+    /// `installMainMenu()`. A no-op on every other host.
+    ///
+    /// Called from `window_opened` for the same reason the Dock badge is:
+    /// AppKit before winit has built the event loop is unsupported, and a
+    /// focus-regain re-entry is idempotent (the seam installs once).
+    pub(super) fn install_main_menu(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("menu install") else {
+                return;
+            };
+            let built = crate::macos::menu::install(
+                mtm,
+                self.title_fallback,
+                &self.keybindings,
+                self.feed_tx.clone(),
+            );
+            if built {
+                // A freshly built menu is all-enabled. Reset the cache to
+                // match so `sync_menu_gating` — which runs later in this
+                // same update turn — pushes whatever route the app is
+                // actually in (an IPC `palette.present` can beat the first
+                // window).
+                self.menu_gating = crate::macos::menu::MenuGating::default();
+                // Ditto for the Window rows: the menu was built with none.
+                self.menu_window_rows = crate::macos::menu::WindowRows::default();
+            }
+        }
+    }
+
+    /// Load Sparkle and start its updater — the parity port of
+    /// `App.swift`'s `SPUStandardUpdaterController` init. A no-op on
+    /// every other host, and (on macOS) a no-op after the first call.
+    ///
+    /// Called from `window_opened` after the menu install, for the
+    /// menu's own reason plus one of Sparkle's: its standard user driver
+    /// is an AppKit consumer, so it may not exist before winit has built
+    /// the event loop.
+    pub(super) fn init_sparkle(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("sparkle init") else {
+                return;
+            };
+            crate::macos::sparkle::init(mtm, self.test_mode);
+        }
+    }
+
+    /// Push `SPUUpdater.canCheckForUpdates` onto the "Check for
+    /// Updates…" item, when it moved.
+    ///
+    /// Its own axis rather than a field of `MenuGating`: the item is
+    /// ungated by the keyboard route (§ 3.8), and what moves it is the
+    /// updater — boot, and the start/end of every check. Hence the call
+    /// sites: `window_opened` (boot), `sync_menu_gating` (the
+    /// route-change funnel, which every update turn passes through, so
+    /// it is also where a check that finished in the background lands),
+    /// and both of the two calls that START a check.
+    pub(super) fn sync_update_menu_item(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("update-item sync") else {
+                return;
+            };
+            let can_check = crate::macos::sparkle::can_check(mtm);
+            if self.menu_can_check_updates == Some(can_check) {
+                return;
+            }
+            self.menu_can_check_updates = Some(can_check);
+            crate::macos::menu::sync_update_item(mtm, can_check);
+        }
+    }
+
+    /// Rebuild the Window menu's project/tab rows when the rows moved.
+    ///
+    /// Reconcile is where this hangs (the Dock badge's reasoning), and
+    /// reconcile runs on every drain — so the diff against the last-built
+    /// model, not the AppKit rebuild, is what the common case costs.
+    pub(super) fn sync_window_menu(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let (active_project_id, active_tab_id) = self.workspace.active();
+            let rows = crate::macos::menu::WindowRows::derive(
+                &self.projects,
+                active_project_id,
+                active_tab_id,
+            );
+            if self.menu_window_rows == rows {
+                return;
+            }
+            let Some(mtm) = seam_on_main("window-menu rebuild") else {
+                return;
+            };
+            crate::macos::menu::sync_window_menu(mtm, &rows, &self.keybindings, self.menu_gating());
+            self.menu_window_rows = rows;
+        }
+    }
+
+    /// Push the current keyboard route onto the menu bar, when it moved.
+    ///
+    /// The one call site is `update()`'s post-dispatch drain, so every
+    /// route transition — palette open/close, rename begin/commit, confirm
+    /// modal, IME composition start/end — is covered without a call site
+    /// per transition (plan 028 § 3.5).
+    pub fn sync_menu_gating(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.push_menu_gating();
+            // Not inside `push_menu_gating`'s early returns: a route that
+            // did NOT move can still coincide with a check that finished,
+            // and this funnel is the one place every update turn passes
+            // through.
+            self.sync_update_menu_item();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn push_menu_gating(&mut self) {
+        let gating = self.menu_gating();
+        if self.menu_gating == gating {
+            return;
+        }
+        let Some(mtm) = seam_on_main("menu gating") else {
+            return;
+        };
+        self.menu_gating = gating;
+        crate::macos::menu::sync_gating(gating, mtm);
     }
 
     fn refresh_sidebar_agents(&mut self) {
@@ -999,14 +1248,29 @@ impl App {
                 // Reads AppKit, deliberately without re-deriving the
                 // label from the inbox first: the op exists to prove the
                 // badge write reached the Dock, and a resync here would
-                // make it prove only the mapping. Platform rejection
-                // outranks the test-mode gate so non-macOS iced answers
-                // not-implemented like GTK does, not not-enabled.
-                let result = if cfg!(target_os = "macos") && !self.test_mode {
-                    Err("ROOST_TEST_MODE=1 is required".into())
-                } else {
-                    read_dock_badge()
-                };
+                // make it prove only the mapping.
+                let result = macos_test_gated(self.test_mode, read_dock_badge);
+                let _ = reply.send(result);
+            }
+            UiRequest::AppMenuDump { reply } => {
+                let result = macos_test_gated(self.test_mode, read_menu_dump);
+                let _ = reply.send(result);
+            }
+            UiRequest::AppMenuActivate { path, reply } => {
+                let result = macos_test_gated(self.test_mode, || activate_menu(&path));
+                let _ = reply.send(result);
+            }
+            UiRequest::AppUpdateStatus { reply } => {
+                let result = macos_test_gated(self.test_mode, read_update_status);
+                let _ = reply.send(result);
+            }
+            UiRequest::AppUpdateCheck { reply } => {
+                let result = macos_test_gated(self.test_mode, start_update_check);
+                // A check that just started can flip
+                // `canCheckForUpdates` off; push it so the menu item
+                // greys out for the duration rather than at the next
+                // unrelated reconcile.
+                self.sync_update_menu_item();
                 let _ = reply.send(result);
             }
             UiRequest::Screenshot { scale, reply } => {

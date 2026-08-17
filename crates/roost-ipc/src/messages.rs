@@ -782,6 +782,128 @@ pub struct AppDockBadgeResult {
     pub label: Option<String>,
 }
 
+/// `app.menu_dump` request: read back the live native menu bar the
+/// macOS iced UI installed. Gated like `app.dock_badge`, and
+/// implemented only by the macOS iced UI — every other UI answers
+/// `not-implemented`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppMenuDumpParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppMenuDumpResult {
+    /// One entry per top-level menu bar item (App/File/View/Edit/
+    /// Window), in `NSMenu` order.
+    pub menus: Vec<MenuDump>,
+}
+
+/// One top-level menu and its items, read straight off the live
+/// `NSMenu` — nothing here is re-derived from the keybind table, so a
+/// table/menu drift bug shows up as a dump mismatch instead of being
+/// papered over.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MenuDump {
+    /// The submenu's own title. For the App menu this is the profile
+    /// display name — AppKit substitutes it for display, but the title
+    /// string itself (what this reads) is set to the display name at
+    /// install time, so no separate normalization step is needed here.
+    pub title: String,
+    pub items: Vec<MenuItemDump>,
+}
+
+/// One menu item, read straight off the live `NSMenuItem`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MenuItemDump {
+    pub title: String,
+    /// The raw `keyEquivalent` string AppKit holds (empty when the item
+    /// has none, or when its equivalent is currently blanked by the
+    /// gating seam).
+    pub key_equivalent: String,
+    /// Fixed vocabulary, always in this order:
+    /// `["shift","ctrl","alt","super"]`.
+    pub modifiers: Vec<String>,
+    pub enabled: bool,
+    /// `"on"` or `"off"` — `NSControlStateValueMixed` never appears;
+    /// nothing in this menu bar ever sets it, and a dump that saw it
+    /// would be an internal error.
+    pub state: String,
+    pub separator: bool,
+    /// The wire name of the bound `KeybindAction`
+    /// (`KeybindAction::to_wire_name()`), a `"select_project:<id>"` /
+    /// `"select_tab:<id>"` Window-row marker, the `"quit"` /
+    /// `"check_for_updates"` markers, an `"appkit:<selector>"`
+    /// standard-selector item, or `null` for an inert item (Cut, Select
+    /// All, separators).
+    pub action: Option<String>,
+}
+
+/// `app.menu_activate` request: resolve `path` (a title path, e.g.
+/// `["File", "New Tab"]`) through the live native menu bar and fire it
+/// via `performActionForItemAtIndex:` — the same dispatch a real click
+/// takes. Titles carry real ellipses (U+2026), not `...`. Errors on an
+/// unknown path, an ambiguous one (two items sharing a title at the
+/// same level — dynamic Window rows can collide; seed unique names),
+/// or a disabled item (`performActionForItemAtIndex:` runs no
+/// validation itself, so this op checks `isEnabled` first). Gated and
+/// platform-restricted like `app.menu_dump`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppMenuActivateParams {
+    pub path: Vec<String>,
+}
+
+/// `app.update_status` request: read back the Sparkle updater's state
+/// from the macOS iced UI's seam. Gated and platform-restricted like
+/// `app.menu_dump`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUpdateStatusParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppUpdateStatusResult {
+    /// Whether `Sparkle.framework` was found beside the executable and
+    /// `dlopen`ed. False for every bare-binary build — the framework
+    /// only ever ships inside `Roost-Iced.app` (plan 028 § 3.8).
+    pub framework_loaded: bool,
+    /// `"started"` or `"unavailable"`. Started means `-startUpdater:`
+    /// succeeded, which is also what the "Check for Updates…" menu
+    /// item's enabled state is derived from.
+    pub updater: String,
+    /// Why the updater is unavailable (no framework, a refused start),
+    /// or `null` once it started.
+    pub reason: Option<String>,
+    /// Increments once per completed check, so a poll cannot pass on a
+    /// stale `last_check` from an earlier one — condition-wait on this
+    /// advancing rather than on `last_check` becoming non-null.
+    pub check_id: i64,
+    pub last_check: Option<UpdateCheckDump>,
+}
+
+/// The outcome of one completed update check, recorded by the seam's
+/// `SPUUpdaterDelegate` callbacks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCheckDump {
+    /// `"found"` (a newer version is in the appcast), `"none"` (the
+    /// feed parsed and offered nothing newer) or `"error"` (no feed, an
+    /// unreachable one, a malformed appcast).
+    pub outcome: String,
+    /// The found update's version, from `SUAppcastItem`'s
+    /// `displayVersionString`. Only set for `"found"`.
+    pub version: Option<String>,
+    /// The reporting error's `localizedDescription`, when there was one.
+    pub detail: Option<String>,
+}
+
+/// `app.update_check` request: start a non-interactive
+/// `-[SPUUpdater checkForUpdateInformation]` — no UI, no download. The
+/// result lands in `app.update_status` via the delegate callbacks, so
+/// callers condition-wait on `check_id` advancing. Errors when the
+/// updater is unavailable. Gated and platform-restricted like
+/// `app.menu_dump`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUpdateCheckParams {}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -1383,6 +1505,27 @@ pub mod ops {
     /// tab id (UI truth), for asserting the core and the displayed tab
     /// agree. Implemented by the Rust UI adapters; read-only, not gated.
     pub const APP_SELECTED_TAB_ID: &str = "app.selected_tab_id";
+
+    /// Test-only read of the macOS iced UI's live native menu bar —
+    /// walks `NSApp.mainMenu` (not the keybind table), so the e2e suite
+    /// can prove table↔menu agreement. Same gate as `app.dock_badge`;
+    /// macOS iced only.
+    pub const APP_MENU_DUMP: &str = "app.menu_dump";
+    /// Test-only dispatch into the live native menu bar by title path
+    /// (e.g. `["File", "New Tab"]`), through the same
+    /// `performActionForItemAtIndex:` a real click takes. Same gate and
+    /// platform restriction as `app.menu_dump`.
+    pub const APP_MENU_ACTIVATE: &str = "app.menu_activate";
+
+    /// Test-only read of the macOS iced UI's Sparkle updater state —
+    /// whether the framework loaded, whether the updater started, and
+    /// the outcome of the last completed check. Same gate and platform
+    /// restriction as `app.menu_dump`.
+    pub const APP_UPDATE_STATUS: &str = "app.update_status";
+    /// Test-only non-interactive update check (`checkForUpdateInformation`
+    /// — no UI, no download). Results are read back through
+    /// `app.update_status`. Same gate and platform restriction.
+    pub const APP_UPDATE_CHECK: &str = "app.update_check";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
@@ -2182,6 +2325,92 @@ mod tests {
         assert_eq!(cleared, r#"{"label":null}"#);
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppDockBadgeParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_menu_dump_round_trips() {
+        round_trip(&AppMenuDumpParams {});
+        round_trip(&AppMenuDumpResult {
+            menus: vec![MenuDump {
+                title: "File".into(),
+                items: vec![
+                    MenuItemDump {
+                        title: "New Tab".into(),
+                        key_equivalent: "t".into(),
+                        modifiers: vec!["super".into()],
+                        enabled: true,
+                        state: "off".into(),
+                        separator: false,
+                        action: Some("new_tab".into()),
+                    },
+                    MenuItemDump {
+                        title: String::new(),
+                        key_equivalent: String::new(),
+                        modifiers: vec![],
+                        enabled: true,
+                        state: "off".into(),
+                        separator: true,
+                        action: None,
+                    },
+                ],
+            }],
+        });
+        round_trip(&AppMenuDumpResult::default());
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppMenuDumpParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_menu_activate_round_trips() {
+        round_trip(&AppMenuActivateParams {
+            path: vec!["File".into(), "New Tab".into()],
+        });
+        round_trip(&AppMenuActivateParams { path: vec![] });
+        let bad = r#"{"path":["File"],"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppMenuActivateParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_update_status_round_trips() {
+        round_trip(&AppUpdateStatusParams {});
+        round_trip(&AppUpdateCheckParams {});
+        round_trip(&AppUpdateStatusResult {
+            framework_loaded: true,
+            updater: "started".into(),
+            reason: None,
+            check_id: 3,
+            last_check: Some(UpdateCheckDump {
+                outcome: "found".into(),
+                version: Some("99.0.0".into()),
+                detail: None,
+            }),
+        });
+        round_trip(&AppUpdateStatusResult {
+            framework_loaded: false,
+            updater: "unavailable".into(),
+            reason: Some("dlopen(...) failed".into()),
+            check_id: 0,
+            last_check: None,
+        });
+        round_trip(&AppUpdateStatusResult::default());
+
+        // The bare-binary shape the e2e asserts on: `null` is how a
+        // never-checked updater differs from one whose check reported
+        // nothing, so the distinction has to survive the wire.
+        let never_checked = serde_json::to_value(&AppUpdateStatusResult {
+            framework_loaded: false,
+            updater: "unavailable".into(),
+            reason: Some("no framework".into()),
+            check_id: 0,
+            last_check: None,
+        })
+        .unwrap();
+        assert_eq!(never_checked["last_check"], serde_json::Value::Null);
+
+        for bad in [r#"{"extra":"x"}"#, r#"{"foo":1}"#] {
+            assert!(serde_json::from_str::<AppUpdateStatusParams>(bad).is_err());
+            assert!(serde_json::from_str::<AppUpdateCheckParams>(bad).is_err());
+        }
     }
 
     #[test]

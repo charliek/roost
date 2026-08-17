@@ -1051,15 +1051,86 @@ is wired into `ICED_E2E_TESTS` and all three `ci.yml` iced lane lists.
   Sparkle does not care what language wrote the app, so an Iced build
   shipping under the *same* bundle id with the same `SUPublicEDKey` and a
   higher `CFBundleVersion` upgrades existing Swift installs in place.
-* **6d. Menu bar.** winit installs none, so Iced on macOS currently has
-  no menus at all. `App.swift` builds ~35 items across App/File/View/
-  Edit/Window plus a dynamic Window menu of tabs and projects. Options:
-  `muda` (designed to sit alongside winit) or hand-rolled NSMenu via
-  `objc2-app-kit`. The keybind story is *better* in Rust — the table
-  already lives in `roost-ui-model`, so menu equivalents and the terminal
-  key encoder read one source instead of Swift re-deriving them. Highest
-  volume, lowest risk; also where "custom options later" becomes cheap
-  once menu items are just `Message` variants.
+
+**Mechanics shipped, feed deliberately absent (plan 028, 2026-08-16).**
+`third_party/sparkle/fetch.sh` pins Sparkle 2.9.5 by SHA256 from the
+official release artifact (gitignored `out/`, stamped, cached — and
+`actions/cache`d in CI so a release-asset outage can't flake the lanes);
+`bundle-iced.sh` embeds it and signs via `codesign_sparkle_or_die`'s
+strict inner→outer per-component chain (Installer.xpc → Downloader.xpc
+with `--preserve-metadata=entitlements`, Sparkle#2511 → Autoupdate →
+Updater.app → framework; **no `--deep`** — shed's production evidence:
+a `--deep`/wrong-order chain signs and notarizes clean but breaks at
+update-apply; the Swift bundle's looser `--deep` function is left
+untouched and noted as a future hygiene pass).
+`Roost-Iced.entitlements` restored `cs.disable-library-validation` for
+the ad-hoc framework (REMOVE-once-team-signed note mirrored from the
+Swift app). The runtime side is `crates/roost-iced/src/macos/sparkle.rs`:
+**dlopen** of the framework's top-level symlink at `window_opened` + a
+hand-written `msg_send!` surface — deliberately NOT a link-time
+`-framework` dependency, so cargo builds/CI matrices/`make run-iced`
+never need the framework staged (bare binaries report
+`unavailable`-with-reason). One deviation from the obvious API:
+`initWithStartingUpdater:NO` + explicit `startUpdater:`, because the
+controller's auto-start throws an unprompted modal alert on a feedless
+app; direct start surfaces the same condition as an `NSError`. Feedless
+`startUpdater:` succeeds, so the shipped keyless bundle runs with the
+updater started and errors gracefully on a manual check. The shipped
+plist carries `SUEnableAutomaticChecks=false` and **no
+`SUFeedURL`/`SUPublicEDKey`**; **feed enablement is two env vars** at
+bundle time (`ROOST_ICED_SPARKLE_FEED_URL` +
+`ROOST_ICED_SPARKLE_ED_PUBLIC_KEY`, both-or-error →
+PlistBuddy-inserted), proven live by the `e2e-iced-sparkle` lane, which
+builds a TEST-ONLY-keyed bundle and drives
+`checkForUpdateInformation` against a loopback http appcast to a real
+`found` via the test-mode `app.update_check`/`app.update_status` ops
+(delegate feed override gated on `ROOST_TEST_MODE`; only the TEST-ONLY
+*public* key is committed — Sparkle does not filter unsigned appcast
+items at parse time, verified). When a real iced feed happens: generate
+a fresh keypair (never the Swift app's), host an iced-specific appcast,
+set the two env vars in the bundle job — no rework. The first
+feed-carrying build necessarily reaches users out-of-band; every build
+after it updates in place. Interactive panel flow + Gatekeeper behavior
+remain morning-checklist/manual (locked-Mac constraint); DMG/release.yml
+wiring deliberately untouched.
+
+* **6d. Menu bar.** ~~winit installs none~~ (correction, verified
+  against winit 0.30.13 source: winit installs a minimal default menu —
+  About/Hide/Quit via `terminate:` — so the real gap was app commands
+  and a Quit that provably runs the clean-exit flush). `App.swift`
+  builds ~35 items across App/File/View/Edit/Window plus a dynamic
+  Window menu of tabs and projects.
+
+**Shipped (plan 028, 2026-08-16), hand-rolled NSMenu via
+`objc2-app-kit`** (`muda` rejected: new dependency, duplicate accel
+model, and the 6b spike had already proven the `define_class!`
+target/action mechanism). `crates/roost-iced/src/macos/menu.rs` builds
+the full parity menu set (30 static actionable items; Cut/Select All
+present-but-disabled with **no key equivalents**; a dynamic Window menu
+of project rows ⌘1-9 and active-project tab rows ⌃1-9 with stable-id
+dispatch, rebuilt from `reconcile()` behind a plain-data model diff).
+The keybind promise landed: menu key equivalents derive from the
+canonicalized table via `menu_accel_for_action` (deterministic
+inversion, in `roost-ui-model` beside the table — user rebinds show up
+in the menu), and activation rides the engine feed into the SAME
+`dispatch_keybind_action` path a keystroke takes. Quit is a custom item
+through the graceful exit path (never `terminate:`, which skips
+`Workspace::flush`); ⌘Q now actually quits cleanly, asserted by an
+exit-lane e2e. Route gating without `validateMenuItem`
+(`autoenablesItems=false`, direct mutation): palette-open disables all
+but the four palette toggles (Swift parity), editor/confirm/IME-compose
+disables everything, and Copy/Paste get their key equivalents
+**blanked** whenever any text surface owns the keyboard — a blanked
+equivalent provably falls through to iced's `text_input` regardless of
+AppKit's (disputed) disabled-item chord behavior. Introspection for the
+locked-Mac test posture: test-mode ops `app.menu_dump` (walks the LIVE
+`NSApp.mainMenu`) and `app.menu_activate` (title-path resolution, its
+own `isEnabled` check — `performActionForItemAtIndex:` runs no
+validation), covered by `test_menu_bar.py` (20 e2e) + the
+`e2e-iced-menu-quit` destructive lane. Accepted behavior change:
+held-accel repeat is now AppKit's menu repeat, not
+`dispatch_keybind_action`'s per-action suppression. Real-keypress
+interception and OS menu rendering are morning-checklist items.
 * **6e. Desktop notifications, macOS backend.** Closes [#303]. The seam
   from slice 3f is backend-agnostic already (`notifications.rs`: worker,
   per-tab replace semantics, click routing); only `mod backend` is

@@ -30,8 +30,9 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AppRenderStatsResult, PaletteItemView, PalettePresentResult, PaletteStateResult, Project,
-    SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
+    AppMenuDumpResult, AppRenderStatsResult, AppUpdateStatusResult, PaletteItemView,
+    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
+    SidebarDumpResult, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;
@@ -903,7 +904,15 @@ impl ExitState {
     /// request, so the log line lands on the edge rather than on every
     /// reconcile that follows it.
     fn observe(&mut self, projects_empty: bool) -> bool {
-        if *self != Self::Running || !projects_empty {
+        projects_empty && self.request()
+    }
+
+    /// Latch the request — from the empty-workspace observation above, or
+    /// directly from the menu's Quit, which has no empty workspace to
+    /// observe. Returns whether THIS call raised it, so a second request
+    /// while the first is in flight cannot queue a second exit.
+    fn request(&mut self) -> bool {
+        if *self != Self::Running {
             return false;
         }
         *self = Self::Requested;
@@ -1064,6 +1073,19 @@ pub struct App {
     revealed_tab_id: Option<i64>,
     tab_reveal_request: Option<i64>,
     exit_state: ExitState,
+    /// The gating value last pushed to the native menu bar, so the seam is
+    /// touched only when the keyboard route actually moved.
+    #[cfg(target_os = "macos")]
+    menu_gating: crate::macos::menu::MenuGating,
+    /// The Window menu's dynamic rows as last built, so a reconcile that
+    /// moved no project or tab never touches AppKit.
+    #[cfg(target_os = "macos")]
+    menu_window_rows: crate::macos::menu::WindowRows,
+    /// `SPUUpdater.canCheckForUpdates` as last pushed onto the "Check
+    /// for Updates…" item. `None` before the first push, so boot writes
+    /// the item's state even when it is already correct.
+    #[cfg(target_os = "macos")]
+    menu_can_check_updates: Option<bool>,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -1231,6 +1253,12 @@ impl App {
             revealed_tab_id: None,
             tab_reveal_request: None,
             exit_state: ExitState::default(),
+            #[cfg(target_os = "macos")]
+            menu_gating: crate::macos::menu::MenuGating::default(),
+            #[cfg(target_os = "macos")]
+            menu_window_rows: crate::macos::menu::WindowRows::default(),
+            #[cfg(target_os = "macos")]
+            menu_can_check_updates: None,
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -1262,13 +1290,22 @@ impl App {
         // here on the reconcile owns it, and a repeat from a later
         // `WindowFocus` is an idempotent rewrite of the same label.
         self.sync_dock_badge();
-        prepare_window_opened(
+        let opened = prepare_window_opened(
             &mut self.window_id,
             &mut self.pending_window_resize,
             &mut self.screenshots,
             id,
-        )
-        .task
+        );
+        self.install_main_menu();
+        // After the menu install, so the "Check for Updates…" item
+        // already exists for the readiness push below (plan 028 § 3.8).
+        self.init_sparkle();
+        self.sync_update_menu_item();
+        // A freshly installed menu has no Window rows yet, and the next
+        // reconcile may be a while off (nothing forces one on the turn a
+        // window opens).
+        self.sync_window_menu();
+        opened.task
     }
 
     pub fn window_resized(&mut self, id: window::Id, size: Size) -> UiTask {
@@ -1684,6 +1721,83 @@ impl App {
     pub fn captured_enter_release(&mut self) {
         if self.rename_completion_key == Some(RenameCompletionKey::Enter) {
             self.rename_completion_key = None;
+        }
+    }
+
+    /// What the menu bar's enabled-state should currently be — the whole
+    /// keyboard-route → menu mapping in one place, read both by the seam
+    /// push and by the dispatch-side gate below.
+    #[cfg(target_os = "macos")]
+    fn menu_gating(&self) -> crate::macos::menu::MenuGating {
+        crate::macos::menu::MenuGating {
+            palette_open: self.palette.is_some(),
+            text_capture: self.rename_editor.is_some()
+                || self.confirm_delete.is_some()
+                || self.terminal_composing(),
+        }
+    }
+
+    /// Route a native menu activation into the paths a keystroke takes.
+    ///
+    /// `repeat` is always `false`: a held chord is now AppKit's menu
+    /// repeat rather than iced's key repeat, so the per-action repeat
+    /// suppression `dispatch_keybind_action` applies has nothing to see
+    /// (plan 028 § 3.5, an accepted behavior change).
+    ///
+    /// The gate here mirrors [`Self::menu_gating`] one layer down, because
+    /// the item's enabled-state is not authoritative by the time the event
+    /// is dispatched: the activation rides the feed and lands a turn
+    /// later, and `performActionForItemAtIndex:` — the route the test op
+    /// takes — does not consult enabled-state at all.
+    #[cfg(target_os = "macos")]
+    pub fn menu_event(&mut self, event: crate::macos::menu::MenuEvent) -> UiTask {
+        use crate::macos::menu::{command_enabled, is_palette_toggle, MenuEvent};
+
+        match event {
+            MenuEvent::Action(action) => {
+                if !command_enabled(self.menu_gating(), is_palette_toggle(action)) {
+                    return UiTask::None;
+                }
+                self.dispatch_keybind_action(action, false)
+            }
+            // The Window menu's rows take the same paths the sidebar and
+            // tab strip take (`Message::ProjectSelected`/`TabSelected`) —
+            // including their lack of Swift's `ensureSidebarVisible`,
+            // which no iced selection route performs.
+            MenuEvent::SelectProject(project_id) => {
+                if !command_enabled(self.menu_gating(), false) {
+                    return UiTask::None;
+                }
+                self.select_project(project_id);
+                UiTask::None
+            }
+            MenuEvent::SelectTab(tab_id) => {
+                if !command_enabled(self.menu_gating(), false) {
+                    return UiTask::None;
+                }
+                self.select_tab(tab_id);
+                UiTask::None
+            }
+            // Quit is never gated — it is the one command that must work
+            // while a modal or a palette owns the keyboard, and the Swift
+            // app agrees (its `validateMenuItem` gates only the items
+            // targeting the app delegate, not `NSApplication`'s Quit).
+            MenuEvent::Quit => {
+                self.exit_state.request();
+                UiTask::None
+            }
+            // Ungated for Quit's reason, and additionally guarded by the
+            // updater itself: the item is only enabled while
+            // `canCheckForUpdates` holds, and Sparkle re-checks that on
+            // its own side. Everything past this point — panels, errors,
+            // the download flow — is Sparkle's UI, not ours.
+            MenuEvent::CheckForUpdates => {
+                if let Some(mtm) = servicing::seam_on_main("interactive update check") {
+                    crate::macos::sparkle::check_for_updates(mtm);
+                    self.sync_update_menu_item();
+                }
+                UiTask::None
+            }
         }
     }
 

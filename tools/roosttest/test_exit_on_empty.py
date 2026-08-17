@@ -13,7 +13,7 @@ shared-session iced lane: the session-scoped harness fixture launches ONE
 instance for the whole invocation, and a mid-suite exit would leave every
 later module without a UI. It is deliberately absent from Makefile
 `ICED_E2E_TESTS` and from the three enumerated ci.yml iced lists — and it
-enforces that itself (`_runs_alone`) rather than trusting those lists.
+enforces that itself (`util.runs_alone`) rather than trusting those lists.
 
 GTK is unchanged by this slice (divergence recorded in the plan, per the
 plan-016 stance) and Mac has always terminated on the last project's
@@ -27,22 +27,11 @@ import json
 import pytest
 import ui
 from client import scaled_timeout
-from util import is_fresh
+from util import is_fresh, runs_alone
 
 
 def _project_ids(roost) -> list[int]:
     return [int(p["id"]) for p in roost.list()]
-
-
-def _runs_alone(request) -> bool:
-    """Whether this module is the whole invocation.
-
-    Self-enforcing version of the lane rule above: collected beside other
-    modules (a whole-directory run, or a stale edit to `ICED_E2E_TESTS`),
-    ending the UI here would fail every test that comes after. Skipping is
-    loud — `pytest_terminal_summary` prints every skip with its reason.
-    """
-    return {item.path for item in request.session.items} == {request.node.path}
 
 
 def test_deleting_the_last_project_exits_cleanly_and_flushes_state(roost, target, request):
@@ -63,7 +52,7 @@ def test_deleting_the_last_project_exits_cleanly_and_flushes_state(roost, target
             "terminates on the last project's window close, and GTK keeps "
             "its empty-workspace state (recorded divergence)"
         )
-    if not _runs_alone(request):
+    if not runs_alone(request):
         pytest.skip(
             "ends the UI it drives, so it must be its own pytest "
             "invocation (`make e2e-iced-exit`) — collected beside other "

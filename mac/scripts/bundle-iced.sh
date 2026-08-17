@@ -22,19 +22,31 @@
 #      Roost-Iced icon is future work).
 #   5. Embeds `roostctl` under Contents/Resources/bin/ (same as
 #      bundle.sh).
-#   6. Code-signs (ad-hoc by default, Developer ID when
-#      ROOST_DEVELOPER_ID_IDENTITY is set) — no framework signing
-#      stage: this bundle embeds no frameworks (no Sparkle).
+#   6. Fetches (pinned version+SHA, cached — third_party/sparkle/
+#      fetch.sh) and embeds Sparkle.framework under Contents/
+#      Frameworks/ — M6 6c mechanics (plan 028). The embed runs even
+#      for ROOST_ALLOW_UNSIGNED=1 builds; only the signing is
+#      conditional.
+#   7. Code-signs (ad-hoc by default, Developer ID when
+#      ROOST_DEVELOPER_ID_IDENTITY is set): roostctl, then the Sparkle
+#      chain (codesign_sparkle_or_die — strict inner→outer, never
+#      --deep), then the outer app.
+#
+# Sparkle posture (6c: mechanics shipped, feed deliberately absent):
+# the bundle carries the signed framework and the updater machinery,
+# but NO SUFeedURL and NO SUPublicEDKey — a build with no feed never
+# checks, and the two Roost bundles must never be able to offer each
+# other's updates (see Info-iced.plist.template's header). Feed
+# enablement is the ROOST_ICED_SPARKLE_FEED_URL +
+# ROOST_ICED_SPARKLE_ED_PUBLIC_KEY env pair below (both set → keys
+# PlistBuddy-inserted; exactly one → hard error; neither → today's
+# posture).
 #
 # What this script deliberately does NOT do (unlike bundle.sh):
 #   * No SwiftPM build, no SwiftPM resource-bundle copy — the iced
 #     chrome fonts are `include_bytes!`'d and the themes ship
 #     compiled into `roost-ui-model`; nothing is loaded from a
 #     resource bundle at runtime.
-#   * No Sparkle.framework embed/sign — no auto-update parity between
-#     the two bundles (6c decision, not made here); see the header
-#     comment in Info-iced.plist.template for why the Sparkle plist
-#     keys are absent too.
 #
 # Deferred the same way bundle.sh defers them (shared posture, not a
 # difference):
@@ -119,6 +131,12 @@ cp "${ICED_BUILD_BIN}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
 roost_stamp_plist "${TEMPLATE_PLIST}" "${APP_DIR}" "${VERSION}"
+# Optional feed enablement (plan 028 § 3.9): both env vars set inserts
+# SUFeedURL + SUPublicEDKey into the stamped plist; exactly one is a
+# hard error; neither (the default) keeps today's no-feed posture.
+roost_insert_sparkle_feed "${APP_DIR}" \
+  "${ROOST_ICED_SPARKLE_FEED_URL:-}" \
+  "${ROOST_ICED_SPARKLE_ED_PUBLIC_KEY:-}"
 roost_write_pkginfo "${APP_DIR}"
 
 roost_install_app_icon "${ICON_COMPOSER_SRC}" "${ICON_SRC}" "${APP_DIR}"
@@ -128,13 +146,30 @@ roost_install_app_icon "${ICON_COMPOSER_SRC}" "${ICON_SRC}" "${APP_DIR}"
 # point at the bundled binary, not a dev-machine target/ path.
 roost_build_and_embed_roostctl "${REPO_ROOT}" "${APP_DIR}" "${CONFIG}"
 
+# Sparkle.framework embed (M6 6c mechanics — plan 028 § 3.10). Fetch is
+# pinned-version + SHA-verified and cached (idempotent stamp); cp -R
+# preserves the Versions/ symlink farm codesign requires. This stage is
+# deliberately OUTSIDE the signing conditional below: a
+# ROOST_ALLOW_UNSIGNED=1 build must still ship the framework — only the
+# signing is conditional, never the bundle's contents.
+"${REPO_ROOT}/third_party/sparkle/fetch.sh"
+SPARKLE_FW_SRC="${REPO_ROOT}/third_party/sparkle/out/Sparkle.framework"
+echo "==> Embedding Sparkle.framework"
+mkdir -p "${APP_DIR}/Contents/Frameworks"
+# roost_assemble_skeleton wiped APP_DIR, so the destination can't
+# pre-exist today — but `cp -R` onto an existing directory would nest a
+# second Sparkle.framework inside it; the delete keeps this stage
+# deterministic on its own, not by courtesy of the helper's ordering.
+rm -rf "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
+cp -R "${SPARKLE_FW_SRC}" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
+
 # Signing. When ROOST_DEVELOPER_ID_IDENTITY is set (release CI, or a dev who
 # holds the cert) we sign with that Developer ID + a secure `--timestamp` so the
 # bundle can be notarized. Otherwise we fall back to ad-hoc (`-`) signing: fine
 # for local launch, but Gatekeeper will warn and notarization is impossible.
-# The inner→outer order (embedded roostctl first, then the .app) is required —
-# codesign seals nested code into the outer signature. No framework-signing
-# stage: unlike Roost.app, this bundle embeds no frameworks.
+# The inner→outer order is required — codesign seals nested code into the
+# outer signature: embedded roostctl, then the Sparkle chain (itself strictly
+# inner→outer — see codesign_sparkle_or_die in bundle-lib.sh), then the .app.
 ENT_FILE="${MAC_DIR}/Resources/Roost-Iced.entitlements"
 # The bundled roostctl helper gets the same narrower entitlements file
 # bundle.sh uses: it never records audio/video or sends Apple events,
@@ -142,7 +177,17 @@ ENT_FILE="${MAC_DIR}/Resources/Roost-Iced.entitlements"
 ROOSTCTL_ENT_FILE="${MAC_DIR}/Resources/roostctl.entitlements"
 if roost_setup_signing "${ENT_FILE}" "${ROOSTCTL_ENT_FILE}"; then
   codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl" "${ROOSTCTL_ENT_FILE}"
-  codesign_or_die "${APP_DIR}"
+  # An abandoned Sparkle chain (a component failure bypassed by
+  # ROOST_ALLOW_UNSIGNED=1) returns nonzero: skip the outer signature
+  # too, so a half-re-signed framework is never sealed under it — the
+  # exact state the strict chain exists to prevent. The hard-fail path
+  # (no ROOST_ALLOW_UNSIGNED) exits inside the helper and never gets
+  # here.
+  if codesign_sparkle_or_die "${APP_DIR}/Contents/Frameworks/Sparkle.framework"; then
+    codesign_or_die "${APP_DIR}"
+  else
+    echo "==> warn: Sparkle chain abandoned; skipping the outer app signature so a half-re-signed framework is never sealed under it" >&2
+  fi
 fi
 
 echo "==> Bundled: ${APP_DIR}"
