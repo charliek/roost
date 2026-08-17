@@ -114,6 +114,26 @@ def read_render_stats(client: Client, reset: bool) -> dict:
     return {key: int(value) for key, value in result.items()}
 
 
+def wait_for_echo_tail(client: Client, tab_id, keystrokes: int, timeout_s: float = 5.0):
+    """Poll `tab.dump` until the final written character has echoed back to
+    the screen, so the counter read that follows sees the whole burst
+    (cat echoes everything onto one wrapping line; the last char of the
+    visible text is the last one drawn)."""
+    expected = ECHO_CHARS[(keystrokes - 1) % len(ECHO_CHARS)]
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        dump = client.call("tab.dump", {"tab_id": str(tab_id)})
+        text = "".join(dump.get("rows_text") or []).rstrip()
+        if text.endswith(expected):
+            return
+        time.sleep(0.05)
+    print(
+        f"warning: final echo {expected!r} not observed within {timeout_s}s; "
+        "counters may under-count the tail",
+        file=sys.stderr,
+    )
+
+
 def run_probe(client: Client, keystrokes: int, rate_hz: float) -> dict:
     projects = client.call("tab.list").get("projects") or []
     if not projects:
@@ -145,6 +165,7 @@ def run_probe(client: Client, keystrokes: int, rate_hz: float) -> dict:
             client.call("tab.write", {"tab_id": str(scratch_id), "data": data})
             time.sleep(interval_s)
 
+        wait_for_echo_tail(client, scratch_id, keystrokes)
         stats = read_render_stats(client, reset=False)
         view_calls = stats["view_calls"]
         view_nanos = stats["view_nanos"]
