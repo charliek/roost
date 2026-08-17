@@ -156,6 +156,11 @@ roost_build_and_embed_roostctl "${REPO_ROOT}" "${APP_DIR}" "${CONFIG}"
 SPARKLE_FW_SRC="${REPO_ROOT}/third_party/sparkle/out/Sparkle.framework"
 echo "==> Embedding Sparkle.framework"
 mkdir -p "${APP_DIR}/Contents/Frameworks"
+# roost_assemble_skeleton wiped APP_DIR, so the destination can't
+# pre-exist today — but `cp -R` onto an existing directory would nest a
+# second Sparkle.framework inside it; the delete keeps this stage
+# deterministic on its own, not by courtesy of the helper's ordering.
+rm -rf "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
 cp -R "${SPARKLE_FW_SRC}" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
 
 # Signing. When ROOST_DEVELOPER_ID_IDENTITY is set (release CI, or a dev who
@@ -172,8 +177,17 @@ ENT_FILE="${MAC_DIR}/Resources/Roost-Iced.entitlements"
 ROOSTCTL_ENT_FILE="${MAC_DIR}/Resources/roostctl.entitlements"
 if roost_setup_signing "${ENT_FILE}" "${ROOSTCTL_ENT_FILE}"; then
   codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl" "${ROOSTCTL_ENT_FILE}"
-  codesign_sparkle_or_die "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
-  codesign_or_die "${APP_DIR}"
+  # An abandoned Sparkle chain (a component failure bypassed by
+  # ROOST_ALLOW_UNSIGNED=1) returns nonzero: skip the outer signature
+  # too, so a half-re-signed framework is never sealed under it — the
+  # exact state the strict chain exists to prevent. The hard-fail path
+  # (no ROOST_ALLOW_UNSIGNED) exits inside the helper and never gets
+  # here.
+  if codesign_sparkle_or_die "${APP_DIR}/Contents/Frameworks/Sparkle.framework"; then
+    codesign_or_die "${APP_DIR}"
+  else
+    echo "==> warn: Sparkle chain abandoned; skipping the outer app signature so a half-re-signed framework is never sealed under it" >&2
+  fi
 fi
 
 echo "==> Bundled: ${APP_DIR}"

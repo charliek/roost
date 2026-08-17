@@ -186,6 +186,17 @@ def _run_check(roost) -> dict:
     return status
 
 
+def _ensure_completed_check(roost) -> dict:
+    """A completed check, running one only if none has finished yet — so
+    every test that needs check side effects (the server's access log,
+    post-cycle canCheckForUpdates) stands alone under a focused `-k`
+    run instead of depending on test order."""
+    status = roost.app_update_status()
+    if status["check_id"] > 0:
+        return status
+    return _run_check(roost)
+
+
 class TestSparkleBundle:
     """§ AC6/AC7 in the test-keyed bundle lane (`make e2e-iced-sparkle`):
     the framework loads, the updater starts, and a check against the
@@ -212,7 +223,8 @@ class TestSparkleBundle:
         assert status["last_check"]["version"] == OFFERED_VERSION, status
 
     def test_the_feed_was_fetched_over_loopback(self, roost):
-        # The outcome above could in principle come from a cached feed;
+        _ensure_completed_check(roost)
+        # The found outcome could in principle come from a cached feed;
         # the server's own access log is what proves the wire hop.
         assert FEED_SERVER is not None
         assert any("appcast.xml" in line for line in FEED_SERVER.requests), (
@@ -221,6 +233,7 @@ class TestSparkleBundle:
         )
 
     def test_the_check_for_updates_item_is_enabled(self, roost):
+        _ensure_completed_check(roost)
         assert _updates_item(roost)["action"] == "check_for_updates"
         # canCheckForUpdates only flips true once the probe session ends
         # (cycle-finish fires AFTER the check_id advance the previous test

@@ -490,15 +490,16 @@ roost_setup_signing() {
 
     echo "==> Signing Sparkle.framework (strict inner→outer chain, no --deep)"
     # A component failure under ROOST_ALLOW_UNSIGNED=1 returns 1: stop
-    # the chain right there rather than sealing a half-re-signed
-    # framework under the outer signature (see the helper's comment).
+    # the chain right there AND propagate the failure to the caller,
+    # which must then skip the outer-app signature too — sealing a
+    # half-re-signed framework under the outer signature is the exact
+    # state this chain exists to prevent (see the helper's comment).
     roost__codesign_sparkle_component "${versions}/XPCServices/Installer.xpc" \
       && roost__codesign_sparkle_component "${versions}/XPCServices/Downloader.xpc" \
            --preserve-metadata=entitlements \
       && roost__codesign_sparkle_component "${versions}/Autoupdate" \
       && roost__codesign_sparkle_component "${versions}/Updater.app" \
-      && roost__codesign_sparkle_component "${fw}" \
-      || true
+      && roost__codesign_sparkle_component "${fw}"
   }
 
   return 0

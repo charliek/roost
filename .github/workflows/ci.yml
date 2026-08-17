@@ -1051,6 +1051,12 @@ jobs:
           plist="mac/build/Roost-Iced.app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" >/dev/null \
             || { echo "FAIL: test-keyed bundle has no SUPublicEDKey"; exit 1; }
+          # The e2e supplies the real feed URL at runtime via the
+          # delegate override, so it would pass even if the plist
+          # insertion silently dropped SUFeedURL — assert the exact
+          # placeholder value here instead.
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$plist")" = "http://127.0.0.1:1/placeholder" ] \
+            || { echo "FAIL: test-keyed bundle missing or wrong SUFeedURL"; exit 1; }
           echo "OK: test-keyed bundle carries SUFeedURL + SUPublicEDKey"
 
       - name: Run Iced Sparkle E2E (macOS)

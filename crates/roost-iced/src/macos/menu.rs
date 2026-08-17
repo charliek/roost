@@ -958,7 +958,7 @@ fn resolve(
         if matching.next().is_some() {
             return Err(format!(
                 "ambiguous menu path {:?}: multiple items are titled {segment:?}",
-                &path[..depth]
+                &path[..=depth]
             ));
         }
         drop(matching);
