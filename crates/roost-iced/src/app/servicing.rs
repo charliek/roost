@@ -310,6 +310,14 @@ impl App {
         // `Resync` and this rebuild is what heals it: deltas are an
         // optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        // Every pill-relevant change (title, active, notification) lands
+        // here, so this is where the elision memo is refreshed. Gated on a
+        // window: the bootstrap reconcile runs before the chrome fonts are
+        // registered, and a measurement taken then would be cached wrong
+        // forever — `window_opened` does the first populate instead.
+        if self.window_id.is_some() {
+            self.refresh_pill_labels();
+        }
         self.request_exit_if_empty();
         reconcile_confirm_delete(&mut self.confirm_delete, &self.projects);
         self.reconcile_tab_drag_preview();
