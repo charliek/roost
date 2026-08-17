@@ -861,8 +861,12 @@ impl App {
     /// Rebuild the Window menu's project/tab rows when the rows moved.
     ///
     /// Reconcile is where this hangs (the Dock badge's reasoning), and
-    /// reconcile runs on every drain — so the diff against the last-built
-    /// model, not the AppKit rebuild, is what the common case costs.
+    /// reconcile itself only runs when the engine batch is dirty (a real
+    /// workspace/UI-request change, not every PTY byte batch — the 16ms
+    /// tick that used to make it per-drain is gone). Even so, `derive`
+    /// clones every project name and formats "Tab N" for every tab, so the
+    /// allocation-free `WindowRows::matches` check runs FIRST; `derive` (and
+    /// the AppKit rebuild behind it) only run on an actual mismatch.
     pub(super) fn sync_window_menu(&mut self) {
         #[cfg(target_os = "macos")]
         {
@@ -870,14 +874,17 @@ impl App {
                 return;
             }
             let (active_project_id, active_tab_id) = self.workspace.active();
+            if self
+                .menu_window_rows
+                .matches(&self.projects, active_project_id, active_tab_id)
+            {
+                return;
+            }
             let rows = crate::macos::menu::WindowRows::derive(
                 &self.projects,
                 active_project_id,
                 active_tab_id,
             );
-            if self.menu_window_rows == rows {
-                return;
-            }
             let Some(mtm) = seam_on_main("window-menu rebuild") else {
                 return;
             };

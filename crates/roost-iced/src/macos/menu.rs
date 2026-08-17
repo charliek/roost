@@ -142,6 +142,79 @@ impl WindowRows {
                 .collect(),
         }
     }
+
+    /// Whether [`Self::derive`] would produce a value `PartialEq` to
+    /// `self`, computed WITHOUT any of `derive`'s allocations — no
+    /// `project.name.clone()`, no `format!("Tab {N}")`. `sync_window_menu`
+    /// calls this first and only pays for a real `derive` on an actual
+    /// mismatch — a match (a reconcile that moved nothing menu-relevant)
+    /// is the common case.
+    pub(crate) fn matches(
+        &self,
+        projects: &[Project],
+        active_project_id: i64,
+        active_tab_id: i64,
+    ) -> bool {
+        if self.projects.len() != projects.len() {
+            return false;
+        }
+        let projects_match = self
+            .projects
+            .iter()
+            .zip(projects.iter())
+            .all(|(row, project)| {
+                row.id == project.id
+                    && row.title == project.name
+                    && row.active == (project.id == active_project_id)
+            });
+        if !projects_match {
+            return false;
+        }
+
+        let active_tabs = projects
+            .iter()
+            .find(|project| project.id == active_project_id)
+            .into_iter()
+            .flat_map(|project| project.tabs.iter());
+
+        let mut stored = self.tabs.iter();
+        for (index, tab) in active_tabs.enumerate() {
+            let Some(row) = stored.next() else {
+                return false;
+            };
+            if row.id != tab.id
+                || row.active != (tab.id == active_tab_id)
+                || !title_is_tab_number(&row.title, index + 1)
+            {
+                return false;
+            }
+        }
+        stored.next().is_none()
+    }
+}
+
+/// Whether `title` is exactly what `format!("Tab {number}")` would produce,
+/// without formatting: walks `number`'s decimal digits into a stack buffer
+/// and compares bytes. Rejects lookalikes a numeric parse would wrongly
+/// accept (e.g. `"Tab 01"` for `number == 1`) — the equivalence pin needs
+/// exact-string semantics, not "parses to the same value".
+fn title_is_tab_number(title: &str, number: usize) -> bool {
+    let Some(digits) = title.strip_prefix("Tab ") else {
+        return false;
+    };
+    // usize::MAX is 20 decimal digits.
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut n = number;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    digits.as_bytes() == &buf[i..]
 }
 
 // AppKit's modifier bits, as `NSEventModifierFlags` raw values. Named here
@@ -1210,6 +1283,95 @@ mod tests {
 
         assert_ne!(base, WindowRows::derive(&workspace(), 1, 11));
         assert_ne!(base, WindowRows::derive(&workspace(), 2, 10));
+    }
+
+    /// The equivalence pin `sync_window_menu` leans on for skipping
+    /// `derive`: for a varied set of workspace shapes — empty titles
+    /// hitting the "Tab N" fallback, a title edit, an active-selection
+    /// change, and a project add/remove — `matches` must agree with
+    /// `derive`-then-compare in every case, not just the happy path.
+    #[test]
+    fn matches_agrees_with_derive_equality() {
+        fn check(
+            rows: &WindowRows,
+            projects: &[Project],
+            active_project_id: i64,
+            active_tab_id: i64,
+        ) {
+            let expected = WindowRows::derive(projects, active_project_id, active_tab_id) == *rows;
+            assert_eq!(
+                rows.matches(projects, active_project_id, active_tab_id),
+                expected,
+                "projects={projects:?} active_project_id={active_project_id} active_tab_id={active_tab_id} rows={rows:?}"
+            );
+        }
+
+        let ws = workspace();
+        let base = WindowRows::derive(&ws, 1, 11);
+
+        // Exact match.
+        check(&base, &ws, 1, 11);
+
+        // Active project changed.
+        check(&base, &ws, 2, 20);
+
+        // Active tab changed (same project).
+        check(&base, &ws, 1, 10);
+
+        // A project's name changed — the "Tab N" rows are untouched by a
+        // pure name edit, but the project row itself must miss.
+        let mut renamed = ws.clone();
+        renamed[0].name = "alpha-renamed".into();
+        check(&base, &renamed, 1, 11);
+
+        // A tab's own title changed — irrelevant to the rendered rows
+        // (they're positional "Tab N"), so this must still match.
+        let mut retitled = ws.clone();
+        retitled[0].tabs[0].title = "renamed by the shell".into();
+        check(&base, &retitled, 1, 11);
+
+        // Project order changed.
+        let mut reordered = ws.clone();
+        reordered.swap(0, 1);
+        check(&base, &reordered, 1, 11);
+
+        // A project removed.
+        let mut fewer = ws.clone();
+        fewer.pop();
+        check(&base, &fewer, 1, 11);
+
+        // A project added.
+        let mut more = ws.clone();
+        more.push(project(3, "gamma", vec![tab(30, 3)]));
+        check(&base, &more, 1, 11);
+
+        // A tab removed from the active project.
+        let mut fewer_tabs = ws.clone();
+        fewer_tabs[0].tabs.pop();
+        check(&base, &fewer_tabs, 1, 11);
+
+        // A tab added to the active project.
+        let mut more_tabs = ws.clone();
+        more_tabs[0].tabs.push(tab(12, 1));
+        check(&base, &more_tabs, 1, 11);
+
+        // Empty-titled workspace and rows — the "Tab N" fallback with no
+        // projects/tabs at all.
+        let empty_rows = WindowRows::default();
+        check(&empty_rows, &[], 0, 0);
+        check(&empty_rows, &ws, 1, 11);
+
+        // A lookalike "Tab N" string that a numeric parse (rather than an
+        // exact digit-buffer compare) would wrongly accept.
+        let mut lookalike = base.clone();
+        if let Some(row) = lookalike.tabs.first_mut() {
+            row.title = "Tab 01".into();
+        }
+        check(&lookalike, &ws, 1, 11);
+
+        // An unknown active project id — no project checkmarked, tabs
+        // empty.
+        check(&base, &ws, 99, 10);
     }
 
     /// Rows are bound from the table, so a rebind reaches the menu; only
