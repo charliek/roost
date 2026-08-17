@@ -329,8 +329,7 @@ pub fn encode_press(
     let utf8 = chord
         .map(|chord| &*chord.text.encode_utf8(&mut control_buf))
         .or(text.as_deref())
-        .unwrap_or("")
-        .as_bytes();
+        .unwrap_or("");
     let unshifted = match recovered_key {
         Some(value) => u32::from(value),
         None => latin.map_or_else(
@@ -342,6 +341,38 @@ pub fn encode_press(
             u32::from,
         ),
     };
+    // libghostty consults consumed mods only when `utf8` is non-empty, to
+    // decide which modifiers already went into that text. winit reports
+    // neither GDK's real `consumed_modifiers()` (what GTK forwards) nor
+    // AppKit's flag set (mac 5801f53: shift and option are the translation
+    // modifiers there), so this gate approximates both — a printable utf8
+    // that differs from the unshifted key's own character means a modifier
+    // participated in the translation. ALT is macOS-only: plain Alt on Linux
+    // never translates (winit hands back the base character) and alt-as-meta
+    // must keep its ESC prefix, which the cfg-split legacy alt+b pin below
+    // holds in place. Ctrl-held presses always report consumed 0: ctrl never
+    // translates, real toolkits deliver control text (which fails the
+    // printable gate anyway), and a printable utf8 here is our own chord
+    // recovery's synthesis — consuming ALT off it would strip the legacy ESC
+    // meta-prefix from ctrl+alt+shift chords on mac.
+    let translation_mods = if cfg!(target_os = "macos") {
+        mods::SHIFT | mods::ALT
+    } else {
+        mods::SHIFT
+    };
+    let mut unshifted_buf = [0u8; 4];
+    let unshifted_text =
+        char::from_u32(unshifted).map(|value| &*value.encode_utf8(&mut unshifted_buf));
+    let printable = !utf8.is_empty()
+        && utf8
+            .chars()
+            .all(|value| !value.is_control() && (value as u32) < 0xE000);
+    let mod_bits = ghostty_modifiers(modifiers);
+    let consumed = if printable && !modifiers.control() && unshifted_text != Some(utf8) {
+        mod_bits & translation_mods
+    } else {
+        0
+    };
     event
         .set_action(if repeat {
             key_action::REPEAT
@@ -349,11 +380,11 @@ pub fn encode_press(
             key_action::PRESS
         })
         .set_key(keycode)
-        .set_mods(ghostty_modifiers(modifiers))
-        .set_consumed_mods(0)
+        .set_mods(mod_bits)
+        .set_consumed_mods(consumed)
         .set_composing(composing)
         .set_unshifted_codepoint(unshifted)
-        .set_utf8(utf8);
+        .set_utf8(utf8.as_bytes());
     encoder.sync_from_terminal(terminal);
     encoder.encode(&event).unwrap_or_else(|error| {
         tracing::warn!(?error, "libghostty key encoding failed");
@@ -904,6 +935,24 @@ mod tests {
         }
     }
 
+    /// Ctrl-held presses must never consume mods, even when chord recovery
+    /// synthesizes printable text that differs from the unshifted key
+    /// (ctrl+alt+shift+minus recovers "_"): consuming ALT off that synthetic
+    /// text would clear the effective alt libghostty's legacy path consults
+    /// and change these bytes. Pinned with ALT in the chord to hold the
+    /// ctrl-guard in place.
+    #[test]
+    fn ctrl_alt_shift_chords_keep_their_legacy_bytes() {
+        let (mut encoder, terminal) = encoder_pair();
+        let mods =
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
+        let event = chord("-", "_", Code::Minus, mods, "\u{1f}");
+        assert_eq!(
+            encode_press(&mut encoder, &terminal, event, false),
+            b"\x1b\x1f".to_vec()
+        );
+    }
+
     /// ctrl+[ is the one chord in D3's set libghostty deliberately refuses
     /// to fold into a C0: `[`, `i` and `m` are commented out of its
     /// `ctrlSeq` table per fixterms so applications can tell ctrl+[ from
@@ -1064,6 +1113,93 @@ mod tests {
                 "both event shapes must encode {mac:?} identically"
             );
         }
+    }
+
+    /// A shifted printable key must reach a Kitty-protocol app as the
+    /// character it typed, not as a CSI-u entry naming the unshifted key —
+    /// shift went into the translation, so it is consumed and the effective
+    /// mods are empty. Without the gate these emitted `\x1b[103;2u` /
+    /// `\x1b[47;2u` and Kitty apps (strix) inserted the lowercase letter.
+    #[test]
+    fn shift_translated_printables_reach_kitty_apps_as_typed() {
+        let (mut encoder, terminal) = kitty_encoder_pair();
+        let shift = keyboard::Modifiers::SHIFT;
+        for (key, modified, physical, expected) in
+            [("g", "G", Code::KeyG, "G"), ("/", "?", Code::Slash, "?")]
+        {
+            let event = chord(key, modified, physical, shift, expected);
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false),
+                expected.as_bytes().to_vec(),
+                "shift+{key:?} under kitty"
+            );
+        }
+    }
+
+    /// The C0 gate: winit hands Enter and Tab a control `text`, which is not
+    /// a translation, so shift survives into the CSI-u entry. A naive
+    /// consumed-mods copy would swallow it and send a bare `\r` / `\t`.
+    #[test]
+    fn shift_named_keys_keep_their_kitty_entry() {
+        let (mut encoder, terminal) = kitty_encoder_pair();
+        let shift = keyboard::Modifiers::SHIFT;
+        for (named, physical, text, expected) in [
+            (Named::Enter, Code::Enter, "\r", b"\x1b[13;2u".as_slice()),
+            (Named::Tab, Code::Tab, "\t", b"\x1b[9;2u"),
+        ] {
+            let key = Key::Named(named);
+            let event = press(
+                key.clone(),
+                key,
+                Physical::Code(physical),
+                shift,
+                Some(text),
+            );
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false),
+                expected.to_vec(),
+                "shift+{named:?} under kitty"
+            );
+        }
+    }
+
+    /// ALT is a translation modifier on macOS only, so the same
+    /// option-transformed event splits by platform exactly like the legacy
+    /// pin above: macOS consumes ALT and the glyph reaches the app (the
+    /// intended ad909a3 parity change), while Linux keeps ALT effective and
+    /// the alt chord stays byte-identical to today. A Linux-shaped alt press
+    /// carries the untranslated base character, so ALT is never consumed on
+    /// either platform.
+    #[test]
+    fn kitty_alt_consumption_is_macos_only() {
+        let (mut encoder, terminal) = kitty_encoder_pair();
+        let alt = keyboard::Modifiers::ALT;
+
+        #[cfg(target_os = "macos")]
+        let option_transformed = "∫".as_bytes();
+        #[cfg(not(target_os = "macos"))]
+        let option_transformed = b"\x1b[98;3u".as_slice();
+        assert_eq!(
+            encode_press(
+                &mut encoder,
+                &terminal,
+                chord("b", "∫", Code::KeyB, alt, "∫"),
+                false,
+            ),
+            option_transformed.to_vec(),
+            "mac-shaped alt+b under kitty"
+        );
+
+        assert_eq!(
+            encode_press(
+                &mut encoder,
+                &terminal,
+                chord("b", "b", Code::KeyB, alt, "b"),
+                false,
+            ),
+            b"\x1b[98;3u".to_vec(),
+            "linux-shaped alt+b under kitty"
+        );
     }
 
     #[test]
