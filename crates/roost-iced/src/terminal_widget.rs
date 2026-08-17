@@ -371,6 +371,10 @@ pub struct TerminalSnapshot {
     pub foreground: ColorRgb,
     pub background: ColorRgb,
     pub cursor: Option<CursorInfo>,
+    /// Theme cursor color — the fallback when `cursor.color` (an OSC-12
+    /// set, cleared by OSC 112) is `None`. GTK/mac parity: both fall back
+    /// to `theme.cursor`, not `foreground`.
+    pub cursor_color: ColorRgb,
     /// Indexed by viewport row; `grid.len() == rows`.
     pub grid: Vec<Arc<RenderedRow>>,
     pub selection_background: ColorRgb,
@@ -401,6 +405,11 @@ impl TerminalSnapshot {
                 b: 24,
             },
             cursor: None,
+            cursor_color: ColorRgb {
+                r: 214,
+                g: 218,
+                b: 224,
+            },
             grid: vec![blank_row; usize::from(rows)],
             selection_background: ColorRgb {
                 r: 72,
@@ -415,6 +424,15 @@ impl TerminalSnapshot {
     }
 }
 
+/// The cursor color the renderer should paint: an OSC-12 override
+/// (`cursor.color`) wins when present, otherwise the theme's cursor color
+/// carried on the snapshot. GTK/mac parity (both fall back to
+/// `theme.cursor`, not `foreground`). Pure so it's unit-testable — the
+/// draw path that consumes it needs a live `Renderer` and can't be.
+fn effective_cursor_color(cursor: &CursorInfo, snapshot: &TerminalSnapshot) -> ColorRgb {
+    cursor.color.unwrap_or(snapshot.cursor_color)
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalWidget {
     pub tab_id: i64,
@@ -425,10 +443,11 @@ pub struct TerminalWidget {
     /// computes it as "the keyboard route is this tab and the window is
     /// focused". Only then does the widget ask the platform for an IME.
     pub ime_active: bool,
-    /// Whether the window has keyboard focus. Only the active tab's
-    /// widget is built per view pass, so this is the window's own focus
-    /// state; an unfocused window draws the cursor hollow (mac parity,
-    /// `TerminalView.cursorRenderMode`).
+    /// Whether the terminal owns the keyboard: the window has focus AND
+    /// the keyboard route is a terminal (not the palette, rename editor,
+    /// or confirm overlay). Either being false draws the cursor hollow
+    /// (mac parity, `TerminalView.cursorRenderMode` /
+    /// `hasFocus = windowIsKey && viewIsFirstResponder`).
     pub focused: bool,
 }
 
@@ -1028,7 +1047,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             if let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) {
                 let point =
                     cell_position(bounds.position(), cursor.col as u16, cursor.row, metrics);
-                let cursor_color = color(cursor.color.unwrap_or(self.snapshot.foreground));
+                let cursor_color = color(effective_cursor_color(&cursor, &self.snapshot));
                 let visual_style = if self.focused {
                     cursor.visual_style
                 } else {
@@ -1279,6 +1298,54 @@ mod tests {
             ime_active: false,
             focused: true,
         }
+    }
+
+    fn cursor_info(color: Option<ColorRgb>) -> CursorInfo {
+        CursorInfo {
+            col: 0,
+            row: 0,
+            wide_tail: false,
+            visible: true,
+            blinking: false,
+            visual_style: CursorVisualStyle::Block,
+            color,
+        }
+    }
+
+    #[test]
+    fn effective_cursor_color_falls_back_to_the_snapshot_theme_color_without_an_override() {
+        let mut snapshot = TerminalSnapshot::blank(80, 24);
+        snapshot.cursor_color = ColorRgb {
+            r: 255,
+            g: 204,
+            b: 102,
+        };
+        let cursor = cursor_info(None);
+        assert_eq!(
+            effective_cursor_color(&cursor, &snapshot),
+            snapshot.cursor_color
+        );
+        assert_ne!(
+            effective_cursor_color(&cursor, &snapshot),
+            snapshot.foreground
+        );
+    }
+
+    #[test]
+    fn effective_cursor_color_prefers_an_osc12_override_over_the_theme_color() {
+        let mut snapshot = TerminalSnapshot::blank(80, 24);
+        snapshot.cursor_color = ColorRgb {
+            r: 255,
+            g: 204,
+            b: 102,
+        };
+        let override_color = ColorRgb {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
+        let cursor = cursor_info(Some(override_color));
+        assert_eq!(effective_cursor_color(&cursor, &snapshot), override_color);
     }
 
     #[test]

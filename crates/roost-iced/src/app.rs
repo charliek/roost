@@ -804,6 +804,15 @@ fn terminal_ime_active(route: KeyboardRoute, active_tab: i64, window_focused: bo
     window_focused && ime_preedit_target(route) == Some(active_tab)
 }
 
+/// Whether the active terminal should render a solid (as opposed to
+/// hollow) cursor: the window has focus AND the keyboard route is a
+/// terminal — palette/rename/confirm owning the route draws the cursor
+/// hollow, mac parity. Independent of the route-only `app.active_terminal_
+/// focused` IPC op (`test_focus.py`), which stays unchanged.
+fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
+    window_focused && matches!(route, KeyboardRoute::Terminal(_))
+}
+
 fn resolve_keyboard_route(
     confirm_open: bool,
     editor_open: bool,
@@ -2587,7 +2596,7 @@ impl App {
                     active_tab,
                     self.window_focused,
                 ),
-                focused: self.window_focused,
+                focused: terminal_cursor_focused(self.keyboard_route(), self.window_focused),
             }
             .into(),
             // No frame to draw yet (the tab is spawning, or attached but
@@ -4114,6 +4123,27 @@ mod tests {
         assert!(!terminal_ime_active(KeyboardRoute::Terminal(7), 7, false));
         assert!(!terminal_ime_active(KeyboardRoute::Terminal(8), 7, true));
         assert!(!terminal_ime_active(KeyboardRoute::Palette, 7, true));
+    }
+
+    /// The terminal cursor is solid only while it owns the keyboard AND
+    /// the window has focus — palette/rename/confirm owning the route (or
+    /// an unfocused window) draws it hollow uniformly, mac parity.
+    #[test]
+    fn terminal_cursor_focused_requires_the_terminal_route_and_window_focus() {
+        assert!(terminal_cursor_focused(KeyboardRoute::Terminal(7), true));
+        assert!(!terminal_cursor_focused(KeyboardRoute::Terminal(7), false));
+
+        for route in [
+            KeyboardRoute::None,
+            KeyboardRoute::Confirm,
+            KeyboardRoute::Editor,
+            KeyboardRoute::Palette,
+        ] {
+            assert!(
+                !terminal_cursor_focused(route, true),
+                "{route:?} should draw the cursor hollow even while the window is focused"
+            );
+        }
     }
 
     /// A commit can arrive after the active tab already moved. It belongs
