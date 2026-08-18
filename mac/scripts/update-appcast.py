@@ -17,6 +17,7 @@ Inputs (environment):
   ROOST_SIGN_FILE  optional   sign_update output file; default "sign_update.txt"
   ROOST_REPO       optional   "owner/repo"; default "charliek/roost"
   ROOST_MIN_MACOS  optional   minimum system version; default "15.0.0"
+  ROOST_DMG_NAME   optional   enclosure filename; default "Roost-{version}.dmg"
 
 `sign_update.txt` must hold the line Sparkle's `sign_update` prints for the
 released DMG:
@@ -107,7 +108,7 @@ def main():
             channel.remove(item)
 
     now = datetime.now(timezone.utc)
-    dmg = f"Roost-{version}.dmg"
+    dmg = os.environ.get("ROOST_DMG_NAME", f"Roost-{version}.dmg")
     url = f"https://github.com/{repo}/releases/download/{tag}/{dmg}"
 
     item = ET.SubElement(channel, "item")

@@ -73,6 +73,13 @@ jobs:
               # Without this, editing which tests a lane runs doesn't
               # retrigger the lane that runs them.
               - 'Makefile'
+              # test_update_appcast.py and test_sparkle_plist.py drive the
+              # real scripts/templates via subprocess, so editing them
+              # should retrigger harness-unit too.
+              - 'mac/scripts/update-appcast.py'
+              - 'mac/scripts/bundle-lib.sh'
+              - 'mac/scripts/bundle-iced.sh'
+              - 'mac/Resources/Info-iced.plist.template'
             ci:
               - '.github/workflows/ci.yml'
             # Deliberately NOT `linux`: that filter folds in the *rustcore
