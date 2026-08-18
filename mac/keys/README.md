@@ -69,14 +69,14 @@ git add mac/keys/roost-iced-sparkle-ed-public-key.txt
 ```bash
 umask 077
 ./third_party/sparkle/out/bin/generate_keys --account roost-iced \
-  -x "$TMPDIR/roost-iced-private.key"
+  -x .secrets/roost-iced-sparkle-ed-private.key
 ```
 
 **5. Set the repo secret** (base64 of that file — see the convention above).
 
 ```bash
 gh secret set ROOST_ICED_SPARKLE_ED_PRIVATE_KEY \
-  --body "$(base64 < "$TMPDIR/roost-iced-private.key")"
+  --body "$(base64 < .secrets/roost-iced-sparkle-ed-private.key)"
 ```
 
 **6. Verify the two halves are a pair — do not skip.**
@@ -99,17 +99,17 @@ scratch="$(mktemp)"; head -c 4096 /dev/urandom > "$scratch"
 sig_from_keychain="$(./third_party/sparkle/out/bin/sign_update \
   --account roost-iced -p "$scratch")"
 sig_from_file="$(./third_party/sparkle/out/bin/sign_update \
-  --ed-key-file "$TMPDIR/roost-iced-private.key" -p "$scratch")"
+  --ed-key-file .secrets/roost-iced-sparkle-ed-private.key -p "$scratch")"
 [ "$sig_from_keychain" = "$sig_from_file" ] && echo "private half OK"
 
 # c) the signature actually verifies
 ./third_party/sparkle/out/bin/sign_update --verify \
-  --ed-key-file "$TMPDIR/roost-iced-private.key" "$scratch" "$sig_from_file" \
+  --ed-key-file .secrets/roost-iced-sparkle-ed-private.key "$scratch" "$sig_from_file" \
   && echo "signature verifies"
 
 # d) the secret's encoding round-trips (what release.yml will decode)
-base64 < "$TMPDIR/roost-iced-private.key" | base64 --decode \
-  | diff - "$TMPDIR/roost-iced-private.key" && echo "encoding OK"
+base64 < .secrets/roost-iced-sparkle-ed-private.key | base64 --decode \
+  | diff - .secrets/roost-iced-sparkle-ed-private.key && echo "encoding OK"
 
 rm -f "$scratch"
 ```
@@ -117,14 +117,22 @@ rm -f "$scratch"
 (a) + (b) together are the pair proof: the committed public key belongs to the
 keychain item, and the exported file *is* that keychain item.
 
-**7. Delete the local private material.**
+**7. Sync the private file via envsecrets — do not delete it.**
+
+`.secrets/roost-iced-sparkle-ed-private.key` is deliberately kept: it is in
+the `# envsecrets` tracked list in `.gitignore` (git-ignored,
+age-encrypted to GCS beside `cert.p12` + `apple.env`), so other machines
+recover it with `envsecrets pull` and local release dry-runs can hand it
+straight to `sign_update --ed-key-file`.
 
 ```bash
-rm -f "$TMPDIR/roost-iced-private.key"
+envsecrets push -m "roost-iced sparkle private key"
 ```
 
-The Keychain copy stays (it is the recovery path if the secret is ever lost);
-the exported file must not linger on disk.
+The key then lives in four places, all deliberate: the login Keychain
+(this Mac), the `ROOST_ICED_SPARKLE_ED_PRIVATE_KEY` repo secret (what
+release.yml signs with), the envsecrets store, and the synced
+`.secrets/` file. It must never appear anywhere else.
 
 ## Rotation
 

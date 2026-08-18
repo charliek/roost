@@ -172,10 +172,15 @@ build identity beyond "last released" is needed (e.g. for `roostctl
 | `APT_DISPATCH_TOKEN` | Legacy PAT — superseded by the release-bot App; can be removed once you're sure the App-based dispatch is working | optional / deprecated |
 | `MACOS_CERTIFICATE_P12_BASE64` + `MACOS_CERTIFICATE_PASSWORD` + `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD` + `ROOST_DEVELOPER_ID_IDENTITY` | Mac code-signing + notarization | **set** (2026-06-28; #83 closed) — DMG is Developer ID signed + notarized. All six are gated together as `CAN_NOTARIZE` (all-or-nothing); any one unset → ad-hoc-signed DMG with the Gatekeeper-bypass note |
 
-The cert + Apple creds are kept locally — git-ignored, synced across machines
-via envsecrets (the `# envsecrets` marker in `.gitignore`) — at
-`.secrets/cert.p12` + `.secrets/apple.env`. `envsecrets pull` restores them on a
-new machine; source `apple.env` for a local notarized build.
+The cert + Apple creds + iced Sparkle private key are kept locally —
+git-ignored, synced across machines via envsecrets (the `# envsecrets`
+marker in `.gitignore`) — at `.secrets/cert.p12` + `.secrets/apple.env` +
+`.secrets/roost-iced-sparkle-ed-private.key`. `envsecrets pull` restores
+them on a new machine. For a local notarized build, source `apple.env`
+AND import `cert.p12` into a keychain first — the login keychain carries
+no signing identity, so without the import the bundle scripts fail
+per-file with "no identity found" (mirror release.yml's temp-keychain
+import step).
 
 ## Branch protection
 
