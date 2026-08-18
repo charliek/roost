@@ -125,6 +125,11 @@ jobs:
               # Sparkle pin (version+SHA in fetch.sh) — a bump must re-run
               # the bundle lanes that embed + sign the framework.
               - 'third_party/sparkle/**'
+              # The release-packaging scripts the DMG + sign->appcast smoke
+              # steps drive (plan 030 C4). Without these, a script-only fix
+              # to either one would re-run nothing that packages a DMG.
+              - 'mac/scripts/make-dmg.sh'
+              - 'mac/scripts/update-appcast.py'
 
   rust-lint:
     needs: changes
@@ -1083,6 +1088,70 @@ jobs:
           uv run --group test pytest
           tools/roosttest/test_sparkle.py
           --roost-target iced --roost-fresh -v
+
+      # Branch-side proof of the release path's packaging half (plan 030
+      # § 3.5): release.yml's `mac-iced` job runs this same script with the
+      # same overrides, and the regression that matters is the staging leaf —
+      # a DMG that contains "Roost.app" would drag-install OVER the Swift app.
+      # Version string is arbitrary here; only the layout is under test.
+      - name: Smoke the iced DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          ROOST_DMG_APP_DIR: mac/build/Roost-Iced.app
+          ROOST_DMG_BASENAME: Roost-Iced-ci-smoke
+        run: |
+          set -euo pipefail
+          ./mac/scripts/make-dmg.sh 0.0.0-ci
+          dmg="mac/build/Roost-Iced-ci-smoke.dmg"
+          mnt="$(mktemp -d)"
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mnt" >/dev/null
+          trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true' EXIT
+          ls -la "$mnt"
+          [ -d "$mnt/Roost-Iced.app" ] \
+            || { echo "FAIL: $dmg does not contain Roost-Iced.app at its root"; exit 1; }
+          [ ! -e "$mnt/Roost.app" ] \
+            || { echo "FAIL: $dmg contains Roost.app — the iced DMG would drag-install over the Swift app"; exit 1; }
+          hdiutil detach "$mnt" >/dev/null
+          trap - EXIT
+          rmdir "$mnt"
+          echo "OK: iced DMG mounts with Roost-Iced.app (and no Roost.app) at its root"
+
+      # The other half: sign_update -> update-appcast.py, the exact chain
+      # release.yml's mac-iced + appcast-iced jobs run, against a scratch copy
+      # of the committed seed feed. Proves the seed parses, the iced overrides
+      # reach the enclosure, and the writer's output is well-formed XML.
+      - name: Smoke the iced sign -> appcast chain (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          W="$(mktemp -d)"
+          chmod 700 "$W"
+          trap 'rm -rf "$W"' EXIT
+          # Deliberately NOT generate_keys: it only ever writes the private
+          # half into the login Keychain (-x exports an existing key, -f
+          # imports one — there is no file-only generation mode), and a CI
+          # step must not leave key material in the runner's Keychain. A
+          # Sparkle key FILE is base64 of the 32-byte ed25519 seed (see
+          # `generate_keys --help`, -x), so minting the ephemeral half
+          # directly is the same input sign_update would get.
+          openssl rand 32 | base64 > "$W/ephemeral-private.key"
+          third_party/sparkle/out/bin/sign_update \
+            --ed-key-file "$W/ephemeral-private.key" \
+            mac/build/Roost-Iced-ci-smoke.dmg > "$W/sign-iced.txt"
+          cat "$W/sign-iced.txt"
+          cp docs/appcast-iced.xml "$W/appcast-iced.xml"
+          ROOST_VERSION=0.0.0-ci-smoke \
+            ROOST_TAG=v0.0.0-ci-smoke \
+            ROOST_APPCAST="$W/appcast-iced.xml" \
+            ROOST_DMG_NAME=Roost-Iced-ci-smoke.dmg \
+            ROOST_SIGN_FILE="$W/sign-iced.txt" \
+            python3 mac/scripts/update-appcast.py
+          xmllint --noout "$W/appcast-iced.xml"
+          grep -q 'Roost-Iced-ci-smoke\.dmg' "$W/appcast-iced.xml" \
+            || { echo "FAIL: the appcast entry does not carry the iced enclosure name"; exit 1; }
+          echo "OK: sign_update -> update-appcast.py chain produced a valid iced feed entry"
 
       - name: Collect Iced diagnostics
         if: always()
