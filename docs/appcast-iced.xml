@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='utf-8'?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <title>Roost-Iced</title>
+    <link>https://github.com/charliek/roost</link>
+    <description>Appcast for the experimental Roost-Iced macOS build's auto-updates (Sparkle). Separate feed and separate signing keypair from docs/appcast.xml — the two bundles must never be able to offer each other's updates.</description>
+    <language>en</language>
+  </channel>
+</rss>

@@ -72,4 +72,5 @@ sparkle_ed_key
 # envsecrets
 .secrets/cert.p12
 .secrets/apple.env
+.secrets/roost-iced-sparkle-ed-private.key
 

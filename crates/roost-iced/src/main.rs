@@ -201,14 +201,14 @@ fn host_default_kind(
 /// A `CFBundle` identifier read is not AppKit surface, so this stays correct
 /// whatever the M6 6b native-seam decision turns out to be.
 #[cfg(target_os = "macos")]
-fn main_bundle_identifier() -> Option<String> {
+pub(crate) fn main_bundle_identifier() -> Option<String> {
     objc2_core_foundation::CFBundle::main_bundle()?
         .identifier()
         .map(|id| id.to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn main_bundle_identifier() -> Option<String> {
+pub(crate) fn main_bundle_identifier() -> Option<String> {
     None
 }
 

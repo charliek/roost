@@ -1153,6 +1153,14 @@ impl App {
                                     .into(),
                             ));
                         }
+                        // The UN notification backend is macOS-iced-only
+                        // too — same reasoning as `AppUpdateStatus`.
+                        UiRequest::AppNotificationStatus { reply } => {
+                            let _ = reply.send(Err(
+                                "app.notification_status is not supported on this UI (macOS iced only)"
+                                    .into(),
+                            ));
+                        }
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
                         }

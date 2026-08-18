@@ -904,6 +904,30 @@ pub struct UpdateCheckDump {
 #[serde(deny_unknown_fields)]
 pub struct AppUpdateCheckParams {}
 
+/// `app.notification_status` request: read back the macOS iced UI's
+/// `UNUserNotificationCenter` backend state
+/// (`crates/roost-iced/src/macos/notifications.rs`). Gated and
+/// platform-restricted like `app.menu_dump`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppNotificationStatusParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppNotificationStatusResult {
+    /// `"available"` once the UN delegate installed (a bundled launch
+    /// that has reached `window_opened`), `"unavailable"` otherwise —
+    /// every bare-binary build, and a bundled app before its first
+    /// window opens.
+    pub backend: String,
+    /// Why the backend is unavailable — no app bundle, or the window
+    /// has not opened yet — or `null` once it is available.
+    pub reason: Option<String>,
+    /// The user's answer to the authorization prompt. Always `false`
+    /// while unavailable. CI's TCC authorization state is unknowable,
+    /// so nothing in the automated suite asserts this `true`.
+    pub authorized: bool,
+}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -1539,6 +1563,12 @@ pub mod ops {
     /// — no UI, no download). Results are read back through
     /// `app.update_status`. Same gate and platform restriction.
     pub const APP_UPDATE_CHECK: &str = "app.update_check";
+
+    /// Test-only read of the macOS iced UI's `UNUserNotificationCenter`
+    /// backend state — whether the delegate installed and the user's
+    /// authorization answer. Same gate and platform restriction as
+    /// `app.menu_dump`.
+    pub const APP_NOTIFICATION_STATUS: &str = "app.notification_status";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
@@ -2452,6 +2482,35 @@ mod tests {
             assert!(serde_json::from_str::<AppUpdateStatusParams>(bad).is_err());
             assert!(serde_json::from_str::<AppUpdateCheckParams>(bad).is_err());
         }
+    }
+
+    #[test]
+    fn app_notification_status_round_trips() {
+        round_trip(&AppNotificationStatusParams {});
+        // Deliberately never a fixture with `authorized: true` — CI's
+        // TCC authorization state is unknowable, and this wire-format
+        // test is the wrong place to normalize asserting it.
+        let available = AppNotificationStatusResult {
+            backend: "available".into(),
+            reason: None,
+            authorized: false,
+        };
+        round_trip(&available);
+        // A `reason`-less status serializes the field as null, not an
+        // omitted field — the wire shape ipc.md documents.
+        assert_eq!(
+            serde_json::to_value(&available).unwrap()["reason"],
+            serde_json::Value::Null
+        );
+        round_trip(&AppNotificationStatusResult {
+            backend: "unavailable".into(),
+            reason: Some("not running from an app bundle".into()),
+            authorized: false,
+        });
+        round_trip(&AppNotificationStatusResult::default());
+
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppNotificationStatusParams>(bad).is_err());
     }
 
     #[test]
