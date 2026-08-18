@@ -7,9 +7,14 @@ this exercises the inbox surface a user actually triages through.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 
-from client import Timeout
+from client import RoostError, Timeout
+
+TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
 def _wait(roost, pred, what, timeout=4.0):
@@ -196,3 +201,65 @@ def test_clear_all_empties_inbox(roost, project, palette):
     # Inbox drains to the empty sentinel (row removal rides the same
     # false-edge event as the badge clear, so it can lag a tick).
     roost._wait(lambda: _inbox_ids(palette) == ["notif:none"], 5.0, "inbox drained to sentinel")
+
+
+@pytest.mark.skipif(
+    not TEST_MODE,
+    reason="app.notification_status requires ROOST_TEST_MODE=1 in the UI's launch env",
+)
+class TestNotificationStatusBareIced:
+    """`app.notification_status` (plan 030 C2) — the automatable half of
+    the macOS UN backend's regression fence; the real banner/click/TCC
+    prompt stays the morning checklist (#285). This class pins the bare
+    `cargo build` iced dev binary's shape: no app bundle, so
+    `crates/roost-iced/src/macos/notifications.rs::init` never touches
+    UN and the op reports `unavailable` with the no-bundle reason —
+    mirroring `TestSparkleBareBinary` (test_sparkle.py) and
+    `TestDockBadge`'s `_mac_iced_only` gate (test_dock_badge.py).
+
+    macOS-iced-only: on Linux iced the backend module is not even
+    compiled in, so the op answers `not-implemented` there too — but
+    that is not this class's shape to assert
+    (`TestNotificationStatusGtkRejects` below pins the not-implemented
+    shape on the UI that always takes it, regardless of host OS)."""
+
+    @pytest.fixture(autouse=True)
+    def _bare_iced_only(self, target):
+        if sys.platform != "darwin" or target != "iced":
+            pytest.skip(
+                "app.notification_status's bare-binary shape is "
+                "macOS-iced-only (plan 030 § 3.1)"
+            )
+
+    def test_bare_binary_is_unavailable_with_the_no_bundle_reason(self, roost):
+        status = roost.app_notification_status()
+        assert status["backend"] == "unavailable", status
+        # The reason names what was missing (no bundle), the same
+        # contract `TestSparkleBareBinary` pins for the missing-framework
+        # reason.
+        assert status["reason"] == "not running from an app bundle", status
+        # CI's TCC authorization state is unknowable — never assert
+        # `authorized` true anywhere in this suite.
+        assert status["authorized"] is False, status
+
+
+@pytest.mark.skipif(
+    not TEST_MODE,
+    reason="app.notification_status requires ROOST_TEST_MODE=1 in the UI's launch env",
+)
+class TestNotificationStatusGtkRejects:
+    """No `UNUserNotificationCenter` seam exists on the GTK UI at all —
+    `app.notification_status` must reject loudly rather than answer a
+    plausible `unavailable`, which would pass a test that never
+    exercised the seam. Same reasoning as `app.dock_badge`'s GTK reject
+    arm (`crates/roost-linux/src/app.rs`)."""
+
+    @pytest.fixture(autouse=True)
+    def _gtk_only(self, target):
+        if target != "gtk":
+            pytest.skip("this class pins the GTK reject arm")
+
+    def test_gtk_rejects_as_not_implemented(self, roost):
+        with pytest.raises(RoostError) as caught:
+            roost.app_notification_status()
+        assert caught.value.code == "not-implemented", caught.value

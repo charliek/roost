@@ -873,6 +873,32 @@ ignores the variable entirely.
 
 Implemented only by the iced UI on macOS, same as `app.menu_dump`.
 
+### `app.notification_status` *(test-only — gated, macOS iced only)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Reads back the macOS iced
+UI's `UNUserNotificationCenter` backend state
+(`crates/roost-iced/src/macos/notifications.rs`).
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"backend": "available", "reason": null, "authorized": false}
+```
+
+`backend` is `"available"` once the UN delegate has installed — a
+bundled launch that has reached `window_opened` — and `"unavailable"`
+otherwise: every bare-binary build (no app bundle, so UN is never
+touched), and a bundled app before its first window opens. `reason`
+names why it is unavailable (`"not running from an app bundle"`,
+`"window not opened yet"`), or `null` once available. `authorized` is
+the user's answer to the authorization prompt, always `false` while
+unavailable — CI's TCC authorization state is unknowable, so the
+automated suite never asserts this `true`; the real prompt/click is the
+morning checklist (#285).
+
+Implemented only by the iced UI on macOS, same as `app.menu_dump`.
+
 ### `sidebar.set_width` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
