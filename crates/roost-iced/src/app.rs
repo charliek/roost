@@ -1433,6 +1433,10 @@ impl App {
         // reconcile may be a while off (nothing forces one on the turn a
         // window opens).
         self.sync_window_menu();
+        // A notification fired before this runs finds the backend still
+        // disabled and shows nothing — by design, and vanishingly rare:
+        // policy B only fires for an unfocused window.
+        self.init_notifications();
         opened.task
     }
 

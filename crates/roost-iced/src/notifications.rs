@@ -68,19 +68,19 @@ impl TabSlot {
 /// The future that resolves once the user acts on a shown notification:
 /// `true` for a click on the banner body, `false` for anything else (a
 /// dismiss, or a server that closed it).
-type Activation = Pin<Box<dyn Future<Output = bool> + Send>>;
+pub(crate) type Activation = Pin<Box<dyn Future<Output = bool> + Send>>;
 
 /// What one show produced. The `activation` is `None` on backends that
 /// cannot report a click at all, which is why the worker — not the
 /// backend — owns the listener bookkeeping.
-struct Shown {
-    server_id: Option<u32>,
-    activation: Option<Activation>,
+pub(crate) struct Shown {
+    pub(crate) server_id: Option<u32>,
+    pub(crate) activation: Option<Activation>,
 }
 
 impl Shown {
     /// Nothing reached the desktop: no id to replace, no banner to click.
-    fn nothing() -> Self {
+    pub(crate) fn nothing() -> Self {
         Self {
             server_id: None,
             activation: None,
@@ -91,12 +91,16 @@ impl Shown {
 /// A show request in toolkit-neutral form, so the mapping is testable off
 /// Linux and a second backend has one shape to implement.
 #[derive(Debug, PartialEq, Eq)]
-struct Payload {
-    title: String,
+pub(crate) struct Payload {
+    /// The tab this fired for. Backends that key their notifications by
+    /// tab rather than by server id build their identifier from it; the
+    /// freedesktop one replaces via [`Payload::replaces`] and ignores it.
+    pub(crate) tab_id: i64,
+    pub(crate) title: String,
     /// `None` when the notification carried no body — an empty body line
     /// is worse than none, and GTK omits it the same way.
-    body: Option<String>,
-    replaces: Option<u32>,
+    pub(crate) body: Option<String>,
+    pub(crate) replaces: Option<u32>,
 }
 
 pub(crate) struct DesktopNotifications {
@@ -178,20 +182,22 @@ where
             } => (tab_id, title, body),
         };
         let previous = slots.get(&tab_id).and_then(|slot| slot.server_id);
-        let shown =
-            match tokio::time::timeout(SHOW_TIMEOUT, show(build_payload(title, body, previous)))
-                .await
-            {
-                Ok(Ok(shown)) => shown,
-                Ok(Err(error)) => {
-                    tracing::warn!(tab_id, %error, "desktop notification failed");
-                    Shown::nothing()
-                }
-                Err(_) => {
-                    tracing::warn!(tab_id, "desktop notification timed out");
-                    Shown::nothing()
-                }
-            };
+        let shown = match tokio::time::timeout(
+            SHOW_TIMEOUT,
+            show(build_payload(tab_id, title, body, previous)),
+        )
+        .await
+        {
+            Ok(Ok(shown)) => shown,
+            Ok(Err(error)) => {
+                tracing::warn!(tab_id, %error, "desktop notification failed");
+                Shown::nothing()
+            }
+            Err(_) => {
+                tracing::warn!(tab_id, "desktop notification timed out");
+                Shown::nothing()
+            }
+        };
         let listener = shown
             .activation
             .map(|activation| spawn_listener(&feed, tab_id, activation).abort_handle());
@@ -217,8 +223,9 @@ fn spawn_listener(
     })
 }
 
-fn build_payload(title: String, body: String, replaces: Option<u32>) -> Payload {
+fn build_payload(tab_id: i64, title: String, body: String, replaces: Option<u32>) -> Payload {
     Payload {
+        tab_id,
         title,
         body: (!body.is_empty()).then_some(body),
         replaces,
@@ -471,14 +478,27 @@ mod backend {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod backend {
     use super::{Payload, Shown};
 
-    /// macOS is deferred, not designed out: a UNUserNotificationCenter
-    /// backend drops in at this signature, activation included.
+    /// `app_id` has no counterpart here: UN identifies the sender by the
+    /// bundle it is running out of, which is also what gates the backend
+    /// on (`crate::macos::notifications::init`).
+    pub(super) async fn show(payload: Payload, _app_id: String) -> Result<Shown, String> {
+        crate::macos::notifications::show(payload).await
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod backend {
+    use super::{Payload, Shown};
+
+    /// Every remaining host: no backend, and the seam says so rather than
+    /// pretending a banner reached anyone.
     pub(super) async fn show(payload: Payload, _app_id: String) -> Result<Shown, String> {
         let Payload {
+            tab_id: _,
             title,
             body,
             replaces,
@@ -574,16 +594,18 @@ mod tests {
     #[test]
     fn an_empty_body_is_omitted_and_the_title_travels_verbatim() {
         assert_eq!(
-            build_payload("Claude".into(), String::new(), None),
+            build_payload(7, "Claude".into(), String::new(), None),
             Payload {
+                tab_id: 7,
                 title: "Claude".into(),
                 body: None,
                 replaces: None,
             }
         );
         assert_eq!(
-            build_payload(String::new(), "  ".into(), Some(4)),
+            build_payload(7, String::new(), "  ".into(), Some(4)),
             Payload {
+                tab_id: 7,
                 title: String::new(),
                 body: Some("  ".into()),
                 replaces: Some(4),
