@@ -912,6 +912,10 @@ async fn main() -> Result<()> {
             println!("draw_calls       {}", stats.draw_calls);
             println!("draw_nanos       {}", stats.draw_nanos);
             println!("fill_text_calls  {}", stats.fill_text_calls);
+            println!("view_calls       {}", stats.view_calls);
+            println!("view_nanos       {}", stats.view_nanos);
+            println!("elide_calls      {}", stats.elide_calls);
+            println!("elide_nanos      {}", stats.elide_nanos);
             println!(
                 "ns_per_refresh   {}",
                 per(stats.refresh_nanos, stats.refresh_calls)
@@ -919,6 +923,14 @@ async fn main() -> Result<()> {
             println!(
                 "ns_per_draw      {}",
                 per(stats.draw_nanos, stats.draw_calls)
+            );
+            println!(
+                "us_per_view      {}",
+                per(stats.view_nanos / 1_000, stats.view_calls)
+            );
+            println!(
+                "ns_per_elide     {}",
+                per(stats.elide_nanos, stats.elide_calls)
             );
         }
         Cmd::Palette(PaletteCmd::Open { kind, json }) => {

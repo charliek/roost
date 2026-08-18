@@ -1215,6 +1215,11 @@ pub struct AppRenderStatsParams {
 /// Permissive (no `deny_unknown_fields`) like every other result
 /// struct, so a newer UI can add counters without breaking older
 /// clients.
+///
+/// `view_calls`/`view_nanos`/`elide_calls`/`elide_nanos` carry `default`
+/// on top of `string_int64`: the mac Swift handler doesn't send them, so
+/// a decode against that response must still succeed (same tolerance
+/// pattern as `TabOpenParams.project_id`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRenderStatsResult {
     #[serde(with = "string_int64")]
@@ -1231,6 +1236,14 @@ pub struct AppRenderStatsResult {
     pub draw_nanos: i64,
     #[serde(with = "string_int64")]
     pub fill_text_calls: i64,
+    #[serde(with = "string_int64", default)]
+    pub view_calls: i64,
+    #[serde(with = "string_int64", default)]
+    pub view_nanos: i64,
+    #[serde(with = "string_int64", default)]
+    pub elide_calls: i64,
+    #[serde(with = "string_int64", default)]
+    pub elide_nanos: i64,
 }
 
 /// `window.resize` request — programmatically set the window's logical
@@ -2211,6 +2224,10 @@ mod tests {
             draw_calls: 30,
             draw_nanos: 4_500_000,
             fill_text_calls: 720,
+            view_calls: 288,
+            view_nanos: 3_100_000,
+            elide_calls: 0,
+            elide_nanos: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains(r#""refresh_calls":"12""#), "got: {json}");
@@ -2223,6 +2240,10 @@ mod tests {
         assert!(json.contains(r#""draw_calls":"30""#), "got: {json}");
         assert!(json.contains(r#""draw_nanos":"4500000""#), "got: {json}");
         assert!(json.contains(r#""fill_text_calls":"720""#), "got: {json}");
+        assert!(json.contains(r#""view_calls":"288""#), "got: {json}");
+        assert!(json.contains(r#""view_nanos":"3100000""#), "got: {json}");
+        assert!(json.contains(r#""elide_calls":"0""#), "got: {json}");
+        assert!(json.contains(r#""elide_nanos":"0""#), "got: {json}");
         round_trip(&r);
     }
 
@@ -2233,9 +2254,29 @@ mod tests {
     fn app_render_stats_result_accepts_extra_fields() {
         let json = r#"{"refresh_calls":"1","refresh_nanos":"2","rows_rebuilt":"3",
                        "cells_walked":"4","draw_calls":"5","draw_nanos":"6",
-                       "fill_text_calls":"7","gpu_nanos":"8"}"#;
+                       "fill_text_calls":"7","view_calls":"8","view_nanos":"9",
+                       "elide_calls":"10","elide_nanos":"11","gpu_nanos":"12"}"#;
         let r: AppRenderStatsResult = serde_json::from_str(json).expect("permissive decode");
         assert_eq!(r.fill_text_calls, 7);
+        assert_eq!(r.view_calls, 8);
+        assert_eq!(r.view_nanos, 9);
+        assert_eq!(r.elide_calls, 10);
+        assert_eq!(r.elide_nanos, 11);
+    }
+
+    /// The mac Swift handler doesn't send `view_*`/`elide_*` — those
+    /// fields must default to 0 rather than fail the decode, the same
+    /// tolerance `TabOpenParams.project_id` relies on.
+    #[test]
+    fn app_render_stats_result_defaults_missing_view_elide_fields() {
+        let json = r#"{"refresh_calls":"1","refresh_nanos":"2","rows_rebuilt":"3",
+                       "cells_walked":"4","draw_calls":"5","draw_nanos":"6",
+                       "fill_text_calls":"7"}"#;
+        let r: AppRenderStatsResult = serde_json::from_str(json).expect("permissive decode");
+        assert_eq!(r.view_calls, 0);
+        assert_eq!(r.view_nanos, 0);
+        assert_eq!(r.elide_calls, 0);
+        assert_eq!(r.elide_nanos, 0);
     }
 
     #[test]

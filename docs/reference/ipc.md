@@ -647,7 +647,8 @@ Response:
 {"refresh_calls": "412", "refresh_nanos": "51500000",
  "rows_rebuilt": "9888", "cells_walked": "790400",
  "draw_calls": "377", "draw_nanos": "94250000",
- "fill_text_calls": "9048"}
+ "fill_text_calls": "9048", "view_calls": "412", "view_nanos": "3300000",
+ "elide_calls": "0", "elide_nanos": "0"}
 ```
 
 Every counter is a **string-wrapped int64** (the same
@@ -663,7 +664,13 @@ that walk touched. `draw_calls` / `draw_nanos` / `fill_text_calls`
 cover the widget draw pass. `fill_text_calls` counts glyph draws the
 pass emitted — a sprite-rendered cell (box drawing, blocks) *replaces*
 a glyph draw and counts as one on both UIs, so the field is comparable
-across them.
+across them. `view_calls` / `view_nanos` cover the iced UI's whole
+`App::view()` rebuild; `elide_calls` / `elide_nanos` cover
+`chrome::elide_to_width`, the tab-pill title eliding it calls — GTK has
+no view/elide instrumentation, so its handler always reports these four
+as `0`. `view_calls`/`view_nanos`/`elide_calls`/`elide_nanos` default
+to `0` on decode when absent, so an older client (the mac Swift
+handler doesn't send them) still parses.
 
 `reset: true` zeroes the counters **after** the read, so a caller can
 read-reset, run a workload, then read the delta directly.

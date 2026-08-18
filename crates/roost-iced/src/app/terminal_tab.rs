@@ -1071,6 +1071,7 @@ impl TerminalTab {
             foreground: colors.foreground,
             background: colors.background,
             cursor,
+            cursor_color: self.theme.cursor,
             grid: self.grid.clone(),
             selection_background: self.theme.selection_background,
             selection_spans: self

@@ -804,6 +804,15 @@ fn terminal_ime_active(route: KeyboardRoute, active_tab: i64, window_focused: bo
     window_focused && ime_preedit_target(route) == Some(active_tab)
 }
 
+/// Whether the active terminal should render a solid (as opposed to
+/// hollow) cursor: the window has focus AND the keyboard route is a
+/// terminal — palette/rename/confirm owning the route draws the cursor
+/// hollow, mac parity. Independent of the route-only `app.active_terminal_
+/// focused` IPC op (`test_focus.py`), which stays unchanged.
+fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
+    window_focused && matches!(route, KeyboardRoute::Terminal(_))
+}
+
 fn resolve_keyboard_route(
     confirm_open: bool,
     editor_open: bool,
@@ -1001,6 +1010,107 @@ fn title_fallback(kind: BundleProfileKind) -> &'static str {
     }
 }
 
+/// One tab pill's elided title, with the inputs it was elided under.
+#[derive(Debug, Clone, PartialEq)]
+struct PillLabel {
+    /// The DISPLAY title — post-`"shell"` substitution, exactly what
+    /// `view()` hands the eliding measurer.
+    title: String,
+    active: bool,
+    has_notification: bool,
+    label: String,
+    width: f32,
+}
+
+impl PillLabel {
+    /// Whether this entry was elided under exactly `key`. `id` is the map
+    /// slot, so only the elision inputs take part.
+    fn matches(&self, key: PillKey<'_>) -> bool {
+        self.title == key.title
+            && self.active == key.active
+            && self.has_notification == key.has_notification
+    }
+}
+
+/// The pill's key as `view()` derives it, for one tab. Carrying it as one
+/// value is what keeps the lookup and the populate from disagreeing on the
+/// two same-typed flags.
+#[derive(Debug, Clone, Copy)]
+struct PillKey<'a> {
+    id: i64,
+    title: &'a str,
+    active: bool,
+    has_notification: bool,
+}
+
+/// What a pill spends beyond its title: the close affordance on the active
+/// pill, the badge on a notified inactive one. Both are laid out trailing,
+/// so both come out of the title's width budget.
+fn pill_trailing_width(active: bool, has_notification: bool) -> f32 {
+    if active {
+        chrome::PILL_HEIGHT
+    } else if has_notification {
+        chrome::NOTIFICATION_DOT_SIZE
+    } else {
+        0.0
+    }
+}
+
+/// The one place the pill title's font + width budget are derived, so
+/// `view()` and the memo populate cannot drift into measuring differently.
+fn pill_title_metrics(active: bool, has_notification: bool) -> (Font, f32) {
+    let font = chrome::chrome_font(if active {
+        font::Weight::Medium
+    } else {
+        font::Weight::Normal
+    });
+    let budget = chrome::TAB_PILL_MAX_WIDTH
+        - chrome::TAB_PILL_CHROME_WIDTH
+        - pill_trailing_width(active, has_notification);
+    (font, budget)
+}
+
+fn elide_pill_title(key: PillKey<'_>) -> (Cow<'_, str>, f32) {
+    let (font, budget) = pill_title_metrics(key.active, key.has_notification);
+    chrome::elide_to_width(key.title, font, chrome::TAB_TITLE_SIZE, budget)
+}
+
+/// Recompute `labels` for exactly `keys`, skipping every tab whose key is
+/// unchanged and dropping every tab that is no longer in the strip.
+fn refresh_pill_label_map(labels: &mut HashMap<i64, PillLabel>, keys: &[PillKey<'_>]) {
+    for &key in keys {
+        if labels
+            .get(&key.id)
+            .is_some_and(|stored| stored.matches(key))
+        {
+            continue;
+        }
+        let (label, width) = elide_pill_title(key);
+        labels.insert(
+            key.id,
+            PillLabel {
+                title: key.title.to_owned(),
+                active: key.active,
+                has_notification: key.has_notification,
+                label: label.into_owned(),
+                width,
+            },
+        );
+    }
+    labels.retain(|id, _| keys.iter().any(|key| key.id == *id));
+}
+
+/// The display string a pill shows for `title` — an untitled tab reads
+/// `"shell"`, and that substituted string is what gets elided, cached and
+/// keyed on.
+fn pill_display_title(title: &str) -> &str {
+    if title.is_empty() {
+        "shell"
+    } else {
+        title
+    }
+}
+
 pub struct App {
     workspace: Arc<Workspace>,
     supervisor: Arc<PtySupervisor>,
@@ -1036,6 +1146,17 @@ pub struct App {
     rename_op: Option<u64>,
     /// Monotonic source of the ids that guard in-flight engine ops.
     next_engine_op: u64,
+    /// Elided tab-pill titles, memoized across `view()` rebuilds: eliding
+    /// binary-searches over full `Paragraph` shaping, which made the pill
+    /// loop 79% of per-keystroke main-thread work (plan 029 F1).
+    ///
+    /// The memo is sound only while EVERY elision input is in the key. It
+    /// is today — the display title, `active` and `has_notification` are
+    /// the only variables; the font, text size and width budget are
+    /// constants (`pill_title_metrics`). If the budget ever becomes
+    /// window-relative, or the chrome font configurable, the key must grow
+    /// to match or pills will render at a stale width.
+    pill_labels: HashMap<i64, PillLabel>,
     tab_drag_preview: Option<TabDragPreview>,
     tab_strip_generation: u64,
     project_drag_preview: Option<ProjectDragPreview>,
@@ -1221,6 +1342,7 @@ impl App {
             rename_completion_key: None,
             rename_op: None,
             next_engine_op: 1,
+            pill_labels: HashMap::new(),
             tab_drag_preview: None,
             tab_strip_generation: 1,
             project_drag_preview: None,
@@ -1296,6 +1418,12 @@ impl App {
             &mut self.screenshots,
             id,
         );
+        // `App::new`'s reconcile ran before `iced::application(..).font(..)`
+        // registered Inter, so it deliberately skipped the pill memo rather
+        // than cache wrong-font measurements. The fonts are registered by
+        // the time a window opens; this is the populate that reconcile
+        // skipped.
+        self.refresh_pill_labels();
         self.install_main_menu();
         // After the menu install, so the "Check for Updates…" item
         // already exists for the readiness push below (plan 028 § 3.8).
@@ -1306,6 +1434,31 @@ impl App {
         // window opens).
         self.sync_window_menu();
         opened.task
+    }
+
+    /// Bring [`App::pill_labels`] up to date with the active project's
+    /// strip. Only the active project's tabs are drawn as pills, so only
+    /// they are memoized.
+    fn refresh_pill_labels(&mut self) {
+        let (active_project, active_tab) = self.workspace.active();
+        let keys: Vec<PillKey<'_>> = self
+            .projects
+            .iter()
+            .find(|project| project.id == active_project)
+            .map(|project| {
+                project
+                    .tabs
+                    .iter()
+                    .map(|tab| PillKey {
+                        id: tab.id,
+                        title: pill_display_title(&tab.title),
+                        active: tab.id == active_tab,
+                        has_notification: tab.has_notification,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        refresh_pill_label_map(&mut self.pill_labels, &keys);
     }
 
     pub fn window_resized(&mut self, id: window::Id, size: Size) -> UiTask {
@@ -1943,8 +2096,10 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        let started = Instant::now();
         let content = self.view_body();
         let Some(confirm) = &self.confirm_delete else {
+            crate::perf::record_view(started.elapsed());
             return content;
         };
         // Copy and structure follow the Mac's `closeActiveProject` NSAlert
@@ -2002,10 +2157,12 @@ impl App {
             .center(Fill);
         let catcher = mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
             .on_press(Message::ConfirmDeleteCancel);
-        stack![content, catcher, overlay]
+        let result = stack![content, catcher, overlay]
             .width(Fill)
             .height(Fill)
-            .into()
+            .into();
+        crate::perf::record_view(started.elapsed());
+        result
     }
 
     fn view_body(&self) -> Element<'_, Message> {
@@ -2255,11 +2412,7 @@ impl App {
         // frame on every ordinary click. Same rule the sidebar rows use.
         let mut tab_pills = row![].spacing(6);
         for tab in active_project_tabs {
-            let title = if tab.title.is_empty() {
-                "shell"
-            } else {
-                &tab.title
-            };
+            let title = pill_display_title(&tab.title);
             let active = tab.id == active_tab;
             let editing = self
                 .rename_editor
@@ -2277,28 +2430,27 @@ impl App {
                     .background(status_color)
                     .border(iced::border::rounded(4))
             });
-            // What the pill spends beyond its chrome and title: the close
-            // affordance on the active pill, the badge on a notified
-            // inactive one. Both are laid out trailing, so both come out
-            // of the title's width budget.
-            let trailing_width = if active {
-                chrome::PILL_HEIGHT
-            } else if tab.has_notification {
-                chrome::NOTIFICATION_DOT_SIZE
-            } else {
-                0.0
+            let key = PillKey {
+                id: tab.id,
+                title,
+                active,
+                has_notification: tab.has_notification,
             };
-            let title_font = chrome::chrome_font(if active {
-                font::Weight::Medium
-            } else {
-                font::Weight::Normal
-            });
-            let title_budget =
-                chrome::TAB_PILL_MAX_WIDTH - chrome::TAB_PILL_CHROME_WIDTH - trailing_width;
+            let trailing_width = pill_trailing_width(active, tab.has_notification);
+            let (title_font, _) = pill_title_metrics(active, tab.has_notification);
+            let cached = self
+                .pill_labels
+                .get(&key.id)
+                .filter(|stored| stored.matches(key));
             let (label, label_width) = if editing.is_some() {
                 (Cow::Borrowed(title), RENAME_FIELD_WIDTH)
+            } else if let Some(stored) = cached {
+                (Cow::Borrowed(stored.label.as_str()), stored.width)
             } else {
-                chrome::elide_to_width(title, title_font, chrome::TAB_TITLE_SIZE, title_budget)
+                // `view` is `&self`, so a miss cannot be memoized here — it
+                // re-elides, and the e2e guard fails loudly if misses ever
+                // become steady state (`elide_calls > 0` per keystroke).
+                elide_pill_title(key)
             };
             let pill_width = (chrome::TAB_PILL_CHROME_WIDTH + trailing_width + label_width)
                 .ceil()
@@ -2444,7 +2596,7 @@ impl App {
                     active_tab,
                     self.window_focused,
                 ),
-                focused: self.window_focused,
+                focused: terminal_cursor_focused(self.keyboard_route(), self.window_focused),
             }
             .into(),
             // No frame to draw yet (the tab is spawning, or attached but
@@ -3211,6 +3363,103 @@ mod tests {
         assert_eq!(terminal_grid(size, 220.0, metrics), (2, 2));
     }
 
+    fn pill_key(id: i64, title: &str, active: bool) -> PillKey<'_> {
+        PillKey {
+            id,
+            title,
+            active,
+            has_notification: false,
+        }
+    }
+
+    /// A sentinel no elision could ever produce, so its survival proves a
+    /// skip and its disappearance proves a recompute.
+    fn seed_stale(labels: &mut HashMap<i64, PillLabel>, key: PillKey<'_>) {
+        labels.insert(
+            key.id,
+            PillLabel {
+                title: key.title.to_owned(),
+                active: key.active,
+                has_notification: key.has_notification,
+                label: "STALE".to_owned(),
+                width: -1.0,
+            },
+        );
+    }
+
+    #[test]
+    fn an_untitled_tab_memoizes_the_shell_placeholder() {
+        assert_eq!(pill_display_title(""), "shell");
+        let mut labels = HashMap::new();
+        refresh_pill_label_map(&mut labels, &[pill_key(1, pill_display_title(""), true)]);
+        let stored = labels.get(&1).expect("the pill is memoized");
+        assert_eq!(stored.title, "shell");
+        assert_eq!(stored.label, "shell", "a short title elides to itself");
+        assert!(stored.width > 0.0);
+        assert!(stored.matches(pill_key(1, "shell", true)));
+    }
+
+    #[test]
+    fn a_changed_pill_key_recomputes_its_label() {
+        let mut labels = HashMap::new();
+        seed_stale(&mut labels, pill_key(1, "alpha", false));
+
+        refresh_pill_label_map(&mut labels, &[pill_key(1, "beta", false)]);
+        assert_eq!(labels[&1].label, "beta", "a new title re-elides");
+
+        seed_stale(&mut labels, pill_key(1, "beta", false));
+        refresh_pill_label_map(&mut labels, &[pill_key(1, "beta", true)]);
+        assert_eq!(
+            labels[&1].label, "beta",
+            "activation changes the font weight and the width budget, so it re-elides"
+        );
+
+        seed_stale(&mut labels, pill_key(1, "beta", true));
+        let notified = PillKey {
+            has_notification: true,
+            ..pill_key(1, "beta", true)
+        };
+        refresh_pill_label_map(&mut labels, &[notified]);
+        assert_eq!(labels[&1].label, "beta", "the badge reservation re-elides");
+    }
+
+    #[test]
+    fn an_unchanged_pill_key_skips_the_measurer() {
+        let mut labels = HashMap::new();
+        seed_stale(&mut labels, pill_key(1, "alpha", false));
+        refresh_pill_label_map(&mut labels, &[pill_key(1, "alpha", false)]);
+        assert_eq!(
+            labels[&1].label, "STALE",
+            "an identical key must not re-measure"
+        );
+    }
+
+    #[test]
+    fn a_closed_tab_drops_out_of_the_pill_memo() {
+        let mut labels = HashMap::new();
+        refresh_pill_label_map(
+            &mut labels,
+            &[pill_key(1, "alpha", true), pill_key(2, "beta", false)],
+        );
+        refresh_pill_label_map(&mut labels, &[pill_key(2, "beta", false)]);
+        assert_eq!(labels.keys().copied().collect::<Vec<_>>(), vec![2]);
+    }
+
+    /// A title far past `TAB_PILL_MAX_WIDTH` must come back marked, and the
+    /// cached width must be the measured one — the pill lays itself out
+    /// from it.
+    #[test]
+    fn an_overlong_pill_title_caches_its_elided_form() {
+        let long = "/Users/charliek/projects/roost/crates/roost-iced/src/app.rs";
+        let mut labels = HashMap::new();
+        refresh_pill_label_map(&mut labels, &[pill_key(1, long, false)]);
+        let stored = &labels[&1];
+        assert!(stored.label.ends_with(chrome::ELLIPSIS));
+        assert!(stored.label.len() < long.len());
+        let (_, budget) = pill_title_metrics(false, false);
+        assert!(stored.width <= budget);
+    }
+
     #[test]
     fn collapsed_sidebar_has_no_layout_width() {
         assert_eq!(effective_sidebar_width(false, 220.0), 220.0);
@@ -3874,6 +4123,27 @@ mod tests {
         assert!(!terminal_ime_active(KeyboardRoute::Terminal(7), 7, false));
         assert!(!terminal_ime_active(KeyboardRoute::Terminal(8), 7, true));
         assert!(!terminal_ime_active(KeyboardRoute::Palette, 7, true));
+    }
+
+    /// The terminal cursor is solid only while it owns the keyboard AND
+    /// the window has focus — palette/rename/confirm owning the route (or
+    /// an unfocused window) draws it hollow uniformly, mac parity.
+    #[test]
+    fn terminal_cursor_focused_requires_the_terminal_route_and_window_focus() {
+        assert!(terminal_cursor_focused(KeyboardRoute::Terminal(7), true));
+        assert!(!terminal_cursor_focused(KeyboardRoute::Terminal(7), false));
+
+        for route in [
+            KeyboardRoute::None,
+            KeyboardRoute::Confirm,
+            KeyboardRoute::Editor,
+            KeyboardRoute::Palette,
+        ] {
+            assert!(
+                !terminal_cursor_focused(route, true),
+                "{route:?} should draw the cursor hollow even while the window is focused"
+            );
+        }
     }
 
     /// A commit can arrive after the active tab already moved. It belongs
