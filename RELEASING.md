@@ -31,11 +31,22 @@ That's it. Everything else is automatic.
      EdDSA-sign it and hand `sign.txt` forward as a build artifact. The
      "Append macOS first-launch note" step keeps the Gatekeeper bypass
      instructions on the Release body while the DMG is not notarized.
-   - **`publish-release`** — asserts the artifact set, then flips the draft
-     public. **This is the only irreversible step in the pipeline.**
+   - `mac-iced` — the **experimental** Rust + iced mac build's twin of
+     `mac`: fails fast if the iced Sparkle key material isn't installed,
+     then builds + bundles `Roost-Iced.app`, notarizes + uploads
+     `Roost-Iced-X.Y.Z.dmg`, and EdDSA-signs it (its own keypair, never
+     the Swift key), handing `sign-iced.txt` forward as a build artifact.
+   - **`publish-release`** — asserts the artifact set (both `.deb`s, the
+     Swift DMG, and the iced DMG — four assets, one each, correctly
+     named and sized), then flips the draft public. **This is the only
+     irreversible step in the pipeline.**
    - `appcast` — append the signed Sparkle entry to `docs/appcast.xml` and
      bot-push it to main. Runs after publish because the enclosure URL it
      writes is a public `/releases/download/` link.
+   - `appcast-iced` — the iced twin of `appcast`, writing
+     `docs/appcast-iced.xml` from `mac-iced`'s `sign-iced.txt`. Runs after
+     `appcast` (not after `publish-release`) so the two bot pushes are
+     sequenced rather than racing each other onto main.
    - `dispatch-apt-charliek` — fire a `repository_dispatch` at
      `charliek/apt-charliek` so the .debs land on `apt.stridelabs.ai`.
      Uses a release-bot App token scoped to `apt-charliek` (no
@@ -44,8 +55,10 @@ That's it. Everything else is automatic.
 ## Draft-until-complete, and how to recover
 
 The Release is created as a **draft** and stays one until `publish-release`
-has seen an amd64 `.deb`, an arm64 `.deb` and a `.dmg` on it — each present
-exactly once, non-empty, and named for the tag.
+has seen an amd64 `.deb`, an arm64 `.deb`, the Swift `.dmg` and the iced
+`.dmg` on it — each present exactly once, at least 1 MiB (a floor that
+catches truncated uploads plain non-emptiness would wave through), and
+named for the tag.
 
 A draft is invisible on the public releases page and API to anyone without
 push access. That is not cosmetic: apt-charliek authenticates with a
@@ -57,9 +70,12 @@ republish the previous version**.
 
 ### A build job failed
 
-`linux` or `mac` red → the draft stays a draft. Nothing is public, no apt
-dispatch, no appcast entry. `publish-release` has a plain `needs:` and no
-`if: always()`, so it simply never runs.
+`linux`, `mac`, or `mac-iced` red → the draft stays a draft. Nothing is
+public, no apt dispatch, no appcast entry. `publish-release` has a plain
+`needs: [linux, mac, mac-iced]` and no `if: always()`, so it simply never
+runs — a `mac-iced` failure (including the key-material guard, before it
+even builds) blocks the whole release exactly like a `linux` or `mac`
+failure does.
 
     gh release view vX.Y.Z --json isDraft,assets   # inspect
 
@@ -149,9 +165,10 @@ build identity beyond "last released" is needed (e.g. for `roostctl
 
 | Secret | Purpose | Required? |
 |---|---|---|
-| `RELEASE_BOT_APP_ID` | `charliek-release-bot` GitHub App ID (3902108) | required — bot push of signed appcast + apt-charliek dispatch |
+| `RELEASE_BOT_CLIENT_ID` | `charliek-release-bot` GitHub App client ID (`create-github-app-token`'s `client-id` input; the numeric App ID also works) | required — bot push of signed appcast + apt-charliek dispatch |
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required — same |
 | `SPARKLE_ED_PRIVATE_KEY` | EdDSA signing key for Sparkle appcast, base64-encoded | **required for every release, prereleases included** — the mac job's signing step fails hard without it. Only the separate *throwaway-key guard* is prerelease-exempt |
+| `ROOST_ICED_SPARKLE_ED_PRIVATE_KEY` | EdDSA signing key for the **Roost-Iced** appcast, base64-encoded — same convention as `SPARKLE_ED_PRIVATE_KEY` (base64 of the key file `generate_keys -x` wrote), but its own keypair, never shared with the Swift key | **required for every release, prereleases included** — the `mac-iced` job's "Verify the iced Sparkle key material" step fails fast, before building, without it. See `mac/keys/README.md` for the paired generate → commit → install → verify ceremony |
 | `APT_DISPATCH_TOKEN` | Legacy PAT — superseded by the release-bot App; can be removed once you're sure the App-based dispatch is working | optional / deprecated |
 | `MACOS_CERTIFICATE_P12_BASE64` + `MACOS_CERTIFICATE_PASSWORD` + `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD` + `ROOST_DEVELOPER_ID_IDENTITY` | Mac code-signing + notarization | **set** (2026-06-28; #83 closed) — DMG is Developer ID signed + notarized. All six are gated together as `CAN_NOTARIZE` (all-or-nothing); any one unset → ad-hoc-signed DMG with the Gatekeeper-bypass note |
 
@@ -188,6 +205,28 @@ preserves the existing `pubDate` if re-running against an unchanged version
 (so workflow re-runs produce a byte-empty diff and the "nothing to push"
 guard fires correctly).
 
+The **experimental** Roost-Iced build has its own, separate feed:
+`docs/appcast-iced.xml`, served at
+`https://charliek.github.io/roost/appcast-iced.xml`. The `appcast-iced` job
+runs `update-appcast.py` again with `ROOST_APPCAST=docs/appcast-iced.xml`
+and `ROOST_DMG_NAME=Roost-Iced-X.Y.Z.dmg` (the C3 generalization this repo
+made to the script for exactly this second bundle), against `mac-iced`'s
+own `sign-iced.txt`, and commits + pushes as the same release-bot. Two
+feeds, two keypairs — `mac/keys/roost-iced-sparkle-ed-public-key.txt` (the
+iced public key, committed once the key ceremony is done) is a **separate**
+key from the Swift app's `SUPublicEDKey` in
+`mac/Resources/Info.plist.template`; like the Swift key, it is **never
+touched by releases** (see `mac/keys/README.md` for the rotation
+warning). The `mac-iced` job fails fast — before it builds anything — with
+a clear `::error::` until the key ceremony in `mac/keys/README.md` is done;
+until then it is a **hard prerequisite for every release**, not just the
+iced DMG, because `publish-release` needs `mac-iced` too (see the symptom
+table). `appcast-iced` runs after `appcast` (`needs: appcast`), not after
+`publish-release`, so the two release-bot pushes are sequenced rather than
+racing each other onto main — one consequence is that a failed Swift
+`appcast` run strands `appcast-iced` behind it; re-run `appcast` first (or
+alongside it), then re-run `appcast-iced`.
+
 ## When things break
 
 | Symptom | Cause | Fix |
@@ -205,7 +244,8 @@ guard fires correctly).
 | `appcast` fails: "does not resolve — refusing to publish an appcast entry that points at a 404" | The DMG is not on the published release | Re-upload it (`gh release upload vX.Y.Z Roost-X.Y.Z.dmg --clobber`), confirm the public URL resolves, then re-run just the `appcast` job. Re-running `appcast` alone cannot fix a missing asset — and until it is back, macOS users have nothing to download |
 | Release is stuck as a draft | `publish-release` never ran or never passed | See [Draft-until-complete](#draft-until-complete-and-how-to-recover) |
 | Appcast not visible at `https://charliek.github.io/roost/appcast.xml` after a release | `docs.yml` didn't redeploy | Check `docs.yml`'s most recent run; re-trigger via Actions UI if needed |
-| `dispatch-apt-charliek` shows a warning about missing token | `RELEASE_BOT_APP_ID` unset OR the App is not installed on `charliek/apt-charliek` | Confirm via `sanity-check-app.yml`'s "Token can reach charliek/apt-charliek" block; if missing, install the App on apt-charliek. Otherwise wait for apt-charliek's next scheduled re-scan (it picks up new .debs automatically) |
+| `dispatch-apt-charliek` shows a warning about missing token | `RELEASE_BOT_CLIENT_ID` unset OR the App is not installed on `charliek/apt-charliek` | Confirm via `sanity-check-app.yml`'s "Token can reach charliek/apt-charliek" block; if missing, install the App on apt-charliek. Otherwise wait for apt-charliek's next scheduled re-scan (it picks up new .debs automatically) |
+| `mac-iced` fails at "Verify the iced Sparkle key material" | `mac/keys/roost-iced-sparkle-ed-public-key.txt` is missing/empty/the TEST-ONLY fixture, or `ROOST_ICED_SPARKLE_ED_PRIVATE_KEY` is unset or doesn't decode to an ed25519 key | Run the generate → commit → install → verify ceremony in `mac/keys/README.md`. This blocks `publish-release` (needs `[linux, mac, mac-iced]`), so it stops the whole release, not just the iced DMG |
 | v0.0.5 incident: mac job failed at appcast step because `Cargo.lock` drifted during the build | `/release:release` didn't bump `Cargo.lock` (legacy plugin); the staged-set assertion in the bot push step caught the drift | Now solved: `/release-workflows:release` runs `update-version.sh` which always regenerates `Cargo.lock`. |
 
 ## Adopting the convention (for new contributors)
