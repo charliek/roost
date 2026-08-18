@@ -39,6 +39,7 @@ use objc2_user_notifications::{
     UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
     UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
+use roost_ipc::messages::AppNotificationStatusResult;
 use tokio::sync::oneshot;
 
 use crate::notifications::{Payload, Shown};
@@ -52,6 +53,12 @@ const FALLBACK_TITLE: &str = "Roost";
 /// sender by its bundle, and calling into it without one can abort the
 /// process — so this state is decided *before* any UN API is touched.
 const NO_BUNDLE_REASON: &str = "not running from an app bundle";
+
+/// Why [`status`] reports unavailable before [`init`] has ever run.
+/// `window_opened` is what calls `init`, so a status read landing first
+/// — an IPC request racing the first window, vanishingly rare but
+/// possible — has genuinely nothing else to report.
+const NOT_INITIALIZED_REASON: &str = "window not opened yet";
 
 /// Registered with no actions, matching the Swift app's `roost-tab`
 /// category. Apple's docs imply the default (banner-body) action needs no
@@ -237,6 +244,32 @@ fn request_authorization(center: &UNUserNotificationCenter) {
             | UNAuthorizationOptions::Badge,
         &handler,
     );
+}
+
+/// The `app.notification_status` payload — the marker proves the
+/// `thread_local!` read below is on the thread every other caller of
+/// [`init`] sees, same shape as `sparkle::status`.
+pub(crate) fn status(_mtm: MainThreadMarker) -> AppNotificationStatusResult {
+    if !INITIALIZED.with(|cell| *cell.borrow()) {
+        return AppNotificationStatusResult {
+            backend: "unavailable".into(),
+            reason: Some(NOT_INITIALIZED_REASON.into()),
+            authorized: false,
+        };
+    }
+    if ENABLED.load(Ordering::SeqCst) {
+        AppNotificationStatusResult {
+            backend: "available".into(),
+            reason: None,
+            authorized: AUTHORIZED.load(Ordering::SeqCst),
+        }
+    } else {
+        AppNotificationStatusResult {
+            backend: "unavailable".into(),
+            reason: UNAVAILABLE.with(|cell| cell.borrow().clone()),
+            authorized: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

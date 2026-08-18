@@ -23,17 +23,18 @@ use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
-    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppRenderStatsParams,
-    AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams,
-    AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
-    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
+    AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
+    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
+    AppUpdateStatusParams, AppUpdateStatusResult, ClipboardDumpParams, ClipboardDumpResult,
+    ClipboardWriteParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
+    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
+    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
+    ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams,
+    SelectionDumpParams, SelectionDumpResult, SelectionSetParams, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
@@ -388,6 +389,13 @@ pub enum UiRequest {
     /// `AppDockBadge`.
     AppUpdateCheck {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// `app.notification_status` — read back the macOS iced UI's
+    /// `UNUserNotificationCenter` backend state (whether the delegate
+    /// installed, whether the user authorized notifications). Gated +
+    /// macOS-iced-only like `AppDockBadge`.
+    AppNotificationStatus {
+        reply: tokio::sync::oneshot::Sender<Result<AppNotificationStatusResult, String>>,
     },
 }
 
@@ -1169,6 +1177,14 @@ async fn dispatch(
                 .await?
                 .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
+        }
+        ops::APP_NOTIFICATION_STATUS => {
+            let _: AppNotificationStatusParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppNotificationStatus { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&result)
         }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
