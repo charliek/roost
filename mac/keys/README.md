@@ -28,7 +28,7 @@ committed in `mac/Resources/Info.plist.template`. Nothing here touches either.
 `generate_keys -x` wrote (that file's own contents are already base64 of the
 32-byte ed25519 seed). The job decodes one layer —
 
-```
+```bash
 printf '%s' "$KEY" | base64 --decode > "$W/key"
 ```
 
@@ -40,7 +40,7 @@ Run all of this from the repo root, on a trusted machine.
 
 **1. Stage Sparkle's tools.**
 
-```
+```bash
 ./third_party/sparkle/fetch.sh
 ```
 
@@ -52,13 +52,13 @@ Run all of this from the repo root, on a trusted machine.
 override ("If a private key was already generated in your Keychain, that key
 will be used and not overridden"). Always pass `--account roost-iced`.
 
-```
+```bash
 ./third_party/sparkle/out/bin/generate_keys --account roost-iced
 ```
 
 **3. Commit the public half.**
 
-```
+```bash
 ./third_party/sparkle/out/bin/generate_keys --account roost-iced -p \
   > mac/keys/roost-iced-sparkle-ed-public-key.txt
 git add mac/keys/roost-iced-sparkle-ed-public-key.txt
@@ -66,7 +66,7 @@ git add mac/keys/roost-iced-sparkle-ed-public-key.txt
 
 **4. Export the private half to a file.**
 
-```
+```bash
 umask 077
 ./third_party/sparkle/out/bin/generate_keys --account roost-iced \
   -x "$TMPDIR/roost-iced-private.key"
@@ -74,7 +74,7 @@ umask 077
 
 **5. Set the repo secret** (base64 of that file — see the convention above).
 
-```
+```bash
 gh secret set ROOST_ICED_SPARKLE_ED_PRIVATE_KEY \
   --body "$(base64 < "$TMPDIR/roost-iced-private.key")"
 ```
@@ -86,7 +86,7 @@ valid update" forever, and nothing in the release pipeline can notice. Prove
 the pair with Sparkle's own tools (no OpenSSL — macOS's LibreSSL cannot
 handle ed25519 keys):
 
-```
+```bash
 # a) the committed public half is the one belonging to the keychain item
 diff <(./third_party/sparkle/out/bin/generate_keys --account roost-iced -p) \
      mac/keys/roost-iced-sparkle-ed-public-key.txt \
@@ -119,7 +119,7 @@ keychain item, and the exported file *is* that keychain item.
 
 **7. Delete the local private material.**
 
-```
+```bash
 rm -f "$TMPDIR/roost-iced-private.key"
 ```
 
