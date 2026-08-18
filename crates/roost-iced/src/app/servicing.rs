@@ -830,6 +830,28 @@ impl App {
         }
     }
 
+    /// Install the `UNUserNotificationCenter` delegate and request
+    /// authorization — the parity port of `DesktopNotifications.swift`'s
+    /// launch-time setup. A no-op on every other host, and (on macOS) a
+    /// no-op after the first call.
+    ///
+    /// Called from `window_opened` rather than at boot: the delegate is
+    /// retained in a main-thread `thread_local!`, and the seam's own
+    /// convention is that the native surfaces come up once a window
+    /// exists.
+    pub(super) fn init_notifications(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("notifications init") else {
+                return;
+            };
+            crate::macos::notifications::init(mtm);
+        }
+    }
+
     /// Push `SPUUpdater.canCheckForUpdates` onto the "Check for
     /// Updates…" item, when it moved.
     ///

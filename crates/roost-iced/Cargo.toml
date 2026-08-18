@@ -94,7 +94,12 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    # The category registration's `NSArray`/`NSSet` arguments.
+    "NSArray",
+    # `localizedDescription` on the errors the UN completion blocks hand back.
+    "NSError",
     "NSObject",
+    "NSSet",
     "NSString",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
@@ -109,6 +114,38 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSMenuItem",
     # `NSApplication`'s superclass; the class item does not exist without it.
     "NSResponder",
+] }
+
+# The UNUserNotificationCenter backend (`src/macos/notifications.rs`, plan
+# 030 § 3.1). Same coupling policy as the block above — it rides the objc2
+# 0.6 / *-0.3 generation. The lockfile ALSO carries an
+# `objc2-user-notifications 0.2.2` pulled in transitively by winit →
+# objc2-ui-kit: a different major from the older generation, coexisting by
+# design. Do not "unify" them.
+#
+# `UNNotificationSound` is deliberately absent: the content carries no
+# sound, only the presentation options do (Swift parity,
+# DesktopNotifications.swift:130-136). `block2` is a direct dep because
+# the backend spells out the completion-handler block types itself.
+block2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "UNNotification",
+    # The `roost-tab` category (no actions) — the Swift app's M8 spike
+    # found banner clicks were delivered as plain dismissals until the
+    # category was registered (DesktopNotifications.swift:58), so the
+    # click -> activation path depends on it. `UNNotificationAction` only
+    # because the category constructor's empty `actions` array is typed.
+    "UNNotificationAction",
+    "UNNotificationCategory",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    # Only so `requestWithIdentifier:content:trigger:` is in scope — the
+    # trigger passed is always nil (deliver now).
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
 ] }
 
 # The desktop-notification backend is per-OS: this one talks
