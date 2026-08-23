@@ -22,6 +22,11 @@ edit_uri: edit/main/docs/
 docs_dir: docs
 site_dir: site-build
 
+# Working notes, not the public site. They stay in git for PRs; omitting
+# this glob would still build them as unlisted (searchable) pages.
+exclude_docs: |
+  discovery/
+
 dev_addr: '127.0.0.1:7070'
 
 theme:
