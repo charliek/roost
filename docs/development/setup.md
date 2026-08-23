@@ -83,16 +83,16 @@ Mac tests are under `mac/Tests/RoostTests/`; they cover the workspace state mach
 
 ## Documentation site
 
-Markdown sources live in `docs/`. mkdocs-material builds them through `uv`:
+Markdown sources live in `docs/`. [Zensical](https://zensical.org) builds them through `uv`:
 
 ```bash
-make docs                # static site under site-build/
+make docs                # static site under site-build/ (`zensical build --strict`)
 make docs-serve          # live-reload server at http://127.0.0.1:7070
 ```
 
-`uv sync --group docs` runs automatically; no global Python install needed beyond the `uv` binary.
+`uv sync --locked --group docs` runs automatically; no global Python install needed beyond the `uv` binary. `zensical serve --strict` is unsupported — verify with `make docs`.
 
-The voice for new docs is set in `mkdocs.yml`: professional + direct (no marketing), tables for option lists, code blocks with language hints, admonitions only for important notes/warnings, copy-pasteable examples, one topic per page.
+The voice for new docs is set in `zensical.toml`: professional + direct (no marketing), tables for option lists, code blocks with language hints, admonitions only for important notes/warnings, copy-pasteable examples, one topic per page.
 
 ## Bumping the pinned Ghostty SHA
 

@@ -1,9 +1,9 @@
 # Test automation & scripting architecture (plan)
 
 Status: **largely implemented** (2026-05). The functional E2E harness
-(pytest) is built and headless in CI as [`tools/roosttest/`](../../tools/roosttest/README.md);
+(pytest) is built and headless in CI as [`tools/roosttest/`](https://github.com/charliek/roost/blob/main/tools/roosttest/README.md);
 the tooling is reorganized into three layers (see
-[`tools/README.md`](../../tools/README.md)); and `tab.dump`, `wait`, and
+[`tools/README.md`](https://github.com/charliek/roost/blob/main/tools/README.md)); and `tab.dump`, `wait`, and
 the `palette.*` ops shipped. The plan below is kept as the design
 rationale — the "Gap" entries it lists are mostly closed now. The Lua
 scripting layer (§ below) remains the open piece. The north star is
@@ -119,7 +119,7 @@ across both implementations?*
 | IPC surface | `roost-ipc`: tab/project CRUD, set-state, notify, focus, send, resize, reorder, screenshot, claude-hook, identify — **now also `tab.dump` (content), `palette.*` (UI-action), and `roostctl wait`**. | Copy/paste + live `events.subscribe` still unimplemented. |
 | Event stream | UIs consume an **in-process** event bus. `events.subscribe` over the wire is **stubbed not-implemented on both UIs** (`mac/Sources/Roost/IPCHandlerImpl.swift`, `crates/roost-linux/src/ipc.rs`). | External clients can't wait on events yet (the pytest harness condition-waits via polling instead). |
 | Render state | `roost-vt` `RenderState.walk(|cell| …)` yields `Cell { text: String /*grapheme*/, fg, bg }` + cursor; mirrored 1:1 in `mac/Sources/Roost/RenderState.swift`. Both UIs walk it to draw. | **Now exposed over IPC as text via `tab.dump`** (viewport only; scrollback is a follow-up). |
-| Tooling | Three layers (see [`tools/README.md`](../../tools/README.md)): `tools/roosttest/` (pytest, IPC, **in CI**), `tools/screenshot/` (bash + roostctl + pngtool, visual), `tools/input/linux/` (uinput/clipboard, real input). | Real-input (Layer 3) + visual (Layer 2) are local-only; a Mac CGEvent injector is still to come. |
+| Tooling | Three layers (see [`tools/README.md`](https://github.com/charliek/roost/blob/main/tools/README.md)): `tools/roosttest/` (pytest, IPC, **in CI**), `tools/screenshot/` (bash + roostctl + pngtool, visual), `tools/input/linux/` (uinput/clipboard, real input). | Real-input (Layer 3) + visual (Layer 2) are local-only; a Mac CGEvent injector is still to come. |
 
 This unified design is now realized: the pytest harness (`tools/roosttest/`)
 is Tier 1, and the screenshot + input harnesses are reorganized by layer.
@@ -281,7 +281,7 @@ compat (optional fields). Document each new op in
 ### 5.6 Hermetic runs, harness flags & the skip policy  *(2026-05)*
 
 The pytest harness is parameterized + configured by these knobs (full
-operational detail in [`tools/roosttest/README.md`](../../tools/roosttest/README.md)):
+operational detail in [`tools/roosttest/README.md`](https://github.com/charliek/roost/blob/main/tools/roosttest/README.md)):
 
 **Make targets.** `make e2e` / `e2e-gtk` / `e2e-mac` are the quick local
 runs (reuse a running UI if present). `make e2e-gtk-ci` / `e2e-mac-ci`
@@ -396,7 +396,7 @@ network in the exposed `roost` table.
 
 **Decision: pytest drives the tests; Lua is a scoped user-scripting
 surface, not the test mechanism** (see
-[vision.md DL-12](vision.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface)).
+[vision.md DL-12](vision.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface-2026-05-26)).
 The analysis that led there is kept below; the key insight that made it
 low-stakes is that E2E robustness lives in the *affordances*, not the
 runner.

@@ -241,6 +241,44 @@ wrapper small.
     and before the single-instance lock, so it never touches a running
     instance.
 
+## Docs
+
+**Not part of `make check` or the `ci-success` gate.** The docs site has
+its own toolchain (uv/Python) and its own CI workflows; the Rust/Swift
+gates do not cover it. Run it for commits touching `docs/`,
+`zensical.toml`, `pyproject.toml`, `uv.lock`, or either docs workflow —
+both workflows trigger on those shared inputs (and each additionally on
+its own file), because a dependency or lockfile change can break the
+build just as easily as a content change:
+
+```bash
+make docs            # uv run --locked zensical build --strict
+make docs-serve      # preview on http://127.0.0.1:7070
+```
+
+The site is [Zensical](https://zensical.org) (not MkDocs — migrated 2026-08),
+configured in `zensical.toml`, built into `site-build/`. `--strict` fails
+on broken links and anchors and is what both CI workflows run, so run it
+locally before pushing docs changes. Note `zensical serve --strict` is
+unsupported; verify strictness via `build`.
+
+The look comes from the shared
+[stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
+package, pinned by tag in `pyproject.toml`. Palette, fonts and feature
+toggles live there, not here — do not add `theme.palette`, `theme.features`,
+or a `[project.theme.font]` table to `zensical.toml`. The last is the
+sharp edge: it re-enables Zensical's Google Fonts `<link>` on every page
+while the theme's self-hosted faces keep loading anyway.
+
+Working notes in `discovery/` live outside `docs/` on purpose. Zensical
+has no `exclude_docs` equivalent; files under `docs_dir` are published.
+
+Two gotchas worth knowing: Zensical **silently ignores unknown config
+keys** even under `--strict`, so a green build does not prove a config
+edit did what you meant; and the `pymdownx.emoji` callables live in the
+`zensical.extensions.emoji` namespace — the Material for MkDocs
+`material.extensions.emoji` namespace aborts the build.
+
 ## Build
 
 - libghostty-vt is pinned to a specific Ghostty commit in
