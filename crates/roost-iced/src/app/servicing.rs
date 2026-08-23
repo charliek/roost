@@ -181,7 +181,9 @@ pub(super) fn collect_tab_output(
 /// `focus_tab_by_id` bails on the same `focus_tab` error.
 ///
 /// The raise is best-effort: a window that has not opened yet has no id,
-/// and the focus still landed in the core either way.
+/// and the tab focus still landed in the core either way. On Wayland,
+/// iced `window::gain_focus` is a no-op (no way to spend the spec
+/// `ActivationToken`); see [#351](https://github.com/charliek/roost/issues/351).
 fn notification_activation(
     workspace: &Workspace,
     window_id: Option<window::Id>,

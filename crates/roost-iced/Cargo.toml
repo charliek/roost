@@ -111,13 +111,16 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder",
 ] }
 
-# The desktop-notification backend is per-OS: this one talks
-# `org.freedesktop.Notifications` over D-Bus. `z-with-tokio` keeps zbus on
-# the app's tokio runtime instead of pulling in async-io/smol.
+# Linux desktop notifications speak the freedesktop Desktop Notifications
+# spec (`org.freedesktop.Notifications` over the session bus) — GNOME,
+# KDE, COSMIC, and everyone else that implements the spec. Direct zbus
+# rather than notify-rust: we need one connection for Notify +
+# ActionInvoked, and a single MessageStream (notify-rust 4.18 rebuilds
+# the stream on every ignored signal, which drops spec 1.2
+# `ActivationToken` → `ActionInvoked` pairs). `tokio` keeps zbus on the
+# app runtime.
 [target.'cfg(target_os = "linux")'.dependencies]
-notify-rust = { version = "4.11", default-features = false, features = [
-    "z-with-tokio",
-] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 swash = "=0.2.10"
