@@ -207,10 +207,10 @@ Slices, each sized for one gauntlet pass:
   frosted/translucent spike — split out as **3h** below (plan 016,
   W8); do not read those as still-3e.
 * **3f. Native desktop notifications (complete — plan 015).** Shipped: a
-  Linux D-Bus adapter via notify-rust 4.18 (`z-with-tokio`: zbus 5 rides
-  the app's existing tokio runtime), a per-OS backend seam (non-Linux
+  Linux adapter on `org.freedesktop.Notifications` (Desktop Notifications
+  spec; zbus 5 on the app tokio runtime), a per-OS backend seam (non-Linux
   targets log and no-op), GTK-parity per-tab replace-not-stack semantics,
-  and click-to-focus through the freedesktop default action → focus tab +
+  and click-to-focus through the spec `default` action → focus tab +
   clear badge + reveal sidebar + best-effort raise. Adapter-only; engine-side
   suppression is untouched. macOS backend and .desktop shell-grouping/icon
   follow-ups tracked in [#303].

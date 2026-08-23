@@ -131,7 +131,7 @@ on the main thread.
 | libghostty-vt        | cgo via `roost-vt` (`--features ffi`)                          | Pinned Ghostty SHA in `third_party/ghostty/build.sh`.                                                |
 | JSON IPC             | `roost-ipc` (server + client + framing + paths + target picker) | Newline-delimited JSON, 16 MiB frame cap; client + server share the wire-types module.               |
 | swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a small set of malformed-font guards (issues #292 + #299 — debug SIGABRTs, an unbounded name-table read, and a hang when iced/cosmic-text shapes such a font). `README.roost.md` enumerates the deltas + removal condition. |
-| notify-rust           | iced-side Linux desktop notifications (`crates/roost-iced`)   | Target-scoped to Linux; `z-with-tokio` = zbus 5 riding the app's existing tokio runtime. macOS backend deliberately absent — issue #303. |
+| zbus (Linux notifications) | iced-side `org.freedesktop.Notifications` (`crates/roost-iced`) | Spec session-bus client, not a DE-specific stack. GTK uses gio on the same bus. macOS backend deliberately absent — issue #303. |
 | arboard                | iced-side clipboard image read on paste (`crates/roost-iced`) | `image-data` + `wayland-data-control` with X11 fallback; PNG encoding stays on the existing `png` crate. |
 | Inter (bundled font)   | `third_party/inter` (`include_bytes!` via `roost-iced`)       | v4.1 static Regular/Medium/SemiBold, SIL OFL 1.1; iced chrome font only (terminal cells keep the configured monospace); single `chrome_font()` seam so a future config swap is small. `README.roost.md` has provenance + removal condition. |
 

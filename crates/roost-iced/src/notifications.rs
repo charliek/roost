@@ -159,6 +159,15 @@ where
             Request::Retire { tab_id } => {
                 if let Some(mut slot) = slots.remove(&tab_id) {
                     slot.abort_listener();
+                    #[cfg(target_os = "linux")]
+                    if let Some(id) = slot.server_id {
+                        if tokio::time::timeout(SHOW_TIMEOUT, backend::close_notification(id))
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(id, "CloseNotification timed out on retire");
+                        }
+                    }
                 }
                 continue;
             }
@@ -202,6 +211,7 @@ fn spawn_listener(
     let feed = feed.clone();
     tokio::spawn(async move {
         if activation.await {
+            tracing::info!(tab_id, "desktop notification clicked");
             feed.send(EngineFeed::NotificationActivated { tab_id });
         }
     })
@@ -248,7 +258,12 @@ fn record_shown(
 
 #[cfg(target_os = "linux")]
 mod backend {
-    use notify_rust::{Hint, Notification, NotificationHandle, NotificationResponse};
+    use std::collections::HashMap;
+
+    use iced::futures::StreamExt;
+    use zbus::message::Type as MessageType;
+    use zbus::zvariant::Value;
+    use zbus::{MatchRule, MessageStream};
 
     use super::{Payload, Shown};
 
@@ -256,50 +271,203 @@ mod backend {
     /// rather than on a button. Declaring it is what makes the banner
     /// clickable at all — servers only invoke actions a notification lists.
     const DEFAULT_ACTION: &str = "default";
+    const DEFAULT_ACTION_LABEL: &str = "Open";
+
+    const NOTIFICATIONS_BUS: &str = "org.freedesktop.Notifications";
+    const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+    const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
+
+    /// Freedesktop Desktop Notifications spec: `expire_timeout` `0` means
+    /// the notification never expires; `-1` defers to the server. We send
+    /// `0` so a click-to-focus banner stays until the user acts or
+    /// dismisses — servers that cap `-1` to a few seconds (several
+    /// compositors do) otherwise hide the popup before it can be clicked.
+    /// The tab badge remains the durable indicator either way.
+    const EXPIRE_NEVER: i32 = 0;
 
     /// `app_id` is the desktop-entry hint — best-effort shell grouping: a
     /// desktop file may not be installed for a dev build, and the hint is
     /// simply ignored then.
     pub(super) async fn show(payload: Payload, app_id: String) -> Result<Shown, String> {
-        let Payload {
-            title,
-            body,
-            replaces,
-        } = payload;
-        let mut notification = Notification::new();
-        notification
-            .appname("Roost")
-            .summary(&title)
-            .action(DEFAULT_ACTION, "Open")
-            .hint(Hint::DesktopEntry(app_id));
-        if let Some(body) = &body {
-            notification.body(body);
-        }
-        if let Some(replaces) = replaces {
-            notification.id(replaces);
-        }
-        let handle = notification
-            .show_async()
+        let connection = zbus::Connection::session()
             .await
             .map_err(|error| error.to_string())?;
+        // Subscribe before Notify so a fast click cannot land in the gap
+        // between show and the listener task starting. Same connection as
+        // Notify, so a server that unicasts ActionInvoked at the sender
+        // still delivers it here.
+        let mut stream = action_invoked_stream(&connection).await?;
+        let id = send_notify(&connection, &app_id, &payload).await?;
+        tracing::info!(id, "desktop notification shown");
         Ok(Shown {
-            server_id: Some(handle.id()),
-            activation: Some(Box::pin(wait_for_click(handle))),
+            server_id: Some(id),
+            activation: Some(Box::pin(async move {
+                let clicked = drain_action_invoked(id, &mut stream).await;
+                // `resident` + expire 0: the server will not withdraw the
+                // banner for us after the action. Close it ourselves so a
+                // click (or a later tab close via `Retire`) cannot leave a
+                // permanent inert popup.
+                if clicked
+                    && tokio::time::timeout(super::SHOW_TIMEOUT, close_on(&connection, id))
+                        .await
+                        .is_err()
+                {
+                    tracing::warn!(id, "CloseNotification timed out after click");
+                }
+                clicked
+            })),
         })
     }
 
-    /// `wait_for_action_async` borrows its handle, so the handle moves into
-    /// this future and the borrow never escapes it — the whole thing is one
-    /// owned, abortable unit. Dropping it (the worker aborting) drops the
-    /// handle and its D-Bus signal stream with it.
-    async fn wait_for_click(handle: NotificationHandle) -> bool {
-        let mut clicked = false;
-        handle
-            .wait_for_action_async(|response| {
-                clicked = matches!(response, NotificationResponse::Default);
-            })
-            .await;
-        clicked
+    async fn send_notify(
+        connection: &zbus::Connection,
+        app_id: &str,
+        payload: &Payload,
+    ) -> Result<u32, String> {
+        let mut hints: HashMap<String, Value<'static>> = HashMap::new();
+        hints.insert("desktop-entry".into(), Value::from(app_id.to_string()));
+        hints.insert("resident".into(), Value::from(true));
+        hints.insert("urgency".into(), Value::from(1u8));
+        let body = payload.body.as_deref().unwrap_or("");
+        let replaces = payload.replaces.unwrap_or(0);
+        let reply = connection
+            .call_method(
+                Some(NOTIFICATIONS_BUS),
+                NOTIFICATIONS_PATH,
+                Some(NOTIFICATIONS_INTERFACE),
+                "Notify",
+                &(
+                    "Roost",
+                    replaces,
+                    "",
+                    payload.title.as_str(),
+                    body,
+                    notify_actions(),
+                    hints,
+                    EXPIRE_NEVER,
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        reply
+            .body()
+            .deserialize()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) async fn close_notification(id: u32) {
+        let Ok(connection) = zbus::Connection::session().await else {
+            return;
+        };
+        close_on(&connection, id).await;
+    }
+
+    async fn close_on(connection: &zbus::Connection, id: u32) {
+        if let Err(error) = connection
+            .call_method(
+                Some(NOTIFICATIONS_BUS),
+                NOTIFICATIONS_PATH,
+                Some(NOTIFICATIONS_INTERFACE),
+                "CloseNotification",
+                &(id,),
+            )
+            .await
+        {
+            tracing::debug!(id, %error, "CloseNotification failed");
+        }
+    }
+
+    async fn action_invoked_stream(connection: &zbus::Connection) -> Result<MessageStream, String> {
+        let rule = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .interface(NOTIFICATIONS_INTERFACE)
+            .expect("static Notifications interface")
+            .member("ActionInvoked")
+            .expect("static ActionInvoked member")
+            .build();
+        MessageStream::for_match_rule(rule, connection, Some(16))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Wait for a body-click on this banner.
+    ///
+    /// Spec 1.2 servers (GNOME, KDE, COSMIC, …) may emit `ActivationToken`
+    /// immediately before `ActionInvoked`. We subscribe to `ActionInvoked`
+    /// only, on one stream, on the same connection that sent `Notify`, so
+    /// that extra signal cannot steal the click. The `xdg-activation`
+    /// token is how Wayland compositors authorize a raise; iced 0.14 has
+    /// no API to consume it on an existing window, so `window::gain_focus`
+    /// is a no-op there — [#351](https://github.com/charliek/roost/issues/351).
+    ///
+    /// We only register the spec `default` action. Any `ActionInvoked` for
+    /// this id is a click — some servers send the label instead of the
+    /// key. Dismiss/timeout leave this future pending until the worker
+    /// aborts it.
+    async fn drain_action_invoked(id: u32, stream: &mut MessageStream) -> bool {
+        while let Some(msg) = stream.next().await {
+            let Ok(msg) = msg else {
+                continue;
+            };
+            let Ok((nid, action)) = msg.body().deserialize::<(u32, String)>() else {
+                continue;
+            };
+            if !action_invoked_is_ours(id, nid) {
+                continue;
+            }
+            tracing::info!(id, %action, "desktop notification ActionInvoked");
+            return true;
+        }
+        false
+    }
+
+    /// Spec `actions` is `as` (array of STRING): even keys, odd labels.
+    /// A `[_; 2]` serializes as D-Bus `(ss)` and Notify rejects the call.
+    fn notify_actions() -> Vec<&'static str> {
+        vec![DEFAULT_ACTION, DEFAULT_ACTION_LABEL]
+    }
+
+    fn action_invoked_is_ours(our_id: u32, nid: u32) -> bool {
+        nid == our_id
+    }
+
+    #[cfg(test)]
+    mod linux_tests {
+        use zbus::zvariant::DynamicType;
+
+        use super::{
+            action_invoked_is_ours, notify_actions, DEFAULT_ACTION, DEFAULT_ACTION_LABEL,
+            EXPIRE_NEVER,
+        };
+
+        #[test]
+        fn never_expire_is_the_spec_zero() {
+            assert_eq!(EXPIRE_NEVER, 0);
+        }
+
+        #[test]
+        fn default_action_pair_is_key_then_label() {
+            assert_eq!(DEFAULT_ACTION, "default");
+            assert_eq!(DEFAULT_ACTION_LABEL, "Open");
+        }
+
+        #[test]
+        fn notify_actions_serialize_as_dbus_string_array_not_struct() {
+            let actions = notify_actions();
+            assert_eq!(actions.signature().to_string(), "as");
+            let as_tuple = [DEFAULT_ACTION, DEFAULT_ACTION_LABEL];
+            assert_eq!(
+                as_tuple.signature().to_string(),
+                "(ss)",
+                "a 2-array would be the signature Notify rejected in development"
+            );
+        }
+
+        #[test]
+        fn any_action_invoked_for_our_id_is_a_click() {
+            assert!(action_invoked_is_ours(7, 7));
+            assert!(!action_invoked_is_ours(7, 8));
+        }
     }
 }
 
