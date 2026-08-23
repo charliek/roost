@@ -170,8 +170,8 @@ Three different problems get called “scrollback”:
    `pane_history` dumps ANSI to disk and replays into a *new* shell.
    Off by default (secrets). Skip for any first cut.
 
-On reattach, the client needs the current screen quickly, then
-scrollback. Live PTY bytes follow.
+On reattach, follow the attach contract below (READY first, then live
+bytes, history in the background). Do not invent a second ordering.
 
 ---
 
@@ -348,28 +348,46 @@ projects/tabs onto a session process.
 ```
 
 Control plane stays `roost-ipc` JSON (projects, tabs, events, agent
-reports). The new piece is an **attach stream** per tab, Superlogical-
-shaped:
+reports). The new piece is an **attach stream** per tab. One
+versioned contract (handshake advertises protocol version and
+accepted payload `kind`s; unknown version or kind fails the attach
+cleanly — no half-applied snapshot):
 
-1. Pause or briefly quiesce PTY drain.
-2. Send attach payload `{ kind: "ghostty-snapshot" | "vt", bytes }`.
-3. READY: client `Terminal` can paint, select, scroll, and type.
-4. Tee raw PTY bytes to the client. Client libghostty parses in
-   parallel with the server Terminal (server stays authoritative).
-5. History after READY, newest to oldest, when the payload kind
-   supports it (snapshot). Formatter `vt` may only carry the current
-   screen; that is acceptable for the first cut.
-6. Input and resize go to the server. One writer; a second connect
-   takes over until we add independent viewports.
+1. **Fence.** Record a PTY sequence (or pause drain into the server
+   `Terminal`) so later live bytes have a defined start. “Briefly
+   quiesce” is not enough; `PtySupervisor` already broadcasts and
+   can lag a late subscriber.
+2. **Payload.** `{ kind: "ghostty-snapshot" | "vt", version, bytes }`
+   of the fenced server Terminal. Snapshot includes the visible
+   screen; `vt` formatter may be viewport-only.
+3. **READY.** Client has a renderable `Terminal`. It may paint,
+   select, scroll, and type. Input and resize go to the server.
+4. **Live tee.** Raw PTY bytes *after the fence* to the client.
+   Client libghostty parses in parallel; the server Terminal stays
+   authoritative. Buffer or sequence-number the tee so attach cannot
+   lose or duplicate bytes around the fence.
+5. **History (optional, after READY).** Newest to oldest, when
+   `kind` is `ghostty-snapshot`. Must not block typing. `vt` may
+   skip this in the first cut.
 
 Do not stream iced primitives, cell-diff frames as the hot path, or
 tmux/Herdr TUI bytes. The client owns interactive state after READY
-(Mitchell: diffs break scrollback and selection).
+(Mitchell: diffs break scrollback and selection). One writer; a
+second connect takes over until independent viewports exist.
 
 `roost-session` is a **separate binary** (or `roost session` that
 daemonizes). It must survive the UI exiting: `setsid` / double-fork
 on Unix, its own single-instance lock, a socket profile distinct from
 the UI’s `roostctl` socket (`roost-session` vs `roost` / `roost-iced`).
+
+**Trust boundary (Phase 1+).** The session socket is local-user only:
+owned by the session UID, directory not world-writable, socket mode
+`0600` (today’s `roost-ipc::IpcServer` already sets `0600` and does
+**not** check peer credentials). Reuse that server only if
+`roost-session` also authorizes same-UID peers (`getpeereid` /
+`SO_PEERCRED`); mode bits are not enough once the socket is
+SSH-forwarded. SSH is a user-authenticated tunnel to that UDS, not a
+public network protocol. Do not bind the session on a TCP port.
 
 Saved hosts live in **local** iced state (`hosts` in `state.json` or a
 sidecar): `{ id, label, target, last_connected }`. `target` is

@@ -152,11 +152,14 @@ Do not steal in the first cut:
   change that for *detach*, not for `roost-session` crash).
 - Running Herdr as a sidecar detector.
 
-License: Herdr is Apache-2.0, so adapting manifest *ideas* or even
-TOML rule files with attribution is legally possible. Still treat
-their live manifests as a rapidly moving dataset (Claude spinner
-shapes change often). Prefer a Roost-owned rule corpus, informed by
-Herdr’s structure, over a hard vendor of their tree.
+License: Herdr is Apache-2.0. **Idea-only reuse distributes no Herdr
+files.** If a later PR copies or modifies Herdr files (for example
+TOML manifests), it must keep Herdr’s `LICENSE` and copyright
+notices, mark modified files, and pin the exact upstream revision at
+import time. As of this note the herdrdev/herdr tree has no `NOTICE`
+file; re-check that revision before any import. Prefer a Roost-owned
+rule corpus, informed by Herdr’s structure, over vendoring their
+tree: their live manifests change often (Claude spinner shapes).
 
 ### Adapters vs screen
 
