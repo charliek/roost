@@ -161,7 +161,12 @@ where
                     slot.abort_listener();
                     #[cfg(target_os = "linux")]
                     if let Some(id) = slot.server_id {
-                        backend::close_notification(id).await;
+                        if tokio::time::timeout(SHOW_TIMEOUT, backend::close_notification(id))
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(id, "CloseNotification timed out on retire");
+                        }
                     }
                 }
                 continue;
@@ -302,8 +307,12 @@ mod backend {
                 // banner for us after the action. Close it ourselves so a
                 // click (or a later tab close via `Retire`) cannot leave a
                 // permanent inert popup.
-                if clicked {
-                    close_on(&connection, id).await;
+                if clicked
+                    && tokio::time::timeout(super::SHOW_TIMEOUT, close_on(&connection, id))
+                        .await
+                        .is_err()
+                {
+                    tracing::warn!(id, "CloseNotification timed out after click");
                 }
                 clicked
             })),
