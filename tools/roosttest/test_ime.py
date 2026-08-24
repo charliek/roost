@@ -91,20 +91,24 @@ def _settled_png(roost, path: Path) -> bytes:
 
 
 def _after_redraw(roost, op) -> None:
-    """Run `op`, then wait for a fresh paint (the `app.render_stats`
-    draw-call counter ticking) before the caller screenshots — mirrors
-    `test_sprite_pixels`'s D4 wait, so the capture reflects the op's
-    state change and not a stale cached frame. `feed_ime` (and
-    `palette.dismiss`) are synchronous over IPC — the state mutation
-    has already landed by the time `op()` returns — so this only waits
-    for the NEXT paint to pick it up."""
-    roost.call("app.render_stats", {"reset": True})
+    """Run `op`, then wait for a paint that can only have started after
+    the mutation. `feed_ime` / `palette.dismiss` are synchronous over
+    IPC; iced then views+draws on the next frame.
+
+    Resetting the counters *before* `op` lets an in-flight pre-op
+    present count as "the next paint". Wayland `window::screenshot`
+    copies that last presented buffer, so the capture still shows the
+    pre-op overlay. Reset after the mutation, then wait for
+    `view_calls` (chrome, including the palette) and `draw_calls`
+    (terminal widget, including the preedit overlay)."""
     op()
-    Roost._wait(
-        lambda: int(roost.call("app.render_stats", {})["draw_calls"]) > 0,
-        5.0,
-        "redraw after IME op",
-    )
+    roost.call("app.render_stats", {"reset": True})
+
+    def painted() -> bool:
+        stats = roost.call("app.render_stats", {})
+        return int(stats["view_calls"]) > 0 and int(stats["draw_calls"]) > 0
+
+    Roost._wait(painted, 2.0, "redraw after IME op")
 
 
 @pytest.mark.skipif(
