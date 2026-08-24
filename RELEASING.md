@@ -176,7 +176,7 @@ Inspect or edit at https://github.com/charliek/roost/rules.
 ## The appcast lives where
 
 The Sparkle appcast is at `docs/appcast.xml`, served by GitHub Pages from
-`https://charliek.github.io/roost/appcast.xml` via `docs.yml`'s mkdocs
+`https://charliek.github.io/roost/appcast.xml` via `docs.yml`'s Zensical
 deploy. The `appcast` job mutates that file in place, commits it as the
 release-bot, and pushes to main; `docs.yml` redeploys Pages shortly after.
 

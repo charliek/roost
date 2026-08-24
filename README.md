@@ -56,7 +56,7 @@ cd mac && swift build                 # or: ./mac/scripts/bundle.sh release  →
 
 ## Documentation
 
-The full site lives under `docs/` and builds with `mkdocs-material` (`make docs-serve` → http://127.0.0.1:7070):
+The full site lives under `docs/` and builds with [Zensical](https://zensical.org) (`make docs-serve` → http://127.0.0.1:7070):
 
 - [Installation](docs/getting-started/installation.md) — toolchain + build
 - [First Run](docs/getting-started/first-run.md) — launch behavior + where state lives

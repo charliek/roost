@@ -259,11 +259,11 @@ check: fmt-check clippy themes-check test  ## Pre-push gate: fmt-check + clippy 
 # ---- docs -------------------------------------------------------------
 
 .PHONY: docs docs-serve
-docs:  ## Build the mkdocs site into site-build/
-	uv sync --group docs && uv run mkdocs build
+docs:  ## Build the docs site into site-build/ (same as CI)
+	uv sync --locked --group docs && uv run --locked zensical build --strict
 
-docs-serve:  ## Serve the docs locally (mkdocs serve)
-	uv sync --group docs && uv run mkdocs serve
+docs-serve:  ## Serve the docs locally with live reload
+	uv sync --locked --group docs && uv run --locked zensical serve
 
 # ---- clean ------------------------------------------------------------
 

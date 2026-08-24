@@ -204,8 +204,8 @@ done (above) and [`nfpm`](https://nfpm.goreleaser.com) on `PATH`:
 ./linux/scripts/build-deb.sh 0.0.1-dev
 ```
 
-See [`linux/README.md`](../../linux/README.md) and
-[`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) for what the
+See [`linux/README.md`](https://github.com/charliek/roost/blob/main/linux/README.md) and
+[`packaging/nfpm.yaml`](https://github.com/charliek/roost/blob/main/packaging/nfpm.yaml) for what the
 package contains.
 
 ## CLI on PATH

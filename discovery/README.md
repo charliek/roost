@@ -1,8 +1,8 @@
 # Discovery notes
 
-Working notes, not product commitments. `mkdocs.yml` lists this
-folder under `exclude_docs`, so it is not in the nav and is not
-built into the public site.
+Working notes, not product commitments. These files live outside
+`docs/` so they are not built into the public site — Zensical has
+no equivalent of MkDocs `exclude_docs`.
 
 | Note | What it is |
 |---|---|

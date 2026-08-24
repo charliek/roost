@@ -1,0 +1,129 @@
+# =============================================================================
+# Documentation Style Guidelines
+# =============================================================================
+# - Professional, direct tone (no marketing language)
+# - Tables for all CLI options and configuration fields
+# - Code blocks with language hints (yaml, bash, json, go)
+# - Use admonitions sparingly (only for important notes/warnings)
+# - Examples should be copy-pasteable
+# - Keep pages focused and concise - one topic per page
+# - No deep troubleshooting guides - keep it minimal but useful
+# =============================================================================
+
+[project]
+
+site_name = "roost"
+site_description = "Cross-platform terminal multiplexer for AI coding agents, built on libghostty-vt"
+site_author = "roost Contributors"
+site_url = "https://charliek.github.io/roost/"
+
+repo_name = "charliek/roost"
+repo_url = "https://github.com/charliek/roost"
+edit_uri = "edit/main/docs/"
+
+docs_dir = "docs"
+site_dir = "site-build"
+
+dev_addr = "127.0.0.1:7070"
+
+# Working notes live in /discovery at the repo root, not under docs/.
+# Zensical has no exclude_docs equivalent; files in docs_dir are published.
+
+nav = [
+  { "Home" = "index.md" },
+  { "Getting Started" = [
+    { "Installation" = "getting-started/installation.md" },
+    { "First Run" = "getting-started/first-run.md" },
+    { "Keybindings" = "getting-started/keybindings.md" },
+  ] },
+  { "Guides" = [
+    { "Notifications" = "guides/notifications.md" },
+    { "Claude Code Hooks" = "guides/claude-code.md" },
+    { "Working Directory Tracking" = "guides/cwd-tracking.md" },
+    { "Extending Roost" = "guides/extending.md" },
+  ] },
+  { "Reference" = [
+    { "Configuration" = "reference/config.md" },
+    { "CLI" = "reference/cli.md" },
+    { "IPC" = "reference/ipc.md" },
+    { "Paths & Environment" = "reference/paths.md" },
+    { "Themes" = "reference/themes.md" },
+    { "Fonts" = "reference/fonts.md" },
+    { "Tab Strip" = "reference/tab-strip.md" },
+    { "Architecture" = "reference/architecture.md" },
+  ] },
+  { "Development" = [
+    { "Architecture & principles" = "development/vision.md" },
+    { "Iced migration roadmap" = "development/iced-migration-roadmap.md" },
+    { "Iced POC plan (archived)" = "development/iced-poc-plan.md" },
+    { "Iced POC development" = "development/iced-poc.md" },
+    { "Shared Rust engine" = "development/shared-rust-engine.md" },
+    { "Test automation" = "development/test-automation.md" },
+    { "Setup" = "development/setup.md" },
+    { "Claude integration testing" = "development/claude-testing.md" },
+  ] },
+]
+
+# -----------------------------------------------------------------------------
+# Theme
+# -----------------------------------------------------------------------------
+# The shared StrideLabs theme (stridelabs-docs-theme, pinned in pyproject.toml)
+# supplies the palette, the self-hosted type stack, the feature toggles, and
+# the owl + project-icon header lockup. Anything set here overrides it.
+#
+# Do NOT add a [project.theme.font] table: the theme sets `font: false` and
+# ships its own woff2 faces, so setting one re-enables Zensical's Google Fonts
+# <link> on every page while the self-hosted faces keep loading anyway.
+[project.theme]
+name = "stridelabs"
+
+# The icon that says *which* tool this is -- rendered beside the shared owl.
+[project.theme.icon]
+logo = "material/console-line"
+
+# -----------------------------------------------------------------------------
+# Extra
+# -----------------------------------------------------------------------------
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/charliek/roost"
+
+# -----------------------------------------------------------------------------
+# Markdown extensions
+# -----------------------------------------------------------------------------
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.md_in_html]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.markdown_extensions.pymdownx.details]
+
+# NOTE: the callable namespace is "zensical.extensions.emoji", not
+# "material.extensions.emoji" - the latter aborts the build under Zensical
+# with ModuleNotFoundError: No module named 'material'.
+[project.markdown_extensions.pymdownx.emoji]
+emoji_generator = "zensical.extensions.emoji.to_svg"
+emoji_index = "zensical.extensions.emoji.twemoji"
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.snippets]
+
+# Mermaid works with no further configuration - Zensical initializes the JS
+# runtime itself when it sees a mermaid fence.
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true
