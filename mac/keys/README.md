@@ -86,32 +86,42 @@ valid update" forever, and nothing in the release pipeline can notice. Prove
 the pair with Sparkle's own tools (no OpenSSL — macOS's LibreSSL cannot
 handle ed25519 keys):
 
+Run it as one block. `set -euo pipefail` is load-bearing: without it a
+failed check just prints and the block still exits 0, which is the exact
+outcome — a mismatched pair that *looks* verified — this step exists to
+prevent.
+
 ```bash
+set -euo pipefail
+scratch="$(mktemp)"
+trap 'rm -f "$scratch"' EXIT
+
 # a) the committed public half is the one belonging to the keychain item
 diff <(./third_party/sparkle/out/bin/generate_keys --account roost-iced -p) \
-     mac/keys/roost-iced-sparkle-ed-public-key.txt \
-  && echo "public half OK"
+     mac/keys/roost-iced-sparkle-ed-public-key.txt
+echo "public half OK"
 
 # b) the EXPORTED file is the same key as that keychain item: Ed25519 is
 #    deterministic, so signing identical bytes with both must produce
 #    byte-identical signatures.
-scratch="$(mktemp)"; head -c 4096 /dev/urandom > "$scratch"
+head -c 4096 /dev/urandom > "$scratch"
 sig_from_keychain="$(./third_party/sparkle/out/bin/sign_update \
   --account roost-iced -p "$scratch")"
 sig_from_file="$(./third_party/sparkle/out/bin/sign_update \
   --ed-key-file .secrets/roost-iced-sparkle-ed-private.key -p "$scratch")"
-[ "$sig_from_keychain" = "$sig_from_file" ] && echo "private half OK"
+[ "$sig_from_keychain" = "$sig_from_file" ] || {
+  echo "MISMATCH: the exported file is not the keychain key" >&2; exit 1; }
+echo "private half OK"
 
 # c) the signature actually verifies
 ./third_party/sparkle/out/bin/sign_update --verify \
-  --ed-key-file .secrets/roost-iced-sparkle-ed-private.key "$scratch" "$sig_from_file" \
-  && echo "signature verifies"
+  --ed-key-file .secrets/roost-iced-sparkle-ed-private.key "$scratch" "$sig_from_file"
+echo "signature verifies"
 
 # d) the secret's encoding round-trips (what release.yml will decode)
 base64 < .secrets/roost-iced-sparkle-ed-private.key | base64 --decode \
-  | diff - .secrets/roost-iced-sparkle-ed-private.key && echo "encoding OK"
-
-rm -f "$scratch"
+  | diff - .secrets/roost-iced-sparkle-ed-private.key
+echo "encoding OK"
 ```
 
 (a) + (b) together are the pair proof: the committed public key belongs to the

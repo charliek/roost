@@ -703,6 +703,24 @@ jobs:
               exit 1
               ;;
           esac
+          # The two halves are validated independently above, which cannot
+          # catch the failure that matters most: a secret holding a DIFFERENT
+          # valid key than the committed public half. That ships a bundle
+          # whose SUPublicEDKey rejects every signature we produce, and
+          # Sparkle reports it to users as nothing at all — just "no update".
+          # Sparkle's own `sign_update --verify` takes a private key, so it
+          # cannot prove the pair; derive the public half from the seed
+          # instead. 96-byte legacy keys carry their own public half and are
+          # not derivable this way, so they are skipped rather than guessed.
+          if [ "${seed_bytes}" = "32" ]; then
+            derive='import base64,sys; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; from cryptography.hazmat.primitives.serialization import Encoding,PublicFormat; print(base64.b64encode(K.from_private_bytes(sys.stdin.buffer.read()).public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)).decode())'
+            derived="$(base64 --decode < "${W}/key" | uv run --with cryptography python3 -c "${derive}")"
+            if [ "${derived}" != "$(tr -d '[:space:]' < "${key_file}")" ]; then
+              echo "::error::ROOST_ICED_SPARKLE_ED_PRIVATE_KEY is not the private half of ${key_file}. Signing with it would ship updates no installed Roost-Iced can verify. Re-run the ceremony in mac/keys/README.md."
+              exit 1
+            fi
+            echo "keypair match confirmed (derived public half equals the committed one)"
+          fi
           rm -f "${W}/key"
           echo "iced Sparkle key material looks well-formed (public key committed, private secret decodes to ${seed_bytes} bytes)."
 
