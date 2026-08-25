@@ -8,11 +8,13 @@ attention.
 
 Two native UIs — **Swift + AppKit on macOS** (`Roost.app`) and **Rust + iced
 on Linux** (`roost`) — each embed the workspace + PTY supervisor + a JSON-IPC
-server **in-process** (no daemon). The Linux package ships the iced UI; GTK
-(`crates/roost-linux`, gtk4-rs) remains in-repo as the development/parity
-implementation. External tooling (`roostctl`, Claude Code hooks) talks to
-the running UI over newline-delimited JSON on a Unix-domain socket; the wire
-contract is in [`docs/reference/ipc.md`](docs/reference/ipc.md).
+server **in-process** (no daemon). macOS also gets an experimental
+**Roost-Iced.dmg**, the same iced UI built for Mac, installed side by side
+with `Roost.app` — see the
+[latest release](https://github.com/charliek/roost/releases/latest). External
+tooling (`roostctl`, Claude Code hooks) talks to the running UI over
+newline-delimited JSON on a Unix-domain socket; the wire contract is in
+[`docs/reference/ipc.md`](docs/reference/ipc.md).
 
 ## Install
 
@@ -35,6 +37,11 @@ com.apple.quarantine /Applications/Roost.app`, or use System Settings → Privac
 [Installation → First launch on macOS](docs/getting-started/installation.md#first-launch-on-macos)
 for details.
 
+An experimental **`Roost-Iced-<version>.dmg`** is also published on the same
+release — the iced UI built for macOS, installed side by side with
+`Roost.app` under its own bundle id. See
+[Installation](docs/getting-started/installation.md) for details.
+
 ## Build from source
 
 ```bash
@@ -45,12 +52,9 @@ mise install                          # Rust (rust-toolchain.toml) + Zig 0.15.x
 
 # Linux UI — iced, what the packaged .deb ships (needs: sudo apt install libclang-dev pkg-config):
 cargo build --release -p roost-iced -p roost-cli    # → target/release/{roost-iced,roostctl}
-./linux/scripts/build-deb.sh 0.0.1-dev              # …or build an installable .deb (stages it as /usr/bin/roost)
+./linux/scripts/build-deb.sh 0.0.1-dev              # …or build an installable .deb (packages roost-iced as /usr/bin/roost via the linux-package feature; also needs nfpm on PATH)
 
-# Linux UI — gtk4-rs, the in-repo development/parity UI (needs: sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config):
-cargo build --release -p roost-linux -p roost-cli   # → target/release/{roost,roostctl}
-
-# macOS UI (needs: brew install gtk4 libadwaita):
+# macOS UI:
 cd mac && swift build                 # or: ./mac/scripts/bundle.sh release  → mac/build/Roost.app
 ```
 
@@ -65,5 +69,7 @@ The full site lives under `docs/` and builds with [Zensical](https://zensical.or
 - [Notifications](docs/guides/notifications.md) — how `roostctl` + OSC fallbacks surface in the UI
 - [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
 - [Architecture](docs/reference/architecture.md) — package layout + threading contract
+- [Vision & Principles](docs/development/vision.md) — direction, decision log, and the two-implementation architecture
+- [IPC Reference](docs/reference/ipc.md) — the JSON wire format `roostctl` and Claude hooks speak
 
 `CLAUDE.md` at the repo root captures the project conventions enforced by review.

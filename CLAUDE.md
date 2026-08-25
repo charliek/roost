@@ -6,15 +6,10 @@ Roost is a cross-platform (Mac + Linux) desktop terminal multiplexer
 built around libghostty-vt. It ships **two platform products** — Swift
 + AppKit on macOS and Rust + iced on Linux — that each embed the
 workspace + PTY supervisor in-process and serve a JSON IPC socket for
-external tooling (`roostctl`, Claude hooks). No daemon. **Three UI
-implementations** live in the repo: `mac/` (Swift + AppKit),
-`crates/roost-iced/` (iced, what the Linux package ships), and
-`crates/roost-linux/` (gtk4-rs, the in-repo Linux development/parity
-implementation).
+external tooling (`roostctl`, Claude hooks). No daemon.
 
 * Mac UI: Swift + AppKit, `mac/` (bundle id `ai.stridelabs.Roost`).
 * Linux UI (shipped): Rust + iced, `crates/roost-iced/` (packaged as `/usr/bin/roost`).
-* Linux UI (in-repo dev/parity): gtk4-rs + libadwaita, `crates/roost-linux/`.
 * CLI: `crates/roost-cli/` (binary `roostctl`).
 * IPC + path resolution: `crates/roost-ipc/`.
 * libghostty-vt FFI + OSC: `crates/roost-vt/`, `crates/roost-osc/`.
@@ -22,12 +17,12 @@ implementation).
 **North star.** Every surface — UI clicks, hotkeys, `roostctl`, and Lua
 scripts — routes through **one core: the workspace operation set**; the
 UI is a *reaction* to the core's events, never its own source of truth.
-One contract (`roost-ipc`'s op set), three implementations (Swift + AppKit,
-Rust + GTK, Rust + iced) kept at behavioral parity. Optimize for **testability,
+One contract (`roost-ipc`'s op set), two implementations (Swift + AppKit,
+Rust + iced) kept at behavioral parity. Optimize for **testability,
 programmability, clean architecture**: adding a capability is "add an op
 + thin adapters", not per-surface logic. When in doubt, ask: *does this
 route through the one op set, keep the UI reactive, and stay at parity
-across all three implementations?*
+across both implementations?*
 
 See [docs/development/vision.md](docs/development/vision.md) for the full
 architecture, principles, and decision log;
@@ -42,10 +37,10 @@ retired). Topic branches (`polish/*`, `refactor/*`, feature branches)
 open PRs into `main`. **Merges are manual**: CI must be green, then the
 committer merges — no auto-merge (the repo's `allow_auto_merge` is off;
 use `/merge-pr`). The single required check is **`ci-success`** from
-`.github/workflows/ci.yml` (rust/swift/gtk build+test plus the functional
-E2E jobs — `e2e-gtk` and `e2e-mac` — path-filtered so jobs run only when
-relevant code changes). Releases gate on the same `ci-success` via a
-`ci-gate` job in `release.yml`.
+`.github/workflows/ci.yml` (rust/swift/iced build+test plus the functional
+E2E jobs — `e2e-iced` (within `iced-build-e2e`) and `e2e-mac` — path-filtered
+so jobs run only when relevant code changes). Releases gate on the same
+`ci-success` via a `ci-gate` job in `release.yml`.
 
 `claude/discuss-architecture-refactor-cjU3E` is the predecessor refactor
 branch and is **frozen** at `00b3d10`. Do not start new work on it.
@@ -62,39 +57,39 @@ See `docs/development/vision.md` for the design rationale and
 
 ## Architecture
 
-- Three UIs (Swift Mac; gtk4-rs Linux, in-repo dev/parity; Rust + iced
-  Linux, what the package ships). Each embeds the workspace + PTY
-  supervisor in-process.
-- libghostty-vt is the terminal engine on all three UIs — VT parsing,
+- Two UIs (Swift Mac; Rust + iced Linux, what the package ships). Each
+  embeds the workspace + PTY supervisor in-process.
+- libghostty-vt is the terminal engine on both UIs — VT parsing,
   screen state, OSC parsing, key/mouse encoding.
-- The renderer is ours across all three: AppKit + Core Graphics on
-  Mac, Cairo + Pango on `GtkDrawingArea` for the GTK dev UI, and iced +
-  wgpu for the shipped Linux UI. We walk libghostty-vt's render state
-  and draw cell-aligned rects + text.
+- The renderer is ours on both: AppKit + Core Graphics on Mac, iced +
+  wgpu on Linux. We walk libghostty-vt's render state and draw
+  cell-aligned rects + text.
 - The PTY is ours — `forkpty(3)` directly on Mac (`mac/Sources/Roost/
   PtySupervisor.swift`), `portable-pty` on Linux (`crates/roost-engine/
-  src/pty.rs`, shared by both Linux UIs). One PTY per tab.
+  src/pty.rs`, the shared engine crate the iced UI embeds). One PTY per
+  tab.
 - External tools dial the running UI process at the bundle profile's
   socket path (`~/Library/Caches/Roost/roost.sock` for Mac,
   `$XDG_RUNTIME_DIR/roost/roost.sock` for Linux — fallback
-  `/tmp/roost-<uid>/roost.sock`). On macOS the Gtk dev profile uses
-  `Roost-gtk` in place of `Roost`. The wire format is newline-delimited
+  `/tmp/roost-<uid>/roost.sock`). The wire format is newline-delimited
   JSON; see `docs/reference/ipc.md`.
 
 ## Threading (critical)
 
-GTK4 and AppKit are both strictly single-threaded for UI work. Every
-widget operation MUST happen on the main thread. libghostty-vt
-handles + `vt_write` calls are also main-thread-only.
+AppKit is strictly single-threaded for UI work; iced's winit event loop
+is likewise single-threaded for its `update`/`view` cycle. Every widget
+operation MUST happen on that thread. libghostty-vt handles + `vt_write`
+calls are also main-thread-only.
 
-| Layer                       | Thread / Actor                                                              |
-|-----------------------------|------------------------------------------------------------------------------|
-| GTK / AppKit widgets        | Main thread only                                                            |
-| libghostty-vt handle + vt_write | Main thread only                                                        |
-| PTY read                    | DispatchSourceRead (macOS) / per-tab tokio task (Linux); background thread  |
-| PTY write                   | Main thread (called from `@MainActor` on Mac, `Workspace` on Linux)         |
-| OSC dispatch                | Lifted to main via `DispatchQueue.main.async` (Mac) / `glib::idle_add` (Linux) |
-| IPC server accept loop      | Detached background task; handler hops back to main for state mutations     |
+| Layer                              | Thread / Actor                                                                |
+|-------------------------------------|--------------------------------------------------------------------------------|
+| AppKit widgets / iced `update`+`view` | Main thread only (iced: the winit event loop thread)                        |
+| libghostty-vt handle + vt_write     | Main thread only, driven from `update` on Linux                              |
+| PTY read                            | DispatchSourceRead (macOS) / per-tab `tokio::spawn_blocking` read loop (Linux, `roost-engine`); background thread |
+| PTY write                           | Main thread (Mac, `@MainActor`) / a per-tab ordered `tokio` task draining an input+resize command channel (Linux) |
+| Engine → UI feed                    | Workspace events + PTY output + IPC requests land on one channel from background tokio tasks; a `Notify`-backed iced `Subscription` wakes `update` to drain it on the main thread (`crates/roost-iced/src/engine_feed.rs`) |
+| OSC dispatch                        | Lifted to main via `DispatchQueue.main.async` (Mac) / delivered through the engine feed above (Linux) |
+| IPC server accept loop              | Detached background task; handler hops back to main via the engine feed for state mutations |
 
 ### Swift threading subsection (Mac)
 
@@ -117,21 +112,20 @@ handles + `vt_write` calls are also main-thread-only.
 * Env: `ROOST_TAB_ID` + `ROOST_SOCKET` + `TERM` + `COLORTERM=
   truecolor` + `FORCE_HYPERLINK=1` injected before execve.
 
-When in doubt: if it touches GTK / AppKit or libghostty-vt, it runs
-on the main thread.
+When in doubt: if it touches AppKit, iced's `update`/`view`, or
+libghostty-vt, it runs on the main thread.
 
 ## Library preferences
 
 | Concern              | Library                                                        | Notes                                                                                                |
 |----------------------|----------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| GTK4 (Linux)         | `gtk4-rs` + `libadwaita-rs`                                    | Sys deps from Homebrew on Mac dev, apt on Linux.                                                     |
 | AppKit (Mac)         | stdlib / direct                                                | SwiftPM executable target.                                                                            |
-| PTY                  | `forkpty(3)` (Swift, Mac) / `portable-pty` (Rust, Linux)       | Mac uses raw C; Linux uses a maintained safe-API crate. Both spawn one PTY per tab.                  |
+| PTY                  | `forkpty(3)` (Swift, Mac) / `portable-pty` (Rust, Linux)       | Mac uses raw C; `portable-pty` lives in `roost-engine`, shared by the iced UI. Both spawn one PTY per tab. |
 | Persistence          | `state.json` (atomic tmp + rename; write-through, fsync on clean exit) | No SQLite. Projects, next_id, and per-project tab **layout** (title+cwd+position) + active selection — relaunch re-opens prior tabs as fresh shells in their dirs (no process/scrollback). Inline write-through during the session (page-cache cheap, no fsync); `Workspace::flush()` fsyncs on clean exit and freezes further writes. Crash loses at most the kernel writeback window; the atomic rename means the file is never torn. |
 | libghostty-vt        | cgo via `roost-vt` (`--features ffi`)                          | Pinned Ghostty SHA in `third_party/ghostty/build.sh`.                                                |
 | JSON IPC             | `roost-ipc` (server + client + framing + paths + target picker) | Newline-delimited JSON, 16 MiB frame cap; client + server share the wire-types module.               |
 | swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a small set of malformed-font guards (issues #292 + #299 — debug SIGABRTs, an unbounded name-table read, and a hang when iced/cosmic-text shapes such a font). `README.roost.md` enumerates the deltas + removal condition. |
-| zbus (Linux notifications) | iced-side `org.freedesktop.Notifications` (`crates/roost-iced`) | Spec session-bus client, not a DE-specific stack. GTK uses gio on the same bus. macOS backend deliberately absent — issue #303. |
+| zbus (Linux notifications) | iced-side `org.freedesktop.Notifications` (`crates/roost-iced`) | Spec session-bus client, not a DE-specific stack. macOS backend deliberately absent — issue #303. |
 | arboard                | iced-side clipboard image read on paste (`crates/roost-iced`) | `image-data` + `wayland-data-control` with X11 fallback; PNG encoding stays on the existing `png` crate. |
 | Inter (bundled font)   | `third_party/inter` (`include_bytes!` via `roost-iced`)       | v4.1 static Regular/Medium/SemiBold, SIL OFL 1.1; iced chrome font only (terminal cells keep the configured monospace); single `chrome_font()` seam so a future config swap is small. `README.roost.md` has provenance + removal condition. |
 
@@ -168,12 +162,8 @@ wrapper small.
 - **Linux UI logs**: the shipped iced UI writes `$XDG_STATE_HOME/roost/roost.log`
   (default `~/.local/state/roost/roost.log`) **and** tees to stdout
   (synchronous file appender in `crates/roost-iced/src/main.rs`, so
-  entries survive a crash) — the in-repo GTK UI's own log lives at the
-  same profile path under its `Gtk` bundle profile. `tail -f` it while reproducing; set
-  `RUST_LOG=info,roost_ipc=debug` to adjust. On macOS the Gtk dev
-  profile writes `~/Library/Logs/Roost-gtk/roost.log` — a **distinct**
-  file from the Swift app's `~/Library/Logs/Roost/roost.log`, so both UIs
-  can run side by side without clobbering each other's log.
+  entries survive a crash). `tail -f` it while reproducing; set
+  `RUST_LOG=info,roost_ipc=debug` to adjust.
 - **IPC wire trace**: launch the UI with `RUST_LOG=roost_ipc=debug`
   (Linux) or `OS_ACTIVITY_MODE=disable` + `swift run` (Mac) to see
   per-frame logging. The wire format is human-readable JSON; `nc -U`
@@ -188,21 +178,23 @@ wrapper small.
 - **Test-harness map**: the harnesses are organized in three layers —
   see [`tools/README.md`](tools/README.md) (functional / visual /
   real-input) for which to reach for.
-- **Linux testing on a Mac**: the GTK UI + its three test tiers (X11,
+- **Linux testing on a Mac**: the iced UI's real-input tiers (X11/Xvfb,
   weston/Wayland, and the cage+uinput Wayland pointer-drag guard) only
-  run on Linux, and Docker Desktop can't run the drag tier (no
+  run on Linux, and Docker Desktop can't run the cage+uinput tier (no
   `/dev/uinput`). Use a **shed** (Apple VZ Linux microVM, real kernel +
   uinput) via the **`linux-test` skill** / `tools/shed/shed-test.sh`
   (mounts the repo, provisions via `.shed/provision.yaml`, builds
-  shed-local, runs the drag guard — mirrors CI's `e2e-gtk-wayland-drag`).
+  `roost-iced` + `roostctl` shed-local, runs the three iced real-input
+  lanes — mirrors CI's `e2e-iced-wayland-drag`).
 - **Linux testing natively (Pop!_OS COSMIC)**: on a Linux dev box you
   don't need a VM — build + run the suite directly. The **`popos-test`
-  skill** covers the apt deps, the e2e-gtk (Xvfb) + weston + headless-cage
-  tiers that run locally, the **seat0 caveat** (the live COSMIC session
-  owns input, so the real-pointer cage+uinput tier can't run locally —
-  use CI/shed), workspace isolation, and the gdb trick for focus criticals.
+  skill** covers the apt deps, `make e2e-iced` / `e2e-iced-ci` under the
+  live session and the weston headless tier, the **seat0 caveat** (the
+  live COSMIC session owns input, so the cage+uinput real-input tier
+  can't run locally — use CI/shed), workspace isolation, and where logs
+  live.
 - **Visual smoke (screenshots)**: `tools/screenshot/` drives either UI
-  through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|gtk>`),
+  through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|iced>`),
   captures labeled screenshots + a `manifest.md` of per-shot
   expectations, and includes `pngtool.py` (stdlib PNG inspect/crop —
   cross-platform) for programmatic pixel assertions. One harness covers
@@ -216,11 +208,13 @@ wrapper small.
   screen↔window coordinate mapping and gotchas.
 - **Functional E2E (pytest)**: [`tools/roosttest/`](tools/roosttest/README.md)
   is the primary automated suite — a thin Python IPC client drives a real
-  UI (`--roost-target mac|gtk`) and asserts on the op set (`tab.dump` /
+  UI (`--roost-target mac|iced`) and asserts on the op set (`tab.dump` /
   `tab.list` / `palette.*` / `identify`), so it exercises exactly what
   users + `roostctl` drive. No sleeps (condition waits), content via text
-  not pixels. `make e2e` / `make e2e-gtk` / `make e2e-mac`; **both are
-  required CI gates** (GTK headless under xvfb; Mac on a macOS GUI-session
+  not pixels. `make e2e` dispatches to a curated lane per target (iced is
+  the default; `make e2e-iced` / `e2e-mac` run them directly); **both
+  `e2e-iced` (within `iced-build-e2e`) and `e2e-mac` are required CI
+  gates** (iced headless under Xvfb/weston; Mac on a macOS GUI-session
   runner — the harness clears any stale instance before launch and scales
   its timeouts up via `ROOST_TEST_TIMEOUT_SCALE`). This is where new
   cross-cutting behavior gets a regression test; the screenshot
@@ -235,7 +229,7 @@ wrapper small.
     shell — pattern walk in
     [`tools/roosttest/README.md`](tools/roosttest/README.md#osc-routed-regression-patterns).
     A sibling env gate, `ROOST_TEST_PANIC`, forces the crash-report +
-    abort path in the Rust UIs for end-to-end verification: `=1` panics
+    abort path in the iced UI for end-to-end verification: `=1` panics
     on the main thread at startup, `=thread` panics from a named
     background thread. It fires right after the panic hook is installed
     and before the single-instance lock, so it never touches a running
@@ -286,10 +280,11 @@ edit did what you meant; and the `pymdownx.emoji` callables live in the
   `cargo build` or `swift build`; it caches.
 - Toolchain via `mise`: rust pinned in `rust-toolchain.toml`, zig
   `0.15.x`. Run `mise install` after cloning.
-- Linux dev: `apt install libgtk-4-dev libadwaita-1-dev` (Ubuntu).
-- Mac dev: `brew install gtk4 libadwaita` (the GTK side links them
-  on Mac too because `roost-linux` works on macOS for cross-platform
-  development).
+- Linux dev: the iced UI itself needs no GTK packages; `apt install
+  libgtk-4-dev libadwaita-1-dev` (Ubuntu) is only needed to build
+  `tools/input/linux/iced_native_file_drop_check.py`'s throwaway GTK
+  app, which it launches as an XDND drag source to exercise
+  `roost-iced`'s native file-drop target.
 - Mac UI build: `cd mac && swift build` (no `protoc`, no plugin).
 - Mac UI bundle: `mac/scripts/bundle.sh debug` produces
   `mac/build/Roost.app`.
