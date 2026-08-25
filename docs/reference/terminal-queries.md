@@ -43,8 +43,8 @@ Roost runs its own OSC scanner over the PTY output, *in parallel* with
 feeding the same bytes to libghostty (`roost-osc` crate on Linux,
 `OscScanner.swift` on macOS). The scanner surfaces query events; the UI
 answers them and writes the reply onto the same per-tab PTY-input channel
-as keystrokes (`TabSession::send_input` on Linux, `onKey` on macOS), so
-the reply is FIFO-ordered with other input once enqueued.
+as keystrokes (`TabSession::send_input` in the Rust UI, `onKey` on
+macOS), so the reply is FIFO-ordered with other input once enqueued.
 
 | Query | Scanner event | Reply formatter | Live data source |
 |---|---|---|---|
@@ -64,7 +64,9 @@ and opencode renders an unreadable gray fallback theme. Answering OSC 4
 is what unblocks it (and any other opentui-based TUI).
 
 Code: `crates/roost-osc/src/lib.rs` (scanner + formatters),
-`crates/roost-linux/src/app.rs` (drain reply arm),
+`crates/roost-engine/src/osc.rs` (the `OscRouter` arm that answers
+`ColorQuery` / `PaletteQuery` straight off the per-tab drain and enqueues
+the reply on `TabSession::send_input`),
 `mac/Sources/Roost/TerminalView.swift` (`appendBytes` reply arm).
 
 ## Channel 2 — libghostty-answered device queries (`write_pty`) — *live*
@@ -124,11 +126,15 @@ Drain points, per UI:
   `flushPendingPtyReplies()` drains it into `onKey` at the end of
   `appendBytes` (post-`vt_write`) and immediately after the
   `ghostty_terminal_resize` call in `reflowGridForBounds`.
-- **Linux** (`crates/roost-linux/src/terminal_view.rs`): the trampoline
-  (in `crates/roost-vt/src/terminal.rs`) appends to an
-  `Arc<Mutex<Vec<u8>>>`; `TerminalView::drain_write_pty` takes the bytes
-  and dispatches through `input_callback` after `TerminalView::vt_write`
-  and after every `reflow` (each of the three resize call sites).
+- **iced** (`crates/roost-iced/src/app/terminal_tab.rs`): the trampoline
+  (in `crates/roost-vt/src/terminal.rs`) appends to the
+  `Arc<Mutex<Vec<u8>>>` installed by `Terminal::set_write_pty_buffer`;
+  `TerminalTab::drain_terminal_replies` takes the bytes and hands them to
+  `TabSession::send_input` after `write_vt`. The resize path is staged
+  rather than sent inline: `apply_geometry` takes the buffer into
+  `GeometryChange::deferred_replies`, and those bytes are sent only once
+  the geometry transaction commits — a rolled-back resize discards its
+  report, because the PTY never observed that size.
 
 The buffer take never holds its lock across `vt_write`/`resize` (the
 trampoline locks the same mutex synchronously — a held guard would
@@ -170,7 +176,8 @@ formula on both UIs (`ColorRgb::is_light` in
 in practice the report is `997;1n` until a light theme is added.
 
 The report is emitted from each UI's runtime theme-switch path
-(`TerminalView::set_theme` on Linux, `TerminalView.setTheme` on macOS),
+(`TerminalTab::set_theme` in the iced UI, `TerminalView.setTheme` on
+macOS),
 routed through the **same per-tab PTY-input sink as keystrokes** (`onKey`
 / `input_callback` → `send_input`) so it stays FIFO-ordered with input
 and is visible to `tab.capture_pty_input`. Gating: only when the tab's

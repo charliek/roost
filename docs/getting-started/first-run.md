@@ -11,7 +11,7 @@ Top to bottom, left to right:
 | Title bar | Window title (active tab's cwd) |
 | Sidebar (left) | List of projects, with a **+ New Project** button at the bottom |
 | Tab strip (right) | Tabs for the currently selected project, with a trailing **+** button |
-| Terminal surface | One libghostty-vt terminal per tab (Core Graphics on macOS, Cairo + Pango on Linux) |
+| Terminal surface | One libghostty-vt terminal per tab (Core Graphics on macOS, iced + wgpu on Linux) |
 
 Click a project in the sidebar to switch its tab strip into the right pane. Click a tab to swap the terminal surface to that tab's session.
 
@@ -51,8 +51,8 @@ See [Paths & Environment](../reference/paths.md) for the full layout.
 
 ## Common first-launch behaviors
 
-- A few harmless GLib warnings on stderr (`g_settings_schema_source_lookup` etc.) on macOS — they come from libraries Roost links against and don't affect anything. Roost filters out the GTK theme-parser noise on its own; the rest is silent on a real desktop session.
 - macOS Notification Center may prompt for permission the first time `roost` (or `osascript`, the macOS notification fallback) tries to surface a notification.
+- On Linux the UI logs to `$XDG_STATE_HOME/roost/roost.log` (default `~/.local/state/roost/roost.log`) **and** tees the same lines to stdout, so launching from a shell shows startup warnings (a missing font family, for instance) directly. `RUST_LOG=debug` turns the volume up. On macOS the Swift app logs to `~/Library/Logs/Roost/roost.log`.
 
 ## Next
 

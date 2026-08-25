@@ -6169,9 +6169,13 @@ mod tests {
             !nav_lists(nav, "cli.md"),
             "a suffix of a nav path is not a nav entry"
         );
+        // Against the real nav block, not a fixture: a path that shares a
+        // basename with a listed entry but sits in another directory must
+        // not match. `reference/cli.md` IS listed; `development/cli.md` is
+        // not, and never will be.
         assert!(!nav_lists(
             &nav_block(&std::fs::read_to_string(repo_root().join("zensical.toml")).unwrap()),
-            "reference/terminal-queries.md"
+            "development/cli.md"
         ));
     }
 

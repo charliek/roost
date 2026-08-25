@@ -50,6 +50,7 @@ nav = [
     { "Themes" = "reference/themes.md" },
     { "Fonts" = "reference/fonts.md" },
     { "Tab Strip" = "reference/tab-strip.md" },
+    { "Terminal Queries" = "reference/terminal-queries.md" },
     { "Architecture" = "reference/architecture.md" },
   ] },
   { "Development" = [

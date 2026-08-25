@@ -1,87 +1,75 @@
 # Fonts
 
-Roost reads font settings from `~/.config/roost/config.conf` (more precisely `$XDG_CONFIG_HOME/roost/config.conf`) on both platforms. Font family, features, and Cairo rendering options take effect on the next launch — same model as themes. Font *size* also responds to runtime hotkeys per tab; see [Keybindings](../getting-started/keybindings.md#font-sizing).
+Roost reads font settings from `~/.config/roost/config.conf` (more
+precisely `$XDG_CONFIG_HOME/roost/config.conf`) on both platforms. Family
+changes take effect on the next launch — same model as themes. Font
+*size* also responds to runtime hotkeys per tab; see
+[Keybindings](../getting-started/keybindings.md#font-sizing).
 
 ```conf
 # ~/.config/roost/config.conf
-font_family = JetBrains Mono, Iosevka, Monaco, monospace
-font_size = 13
-font_feature = -calt
+font-family = "JetBrains Mono"
+font-size = 13
 ```
+
+Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a
+misspelled key is silently ignored.
 
 ## Available settings
 
-| Key                | Default                                   | Effect                                                                                  |
-|--------------------|-------------------------------------------|-----------------------------------------------------------------------------------------|
-| `font_family`      | `JetBrains Mono, Monaco, monospace`       | Comma-separated family list. The first installed family wins. The fallback chain matters because Pango's macOS fallback is unreliable when the head of the list is missing. On Linux, if the *primary* (first) family is not installed, Roost logs a one-time warning at startup and falls back to the `Monospace` generic — cell alignment is preserved, but install the family (or reorder the list) to silence it. |
-| `font_size`        | `12`                                      | Point size. Adjustable per-tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
-| `font_family_bold` | (inherits `font_family`)                  | Override family used for bold text. Useful when pairing fonts (e.g. Iosevka regular + Berkeley Mono Bold). When unset, Pango synthesizes bold from the regular family. |
-| `font_feature`     | (none)                                    | OpenType feature tag. Repeatable: each line appends one entry. Joined with commas at render time. |
-| `hint_metrics`     | `on`                                      | One of `on`, `off`, `default`. Snaps glyph advance widths to integer pixels. Keep `on` for monospace crispness — without it, cells look soft. |
-| `hint_style`       | `none` (macOS) / `slight` (Linux)         | One of `none`, `slight`, `medium`, `full`, `default`. macOS fonts are not designed for hinting; FreeType `slight` is the typical Linux setup. |
-| `antialias`        | `gray`                                    | One of `none`, `gray`, `subpixel`, `default`. On Linux RGB-stripe panels `subpixel` gives sharper strokes; on macOS `subpixel` is effectively a no-op (Apple removed system-wide subpixel AA in Mojave) and falls back to grayscale, so setting `subpixel` explicitly is a safe cross-platform choice. |
+| Key           | Default                 | Effect                                                                                 |
+|---------------|-------------------------|----------------------------------------------------------------------------------------|
+| `font-family` | macOS: the system monospaced font. Linux: `JetBrains Mono, Monospace` (JetBrains Mono when installed, else the system `Monospace` alias) | Terminal cell font. Quote values containing spaces (`"JetBrains Mono"`). |
+| `font-size`   | `13` (Linux) / `14` (macOS) | Point size for the terminal font. Must be `> 0`. Adjustable per tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
 
-Empty string and `default` both mean "use the platform default for this setting."
+### How `font-family` resolves
 
-## Cell tuning
+The two UIs resolve the value differently, so a config file that has to
+work on both should name a single installed family:
 
-Four knobs adjust the cell grid and glyph rendering. The defaults already give roost a polished out-of-the-box look (Pango's natural cell metrics are tighter than mainstream terminals); these knobs let you fine-tune from there. All take effect on the next launch.
+- **Linux (iced).** The value is a comma-separated fallback chain, matched
+  case-insensitively against the installed families left-to-right; the
+  first installed one wins. `monospace` anywhere in the chain (and an
+  unmatched chain) resolves to the `Monospace` generic
+  (`resolve_family_name` in `crates/roost-ui-model/src/typography.rs`).
+- **macOS (Swift).** The value is a single family name handed to
+  `NSFont(name:size:)`. An unknown or empty name falls back to
+  `NSFont.monospacedSystemFont` — a comma-separated *list* is not parsed,
+  so it will not match a family and you get the system monospace instead.
 
-| Key                    | Default | Value syntax                       | Effect                                                                                  |
-|------------------------|---------|------------------------------------|-----------------------------------------------------------------------------------------|
-| `adjust_cell_height`   | `2px`   | `2`, `2px`, `10%`, `-1`, `-5%`     | Add or subtract from the natural cell height. Positive values add line spacing; glyphs auto-center in the enlarged cell. |
-| `adjust_cell_width`    | `2px`   | same syntax                        | Add or subtract from the natural cell width (letter spacing).                           |
-| `adjust_font_baseline` | (none)  | same syntax                        | Shift glyphs vertically inside the cell. A fine-tune *after* `adjust_cell_height` — leave it unset until you need to bias the glyph up or down. |
-| `font_thicken`         | `false` | `true` / `false`                   | Render each glyph twice with a 0.5 px horizontal offset, fattening strokes. Approximates Apple Core Text stem darkening for pipelines that don't apply it natively (notably Cairo on macOS). Not a perfect parity with Apple's algorithm. |
+Either way an unresolvable family degrades to the system monospace rather
+than failing to launch.
 
-A bare integer means pixels (`2` is the same as `2px`). A trailing `%` means a signed percentage of the natural metric. Negative values shrink. The cell metrics are clamped to a minimum of 1 px so a runaway negative can't crash the geometry.
+## Picking a font from the UI
 
-### Opting out of the cell padding
+Both UIs expose **Select a font…** in the command palette
+(`Cmd-Shift-P` / `Alt-Shift-P`). It lists the monospaced families the
+system reports, previews the highlighted one live, and writes the choice
+back to `config.conf` as a `font-family =` line when you confirm — so the
+picker and the config file are the same setting, not two.
 
-The cell padding defaults can be reverted to Pango's natural metrics by setting them to `0`:
+## Chrome vs. terminal cells
 
-```conf
-adjust_cell_width = 0
-adjust_cell_height = 0
-```
+Only the **terminal cell font** is configurable. The window chrome —
+sidebar rows, tab pill labels, palette rows — uses its own font:
 
-### Going for a cmux / Terminal.app look on macOS
-
-cmux and Apple's Terminal.app both use Menlo at a smaller size with Apple-like stem weight. Layered on top of the defaults:
-
-```conf
-font_family = Menlo
-font_size = 11
-font_thicken = true
-```
-
-Eyeball alongside cmux and adjust `adjust_cell_height` and `font_size` to taste.
-
-## Tuning for crisp text
-
-The defaults aim at the cmux/ghostty look: cell-snapped metrics, grayscale AA, light-or-no hinting depending on platform. Tweak from there:
-
-- If text looks soft, verify `hint_metrics = on` is set (or left as default).
-- On Linux with a standard RGB-stripe panel, try `antialias = subpixel`.
-- To disable programming ligatures: `font_feature = -calt`.
-- To stack multiple OpenType features, add additional `font_feature` lines:
-
-  ```conf
-  font_feature = -calt
-  font_feature = +ss01
-  font_feature = +cv01
-  ```
-
-- Pair fonts when the regular weight you like has a thin bold:
-
-  ```conf
-  font_family = Iosevka SS04
-  font_family_bold = Berkeley Mono Bold
-  ```
+- **macOS:** the system UI font.
+- **Linux (iced):** [Inter](https://rsms.me/inter/) v4.1, bundled into the
+  binary (`third_party/inter`, embedded by `crates/roost-iced/src/main.rs`
+  and served through the single `chrome::chrome_font()` seam). Bundling it
+  makes the chrome render identically on every distro instead of
+  inheriting whatever the desktop's default sans happens to be.
 
 ## Limitations
 
-- **Italic family is not configurable yet.** `font_family_italic` is reserved.
-- **Cursor / underline / strikethrough thickness adjusters are not exposed.** Only the cell, baseline, and stem-thicken knobs land here; the TUI-alignment family of `adjust_cursor_*`, `adjust_underline_*`, `adjust_strikethrough_*`, and `adjust_box_thickness` are deferred.
-- **Sidebar and tab-label fonts use GTK's UI font.** Only the terminal cell font is configurable.
-- **All restart-required except size hotkeys.** `Cmd-+/-/0` rescales live; every other knob (family, features, AA, hint, cell adjusters, font-thicken) takes effect on next launch.
+- **Only family and size are configurable.** There is no separate bold or
+  italic family, no OpenType feature list, no hinting/antialias knobs and
+  no cell-metric adjusters. Earlier Roost builds documented a set of
+  Cairo/Pango-era keys (`font_family_bold`, `font_feature`,
+  `hint_metrics`, `hint_style`, `antialias`, `adjust_cell_width`,
+  `adjust_cell_height`, `adjust_font_baseline`, `font_thicken`) — those
+  belonged to the retired GTK renderer and no shipping UI reads them.
+  Leaving them in your config is harmless; unknown keys are dropped.
+- **Chrome fonts are not configurable.** See above.
+- **Family changes need a relaunch.** Only `Cmd-+` / `Cmd--` / `Cmd-0`
+  (`Alt-` on Linux) rescale live, per tab.

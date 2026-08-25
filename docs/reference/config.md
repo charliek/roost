@@ -2,11 +2,11 @@
 
 Roost reads a single user-level config file at `~/.config/roost/config.conf`
 (XDG-style on macOS by deliberate divergence from Apple HIG — matching
-Ghostty / nvim / fish). All three UIs (Swift Mac app, Linux gtk4-rs
-binary, Linux iced binary) parse the same file with the same
-semantics, so a config tuned on one platform is portable to the
-others. A few settings are honored by only some UIs — where that is the
-case, the setting's own section says so explicitly (see
+Ghostty / nvim / fish). Both UIs — the Swift Mac app and the iced binary
+Linux installs as `roost` — parse the same file with the same semantics,
+so a config tuned on one platform is portable to the other. A few
+settings are honored by only one of them — where that is the case, the
+setting's own section says so explicitly (see
 [`link-modifier`](#link-modifier)); unknown and unsupported keys are
 dropped rather than erroring, so a portable file stays valid everywhere.
 
@@ -26,7 +26,9 @@ the launcher with deterministic commands.
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `theme` | string | bundled `roost-dark` | Theme name (see [`themes.md`](themes.md)). |
-| `font-family` | string | platform default | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). |
+| `font-family` | string | system monospace (Mac) / `JetBrains Mono, Monospace` (Linux) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
+| `word-break-chars` | string | `` `_-.+~/:@%` `` | Extra characters treated as word characters for double-click word selection (keeps paths + URLs whole). Despite the `-break-` name (kept for Ghostty compatibility), the value is the extra word-char set. |
+| `show-sidebar-agents` | bool | `true` | Whether the sidebar renders one row per agent-owned tab under its project. Also toggled at runtime (keybind / palette / Mac View menu). |
 | `font-size` | number | `13` (Linux), `14` (Mac) | Point size for the terminal font. Must be `> 0`. |
 | `tab-min-width` | number | `80` (Mac) | Minimum tab pill width in points. `0` disables the floor. Mac-only. |
 | `tab-max-width` | number | `220` (Mac) | Maximum tab pill width in points. `0` disables the cap (pills grow to fit). Mac-only. |
@@ -35,7 +37,7 @@ the launcher with deterministic commands.
 | `provider` | `label="…" run="…" [timeout=…] [limit=…]` | none | Dynamic, script-backed menu in the custom palette (⌘⇧E / Alt+Shift+E). The script generates rows on demand and acts on the choice. Repeatable; executables in `providers/` (beside this file) are also discovered. See [Extending Roost](../guides/extending.md#3-dynamic-providers). |
 | `copy-on-select` | `off | true | clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow | deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
-| `link-modifier` | `ctrl | alt | super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click in the GTK and Iced apps. See [the dedicated section below](#link-modifier). |
+| `link-modifier` | `ctrl | alt | super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
 
 ## `copy-on-select`
 
@@ -169,7 +171,7 @@ and plain `https://…` text matched on screen.
 **Defaults are platform-native**, mirroring the keybinding scheme:
 
 - **macOS: Cmd** — matches the Swift app and native Mac apps (⌘-click).
-- **Linux: Alt** — the GTK app's single "primary" modifier, leaving
+- **Linux: Alt** — Roost's single "primary" modifier on Linux, leaving
   Ctrl free for the shell/readline.
 
 **Linux users who prefer the traditional Ctrl+click** (the ghostty /
@@ -179,11 +181,11 @@ common-terminal convention) just set:
 link-modifier = ctrl
 ```
 
-> **Scope:** this setting is honored by **both Linux UIs** — GTK and the
-> shipped iced app (`link_modifier_held` in
-> `crates/roost-iced/src/app.rs`). The Swift Mac app's modifier is
-> currently fixed to Cmd, so the key is silently ignored there (harmless
-> — unknown keys are always dropped).
+> **Scope:** this setting is honored by the **iced UI** — the shipped
+> Linux `roost` and the experimental `Roost-Iced.app` alike
+> (`link_modifier_held` in `crates/roost-iced/src/app/interactions.rs`).
+> The Swift Mac app's modifier is currently fixed to Cmd, so the key is
+> silently ignored there (harmless — unknown keys are always dropped).
 >
 > **Heads up (Linux):** some window managers/compositors grab `Alt`+drag
 > to move windows, which can swallow `Alt`+click. If link-clicking feels
@@ -191,8 +193,9 @@ link-modifier = ctrl
 
 ### Prefer Ctrl across the board? (Linux)
 
-The GTK app defaults to an **Alt-centric** scheme (`Alt+T` new tab,
-`Alt+W` close, etc.) so Ctrl stays free for the shell. If you'd rather
+On Linux Roost defaults to an **Alt-centric** scheme (`Alt+T` new tab,
+`Alt+W` close, etc.) so Ctrl stays free for the shell — the only Ctrl
+defaults are `Ctrl+1`…`Ctrl+9` (tab switching) and `Ctrl+Shift+C/V`. If you'd rather
 use the more familiar Ctrl shortcuts, you can remap both the link
 modifier and any keybinding — `keybind` lines are repeatable and
 last-wins:
@@ -234,7 +237,8 @@ copy-on-select = true
 clipboard-write = allow
 
 # Open links with Ctrl+click instead of the platform default
-# (Cmd on Mac, Alt on Linux). GTK app only.
+# (Cmd on Mac, Alt on Linux). iced UI only — the Swift Mac app is
+# always Cmd-click.
 link-modifier = ctrl
 
 # Add a custom trigger (here, restoring the pre-Alt Ctrl+T for new_tab
