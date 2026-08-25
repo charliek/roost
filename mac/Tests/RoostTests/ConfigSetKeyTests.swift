@@ -1,6 +1,7 @@
 // Round-trip tests for `RoostConfig.setKey` / `renderSetKey`.
-// Mirrors `crates/roost-linux/src/config.rs::tests` (the
-// `set_key_*` cases) so the two UIs agree on write-back semantics.
+// Mirrors `crates/roost-ui-model/src/config.rs::tests` (the
+// `set_key_*` cases; shared by iced) so the two UIs agree on
+// write-back semantics.
 
 import Foundation
 import Testing

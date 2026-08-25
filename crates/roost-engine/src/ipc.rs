@@ -1,7 +1,8 @@
 //! Toolkit-neutral JSON IPC handler for a Roost UI adapter.
 //!
-//! M3a of the daemon-removal refactor — adds the handler now so
-//! M3b can wire it into the gtk4-rs application. The handler
+//! M3a of the daemon-removal refactor — adds the handler so a UI
+//! adapter's `app.rs` can wire it in (M3b, first done for the
+//! now-removed gtk4-rs UI; iced followed the same seam). The handler
 //! consumes a shared [`daemon::Workspace`] + [`daemon::PtySupervisor`]
 //! and dispatches each request from the [`roost_ipc::IpcServer`]
 //! against them.
@@ -12,8 +13,7 @@
 //! no need for the UI adapter's main loop to be involved. The actual
 //! UI updates flow through `Workspace::subscribe` — each adapter
 //! installs a receiver on its own main-loop mechanism and listens
-//! there (GTK's `app.rs` (M3b) installs a `glib::MainContext::channel`;
-//! Iced drains its subscription on its own event loop).
+//! there (Iced drains its subscription on its own event loop).
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -73,7 +73,7 @@ type SidebarDumpReply = tokio::sync::oneshot::Sender<Result<SidebarDumpResult, S
 /// Reply for [`UiRequest::AppRenderStats`]: the UI's render-path
 /// counters. Read-only; always answers `Ok`, matching
 /// `WindowMetricsReply`. A UI with no instrumentation answers with a
-/// zeroed struct rather than an error — see the GTK arm.
+/// zeroed struct rather than an error.
 type RenderStatsReply = tokio::sync::oneshot::Sender<Result<AppRenderStatsResult, String>>;
 
 /// Reply for a [`UiRequest::Dump`]: the viewport text on success, an
@@ -1243,7 +1243,7 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 ///   * `app.menu_activate`'s path resolution failing (unknown path,
 ///     ambiguous title, or a disabled item) → `invalid-param` — the
 ///     caller asked for a path the live menu bar doesn't support.
-///   * an op a UI hasn't wired up yet (`tab.feed_ime` on GTK, still
+///   * an op a UI hasn't wired up yet (`tab.feed_ime` off Mac, still
 ///     iced-only), or one that is structurally unavailable there
 ///     (`app.dock_badge` off macOS — there is no Dock) →
 ///     `not-implemented`, mirroring `events.subscribe`.

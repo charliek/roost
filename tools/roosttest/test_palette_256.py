@@ -7,7 +7,7 @@ COLORTERM is unset in a shed) backgrounds with `48;5;232` (#080808) and
 rendered an unreadable gray. Feed known indices and assert the
 production color resolver (`tab.dump_resolved`) returns the correct RGB.
 
-Runs on both targets in CI (e2e-gtk + e2e-mac).
+Runs on both targets in CI (iced-build-e2e + e2e-mac).
 """
 
 from __future__ import annotations

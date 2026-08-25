@@ -1,8 +1,10 @@
 // Load every `tests/config-fixtures/*.json` and run it against
-// `Config.swift`'s `parse`. The Rust loader in
-// `crates/roost-linux/src/config_fixture_tests.rs` runs the same files,
-// so a divergence between the two config parsers surfaces on whichever
-// side regressed.
+// `Config.swift`'s `parse`. The now-removed GTK UI had a Rust loader
+// (`config_fixture_tests.rs`) that ran the same files, so a
+// divergence between the two config parsers surfaced on whichever
+// side regressed; no equivalent Rust loader exists today
+// (`crates/roost-ui-model/src/config.rs`'s own unit tests cover the
+// parser directly instead).
 //
 // Format documented in `tests/config-fixtures/README.md`. Same
 // workspace-root path walk as `AgentStateFixtureTests`. Known accepted

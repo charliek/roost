@@ -1,8 +1,9 @@
 // Agent palette — the pure frame builder for the `agents` frame
 // (plan 005 §3.2–§3.6).
 //
-// Mirror of `crates/roost-linux/src/agent_palette.rs`: one row per tab
-// an agent owns, carrying a status dot + project + name + status text +
+// Mirror of `crates/roost-ui-model/src/agent_palette.rs` (shared by
+// iced): one row per tab an agent owns, carrying a status dot +
+// project + name + status text +
 // elapsed time (+ git metrics, filled asynchronously). Every rendered
 // value is derived here from the core workspace snapshot, so
 // `PalettePanel` stays a dumb renderer and the whole mapping —
@@ -10,8 +11,8 @@
 // ordering — is unit-testable without a window or a live panel.
 //
 // The lifecycle input is `Agent.effectiveLifecycle`, the same value the
-// tab pill, the sidebar rollup, and the GTK palette render, so the two
-// UIs and the three surfaces can never disagree. Ordering reuses
+// tab pill, the sidebar rollup, and iced's agent palette render, so the
+// two UIs and the three surfaces can never disagree. Ordering reuses
 // `Agent.rank`, the shipped definition of "most urgent".
 
 import AppKit
@@ -72,8 +73,8 @@ enum AgentPalette {
     /// Empty populations yield the single non-actionable sentinel row.
     ///
     /// Takes the flat tab list plus the project list (the Mac workspace
-    /// keeps them apart, where the GTK snapshot nests tabs under their
-    /// project); a tab whose project is missing is skipped.
+    /// keeps them apart, where the wire `Project` shape nests tabs under
+    /// their project); a tab whose project is missing is skipped.
     static func agentItems(
         projects: [Workspace.Project], tabs: [Workspace.Tab], now: Int64
     ) -> [PaletteItem] {
@@ -198,8 +199,9 @@ enum AgentPalette {
 
     /// Dot + status-text colour for a lifecycle. The four live colours
     /// come from `rollupColor` (one hex source shared with the sidebar
-    /// stripe and the GTK CSS); `inactive` — which has no stripe — is
-    /// that gray at 50% alpha, distinct from `finished`'s full-alpha one.
+    /// stripe and iced's rollup colouring); `inactive` — which has no
+    /// stripe — is that gray at 50% alpha, distinct from `finished`'s
+    /// full-alpha one.
     static func statusColor(for lifecycle: AgentLifecycle) -> NSColor {
         rollupColor(for: lifecycle) ?? inactiveColor
     }
@@ -298,12 +300,15 @@ enum AgentPalette {
         return role
     }
 
-    /// The colour a role renders in. The hexes are the GTK twins in
-    /// `agent_palette.rs`'s `metrics_role_hex` — `#7a7a7a` muted,
-    /// `#7fbf7f` adds, `#e05252` dels — so the two palettes can't drift.
-    /// The muted one is also the elapsed-time colour on both UIs (the
-    /// `.palette-agent-time` CSS class over there), since the time label
-    /// sits next to the metrics in the same right column.
+    /// The colour a role renders in. The hexes match
+    /// `crates/roost-ui-model/src/agent_palette.rs`'s `metrics_role_hex`
+    /// — `#7a7a7a` muted, `#7fbf7f` adds, `#e05252` dels — though today
+    /// only Mac actually reads that function: iced paints its metrics +
+    /// elapsed-time strings in a single flat `chrome::MUTED_TEXT`
+    /// (`#a0a4b0`), with no per-role split. The muted hex here also
+    /// colours the elapsed-time label, since it sits next to the
+    /// metrics in the same right column (the now-removed GTK UI's
+    /// `.palette-agent-time` CSS class happened to use the same hex).
     static func metricsColor(_ role: MetricsRole) -> NSColor {
         switch role {
         case .muted: return metricsMutedColor
@@ -320,8 +325,8 @@ enum AgentPalette {
         red: 0xe0 / 255.0, green: 0x52 / 255.0, blue: 0x52 / 255.0, alpha: 1.0)
 
     /// The metrics column as one attributed string: every segment in its
-    /// role's colour, all of them in `font`. The GTK twin is
-    /// `palette_ui.rs`'s `metrics_markup`.
+    /// role's colour, all of them in `font`. The now-removed GTK UI's
+    /// twin was `palette_ui.rs`'s `metrics_markup`.
     static func metricsAttributed(_ text: String, font: NSFont) -> NSAttributedString {
         let out = NSMutableAttributedString()
         for (segment, role) in metricsSegments(text) {

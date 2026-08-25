@@ -44,11 +44,10 @@ class TargetContractTests(unittest.TestCase):
             check=False,
         )
 
-    def test_target_table_has_three_explicit_profiles(self) -> None:
-        self.assertEqual(ui.TARGETS, ("mac", "gtk", "iced"))
+    def test_target_table_has_two_explicit_profiles(self) -> None:
+        self.assertEqual(ui.TARGETS, ("mac", "iced"))
         self.assertEqual(ui.TARGET_SPECS["iced"].rust_package, "roost-iced")
         self.assertEqual(ui.TARGET_SPECS["iced"].binary_name, "roost-iced")
-        self.assertFalse(ui.TARGET_SPECS["iced"].scans_gtk_criticals)
         self.assertTrue(ui.TARGET_SPECS["mac"].isolates_user_defaults)
 
     @patch("ui.Path.home", return_value=Path("/Users/tester"))
@@ -56,18 +55,10 @@ class TargetContractTests(unittest.TestCase):
     def test_macos_paths_are_pairwise_distinct(self, _system, _home) -> None:
         paths = {target: ui.socket_path(target) for target in ui.TARGETS}
         self.assertEqual(paths["iced"], Path("/Users/tester/Library/Caches/Roost-iced/roost.sock"))
-        self.assertEqual(len(set(paths.values())), 3)
-
-    @patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}, clear=False)
-    @patch("ui.platform.system", return_value="Linux")
-    def test_linux_gtk_and_iced_paths_are_distinct(self, _system) -> None:
-        self.assertEqual(ui.socket_path("gtk"), Path("/run/user/1000/roost/roost.sock"))
-        self.assertEqual(
-            ui.socket_path("iced"), Path("/run/user/1000/roost-iced/roost.sock")
-        )
+        self.assertEqual(len(set(paths.values())), 2)
 
     def test_unknown_target_names_all_candidates(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"want mac\|gtk\|iced"):
+        with self.assertRaisesRegex(ValueError, r"want mac\|iced"):
             ui.socket_path("other")
 
     @patch.dict(os.environ, {"ROOST_ICED_BIN": "/home/shed/rt/debug/roost-iced"})
@@ -75,14 +66,6 @@ class TargetContractTests(unittest.TestCase):
         self.assertEqual(
             ui.rust_binary_path("iced"),
             (Path("/home/shed/rt/debug/roost-iced"), True),
-        )
-
-    @patch.dict(os.environ, {"ROOST_GTK_BIN": "out/linux/roost"})
-    @patch("ui.REPO_ROOT", Path("/work/roost"))
-    def test_relative_gtk_binary_override_is_repository_relative(self) -> None:
-        self.assertEqual(
-            ui.rust_binary_path("gtk"),
-            (Path("/work/roost/out/linux/roost"), True),
         )
 
     def test_mac_has_no_rust_binary(self) -> None:
@@ -126,7 +109,7 @@ class TargetContractTests(unittest.TestCase):
     def test_socket_lock_follows_the_socket_not_the_state_dir(self) -> None:
         with patch("ui.socket_path", return_value=Path("/run/user/1/roost/roost.sock")):
             self.assertEqual(
-                ui.socket_lock_path("gtk"), Path("/run/user/1/roost/roost.lock")
+                ui.socket_lock_path("iced"), Path("/run/user/1/roost/roost.lock")
             )
         self.assertEqual(
             ui.state_lock_path(Path("/tmp/roost-e2e-state-xyz")),

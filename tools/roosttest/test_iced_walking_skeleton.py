@@ -86,7 +86,7 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
     Iced 0.14.0's tiny-skia Canvas path applied the sidebar/tab translation
     twice. This focused product-capture guard seeds one distinctive cell and
     samples logical geometry; it deliberately does not compare whole-window
-    pixels or encode GTK/Iced visual parity.
+    pixels or encode cross-UI visual parity.
     """
     tab = roost.open_tab(project, cwd="/tmp")
     # Quiet, not just attached: `feed_pty_bytes` applies immediately and does

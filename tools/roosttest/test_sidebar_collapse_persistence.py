@@ -20,27 +20,29 @@ Two regressions in the same class, locked in here:
    silently uncollapsing the sidebar by the same path.
    Fix: refactor `selectProject` to pure data mutation (drop the
    parameter entirely) and move `ensureSidebarVisible()` to the
-   user-action call sites. Matches GTK's `set_active_project` and the
-   vision.md DL-11 principle.
+   user-action call sites. Matches iced's `select_project`
+   (`crates/roost-iced/src/app.rs`), which never touches sidebar
+   visibility either, and the vision.md DL-11 principle.
 
 Both UIs persist the collapse choice: the Mac UI in UserDefaults
-(`RoostSidebarVisible`), the GTK/Linux UI in `state.json`
+(`RoostSidebarVisible`), the Linux (iced) UI in `state.json`
 (`SnapshotFile.sidebar_collapsed`, restored synchronously in `App::new`
 and written through on `toggle_sidebar`). So this runs and passes on a
-developer GTK build (Linux or the macOS GTK dev profile) too, not just Mac.
+developer iced build (Linux or the macOS iced dev profile) too, not
+just Mac.
 
 Skip on CI entirely (the mid-test quit→relaunch is the unreliable part,
 independent of state isolation — which `ROOST_STATE_DIR` now handles):
-- GTK CI runs under bare xvfb (no WM); the quit/relaunch lifecycle is
+- iced CI runs under bare xvfb (no WM); the quit/relaunch lifecycle is
   unreliable there.
 - The macOS GUI runner is slow enough that the mid-test `ui.quit +
   ui.launch` cycle frequently exceeds the 90s `wait_alive` budget even
   after the harness's retry (slow LaunchServices respawn).
 
-Runs locally on a developer Mac (and on a developer GTK build under a
+Runs locally on a developer Mac (and on a developer iced build under a
 real window manager) — where the fix is actually iterated, the test
 reliably catches the bug. The regression class is also covered off the
-relaunch path: the GTK Rust unit test
+relaunch path: the Rust unit test
 `sidebar_collapsed_persists_across_reopen` and the Mac Swift
 `UserDefaults` unit test (WS7).
 """
@@ -57,7 +59,7 @@ from util import skip_on_ci
 @pytest.fixture(autouse=True)
 def _skip_on_ci():
     skip_on_ci(
-        "quit + relaunch is unreliable on CI: GTK xvfb has no WM, and the slow "
+        "quit + relaunch is unreliable on CI: iced xvfb has no WM, and the slow "
         "macOS LaunchServices respawn pushes wait_alive past its 90s budget",
         alt_coverage="Rust sidebar_collapsed_persists_across_reopen + "
         "Swift sidebarVisibleStateSurvivesReopen",
@@ -66,9 +68,14 @@ def _skip_on_ci():
 
 def _toggle_to_collapsed(roost: Roost) -> None:
     """Drive the palette to collapse the sidebar, then wait for the
-    collapse to land — the toggle is applied on the GTK idle, so the
-    callers' immediate `window_metrics` reads race it otherwise (the
-    inverse of `_toggle_to_visible`'s settle wait)."""
+    collapse to land. iced's `set_sidebar_collapsed`
+    (`crates/roost-iced/src/app.rs`) updates workspace state and
+    resizes synchronously — there is no separate layout pass to race —
+    but `palette_open` / `palette_query` / `palette_activate` are each
+    their own IPC round trip, so a caller reading `window_metrics`
+    immediately after issuing `palette_activate` can still observe it
+    before the mutation lands. Wait rather than assume (the inverse of
+    `_toggle_to_visible`'s settle wait)."""
     metrics = roost.window_metrics()
     if metrics["sidebar_collapsed"]:
         return
@@ -83,27 +90,36 @@ def _toggle_to_collapsed(roost: Roost) -> None:
 
 
 def _sidebar_visible_and_allocated(roost: Roost) -> bool:
-    """The sidebar is uncollapsed AND its width has been allocated.
-    The two checks are independent on GTK: `is_visible()` flips
-    synchronously, but the layout pass that materializes a non-zero
-    allocation width is queued on the idle. Polling both rules out the
-    `visible=True, width=0` transient that poisons downstream tests."""
+    """The sidebar is uncollapsed AND its width is non-zero. On iced
+    both flow from the same synchronous computation
+    (`effective_sidebar_width`, `crates/roost-iced/src/app.rs`), so
+    they can never actually disagree once a toggle lands — but polling
+    both still rules out reading `window_metrics` mid-IPC-round-trip,
+    before a preceding `toggle_sidebar` activation has been applied.
+    (The now-removed GTK UI genuinely had an async, idle-cycle layout
+    pass here, where the two checks really could transiently
+    disagree.)"""
     m = roost.window_metrics()
     return not m["sidebar_collapsed"] and m["sidebar_width"] > 0
 
 
 def _toggle_to_visible(roost: Roost) -> None:
-    """Drive the palette to restore the sidebar, then wait for the GTK
-    layout pass to materialize a non-zero width — otherwise the next
-    test inherits a `visible=True, width=0` transient (GTK runs the
-    layout on the idle cycle after `set_visible(true)`)."""
+    """Drive the palette to restore the sidebar, then wait for
+    `window_metrics` to report a non-zero width. iced computes
+    `sidebar_width` synchronously from workspace state the moment
+    `set_sidebar_collapsed` runs (no separate layout pass, unlike the
+    now-removed GTK UI), but the palette round trip means a reader can
+    still observe stale metrics for the instant before that mutation
+    lands — otherwise the next test inherits a `visible=True, width=0`
+    read."""
     metrics = roost.window_metrics()
     if metrics["sidebar_collapsed"]:
         roost.palette_open()
         roost.palette_query("toggle sidebar")
         roost.palette_activate("toggle_sidebar")
     # Always wait for settle — even on the no-op path the caller may
-    # be the post-relaunch teardown where the layout pass hasn't run yet.
+    # be the post-relaunch teardown, and the mutation above (if any) is
+    # still an in-flight IPC round trip at this point.
     Roost._wait(
         lambda: _sidebar_visible_and_allocated(roost),
         timeout=2.0,

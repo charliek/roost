@@ -18,11 +18,10 @@ All tests use the `tab.feed_pty_bytes` (to enable a mode) +
 `app.cursor_shape` IPC ops; capture via `tab.capture_pty_input`.
 
 Cross-platform behavioral-parity gate: every case runs against
-`--roost-target mac` (PR A wiring) and `--roost-target gtk`
-(PR B wiring) and `--roost-target iced`. A regression on any
-side fails the matching job in CI. The same-cell drag-gate cases
-are the one exception — the gate is wired from iced only (plan
-026 D11), so they skip on mac and gtk.
+`--roost-target mac` and `--roost-target iced`. A regression on
+either side fails the matching job in CI. The same-cell drag-gate
+cases are the one exception — the gate is wired from iced only
+(plan 026 D11), so they skip on mac.
 """
 
 from __future__ import annotations
@@ -39,9 +38,8 @@ from util import drain, drain_until_match, wait_tab_attached
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
-# The whole module is gated on test mode. Both platforms run it now
-# (PR B dropped the PR-A skip-on-gtk markers); it's the cross-
-# platform behavioral-parity gate the plan called for.
+# The whole module is gated on test mode. Both platforms run it now;
+# it's the cross-platform behavioral-parity gate the plan called for.
 pytestmark = [
     pytest.mark.skipif(
         not TEST_MODE,
@@ -173,9 +171,10 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
 
 def _skip_unless_iced(target) -> None:
     """The same-cell drag gate is wired from iced only (plan 026 D11):
-    AppKit and X11 never synthesize a same-cell drag, so mac and GTK
-    forward what they are given. Adopting the gate there is a later
-    parity choice; until then these cases are iced-scoped."""
+    AppKit never synthesizes a same-cell drag, so mac forwards what it
+    is given (the now-removed GTK UI's X11 backend did the same).
+    Adopting the gate there is a later parity choice; until then these
+    cases are iced-scoped."""
     if target != "iced":
         pytest.skip("same-cell drag gate is iced-wired only (plan 026 D11)")
 

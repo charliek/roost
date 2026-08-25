@@ -139,18 +139,20 @@ enum Message {
 /// which is what keeps the dev harnesses correct no matter how the binary was
 /// compiled — they all pin that variable explicitly.
 ///
-/// A packaged Linux build adopts the production `roost` namespace the GTK
-/// package already owns, so an in-place upgrade keeps the user's socket,
-/// `state.json` and logs. The `linux` guard keeps the feature inert
-/// everywhere else: on macOS `Gtk` resolves `Roost-gtk`, the *GTK dev*
-/// profile — not the Swift app — so an unguarded feature would collide with
-/// the macOS GTK binary that CLAUDE.md supports running side by side.
+/// A packaged Linux build adopts the production `roost` namespace an
+/// installed Roost already owns, so an in-place upgrade keeps the user's
+/// socket, `state.json` and logs. The `linux` guard keeps the feature inert
+/// everywhere else: on macOS the `Linux` kind still resolves — to
+/// `Roost-linux` — but nothing ships or launches it there, so an unguarded
+/// feature would silently point a Mac build at a profile no Mac process
+/// owns, away from the `Roost-iced` paths the harnesses and the
+/// experimental `Roost-Iced.app` use.
 ///
 /// Parameterized rather than a bare `#[cfg]` at the call site so all four
 /// cells are unit-testable in a single build.
 fn default_profile_kind(packaged: bool, linux: bool) -> BundleProfileKind {
     if packaged && linux {
-        BundleProfileKind::Gtk
+        BundleProfileKind::Linux
     } else {
         BundleProfileKind::Iced
     }
@@ -181,7 +183,7 @@ fn mac_bundle_default_kind(bundle_id: Option<&str>) -> BundleProfileKind {
 
 /// The compiled-in default `main` starts from, per host OS. macOS defers to
 /// the bundle probe; every other host keeps the `linux-package` logic above
-/// untouched, so a packaged Linux build still resolves `Gtk`.
+/// untouched, so a packaged Linux build still resolves `Linux`.
 fn host_default_kind(
     packaged: bool,
     linux: bool,
@@ -233,6 +235,16 @@ fn main() -> anyhow::Result<()> {
         profile = profile.kind.as_str(),
         "resolved bundle identity"
     );
+    // Profile resolution ran before the subscriber existed, so the
+    // resolver's own stale-value warn was discarded; re-check now that
+    // it can land in the log.
+    if let Some(value) = roost_ipc::paths::unrecognized_profile_env() {
+        tracing::warn!(
+            value,
+            profile = profile.kind.as_str(),
+            "ROOST_BUNDLE_PROFILE not recognized; using the default profile"
+        );
+    }
     roost_engine::crash::install_panic_hook(
         profile.log_dir.clone(),
         profile.app_label,
@@ -941,7 +953,7 @@ mod tests {
     fn only_a_packaged_linux_build_adopts_the_production_profile() {
         assert_eq!(
             default_profile_kind(true, true),
-            BundleProfileKind::Gtk,
+            BundleProfileKind::Linux,
             "the Linux .deb adopts the `roost` namespace in place"
         );
         assert_eq!(default_profile_kind(true, false), BundleProfileKind::Iced);
@@ -976,17 +988,17 @@ mod tests {
     }
 
     /// The probe must not reach the non-macOS default: a packaged Linux
-    /// build still resolves `Gtk` no matter what the (always-`None`) bundle
-    /// id says.
+    /// build still resolves `Linux` no matter what the (always-`None`)
+    /// bundle id says.
     #[test]
     fn only_macos_defers_to_the_bundle_probe() {
         assert_eq!(
             host_default_kind(true, true, false, None),
-            BundleProfileKind::Gtk
+            BundleProfileKind::Linux
         );
         assert_eq!(
             host_default_kind(true, true, false, Some(ICED_BUNDLE_ID)),
-            BundleProfileKind::Gtk
+            BundleProfileKind::Linux
         );
         assert_eq!(
             host_default_kind(true, true, true, None),
@@ -1026,7 +1038,7 @@ mod tests {
         // `default_profile_kind(false, true)` — `Iced`, and the test fails.
         assert_eq!(
             default_profile_kind(PACKAGED, true),
-            BundleProfileKind::Gtk,
+            BundleProfileKind::Linux,
             "a packaged Linux build must adopt the production profile"
         );
     }

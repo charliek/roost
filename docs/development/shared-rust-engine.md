@@ -1,10 +1,16 @@
 # Shared Rust engine
 
 `roost-engine` is Roost's toolkit-neutral authoritative Rust application
-engine. Both Linux UIs consume it directly — the shipped iced UI and the
-in-repo GTK development/parity UI. A future
-Swift adapter can adopt the same boundary incrementally without exposing Rust
-layouts across an ABI.
+engine. It is the core of the Linux UI — `roost-iced` is an adapter over it,
+not a second implementation of it — and it is the seam a future convergence
+would build on, whichever way
+[that question resolves](vision.md#direction-under-evaluation): either an iced
+shell on both platforms sits on this engine, or a Swift shell adopts it
+incrementally without exposing Rust layouts across an ABI.
+
+That the engine has exactly one consumer today is a fact about the present,
+not a licence to fold it back into the UI. Its whole value is that the
+authoritative state machine is separable from the toolkit.
 
 ## Ownership
 
@@ -19,17 +25,18 @@ resolution, keybinds, command palettes, providers, custom commands, agent and
 notification projections, project rollups, shell escaping, and word
 selection.
 
-`roost-vt::TerminalScroll` owns the synchronous terminal-wheel policy shared
-by GTK and Iced. Every live terminal has an independent accumulator and
-snap-to-bottom state. Adapters normalize native units into signed rows and
-retain pointer geometry, modifiers, encoders, and PTY writes; the shared model
-selects mouse-report, alternate-screen key, or local viewport behavior with
-mouse tracking taking precedence. Local movement reconciles against
-libghostty's authoritative scrollbar rather than guessing whether a downward
-request reached the live bottom. The outcome enum is also a realistic future
-Swift adoption seam without exposing Rust layouts through an ABI.
+`roost-vt::TerminalScroll` owns the synchronous terminal-wheel policy. Every
+live terminal has an independent accumulator and snap-to-bottom state. The
+adapter normalizes native units into signed rows and retains pointer geometry,
+modifiers, encoders, and PTY writes; the shared model selects mouse-report,
+alternate-screen key, or local viewport behavior with mouse tracking taking
+precedence. Local movement reconciles against libghostty's authoritative
+scrollbar rather than guessing whether a downward request reached the live
+bottom. The outcome enum is deliberately a plain value type — a realistic
+adoption seam for a second adapter without exposing Rust layouts through an
+ABI.
 
-UI adapters retain native widgets and layout, terminal drawing and
+The UI adapter retains native widgets and layout, terminal drawing and
 libghostty-vt event-loop access, platform input translation, clipboard and
 notifications, URL launching, screenshot capture, and event-loop marshalling.
 
@@ -37,34 +44,36 @@ notifications, URL launching, screenshot capture, and event-loop marshalling.
 
 The crate boundary in production use today is the concrete API: `Workspace`,
 `LocalClient`, `PtySupervisor`, and `roost_engine::ipc`'s exhaustively-matched
-`UiRequest` port, consumed by both the GTK and Iced adapters.
+`UiRequest` port. The exhaustive match is the mechanism, not a style
+preference: a new capability cannot reach the UI without the compiler naming
+every adapter that has to answer it. Never add a wildcard arm.
 
 `events::subscribe` bridges `Workspace`'s broadcast channel into an unbounded
-mpsc that both adapters drain on their own main-loop task — GTK via
-`glib::spawn_future_local`, Iced via the `EngineFeed` wake subscription —
-folding lag or the startup gap into a full-state `Resync` either adapter
-reconciles against.
+mpsc the adapter drains on its own main-loop task — for iced, the `EngineFeed`
+wake subscription — folding lag or the startup gap into a full-state `Resync`
+the adapter reconciles against.
 
 The `facade` module (`Engine`/`EngineCommand`/`EngineSnapshot`/
 `EngineEventStream`) is the **experimental** Swift-facing boundary. It has no
-production consumer yet and is feature-gated (`roost-engine/facade`, tested in
-CI but off by default) until a real adapter adopts it and proves the seam —
-see the migration roadmap's M5. Its design: `EngineCommand` reuses
-serializable `roost-ipc` request DTOs. `Engine::execute` returns an owned
-`CommandResult` or a typed `EngineError` with a stable status key.
-`EngineSnapshot` is a versioned, owned, ordered replacement projection.
-Every committed workspace transition has a monotonic in-process revision;
-compound events share that revision and retain their established order.
+production consumer, is feature-gated (`roost-engine/facade`, compiled and
+tested in CI but off by default), and stays unproven until a real adapter
+adopts it — tracked as
+[#286](https://github.com/charliek/roost/issues/286), held at "don't invest,
+don't delete" while the Mac-shell question is open (see
+[Direction](vision.md#direction-under-evaluation) and the
+[iced migration's M5](iced-migration.md#m5-frozen)). Its design:
+`EngineCommand` reuses serializable `roost-ipc` request DTOs.
+`Engine::execute` returns an owned `CommandResult` or a typed `EngineError`
+with a stable status key. `EngineSnapshot` is a versioned, owned, ordered
+replacement projection. Every committed workspace transition has a monotonic
+in-process revision; compound events share that revision and retain their
+established order.
 
 `EngineEventStream` subscribes before its initial snapshot, discards any stale
 buffered deltas already represented by that snapshot, and turns broadcast lag
 or a revision gap into `EngineEvent::Resync`. Event publication is synchronous
 and non-blocking while the state lock establishes order. No UI callback runs
 under that lock, and persistence I/O happens after it is released.
-
-The concrete `Workspace`, `LocalClient`, and runtime APIs remain public during
-the GTK migration. `roost-linux` compatibility modules only re-export shared
-types; they no longer own those state machines.
 
 `Workspace` also owns the last selected live tab for each project. Its
 `preferred_tab` query falls back to display order and repairs preferences when
@@ -78,27 +87,28 @@ schema and semantics.
 Each live Rust terminal owns a `roost_engine::osc::OscRouter`. The caller feeds
 PTY bytes plus an owned renderer-derived RGB/palette snapshot and receives an
 ordered list of workspace, PTY-input, clipboard, and pointer actions. This
-keeps split-sequence scan state and reply ordering shared while the adapters
-retain libghostty-vt access and execute native clipboard/pointer ports. No UI
-callback or renderer type crosses the router boundary.
+keeps split-sequence scan state and reply ordering inside the engine while the
+adapter retains libghostty-vt access and executes native clipboard/pointer
+ports. No UI callback or renderer type crosses the router boundary.
 
 ## Dependency checks
 
+`make check-iced` enforces these with `cargo tree` greps; CI runs its
+own equivalent in `iced-build-e2e`'s toolkit-boundary step:
+
 ```sh
-cargo tree -p roost-engine -e normal
-cargo tree -p roost-ui-model -e normal
-cargo tree -p roost-linux -i roost-engine
-cargo tree -p roost-iced -i roost-engine
+# make check-iced (excerpt)
+cargo tree -p roost-iced   | grep -E 'gtk4|libadwaita|pango|cairo-rs'         # must not match
+cargo tree -p roost-engine | grep -E 'gtk4|libadwaita|iced|notify-rust|zbus|arboard'  # must not match
 ```
 
-Neither shared crate may gain GTK, libadwaita, Iced, AppKit, Cairo, Pango, or a
-renderer dependency. `roost-ui-model` uses the renderer-independent
-`roost_vt::ColorRgb`; enabling libghostty-vt FFI remains a UI-adapter choice.
+Neither shared crate may gain Iced, AppKit, or any other renderer, windowing,
+or desktop-integration dependency — the Make target names `iced`,
+`notify-rust`, `zbus`, and `arboard` explicitly for `roost-engine`; the CI
+step covers `roost-engine` (gtk4/libadwaita/iced) and additionally
+`roost-ui-model` (those plus pango/cairo-rs/wgpu). `roost-ui-model` uses the
+renderer-independent `roost_vt::ColorRgb`; enabling libghostty-vt FFI remains a
+UI-adapter choice.
 
-GTK and Iced both depend on `roost-engine`; neither shared crate depends back
-on either adapter, and `roost-iced` has no dependency on `roost-linux` or GTK's
-native stack.
-
-The proposed Swift ABI, ownership and threading rules, migration slices, and
-the reviewed decision to defer unsafe FFI during the walking skeleton are in
-the [Iced POC plan](iced-poc-plan.md#swift-interoperability-decision).
+`roost-iced` depends on `roost-engine`; neither shared crate depends back on
+the adapter.

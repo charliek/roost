@@ -18,10 +18,12 @@
 // orders let two starting processes refuse each other.
 //
 // Why flock (BSD style) and not POSIX fcntl(F_SETLK):
-//   * The GTK side uses `fs2::FileExt::try_lock_exclusive`, which
-//     is a thin wrapper around flock(2). Using the same primitive
-//     keeps the cross-platform behavior identical — both variants
-//     fail in the same way when the lock is contended.
+//   * `crates/roost-engine/src/single_instance.rs` (shared by iced)
+//     calls flock(2) directly. Using the same primitive keeps the
+//     cross-platform behavior identical — both variants fail in the
+//     same way when the lock is contended. (The now-removed GTK UI
+//     reached it via `fs2::FileExt::try_lock_exclusive`, a thin
+//     wrapper over the same syscall.)
 //   * POSIX record locks (fcntl F_SETLK) have lock-vs-fd semantics
 //     that interact badly with multi-fd handling and "any close
 //     drops all locks" surprises. flock is a 1:1 lock-per-fd model.
@@ -99,10 +101,11 @@ final class SingleInstance: @unchecked Sendable {
         _ = roost_flock(lockFD, LOCK_UN)
         // We do NOT unlink the lockfile —
         // unlinking on shutdown would race with a concurrent second
-        // launch that already opened the same path; the GTK side
-        // uses the same "leave it on disk" convention. The PID in
-        // the file is the only thing that lies, and the lock
-        // status (acquired vs. blocked) is the source of truth.
+        // launch that already opened the same path; `roost-engine`
+        // (shared with iced) uses the same "leave it on disk"
+        // convention. The PID in the file is the only thing that
+        // lies, and the lock status (acquired vs. blocked) is the
+        // source of truth.
         Darwin.close(lockFD)
     }
 

@@ -1,6 +1,8 @@
 # StartupWMClass matches the app id the packaged (iced) binary announces —
 # renamed to the production id in the first iced release (#320). The legacy
-# `.gtk` name lives on as the NoDisplay alias in roost-gtk-alias.desktop.
+# `.gtk` name lives on as the NoDisplay alias in roost-gtk-alias.desktop —
+# see that file for the removal condition (delete once no installed launcher
+# pin references it; revisit at v0.1.0).
 [Desktop Entry]
 Type=Application
 Name=Roost

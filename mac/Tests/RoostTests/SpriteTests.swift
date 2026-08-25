@@ -1,4 +1,5 @@
-// Pixel-assertion suite mirroring `crates/roost-linux/src/sprite.rs::tests`.
+// Pixel-assertion suite mirroring
+// `crates/roost-ui-model/src/sprite.rs::tests` (shared by iced).
 // Renders each glyph into a CGBitmapContext and pokes at raw bytes to
 // verify fills land in the right places. The OpenCode-logo regression
 // is `blockTilingNoGap` — two adjacent █ cells must abut with no seam.

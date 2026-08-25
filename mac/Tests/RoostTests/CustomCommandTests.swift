@@ -3,7 +3,7 @@
 // launcher palette-row builder. Mirrors the repo's pattern of testing
 // extracted state (PaletteStateTests, NotificationInboxTests) without
 // standing up AppKit, and the Rust peer in
-// `crates/roost-linux/src/custom_command.rs`.
+// `crates/roost-ui-model/src/custom_command.rs` (shared by iced).
 
 import Testing
 

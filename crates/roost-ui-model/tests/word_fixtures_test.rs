@@ -14,11 +14,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use roost_linux::word_selection::{expand_line, expand_word, WordSpan, DEFAULT_EXTRA_WORD_CHARS};
+use roost_ui_model::word_selection::{
+    expand_line, expand_word, WordSpan, DEFAULT_EXTRA_WORD_CHARS,
+};
 
 fn fixtures_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    assert!(p.pop()); // pop "roost-linux"
+    assert!(p.pop()); // pop "roost-ui-model"
     assert!(p.pop()); // pop "crates"
     p.push("tests");
     p.push("word-fixtures");

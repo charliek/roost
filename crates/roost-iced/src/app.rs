@@ -991,7 +991,7 @@ fn prepare_window_opened(
 ///
 /// Keyed off the resolved profile, not the OS: the macOS Iced bundle and the
 /// Linux *dev* iced profile both announce `Roost-Iced` (matching the bundle's
-/// `CFBundleName`), while the packaged Linux build resolves `Gtk` and keeps
+/// `CFBundleName`), while the packaged Linux build resolves `Linux` and keeps
 /// the production `Roost` users already see.
 /// Pure half of [`App::window_title`]: `project` is the active project's
 /// `(name, effective cwd)`, `None` when no project is active. Split out so
@@ -1006,7 +1006,7 @@ fn compose_window_title(fallback: &str, project: Option<(&str, &str)>, home: &st
 fn title_fallback(kind: BundleProfileKind) -> &'static str {
     match kind {
         BundleProfileKind::Iced => "Roost-Iced",
-        BundleProfileKind::Mac | BundleProfileKind::Gtk => window_title::DEFAULT_WINDOW_TITLE,
+        BundleProfileKind::Mac | BundleProfileKind::Linux => window_title::DEFAULT_WINDOW_TITLE,
     }
 }
 
@@ -3333,9 +3333,9 @@ mod tests {
         assert_eq!(title_fallback(BundleProfileKind::Iced), "Roost-Iced");
         assert_eq!(title_fallback(BundleProfileKind::Mac), "Roost");
         assert_eq!(
-            title_fallback(BundleProfileKind::Gtk),
+            title_fallback(BundleProfileKind::Linux),
             "Roost",
-            "the packaged Linux build resolves Gtk and keeps the production name"
+            "the packaged Linux build resolves Linux and keeps the production name"
         );
     }
 
@@ -4526,7 +4526,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_colors_match_the_shipped_gtk_and_appkit_palette() {
+    fn agent_colors_match_the_shipped_linux_and_appkit_palette() {
         use roost_ipc::agent::AgentLifecycle;
         assert_eq!(
             agent_color(AgentLifecycle::Working),

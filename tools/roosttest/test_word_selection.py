@@ -8,7 +8,7 @@ click event to. We cover the golden cases the unit tests already pin
 plus a few cross-port parity checks; the unit + fixture corpus is the
 exhaustive layer.
 
-Both targets run these in CI (e2e-gtk + e2e-mac) with
+Both targets run these in CI (iced-build-e2e + e2e-mac) with
 `ROOST_TEST_MODE: "1"` set in the workflow env block.
 """
 

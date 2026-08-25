@@ -1,7 +1,7 @@
 name: CI
 
 # CI for Roost (Rust + Swift). Runs on main + PRs targeting main. A
-# `changes` job (path filter) gates the rust/swift/gtk jobs so they run only when
+# `changes` job (path filter) gates the rust/swift/iced jobs so they run only when
 # code that impacts them changes; `ci-success` is the single aggregated required
 # check (stable regardless of which jobs run).
 
@@ -43,7 +43,6 @@ jobs:
               # The file is a dotfile. The old 'mise.toml' pattern could
               # never match, so a toolchain bump triggered no Rust job.
               - '.mise.toml'
-              - 'clippy.toml'
               - 'crates/**'
               - 'third_party/ghostty/**'
               - 'third_party/swash/**'
@@ -57,9 +56,9 @@ jobs:
               - 'linux/**'
               - 'packaging/**'
             # repo-root shared fixture corpora (parity gates for both UIs),
-            # consumed only by the unit-test jobs (rust-build, gtk-build,
-            # swift-mac) — distinct from the `tests` output below, which
-            # means tools/roosttest/**
+            # consumed only by the unit-test jobs (rust-build, swift-mac) —
+            # distinct from the `tests` output below, which means
+            # tools/roosttest/**
             fixtures:
               - 'tests/**'
             tests:
@@ -67,6 +66,10 @@ jobs:
               - 'tools/roosttest_unit/**'
               - 'tools/input/linux/**'
               - 'tools/wayland/**'
+              # e2e-iced-wayland-drag's check imports pngtool from here (and
+              # the screenshot harness shares helpers with tools/input), so a
+              # change there can break a lane that lists none of its files.
+              - 'tools/screenshot/**'
               - 'pyproject.toml'
               - 'uv.lock'
               # The e2e jobs invoke Makefile targets, so the test-module
@@ -169,9 +172,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        # UI crates have native dependencies and dedicated strict lint jobs.
-        # Keep this runner the toolkit-neutral core lane.
-        run: cargo clippy --workspace --exclude roost-linux --exclude roost-iced --all-targets -- -D warnings
+        # Keep this runner the toolkit-neutral core lane. roost-iced stays
+        # excluded because its clippy has to run once per feature set
+        # (default + `linux-package`) — that lives in iced-build-e2e's
+        # "Test and lint Iced" step, which is required just like this one.
+        run: cargo clippy --workspace --exclude roost-iced --all-targets -- -D warnings
 
   harness-unit:
     needs: changes
@@ -256,9 +261,8 @@ jobs:
 
       - name: cargo build (workspace, default features)
         # Default features: roost-vt's `ffi` feature is OFF, so this build does
-        # not consume libghostty-vt. `--exclude roost-linux` (GTK toolchain
-        # lives in gtk-build).
-        run: cargo build --workspace --exclude roost-linux --all-targets
+        # not consume libghostty-vt.
+        run: cargo build --workspace --all-targets
 
       - name: cargo build (roost-vt with ffi)
         run: cargo build -p roost-vt --features ffi
@@ -271,7 +275,7 @@ jobs:
         run: cargo test -p roost-vt --features ffi
 
       - name: cargo test
-        run: cargo test --workspace --exclude roost-linux
+        run: cargo test --workspace
 
       # The experimental Swift-facing facade is feature-gated with no
       # production consumer; test it explicitly so the gated code stays green.
@@ -450,76 +454,6 @@ jobs:
             NSAppleEventsUsageDescription
           echo "OK: capture entitlements (=true) + usage strings present; helper + broad keys excluded"
 
-  gtk-build:
-    needs: changes
-    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install GTK4 + libadwaita
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev \
-            libadwaita-1-dev \
-            pkg-config \
-            libclang-dev
-
-      - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - uses: jdx/mise-action@v4
-
-      - name: Cache vendored libghostty-vt
-        id: cache-ghostty
-        uses: actions/cache@v5
-        with:
-          path: |
-            third_party/ghostty/out
-            third_party/ghostty/src
-          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
-
-      - name: Build libghostty-vt
-        if: steps.cache-ghostty.outputs.cache-hit != 'true'
-        run: ./third_party/ghostty/build.sh
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: cargo build -p roost-linux
-        run: cargo build -p roost-linux
-
-      # The rust-test job runs `--workspace --exclude roost-linux` (no GTK
-      # toolchain there), so this is the ONLY place roost-linux's own tests
-      # can run. Without it the crate's unit tests — including the key
-      # encoder's Kitty-mode guards — compile but never execute anywhere.
-      # Headless-safe: these tests never construct a widget or call gtk_init.
-      - name: cargo test -p roost-linux
-        run: cargo test -p roost-linux
-
-      # roost-linux is clippy-clean (issue #283 closed out the last
-      # type_complexity holdout), so this runs the same full gate as
-      # rust-lint / Iced's "Test and lint Iced" step below — no more
-      # `-A warnings` narrow denylist. disallowed_types (GtkDnD #236) and
-      # disallowed_methods (raw grab_focus #234) are warn-by-default clippy
-      # lints, so `-D warnings` still catches regressions on both; clippy.toml
-      # stays the source of truth for which types/methods are disallowed.
-      # rust-lint excludes roost-linux because it needs the GTK toolchain
-      # that only this job has.
-      - name: cargo clippy -p roost-linux
-        run: cargo clippy -p roost-linux --all-targets -- -D warnings
-
   # Iced walking skeleton: exact released Iced + libghostty-vt on both host
   # platforms, with the common IPC harness driving a real PTY-backed window.
   # The Linux leg selects X11 under Xvfb; its wgpu renderer uses Mesa's
@@ -612,8 +546,8 @@ jobs:
             echo "FAIL: roost-ui-model depends on a UI toolkit or renderer"
             exit 1
           fi
-          if cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs|roost-linux) v'; then
-            echo "FAIL: roost-iced depends on GTK or roost-linux"
+          if cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs) v'; then
+            echo "FAIL: roost-iced depends on GTK"
             exit 1
           fi
 
@@ -1506,10 +1440,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # Functional E2E: launch the real GTK UI headless under Xvfb and drive
-  # it through the IPC op set with the pytest harness (tools/roosttest).
-  # Required — Linux is the cheap, reliable headless target.
-  e2e-gtk:
+  # Real pointer-DRAG + system-clipboard proof for the Iced UI under a headless
+  # WAYLAND compositor — the one thing the IPC-driven Wayland lane inside
+  # `iced-build-e2e` cannot do. Runs roost-iced fullscreen under `cage` (a kiosk
+  # wlroots compositor, so window coords == output coords) and drives the stdlib
+  # /dev/uinput key + pointer injectors (tools/input/linux/inject_key.py,
+  # inject_pointer.py) through tools/input/linux/iced_wayland_clipboard_check.py,
+  # whose checks include `_wayland_tab_reorder` — a real compositor-seat tab drag.
+  #
+  # NON-BLOCKING (continue-on-error + absent from ci-success). Its retired gtk
+  # predecessor (e2e-gtk-wayland-drag) failed 3 of 21 sampled `main` runs with
+  # "window_metrics returned no window size" — harness-shaped (the injector never
+  # got a window geometry back), not product-shaped. Gather signal on this lane
+  # before promoting it to required; see #328.
+  #
+  # ROOST_REQUIRE_REAL_INPUT=1 is LOAD-BEARING: without it the script exits 0
+  # with a SKIP line whenever cage, /dev/uinput, or the binary is missing, and
+  # the lane would be green-by-skip forever. Mirrors `make test-iced-wayland-input`.
+  e2e-iced-wayland-drag:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
@@ -1519,11 +1467,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install GTK4 + libadwaita + Xvfb + zsh
+      - name: Install Iced build deps + cage + seatd
+        # No GTK dev packages — roost-iced is GTK-free, and iced-build-e2e's
+        # boundary grep enforces that independently. pkg-config + libclang-dev
+        # build roost-vt's bindgen; the xkbcommon / wayland-client libs are what
+        # winit dlopens; cage + seatd provide the headless compositor and the
+        # seat the uinput injectors need.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb xdotool zsh
+            pkg-config libclang-dev libxkbcommon-x11-0 libwayland-client0 \
+            cage seatd
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -1546,322 +1500,28 @@ jobs:
         if: steps.cache-ghostty.outputs.cache-hit != 'true'
         run: ./third_party/ghostty/build.sh
 
-      - name: Cache cargo registry + target
+      - name: Cache cargo registry + Iced target
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-iced-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-iced-${{ runner.os }}-
 
-      # roostctl too: `test_agent_lifecycle.py` drives synthetic Claude
-      # hook payloads through the real `roostctl claude-hook` binary, so
-      # the adapter -> CLI -> IPC -> workspace path runs end to end. (The
-      # harness can build it on demand, but that would land inside the
-      # pytest step.) The Mac leg gets it from bundle.sh, which embeds
-      # roostctl in the .app.
-      - name: Build the GTK UI + roostctl
-        run: cargo build -p roost-linux -p roost-cli
-
-      - name: Run E2E (GTK under Xvfb)
-        env:
-          GDK_BACKEND: x11
-          RUST_LOG: warn
-          ROOST_TEST_TIMEOUT_SCALE: "3"   # shared CI runner is slower/variable
-          # Unlocks tab.feed_pty_bytes + tab.capture_pty_input on the
-          # UI side so the OSC-pipeline tests can drive PTY bytes
-          # end-to-end. The harness reads the same var to skip those
-          # tests entirely when it's absent (no spurious red).
-          ROOST_TEST_MODE: "1"
-          # Where the harness captures the launched UI's stdout+stderr (the
-          # GTK UI tees its log to stdout). Collected + uploaded below so a
-          # boot failure under xvfb isn't blind — the Mac twin already does
-          # this via crash reports; this is the GTK equivalent.
-          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-e2e-logs
-
-        # The harness launches its own `roost` process; under xvfb-run it
-        # inherits the virtual DISPLAY. tab.dump reads in-process render
-        # state, so no compositor screen-capture is involved.
-        # Big virtual screen so window.resize can grow the toplevel to the
-        # full test width (the default 1280-wide xvfb capped resizes at
-        # ~1270, registered-skipping the sidebar geometry tests). With room
-        # to resize, those tests run instead of skipping.
-        run: >
-          xvfb-run -a --server-args="-screen 0 2560x1440x24"
-          uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
-
-      # Real-input regressions: the behaviors that only real pointer/key input
-      # through the GTK gesture/shortcut stack can exercise (the IPC suite drives
-      # the op set, never the gesture stack) — click-to-focus + project-switch
-      # core-sync (#1), Alt+digit / Ctrl+PageDown / cycle_tab / pill-click core-
-      # sync (#228/#229), tab context-menu no-crash, and the GtkGestureDrag
-      # tab/project reorder that replaced GTK DnD (whose Wayland drag-icon
-      # surface aborted in gdksurface-wayland.c:frame_callback). Self-contained —
-      # it starts its OWN Xvfb + throwaway Roost — so it runs as its own step,
-      # NOT under xvfb-run.
-      #
-      # REQUIRED as of plan 024. This job is in `ci-success`, so a soft step
-      # inside it made the required gate only a partial one. The
-      # gather-signal period is over and XTEST-under-Xvfb held up: 21
-      # consecutive `main` runs (2026-07-31 → 2026-08-09), every one ending
-      # `PASS: focus + core-sync …, drag reorder …, palette chrome-click
-      # no-storm all verified`, with zero failures and zero skips. Measured
-      # from the step LOGS — with `continue-on-error` set, both the job
-      # conclusion and the REST API's step `conclusion` report success no
-      # matter what the step actually did, so neither is evidence.
-      #
-      # ROOST_REQUIRE_REAL_INPUT turns the script's self-skip into a failure
-      # here (xdotool/Xvfb are installed, so a skip means a real setup
-      # problem, not "unsupported").
-      - name: Real-input regressions (Xvfb + xdotool)
-        env:
-          GDK_BACKEND: x11
-          ROOST_TEST_MODE: "1"
-          ROOST_TEST_TIMEOUT_SCALE: "3"
-          ROOST_REQUIRE_REAL_INPUT: "1"
-        run: uv run --group test python tools/input/linux/real_input_check.py
-
-      # Stage the captured UI log into one dir (upload-artifact doesn't
-      # expand globs/`~`). The harness writes the launched UI's stdout+stderr
-      # to ROOST_E2E_LOG_DIR; grab it whether or not the run failed.
-      - name: Collect failure diagnostics
-        if: always()
-        run: |
-          mkdir -p diagnostics
-          cp "${RUNNER_TEMP}"/roost-e2e-logs/*.log diagnostics/ 2>/dev/null || true
-          ls -la diagnostics || true
-
-      - name: Upload E2E diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: e2e-gtk-diagnostics
-          path: diagnostics/
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # Functional E2E against the GTK UI under a headless WAYLAND compositor
-  # (weston) — the twin of e2e-gtk-under-Xvfb. Exists because GTK's
-  # GDK-Wayland backend (gdksurface-wayland.c) is ONLY exercised here: the
-  # Xvfb job forces GDK_BACKEND=x11, so Wayland-only bugs (e.g. the DnD
-  # drag-icon-surface frame_callback abort that crashed tab reorder on
-  # COSMIC) are invisible to it.
-  #
-  # REQUIRED (in ci-success) as of plan 024. The gather-signal period is over
-  # and the signal was clean: 21 consecutive `main` runs between 2026-07-31
-  # and 2026-08-09, every one ending `N passed, M skipped` with zero failures,
-  # runtime stable at 19-31s.
-  #
-  # HOW that was measured matters, because the obvious methods lie. A step
-  # carrying `continue-on-error` is reported by the REST jobs API with
-  # `conclusion: success` no matter what it did — that API exposes
-  # `conclusion` and not `outcome`. So both "the job went green 21 times" and
-  # a step-level query saying "all steps ok" were true and meaningless. The
-  # only honest signal is the step's log body, which is where the numbers
-  # above come from. Do not promote anything here on job- or step-conclusion
-  # evidence again.
-  #
-  # weston headless drives the IPC suite, not pointer input; the real
-  # pointer-DRAG guard lives in the separate e2e-gtk-wayland-drag job (cage +
-  # /dev/uinput) below, which is deliberately NOT promoted — see its comment.
-  e2e-gtk-wayland:
-    needs: changes
-    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    # Job-level cap so a hung run can't sprawl (a single hung test ate the 15m
-    # step cap once → the job ran 22m). Sized to survive a cache-COLD run (cold
-    # libghostty-vt + cargo build add ~10m), not the warm ~2m time.
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install GTK4 + libadwaita + weston + zsh
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev weston wl-clipboard zsh
-
-      - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - uses: jdx/mise-action@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Cache vendored libghostty-vt
-        id: cache-ghostty
-        uses: actions/cache@v5
-        with:
-          path: |
-            third_party/ghostty/out
-            third_party/ghostty/src
-          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
-
-      - name: Build libghostty-vt
-        if: steps.cache-ghostty.outputs.cache-hit != 'true'
-        run: ./third_party/ghostty/build.sh
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      # roostctl too — same reason as the Xvfb job above (the pytest
-      # suite's Claude-hook test shells out to the real binary).
-      - name: Build the GTK UI + roostctl
-        run: cargo build -p roost-linux -p roost-cli
-
-      - name: Run E2E (GTK under headless Wayland / weston)
-        timeout-minutes: 15
-        env:
-          RUST_LOG: warn
-          ROOST_TEST_TIMEOUT_SCALE: "3"   # shared CI runner is slower/variable
-          ROOST_TEST_MODE: "1"
-          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-e2e-wl-logs
-        # weston-run.sh boots a headless weston, points GDK at it
-        # (GDK_BACKEND=wayland) and runs the IPC-driven suite — tab.dump reads
-        # in-process render state, so no screen capture is involved.
-        #
-        # Curated subset: skip the clipboard + shell-env tests. On headless
-        # Wayland there's no clipboard manager, so a GTK clipboard read can
-        # block indefinitely (the full suite hung ~2h on the runner before
-        # this cap), and those paths test integration semantics that diverge
-        # X11↔Wayland — not the GDK-Wayland backend this job exists to cover.
-        # `test_selection.py` is NOT skipped: `selection.set`/`selection.dump`
-        # go straight to the TerminalView and never reach GdkClipboard, so
-        # there's nothing here for a missing clipboard manager to block on.
-        # `timeout-minutes` is the belt-and-suspenders cap so a future hang can
-        # never run away again — and now that this step is required, a hang
-        # reds the gate instead of being swallowed.
-        # --timeout: per-test hard cap (pytest-timeout) so one hung test fails
-        # fast instead of consuming the whole step (that's what ran the job to
-        # 22m). Derived from the same ROOST_TEST_TIMEOUT_SCALE the harness uses
-        # (30s base * 3 = 90s) so the one knob meant to absorb runner variance
-        # doesn't get bypassed. `thread` method dumps the stack + fails without
-        # relying on SIGALRM landing in a GTK/IPC C call.
-        run: >
-          tools/wayland/weston-run.sh
-          uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
-          --timeout=$((30 * ROOST_TEST_TIMEOUT_SCALE)) --timeout-method=thread
-          --ignore=tools/roosttest/test_osc52.py
-          --ignore=tools/roosttest/test_shell_integration.py
-
-      - name: Collect failure diagnostics
-        if: always()
-        run: |
-          mkdir -p diagnostics
-          cp "${RUNNER_TEMP}"/roost-e2e-wl-logs/*.log diagnostics/ 2>/dev/null || true
-          ls -la diagnostics || true
-
-      - name: Upload E2E diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: e2e-gtk-wayland-diagnostics
-          path: diagnostics/
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # Real pointer-DRAG under a headless WAYLAND compositor — the one thing the
-  # IPC-only e2e-gtk-wayland job can't do. Drives an absolute-pointer drag with
-  # the stdlib /dev/uinput injector (tools/input/linux/inject_pointer.py) under
-  # `cage` (a kiosk wlroots compositor that fullscreens its single client, so
-  # window coords == output coords). Guards that the GtkGestureDrag reorder
-  # neither aborts the process nor emits a Wayland surface critical — the X11
-  # real-input job can only exercise the gesture *logic*, not the GDK-Wayland
-  # backend where the old GtkDnD drag-icon surface crashed.
-  #
-  # STILL NON-BLOCKING (continue-on-error + absent from ci-success), and this
-  # is now a measured decision rather than a pending one.
-  #
-  # Plan 024 re-checked the history from the step LOGS — the only signal that
-  # survives `continue-on-error`, since both the job conclusion and the REST
-  # API's step `conclusion` report success regardless. Its sibling
-  # e2e-gtk-wayland came back 21/21 clean and was promoted. This lane did not:
-  # 3 of the same 21 runs FAILED with
-  #
-  #     FAIL (real-input required): window_metrics returned no window size
-  #
-  # (runs 31134306062, 31144935154, 31151407004 — all within one ~5h window on
-  # 2026-08-07, so plausibly a runner-image or seat/uinput blip rather than a
-  # steady 14% rate, but a gate cannot be promoted on a hypothesis).
-  #
-  # The failure is harness-shaped, not product-shaped: the injector never got
-  # a window geometry back, so it could not aim the pointer. Two candidates
-  # worth investigating before promoting — cage not having the surface mapped
-  # when the harness asks (needs a wait/retry rather than a single probe), or
-  # the best-effort `modprobe uinput` + seatd step below silently not taking,
-  # in which case this should SKIP loudly rather than FAIL. See #328.
-  #
-  # The developer confirms the real COSMIC/cosmic-comp behavior separately;
-  # cage is generic wlroots Wayland, which is where the crash lived.
-  e2e-gtk-wayland-drag:
-    needs: changes
-    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install GTK4 + libadwaita + cage + seatd
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev cage seatd
-
-      - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - uses: jdx/mise-action@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Cache vendored libghostty-vt
-        id: cache-ghostty
-        uses: actions/cache@v5
-        with:
-          path: |
-            third_party/ghostty/out
-            third_party/ghostty/src
-          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
-
-      - name: Build libghostty-vt
-        if: steps.cache-ghostty.outputs.cache-hit != 'true'
-        run: ./third_party/ghostty/build.sh
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Build the GTK UI + roostctl
-        # roostctl (roost-cli) is what the injector harness drives; a cold
-        # `-p roost-linux` build doesn't produce it, so build both explicitly.
-        run: cargo build -p roost-linux -p roost-cli
+      - name: Build Iced + roostctl
+        # The check drives the UI over IPC from Python, but roostctl is the
+        # documented companion binary for reproducing a failure by hand and a
+        # cold `-p roost-iced` build does not produce it.
+        run: cargo build -p roost-iced -p roost-cli
 
       - name: Enable uinput + a seat for synthetic input
         # Headless wlroots has no input devices; to read the uinput device the
         # injector creates, cage needs a libinput backend on a seat. modprobe
         # uinput works on ubuntu-latest; seatd grants the seat to the runner's
-        # group. Best-effort — the check SKIPs/FAILs clearly if this didn't take.
+        # group. Best-effort here — ROOST_REQUIRE_REAL_INPUT=1 below turns the
+        # check's SKIP into a loud FAIL if it did not take.
         run: |
           sudo modprobe uinput || true
           sudo chmod 0666 /dev/uinput || true
@@ -1869,20 +1529,43 @@ jobs:
           sleep 1
           echo "LIBSEAT_BACKEND=seatd" >> "$GITHUB_ENV"
 
-      - name: Wayland pointer-drag guard (cage + uinput)
+      - name: Iced Wayland clipboard + pointer-drag guard (cage + uinput)
         continue-on-error: true
-        timeout-minutes: 12
+        timeout-minutes: 15
         env:
           ROOST_TEST_MODE: "1"
           ROOST_TEST_TIMEOUT_SCALE: "3"
+          # Load-bearing — see the job comment. Without it a missing cage or
+          # /dev/uinput is a SKIP with exit 0 and this lane never tests anything.
           ROOST_REQUIRE_REAL_INPUT: "1"
+          ICED_BACKEND: tiny-skia
           WLR_BACKENDS: "headless,libinput"
           WLR_RENDERER: "pixman"
-        run: uv run --group test python tools/input/linux/wayland_drag_check.py
+        # The script deletes its temp dir in `finally` and dumps the cage + app
+        # logs to stderr only on failure, so this step's own combined output is
+        # the ONLY durable record — tee it to a file and upload it below.
+        # `shell: bash` already implies `-eo pipefail`; the explicit `set` keeps
+        # the script's exit status (not tee's) as the step result even if that
+        # shell line is ever dropped, so continue-on-error still records a real
+        # `outcome: failure`.
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run --group test python tools/input/linux/iced_wayland_clipboard_check.py 2>&1 \
+            | tee e2e-iced-wayland-drag.log
 
-  # Functional E2E against the real Swift app, driven through the IPC op
-  # set by the pytest harness (tools/roosttest) — the Mac twin of e2e-gtk.
-  # Required (in ci-success). The harness clears any stale instance before
+      - name: Upload drag-guard diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-iced-wayland-drag-diagnostics
+          path: e2e-iced-wayland-drag.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Functional E2E against the real Swift app, driven through the IPC op set
+  # by the pytest harness (tools/roosttest) — the Mac twin of the Linux
+  # functional lanes inside iced-build-e2e. Required (in ci-success). The harness clears any stale instance before
   # launch (tools/roosttest/ui.py) and timeouts scale up for the slower
   # shared runner; see docs/development/test-automation.md.
   e2e-mac:
@@ -1957,7 +1640,7 @@ jobs:
           ROOST_TEST_TIMEOUT_SCALE: "3"   # shared macos-latest runner is slower/variable
           # Unlocks the test-only IPC ops in the bundled Mac app
           # (tools/roosttest/ui.py forwards this via `open --env`).
-          # See the GTK job above for full rationale.
+          # See the Iced E2E steps above for full rationale.
           ROOST_TEST_MODE: "1"
         # --roost-fresh: own a hermetic instance with an isolated, throwaway
         # ROOST_STATE_DIR (replaces the old ROOST_TEST_RESET_STATE clean-slate
@@ -1993,7 +1676,7 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, iced-build-e2e, iced-release, e2e-gtk, e2e-gtk-wayland, e2e-mac]
+    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, iced-build-e2e, iced-release, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2022,7 +1705,11 @@ jobs:
           # count only rises), and lowering this number should be a
           # deliberate act with a reason. `release.yml`'s ci-gate trusts this
           # check, so "fewer gates than we think" has to be loud.
-          required_jobs=12
+          # 12 -> 9 in plan 031: the gtk UI and its three CI jobs (gtk-build,
+          # e2e-gtk, e2e-gtk-wayland) were deleted with crates/roost-linux.
+          # e2e-iced-wayland-drag is deliberately NOT in `needs` — it is a
+          # non-blocking signal lane (see its job comment).
+          required_jobs=9
           count="$(echo "${NEEDS}" | jq -r 'length')"
           if [ "${count}" -lt "${required_jobs}" ]; then
             echo "::error::ci-success is gating ${count} jobs but expects at least ${required_jobs} — a job was removed from its needs list. If that was deliberate, lower required_jobs in the same commit."

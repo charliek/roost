@@ -15,9 +15,9 @@ later module without a UI. It is deliberately absent from Makefile
 `ICED_E2E_TESTS` and from the three enumerated ci.yml iced lists — and it
 enforces that itself (`util.runs_alone`) rather than trusting those lists.
 
-GTK is unchanged by this slice (divergence recorded in the plan, per the
-plan-016 stance) and Mac has always terminated on the last project's
-window close, so both skip.
+Mac has always terminated on the last project's window close, so it
+skips here too. (The now-removed GTK UI was unchanged by this slice,
+per the plan-016 stance — it kept its empty-workspace state instead.)
 """
 
 from __future__ import annotations
@@ -49,8 +49,9 @@ def test_deleting_the_last_project_exits_cleanly_and_flushes_state(roost, target
     if target != "iced":
         pytest.skip(
             "exit-on-empty is an iced behavior this slice: mac already "
-            "terminates on the last project's window close, and GTK keeps "
-            "its empty-workspace state (recorded divergence)"
+            "terminates on the last project's window close (the now-removed "
+            "GTK UI kept its empty-workspace state instead — recorded "
+            "divergence)"
         )
     if not runs_alone(request):
         pytest.skip(

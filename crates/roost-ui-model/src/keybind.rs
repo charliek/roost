@@ -18,12 +18,11 @@ pub enum KeybindAction {
     NewTab,
     CloseTab,
     NewProject,
-    /// M8: rename the active project — flips its sidebar row's
-    /// `gtk::Stack` to the inline `gtk::Entry` (M9). Default
-    /// `projectMod+shift+r`.
+    /// M8: rename the active project via an inline editable field
+    /// over its sidebar row (M9). Default `projectMod+shift+r`.
     RenameProject,
-    /// M8: rename the active tab — opens a `gtk::Popover` over the
-    /// pill with an inline `gtk::Entry` (M9). Default `projectMod+r`.
+    /// M8: rename the active tab via an inline editable field over
+    /// the tab pill (M9). Default `projectMod+r`.
     RenameTab,
     /// M8: close the active project (with an `adw::AlertDialog`
     /// confirmation, since this cascades to close every tab in the
@@ -44,7 +43,7 @@ pub enum KeybindAction {
     ToggleSidebar,
     /// Show/hide the per-agent rows nested under each project in the
     /// sidebar (plan 007 §3.7). Default `projectMod+shift+a` —
-    /// Cmd+Shift+A on macOS (GTK, Iced), Alt+Shift+A on Linux. Not a picker
+    /// Cmd+Shift+A on macOS (Iced), Alt+Shift+A on Linux. Not a picker
     /// toggle — `dispatch_action`'s `is_picker_toggle` allowlist
     /// doesn't include it.
     ToggleSidebarAgents,
@@ -61,21 +60,21 @@ pub enum KeybindAction {
     FontReset,
     /// Open the command palette (VS Code / Zed–style `Cmd+Shift+P`
     /// overlay). Default `projectMod+shift+p` — Cmd+Shift+P on
-    /// macOS (GTK, Iced), Alt+Shift+P on Linux.
+    /// macOS (Iced), Alt+Shift+P on Linux.
     CommandPalette,
     /// Open the custom command launcher (config-defined `command =`
     /// list) on its own picker. Default `projectMod+shift+t` —
-    /// Cmd+Shift+T on macOS (GTK, Iced), Alt+Shift+T on Linux.
+    /// Cmd+Shift+T on macOS (Iced), Alt+Shift+T on Linux.
     CommandLauncher,
     /// Open the custom palette (config-defined `provider =` list, plus
     /// any discovered provider scripts) — the dynamic, script-backed
-    /// picker. Default `projectMod+shift+e` — Cmd+Shift+E on macOS (GTK, Iced),
+    /// picker. Default `projectMod+shift+e` — Cmd+Shift+E on macOS (Iced),
     /// Alt+Shift+E on Linux. (`…+shift+r` is RenameProject; users who
     /// prefer the "R for Run" mnemonic rebind via config.)
     CustomPalette,
     /// Open the agent palette — one row per agent-owned tab, ordered by
     /// urgency (plan 005). Default `projectMod+shift+o` — Cmd+Shift+O on
-    /// macOS (GTK, Iced), Alt+Shift+O on Linux.
+    /// macOS (Iced), Alt+Shift+O on Linux.
     AgentPalette,
     /// Unbind a trigger; removes any default action attached to it.
     Unbind,
@@ -190,7 +189,8 @@ bitflags::bitflags! {
 /// or `None` for a non-modifier token (a key name, or invalid input).
 /// The accepted spellings live here once so `parse_trigger` and
 /// `parse_link_modifier` can't drift. `meta` is an alias for `super`
-/// (same physical key; GTK's macOS backend reports Cmd as Meta).
+/// (same physical key; iced's winit backend reports Cmd as Meta on
+/// macOS).
 fn parse_modifier_token(token: &str) -> Option<AccelMods> {
     match token.trim().to_ascii_lowercase().as_str() {
         "shift" => Some(AccelMods::SHIFT),
@@ -234,9 +234,8 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
 /// the app's own keybind scheme:
 ///
 /// * macOS: `Super` (Cmd) — parity with the Swift UI and native Mac
-///   apps. (At the GDK layer the Command key arrives as Meta/Super; the
-///   GTK widget maps both, see `TerminalView`'s link-modifier check.)
-/// * Linux: `Alt` — the UI adapters' (GTK, Iced) single "primary"
+///   apps (see `TerminalView`'s link-modifier check).
+/// * Linux: `Alt` — the Rust UI adapter's (Iced) single "primary"
 ///   modifier (mirrors `default_bindings`), leaving `Ctrl` to the
 ///   shell/readline.
 ///
@@ -282,10 +281,9 @@ pub fn resolve_link_modifier(config_override: Option<AccelMods>) -> AccelMods {
 /// * macOS: `primary = super` (Cmd), `projectMod = super`,
 ///   `clipboardMod = super`.
 ///
-/// GTK is primarily the Linux UI, but developers commonly run it on
-/// macOS Homebrew GTK4 for cross-client testing; Iced runs natively on
-/// both Linux and macOS. Flipping the primary modifier on Mac means
-/// both Rust UI adapters feel native there.
+/// Iced is primarily the Linux UI, but it also runs (experimentally)
+/// on macOS; flipping the primary modifier on Mac means the Rust UI
+/// adapter feels native there too.
 /// Users override anything via `~/.config/roost/config.conf` —
 /// the `canonicalize_bindings` layer below preserves that.
 pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
@@ -328,7 +326,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::CloseProject,
     );
     // Jump to the next unread notification. `primary+shift+u`
-    // (Cmd+Shift+U on macOS (GTK, Iced), Alt+Shift+U on Linux) — parity with
+    // (Cmd+Shift+U on macOS (Iced), Alt+Shift+U on Linux) — parity with
     // the Mac UI's `jump_to_unread`.
     add(
         &mut out,
@@ -378,7 +376,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::ToggleSidebar,
     );
 
-    // Toggle sidebar agents: Cmd+Shift+A on macOS (GTK, Iced), Alt+Shift+A on
+    // Toggle sidebar agents: Cmd+Shift+A on macOS (Iced), Alt+Shift+A on
     // Linux. Verified free — no other default uses `…+shift+a`.
     add(
         &mut out,
@@ -386,7 +384,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::ToggleSidebarAgents,
     );
 
-    // Command palette: Cmd+Shift+P on macOS (GTK, Iced), Alt+Shift+P on Linux
+    // Command palette: Cmd+Shift+P on macOS (Iced), Alt+Shift+P on Linux
     // (mirrors the Swift app's Cmd+Shift+P). No existing default uses
     // `…+shift+p`, so no collision.
     add(
@@ -395,7 +393,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::CommandPalette,
     );
 
-    // Command launcher: Cmd+Shift+T on macOS (GTK, Iced), Alt+Shift+T on Linux
+    // Command launcher: Cmd+Shift+T on macOS (Iced), Alt+Shift+T on Linux
     // (mirrors the Swift app). No existing default uses `…+shift+t`
     // (NewTab is `primary+t`), so no collision.
     add(
@@ -404,7 +402,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::CommandLauncher,
     );
 
-    // Custom palette (script-backed providers): Cmd+Shift+E on macOS (GTK, Iced),
+    // Custom palette (script-backed providers): Cmd+Shift+E on macOS (Iced),
     // Alt+Shift+E on Linux. `…+shift+r` would be the "R for Run" mnemonic
     // but RenameProject already owns it; `…+shift+e` ("Extensions") is
     // free on both platforms. Users rebind to `…+shift+r` via config.
@@ -414,7 +412,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::CustomPalette,
     );
 
-    // Agent palette: Cmd+Shift+O on macOS (GTK, Iced), Alt+Shift+O on Linux.
+    // Agent palette: Cmd+Shift+O on macOS (Iced), Alt+Shift+O on Linux.
     // `…+shift+o` is unclaimed by every other default and by the
     // terminal key encoder ("O for Overview" / "go to agent").
     add(

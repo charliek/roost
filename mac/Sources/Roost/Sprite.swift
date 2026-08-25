@@ -9,8 +9,8 @@
 // Swift + Core Graphics equivalent — every dispatch arm and helper
 // follows the Zig original. When tweaking pixel math,
 // cross-reference it. The Rust sibling lives at
-// `crates/roost-linux/src/sprite.rs` and stays in lockstep with
-// this file per the CLAUDE.md parity rule.
+// `crates/roost-ui-model/src/sprite.rs` (shared by iced) and stays in
+// lockstep with this file per the CLAUDE.md parity rule.
 //
 // Public entry point: `Sprite.draw` — returns `true` when the
 // codepoint is handled (caller skips the font glyph), `false`

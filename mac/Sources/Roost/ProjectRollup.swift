@@ -13,7 +13,7 @@
 // skipped every tab with `hookActive` set, so a project whose only
 // blocked tab was a Claude session showed no stripe at all — the
 // differentiating case, hidden. Kept at parity with the Linux port
-// (`crates/roost-linux/src/rollup.rs`).
+// (`crates/roost-ui-model/src/rollup.rs`, shared by iced).
 
 import AppKit
 

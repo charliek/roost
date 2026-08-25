@@ -4,7 +4,8 @@
 /// workspace, or `None` when the submitted value is empty after trimming.
 ///
 /// The engine continues to accept its serialized command contract verbatim;
-/// this helper only keeps GTK and Iced's native editing behavior identical.
+/// this helper only keeps the Rust UI adapter's (Iced) native editing
+/// behavior identical (and, historically, the removed GTK UI's).
 pub fn committed_label(draft: &str) -> Option<String> {
     let trimmed = draft.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())

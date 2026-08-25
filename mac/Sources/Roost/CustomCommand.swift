@@ -4,7 +4,7 @@
 // builds the login-shell argv that runs one in a fresh tab, and turns a
 // command list into launcher `PaletteItem`s. Kept split from the App /
 // PTY layer so the tokenizer + argv builder are unit-tested in isolation,
-// mirroring `crates/roost-linux/src/custom_command.rs`.
+// mirroring `crates/roost-ui-model/src/custom_command.rs` (shared by iced).
 //
 // Format — one record per `command =` line; the value is
 // whitespace-separated `key="value"` (or `key=value`) tokens, where a

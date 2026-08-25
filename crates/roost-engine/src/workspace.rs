@@ -103,12 +103,12 @@ struct Inner {
     active_tab_id: i64,
     /// Whether the sidebar is collapsed (hidden). UI-set via
     /// `set_sidebar_collapsed`; persisted so a relaunch restores it
-    /// (Rust UI adapter (GTK, Iced) parity with the Mac UI's
+    /// (Rust UI adapter (Iced) parity with the Mac UI's
     /// `RoostSidebarVisible`).
     sidebar_collapsed: bool,
     /// The sidebar's width in logical points. UI-set via
     /// `set_sidebar_width`; persisted so a relaunch restores it
-    /// (Rust UI adapter (GTK, Iced) parity with the Mac UI's
+    /// (Rust UI adapter (Iced) parity with the Mac UI's
     /// `RoostSidebarWidth`).
     sidebar_width: f64,
     /// Whether the UI window currently has focus. Half of the
@@ -500,7 +500,7 @@ impl Workspace {
 
     /// The sidebar's persisted collapsed state. The UI reads this at
     /// startup to restore the user's hide/show choice (Rust UI adapter
-    /// (GTK, Iced) parity with the Mac UI's `RoostSidebarVisible`).
+    /// (Iced) parity with the Mac UI's `RoostSidebarVisible`).
     pub fn sidebar_collapsed(&self) -> bool {
         self.inner.lock().unwrap().sidebar_collapsed
     }
@@ -521,7 +521,7 @@ impl Workspace {
 
     /// The sidebar's persisted width in logical points. The UI reads
     /// this at startup to restore the user's drag (Rust UI adapter
-    /// (GTK, Iced) parity with the Mac UI's `RoostSidebarWidth`).
+    /// (Iced) parity with the Mac UI's `RoostSidebarWidth`).
     pub fn sidebar_width(&self) -> f64 {
         self.inner.lock().unwrap().sidebar_width
     }
@@ -2726,7 +2726,7 @@ mod tests {
 
     #[test]
     fn sidebar_collapsed_persists_across_reopen() {
-        // Rust UI adapter (GTK, Iced) parity with the Mac UI's
+        // Rust UI adapter (Iced) parity with the Mac UI's
         // RoostSidebarVisible: the user's hide/show choice survives quit
         // + relaunch. Backs the locally-run
         // e2e `test_sidebar_collapsed_state_survives_relaunch`.
@@ -2756,7 +2756,7 @@ mod tests {
 
     #[test]
     fn sidebar_width_persists_across_reopen() {
-        // Rust UI adapter (GTK, Iced) parity with the Mac UI's
+        // Rust UI adapter (Iced) parity with the Mac UI's
         // RoostSidebarWidth: the user's drag survives quit + relaunch.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");

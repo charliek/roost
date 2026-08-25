@@ -53,13 +53,9 @@ enum KeybindAction {
     /// Phase 6a P7: jump to the next unread (notified) tab
     /// (cmux-inspired ⌘⇧U convention).
     static let jumpToUnread  = "jump_to_unread"
-    /// Cmd+Shift+P command palette. Mac-only for now — no Linux
-    /// counterpart yet, so this breaks the otherwise-lockstep
-    /// namespace deliberately; add the peer action when Linux grows a
-    /// palette.
+    /// Cmd+Shift+P command palette. Alt+Shift+P on Linux (iced).
     static let commandPalette = "command_palette"
-    /// Cmd+Shift+T custom command launcher. Like `commandPalette`,
-    /// Mac-and-GTK only.
+    /// Cmd+Shift+T custom command launcher. Alt+Shift+T on Linux (iced).
     static let commandLauncher = "command_launcher"
     /// Cmd+Shift+E custom palette — the dynamic, script-backed picker
     /// (`provider =` list + discovered scripts). `…+shift+r` would be the
@@ -67,8 +63,8 @@ enum KeybindAction {
     /// ("Extensions") is free. Users rebind to `…+shift+r` via config.
     static let customPalette = "custom_palette"
     /// Cmd+Shift+O agent palette — the agent switcher (plan 005 §3.1).
-    /// ⌘⇧O for "Open agent"; no default binding used `o`. Peer of the
-    /// GTK `AgentPalette` (Alt+Shift+O).
+    /// ⌘⇧O for "Open agent"; no default binding used `o`. Peer of
+    /// iced's `AgentPalette` action (Alt+Shift+O on Linux).
     static let agentPalette = "agent_palette"
     static let unbind        = "unbind"
 

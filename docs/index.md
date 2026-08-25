@@ -2,7 +2,7 @@
 
 Roost is a desktop terminal multiplexer for AI coding agents. It runs on macOS and Linux, presents a sidebar of projects with tabs inside each project, and notifies you when an agent in a tab needs your attention.
 
-The terminal engine is [libghostty-vt](https://ghostty.org), the parser/screen-state library extracted from Ghostty. Roost ships two native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + iced on Linux (`roost`). GTK (`crates/roost-linux`, gtk4-rs) remains in the repo as the Linux development/parity implementation, but the packaged `.deb` ships iced. There is no daemon: each UI embeds the workspace, the PTY supervisor, and a JSON IPC server in-process. External tooling (`roostctl`, Claude Code hooks) reaches the running UI over a Unix domain socket speaking newline-delimited JSON; see [IPC](reference/ipc.md) for the wire format. Persistence is a small `state.json` written atomically.
+The terminal engine is [libghostty-vt](https://ghostty.org), the parser/screen-state library extracted from Ghostty. Roost ships two products — Swift + AppKit on macOS (`Roost.app`) and Rust + iced on Linux (`roost`, what the `.deb` installs). An experimental iced build of the Mac app (`Roost-Iced.app`) ships alongside the Swift one; see [Installation](getting-started/installation.md#roost-icedapp-experimental). There is no daemon: each UI embeds the workspace, the PTY supervisor, and a JSON IPC server in-process. External tooling (`roostctl`, Claude Code hooks) reaches the running UI over a Unix domain socket speaking newline-delimited JSON; see [IPC](reference/ipc.md) for the wire format. Persistence is a small `state.json` written atomically.
 
 ## Install
 

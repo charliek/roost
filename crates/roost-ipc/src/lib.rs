@@ -1,8 +1,8 @@
 //! JSON-over-Unix-socket IPC for Roost.
 //!
 //! This crate is the wire-format home of the post-daemon-removal IPC
-//! that `roostctl` (Rust) and Roost's native UIs (Swift on Mac,
-//! gtk4-rs on Linux) speak. The full protocol spec lives at
+//! that `roostctl` (Rust) and Roost's native UIs (Swift on Mac, iced
+//! on Linux) speak. The full protocol spec lives at
 //! [`docs/reference/ipc.md`]; this crate is the Rust implementation
 //! of it.
 //!

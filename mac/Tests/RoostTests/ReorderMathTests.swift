@@ -1,8 +1,9 @@
 // Table-driven tests for `computeInsertIdx` — 20 cases (5 source
 // positions × 4 raw targets each) covering forward/backward drops and
 // the on/after-source no-ops. The Linux UI's
-// `crates/roost-linux/src/app.rs` covers the same set; drift here will
-// cause cross-UI reorder behavior to diverge.
+// `crates/roost-ui-model/src/reorder.rs::compute_insert_idx` (shared
+// by iced) covers the same set; drift here will cause cross-UI
+// reorder behavior to diverge.
 
 import Foundation
 import Testing

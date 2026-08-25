@@ -305,7 +305,7 @@ line per section, clipped to a fixed width so it stays scannable in a
 narrow terminal:
 
 ```text
-roostctl doctor — roostctl 0.0.15 (run `roostctl doctor -v` for the full report)
+roostctl doctor — roostctl 0.0.18 (run `roostctl doctor -v` for the full report)
 
 [–] Environment         not running inside a Roost tab
 [✗] Roost UI            no Roost UI is listening (tried: /Users/charliek/Library/Caches/Roost/roost…
@@ -329,20 +329,20 @@ that show every row shape — the elided ones are "Shell integration" and
 Roost tab:
 
 ```text
-roostctl doctor — roostctl 0.0.15
+roostctl doctor — roostctl 0.0.18
 
 Environment (process)
   skipped env.tab_id               not running inside a Roost tab
           env.socket               unset — target resolution falls through to --socket / --target / auto-detect
 
 Roost UI (ui)
-  fail    ui.target                no Roost UI is listening (tried: /Users/charliek/Library/Caches/Roost/roost.sock, /Users/charliek/Library/Caches/Roost-gtk/roost.sock)
+  fail    ui.target                no Roost UI is listening (tried: /Users/charliek/Library/Caches/Roost/roost.sock, /Users/charliek/Library/Caches/Roost-linux/roost.sock, /Users/charliek/Library/Caches/Roost-iced/roost.sock)
                                    → https://charliek.github.io/roost/reference/cli/#environment
-  fail    ui.socket                mac /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed; gtk /Users/charliek/Library/Caches/Roost-gtk/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed
+  fail    ui.socket                mac /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed; linux /Users/charliek/Library/Caches/Roost-linux/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed; iced /Users/charliek/Library/Caches/Roost-iced/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed
                                    → https://charliek.github.io/roost/reference/cli/#environment
   fail    ui.identify              no connection: target resolution found no socket to dial
                                    → https://charliek.github.io/roost/reference/cli/#identify
-  skipped ui.version               roostctl 0.0.15 — no UI reached, nothing to compare
+  skipped ui.version               roostctl 0.0.18 — no UI reached, nothing to compare
   skipped ui.agent_model           undetermined — tab.list failed: target resolution found no socket to dial
 
   […]
@@ -388,7 +388,7 @@ flag.
 | `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl`. Best-effort — may be absent if the UI can't resolve its bundled/sibling CLI, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
 | `ROOST_DEBUG` | If set, `claude-hook` writes failure messages to stderr |
 
-`ROOST_SOCKET` / `ROOST_TAB_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac`/`gtk`) — see [Paths & Environment](paths.md).
+`ROOST_SOCKET` / `ROOST_TAB_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back.
 
 ## Exit codes
 

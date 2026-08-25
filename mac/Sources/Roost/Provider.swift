@@ -4,7 +4,8 @@
 // demand, then runs again when the user picks a row. Where a `command =`
 // entry (CustomCommand.swift) launches one fixed command in a tab, a
 // `provider =` entry produces a dynamic list and then acts on the choice —
-// the "open shed" pattern. Mirrors `crates/roost-linux/src/provider.rs`.
+// the "open shed" pattern. Mirrors `crates/roost-ui-model/src/provider.rs`
+// (shared by iced).
 //
 // This file is the pure half: parsing `provider =` lines + directory
 // entries, building the subprocess invocation (argv / env / stdin), and
@@ -305,7 +306,8 @@ func parseProviderOutput(_ stdout: String) throws -> ProviderOutput {
 /// id `roostctl tab open` prints, log lines, …) yields an empty result, so
 /// the palette just closes. Output that *does* look like JSON but fails to
 /// parse is still surfaced as an error (a genuinely malformed sub-menu).
-/// Mirrors `parse_activate_output` on the GTK side.
+/// Mirrors `crates/roost-ui-model/src/provider.rs`'s
+/// `parse_activate_output` (shared with iced).
 func parseActivateOutput(_ stdout: String) throws -> ProviderOutput {
     let trimmed = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") {

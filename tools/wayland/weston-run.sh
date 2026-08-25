@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 # Run a command under a headless weston Wayland compositor — the Wayland
-# analogue of `xvfb-run`. Exists to close the X11-only test blind spot:
-# GTK's GDK-Wayland backend (gdksurface-wayland.c) is ONLY exercised on
-# Wayland, never under Xvfb, so Wayland-specific bugs (e.g. the DnD
-# drag-icon-surface frame_callback abort) slip through an X11-only CI.
+# analogue of `xvfb-run`. This is Iced's Wayland CI lane: winit's Wayland
+# backend is ONLY exercised on a real Wayland compositor, never under Xvfb,
+# so Wayland-specific bugs slip through an X11-only CI. (Originally written
+# to close the same blind spot for GTK's GDK-Wayland backend, back when the
+# gtk4-rs UI was still in the tree; retired along with it — see plan 031.)
 #
 # Usage:  tools/wayland/weston-run.sh <command> [args...]
 # Example: tools/wayland/weston-run.sh uv run --group test pytest tools/roosttest \
-#            --roost-target gtk --roost-fresh -v
+#            --roost-target iced --roost-fresh -v
 #
 # Sets GDK_BACKEND=wayland + WAYLAND_DISPLAY for the child and unsets
-# DISPLAY so GTK can't silently fall back to X11. GSK_RENDERER defaults to
-# cairo (no GPU on headless runners). Honors an existing XDG_RUNTIME_DIR;
-# otherwise mints a private one so the compositor + roost sockets agree.
+# DISPLAY so a Wayland-native client can't silently fall back to X11
+# (GDK_BACKEND/GSK_RENDERER also cover the throwaway GTK XDND source
+# `iced_native_file_drop_check.py` spawns, if it runs under this
+# compositor). GSK_RENDERER defaults to cairo (no GPU on headless
+# runners). Honors an existing XDG_RUNTIME_DIR; otherwise mints a private
+# one so the compositor + roost sockets agree.
 #
-# Caveat: weston headless exercises GTK's *generic* Wayland path (where the
-# crash lives), not cosmic-comp — COSMIC-specific quirks still need a real
-# COSMIC box. And it has no input devices, so this drives the IPC suite, not
-# pointer/gesture input (that needs ydotool + /dev/uinput).
+# Caveat: weston headless exercises the *generic* Wayland path, not
+# cosmic-comp — COSMIC-specific quirks still need a real COSMIC box. And it
+# has no input devices, so this drives the IPC suite, not pointer/gesture
+# input (that needs cage + /dev/uinput, see tools/shed/shed-test.sh).
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then

@@ -1,8 +1,9 @@
 //! Toolkit-neutral normalization for content dropped onto a terminal.
 //!
 //! Native adapters own drag protocols and paste delivery. This module owns the
-//! payload policy shared by GTK and Iced: safe local paths take precedence over
-//! plain text, retain first-seen order, and become shell-safe terminal input.
+//! payload policy for the Rust UI adapter (Iced), mirrored by Swift's
+//! `TerminalView.swift`: safe local paths take precedence over plain text,
+//! retain first-seen order, and become shell-safe terminal input.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

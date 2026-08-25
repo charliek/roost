@@ -22,8 +22,8 @@ tools/
 
 | Layer | Dir | Drives via | Verifies | Platforms | CI |
 |---|---|---|---|---|---|
-| **1 — functional** | [`roosttest/`](roosttest/README.md) | JSON IPC (Python client) | the op set: `tab.dump`/`tab.list`/`palette.*`/`identify` — behavior + content (text) | mac + gtk | ✅ headless |
-| **2 — visual** | [`screenshot/`](screenshot/README.md) | `roostctl` + `roostctl screenshot` | pixels: colors, badges, cursor, reflow, which tab/sidebar is shown | mac + gtk | local |
+| **1 — functional** | [`roosttest/`](roosttest/README.md) | JSON IPC (Python client) | the op set: `tab.dump`/`tab.list`/`palette.*`/`identify` — behavior + content (text) | mac + iced | ✅ headless |
+| **2 — visual** | [`screenshot/`](screenshot/README.md) | `roostctl` + `roostctl screenshot` | pixels: colors, badges, cursor, reflow, which tab/sidebar is shown | mac + iced | local |
 | **3 — real input** | [`input/`](input/linux/README.md) | OS key/pointer injection | the *real* key-encoder + mouse-gesture + clipboard path: selection, copy/paste, scroll | per-OS (linux now) | local |
 
 ## Which layer for what

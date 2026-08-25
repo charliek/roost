@@ -4,9 +4,9 @@
 //! in-process [`crate::PtySupervisor`]'s broadcast for its
 //! tab and forwards bytes / exit events to the UI adapter's main
 //! thread via a tokio mpsc channel. The renderer drains the receiver
-//! on the adapter's own main-loop task (GTK's via
-//! `glib::spawn_future_local`) so all `vt_write` calls stay
-//! main-thread.
+//! on the adapter's own main-loop task (`roost-iced` spawns a tokio
+//! task per tab and forwards into its `Subscription`) so all
+//! `vt_write` calls stay main-thread.
 //!
 //! Pre-M3b this module wrapped a gRPC bidi stream to `roost-core`'s
 //! `StreamPty`. Everything stream-related is gone — the supervisor
@@ -92,9 +92,9 @@ pub struct TabSession {
     /// later succeeds — exactly what a test wants to assert on.
     input_capture: Option<InputCapture>,
     /// `Some` only under the `attach_scanned` opt-in (iced). `None` —
-    /// the default, and what GTK attaches with — leaves this session's
-    /// forwarding task a pure byte pump, bit-identical to what it was
-    /// before the opt-in existed.
+    /// the default, and what the (now-removed) GTK UI always used —
+    /// leaves this session's forwarding task a pure byte pump,
+    /// bit-identical to what it was before the opt-in existed.
     osc: Option<Arc<Mutex<OscDrain>>>,
 }
 

@@ -2,8 +2,12 @@
 # ai.stridelabs.Roost.gtk.desktop; a launcher pin created then references
 # that desktop-file id forever. This alias keeps such pins launching —
 # and grouping, on shells that match pins through StartupWMClass — with
-# no duplicate menu entry (NoDisplay). Deletable in some future release;
-# the worst case then is a dead pin for someone who never re-pinned.
+# no duplicate menu entry (NoDisplay).
+#
+# Removal condition (plan 031): kept so v0.0.17-era launcher pins to
+# ai.stridelabs.Roost.gtk.desktop keep resolving. Delete once no installed
+# launcher pin references it — practically, once no release install base
+# predates the iced switch. Revisit at v0.1.0.
 [Desktop Entry]
 Type=Application
 Name=Roost

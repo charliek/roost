@@ -555,8 +555,8 @@ final class TerminalView: NSView {
             // drained yet. Reads libghostty's *currently effective*
             // color so a prior `OSC 10/11/12;rgb:…` set is reflected
             // in the next query reply (vim colorscheme plugins etc.).
-            // Mirrors the Linux drain at
-            // `crates/roost-linux/src/app.rs`.
+            // Mirrors the OSC color-query handling at
+            // `crates/roost-engine/src/osc.rs` (shared by iced).
             if case .colorQuery(let n) = event {
                 let color = TerminalView.liveColor(forQuery: n, terminal: terminal, theme: theme)
                 if let color = color,
@@ -2646,7 +2646,7 @@ final class TerminalView: NSView {
         // (#247), or a resize-triggered report leaks. AFTER onResize so
         // the serial PTY queue applies TIOCSWINSZ before the report:
         // an app that reads the report then checks TIOCGWINSZ must see
-        // the new size (matches the GTK UI's ordering).
+        // the new size (matches iced's ordering).
         if pendingResizeReport {
             flushPendingPtyReplies()
         }
@@ -2698,9 +2698,12 @@ final class TerminalView: NSView {
         // loop; a descender from row N (e.g. the lower stem of a 'g'
         // in a gray prompt cell) could be painted, then row N+1's
         // bg fill would clobber the descender ink because the loop
-        // walked in row-major order. Linux already does this same
-        // split — see `crates/roost-linux/src/terminal_view.rs` Pass
-        // A/B comments. SGR style bits (especially `inverse`) are
+        // walked in row-major order. iced's `TerminalWidget::draw`
+        // (`crates/roost-iced/src/terminal_widget.rs`) sidesteps the
+        // same bug differently: it fills each cell's bg then its
+        // glyph together, in row-major submission order, so a later
+        // row's bg fill is never issued before an earlier row's
+        // glyph. SGR style bits (especially `inverse`) are
         // applied via `resolveCellColors` so codex's `\e[7m` prompt
         // row renders its gray bg.
         //
@@ -2907,7 +2910,7 @@ final class TerminalView: NSView {
     /// `mac/Tests/RoostTests/RenderResolverTests.swift`.
     ///
     /// Mirrors the Rust
-    /// `resolve_cell_colors` (`crates/roost-linux/src/terminal_view.rs`)
+    /// `resolve_colors` (`crates/roost-iced/src/terminal_widget.rs`)
     /// 1:1 — same rule order (explicit-color lookup → inverse swap →
     /// bold-accent guarded by `!inverse && fg-was-default`) so both
     /// UIs behave identically on inverse-marked TUI chrome (codex's

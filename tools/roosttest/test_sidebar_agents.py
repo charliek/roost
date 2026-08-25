@@ -1,5 +1,5 @@
 """Sidebar agent rows E2E — plan 007 §7 A9/A10, both targets
-(`--roost-target mac|gtk`). Drives `app.sidebar_dump` (plan 007 §3.8),
+(`--roost-target mac|iced`). Drives `app.sidebar_dump` (plan 007 §3.8),
 the same per-project `rendered_agents` cache both UIs paint the sidebar
 from, so a missed refresh is a stale dump rather than an invisible bug.
 
@@ -9,11 +9,12 @@ a dev UI driving the same instance may have other agents live. Each
 project this file creates is asserted on individually (`_project_row`).
 
 No `time.sleep`: every assertion polls via `roost._wait`. This matters
-more here than in the palette tests — the GTK refresh path
-(`refresh_agent_rows`) bails out soft on a re-entrant
+more here than in the palette tests — the now-removed GTK UI's refresh
+path (`refresh_agent_rows`) bailed out soft on a re-entrant
 `ui.tabs.try_borrow()` failure (plan 007 §3.5/§9 R5), so a dropped
-refresh is a flaky single read, not a deterministic one. A single-shot
-assert right after a mutating call would intermittently see the
+refresh was a flaky single read, not a deterministic one; polling
+outlived that UI as the safer default. A single-shot assert right
+after a mutating call would intermittently see the
 pre-refresh cache; polling absorbs the retry the refresh itself doesn't
 guarantee.
 

@@ -744,7 +744,7 @@ async fn probe_ui(selector: &TargetSelector) -> UiProbe {
 
     // `resolve(probe_alive=false)` is a trap here: with nothing set on
     // macOS it returns the Mac path unconditionally, so with only the
-    // GTK UI running doctor would report "socket missing" against a
+    // Iced UI running doctor would report "socket missing" against a
     // path nobody uses. Classify the resolved path when there is one,
     // otherwise every candidate, per profile.
     let sockets = match &target {
@@ -1749,7 +1749,7 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
                 Status::Fail,
                 format!(
                     "multiple Roost UIs are running ({}; sockets: {candidates}); pass \
-                     --target mac|gtk|iced or set \
+                     --target mac|linux|iced or set \
                      ROOST_BUNDLE_PROFILE",
                     live.join(" + ")
                 ),
@@ -1757,7 +1757,7 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
             Err(TargetFailure::UnknownProfile(v)) => (
                 Status::Fail,
                 format!(
-                    "ROOST_BUNDLE_PROFILE={} is not `mac`, `gtk`, or `iced`",
+                    "ROOST_BUNDLE_PROFILE={} is not `mac`, `linux`, or `iced`",
                     redact(v)
                 ),
             ),
@@ -3597,7 +3597,7 @@ mod tests {
         let inputs = Inputs {
             target: Err(TargetFailure::NoLiveTarget(vec![
                 PathBuf::from("/mac/roost.sock"),
-                PathBuf::from("/gtk/roost.sock"),
+                PathBuf::from("/linux/roost.sock"),
             ])),
             sockets: vec![
                 SocketProbe {
@@ -3606,8 +3606,8 @@ mod tests {
                     outcome: SocketOutcome::Missing,
                 },
                 SocketProbe {
-                    path: PathBuf::from("/gtk/roost.sock"),
-                    profile: Some("gtk"),
+                    path: PathBuf::from("/linux/roost.sock"),
+                    profile: Some("linux"),
                     outcome: SocketOutcome::Stale,
                 },
             ],
@@ -3616,7 +3616,10 @@ mod tests {
         let report = evaluate(&inputs);
         let detail = &find(&report, "ui.socket").detail;
         assert!(detail.contains("mac /mac/roost.sock: missing"), "{detail}");
-        assert!(detail.contains("gtk /gtk/roost.sock: stale"), "{detail}");
+        assert!(
+            detail.contains("linux /linux/roost.sock: stale"),
+            "{detail}"
+        );
         assert_status(&report, "ui.target", Status::Fail);
     }
 
@@ -3625,17 +3628,20 @@ mod tests {
         let inputs = Inputs {
             target_candidates: vec![
                 PathBuf::from("/mac/roost.sock"),
-                PathBuf::from("/gtk/roost.sock"),
+                PathBuf::from("/linux/roost.sock"),
                 PathBuf::from("/iced/roost.sock"),
             ],
-            target: Err(TargetFailure::Ambiguous(vec!["gtk".into(), "iced".into()])),
+            target: Err(TargetFailure::Ambiguous(vec![
+                "linux".into(),
+                "iced".into(),
+            ])),
             ..Inputs::default()
         };
         let report = evaluate(&inputs);
         let detail = &find(&report, "ui.target").detail;
-        assert!(detail.contains("gtk + iced"), "{detail}");
-        assert!(!detail.contains("mac + gtk"), "{detail}");
-        assert!(detail.contains("--target mac|gtk|iced"), "{detail}");
+        assert!(detail.contains("linux + iced"), "{detail}");
+        assert!(!detail.contains("mac + linux"), "{detail}");
+        assert!(detail.contains("--target mac|linux|iced"), "{detail}");
     }
 
     // -------------------------------------------- old server / zero tabs
@@ -6163,9 +6169,13 @@ mod tests {
             !nav_lists(nav, "cli.md"),
             "a suffix of a nav path is not a nav entry"
         );
+        // Against the real nav block, not a fixture: a path that shares a
+        // basename with a listed entry but sits in another directory must
+        // not match. `reference/cli.md` IS listed; `development/cli.md` is
+        // not, and never will be.
         assert!(!nav_lists(
             &nav_block(&std::fs::read_to_string(repo_root().join("zensical.toml")).unwrap()),
-            "reference/terminal-queries.md"
+            "development/cli.md"
         ));
     }
 

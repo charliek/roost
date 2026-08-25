@@ -42,10 +42,10 @@ pub fn rollup_css_class(lifecycle: AgentLifecycle) -> Option<&'static str> {
 /// Compute the project rollup: the highest-[`agent::rank`] tab wins.
 /// No tabs → `Inactive`.
 ///
-/// Pure function — no UI toolkit, no env, no allocation. Used by
-/// each UI adapter's `app` module when applying the rollup (CSS classes
-/// in GTK, a resolved color in Iced); tested directly without spinning
-/// up a UI toolkit runtime.
+/// Pure function — no UI toolkit, no env, no allocation. Used by the
+/// UI adapter's `app` module when applying the rollup (a resolved
+/// color in Iced; the now-removed GTK UI mapped it to CSS classes);
+/// tested directly without spinning up a UI toolkit runtime.
 pub fn project_rollup(tabs: impl IntoIterator<Item = AgentLifecycle>) -> AgentLifecycle {
     tabs.into_iter()
         .max_by_key(|l| agent::rank(*l))

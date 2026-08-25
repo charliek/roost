@@ -11,81 +11,85 @@ the multi-project workspace with **notification routing for AI coding
 agents** (Claude Code, Codex, …). It ships **two platform products, each
 embedding the workspace + PTY supervisor in-process** — Swift + AppKit on
 macOS (`Roost.app`), Rust + iced on Linux (`roost`, the packaged `.deb`).
-A third UI implementation, Rust + gtk4-rs (`roost-linux`), lives in the
-repo as the Linux development/parity implementation. `libghostty-vt` is
-vendored once and linked into all three for in-process VT parsing and
-rendering. There is no daemon.
+The same iced binary additionally ships an **experimental macOS build**,
+`Roost-Iced.dmg`, with its own bundle id and its own update feed; it
+installs beside `Roost.app` and is not a third implementation, just the
+Linux UI on a different host. `libghostty-vt` is vendored once and
+linked into both for in-process VT parsing and rendering. There is no
+daemon.
 
 ## The command core (north star)
 
 Every way to drive Roost — **mouse/clicks, hotkeys, the `roostctl` CLI,
-and Lua scripts** — converges on **one core: the workspace operation
-set** (open/close/focus tab, create/rename/delete/reorder project,
-set-state, notify, dump, … plus a few view ops like screenshot /
-open-palette). Each surface is a *thin adapter* onto that core, and the
-**UI is a reaction to the core's events — never its own source of
-truth.**
+and any future scripting surface** — converges on **one core: the
+workspace operation set** (open/close/focus tab,
+create/rename/delete/reorder project, set-state, notify, dump, … plus a
+few view ops like screenshot / open-palette). Each surface is a *thin
+adapter* onto that core, and the **UI is a reaction to the core's
+events — never its own source of truth.**
 
 ```
-  roostctl (CLI) ─┐
-  Lua scripts ────┤──▶ IPC handler ──┐
+  roostctl (CLI) ──┐
+  (future scripts) ┤──▶ IPC handler ──┐
                                       ├─▶  workspace op set  ──emit──▶ events ──▶ UI re-renders
   mouse / clicks ─┐                   │       (THE CORE)
   hotkeys ────────┤──▶ UI dispatch ───┘
 ```
 
-- **CLI + Lua** are out-of-process → reach the core over the IPC socket
-  (the handler is their adapter; Lua sits on top of the same op set).
+- **The CLI** is out-of-process → reaches the core over the IPC socket
+  (the handler is its adapter). A scripting surface, when one lands
+  (DL-12), sits on top of that same op set rather than beside it.
 - **Clicks + hotkeys** are in-process → call the same op set directly
   (their adapter is the UI command / keybind handler).
-- A hotkey (`Cmd+Shift+T`), a `roostctl` call, and a Lua script all
-  invoke the **same** command — e.g. "run action" or "open tab".
+- A hotkey (`Cmd+Shift+T`) and a `roostctl` call invoke the **same**
+  command — e.g. "run action" or "open tab".
 
-**One contract, three implementations.** There is no shared *codebase*
+**One contract, two implementations.** There is no shared *codebase*
 core across languages — Swift and Rust can't share one. There is one
 shared **contract** — the IPC op set in
 [`crates/roost-ipc`](../reference/ipc.md) — implemented by **Swift
-`Workspace` + AppKit**, **Rust + GTK**, and **Rust + iced** (the two
-Rust UIs additionally share `roost-engine`). "Same interface" means same
-op contract + behavioral parity, which the cross-platform E2E suite
+`Workspace` + AppKit** and **Rust + iced** (the Rust side over the
+toolkit-neutral `roost-engine`). "Same interface" means same op contract
++ behavioral parity, which the cross-platform E2E suite
 ([test-automation.md](test-automation.md)) exists to enforce. Per
 implementation: identical command surface, platform-specific guts
-(`forkpty` vs `portable-pty`; Core Graphics vs Cairo + Pango vs
-iced + wgpu).
+(`forkpty` vs `portable-pty`; Core Graphics vs iced + wgpu).
 
 **Two seams** connect the surfaces to the core:
 
-1. **surfaces → core** (commands in): CLI/Lua via IPC, UI/hotkeys
+1. **surfaces → core** (commands in): the CLI via IPC, UI/hotkeys
    direct. Every UI/hotkey action should route through the op set, not
    carry divergent local logic. *Convergence is an ongoing invariant —
    each place the UI keeps its own truth instead of reacting to a core
    event is a bug to retire (e.g. the dropped `active.changed` the Mac
    UI used to ignore).*
-2. **core → UI** (view reach-back: screenshot / dump / activate): GTK's
-   one `UiRequest` channel, Mac's one `UiBridge` seam — a single
-   registered path from the IPC handler to the main thread, not an
-   ad-hoc channel per op.
+2. **core → UI** (view reach-back: screenshot / dump / activate): on
+   Linux, `roost-engine`'s one `UiRequest` port, delivered to the iced
+   UI over the single engine feed it drains on the main thread; on Mac,
+   the one `UiBridge` seam — a single registered path from the IPC
+   handler to the main thread either way, not an ad-hoc channel per op.
 
 **Why this is the north star.** It buys the three things Roost optimizes
 for at once:
 
 - **Testability** — tests drive the same op set users do and assert on
   its events/state. No test-only backdoors that can drift from reality.
-- **Programmability** — the op set *is* the public surface; Lua actions
-  and the launcher are first-class clients of it, same as the CLI.
+- **Programmability** — the op set *is* the public surface; the launcher
+  (and a future scripting surface) are first-class clients of it, same
+  as the CLI.
 - **Clean architecture** — one place owns each mutation; the UI is a
   pure projection of core state; adding a capability is "add an op +
   thin adapters", not bespoke logic per surface.
 
 Every decision below — and every new feature — is measured against it:
 *does it route through the one op set, keep the UI reactive, and stay at
-parity across all three implementations?*
+parity across both implementations?*
 
 ## Why this shape
 
 **Native Mac UI.** AppKit gives the right trackpad, menu, accessibility,
-and notarization story for macOS. A Swift `.app` bundle drops the
-Homebrew GTK4 dependency entirely and makes signing + DMG distribution a
+and notarization story for macOS, and a Swift `.app` bundle needs no
+third-party toolkit installed to run — signing + DMG distribution are a
 standard Apple workflow.
 
 **No daemon.** Each UI is a single process that owns its PTY supervisor,
@@ -111,16 +115,20 @@ directions, mature async (`tokio`), small static binaries. The
 systems-level work — PTY lifecycle, OSC parsing, IPC framing — is
 exactly what Rust is good at.
 
-**gtk4-rs over Go + GTK on Linux.** Same toolchain as the rest of the
-Rust workspace means one Cargo build, no cgo, no `gotk4` binding
-gotchas.
+**History: gtk4-rs was the first Linux UI.** Roost's Linux UI shipped on
+gtk4-rs — chosen over Go + GTK for the same toolchain as the rest of the
+workspace: one Cargo build, no cgo, no `gotk4` binding gotchas. After
+the iced cutover it stayed in-repo a while longer as the parity
+reference iced was measured against, and was removed once iced *was* the
+product. See [DL-15](#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25).
 
-**Two languages, not one.** Swift on Linux would still bind GTK4 (no
-AppKit on Linux), so "uniform language" doesn't unify the UI code — it
-just adds the Swift runtime to Linux bundles and trades `gotk4` for the
-less-mature SwiftGTK. The thing worth unifying is the JSON IPC wire
-format + the PTY/workspace state machines, and those are mirrored
-idiomatically in each language without sharing source.
+**Two languages, not one — for now.** Swift on Linux has no AppKit, so a
+"uniform language" would still mean binding a foreign toolkit from
+Swift: it adds the Swift runtime to Linux bundles and unifies no UI
+code. What is worth unifying is the JSON IPC wire format + the
+PTY/workspace state machines, and those are mirrored idiomatically in
+each language today. Whether that stays the right trade is exactly what
+[Direction](#direction-under-evaluation) is gating.
 
 ## Architecture
 
@@ -178,11 +186,13 @@ chunk, then everything else is in-process memory.
 - **No rendered output over the wire.** PTY bytes only ever live
   in-process.
 - **No shared UI code between Mac and Linux beyond the JSON wire
-  format.** Each UI is idiomatic to its platform.
+  format.** Each UI is idiomatic to its platform. *(The one non-goal
+  currently under review — see
+  [Direction](#direction-under-evaluation).)*
 - **No core rewrites in third languages.** Rust for the Linux UI + CLI +
-  IPC + supporting crates; Swift for the Mac UI. Lua is an *embedded
-  scripting surface* for user automation (see DL-12), not a third
-  implementation language.
+  IPC + supporting crates; Swift for the Mac UI. Lua, if it ever lands,
+  is an *embedded scripting surface* for user automation (see DL-12),
+  not a third implementation language.
 
 ## Decision log
 
@@ -238,7 +248,17 @@ the Mac feel is worse. The unification benefit does not pay for itself
 when the AppKit surface is the larger half of a Mac terminal's native
 experience.
 
+*[2026-08-25: the toolkit this rejected was gtk4-rs. The same question
+is open again for a different toolkit — see
+[DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)
+and [Direction](#direction-under-evaluation). The AppKit-surface
+argument above is the bar that evaluation has to clear.]*
+
 ### DL-6: gtk4-rs does not need a `pangoextra` workaround
+
+**Retired 2026-08-25 — moot.** The gtk4-rs UI was removed
+([DL-15](#dl-15-linux-ships-iced-gtk4-rs-is-retired-and-removed-2026-08-25));
+kept as the record of a `gotk4` gotcha that never applied to us.
 
 `gtk4-rs` calls `pango_cairo_context_set_font_options` directly via raw
 FFI and does not have the `gotk4` `cairo.FontOptions` record-struct
@@ -280,7 +300,8 @@ Rust + Swift builds — the single source of the pin.
 
 ### DL-11: One command core, thin per-surface adapters (2026-05-26)
 
-Every input surface — UI clicks, hotkeys, `roostctl`, Lua — routes
+Every input surface — UI clicks, hotkeys, `roostctl`, and any scripting
+surface added later — routes
 through the **same workspace operation set**; the UI is a reaction to the
 core's events, not a parallel source of truth. Adding a capability means
 adding an op + thin adapters, not per-surface logic. This is the
@@ -293,21 +314,29 @@ behavioral parity.
 
 ### DL-12: pytest drives the tests; Lua is a user-scripting surface (2026-05-26)
 
+**Status: the pytest half shipped; the Lua half is not implemented** —
+there is no Lua engine, no `mlua` dependency, and no `.lua` anywhere in
+the tree. What follows is the settled *role split*, not a description of
+shipped behavior.
+
 Two distinct roles, one shared core:
 
 - **Tests** are driven by **pytest** over the IPC op set (plus
   `roostctl`/shell for simple cases) — mature fixtures, parametrization
   over both UIs, and reporting, with the affordances that actually kill
   flakiness (`roostctl wait`, `tab.dump`) living in the app, not the
-  runner. See [test-automation.md](test-automation.md).
-- **Lua** is an **embedded user-scripting surface** for the Cmd+Shift+T
-  launcher and complex user-authored multi-step actions — a first-class
-  client of the same op set, deliberately **scoped, not the test
-  mechanism**. We add Lua where it earns user-facing programmability and
-  avoid over-investing it as test infrastructure.
+  runner. See [test-automation.md](test-automation.md). **Shipped** as
+  [`tools/roosttest/`](https://github.com/charliek/roost/blob/main/tools/roosttest/README.md).
+- **Lua**, *if and when it lands*, is an **embedded user-scripting
+  surface** for the Cmd+Shift+T launcher and complex user-authored
+  multi-step actions — a first-class client of the same op set,
+  deliberately **scoped, not the test mechanism**. We add it where it
+  earns user-facing programmability and avoid over-investing it as test
+  infrastructure. The launcher ships today driven by config-declared
+  commands, not scripts.
 
-Both remain thin adapters onto the one command core (DL-11): a Lua action
-and a pytest step invoke the same ops.
+Both would remain thin adapters onto the one command core (DL-11): a
+scripted action and a pytest step invoke the same ops.
 
 ### DL-13: The agent state model — four axes, one derivation (2026-07-27)
 
@@ -330,7 +359,9 @@ classifies a new enum value as a breaking change. The full mapping,
 the op that writes it (`tab.agent_report`), and the compatibility
 contract are in [`ipc.md`](../reference/ipc.md).
 
-Parity between the two UIs is pinned the same way `tests/word-fixtures/`
+Parity between the two UIs *[at the time: Swift and the gtk4-rs Linux
+UI; the Rust half is now `crates/roost-iced`, pinned by the same corpus]*
+is held the same way `tests/word-fixtures/`
 already pins tokenization: a shared, language-neutral corpus —
 `tests/agent-state-fixtures/*.json` — drives both
 `crates/roost-ipc/tests/agent_state_fixtures.rs` and
@@ -339,9 +370,11 @@ derivation, the `rank()` ordering the sidebar rollup and (eventually)
 the agent switcher share, and report-transition semantics — the
 higher-risk half, since it's state-machine logic, not a pure function
 over static input. A behavioral drift between the two ports surfaces
-as a red fixture test, not a bug report. See `AGENT_ROADMAP.md` (repo
-root) for the full layer sequencing (L0 state model, L1 agent adapter
-seam, L2 diagnostics, L3 agent UX) this decision is part of.
+as a red fixture test, not a bug report. *[This entry was one layer of a
+four-layer agent-roadmap document (L0 state model, L1 agent adapter
+seam, L2 diagnostics, L3 agent UX). That document was deleted once the
+spike completed; the state model it produced is what this entry
+records.]*
 
 ### DL-14: Ownership is a label, not a suppression switch (2026-07-27)
 
@@ -370,10 +403,110 @@ whatever the agent was running has exited) drops the lifecycle to
 `inactive` while keeping ownership as a label, which simultaneously
 re-derives shell state and re-opens raw OSC. Every other consumer of
 ownership (the tab tint, the rollup, the switcher) needs no equivalent
-failsafe, because AD-3's cosmetic-degradation argument already covers
-them. See `AGENT_ROADMAP.md` (repo root, AD-3/AD-4) and
+failsafe, because the cosmetic-degradation argument in the paragraph
+above already covers them. See
 [`notifications.md`](../guides/notifications.md#hook-session-osc-suppression)
 for the user-facing behavior.
+
+### DL-15: Linux ships iced; gtk4-rs is retired and removed (2026-08-25)
+
+The Linux product is `crates/roost-iced` — the `.deb` installs it as
+`/usr/bin/roost` (v0.0.18) — and the gtk4-rs UI (`crates/roost-linux`)
+is deleted from the repo.
+
+Why iced won:
+
+- **The renderer was already ours.** Both UIs walked libghostty-vt's
+  render state and drew cell-aligned rects + text themselves, so Cairo +
+  Pango bought nothing the terminal grid needed; iced + wgpu puts the
+  same draw on the GPU.
+- **One Rust codebase, two host OSes.** iced runs on Linux *and* macOS,
+  so the binary that ships the `.deb` is the binary the macOS
+  experiment bundles — versus a toolkit that only exists on one of the
+  two target platforms.
+- **`roost-engine` is shared, not duplicated.** Both Rust UIs already
+  sat on the toolkit-neutral engine, so retiring one adapter removed
+  ~16k LOC of adapter, four CI jobs, a clippy config, and two harness
+  lanes without touching the core.
+- **The parity-reference role expired.** GTK's remaining job after the
+  Linux cutover was to be the thing iced was measured against. Once
+  iced *was* the product, the reference was the product.
+
+What was deliberately **kept**: the on-disk contract. The packaged Linux
+build resolves the same profile paths the GTK package owned — socket,
+`state.json`, both locks, log dir — and `packaging/roost-gtk-alias.desktop`
+keeps launcher pins created before the rename working, so an in-place
+upgrade needs no migration step. Only the profile's *name* changed
+(`roostctl --target gtk` → `--target linux`,
+`ROOST_BUNDLE_PROFILE=gtk` → `=linux`).
+
+### DL-16: An experimental mac-iced build ships beside Swift (2026-08-25)
+
+v0.0.18 added `Roost-Iced-<version>.dmg` — the same iced binary bundled
+for macOS with its own bundle id (`ai.stridelabs.Roost.iced`), its own
+socket/state/log paths, its own Sparkle feed and signing key
+(`docs/appcast-iced.xml`), a native menu bar, a Dock badge, and
+`UNUserNotificationCenter` banners (plans 027 / 028 / 030). It is opt-in,
+installs beside `Roost.app`, and never appears in the Swift app's
+release artifacts. **The Swift app remains the macOS product.**
+
+**This entry records a hypothesis, not a decision.** The *convergence
+hypothesis* is that one iced codebase can serve both platforms well
+enough to retire the second implementation — and the only place to test
+that against the Swift app is daily use, which is what this build exists
+for. What the evaluation turns on, and what each outcome implies, is in
+[Direction (under evaluation)](#direction-under-evaluation).
+
+Accepted going in, decided rather than discovered: **accessibility**.
+AppKit gives the Swift sidebar and menus VoiceOver support for free; an
+iced canvas gives essentially none. Named here so it stays a conscious
+trade rather than a late surprise.
+
+## Direction (under evaluation)
+
+**Status: under evaluation — not a commitment.** Nothing in this section
+is decided. It is written down so the next stretch of work is read
+against it. Decision-log entries land in the PR that actually builds the
+thing, not here — the same rule `discovery/` sets for itself.
+
+**The fixed point is one shared Rust core.** Maintaining two full
+codebases long-term delays features and is not acceptable. There is
+already far too much duplicated code: the workspace state machine, the
+agent-state derivation, config/theme/keybind parsing, URL detection and
+word selection, and the IPC wire types all exist twice — once in Rust,
+once in Swift — pinned to each other by shared fixture corpora precisely
+*because* they are duplicates. Merging the codebases is what makes the
+advanced features feasible at all.
+
+**The open question is the Mac shell**, and it is gated on one thing:
+whether iced visuals on macOS can reach parity with the Swift app.
+
+- **(a) If they can** — converge on iced as the single codebase. Both
+  platforms first-class, feature parity by construction, and the
+  platform-specific items (menu bar, notifications, Dock, updater, TCC,
+  vibrancy) live behind seams/interfaces instead of in a second
+  application.
+- **(b) If they cannot** — keep Swift as the Mac shell and drive it to
+  reuse much more of the Rust core, shrinking the duplication from the
+  other end.
+
+Either branch pays off the same investment — the iced UI,
+`roost-engine`, and `roost-ui-model` — which is why the question is
+gated rather than answered early. The unproven Swift-facing facade
+([#286](https://github.com/charliek/roost/issues/286)) is the (b) seam,
+held at "don't invest, don't delete" until the direction resolves.
+
+**What either branch unlocks** is the `discovery/` backlog as the
+candidate roadmap. The first spike candidate is **remote host support
+without needing tmux or herdr**
+([`discovery/host-sessions.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md)):
+an opt-in session server built from `roost-engine`, with the UI as one
+of its clients — which revises the "no daemon" non-goal for that feature
+without reversing the default. Its companion is **agent watching**
+([`discovery/agent-watching.md`](https://github.com/charliek/roost/blob/main/discovery/agent-watching.md)),
+adding screen/process observation as a fallback writer into the four
+agent axes rather than a replacement for hooks. Both are discovery
+notes; neither is scheduled, and neither waits on the other.
 
 ## Migration history
 
@@ -384,12 +517,35 @@ IPC, `roostctl`, delete `roost-core`/`roost-proto`/`roost-common`/
 `roost-smoke`) → bundling → cutover — is done; Roost has been Swift
 (macOS) + Rust (Linux) over in-process JSON IPC since.
 
+**The iced migration (M1–M6, 2026-08).** A second Rust UI,
+`crates/roost-iced`, began as a POC on the `poc/iced` branch alongside a
+toolkit-neutral engine extraction (`roost-engine` + `roost-ui-model`)
+that both Rust UIs then shared. It merged to `main` on 2026-08-02 as
+merge-quality work rather than a throwaway (M1–M2), then reached
+functional parity with the GTK UI over a series of slices — `app.rs`
+decomposition, project lifecycle, sidebar resize, push subscriptions in
+place of a tick, chrome polish, native D-Bus notifications (M3) —
+carried by the render-path work that made it viable: dirty-row tracking,
+sprite/box-drawing parity, IME input, and crash robustness (the engine
+track). **M4** swapped the Linux `.deb`: `/usr/bin/roost` became the
+iced binary, built with the `linux-package` feature so it adopts the
+production profile the GTK package owned — same socket, same
+`state.json`, no migration step. **M5** (Rust under Swift) is frozen.
+**M6** bundled the same binary for macOS as the experimental
+`Roost-Iced.dmg` — bundle + parallel install, an `objc2` native seam,
+Sparkle, menu bar, macOS notifications (plans 027 / 028 / 030). Both
+shipped in **v0.0.18** (2026-08-25). Plan 031 then removed
+`crates/roost-linux` and the "three implementations" framing with it.
+The full account is in
+[Iced migration — history & status](iced-migration.md).
+
 ## Relationship to existing docs
 
 | Document | Role |
 |---|---|
 | `docs/development/vision.md` (this file) | The **living architecture + principles**. Every PR is measured against the north star + decision log here. |
-| [`docs/development/test-automation.md`](test-automation.md) | The testing + scripting plan that operationalizes the north star (pytest E2E, Lua scripting, CI). |
+| [`docs/development/test-automation.md`](test-automation.md) | How the north star is verified: the three-layer harness map, the CI lanes, and the determinism principles. |
+| [`docs/development/iced-migration.md`](iced-migration.md) | How Roost got to two implementations — the iced migration's milestones, status, and what remains. |
 | [`docs/reference/ipc.md`](../reference/ipc.md) | JSON IPC wire format spec — the canonical command contract. |
 | [`docs/reference/architecture.md`](../reference/architecture.md) | Package layout + threading contract for the in-process implementation. |
 | [`docs/archive/roost.proto`](../archive/roost.proto) | Historical reference for the pre-rewrite gRPC contract. |

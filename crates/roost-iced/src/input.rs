@@ -171,9 +171,9 @@ struct ControlChord {
 /// as the logical key inverts the same way. libghostty keys its
 /// control-sequence table on the *printable* byte, so forwarding the C0 as
 /// utf8 misses the table and falls through to CSI-u — ctrl+a reaches the PTY
-/// as `\x1b[1;5u` instead of 0x01. The Swift and GTK encoders never forward
-/// C0 text for the same reason (`KeyEncoder.swift::printableUTF8`,
-/// `key_encoder.rs`'s `to_unicode` filter).
+/// as `\x1b[1;5u` instead of 0x01. The Swift encoder never forwards C0 text
+/// for the same reason (`KeyEncoder.swift::printableUTF8`; the now-removed
+/// GTK encoder's `key_encoder.rs::to_unicode` filter did the same).
 ///
 /// Only the unambiguous chords invert: the letters and `[ \ ] _`. NUL
 /// (ctrl+shift+2), DEL, RS (ctrl+shift+6) and every named key — ctrl+Enter's
@@ -343,10 +343,11 @@ pub fn encode_press(
     };
     // libghostty consults consumed mods only when `utf8` is non-empty, to
     // decide which modifiers already went into that text. winit reports
-    // neither GDK's real `consumed_modifiers()` (what GTK forwards) nor
-    // AppKit's flag set (mac 5801f53: shift and option are the translation
-    // modifiers there), so this gate approximates both — a printable utf8
-    // that differs from the unshifted key's own character means a modifier
+    // neither GDK's real `consumed_modifiers()` (what the now-removed GTK UI
+    // forwarded) nor AppKit's flag set (mac 5801f53: shift and option are
+    // the translation modifiers there), so this gate approximates both — a
+    // printable utf8 that differs from the unshifted key's own character
+    // means a modifier
     // participated in the translation. ALT is macOS-only: plain Alt on Linux
     // never translates (winit hands back the base character) and alt-as-meta
     // must keep its ESC prefix, which the cfg-split legacy alt+b pin below
@@ -1014,10 +1015,11 @@ mod tests {
     }
 
     /// The shapes that must not move: a toolkit that reports the printable
-    /// character as `text` (GTK's keyval path, and winit wherever the
-    /// platform declines to control-transform), plain typing, option-
-    /// transformed text, and the C0 forms outside the invertible set —
-    /// NUL, RS, and the named keys that own their own encoding.
+    /// character as `text` (the now-removed GTK UI's keyval path, and
+    /// winit wherever the platform declines to control-transform), plain
+    /// typing, option-transformed text, and the C0 forms outside the
+    /// invertible set — NUL, RS, and the named keys that own their own
+    /// encoding.
     #[test]
     fn presses_outside_the_recoverable_chords_encode_unchanged() {
         let (mut encoder, terminal) = encoder_pair();
@@ -1068,7 +1070,8 @@ mod tests {
 
     /// Kitty-ON canonical shape, pinned: the CSI-u entry reports the
     /// letter's codepoint (97) because recovery feeds libghostty a real
-    /// unshifted codepoint — the GTK shape, and what
+    /// unshifted codepoint — the shape the now-removed GTK UI produced
+    /// too, and what
     /// `roost-vt/tests/key_encoder_test.rs::ctrl_a_under_kitty_exact_bytes`
     /// pins from the other side. The Swift app zeroes the codepoint for a
     /// C0 press instead; plan 026 D3 accepts that divergence because the

@@ -39,7 +39,9 @@ tab-max-width = 0
 
 - **macOS** uses these config keys directly to constrain the
   `TabPillView` `widthAnchor` on each pill.
-- **Linux** ignores these keys — libadwaita's `Adw.TabBar` widget
-  handles tab width distribution and scrolling internally with its
-  own (similar) bounded-width algorithm. The Linux behavior already
-  matches the Mac default, so the keys are macOS-only for now.
+- **Linux** (the iced UI) ignores these keys. Its tab strip applies the
+  same bounded-width algorithm with the Mac defaults compiled in —
+  `TAB_PILL_MIN_WIDTH = 80` and `TAB_PILL_MAX_WIDTH = 220` in
+  `crates/roost-iced/src/chrome.rs` — so the behavior already matches
+  the Mac default, but there is no config knob for it yet. The keys are
+  macOS-only for now.

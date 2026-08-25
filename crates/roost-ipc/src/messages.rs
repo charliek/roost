@@ -326,7 +326,7 @@ pub struct TabDumpResult {
 // ============================================================================
 //
 // The palette is a UI overlay, not workspace state, so these ops route
-// through the UI seam (a `UiRequest` on GTK / the `UiBridge` on Mac)
+// through the UI seam (a `UiTask` in iced / the `UiBridge` on Mac)
 // rather than the workspace. They make the palette a driveable, testable
 // command surface: open it, read its rows, filter, and activate a row —
 // where activating dispatches the *same* command an item's keybind would
@@ -581,7 +581,8 @@ pub struct ClipboardWriteParams {
 // into a live tab and observe what the UI would have written back —
 // the missing rung that lets `tools/roosttest/` cover OSC drains,
 // reply round-trips, and other byte-level wiring end-to-end. See
-// `docs/development/test-automation.md` §5.4 for the full rationale.
+// `docs/development/test-automation.md` ("Test-mode IPC ops") for the
+// full rationale.
 //
 // `tab.dump_resolved` is NOT gated: it's a richer read of the same
 // render state `tab.dump` already exposes, useful to anyone debugging
@@ -1483,7 +1484,7 @@ pub mod ops {
 
     /// Test-only PTY drain ops — drive bytes through the OSC scanner,
     /// libghostty, and the input-reply path. Gated behind
-    /// `ROOST_TEST_MODE=1` (set in CI for `e2e-gtk` and `e2e-mac`)
+    /// `ROOST_TEST_MODE=1` (set in CI for the iced and mac E2E lanes)
     /// because injecting arbitrary PTY output and observing keystroke
     /// bytes is something only a test harness should do.
     pub const TAB_FEED_PTY_BYTES: &str = "tab.feed_pty_bytes";

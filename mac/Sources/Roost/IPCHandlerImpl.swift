@@ -6,9 +6,9 @@
 // response value goes back over the connection via the
 // non-isolated `IPCServer.writeAll` path.
 //
-// Mirrors the Rust handler in `crates/roost-linux/src/ipc.rs`'s
-// `dispatch()` — same op names, same error code mapping, same
-// envelope semantics.
+// Mirrors the Rust handler in `crates/roost-engine/src/ipc.rs`'s
+// `dispatch()` (shared by iced) — same op names, same error code
+// mapping, same envelope semantics.
 
 import AppKit
 import Foundation
@@ -511,8 +511,9 @@ actor IPCHandlerImpl: IPCHandler {
         let p = try decodeParams(params, as: IPCPaletteOpenParams.self, expected: ["kind"])
         let kind = p.kind ?? ""
         guard ["", "commands", "launcher", "custom", "agents"].contains(kind) else {
-            // rustDebugQuoted keeps the message byte-identical to the GTK
-            // side's `{:?}` formatting for kinds carrying quotes/escapes.
+            // rustDebugQuoted keeps the message byte-identical to Rust's
+            // `{:?}` formatting (what iced's side of the wire produces)
+            // for kinds carrying quotes/escapes.
             throw IPCHandlerError.invalidParam(
                 "unknown palette kind \(Self.rustDebugQuoted(kind)) "
                     + "(want \"commands\", \"launcher\", \"custom\", or \"agents\")")
@@ -998,7 +999,7 @@ actor IPCHandlerImpl: IPCHandler {
             throw IPCHandlerError.internalError("no UI window for window_metrics")
         }
         let metrics = ui.sidebarMetrics()
-        // Report the content rect (matches GTK's widget allocation,
+        // Report the content rect (matches iced's window inner size,
         // which is content-area, not toplevel-with-decorations).
         // `NSWindow.frame` includes the titlebar; reporting that would
         // break cross-platform width/height equivalence for callers
@@ -1070,10 +1071,11 @@ actor IPCHandlerImpl: IPCHandler {
         let p = try decodeParams(
             params, as: IPCWindowResizeParams.self, expected: ["width", "height"]
         )
-        // Match the GTK handler's validation: width and height must be
-        // positive AND finite (no NaN/Infinity). Without the finite check
-        // a permissive client could push `CGFloat.infinity` into setFrame
-        // and trip AppKit's geometry assertions.
+        // Match `roost-engine/src/ipc.rs`'s validation (shared by iced):
+        // width and height must be positive AND finite (no NaN/Infinity).
+        // Without the finite check a permissive client could push
+        // `CGFloat.infinity` into setFrame and trip AppKit's geometry
+        // assertions.
         guard p.width.isFinite, p.height.isFinite, p.width > 0, p.height > 0 else {
             throw IPCHandlerError.invalidParam(
                 "width and height must be positive and finite; got \(p.width) x \(p.height)"
@@ -1082,11 +1084,11 @@ actor IPCHandlerImpl: IPCHandler {
         guard let window = RoostBackend.shared.ui?.mainWindow else {
             throw IPCHandlerError.internalError("no UI window for window.resize")
         }
-        // Treat width/height as the CONTENT rect (matches GTK, which
-        // resizes the toplevel widget's allocation). Without this
-        // conversion, Mac would set the outer frame (including
-        // titlebar) to W×H while GTK sets content to W×H, producing
-        // different content sizes for the same op call.
+        // Treat width/height as the CONTENT rect (matches iced, which
+        // resizes the window's inner size — winit's `set_inner_size`).
+        // Without this conversion, Mac would set the outer frame
+        // (including titlebar) to W×H while iced sets content to W×H,
+        // producing different content sizes for the same op call.
         let desiredContent = NSRect(
             x: window.frame.origin.x, y: window.frame.origin.y,
             width: CGFloat(p.width), height: CGFloat(p.height)
@@ -1169,7 +1171,8 @@ private func encodeResult<T: Encodable>(_ value: T) throws -> AnyCodable? {
 
 /// Defensive u16 conversion. Zero → `defaultValue`; values
 /// exceeding UInt16 throw `invalid-param`. Mirrors the Rust
-/// `u16::try_from` validation in `crates/roost-linux/src/ipc.rs`.
+/// `u16::try_from` validation in `crates/roost-engine/src/ipc.rs`
+/// (shared by iced).
 private func ipcDim(_ value: UInt32, defaultValue: UInt16, field: String) throws -> UInt16 {
     if value == 0 { return defaultValue }
     if value > UInt32(UInt16.max) {
@@ -1591,7 +1594,8 @@ struct IPCPaletteAgentRow: Codable, Equatable, Sendable {
     let timeText: String
     /// `var` alone among the columns: the row is built with metrics
     /// pending and the async probe fills this one field in place, the way
-    /// the GTK side assigns `agent.metrics_text` on the built item.
+    /// `crates/roost-ui-model/src/agent_palette.rs` assigns
+    /// `agent.metrics_text` on the built item (consumed by iced).
     var metricsText: String?
     enum CodingKeys: String, CodingKey {
         case effectiveLifecycle = "effective_lifecycle"
@@ -2081,8 +2085,8 @@ private struct IPCAppCursorShapeResult: Codable {
 }
 
 /// Format an `NSColor` as `#RRGGBB` for the `tab.dump_resolved` wire
-/// shape. Matches the GTK-side `rgb_hex` helper in
-/// `crates/roost-linux/src/ipc.rs` so cross-UI dumps compare equal.
+/// shape. Matches the `rgb_hex` helper in `crates/roost-engine/src/ipc.rs`
+/// (shared by iced) so cross-UI dumps compare equal.
 /// Returns `"#000000"` for any color that can't be converted to sRGB
 /// (defensive — every theme color in the bundled set converts).
 private func hexFromNSColor(_ color: NSColor) -> String {

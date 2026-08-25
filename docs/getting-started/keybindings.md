@@ -135,9 +135,9 @@ Anything not bound as an app shortcut flows to the focused terminal through libg
 
 ## How the shortcut controller is wired
 
-Shortcuts run in GTK's *capture* phase, which means they fire before the focused widget — including the terminal surface — sees the event. That's why `Cmd-T` (or `Alt-T` on Linux) works while the terminal is focused: the window's controller catches it first and dispatches the action, and the keystroke never reaches the shell. Anything not bound at the window level falls through to the terminal as usual.
+App shortcuts are resolved **before** the keystroke is offered to the terminal, on both UIs. That's why `Cmd-T` (or `Alt-T` on Linux) works while the terminal is focused: the shortcut table is consulted first, the action dispatches, and the keystroke never reaches the shell. Anything not in the table falls through to the terminal as usual.
 
-The terminal's own key controller is also in capture phase — that's what stops GTK's default focus-traversal from consuming Tab and Shift-Tab before the shell (or Claude Code) sees them.
+On macOS this is the AppKit main menu plus the window's own key handling. On Linux the iced UI handles every key press in one place: the terminal widget deliberately never *captures* keyboard events, so they arrive at the app-level handler (`App::keyboard` in `crates/roost-iced/src/app.rs`), which walks a fixed order — an open modal or inline rename first, then the command palette, then the keybinding table, and only then the terminal. There is no toolkit focus-traversal to fight: Tab and Shift-Tab are ordinary keys that fall straight through to the encoder.
 
 ## Mouse
 
@@ -158,7 +158,7 @@ Selection clears automatically on any PTY output, on resize, and on a new click.
 
 Hold the **link modifier** and hover a URL to highlight it (underline + hand cursor); click while holding it to open the URL in your default browser. This works for both OSC 8 hyperlinks (what tools like Claude Code emit) and plain `https://…` text matched on screen.
 
-The modifier is platform-native by default — **Cmd on macOS, Alt on Linux** — and configurable via `link-modifier` in `config.conf`. **Linux users who prefer the conventional Ctrl+click** set `link-modifier = ctrl`. (Some Linux WMs grab `Alt`+drag to move windows, so Ctrl can be the more reliable choice.) The `link-modifier` setting is honored by the GTK and Iced apps; the Swift Mac app is fixed to Cmd. See [`config.md`](../reference/config.md#link-modifier) for details and the broader "prefer Ctrl on Linux" recipe.
+The modifier is platform-native by default — **Cmd on macOS, Alt on Linux** — and configurable via `link-modifier` in `config.conf`. **Linux users who prefer the conventional Ctrl+click** set `link-modifier = ctrl`. (Some Linux WMs grab `Alt`+drag to move windows, so Ctrl can be the more reliable choice.) The `link-modifier` setting is honored by the iced UI; the Swift Mac app is fixed to Cmd. See [`config.md`](../reference/config.md#link-modifier) for details and the broader "prefer Ctrl on Linux" recipe.
 
 Pressing any input-producing key when the viewport is scrolled back snaps the viewport to the bottom before delivering the keystroke — same behavior as every other terminal multiplexer.
 
@@ -191,7 +191,7 @@ Combine with `+`. Aliases are accepted on both sides:
 | `alt`     | `opt`, `option`     |
 | `super`   | `cmd`, `command`    |
 
-The key segment (last token) passes through to GTK's keyval lookup unchanged.
+The key segment is the last token that isn't a modifier; it's matched case-insensitively by name (`t`, `1`, `tab`, `return`, `bracketleft`, `plus`, …) against the same name the UI derives from the pressed key. On a non-Latin keyboard layout the physical key's Latin equivalent is used, so `super+t` still fires where a QWERTY `T` sits.
 
 ### Examples
 

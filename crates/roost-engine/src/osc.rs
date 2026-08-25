@@ -346,8 +346,9 @@ fn map_events(events: Vec<OscEvent>, colors: &OscColorSnapshot) -> Vec<OscAction
             // Color SETs and RESETs produce no action: libghostty
             // applies them to the terminal from the same bytes.
             // They exist for `OscColorState`, and a router fed
-            // without one (the GTK path) must behave exactly as it
-            // did before they were surfaced.
+            // without one (the original, pre-`OscColorState` calling
+            // convention — the now-removed GTK UI's only mode) must
+            // behave exactly as it did before they were surfaced.
             OscEvent::ColorSet { .. }
             | OscEvent::ColorReset(_)
             | OscEvent::PaletteSet(_)
@@ -434,8 +435,9 @@ mod tests {
         ));
     }
 
-    /// The GTK path: a router fed the caller's snapshot must produce
-    /// exactly the actions it produced before SET/RESET events existed.
+    /// The no-`OscColorState` path: a router fed the caller's snapshot
+    /// must produce exactly the actions it produced before SET/RESET
+    /// events existed.
     #[test]
     fn caller_snapshot_feed_ignores_sets_and_resets() {
         let mut router = OscRouter::new();

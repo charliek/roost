@@ -230,8 +230,8 @@ pub(crate) fn wake_subscription(wake: Arc<Notify>) -> Subscription<Message> {
     })
 }
 
-/// Adapter task: workspace broadcast → feed, through the same bridge GTK
-/// uses. `events::subscribe` owns the boot `Resync` and the
+/// Adapter task: workspace broadcast → feed, through `roost_engine::events`'s
+/// UI-adapter bridge. `events::subscribe` owns the boot `Resync` and the
 /// `Lagged` → `Resync` conversion; this only re-tags its output.
 pub(crate) async fn pump_workspace_events(workspace: Arc<Workspace>, feed: EngineFeedSender) {
     let (tx, mut rx) = mpsc::unbounded_channel();

@@ -233,10 +233,10 @@ pub(super) struct TerminalTab {
     cached_defaults: Option<(ColorRgb, ColorRgb)>,
     cached_theme_generation: Option<u64>,
     /// Bumped whenever a theme lands on this tab. Nothing theme-derived
-    /// besides the default fg/bg pair enters `RenderedRow::build` today,
-    /// but GTK's twin resolver already pulls the theme's `bold_color`, so
-    /// this fails the cache safe toward over-rebuilding if that override
-    /// ever lands here.
+    /// besides the default fg/bg pair enters `RenderedRow::build` today
+    /// (the now-removed GTK UI's twin resolver already pulled the
+    /// theme's `bold_color`), so this fails the cache safe toward
+    /// over-rebuilding if that override ever lands here.
     theme_generation: u64,
     cols: u16,
     rows: u16,

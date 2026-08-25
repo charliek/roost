@@ -8,7 +8,7 @@
 //     redaction so the logged strings show through.
 //   * A line-appended file at the bundle profile's `logPath`
 //     (`~/Library/Logs/Roost/roost.log` on Mac, `~/Library/Logs/
-//     Roost-gtk/roost.log` for the gtk profile). The file is easier
+//     Roost-iced/roost.log` for the iced profile). The file is easier
 //     to grep and survives reboots without spinning up Console.
 //
 // File writes hop to a serial `DispatchQueue` so concurrent callers

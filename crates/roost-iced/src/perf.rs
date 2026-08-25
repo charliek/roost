@@ -17,8 +17,8 @@
 //!
 //! `fill_text_calls` counts glyph draws the pass emitted: one per
 //! `fill_text` **plus** one per sprite-rendered cell, because a sprite
-//! *replaces* a glyph draw. GTK counts its sprite draws the same way, so
-//! this field is comparable across the two UIs.
+//! *replaces* a glyph draw. The now-removed GTK UI counted its sprite
+//! draws the same way, so the two were directly comparable.
 //!
 //! Two traps to know about before trusting a number out of this module:
 //!
@@ -41,8 +41,7 @@ pub use roost_ui_model::render_stats::{RenderStats, TabRenderStats};
 
 use roost_ui_model::render_stats::RenderStatsAggregate;
 
-/// This UI's process-global aggregate. GTK holds its own in
-/// `roost-linux::perf`; the two never mix.
+/// This UI's process-global aggregate.
 static AGGREGATE: RenderStatsAggregate = RenderStatsAggregate::new();
 
 /// Read the global aggregate. Backs the `app.render_stats` IPC op.

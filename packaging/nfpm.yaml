@@ -97,6 +97,9 @@ contents:
     dst: /usr/bin/roostctl
   - src: ./packaging/roost.desktop
     dst: /usr/share/applications/ai.stridelabs.Roost.desktop
+  # roost-gtk-alias.desktop: NoDisplay compat shim so v0.0.17-era launcher
+  # pins to ai.stridelabs.Roost.gtk.desktop keep resolving. Delete once no
+  # installed launcher pin references it; revisit at v0.1.0 (plan 031).
   - src: ./packaging/roost-gtk-alias.desktop
     dst: /usr/share/applications/ai.stridelabs.Roost.gtk.desktop
   - src: ./packaging/icons/hicolor/256x256/apps/roost.png

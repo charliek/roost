@@ -11,10 +11,10 @@
 //! the Zig source.
 //!
 //! Nothing here touches a toolkit: [`sprite_geometry`] answers with
-//! cell-relative primitives and each UI adapter renders them its own
-//! way (GTK strokes/fills them through cairo; iced snaps
-//! [`tessellate`]'s rects to integers and emits quads). Color never
-//! crosses this boundary — sprites are monochrome foreground.
+//! cell-relative primitives and the UI adapter renders them its own
+//! way (iced snaps [`tessellate`]'s rects to integers and emits quads;
+//! the now-removed GTK UI stroked/filled them through cairo). Color
+//! never crosses this boundary — sprites are monochrome foreground.
 
 /// Axis-aligned rectangle in cell-relative pixels. The adapter adds
 /// the cell origin.
@@ -813,8 +813,8 @@ fn v_dash(w: f64, h: f64, count: i32, style: LineStyle) -> Vec<SpritePrimitive> 
 const ARC_S: f64 = 0.25;
 
 /// The exact three-segment path for a rounded-corner glyph ╭ ╮ ╯ ╰ in
-/// cell-relative coordinates. Both the GTK adapter's cairo calls and
-/// [`tessellate`] derive from this one description.
+/// cell-relative coordinates. [`tessellate`] derives from this one
+/// description (as the now-removed GTK adapter's cairo calls once did).
 pub fn arc_path(corner: Corner, w: f64, h: f64) -> ArcPath {
     let t = box_thickness(h);
     let cx = ((w - t) / 2.0).floor() + t / 2.0;

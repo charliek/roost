@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# One-time install hook: the system + toolchain deps to BUILD and TEST roost-linux
+# One-time install hook: the system + toolchain deps to BUILD and TEST roost-iced
 # in a shed. Does NOT build roost itself (build-on-first-use — see
 # tools/shed/shed-test.sh), but does install everything the build + the three
 # test tiers (Xvfb/X11, weston/Wayland, cage+uinput drag) need.
 set -euo pipefail
 log() { echo "[provision $(date +%H:%M:%S)] $*"; }
 
-log "apt: GTK4 + libadwaita (build + runtime), Wayland test compositors, X11 input, python test deps"
+# GTK4 + libadwaita are NOT a roost-iced build dependency (the gtk4-rs UI,
+# crates/roost-linux, was retired — plan 031). They stay because
+# tools/input/linux/iced_native_file_drop_check.py launches a small GTK app
+# as its XDND drag *source* to exercise roost-iced's native file-drop
+# target; roost-iced itself is GTK-free, verified independently by the
+# Cargo boundary gate in `make check-iced`.
+log "apt: GTK4 + libadwaita (XDND drag-source test dependency only), Wayland test compositors, X11 input, python test deps"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
 sudo apt-get install -y -qq \

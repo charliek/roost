@@ -5,7 +5,7 @@ Closes both coverage gaps that #142 and #145 left open:
 * **#142** (`bold-color`): the existing resolver tests pass
   `boldColor` explicitly into `resolve_cell_colors` /
   `resolveCellColors`. They don't exercise the production
-  call sites (`crates/roost-linux/src/terminal_view.rs::paint` /
+  call sites (`crates/roost-iced/src/terminal_widget.rs::draw` /
   `mac/Sources/Roost/TerminalView.swift::draw`). A revert to
   `None`/`nil` would still pass the unit tests. The
   `tab.dump_resolved` IPC op walks the SAME `resolve_cell_colors`
@@ -23,8 +23,8 @@ Closes both coverage gaps that #142 and #145 left open:
 Plus parity coverage for the other OSC-routed behaviors (title /
 cwd / notification) that are currently unit-tested only.
 
-Every UI target runs these in CI (e2e-gtk, e2e-mac, and the three iced
-lanes) with `ROOST_TEST_MODE: "1"` set in the workflow env block.
+Every UI target runs these in CI (e2e-mac and the iced lanes) with
+`ROOST_TEST_MODE: "1"` set in the workflow env block.
 """
 
 from __future__ import annotations
@@ -221,7 +221,7 @@ class TestOscPipeline:
 
     def test_osc11_same_chunk_set_query_replies_pre_chunk_color(self, roost, project):
         """SET + QUERY in ONE chunk answers from the chunk-start
-        colors — pinned behavior on all three UIs, not an accident of
+        colors — pinned behavior on both UIs, not an accident of
         one implementation.
 
         This used to be a skipped "known #145 limitation" slot,
@@ -230,7 +230,7 @@ class TestOscPipeline:
         argument no longer applies, and pinned the SAME semantics
         explicitly: `OscRouter::feed`'s contract (a SET affects a LATER
         chunk's query; SET+QUERY in one chunk sees the pre-chunk value)
-        is what all three UIs implement. Asserting only the negative —
+        is what both UIs implement. Asserting only the negative —
         the just-set color is NOT echoed — keeps this target-agnostic
         without hard-coding a theme color.
         """

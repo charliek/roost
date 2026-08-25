@@ -3,9 +3,16 @@
 Canonical `(row, col, click_count, break_chars) → WordSpan` corpus for
 the double-/triple-click selection algorithm in
 `mac/Sources/Roost/WordSelection.swift` (Swift) and
-`crates/roost-linux/src/word_selection.rs` (Rust). Both ports load
+`crates/roost-ui-model/src/word_selection.rs` (Rust). Both ports load
 these files and assert byte-exact equality — drift between the two
 implementations surfaces here.
+
+Loaders:
+
+- Rust: `crates/roost-ui-model/tests/word_fixtures_test.rs`
+  (`cargo test -p roost-ui-model`).
+- Swift: `mac/Tests/RoostTests/WordFixtureRoundTripTests.swift`
+  (`cd mac && swift test`).
 
 Same pattern as [`tests/url-fixtures/`](../url-fixtures/README.md) and
 [`tests/ipc-vectors/`](../ipc-vectors/README.md).

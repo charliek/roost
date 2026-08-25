@@ -1,7 +1,8 @@
-"""Sidebar resize contract — `sidebar.set_width` on all three UIs.
+"""Sidebar resize contract — `sidebar.set_width` on both UIs.
 
-The programmatic twin of dragging the seam (plan 011). One op, three
-arms (Iced, GTK, Mac), one behavioral contract pinned here:
+The programmatic twin of dragging the seam (plan 011). One op, two
+arms (Iced, Mac; the now-removed GTK UI made three), one behavioral
+contract pinned here:
 
 * the applied width is observable on `app.window_metrics` and reaches
   the terminal grid (a wider sidebar means fewer PTY columns);
@@ -63,11 +64,13 @@ WIDER_WIDTH_PT = 300.0
 def _sidebar_width_is(roost: Roost, expected: float) -> bool:
     """Predicate: the sidebar is expanded AND reports `expected` ±1pt.
 
-    Both clauses matter. GTK's `set_visible(true)` flips `is_visible()`
-    synchronously but queues the layout pass on the idle cycle, so a
-    freshly-uncollapsed sidebar reports `collapsed=False, width=0` for
-    an interval — see `test_sidebar_layout._window_and_sidebar_settled`
-    for the same race.
+    Both clauses matter. iced computes `sidebar_width` synchronously
+    from workspace state the moment a toggle/resize lands (no separate
+    idle layout pass, unlike the now-removed GTK UI), but polling both
+    still guards against reading `window_metrics` mid-IPC-round-trip,
+    before a preceding mutation has actually landed — see
+    `test_sidebar_layout._window_and_sidebar_settled` for the same
+    reasoning.
     """
     m = roost.window_metrics()
     if m["sidebar_collapsed"]:
@@ -209,7 +212,7 @@ def _restore_sidebar(target):
     with Roost(ui.socket_path(target)) as client:
         original_collapsed = bool(client.window_metrics()["sidebar_collapsed"])
         # `_toggle_to_visible` waits for a non-zero allocation, so the
-        # read below can't catch the GTK `visible=True, width=0` transient.
+        # read below can't catch the `visible=True, width=0` transient.
         _toggle_to_visible(client)
         original_width = float(client.window_metrics()["sidebar_width"])
         if original_collapsed:
@@ -246,12 +249,13 @@ class TestSidebarResize:
         # One-op-set parity (issue #287): with a terminal live and mounted
         # (guaranteed by `_live_tab` above — Mac omits the fields until one
         # is), every UI answers `terminal_font_family` as a non-empty string
-        # on `app.window_metrics` (iced resolves the active family, GTK
-        # reports the family it fell back to, Mac reports
-        # `TerminalView.font`'s family). `terminal_top` stays optional —
-        # GTK omits the KEY entirely; an explicit `null` (also what serde
-        # emits for a non-finite f64) is a contract violation, so the
-        # omitted-vs-null distinction is asserted, not `.get()`-flattened.
+        # on `app.window_metrics` (iced resolves the active family, Mac
+        # reports `TerminalView.font`'s family; the now-removed GTK UI
+        # reported the family it fell back to). `terminal_top` stays
+        # optional — the now-removed GTK UI omitted the KEY entirely; an
+        # explicit `null` (also what serde emits for a non-finite f64) is
+        # a contract violation, so the omitted-vs-null distinction is
+        # asserted, not `.get()`-flattened.
         metrics = roost.window_metrics()
         family = metrics.get("terminal_font_family")
         assert isinstance(family, str) and family, (
@@ -397,7 +401,7 @@ class TestSidebarResize:
     def test_width_survives_relaunch(self, roost, target):
         """The persistence half: a chosen width outlives the process.
 
-        GTK/Iced write it through to `state.json` (`sidebar_width`), the
+        Iced writes it through to `state.json` (`sidebar_width`), the
         Mac UI to `RoostSidebarWidth` in UserDefaults. Both must restore
         it at launch — a UI that only persisted on drag-release, or that
         overwrote the stored value with its launch default, fails here.
@@ -418,7 +422,7 @@ class TestSidebarResize:
                 "(--roost-fresh / ROOST_TEST_FRESH=1, or no UI already running)"
             )
         skip_on_ci(
-            "quit + relaunch is unreliable on CI: GTK xvfb has no WM, and the slow "
+            "quit + relaunch is unreliable on CI: iced xvfb has no WM, and the slow "
             "macOS LaunchServices respawn pushes wait_alive past its 90s budget",
             alt_coverage="Rust sidebar_width_persists_across_reopen + "
             "Swift sidebarWidthPersistsClampedValue",

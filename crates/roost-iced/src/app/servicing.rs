@@ -10,9 +10,8 @@ pub(crate) struct AgentMetricsResult {
 
 /// `Workspace::open_tab` commits and broadcasts `TabOpened` before the
 /// caller's `PtySupervisor::spawn` promotes the session, so the attach the
-/// event drives can land in that gap and fail. GTK ships the same bounded
-/// retry for the same race (`roost-linux/src/app.rs`, #267): forty
-/// attempts, 25 ms apart. Attempt one is the reconcile that noticed the
+/// event drives can land in that gap and fail. The bounded retry that
+/// covers it (#267): forty attempts, 25 ms apart. Attempt one is the reconcile that noticed the
 /// tab; the rest are [`Message::AttachRetryTick`].
 pub(super) const ATTACH_RETRY_LIMIT: u32 = 40;
 pub(crate) const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(25);
@@ -145,9 +144,9 @@ pub(super) fn collect_tab_output(
         // The session attaches with the OSC opt-in, so PTY output
         // arrives already scanned: its color-query replies left from the
         // drain (that is D10's whole point) and what reaches here is the
-        // remaining actions. `Bytes` is the un-opted-in shape — GTK's —
-        // and cannot occur on this path; treat it as a chunk with no
-        // actions rather than asserting.
+        // remaining actions. `Bytes` is the un-opted-in shape — the
+        // (now-removed) GTK UI's — and cannot occur on this path; treat
+        // it as a chunk with no actions rather than asserting.
         TabOutput::Bytes(bytes) => {
             tab.write_vt(&bytes);
             collected.touched.insert(tab_id);
@@ -177,8 +176,9 @@ pub(super) fn collect_tab_output(
 /// A click on the OS notification banner, decided off the core alone so it
 /// is testable without an `App`: focus the tab the banner named and clear
 /// its pending notification, then say what raise the click earned. `None`
-/// is a tab that closed between the banner and the click — GTK's
-/// `focus_tab_by_id` bails on the same `focus_tab` error.
+/// is a tab that closed between the banner and the click — the
+/// (now-removed) GTK UI's `focus_tab_by_id` bailed on the same
+/// `focus_tab` error.
 ///
 /// The raise is best-effort: a window that has not opened yet has no id,
 /// and the tab focus still landed in the core either way. On Wayland,
@@ -226,8 +226,8 @@ fn read_dock_badge() -> Result<Option<String>, String> {
 }
 
 /// The iced UI also builds for Linux, where there is no Dock. Same
-/// verdict as the GTK arm: reject, so the op can never report a cleared
-/// badge on a platform that has none.
+/// verdict as the (now-removed) GTK UI's arm: reject, so the op can
+/// never report a cleared badge on a platform that has none.
 #[cfg(not(target_os = "macos"))]
 fn read_dock_badge() -> Result<Option<String>, String> {
     Err("app.dock_badge is not supported on this UI (macOS iced only)".into())
@@ -308,8 +308,8 @@ fn read_notification_status() -> Result<AppNotificationStatusResult, String> {
 /// (`app.dock_badge`, `app.menu_dump`, `app.menu_activate`,
 /// `app.update_status`, `app.update_check`, `app.notification_status`):
 /// platform rejection outranks the test-mode gate, so non-macOS iced
-/// answers not-implemented (from `read` itself) like GTK does, not
-/// not-enabled.
+/// answers not-implemented (from `read` itself), same as the
+/// (now-removed) GTK UI did, not not-enabled.
 fn macos_test_gated<T>(
     test_mode: bool,
     read: impl FnOnce() -> Result<T, String>,
@@ -662,9 +662,10 @@ impl App {
                 has_pending: false,
             } => {
                 // A clear keeps the tab's server id: the banner may still
-                // be on the desktop, and GTK's constant per-tab id makes a
-                // later re-notify replace it — forgetting the id here
-                // would stack a duplicate beside it instead.
+                // be on the desktop, and a constant per-tab id (as the
+                // now-removed GTK UI used too) makes a later re-notify
+                // replace it — forgetting the id here would stack a
+                // duplicate beside it instead.
                 self.notification_inbox.remove(tab_id);
             }
             WorkspaceEvent::TabClosed { tab_id } => {
@@ -2290,9 +2291,9 @@ mod tests {
     /// `cached_theme_generation` guard exists precisely to force a full
     /// rebuild off that bump — today nothing but the default fg/bg pair
     /// (already covered by the default-color guard) is theme-derived, but
-    /// the guard is there so a future theme-derived input (e.g. GTK's
-    /// `bold_color` override) fails safe toward over-rebuilding rather than
-    /// silently keeping stale rows.
+    /// the guard is there so a future theme-derived input (e.g. a
+    /// `bold_color` override, like the now-removed GTK UI's) fails safe
+    /// toward over-rebuilding rather than silently keeping stale rows.
     ///
     /// Measured while writing this test: `apply_theme_candidate`'s color
     /// FFI calls (`set_color_foreground`/`background`/`cursor`/`palette`)

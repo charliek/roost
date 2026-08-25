@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from client import RoostError, Timeout
+from client import Timeout
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -77,15 +77,9 @@ def test_inbox_lists_pending_via_palette(roost, project, palette):
     assert by_id[f"notif:{a}"].get("subtitle") == "passed"
 
 
-def test_jump_to_notification_focuses_and_clears(roost, project, palette, target):
+def test_jump_to_notification_focuses_and_clears(roost, project, palette):
     """Activating an inbox row jumps to that tab (the triage action) and
-    clears its badge — closing the palette.
-
-    GTK-only extra (plan 005 §3.11): `ensure_sidebar_visible()` was added
-    to the agent-row jump and retrofitted onto this pre-existing
-    notification-jump path (a cross-UI divergence from Mac's
-    `ensureSidebarVisible()` this plan's review surfaced), so a jump from
-    a collapsed sidebar must reveal it."""
+    clears its badge — closing the palette."""
     a = roost.open_tab(project, cwd="/tmp")
     b = roost.open_tab(project, cwd="/tmp")  # b is active
     roost.notify(a, "JumpMe")
@@ -93,14 +87,6 @@ def test_jump_to_notification_focuses_and_clears(roost, project, palette, target
     # Wait until the inbox registers a before navigating to jump (it lags
     # the badge on Mac; the frame snapshots at push).
     roost._wait(lambda: f"notif:{a}" in _inbox_ids(palette), 5.0, "inbox registers a")
-
-    if target == "gtk":
-        if not roost.window_metrics()["sidebar_collapsed"]:
-            palette.palette_open()
-            palette.palette_activate("toggle_sidebar")
-            roost._wait(
-                lambda: roost.window_metrics()["sidebar_collapsed"], 5.0, "sidebar collapses"
-            )
 
     palette.palette_open()
     palette.palette_activate("view_notifications")
@@ -110,13 +96,6 @@ def test_jump_to_notification_focuses_and_clears(roost, project, palette, target
     # identify reflects where the user was sent.
     _wait(roost, lambda: roost.identify()["active_tab_id"] == a, "jumped to a (core active)")
     _wait(roost, lambda: roost.tab(a).get("has_notification") is False, "a badge cleared by jump")
-
-    if target == "gtk":
-        _wait(
-            roost,
-            lambda: not roost.window_metrics()["sidebar_collapsed"],
-            "sidebar reappears after the notification jump (§3.11)",
-        )
 
 
 def test_jump_to_unread_focuses_notified_tab(roost, project, palette):
@@ -158,7 +137,7 @@ def test_focused_active_tab_gets_no_badge_and_no_inbox_row(roost, project, palet
 
     roost.notify(active, "Foreground", "should be suppressed")
     if _delivered(roost, active):
-        # The window half of the predicate is false: a headless GTK UI
+        # The window half of the predicate is false: a headless UI
         # under xvfb (no window manager) never becomes active, so the
         # suppression arm is genuinely unobservable here. Not a silent
         # gap — the full four-way matrix is covered by the workspace
@@ -218,10 +197,7 @@ class TestNotificationStatusBareIced:
     `TestDockBadge`'s `_mac_iced_only` gate (test_dock_badge.py).
 
     macOS-iced-only: on Linux iced the backend module is not even
-    compiled in, so the op answers `not-implemented` there too — but
-    that is not this class's shape to assert
-    (`TestNotificationStatusGtkRejects` below pins the not-implemented
-    shape on the UI that always takes it, regardless of host OS)."""
+    compiled in, so the op answers `not-implemented` there too."""
 
     @pytest.fixture(autouse=True)
     def _bare_iced_only(self, target):
@@ -241,25 +217,3 @@ class TestNotificationStatusBareIced:
         # CI's TCC authorization state is unknowable — never assert
         # `authorized` true anywhere in this suite.
         assert status["authorized"] is False, status
-
-
-@pytest.mark.skipif(
-    not TEST_MODE,
-    reason="app.notification_status requires ROOST_TEST_MODE=1 in the UI's launch env",
-)
-class TestNotificationStatusGtkRejects:
-    """No `UNUserNotificationCenter` seam exists on the GTK UI at all —
-    `app.notification_status` must reject loudly rather than answer a
-    plausible `unavailable`, which would pass a test that never
-    exercised the seam. Same reasoning as `app.dock_badge`'s GTK reject
-    arm (`crates/roost-linux/src/app.rs`)."""
-
-    @pytest.fixture(autouse=True)
-    def _gtk_only(self, target):
-        if target != "gtk":
-            pytest.skip("this class pins the GTK reject arm")
-
-    def test_gtk_rejects_as_not_implemented(self, roost):
-        with pytest.raises(RoostError) as caught:
-            roost.app_notification_status()
-        assert caught.value.code == "not-implemented", caught.value

@@ -1,17 +1,13 @@
 # Config parser golden fixtures
 
 Canonical corpus for the `config.conf` value semantics pinned in plan
-008 §3.1 — `crates/roost-linux/src/config.rs` (Rust) and
-`mac/Sources/Roost/Config.swift` (Swift). Both ports load these files
-and assert the same expectations, so drift between the two parsers
-surfaces here rather than as a theme that only fails on one platform.
+008 §3.1 — originally shared between a Rust parser and
+`mac/Sources/Roost/Config.swift` (Swift). Only Swift loads this corpus
+today (`crates/roost-ui-model/src/config.rs`'s own unit tests cover
+the Rust parser directly instead); no equivalent Rust loader exists.
 
-Loaders — the corpus is only a parity guard once **both** read it:
+Loader:
 
-- Rust: `crates/roost-linux/src/config_fixture_tests.rs`
-  (`cargo test -p roost-linux`). An in-binary `#[cfg(test)]` module,
-  not a `tests/` integration test, because the parser is a private
-  binary module.
 - Swift: `mac/Tests/RoostTests/ConfigFixtureTests.swift`
   (`swift test --package-path mac`).
 

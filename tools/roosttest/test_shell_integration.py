@@ -1,4 +1,4 @@
-"""Shell-integration E2E (runs against both --roost-target mac and gtk).
+"""Shell-integration E2E (runs against both --roost-target mac and iced).
 
 P1 — shell type follows Ghostty's platform split: Roost spawns the
 default shell as a LOGIN shell (via `-l`) on **macOS** (so
@@ -9,7 +9,7 @@ Terminal.app), but as a **non-login interactive** shell on **Linux** (so
 read the profile chain and let a stray .bash_profile shadow .bashrc).
 The expected state keys off the UI host OS (`sys.platform`), since the
 Rust default-shell logic gates `-l` on `cfg!(target_os = "macos")`: the
-Mac app and the macOS GTK dev build are login, Linux GTK is non-login.
+Mac app and a macOS iced dev build are login, Linux iced is non-login.
 
 Assertion technique: the asserted substring must appear ONLY in command
 *output*, never in the echoed command line. We print the result through
@@ -57,7 +57,7 @@ def test_default_shell_login_matches_platform(roost, project):
     Linux — Ghostty's platform split (see module docstring). The host OS
     decides because the Rust logic gates `-l` on
     `cfg!(target_os = "macos")`; the Mac app only ever runs on darwin,
-    and the macOS GTK dev build is login too, so `sys.platform` is the
+    and a macOS iced dev build is login too, so `sys.platform` is the
     correct determinant for either target."""
     expect_login = sys.platform == "darwin"
     want = "yes" if expect_login else "no"
@@ -110,19 +110,15 @@ def test_explicit_argv_not_login(roost, project):
     roost.wait_text(tab, "EXARGV:bash=yes login=no", timeout=8)
 
 
-def test_native_cwd_inherits_cd(roost, project, palette, target):
+def test_native_cwd_inherits_cd(roost, project, palette):
     """A new tab inherits the active tab's *current* dir via the native
     cwd read, even when the shell emits no OSC 7 (bare bash). This is the
     P3 fallback that fixes Cmd-T for shells without Roost integration.
 
     Uses /usr (not a symlink on macOS or Linux) so the native read's
-    physical path matches the logical path. Skipped on the macOS GTK dev
-    build, which has no /proc; e2e-mac (proc_pidinfo) and Linux e2e-gtk
-    (/proc) cover the real read in CI.
+    physical path matches the logical path. e2e-mac (proc_pidinfo) and
+    the iced lanes (/proc) cover the real read in CI.
     """
-    if target == "gtk" and sys.platform == "darwin":
-        pytest.skip("GTK native cwd read is Linux-only (/proc); macOS GTK is dev-only")
-
     # Bare shell: no rc, no profile, no integration -> no OSC 7 emitted.
     active = roost.open_tab(project, cwd="/tmp",
                             argv=["/bin/bash", "--norc", "--noprofile"])
@@ -146,13 +142,10 @@ def test_native_cwd_inherits_cd(roost, project, palette, target):
     roost.wait_text(new_id, "NEWTAB_PWD=/usr", timeout=8)
 
 
-def test_launcher_inherits_native_cwd(roost, project, palette, target):
+def test_launcher_inherits_native_cwd(roost, project, palette):
     """The command launcher inherits the active tab's native cwd too —
     parity with Cmd-T — for shells without OSC 7. Uses the seeded
     `Print Pwd` command; skips when the seed config isn't active."""
-    if target == "gtk" and sys.platform == "darwin":
-        pytest.skip("GTK native cwd read is Linux-only (/proc); macOS GTK is dev-only")
-
     probe = palette.palette_open(kind="launcher")
     have_seed = "Print Pwd" in {it["title"] for it in probe["items"]}
     palette.palette_dismiss()
@@ -224,7 +217,8 @@ def test_env_injected(roost, project):
 
 def test_resources_dir_has_scripts(roost, project):
     """The shipped integration scripts are present at ROOST_RESOURCES_DIR
-    (Mac: in the .app bundle; GTK: written to the XDG cache at spawn)."""
+    (Mac: in the .app bundle; Linux iced: written to the XDG cache at
+    spawn)."""
     tab = roost.open_tab(project, cwd="/tmp")
     roost.run(
         tab,
@@ -398,7 +392,7 @@ def test_zsh_auto_bootstrap_tracks_cwd(roost, project):
     import shutil
 
     zsh = "/bin/zsh" if os.path.exists("/bin/zsh") else (shutil.which("zsh") or "")
-    # In fresh mode (CI), the GTK + Mac runners are provisioned with zsh — a
+    # In fresh mode (CI), the Linux + Mac runners are provisioned with zsh — a
     # missing binary is a CI-provisioning regression, NOT a benign capability
     # gap. Outside fresh mode (dev hosts), skip cleanly when zsh isn't
     # installed.

@@ -232,8 +232,9 @@ async fn injected_bytes_share_the_drain_router_and_state() {
     assert!(captured.contains("0000/1111/2222"), "{captured:?}");
 }
 
-/// (d) The GTK default: raw bytes, byte-identical, and no drain-side
-/// reply — the UI keeps its own router and answers queries itself.
+/// (d) The default (the now-removed GTK UI's only mode): raw bytes,
+/// byte-identical, and no drain-side reply — the UI keeps its own
+/// router and answers queries itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_default_path_forwards_raw_bytes_and_answers_nothing() {
     let mut harness = harness(907, false);

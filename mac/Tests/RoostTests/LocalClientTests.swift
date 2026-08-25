@@ -24,7 +24,7 @@ struct LocalClientOSCTests {
     @Test func osc7ReturnsNilForHostWithoutPath() {
         // `file://host` (no path after host) — must NOT return
         // "host" as the path. The Rust side has the same regression
-        // test (`parse_osc7_path` in roost-linux/src/local_client.rs).
+        // test (`parse_osc7_path` in crates/roost-engine/src/application.rs).
         #expect(parseOSC7Path("file://host") == nil)
     }
 
@@ -58,8 +58,8 @@ struct LocalClientOSCTests {
 }
 
 // OSC routing through the workspace. Mirrors the Rust suite in
-// `crates/roost-linux/src/local_client.rs`. No PTY is ever spawned —
-// `applyOSC` only touches the workspace.
+// `crates/roost-engine/src/application.rs` (shared by iced). No PTY
+// is ever spawned — `applyOSC` only touches the workspace.
 @MainActor
 @Suite("LocalClient OSC routing")
 struct LocalClientOSCRoutingTests {

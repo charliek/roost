@@ -48,10 +48,10 @@ def roostctl_path() -> str:
     """Absolute path to a `roostctl` binary, building one if needed.
 
     Checked in the order a developer's tree makes them available: an
-    explicit override, the cargo debug build (what CI's GTK job builds),
+    explicit override, the cargo debug build (what CI's iced job builds),
     the binary embedded in the Mac bundle (what CI's Mac job builds),
     then PATH. The cargo fallback mirrors `ui.launch`, which builds the
-    GTK UI the same way when it's missing."""
+    iced UI the same way when it's missing."""
     candidates = [
         os.environ.get("ROOST_ROOSTCTL", ""),
         str(REPO_ROOT / "target/debug/roostctl"),

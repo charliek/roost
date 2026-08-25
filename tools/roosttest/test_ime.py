@@ -25,8 +25,7 @@ here needs more than one.
   that one commit and is then consumed (a fresh preedit disarms it
   first via the non-empty-text check in `set_preedit_in`).
 
-Iced-only: `tab.feed_ime` raises `RoostError('not-implemented')` on the
-GTK target (see `client.py`'s docstring); Mac has no IME test-mode op.
+Iced-only: Mac has no IME test-mode op at all.
 """
 
 from __future__ import annotations

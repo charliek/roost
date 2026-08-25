@@ -1,7 +1,7 @@
 """pytest fixtures for the Roost E2E suite.
 
-Parameterized by target UI (`--roost-target mac|gtk|iced`, default `$ROOST_TARGET`
-or `gtk`). A session fixture ensures the UI is running (launching it if
+Parameterized by target UI (`--roost-target mac|iced`, default `$ROOST_TARGET`
+or `iced`). A session fixture ensures the UI is running (launching it if
 needed, and quitting only what it launched). Each test gets a fresh
 `roost` client and a throwaway `project` that's cascade-cleaned after.
 """
@@ -9,7 +9,6 @@ needed, and quitting only what it launched). Each test gets a fresh
 from __future__ import annotations
 
 import os
-import sys
 import uuid
 
 import pytest
@@ -17,32 +16,10 @@ import ui
 from client import Roost
 
 
-# GLib domain `*-CRITICAL` lines that are known-benign under the headless e2e
-# environment. Curate from a baseline run — currently EMPTY: the full GTK suite
-# is critical-clean. Add entries as a tight substring + a `# reason`, mirroring
-# the clippy.toml guards, only after confirming the line is environmental.
-_GTK_CRITICAL_ALLOWLIST: list[str] = []
-
-# macOS-dev only: Homebrew GTK has no session D-Bus, so GIO's bus wiring
-# fires exactly these three criticals at teardown. Scoped by platform, not
-# by probing DBUS_SESSION_BUS_ADDRESS — CI's ubuntu runners under xvfb-run
-# don't reliably export it either, and this gate must stay strict there.
-# Every OTHER critical remains fatal on macOS dev too (deliberately not a
-# wholesale skip-on-darwin).
-# Full `func: assertion` text, not bare function names — a different
-# (real) critical raised from the same GIO function must still fail.
-_DARWIN_DEV_ALLOWLIST: list[str] = [
-    # no session D-Bus (Homebrew GTK, macOS dev):
-    "g_bus_watch_name_on_connection: assertion 'G_IS_DBUS_CONNECTION (connection)' failed",
-    "g_dbus_connection_signal_subscribe: assertion 'G_IS_DBUS_CONNECTION (connection)' failed",
-    "g_dbus_connection_call_internal: assertion 'G_IS_DBUS_CONNECTION (connection)' failed",
-]
-
-
 def pytest_addoption(parser):
     parser.addoption(
         "--roost-target", action="store", default=None, choices=list(ui.TARGETS),
-        help="which UI to drive (mac|gtk|iced); default $ROOST_TARGET or gtk",
+        help="which UI to drive (mac|iced); default $ROOST_TARGET or iced",
     )
     parser.addoption(
         "--roost-fresh", action="store_true", default=False,
@@ -68,7 +45,7 @@ def target(pytestconfig) -> str:
     return (
         pytestconfig.getoption("--roost-target")
         or os.environ.get("ROOST_TARGET")
-        or "gtk"
+        or "iced"
     )
 
 
@@ -78,37 +55,9 @@ def _ui_session(target, fresh):
     # (launched it with a throwaway state dir); only then do we quit it +
     # clean up at teardown. A reused dev UI is left running and untouched.
     started_here = ui.start_session(target, fresh=fresh)
-    # Capture the captured-log path up front: `end_session` clears the global,
-    # but the file persists, so the #234 critical gate below can read it after
-    # the UI has fully stopped (complete log, including shutdown-time lines).
-    spec = ui.TARGET_SPECS[target]
-    gtk_log = ui._GTK_LOG if (started_here and spec.scans_gtk_criticals) else None
     yield
     if started_here:
         ui.end_session(target)
-    # Gate (#234): with the harness-owned GTK UI now stopped, fail the session
-    # if it emitted any non-allowlisted GLib `*-CRITICAL`. The focus crash was a
-    # `Gtk-CRITICAL` storm no individual test would fail on (a critical doesn't
-    # fail a test on its own); this is the cheap permanent net the panel asked
-    # for. Folded into this fixture — rather than a separate one — so the scan
-    # runs deterministically AFTER `end_session`, not on fragile cross-fixture
-    # teardown order. Surfaces as an ERROR-at-teardown (still a non-zero exit).
-    # (`G_DEBUG=fatal-criticals` as a separate diagnostic lane is a follow-up.)
-    if gtk_log is not None and gtk_log.exists():
-        allowlist = _GTK_CRITICAL_ALLOWLIST + (
-            _DARWIN_DEV_ALLOWLIST if sys.platform == "darwin" else []
-        )
-        bad = [
-            line
-            for line in gtk_log.read_text(errors="replace").splitlines()
-            if "-CRITICAL **:" in line
-            and not any(allow in line for allow in allowlist)
-        ]
-        assert not bad, (
-            f"{len(bad)} non-allowlisted GLib *-CRITICAL line(s) in the GTK UI "
-            "log — a focus/teardown regression like #234 surfaces here. "
-            "First 20:\n" + "\n".join(bad[:20])
-        )
 
 
 @pytest.fixture

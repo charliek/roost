@@ -5,8 +5,7 @@
 //! machine surfaces on whichever side regressed.
 //!
 //! Format documented in `tests/agent-state-fixtures/README.md`.
-//! Integration-test form (in `tests/`) for the same reason as
-//! `crates/roost-linux/tests/word_fixtures.rs`: the path walk starts at
+//! Integration-test form (in `tests/`) because the path walk starts at
 //! `CARGO_MANIFEST_DIR` and climbs to the workspace `tests/` directory.
 
 use std::collections::{BTreeMap, BTreeSet};

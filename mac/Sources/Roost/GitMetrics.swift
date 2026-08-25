@@ -1,7 +1,7 @@
 // Git metrics for the agents palette (plan 005 §3.7).
 //
-// The Swift mirror of `crates/roost-linux/src/git_metrics.rs`, semantics
-// for semantics: each agent row shows what its repo looks like right now
+// The Swift mirror of `crates/roost-engine/src/git_metrics.rs` (shared
+// by iced), semantics for semantics: each agent row shows what its repo looks like right now
 // — `"Nf +A -D"` (files touched, lines added, lines deleted) — probed
 // asynchronously so the palette never blocks on `git`. Everything here is
 // seam-shaped: a `CommandRunner` is injected, so the pipeline (dedupe →
@@ -73,7 +73,8 @@ protocol CommandRunner: Sendable {
 /// argv exec (no shell), `LC_ALL=C`, no stdin, stderr to `/dev/null`,
 /// stdout capped. Cancellation — which is how `GitProbe` enforces its
 /// timeout, and how a dropped batch unwinds — escalates SIGTERM →
-/// SIGKILL at the child, the analog of the GTK runner's `kill_on_drop`.
+/// SIGKILL at the child, the analog of `crates/roost-engine/src/git_metrics.rs`'s
+/// `kill_on_drop` (shared with iced).
 final class GitRunner: CommandRunner {
     /// Captured stdout ceiling. Past it we can't trust a count anyway (a
     /// truncated `ls-files -z` under-counts), so the probe errors out.
@@ -99,9 +100,9 @@ final class GitRunner: CommandRunner {
         -> CommandOutput
     {
         let proc = Process()
-        // `/usr/bin/env` resolves argv[0] against PATH the way the GTK
-        // side's `Command::new("git")` does — no shell, no quoting, and a
-        // missing `git` surfaces as a non-zero exit (→ `—`).
+        // `/usr/bin/env` resolves argv[0] against PATH the way
+        // `roost-engine`'s `Command::new("git")` does — no shell, no
+        // quoting, and a missing `git` surfaces as a non-zero exit (→ `—`).
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         proc.arguments = argv
         var environment = ProcessInfo.processInfo.environment
@@ -165,7 +166,7 @@ final class GitRunner: CommandRunner {
 /// queue owns. `Process` isn't `Sendable`; the lock is what makes this
 /// safe. Internal rather than file-private so the cancel-vs-spawn
 /// orderings are unit-testable — that race is the whole reason this type
-/// exists (the GTK side gets it for free from `kill_on_drop`).
+/// exists (`roost-engine` gets it for free from tokio's `kill_on_drop`).
 final class ChildProcess: @unchecked Sendable {
     private let lock = NSLock()
     private var proc: Process?
@@ -379,7 +380,7 @@ final class GitProbe: Sendable {
 
     /// One command, permit-gated and time-boxed. On timeout the runner's
     /// task is cancelled, which kills the child (`ChildProcess.cancel`) —
-    /// the same shape as the GTK side dropping a `kill_on_drop` future.
+    /// the same shape as `roost-engine` dropping a `kill_on_drop` future.
     private func run(cwd: String, argv: [String]) async throws -> CommandOutput {
         try await slots.withPermit {
             try await withThrowingTaskGroup(of: CommandOutput.self) { group in

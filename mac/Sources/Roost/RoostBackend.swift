@@ -26,9 +26,8 @@ import Foundation
 
 /// The running UI, as seen by the IPC handler. One seam for every
 /// main-thread-only op so the handler never reaches for `NSApp.delegate`
-/// or pokes AppKit directly. `RoostApp` is the only conformer; the
-/// GTK side's equivalent is the `UiRequest` channel
-/// (`crates/roost-linux/src/ipc.rs`).
+/// or pokes AppKit directly. `RoostApp` is the only conformer; iced's
+/// equivalent is the `UiRequest` channel (`crates/roost-engine/src/ipc.rs`).
 @MainActor
 protocol UiBridge: AnyObject {
     /// Main window, for whole-window ops (`app.screenshot`).
@@ -57,7 +56,7 @@ protocol UiBridge: AnyObject {
     /// no live tab holds that id.
     func dumpTab(tabID: Int64) -> TerminalView.Dump?
 
-    // Command-palette drive surface (`palette.*` ops). The GTK side's
+    // Command-palette drive surface (`palette.*` ops). iced's
     // equivalent is the `UiRequest::Palette*` arms. Each returns the
     // resulting palette state; `paletteActivate` returns `nil` when no
     // palette is open or no visible row matched (→ `not-found`).
@@ -147,7 +146,7 @@ protocol UiBridge: AnyObject {
 }
 
 /// Outcome from `UiBridge.expandTabSelectionAt` — mirrors
-/// `roost_linux::ipc::ExpandSelectionData`. `text` is the extracted
+/// `roost_engine::ipc::ExpandSelectionData`. `text` is the extracted
 /// selection content, or `nil` when the renderer reports an empty
 /// selection (off-screen row, single-cell span outside the viewport).
 struct ExpandSelectionOutcome: Sendable {
@@ -214,8 +213,8 @@ final class RoostBackend {
     /// `ROOST_TEST_MODE=1` was set in the app's environment at launch.
     /// Read ONCE in `start(...)` and stashed here, so per-op dispatch is
     /// a cheap bool check rather than a fresh `ProcessInfo` lookup and
-    /// a tester can't toggle the gate mid-session. The matching env
-    /// var name on the GTK side reads the same `ROOST_TEST_MODE=1`.
+    /// a tester can't toggle the gate mid-session. iced reads the same
+    /// `ROOST_TEST_MODE=1` env var.
     /// When false, the gated ops `tab.feed_pty_bytes` and
     /// `tab.capture_pty_input` return `not-enabled` and the capture
     /// buffer map stays empty (zero overhead in production).
@@ -224,8 +223,8 @@ final class RoostBackend {
     /// Per-tab capture buffers for `tab.capture_pty_input`. Populated
     /// only when `testMode` is true; the buffer is appended-to by the
     /// `onKey` closure tap installed in `TabSession.start()` /
-    /// `.attach()`. Mac doesn't need a feed-channel map (`feed_senders`
-    /// on the GTK side) because `TerminalView.appendBytes(_:)` is the
+    /// `.attach()`. Mac doesn't need a feed-channel map (the now-removed
+    /// GTK UI's `feed_senders`) because `TerminalView.appendBytes(_:)` is the
     /// real PTY-output entry point — `feedTabPtyBytes` calls it
     /// directly on the live `TerminalView`, with no parallel channel
     /// to plumb.
@@ -309,7 +308,7 @@ final class RoostBackend {
         if started { return }
         started = true
         self.holdsSocketLock = holdsSocketLock
-        // Read ROOST_TEST_MODE once at boot. Matches the GTK side
+        // Read ROOST_TEST_MODE once at boot. Matches iced's
         // `env::var("ROOST_TEST_MODE").as_deref() == Ok("1")`.
         self.testMode = ProcessInfo.processInfo.environment["ROOST_TEST_MODE"] == "1"
 
@@ -332,8 +331,8 @@ final class RoostBackend {
         // linger as a dead tab: `runShellSession` closes its own tab on
         // exit but `attachShellSession` deliberately doesn't, and the
         // round-trip was async. Routing every `.tabExited` through
-        // `closeTab` here mirrors the GTK side's
-        // `TabOutput::Exit → close_page_for_tab` path, and the
+        // `closeTab` here mirrors iced's own `TabOutput::Exit` handling
+        // (`crates/roost-engine/src/session.rs`), and the
         // cascade in `Workspace.closeTab` then closes the project when
         // it was the last tab. `closeTab` is idempotent — a racing
         // close (e.g. `runShellSession`'s own teardown) throws

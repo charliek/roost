@@ -12,10 +12,10 @@ description = "Roost Iced proof-of-concept UI adapter over roost-engine"
 workspace = true
 
 # Packaging-only. The Linux .deb builds with this on so the shipped binary
-# resolves the production `roost` namespace (socket, state.json, log dir) that
-# the GTK package already owns, letting existing users migrate in place. Dev
-# builds leave it off and keep the isolated `roost-iced` profile so both UIs
-# run side by side.
+# resolves the production `roost` namespace (socket, state.json, log dir) an
+# installed Roost already owns, letting existing users migrate in place. Dev
+# builds leave it off and keep the isolated `roost-iced` profile so a dev build
+# runs side by side with an installed one.
 #
 # Never build this crate with `--all-features`: that would hand a dev binary
 # the production profile and point it at the user's real state.json.

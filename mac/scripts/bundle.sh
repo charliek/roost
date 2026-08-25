@@ -65,7 +65,7 @@ source "${SCRIPT_DIR}/bundle-lib.sh"
 
 # Default the marketing version to the workspace's single source of
 # truth — see roost_workspace_version in bundle-lib.sh — so a local
-# `bundle.sh debug` reports the same version the GTK UI, the .deb, and
+# `bundle.sh debug` reports the same version the iced UI, the .deb, and
 # `roostctl identify` do. The release workflow still overrides
 # ROOST_VERSION from the git tag (asserted to match Cargo.toml).
 VERSION="${ROOST_VERSION:-$(roost_workspace_version "${REPO_ROOT}")}"

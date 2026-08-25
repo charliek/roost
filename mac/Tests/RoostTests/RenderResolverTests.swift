@@ -1,5 +1,6 @@
 // Inverse + bold-accent resolver tests, Swift companion to the Rust
-// suite in `crates/roost-linux/src/terminal_view.rs::tests`. The two
+// `resolve_colors` suite in
+// `crates/roost-iced/src/terminal_widget.rs::tests`. The two
 // renderers MUST behave identically for inverse-marked TUI chrome
 // (codex's `\e[7m` prompt row) and bold default-fg text — getting
 // either case wrong produces a visible regression. The cases below

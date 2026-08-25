@@ -2,16 +2,17 @@
 
 The bug (#TBD, sibling to #159): on macOS, widening the window grew the
 project sidebar proportionally instead of letting the terminal pane
-absorb the delta. GTK was correct via `gtk4::Paned` with
-`resize_start_child(false) + shrink_start_child(false)`. This file
-locks in the parity assertion on both UIs.
+absorb the delta. The now-removed GTK UI was correct via
+`gtk4::Paned` with `resize_start_child(false) + shrink_start_child(false)`;
+iced holds the sidebar width the same way. This file locks in the
+parity assertion on both UIs.
 
 `window.resize` is test-mode-gated, so the whole file is skipped when
 `ROOST_TEST_MODE` is unset — the bare resize attempt would fail with
 `not-enabled` and produce noisy "wrong reason" failures.
 
 Capability gate (instead of a blanket CI skip): a resize only lands if
-the environment honors it up to the available screen. GTK CI runs xvfb
+the environment honors it up to the available screen. Iced CI runs xvfb
 with a large virtual screen (`-screen 0 2560x1440x24`) so the toplevel
 resizes the full amount and these run there; but a tiling/constraining
 compositor (some local setups) or a small screen may grant only a
@@ -46,13 +47,17 @@ def _window_and_sidebar_settled(roost, target_width: float) -> bool:
     """Predicate: window width is within tolerance AND, when the sidebar
     is visible, its width is non-zero.
 
-    GTK's `set_visible(true)` flips `is_visible()` synchronously but
-    queues the actual layout pass on the idle cycle, so a freshly-
-    uncollapsed sidebar reports `collapsed=False` with `width=0` until
-    that pass runs. Waiting on window-width alone would race that
-    interval; the next test then reads `sidebar_width=0` and trips its
-    bounds assertion (root cause of the local-env flake fixed in this
-    file).
+    The wait here is for the OS/compositor to actually grant the
+    requested `window.resize` — an external, genuinely async step (see
+    `_resize_settle` below) — not for anything internal to iced: iced's
+    `sidebar_width` is a synchronous function of workspace state
+    (`effective_sidebar_width`, `crates/roost-iced/src/app.rs`), so an
+    uncollapsed sidebar can never itself report `width=0` the way the
+    now-removed GTK UI's async, idle-cycle-queued layout pass could.
+    Waiting on window-width alone would still let a caller read metrics
+    mid-resize before the window has settled; the next test then reads
+    a not-yet-clamped `sidebar_width` and trips its bounds assertion
+    (root cause of the local-env flake fixed in this file).
 
     When the sidebar is genuinely collapsed (`collapsed=True`), the
     second clause short-circuits — `sidebar_width=0` is the correct
@@ -71,8 +76,8 @@ def _resize_settle(roost, target_width: float) -> dict:
     """Request `target_width` and return the settled metrics. Does NOT fail
     if the WM refuses, only partially grants, or stalls the resize — the
     caller gates on the achieved delta, and the bounds assertion catches
-    the layout-stall case with a metric snapshot so the two failure modes
-    don't read identically.
+    a bad-stored-width case with a metric snapshot so the two failure
+    modes don't read identically.
     """
     roost.window_resize(target_width, 700)
     try:
@@ -82,7 +87,7 @@ def _resize_settle(roost, target_width: float) -> dict:
             what=f"window+sidebar settle to {target_width}",
         )
     except Timeout:
-        pass  # WM refused, OR sidebar layout stalled — disambiguated downstream
+        pass  # WM refused the resize, OR the stored sidebar width is bad — disambiguated downstream
     return roost.window_metrics()
 
 
@@ -97,7 +102,8 @@ class TestSidebarLayout:
         Pre-refactor on Mac (raw NSSplitView + tied-priority constraints):
         sidebar grows by ~20% of the window delta. Post-refactor
         (raw NSSplitView + custom splitView(_:resizeSubviewsWithOldSize:)):
-        sidebar holds. GTK has always held; this test pins both behaviors.
+        sidebar holds. iced (and, historically, GTK) has always held;
+        this test pins both behaviors.
         """
         # Seed a known geometry, then widen. The capability gate runs
         # BEFORE any geometry assertion: under a constraining WM (xvfb,
@@ -119,12 +125,14 @@ class TestSidebarLayout:
         assert 160 <= baseline_sidebar <= 400, (
             f"sidebar starting width {baseline_sidebar} out of [160, 400] "
             f"(collapsed={before['sidebar_collapsed']}, "
-            f"window_width={before['window_width']}). "
-            "0.0 with collapsed=False indicates a layout-stall — the GTK "
-            "set_visible(true) idle relayout didn't run within the "
-            "_resize_settle budget. Check whether a preceding test "
-            "toggled the sidebar without waiting for the layout pass "
-            "(see test_sidebar_collapse_persistence::_toggle_to_visible)."
+            f"window_width={before['window_width']}). iced clamps "
+            "sidebar_width into [SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH] "
+            "on every write (crates/roost-engine/src/workspace.rs), and "
+            "reports it synchronously from workspace state — so 0.0 here "
+            "with collapsed=False means the stored width itself is bad, "
+            "not a layout race. Check whether a preceding test left the "
+            "workspace's sidebar width unset or wrote it directly via "
+            "`sidebar.set_width` without going through the clamp."
         )
         # The bug grew the sidebar ~140pt for a 700pt resize; 1pt clears it.
         assert abs(after["sidebar_width"] - baseline_sidebar) <= WIDTH_TOLERANCE_PT, (
@@ -152,16 +160,16 @@ class TestSidebarLayout:
                 "need ≥200pt to exercise the sidebar-hold invariant (no WM?)"
             )
         # Parity with the grow test: assert visible + bounded baseline.
-        # Without these, a `visible=True, sidebar_width=0` transient
-        # (GTK layout-stall after a preceding `set_visible(true)`) would
-        # produce baseline=0 → after=0 → |0-0|<=1pt false-green, defeating
-        # the regression check.
+        # Without these, a `visible=True, sidebar_width=0` reading (a bad
+        # stored width, not a layout race — see
+        # test_sidebar_holds_width_on_window_resize) would produce
+        # baseline=0 → after=0 → |0-0|<=1pt false-green, defeating the
+        # regression check.
         assert not before["sidebar_collapsed"], "sidebar must be visible for the test"
         assert 160 <= baseline_sidebar <= 400, (
             f"sidebar starting width {baseline_sidebar} out of [160, 400] "
             f"(collapsed={before['sidebar_collapsed']}, "
-            f"window_width={before['window_width']}). "
-            "0.0 with collapsed=False indicates a layout-stall — see "
+            f"window_width={before['window_width']}). See "
             "test_sidebar_holds_width_on_window_resize for the diagnostic."
         )
         # The shrink target (1100) is still wide enough that the

@@ -5,7 +5,7 @@ The experimental **Roost-Iced** macOS build ships its own Sparkle feed
 Swift app's. Two bundles, two feeds, two keypairs: a shared key would let
 either app offer the other's updates, which is exactly the failure the
 separate-feed requirement exists to prevent
-(`docs/development/iced-migration-roadmap.md`, "separate keypair").
+(`docs/development/iced-migration.md`, "M6 — macOS iced").
 
 | Half | Where it lives |
 |------|----------------|

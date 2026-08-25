@@ -1,4 +1,4 @@
-"""Thin JSON-IPC client for a running Roost UI (Mac, GTK, or Iced).
+"""Thin JSON-IPC client for a running Roost UI (Mac or Iced).
 
 Speaks the newline-delimited JSON protocol directly over the Unix socket
 — the same contract `roostctl` uses (see docs/reference/ipc.md). Tests
@@ -435,7 +435,8 @@ class Roost:
     # round-trips, and other byte-level wiring end-to-end — the
     # missing rung between Rust/Swift unit tests and the user-driven
     # IO injectors under `tools/input/`. See
-    # `docs/development/test-automation.md` §5.4 for the full rationale.
+    # `docs/development/test-automation.md` ("Test-mode IPC ops") for
+    # the full rationale.
 
     def tab_feed_pty_bytes(self, tab_id: int, data: bytes) -> None:
         """Inject raw bytes into a tab's PTY-output drain as if the
@@ -466,8 +467,7 @@ class Roost:
         `(start, end)` byte-offset pair into `text` for the preedit
         cursor/underline span; both ends are required together.
         Gated by ROOST_TEST_MODE=1 (raises `RoostError('not-enabled')`
-        when off); iced-only for now (`RoostError('not-implemented')`
-        on GTK)."""
+        when off); iced-only for now — Mac has no IME test-mode op."""
         params: dict = {
             "tab_id": str(tab),
             "action": action,
@@ -565,10 +565,10 @@ class Roost:
         the badge write actually landed.
 
         Gated by ROOST_TEST_MODE=1 (raises `RoostError('not-enabled')`
-        when off) and macOS-iced-only: the GTK UI and the iced UI on
-        Linux answer `RoostError('not-implemented')`; the Swift Mac app
-        has no dispatcher case at all and answers
-        `RoostError('unknown-op')` (same as `tab.feed_ime`)."""
+        when off) and macOS-iced-only: the iced UI on Linux answers
+        `RoostError('not-implemented')`; the Swift Mac app has no
+        dispatcher case at all and answers `RoostError('unknown-op')`
+        (same as `tab.feed_ime`)."""
         res = self.call("app.dock_badge", {})
         # Direct key access: a missing field is a protocol violation, and
         # `.get` would read it as "badge cleared" — the exact state the

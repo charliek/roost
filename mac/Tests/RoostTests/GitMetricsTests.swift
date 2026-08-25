@@ -1,7 +1,7 @@
 // Git-metrics tests for the agents palette (plan 005 §3.7).
 //
-// Mirrors `crates/roost-linux/src/git_metrics.rs`'s `mod tests` case for
-// case: the same formatter rules, shortstat fixtures, `ls-files -z`
+// Mirrors `crates/roost-engine/src/git_metrics.rs`'s (shared by iced)
+// `mod tests` case for case: the same formatter rules, shortstat fixtures, `ls-files -z`
 // counting, dedupe/invocation counts, timeout + cancellation, and session
 // cache semantics — asserted on the same strings, through the same
 // injectable runner seam, with no `git` and no repo on disk. A divergence
@@ -428,8 +428,8 @@ private func probeOne(_ fake: FakeGit, _ cwd: String) async throws -> Result<
     }
     #expect(error.message.contains("timed out"), "\(error)")
     // The runner's task was cancelled mid-flight — the real runner's
-    // SIGTERM → SIGKILL escalation fires at exactly this point (the GTK
-    // twin is `kill_on_drop`).
+    // SIGTERM → SIGKILL escalation fires at exactly this point (the
+    // `roost-engine` twin, shared with iced, is `kill_on_drop`).
     #expect(fake.cancelled == 1)
 }
 

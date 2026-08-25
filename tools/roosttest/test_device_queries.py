@@ -21,7 +21,7 @@ No keystroke-interleaving case: `roost.send`/`tab.write` bypasses
 `capture_pty_input` — ordering is proven compositionally in the roost-vt
 + Mac unit tests instead (plan §3.5).
 
-Both targets run these in CI (e2e-gtk + e2e-mac) with
+Both targets run these in CI (iced-build-e2e + e2e-mac) with
 `ROOST_TEST_MODE: "1"` set in the workflow env block.
 """
 

@@ -4,8 +4,10 @@
 //! with an in-process subscription to [`crate::Workspace`]'s
 //! broadcast channel. Events flow to the UI adapter's main thread via
 //! an unbounded mpsc channel that the adapter drains on its own
-//! main-loop task (GTK's `app.rs` drains it via
-//! `glib::spawn_future_local`).
+//! main-loop task (`roost-iced`'s `engine_feed.rs` spawns this as a
+//! tokio task that forwards each event onto one shared `EngineFeed`
+//! queue; a single wake `Subscription` notifies the main loop to
+//! drain the whole queue at once).
 
 use std::sync::Arc;
 

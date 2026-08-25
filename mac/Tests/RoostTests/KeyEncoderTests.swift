@@ -212,9 +212,10 @@ func shift_enter_under_kitty_remains_modified() {
 
 // Kitty CSI-u and fixterms both identify a key by its UNSHIFTED
 // codepoint, which `unshiftedCodepoint(for:)` reads from
-// `characters(byApplyingModifiers: [])`. These pin the wire bytes the
-// GTK encoder is expected to match — `crates/roost-linux/src/key_encoder.rs`
-// has the twin assertions, and it needs a keymap lookup to produce them.
+// `characters(byApplyingModifiers: [])`. These pin the wire bytes
+// iced's encoder is expected to match — `crates/roost-iced/src/input.rs`
+// and `crates/roost-vt/tests/key_encoder_test.rs` have the twin
+// assertions, and it needs a keymap lookup to produce them.
 
 @MainActor
 @Test

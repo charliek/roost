@@ -1,7 +1,7 @@
 //! Toolkit-neutral ordering helpers for pointer-driven list reordering.
 //!
 //! UIs own gesture geometry; the authoritative workspace owns committed
-//! ordering. These helpers bridge the two without embedding GTK or Iced
+//! ordering. These helpers bridge the two without embedding UI-toolkit
 //! concepts in either side.
 
 use std::collections::HashSet;

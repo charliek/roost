@@ -12,7 +12,7 @@
 # before this file and defeats the injection; such users source roost.zsh
 # manually instead.
 #
-# KEEP IN SYNC with crates/roost-linux/src/resources/shell-integration/zsh/.zshenv
+# KEEP IN SYNC with crates/roost-engine/resources/shell-integration/zsh/.zshenv (shared by iced)
 
 if [[ -n "${ROOST_ZSH_ZDOTDIR+X}" ]]; then
     export ZDOTDIR="$ROOST_ZSH_ZDOTDIR"

@@ -6,12 +6,12 @@ both UIs already. So the parity check for the Swift/Rust divergence in
 #262 — Swift handed out `position` from `count` instead of `max+1`, so a
 mid-list close produced duplicate positions, and closing from the front
 put a brand-new tab to the *left* of a tab that predates it — is this
-file: one dual-target e2e (`--roost-target mac|gtk`, both required CI
+file: one dual-target e2e (`--roost-target mac|iced`, both required CI
 gates) instead of a hand-written golden-fixture corpus (§2.4: no generic
 loader exists, and a new group would cost ~250-650 lines for something
-already reachable through the op set). See AGENT_ROADMAP.md's "On the
-Swift/Rust duplication" for why this shape — behavioral, against the real
-op surface — is the parity corpus for anything reachable as an op.
+already reachable through the op set). Behavioral coverage against the
+real op surface, rather than a duplicated golden-fixture corpus, is the
+parity strategy for anything reachable as an op.
 
 What this file pins is the **observable invariant** — positions unique
 within a parent, and display order matching creation order — not the

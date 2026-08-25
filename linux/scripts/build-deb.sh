@@ -6,11 +6,13 @@
 #   out/roost_<version>_<arch>.deb
 #
 # The iced build is done with `--features roost-iced/linux-package`. That
-# feature makes the shipped binary resolve the *production* `roost` bundle
-# profile (socket path, state.json, log dir) that the GTK package already
-# owned, so existing users upgrade in place with no migration step. Regular
-# dev builds omit the feature and keep the isolated `roost-iced` profile so
-# both UIs can run side by side during development.
+# feature makes the shipped binary resolve the production `linux` bundle
+# profile — the `roost/` path namespace (socket, state.json, log dir) that
+# the pre-iced gtk4-rs package already owned (plan 031 retired that UI) —
+# so existing users upgrade in place with no migration step. Regular dev
+# builds omit the
+# feature and keep the isolated `roost-iced` profile so a dev build can run
+# side by side with an installed package during development.
 #
 # This is the developer-facing entry point — the release CI calls it too. Run it
 # on the target architecture (no cross-compile): an amd64 deb is built on amd64,
@@ -71,7 +73,7 @@ done
 # a Cargo feature was compiled in from the binary alone (it doesn't leave a
 # stable, introspectable marker) — that's verified end-to-end by the release
 # smoke test and CI, which exercise the packaged binary against the
-# production `roost` profile paths.
+# production `linux` profile's `roost/` paths.
 
 echo "==> Staging dist/"
 rm -rf "${REPO_ROOT}/dist"

@@ -1,10 +1,11 @@
 // Race-guard tests for the M5 inline rename state on
-// `ProjectRowCellView`. Linux M9's regression test
-// (`crates/roost-linux/src/app.rs::server_driven_marker_drains_on_first_check`)
-// is structurally similar: assert that a sibling-driven mutation
-// arriving while the user is mid-edit does NOT clobber the typing
-// buffer. The Mac equivalent lives on `isEditing` — `configure(...)`
-// must short-circuit when it's true.
+// `ProjectRowCellView`. iced's
+// `concurrent_snapshot_rename_never_overwrites_the_draft`
+// (`crates/roost-iced/src/app/interactions.rs`) is structurally
+// similar: assert that a sibling-driven mutation arriving while the
+// user is mid-edit does NOT clobber the typing buffer. The Mac
+// equivalent lives on `isEditing` — `configure(...)` must
+// short-circuit when it's true.
 
 import AppKit
 import Foundation

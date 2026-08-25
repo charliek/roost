@@ -7,8 +7,7 @@
 //! join them with a spaced en dash, which is how AppKit renders the pair.
 //!
 //! Pure functions — the caller supplies `$HOME` so these stay testable and
-//! free of process state. GTK's `tilde_abbreviate` is home-collapse-only and
-//! could adopt [`abbreviate_path`] later.
+//! free of process state.
 
 use unicode_segmentation::UnicodeSegmentation;
 

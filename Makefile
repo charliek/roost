@@ -1,7 +1,6 @@
 # Roost — common dev tasks. Run `make` (or `make help`) to list them.
 #
-# Three native UIs around libghostty-vt: Swift + AppKit (mac/),
-# Rust + gtk4-rs (crates/roost-linux, in-repo dev/parity), and Rust +
+# Two native UIs around libghostty-vt: Swift + AppKit (mac/) and Rust +
 # iced (crates/roost-iced, what the Linux package ships), plus the
 # roostctl CLI. See docs/development/vision.md for the architecture +
 # north star.
@@ -40,10 +39,10 @@ $(GHOSTTY_LIB):
 # ---- build ------------------------------------------------------------
 
 .PHONY: build build-iced build-mac bundle bundle-iced build-all
-build: $(GHOSTTY_LIB)  ## cargo build the workspace (GTK UI + roostctl)
+build: $(GHOSTTY_LIB)  ## cargo build the workspace (Iced UI + roostctl)
 	cargo build
 
-build-iced: $(GHOSTTY_LIB)  ## Build the isolated Iced POC binary
+build-iced: $(GHOSTTY_LIB)  ## Build the isolated Iced UI binary
 	cargo build -p roost-iced
 
 build-mac: $(GHOSTTY_LIB)  ## swift build the Mac app
@@ -59,11 +58,8 @@ build-all: build bundle  ## Build both UIs + the Mac bundle
 
 # ---- run --------------------------------------------------------------
 
-.PHONY: run-gtk run-iced run-mac
-run-gtk: build  ## Launch the GTK UI (Roost-gtk profile)
-	./target/debug/roost
-
-run-iced: build-iced  ## Launch the Iced POC (Roost-iced profile)
+.PHONY: run-iced run-mac
+run-iced: build-iced  ## Launch the Iced UI (Roost-iced profile)
 	ROOST_BUNDLE_PROFILE=iced ./target/debug/roost-iced
 
 run-mac: bundle  ## Launch the bundled Mac app
@@ -71,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_sparkle.py`'s two classes split by lane: the bare-binary class
@@ -130,11 +126,19 @@ test-mac:  ## swift test (Mac)
 test-harness:  ## Fast unit tests for target/path/capability harness wiring
 	python3 -m unittest discover -s tools/roosttest_unit -v
 
-e2e:  ## pytest E2E suite (ROOST_TARGET=mac|gtk|iced, default gtk; launches the UI)
-	uv run --group test pytest tools/roosttest
-
-e2e-gtk:  ## E2E against the GTK UI
-	uv run --group test pytest tools/roosttest --roost-target gtk
+# `e2e` dispatches rather than running a bare full-dir suite: the full
+# `tools/roosttest` dir includes `test_exit_on_empty.py` / `test_menu_quit.py`,
+# which end the UI they drive (plan 026 D8 / plan 028 C3) — under the iced
+# default that would strand every module the session-scoped harness fixture
+# runs after them. `e2e-iced`'s `ICED_E2E_TESTS` curated list (below) is the
+# safe iced lane; `mac` still runs the full directory (nothing in it ends the
+# Mac app).
+e2e:  ## pytest E2E suite dispatch (ROOST_TARGET=mac|iced, default iced) -> e2e-mac or the curated e2e-iced lane
+	@case "$${ROOST_TARGET:-iced}" in \
+		mac) $(MAKE) e2e-mac ;; \
+		iced) $(MAKE) e2e-iced ;; \
+		*) echo "ROOST_TARGET=$${ROOST_TARGET} is not supported by 'make e2e' (want mac or iced)"; exit 1 ;; \
+	esac
 
 e2e-iced:  ## Required functional E2E against Iced
 	@tests='$(ICED_E2E_TESTS)'; \
@@ -153,9 +157,6 @@ e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not h
 
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest --roost-target mac
-
-e2e-gtk-ci:  ## GTK E2E at CI parity (test-mode + fresh harness-owned UI, isolated state)
-	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh
 
 e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
 	@tests='$(ICED_E2E_TESTS)'; \
@@ -188,9 +189,6 @@ e2e-iced-sparkle:  ## macOS-only: assemble a TEST-KEYED Roost-Iced.app + run the
 	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 \
 		uv run --group test pytest tools/roosttest/test_sparkle.py --roost-target iced --roost-fresh
 
-smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
-	tools/screenshot/smoke.sh gtk
-
 smoke-iced:  ## Screenshot-driven UI smoke against a running Iced UI
 	tools/screenshot/smoke.sh iced
 
@@ -203,9 +201,6 @@ visual-parity:  ## DESTRUCTIVE: close live target UIs, then capture a hermetic c
 smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build-tree resources, asserts it starts)
 	./mac/scripts/bundle.sh debug
 	./mac/scripts/smoke-launch.sh
-
-test-real-input:  ## GTK real-input regressions: focus/core-sync + drag reorder (self-contained Xvfb+xdotool)
-	uv run --group test python tools/input/linux/real_input_check.py
 
 test-iced-real-input: build-iced  ## Iced real clipboard input (self-contained Linux Xvfb+xdotool)
 	ROOST_REQUIRE_REAL_INPUT=1 uv run --group test python tools/input/linux/iced_clipboard_check.py
@@ -231,11 +226,7 @@ fmt-check:  ## Check formatting (what CI's rust-lint runs)
 clippy:  ## Lint Rust at CI parity (warnings are errors)
 	# `-D warnings` matches the `rust-lint` CI job. Without it `make check`
 	# passed while CI failed, which is worse than no local gate at all.
-	# roost-linux is linted separately (it needs GTK), mirroring CI's split;
-	# it's clippy-clean (issue #283) so it gets the same full `-D warnings`
-	# gate, not a narrow denylist.
-	cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
-	cargo clippy -p roost-linux --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # `linux-package` is off in every dev build, so without the second test +
 # clippy pair the packaging configuration would compile for the first time
@@ -244,7 +235,7 @@ check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency
 	cargo clippy -p roost-iced --all-targets -- -D warnings
 	cargo test -p roost-iced --features linux-package
 	cargo clippy -p roost-iced --features linux-package --all-targets -- -D warnings
-	@! cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs|roost-linux) v' || \
+	@! cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs) v' || \
 		( echo "roost-iced has a forbidden GTK dependency"; exit 1 )
 	@! cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced|notify-rust|zbus|arboard) v' || \
 		( echo "roost-engine has a UI toolkit dependency"; exit 1 )

@@ -29,7 +29,7 @@ enum RoostEvent: Sendable {
     /// first event after the subscription registers, so the UI reconciles
     /// against current truth. Heals the boot gap (a tab opened via IPC
     /// before the subscription was live had its `tabOpened` dropped).
-    /// Mirrors GTK's resync-on-subscribe (`crates/roost-linux/src/events.rs`).
+    /// Mirrors iced's resync-on-subscribe (`crates/roost-engine/src/events.rs`).
     case resync
 }
 

@@ -6,9 +6,9 @@ terminal without an extra click (the Swift `makeFirstResponder` policy).
 
 Companion to `test_mouse_tracking.py`, which owns the mode-1004 focus-
 *event* + cursor-shape surface; this module owns the *who-holds-focus*
-surface via the `app.active_terminal_focused` op. GTK reads its logical
-focus widget, while Iced reports the adapter route that actually dispatches
-keyboard events. Both are independent of compositor/toplevel focus.
+surface via the `app.active_terminal_focused` op. Iced reports the
+adapter route that actually dispatches keyboard events, independent of
+compositor/toplevel focus.
 """
 
 from __future__ import annotations
@@ -24,11 +24,11 @@ from util import drain, drain_until_match, wait_tab_attached
 
 @pytest.fixture(autouse=True)
 def _logical_focus_port_only(target):
-    """GTK and Iced expose the common logical focus port. The Mac UI already
-    has the reference behavior; exposing this test-only read port there remains
+    """Iced exposes the logical focus port. The Mac UI already has the
+    reference behavior; exposing this test-only read port there remains
     a follow-up."""
-    if target not in ("gtk", "iced"):
-        pytest.skip("app.active_terminal_focused is implemented by GTK and Iced only")
+    if target != "iced":
+        pytest.skip("app.active_terminal_focused is implemented by Iced only")
 
 
 def _wait_terminal_focused(roost, what: str, timeout: float = 2.0) -> None:
@@ -99,40 +99,16 @@ def test_window_focus_reports_do_not_change_logical_keyboard_owner(roost, projec
     assert b"\x1b[I" in drain_until_match(roost, tab, rb"\x1b\[I")
 
 
-def _focus_critical_lines(since: int) -> list[str]:
-    """New `GTK_IS_WIDGET` focus-family criticals appended to the captured UI
-    log past byte offset `since`. The #234 focus-on-dead-widget crash (and its
-    `unset_state_flags` / `set_focus_child` / `get_parent` siblings) all carry
-    that assertion text. Empty when the harness didn't capture a child (e.g. a
-    reused external UI)."""
-    import ui
-
-    log = ui._GTK_LOG
-    if log is None or not log.exists():
-        return []
-    text = log.read_bytes()[since:].decode("utf-8", errors="replace")
-    return [ln for ln in text.splitlines() if "GTK_IS_WIDGET" in ln]
-
-
-def _gtk_log_len() -> int:
-    import ui
-
-    log = ui._GTK_LOG
-    return len(log.read_bytes()) if (log is not None and log.exists()) else 0
-
-
 def test_navigation_with_notifications_palette_open_keeps_focus_ownership(
-    palette, project, target
+    palette, project
 ):
     """#234 regression: with the notifications palette open, navigating (a
     project switch here) must NOT steal focus back to a terminal — the palette
-    owns focus until it is dismissed — and must emit no `GTK_IS_WIDGET`
-    focus-family critical.
+    owns focus until it is dismissed.
 
     Pre-fix, the active-terminal refocus ran while the palette still owned
     focus; the synchronous tab-pill-click variant grabbed focus off the
-    mid-teardown palette entry and walked a dead widget (the ~1.77M/s
-    `gtk_widget_get_parent: GTK_IS_WIDGET` storm / crash). This drives the
+    mid-teardown palette entry and walked a dead widget. This drives the
     focus-ownership invariant over IPC (`focus_active_terminal` no-ops while a
     palette is open); the real-pointer pill-click path is covered by the
     Wayland cage guard (tracked follow-up)."""
@@ -149,8 +125,6 @@ def test_navigation_with_notifications_palette_open_keeps_focus_ownership(
         roost.focus(a)
         _wait_terminal_focused(roost, what="terminal focused on the first project")
         roost.notify(b, "Build finished", "#234")
-
-        log_at = _gtk_log_len() if target == "gtk" else 0
 
         # Open the notifications palette (the bell surface); confirm it took focus.
         roost.palette_open(kind="commands")
@@ -191,10 +165,6 @@ def test_navigation_with_notifications_palette_open_keeps_focus_ownership(
         # Dismissing restores terminal focus cleanly.
         roost.palette_dismiss()
         _wait_terminal_focused(roost, what="terminal refocused after the palette is dismissed")
-
-        if target == "gtk":
-            crit = _focus_critical_lines(log_at)
-            assert not crit, "#234 focus-on-dead-widget critical(s):\n" + "\n".join(crit[:10])
     finally:
         roost.delete_project(other)  # deterministic cleanup even if an assert fails
 
@@ -206,9 +176,9 @@ def test_project_switch_focuses_terminal(roost):
 
     Forward sentinel for the IPC/keyboard switch path, NOT the F2
     regression: switching via `tab.focus` doesn't focus a sidebar row,
-    so it never reproduced the strand bug (focus left on the clicked
-    GtkListBoxRow, cursor hollow). The real-click F2 regression lives in
-    tools/input/linux/real_input_check.py."""
+    so it never reproduced the strand bug (focus left on a clicked
+    sidebar row, cursor hollow). The real-click F2 regression was a
+    GTK-only issue, covered by the (removed) GTK real-input harness."""
     a = b = None
     try:
         a = roost.create_project(name="focus-a", cwd="/tmp")
@@ -346,11 +316,11 @@ def test_crossproject_focus_not_overwritten(roost):
         roost.focus(a1)
         Roost._wait(lambda: roost.identify()["active_tab_id"] == a1,
                     timeout=4.0, what="core active tab to reach a1")
-        # The overwrite is in the ASYNC GTK ActiveChanged reaction that runs
-        # after focus(a1) returns — it would echo focus_tab(a2) over a1. So
-        # require the core to *stay* on a1 across the reaction window, not
-        # just read a1 once (which the immediate focus_tab result satisfies
-        # even with the bug).
+        # The overwrite is in the ASYNC active-project-changed reaction that
+        # runs after focus(a1) returns — it would echo focus_tab(a2) over
+        # a1. So require the core to *stay* on a1 across the reaction
+        # window, not just read a1 once (which the immediate focus_tab
+        # result satisfies even with the bug).
         deadline = time.monotonic() + scaled_timeout(1.5)
         while time.monotonic() < deadline:
             assert roost.identify()["active_tab_id"] == a1, \

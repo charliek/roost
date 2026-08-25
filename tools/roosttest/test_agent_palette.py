@@ -1,5 +1,5 @@
 """Agent palette E2E — plan 005 §3.10, both targets (`--roost-target
-mac|gtk`). Drives `palette.open kind="agents"`, seeds lifecycles via
+mac|iced`). Drives `palette.open kind="agents"`, seeds lifecycles via
 `tab.agent_report` (and, for the two paths that must exercise the real
 adapter, the actual `roostctl claude-hook` binary), and asserts on the
 wire's `PaletteItemView.agent` payload documented in
@@ -148,20 +148,6 @@ def _make_git_repo(root: Path) -> tuple[Path, str]:
     return repo, "3f +2 -1"
 
 
-def _sidebar_collapsed(roost) -> bool:
-    return bool(roost.window_metrics()["sidebar_collapsed"])
-
-
-def _collapse_sidebar(roost) -> None:
-    """Drive `toggle_sidebar` through the command palette. No-op if
-    already collapsed. Leaves the command palette closed either way."""
-    if _sidebar_collapsed(roost):
-        return
-    roost.palette_open()
-    roost.palette_activate("toggle_sidebar")
-    roost._wait(lambda: _sidebar_collapsed(roost), 5.0, "sidebar collapses via toggle_sidebar")
-
-
 # ---------------------------------------------------------------------------
 # Entry points + the invalid-kind error string
 # ---------------------------------------------------------------------------
@@ -177,7 +163,7 @@ def test_open_kind_agents_and_unknown_kind_is_invalid_param(palette):
     with pytest.raises(RoostError) as ei:
         palette.palette_open(kind=bad)
     assert ei.value.code == "invalid-param"
-    # Byte-identical across both UIs (crates/roost-linux/src/ipc.rs ~L678,
+    # Byte-identical across both UIs (crates/roost-engine/src/ipc.rs ~L787,
     # mac/Sources/Roost/IPCHandlerImpl.swift ~L511) — the parity assertion.
     assert ei.value.message == (
         f'unknown palette kind "{bad}" '
@@ -491,11 +477,6 @@ def test_activate_agent_row_focuses_tab_and_closes_palette(roost, project, targe
     _seed(roost, tab, lifecycle="waiting")
     row_id = f"agent:{tab}"
 
-    if target == "gtk":
-        # §3.11 sidebar parity fix: agent-row activation must reveal a
-        # collapsed sidebar, same as the notification-jump path.
-        _collapse_sidebar(roost)
-
     st = palette.palette_open(kind="agents")
     assert any(it["id"] == row_id for it in st["items"])
     st = palette.palette_activate(row_id)
@@ -504,11 +485,6 @@ def test_activate_agent_row_focuses_tab_and_closes_palette(roost, project, targe
     roost._wait(
         lambda: roost.identify()["active_tab_id"] == tab, 5.0, "agent row activation focuses its tab"
     )
-
-    if target == "gtk":
-        roost._wait(
-            lambda: not _sidebar_collapsed(roost), 5.0, "sidebar reappears after the jump (§3.11)"
-        )
 
 
 def test_activate_row_for_a_closed_tab_does_not_crash(roost, project, palette):

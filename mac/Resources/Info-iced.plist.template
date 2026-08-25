@@ -10,7 +10,7 @@
   the iced UI (`crates/roost-iced`) can be evaluated against the
   Swift app side by side: Sparkle (6c), UNUserNotificationCenter
   (6e), and TCC testing all require a bundled, signed .app — see
-  `docs/development/iced-migration-roadmap.md` § M6.
+  `docs/development/iced-migration.md` (M6).
 
   Distinct identity from Roost.app (Info.plist.template) so the two
   can be installed and run in parallel: CFBundleIdentifier carries a

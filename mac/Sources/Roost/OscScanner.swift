@@ -106,7 +106,7 @@ enum OscEvent: Equatable {
             // pasteboard state, so don't forward.
             return nil
         case .mouseShape:
-            // OSC 22 is a UI-only action — only the Mac/GTK renderer
+            // OSC 22 is a UI-only action — only the Mac/iced renderer
             // owns the OS cursor; the daemon has no concept of
             // pointer shape.
             return nil

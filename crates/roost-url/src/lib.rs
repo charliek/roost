@@ -1,6 +1,6 @@
 //! Shared URL detection for clickable-link support in both Roost UIs.
 //!
-//! The Linux (GTK) UI consumes this directly; the Swift Mac UI
+//! The Linux (iced) UI consumes this directly; the Swift Mac UI
 //! re-implements the same regex + trim pipeline by hand and pins parity
 //! against the shared corpus in `tests/url-fixtures/`. One contract,
 //! two implementations — same shape as `roost-osc` vs.

@@ -79,9 +79,8 @@ case "${scope}" in
     test_threads="${test_threads:-64}"
     ;;
   workspace)
-    # Mirrors CI's rust job exactly (.github/workflows/ci.yml) — roost-linux
-    # is excluded there because it needs GTK.
-    cargo_args="test --workspace --exclude roost-linux"
+    # Mirrors CI's rust job exactly (.github/workflows/ci.yml).
+    cargo_args="test --workspace"
     iterations="${iterations:-30}"
     # The whole workspace at a very high thread count exhausts the pty table
     # on macOS, which reds the run for reasons that have nothing to do with

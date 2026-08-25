@@ -1,7 +1,8 @@
 // Pure-logic tests for the notification inbox store. Mirrors the
 // repo's pattern of testing extracted state (PaletteStateTests,
-// TabPillStateTests) without standing up AppKit. The GTK port
-// (`notification_inbox.rs`) carries an equivalent set.
+// TabPillStateTests) without standing up AppKit.
+// `crates/roost-ui-model/src/notification_inbox.rs` (shared with iced)
+// carries an equivalent set.
 
 import Foundation
 import Testing

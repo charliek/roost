@@ -4,23 +4,25 @@
 newline-delimited JSON protocol over a Unix-domain stream socket. The protocol
 is local-only — there is no network deployment.
 
-The UI binary (Swift `Roost.app`, Rust/GTK `roost`, or Rust/Iced
-`roost-iced`) is the IPC server. `roostctl` is the only first-party client; the
-contract here is what any other automation should implement.
+The UI binary (Swift `Roost.app`, or the Rust/iced binary — `roost` as
+installed on Linux, `roost-iced` from a dev tree) is the IPC server.
+`roostctl` is the only first-party client; the contract here is what any
+other automation should implement.
 
 The socket path is the bundle profile's `socket_path` (see
 [`paths.md`](paths.md)):
 
-* Mac (Swift `Roost.app`): `~/Library/Caches/Roost/roost.sock`
-* GTK dev mode on Mac:    `~/Library/Caches/Roost-gtk/roost.sock`
-* Iced dev build on Mac:  `~/Library/Caches/Roost-iced/roost.sock`
-* GTK on Linux (XDG):     `$XDG_RUNTIME_DIR/roost/roost.sock`
-* Iced on Linux (XDG):    `$XDG_RUNTIME_DIR/roost-iced/roost.sock`
-* Linux fallback:         `/tmp/roost[-iced]-<uid>/roost.sock`
+* Mac (Swift `Roost.app`):    `~/Library/Caches/Roost/roost.sock`
+* Iced on Mac (`Roost-Iced.app` or a dev build): `~/Library/Caches/Roost-iced/roost.sock`
+* Installed `roost` on Linux (XDG): `$XDG_RUNTIME_DIR/roost/roost.sock`
+* Iced dev build on Linux (XDG):    `$XDG_RUNTIME_DIR/roost-iced/roost.sock`
+* Linux fallback:             `/tmp/roost[-iced]-<uid>/roost.sock`
 
-`roostctl --target mac|gtk|iced` selects a profile explicitly. Without an
+`roostctl --target mac|linux|iced` selects a profile explicitly. Without an
 explicit selector, `roostctl` probes every distinct profile socket; if more
 than one is live, it reports the actual candidates and requires selection.
+(The `linux` profile also resolves on macOS, as `~/Library/Caches/Roost-linux/`,
+but nothing ships or launches it there.)
 
 ## Wire format
 
@@ -58,9 +60,11 @@ than one is live, it reports the actual candidates and requires selection.
   strict server policy; client-side response structs do not, matching
   the client-side permissive policy.
 * **Concurrency:** the server is single-actor — every request is
-  dispatched onto the UI's main thread (Swift `@MainActor`; gtk4 glib
-  main loop). Responses are delivered in completion order, which is
-  not guaranteed to match request order. Clients correlate by `id`.
+  dispatched onto the UI's main thread (Swift `@MainActor`; in the iced
+  UI the handler forwards the request onto the single engine→UI feed and
+  awaits a oneshot reply, so it is applied from `update` on the winit
+  event-loop thread). Responses are delivered in completion order, which
+  is not guaranteed to match request order. Clients correlate by `id`.
 * **Schema drift mitigation:** `tests/ipc-vectors/*.json` is a directory
   of canonical message exemplars (one file per op/event). Both
   `cargo test -p roost-ipc` (Rust) and Swift's `XCTest` target load
@@ -381,8 +385,9 @@ way. Response: `{}`.
 The op routes by the UI's active keyboard route, not directly by
 `tab_id`: `tab_id` must match the tab currently holding the route, or
 the call fails `invalid-param` rather than silently feeding the wrong
-tab. iced-only for now — the GTK UI has no IME wiring yet and answers
-`not-implemented`.
+tab. Implemented by the iced UI only; the Swift Mac app has no case for
+this op and answers `unknown-op` (it does support IME input, via AppKit's
+own `interpretKeyEvents` — there is just no IPC op to drive it).
 
 ### `project.create`
 
@@ -591,17 +596,17 @@ Request: `{"params": {}}`.
 ```
 
 `terminal_top` and `terminal_font_family` are optional for wire compatibility
-(omitted, not `null`, when an adapter has nothing to report). Iced reports the
-exact application-owned top edge of its terminal viewport (the chrome-band
-height above it); the Mac UI reports the AppKit terminal view's top offset,
-measured from the content view's top edge; GTK omits `terminal_top` until it
-can expose equivalent trustworthy geometry. Consumers that require exact
-coordinates must reject a missing, non-finite, or non-positive value instead
-of copying a chrome-height constant. `terminal_font_family` is the resolved
-family the live terminal is actually rendering with (post-fallback-chain, not
-a config echo) and is reported by all three adapters once a terminal is live
-— the Mac adapter omits both fields until a terminal view is mounted (fresh
-launch, no tabs). This operation is ungated and read-only.
+(omitted, not `null`, when an adapter has nothing to report). The iced UI
+reports the exact application-owned top edge of its terminal viewport (the
+chrome-band height above it), always; the Mac UI reports the AppKit terminal
+view's top offset, measured from the content view's top edge. Consumers that
+require exact coordinates must reject a missing, non-finite, or non-positive
+value instead of copying a chrome-height constant. `terminal_font_family` is
+the resolved family the live terminal is actually rendering with
+(post-fallback-chain, not a config echo). Both fields are reported by both
+adapters once a terminal is live — the Mac adapter omits both until a terminal
+view is mounted (fresh launch, no tabs). This operation is ungated and
+read-only.
 
 ### `app.sidebar_dump`
 
@@ -633,11 +638,14 @@ during a drag are transient UI state, not part of this contract.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
 
-### `app.render_stats`
+### `app.render_stats` *(iced UI only)*
 
 Read the running UI's render-path counters. This is the only way to
 measure the real draw path: `TerminalWidget::draw` needs a live
 renderer, which unit tests cannot construct.
+
+Implemented by the iced UI; the Swift Mac app has no case for this op
+and answers `unknown-op`.
 
 Request: `{"params": {"reset": false}}`. `reset` defaults to `false`,
 so `{"params": {}}` — or no `params` at all — is a plain read.
@@ -663,14 +671,11 @@ libghostty's render state; `rows_rebuilt` and `cells_walked` are what
 that walk touched. `draw_calls` / `draw_nanos` / `fill_text_calls`
 cover the widget draw pass. `fill_text_calls` counts glyph draws the
 pass emitted — a sprite-rendered cell (box drawing, blocks) *replaces*
-a glyph draw and counts as one on both UIs, so the field is comparable
-across them. `view_calls` / `view_nanos` cover the iced UI's whole
-`App::view()` rebuild; `elide_calls` / `elide_nanos` cover
-`chrome::elide_to_width`, the tab-pill title eliding it calls — GTK has
-no view/elide instrumentation, so its handler always reports these four
-as `0`. `view_calls`/`view_nanos`/`elide_calls`/`elide_nanos` default
-to `0` on decode when absent, so an older client (the mac Swift
-handler doesn't send them) still parses.
+a glyph draw and counts as one. `view_calls` / `view_nanos` cover the
+whole `App::view()` rebuild; `elide_calls` / `elide_nanos` cover
+`chrome::elide_to_width`, the tab-pill title eliding it calls. Those
+four default to `0` on decode when absent, so a client parsing a
+response from an adapter that doesn't instrument them still works.
 
 `reset: true` zeroes the counters **after** the read, so a caller can
 read-reset, run a workload, then read the delta directly.
@@ -681,10 +686,7 @@ after.
 
 Ungated — always available, matching `tab.dump_resolved`. Not
 read-only: `reset: true` reads the counters and then zeroes them.
-The GTK UI answers with the same shape and real numbers; its `paint`
-folds one refresh and one draw into a single pass, so `refresh_*` and
-`draw_*` always advance together there, unlike iced where the two are
-scheduled independently. CLI: `roostctl render-stats [--reset]`.
+CLI: `roostctl render-stats [--reset]`.
 
 ### `app.dock_badge` *(test-only — gated, macOS iced only)*
 
@@ -708,12 +710,11 @@ write reached the Dock. Because the badge write rides the update loop
 asynchronously, callers poll rather than reading once —
 `tools/roosttest/test_dock_badge.py` is the reference use.
 
-Implemented only by the iced UI on macOS. The GTK UI, the iced UI on
-Linux, and the Swift Mac app (which has no case for it, so its
-dispatcher answers `unknown-op`) do not implement it; the first two
-answer `not-implemented`. There is no Dock off macOS, and answering a
-plausible `null` there would read as "the badge is cleared" and pass a
-test that never ran.
+Implemented only by the iced UI on macOS. The iced UI on Linux answers
+`not-implemented`, and the Swift Mac app has no case for it at all, so
+its dispatcher answers `unknown-op`. There is no Dock off macOS, and
+answering a plausible `null` there would read as "the badge is cleared"
+and pass a test that never ran.
 
 ### `app.menu_dump` *(test-only — gated, macOS iced only)*
 
@@ -774,7 +775,7 @@ display name (set at install time — no separate runtime substitution to
 account for).
 
 Implemented only by the iced UI on macOS, same as `app.dock_badge`;
-the GTK UI and the iced UI on Linux answer `not-implemented`.
+the iced UI on Linux answers `not-implemented`.
 
 ### `app.menu_activate` *(test-only — gated, macOS iced only)*
 
@@ -919,13 +920,15 @@ values are rejected with `invalid-param` before reaching the UI.
 While the sidebar is collapsed the op still succeeds: it persists the
 width and updates what expanding will reveal. `app.window_metrics`
 reports a collapsed sidebar as `sidebar_width < 1.0` until it is
-expanded: GTK and Iced report a literal `0.0`, while the Mac UI reports
+expanded: the iced UI reports a literal `0.0`, while the Mac UI reports
 the collapsed pane's real frame width. Assert `< 1.0`, not `== 0.0`.
 
 Two authority caveats, mirroring `window.resize`'s "the compositor
 remains authoritative" stance: the persisted value is the *requested*
 logical width, and a window too narrow to honor it may render the
-seam narrower (GTK's paned constrains the divider to its allocation) —
+seam narrower — on macOS `NSSplitView`'s `constrainMaxCoordinate`
+clamps the divider to the split view's allocation, so the reported width
+follows what was actually laid out.
 `app.window_metrics` reports the live width, so assert against that.
 And the op is not defined concurrent with a live pointer drag of the
 seam: a drag in flight re-anchors on its press-time width and its

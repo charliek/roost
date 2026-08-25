@@ -121,9 +121,8 @@ pub const PROJECT_LABEL_INACTIVE: Color = Color::from_rgb8(0xd1, 0xd1, 0xd1);
 /// sidebar project-row dot), the dragged-pill border, and the inline-rename
 /// focus ring + selection all share it. Pinned to the Mac's
 /// `NSColor.controlAccentColor` (#007aff), which both Mac surfaces use
-/// (`App.swift:4772`, `:5207`) and which GTK hardcodes for its tab badge
-/// (`crates/roost-linux/src/resources/style.css:277-288`) rather than
-/// tracking the desktop accent — on COSMIC `@accent_bg_color` renders teal.
+/// (`App.swift:4772`, `:5207`). Hardcoded rather than tracking the desktop
+/// accent — on COSMIC `@accent_bg_color` renders teal.
 /// Was two constants (`NOTIFICATION` #4e9af1 generic blue, `NOTIFICATION_BADGE`
 /// #007aff mac accent) until the drag/rename surfaces flipped to the mac
 /// accent too (#321), at which point both names pinned the same value and
@@ -322,8 +321,9 @@ pub fn close_button(_: &Theme, status: button::Status) -> button::Style {
 }
 
 /// The sidebar-footer "+ New Project" chip: a centered rounded button with
-/// a resting fill, matching the shipped Mac bezel and GTK chip affordances
-/// rather than the flat text buttons used elsewhere in the chrome.
+/// a resting fill, matching the shipped Mac bezel (and the now-removed
+/// GTK UI's chip affordance) rather than the flat text buttons used
+/// elsewhere in the chrome.
 pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
     let background = match status {
         button::Status::Hovered => FOOTER_CHIP_HOVER,

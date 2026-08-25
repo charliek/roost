@@ -17,8 +17,8 @@ import Foundation
 /// This *is* the wire type — the UI row and `palette.state`'s row carry
 /// exactly the same six fields, so `RoostApp.paletteSnapshot()` stays a
 /// move instead of a hand-written field copy a new column could
-/// silently fall out of. Mirrors the GTK
-/// `pub use roost_ipc::messages::PaletteAgentRow as AgentRowData`.
+/// silently fall out of. Mirrors `roost_ipc::messages::PaletteAgentRow`,
+/// the shared wire type.
 ///
 /// `effectiveLifecycle` drives the dot colour, the status colour, and
 /// the row order — the same value the tab pill and the sidebar rollup

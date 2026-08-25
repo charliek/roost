@@ -22,7 +22,8 @@ shared with `test_exit_on_empty.py`, rather than trusting the
 Makefile/ci.yml wiring to keep them apart.
 
 darwin+iced only: `app.menu_activate` is macOS-iced-only (plan 028
-§ 3.12). GTK and the Swift Mac app both skip.
+§ 3.12) — the experimental Roost-Iced.dmg build. Swift Mac and
+Linux iced both skip.
 """
 
 from __future__ import annotations

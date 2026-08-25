@@ -20,7 +20,7 @@
 # accept LANG LC_*; users may need to extend `AcceptEnv` server-side
 # for the env to take effect).
 #
-# KEEP IN SYNC with crates/roost-linux/src/resources/shell-integration/roost.zsh
+# KEEP IN SYNC with crates/roost-engine/resources/shell-integration/roost.zsh (shared by iced)
 
 [[ -o interactive ]] || return 0
 [[ -n "${ROOST_TAB_ID:-}" ]] || return 0

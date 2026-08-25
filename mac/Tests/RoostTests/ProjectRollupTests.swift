@@ -1,5 +1,6 @@
-// Mirror of `crates/roost-linux/src/rollup.rs`'s test module — same
-// case set so the two UIs stay byte-equivalent in their rollup picks.
+// Mirror of `crates/roost-ui-model/src/rollup.rs`'s (shared by iced)
+// test module — same case set so the two UIs stay byte-equivalent in
+// their rollup picks.
 
 import Foundation
 import Testing

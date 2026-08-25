@@ -85,7 +85,9 @@ extension NotificationInbox {
 }
 
 /// Compact relative-time label ("just now", "2m", "1h", "3d") for the
-/// inbox row's trailing text. Mirrors the GTK `relative_time`.
+/// inbox row's trailing text. Mirrors
+/// `crates/roost-ui-model/src/notification_inbox.rs`'s `relative_time`
+/// (shared with iced).
 func relativeTimeLabel(from date: Date, now: Date = Date()) -> String {
     relativeTimeLabel(seconds: Int64(now.timeIntervalSince(date)))
 }
