@@ -86,12 +86,15 @@ valid update" forever, and nothing in the release pipeline can notice. Prove
 the pair with Sparkle's own tools (no OpenSSL — macOS's LibreSSL cannot
 handle ed25519 keys):
 
-Run it as one block. `set -euo pipefail` is load-bearing: without it a
-failed check just prints and the block still exits 0, which is the exact
-outcome — a mismatched pair that *looks* verified — this step exists to
-prevent.
+Run it as one block. The `( … )` subshell and `set -euo pipefail` are both
+load-bearing: without the `set`, a failed check just prints and the block
+still exits 0 — a mismatched pair that *looks* verified, which is exactly
+what this step exists to prevent. Without the subshell, pasting it into an
+interactive shell means the first failure **closes your terminal** (and
+`set -e` would linger over the rest of the session).
 
 ```bash
+(
 set -euo pipefail
 scratch="$(mktemp)"
 trap 'rm -f "$scratch"' EXIT
@@ -122,6 +125,7 @@ echo "signature verifies"
 base64 < .secrets/roost-iced-sparkle-ed-private.key | base64 --decode \
   | diff - .secrets/roost-iced-sparkle-ed-private.key
 echo "encoding OK"
+)
 ```
 
 (a) + (b) together are the pair proof: the committed public key belongs to the

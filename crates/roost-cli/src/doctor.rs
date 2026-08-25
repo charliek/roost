@@ -6095,15 +6095,21 @@ mod tests {
             .nth(1)
             .expect("zensical.toml has a nav = [")
             .lines()
-            .take_while(|l| !l.starts_with(']'))
+            // Indentation, not the closing bracket: nav entries are
+            // indented, so this stops at a column-0 `]` AND at the next
+            // `[table]` header. Keying on `]` alone would swallow the rest
+            // of the file if the array close were ever indented.
+            .take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
     /// Deliberately one-directional: for each `(page, anchor)` doctor can
     /// emit, assert the page exists, that it is in `zensical.toml`'s
-    /// hand-maintained nav (`docs/reference/terminal-queries.md` is the
-    /// counterexample on disk today), and that some heading slugifies to
+    /// hand-maintained nav (Zensical publishes everything under `docs/`,
+    /// so nav membership is about being *reachable*, not about publishing
+    /// — `docs/reference/terminal-queries.md` publishes while unlinked),
+    /// and that some heading slugifies to
     /// the anchor. It does NOT reimplement the site generator's slugify over every
     /// heading in the repo — only these URLs matter.
     #[test]
@@ -6127,7 +6133,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert!(
                 nav_lists(&nav, &rel),
-                "{rel} is not in zensical.toml's nav, so its URL would not publish"
+                "{rel} is not in zensical.toml's nav, so nothing in the site links to it"
             );
             let found = headings(&body)
                 .into_iter()
