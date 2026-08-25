@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 publish.workspace      = true
-description = "Shared URL detection (scheme regex + trailing-punctuation cleanup) consumed by roost-linux's GTK mouse path and mirrored by the Swift Mac port for parity."
+description = "Shared URL detection (scheme regex + trailing-punctuation cleanup) consumed by the iced UI's mouse path and mirrored by the Swift Mac port for parity."
 
 [lib]
 path = "src/lib.rs"

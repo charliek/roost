@@ -326,7 +326,7 @@ pub struct TabDumpResult {
 // ============================================================================
 //
 // The palette is a UI overlay, not workspace state, so these ops route
-// through the UI seam (a `UiRequest` on GTK / the `UiBridge` on Mac)
+// through the UI seam (a `UiTask` in iced / the `UiBridge` on Mac)
 // rather than the workspace. They make the palette a driveable, testable
 // command surface: open it, read its rows, filter, and activate a row —
 // where activating dispatches the *same* command an item's keybind would
@@ -1483,7 +1483,7 @@ pub mod ops {
 
     /// Test-only PTY drain ops — drive bytes through the OSC scanner,
     /// libghostty, and the input-reply path. Gated behind
-    /// `ROOST_TEST_MODE=1` (set in CI for `e2e-gtk` and `e2e-mac`)
+    /// `ROOST_TEST_MODE=1` (set in CI for the iced and mac E2E lanes)
     /// because injecting arbitrary PTY output and observing keystroke
     /// bytes is something only a test harness should do.
     pub const TAB_FEED_PTY_BYTES: &str = "tab.feed_pty_bytes";

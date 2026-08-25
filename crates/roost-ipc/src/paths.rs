@@ -6,7 +6,7 @@
 //! `mac/Sources/Roost/BundleProfile.swift` mirrors this resolver
 //! byte-for-byte **on macOS** — the only OS it runs on — and the two
 //! implementations are tested in lockstep there. Off macOS this
-//! resolver diverges by design: the Gtk profile's app id collapses
+//! resolver diverges by design: the Linux profile's app id collapses
 //! onto the production `ai.stridelabs.Roost`, matching how its paths
 //! already collapse.
 //!
@@ -43,24 +43,24 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 /// UI variants Roost ships or evaluates. On macOS all three coexist
-/// with distinct paths. On Linux the established Mac/GTK profiles keep
-/// sharing the production XDG paths, while the Iced POC uses its own
-/// namespace so it can run beside GTK.
+/// with distinct paths. On Linux the established Mac/Linux profiles keep
+/// sharing the production XDG paths, while the dev Iced profile uses its
+/// own namespace so it can run beside a packaged install.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BundleProfileKind {
     /// The Swift `Roost.app`. App id: `ai.stridelabs.Roost`.
     Mac,
-    /// The gtk4-rs `roost-linux` binary. The production Linux UI; on
-    /// macOS this is the dev-mode side-by-side variant. Its app id is
+    /// The packaged Linux UI (`/usr/bin/roost`). Its app id is
     /// platform-resolved: `ai.stridelabs.Roost` on Linux, shared with
     /// the Mac profile that can never run there and that already
-    /// shares the production path namespace; `ai.stridelabs.Roost.gtk`
-    /// on macOS, where the side-by-side dev matrix needs the three
-    /// profiles to stay distinct.
-    Gtk,
-    /// The Rust + Iced proof of concept. App id:
-    /// `ai.stridelabs.Roost.iced`. Always isolated from the production
-    /// Mac/GTK namespace, including on Linux.
+    /// shares the production path namespace; `ai.stridelabs.Roost.linux`
+    /// on macOS, where the kind stays resolvable but nothing ships or
+    /// launches it.
+    Linux,
+    /// The Rust + Iced build run from a dev tree (and the experimental
+    /// macOS `Roost-Iced.app`). App id: `ai.stridelabs.Roost.iced`.
+    /// Always isolated from the production Mac/Linux namespace,
+    /// including on Linux.
     Iced,
 }
 
@@ -68,7 +68,7 @@ impl BundleProfileKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Mac => "mac",
-            Self::Gtk => "gtk",
+            Self::Linux => "linux",
             Self::Iced => "iced",
         }
     }
@@ -83,18 +83,20 @@ impl BundleProfileKind {
 #[derive(Clone, Debug)]
 pub struct BundleProfile {
     pub kind: BundleProfileKind,
-    /// Human-readable label used in path components on macOS.
-    /// `"Roost"` for Mac, `"Roost-gtk"` for GTK, and `"Roost-iced"`
-    /// for Iced. Linux uses the established `roost/` namespace for Mac
-    /// and GTK and the isolated `roost-iced/` namespace for Iced.
+    /// Human-readable label used in path components on macOS, and
+    /// reported by `identify` / `roostctl doctor` on every platform.
+    /// `"Roost"` for Mac, `"Roost-linux"` for Linux, and `"Roost-iced"`
+    /// for Iced. Linux itself uses the established `roost/` namespace
+    /// for Mac and Linux and the isolated `roost-iced/` namespace for
+    /// Iced.
     pub app_label: &'static str,
     /// Reverse-DNS application identifier (`CFBundleIdentifier` on
-    /// macOS, gtk `application_id` on Linux). Stable per kind except
-    /// for Gtk, which resolves per platform — `ai.stridelabs.Roost` on
-    /// Linux (shared with the Mac profile, which never runs there and
-    /// already shares the production path namespace) and
-    /// `ai.stridelabs.Roost.gtk` on macOS (the side-by-side dev matrix
-    /// requires distinct ids).
+    /// macOS, the desktop-entry id on Linux). Stable per kind except
+    /// for Linux, which resolves per platform — `ai.stridelabs.Roost`
+    /// on Linux (shared with the Mac profile, which never runs there
+    /// and already shares the production path namespace) and
+    /// `ai.stridelabs.Roost.linux` on macOS (where the side-by-side
+    /// profiles must stay distinct).
     pub app_id: &'static str,
     pub socket_path: PathBuf,
     pub state_dir: PathBuf,
@@ -106,10 +108,10 @@ impl BundleProfile {
     pub fn for_kind(kind: BundleProfileKind) -> anyhow::Result<BundleProfile> {
         let (app_label, app_id) = match kind {
             BundleProfileKind::Mac => ("Roost", "ai.stridelabs.Roost"),
-            BundleProfileKind::Gtk => (
-                "Roost-gtk",
+            BundleProfileKind::Linux => (
+                "Roost-linux",
                 if cfg!(target_os = "macos") {
-                    "ai.stridelabs.Roost.gtk"
+                    "ai.stridelabs.Roost.linux"
                 } else {
                     "ai.stridelabs.Roost"
                 },
@@ -137,8 +139,8 @@ impl BundleProfile {
         Self::for_kind(BundleProfileKind::Mac)
     }
 
-    pub fn gtk() -> anyhow::Result<BundleProfile> {
-        Self::for_kind(BundleProfileKind::Gtk)
+    pub fn linux() -> anyhow::Result<BundleProfile> {
+        Self::for_kind(BundleProfileKind::Linux)
     }
 
     pub fn iced() -> anyhow::Result<BundleProfile> {
@@ -146,8 +148,10 @@ impl BundleProfile {
     }
 
     /// Pick a profile with `ROOST_BUNDLE_PROFILE` overriding the
-    /// caller's default. Unknown values silently fall through to the
-    /// default.
+    /// caller's default. Unknown values fall through to the default
+    /// (with a warn) rather than failing — see
+    /// [`kind_from_profile_env`]. The CLI's own parser
+    /// (`target.rs`) deliberately hard-errors instead.
     pub fn resolve(default: BundleProfileKind) -> anyhow::Result<BundleProfile> {
         let value = std::env::var("ROOST_BUNDLE_PROFILE").ok();
         Self::for_kind(kind_from_profile_env(default, value.as_deref()))
@@ -208,12 +212,43 @@ impl BundleProfile {
     }
 }
 
+/// Map `ROOST_BUNDLE_PROFILE` onto a kind, keeping the UI-side policy:
+/// an unrecognized value falls through to the caller's default rather
+/// than refusing to launch. It warns first — a stale value (a `gtk`
+/// left over from before the profile was renamed to `linux`) silently
+/// changes which namespace the process owns, and that has to be
+/// observable in the log.
 fn kind_from_profile_env(default: BundleProfileKind, value: Option<&str>) -> BundleProfileKind {
     match value.map(str::trim) {
         Some("mac") => BundleProfileKind::Mac,
-        Some("gtk") => BundleProfileKind::Gtk,
+        Some("linux") => BundleProfileKind::Linux,
         Some("iced") => BundleProfileKind::Iced,
+        // Empty (including the launchd-inherited empty-env case) is not
+        // a mistake — only a non-empty value the parser doesn't know is.
+        Some(other) if !other.is_empty() => {
+            tracing::warn!(
+                value = other,
+                default = default.as_str(),
+                "unrecognized ROOST_BUNDLE_PROFILE; falling back to the default profile"
+            );
+            default
+        }
         _ => default,
+    }
+}
+
+/// The raw `ROOST_BUNDLE_PROFILE` value when it is set, non-empty, and
+/// not a recognized profile slug. The UI resolves its profile *before*
+/// it can initialize logging (the log directory comes from the
+/// profile), so the warn inside [`kind_from_profile_env`] is discarded
+/// at the moment it matters most — the UI calls this again once its
+/// subscriber is installed and logs the stale value itself.
+pub fn unrecognized_profile_env() -> Option<String> {
+    let raw = std::env::var("ROOST_BUNDLE_PROFILE").ok()?;
+    let value = raw.trim();
+    match value {
+        "" | "mac" | "linux" | "iced" => None,
+        other => Some(other.to_string()),
     }
 }
 
@@ -273,65 +308,92 @@ fn resolve_paths(
     Ok((tmp.join("roost.sock"), tmp.clone(), tmp))
 }
 
+/// The environment Linux path resolution reads, captured once so the
+/// resolver below can be pure. Same philosophy as
+/// [`apply_state_dir_override`]: the policy is unit-testable — and its
+/// literal output pinnable — without a test mutating process-global env
+/// that every other test in the binary also reads.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Default, Clone)]
+struct LinuxPathEnv {
+    home: Option<std::ffi::OsString>,
+    runtime_dir: Option<std::ffi::OsString>,
+    data_home: Option<std::ffi::OsString>,
+    state_home: Option<std::ffi::OsString>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl LinuxPathEnv {
+    fn from_process() -> Self {
+        Self {
+            home: std::env::var_os("HOME"),
+            runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
+            data_home: std::env::var_os("XDG_DATA_HOME"),
+            state_home: std::env::var_os("XDG_STATE_HOME"),
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn resolve_paths(
     kind: BundleProfileKind,
     _app_label: &str,
 ) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+    resolve_paths_linux(kind, &LinuxPathEnv::from_process(), libc_getuid())
+}
+
+/// The Linux path contract. **Byte-stable**: these are the paths an
+/// installed Roost already owns, so a rename of the profile kind must
+/// never move them. Pinned by literal-string golden tests below.
+#[cfg(not(target_os = "macos"))]
+fn resolve_paths_linux(
+    kind: BundleProfileKind,
+    env: &LinuxPathEnv,
+    uid: u32,
+) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
     let namespace = match kind {
-        BundleProfileKind::Mac | BundleProfileKind::Gtk => "roost",
+        BundleProfileKind::Mac | BundleProfileKind::Linux => "roost",
         BundleProfileKind::Iced => "roost-iced",
     };
-    let socket = match xdg_runtime_dir() {
+    let socket = match valid_dir(env.runtime_dir.as_deref()) {
         Some(dir) => dir.join(namespace).join("roost.sock"),
-        None => {
-            let uid = libc_getuid();
-            PathBuf::from(format!("/tmp/{namespace}-{uid}")).join("roost.sock")
-        }
+        None => PathBuf::from(format!("/tmp/{namespace}-{uid}")).join("roost.sock"),
     };
-    let state = match xdg_data_home() {
+    let state = match valid_dir(env.data_home.as_deref()) {
         Some(dir) => dir.join(namespace),
-        None => valid_home()?.join(".local/share").join(namespace),
+        None => valid_home(env.home.as_deref())?
+            .join(".local/share")
+            .join(namespace),
     };
-    let log = match xdg_state_home() {
+    let log = match valid_dir(env.state_home.as_deref()) {
         Some(dir) => dir.join(namespace),
-        None => valid_home()?.join(".local/state").join(namespace),
+        None => valid_home(env.home.as_deref())?
+            .join(".local/state")
+            .join(namespace),
     };
     Ok((socket, state, log))
 }
 
-/// Read `$HOME` and ensure it's non-empty and absolute. The plain
-/// `std::env::var_os` would silently yield `""` or a relative path
-/// from a misconfigured launchd / container env, producing unusable
-/// paths like `.local/share/roost` (no leading slash).
+/// Validate `$HOME` as non-empty and absolute. The raw env value would
+/// silently be `""` or a relative path in a misconfigured launchd /
+/// container env, producing unusable paths like `.local/share/roost`
+/// (no leading slash).
 #[cfg(not(target_os = "macos"))]
-fn valid_home() -> anyhow::Result<PathBuf> {
-    let raw = std::env::var_os("HOME").context("$HOME not set")?;
-    let p = PathBuf::from(&raw);
+fn valid_home(raw: Option<&std::ffi::OsStr>) -> anyhow::Result<PathBuf> {
+    let raw = raw.context("$HOME not set")?;
+    let p = PathBuf::from(raw);
     if p.as_os_str().is_empty() || !p.is_absolute() {
         anyhow::bail!("$HOME is not an absolute non-empty path (got {:?})", raw);
     }
     Ok(p)
 }
 
+/// An XDG base dir counts only when it is set, non-empty and absolute —
+/// the spec's own rule, and what keeps a stray relative value from
+/// scattering state against the process CWD.
 #[cfg(not(target_os = "macos"))]
-fn xdg_runtime_dir() -> Option<PathBuf> {
-    let raw = std::env::var_os("XDG_RUNTIME_DIR")?;
-    let p = PathBuf::from(raw);
-    (!p.as_os_str().is_empty() && p.is_absolute()).then_some(p)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn xdg_data_home() -> Option<PathBuf> {
-    let raw = std::env::var_os("XDG_DATA_HOME")?;
-    let p = PathBuf::from(raw);
-    (!p.as_os_str().is_empty() && p.is_absolute()).then_some(p)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn xdg_state_home() -> Option<PathBuf> {
-    let raw = std::env::var_os("XDG_STATE_HOME")?;
-    let p = PathBuf::from(raw);
+fn valid_dir(raw: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let p = PathBuf::from(raw?);
     (!p.as_os_str().is_empty() && p.is_absolute()).then_some(p)
 }
 
@@ -364,16 +426,18 @@ mod tests {
     #[test]
     fn app_ids_are_stable() {
         let mac = BundleProfile::mac().expect("mac profile");
-        let gtk = BundleProfile::gtk().expect("gtk profile");
+        let linux = BundleProfile::linux().expect("linux profile");
         let iced = BundleProfile::iced().expect("iced profile");
         assert_eq!(mac.app_id, "ai.stridelabs.Roost");
         #[cfg(target_os = "macos")]
-        assert_eq!(gtk.app_id, "ai.stridelabs.Roost.gtk");
+        assert_eq!(linux.app_id, "ai.stridelabs.Roost.linux");
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(gtk.app_id, "ai.stridelabs.Roost");
+        assert_eq!(linux.app_id, "ai.stridelabs.Roost");
         assert_eq!(iced.app_id, "ai.stridelabs.Roost.iced");
         assert_eq!(mac.app_label, "Roost");
-        assert_eq!(gtk.app_label, "Roost-gtk");
+        // `'static` per kind, so this is the label `identify` and
+        // `roostctl doctor` report on Linux too.
+        assert_eq!(linux.app_label, "Roost-linux");
         assert_eq!(iced.app_label, "Roost-iced");
     }
 
@@ -433,19 +497,41 @@ mod tests {
             BundleProfileKind::Iced
         );
         assert_eq!(
-            kind_from_profile_env(BundleProfileKind::Iced, Some("gtk")),
-            BundleProfileKind::Gtk
+            kind_from_profile_env(BundleProfileKind::Iced, Some("linux")),
+            BundleProfileKind::Linux
         );
         assert_eq!(
             kind_from_profile_env(BundleProfileKind::Iced, Some("mac")),
             BundleProfileKind::Mac
         );
         assert_eq!(
-            kind_from_profile_env(BundleProfileKind::Gtk, Some("unknown")),
-            BundleProfileKind::Gtk
+            kind_from_profile_env(BundleProfileKind::Linux, Some("unknown")),
+            BundleProfileKind::Linux
         );
         assert_eq!(
             kind_from_profile_env(BundleProfileKind::Iced, None),
+            BundleProfileKind::Iced
+        );
+        assert_eq!(
+            kind_from_profile_env(BundleProfileKind::Iced, Some("  ")),
+            BundleProfileKind::Iced
+        );
+    }
+
+    /// A `ROOST_BUNDLE_PROFILE=gtk` left over from before the rename is
+    /// no longer a recognized value. The UI-side policy is deliberately
+    /// forgiving — it keeps the caller's default rather than refusing to
+    /// launch (the `warn!` in `kind_from_profile_env` is what makes the
+    /// namespace change observable). The CLI side hard-errors instead;
+    /// that divergence is pinned in `target.rs`.
+    #[test]
+    fn a_stale_gtk_profile_value_falls_through_to_the_default() {
+        assert_eq!(
+            kind_from_profile_env(BundleProfileKind::Linux, Some("gtk")),
+            BundleProfileKind::Linux
+        );
+        assert_eq!(
+            kind_from_profile_env(BundleProfileKind::Iced, Some("gtk")),
             BundleProfileKind::Iced
         );
     }
@@ -454,42 +540,213 @@ mod tests {
     #[test]
     fn all_profile_paths_are_distinct_on_mac() {
         let mac = BundleProfile::mac().expect("mac profile");
-        let gtk = BundleProfile::gtk().expect("gtk profile");
+        let linux = BundleProfile::linux().expect("linux profile");
         let iced = BundleProfile::iced().expect("iced profile");
-        assert_ne!(mac.socket_path, gtk.socket_path);
+        assert_ne!(mac.socket_path, linux.socket_path);
         assert_ne!(mac.socket_path, iced.socket_path);
-        assert_ne!(gtk.socket_path, iced.socket_path);
-        assert_ne!(mac.state_dir, gtk.state_dir);
+        assert_ne!(linux.socket_path, iced.socket_path);
+        assert_ne!(mac.state_dir, linux.state_dir);
         assert_ne!(mac.state_dir, iced.state_dir);
-        assert_ne!(gtk.state_dir, iced.state_dir);
-        assert_ne!(mac.log_dir, gtk.log_dir);
+        assert_ne!(linux.state_dir, iced.state_dir);
+        assert_ne!(mac.log_dir, linux.log_dir);
         assert_ne!(mac.log_dir, iced.log_dir);
-        assert_ne!(gtk.log_dir, iced.log_dir);
+        assert_ne!(linux.log_dir, iced.log_dir);
         assert!(mac.socket_path.to_string_lossy().contains("/Roost/"));
-        assert!(gtk.socket_path.to_string_lossy().contains("/Roost-gtk/"));
+        assert!(linux
+            .socket_path
+            .to_string_lossy()
+            .contains("/Roost-linux/"));
         assert!(iced.socket_path.to_string_lossy().contains("/Roost-iced/"));
-        // The side-by-side dev matrix needs distinct ids too, not just
-        // distinct paths: macOS keys the running instance by app id.
-        assert_ne!(mac.app_id, gtk.app_id);
+        // Nothing ships the Linux kind on macOS, but keeping it total
+        // and distinct means the enum needs no cfg-holes: macOS keys a
+        // running instance by app id, so the ids must differ too.
+        assert_ne!(mac.app_id, linux.app_id);
         assert_ne!(mac.app_id, iced.app_id);
-        assert_ne!(gtk.app_id, iced.app_id);
+        assert_ne!(linux.app_id, iced.app_id);
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn linux_keeps_iced_distinct_from_collapsed_production_profiles() {
         let mac = BundleProfile::mac().expect("mac profile");
-        let gtk = BundleProfile::gtk().expect("gtk profile");
+        let linux = BundleProfile::linux().expect("linux profile");
         let iced = BundleProfile::iced().expect("iced profile");
-        assert_eq!(mac.socket_path, gtk.socket_path);
-        assert_eq!(mac.state_dir, gtk.state_dir);
-        assert_eq!(mac.log_dir, gtk.log_dir);
-        assert_ne!(gtk.socket_path, iced.socket_path);
-        assert_ne!(gtk.state_dir, iced.state_dir);
-        assert_ne!(gtk.log_dir, iced.log_dir);
+        assert_eq!(mac.socket_path, linux.socket_path);
+        assert_eq!(mac.state_dir, linux.state_dir);
+        assert_eq!(mac.log_dir, linux.log_dir);
+        assert_ne!(linux.socket_path, iced.socket_path);
+        assert_ne!(linux.state_dir, iced.state_dir);
+        assert_ne!(linux.log_dir, iced.log_dir);
         assert!(iced.socket_path.to_string_lossy().contains("roost-iced"));
-        assert_eq!(gtk.app_id, "ai.stridelabs.Roost");
-        assert_ne!(gtk.app_id, iced.app_id);
+        assert_eq!(linux.app_id, "ai.stridelabs.Roost");
+        assert_ne!(linux.app_id, iced.app_id);
+    }
+
+    // ---------------------------------------------------------------
+    // Golden Linux paths — the on-disk upgrade contract.
+    //
+    // These are literal strings on purpose. The `Linux` kind used to be
+    // called `Gtk`, and an installed Roost owns exactly these paths:
+    // comparing two profiles against each other would still pass if
+    // BOTH moved, so the contract is pinned against recorded values
+    // instead. Driven through the pure `resolve_paths_linux` so no test
+    // has to mutate process-global env.
+    // ---------------------------------------------------------------
+
+    #[cfg(not(target_os = "macos"))]
+    fn golden_env() -> LinuxPathEnv {
+        LinuxPathEnv {
+            home: Some("/home/tester".into()),
+            runtime_dir: Some("/run/user/1000".into()),
+            data_home: Some("/home/tester/.local/share".into()),
+            state_home: Some("/home/tester/.local/state".into()),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_linux_paths_under_explicit_xdg_dirs() {
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Linux, &golden_env(), 1000).expect("resolve");
+        assert_eq!(socket, PathBuf::from("/run/user/1000/roost/roost.sock"));
+        assert_eq!(state, PathBuf::from("/home/tester/.local/share/roost"));
+        assert_eq!(log, PathBuf::from("/home/tester/.local/state/roost"));
+
+        let profile = BundleProfile {
+            kind: BundleProfileKind::Linux,
+            app_label: "Roost-linux",
+            app_id: "ai.stridelabs.Roost",
+            socket_path: socket,
+            state_dir: state,
+            log_dir: log,
+        };
+        assert_eq!(
+            profile.socket_lock_path(),
+            PathBuf::from("/run/user/1000/roost/roost.lock")
+        );
+        assert_eq!(
+            profile.state_lock_path(),
+            PathBuf::from("/home/tester/.local/share/roost/state.lock")
+        );
+        assert_eq!(
+            profile.state_json_path(),
+            PathBuf::from("/home/tester/.local/share/roost/state.json")
+        );
+        assert_eq!(
+            profile.log_path(),
+            PathBuf::from("/home/tester/.local/state/roost/roost.log")
+        );
+        // The app id an installed desktop entry / launcher pin sees.
+        assert_eq!(
+            BundleProfile::linux().expect("linux profile").app_id,
+            "ai.stridelabs.Roost"
+        );
+    }
+
+    /// With no `XDG_RUNTIME_DIR` the socket falls back to
+    /// `/tmp/roost-<uid>` — the path `roostctl` and the docs both name.
+    /// State and log still come from `$HOME`.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_linux_paths_without_a_runtime_dir() {
+        let env = LinuxPathEnv {
+            home: Some("/home/tester".into()),
+            ..LinuxPathEnv::default()
+        };
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Linux, &env, 1000).expect("resolve");
+        assert_eq!(socket, PathBuf::from("/tmp/roost-1000/roost.sock"));
+        assert_eq!(state, PathBuf::from("/home/tester/.local/share/roost"));
+        assert_eq!(log, PathBuf::from("/home/tester/.local/state/roost"));
+    }
+
+    /// A set-but-unusable XDG value (empty or relative) is ignored, not
+    /// honored — the same rule the shipped resolver has always applied.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_linux_paths_ignore_unusable_xdg_values() {
+        let env = LinuxPathEnv {
+            home: Some("/home/tester".into()),
+            runtime_dir: Some("".into()),
+            data_home: Some("relative/share".into()),
+            state_home: Some("".into()),
+        };
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Linux, &env, 1000).expect("resolve");
+        assert_eq!(socket, PathBuf::from("/tmp/roost-1000/roost.sock"));
+        assert_eq!(state, PathBuf::from("/home/tester/.local/share/roost"));
+        assert_eq!(log, PathBuf::from("/home/tester/.local/state/roost"));
+    }
+
+    /// `ROOST_STATE_DIR` moves `state.json` and its lock and nothing
+    /// else. Composed exactly as `for_kind` composes them.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_linux_paths_under_a_state_dir_override() {
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Linux, &golden_env(), 1000).expect("resolve");
+        let profile = BundleProfile {
+            kind: BundleProfileKind::Linux,
+            app_label: "Roost-linux",
+            app_id: "ai.stridelabs.Roost",
+            socket_path: socket,
+            state_dir: apply_state_dir_override(state, Some("/tmp/roost-isolated-state".into())),
+            log_dir: log,
+        };
+        assert_eq!(
+            profile.state_json_path(),
+            PathBuf::from("/tmp/roost-isolated-state/state.json")
+        );
+        assert_eq!(
+            profile.state_lock_path(),
+            PathBuf::from("/tmp/roost-isolated-state/state.lock")
+        );
+        assert_eq!(
+            profile.socket_path,
+            PathBuf::from("/run/user/1000/roost/roost.sock")
+        );
+        assert_eq!(
+            profile.socket_lock_path(),
+            PathBuf::from("/run/user/1000/roost/roost.lock")
+        );
+        assert_eq!(
+            profile.log_path(),
+            PathBuf::from("/home/tester/.local/state/roost/roost.log")
+        );
+    }
+
+    /// The dev Iced profile keeps its own namespace under the same env —
+    /// the other half of the contract, and what lets a dev build run
+    /// beside a packaged install.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_iced_paths_stay_in_their_own_namespace() {
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Iced, &golden_env(), 1000).expect("resolve");
+        assert_eq!(
+            socket,
+            PathBuf::from("/run/user/1000/roost-iced/roost.sock")
+        );
+        assert_eq!(state, PathBuf::from("/home/tester/.local/share/roost-iced"));
+        assert_eq!(log, PathBuf::from("/home/tester/.local/state/roost-iced"));
+    }
+
+    /// A missing / unusable `$HOME` is only fatal when it is actually
+    /// needed — with both XDG dirs set, resolution still succeeds.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_resolution_needs_home_only_when_xdg_is_absent() {
+        let env = LinuxPathEnv {
+            home: None,
+            ..golden_env()
+        };
+        assert!(resolve_paths_linux(BundleProfileKind::Linux, &env, 1000).is_ok());
+
+        let bare = LinuxPathEnv {
+            home: Some("relative/home".into()),
+            ..LinuxPathEnv::default()
+        };
+        assert!(resolve_paths_linux(BundleProfileKind::Linux, &bare, 1000).is_err());
     }
 
     // ROOST_STATE_DIR override policy (pure helper — no env mutation).
@@ -535,7 +792,7 @@ mod tests {
         // socket, the socket lock, and the log byte-identical. The
         // state lock moving is the whole point — two UIs on one state
         // dir must contend even when their runtime dirs differ.
-        let base = BundleProfile::gtk().expect("gtk profile");
+        let base = BundleProfile::linux().expect("linux profile");
         let overridden = BundleProfile {
             state_dir: apply_state_dir_override(
                 base.state_dir.clone(),

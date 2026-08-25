@@ -68,7 +68,7 @@ mod ffi {
         //
         // 2. `rustc-link-lib=static=ghostty-vt` (paired with the
         //    link-search line below) is the standard form that
-        //    propagates downstream — `roost-linux`'s binary
+        //    propagates downstream — `roost-iced`'s binary
         //    inherits this directive and links libghostty-vt
         //    into its own final image. macOS `ld` treats
         //    `static=` as a no-op flag (`-Bstatic/-Bdynamic`

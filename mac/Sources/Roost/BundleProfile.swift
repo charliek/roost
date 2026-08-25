@@ -1,33 +1,34 @@
 // BundleProfile.swift — daemon-removal refactor M1.
 //
 // Swift companion to `roost_ipc::paths::BundleProfile` (Rust). Three
-// variants — `mac` (Swift `Roost.app`), `gtk` (gtk4-rs
-// `roost-linux`), and the Iced POC. Path resolution mirrors the Rust side so
-// `roostctl` written in Rust and the Swift UI agree on where the
-// Unix socket lives.
+// variants — `mac` (Swift `Roost.app`), `linux` (the packaged Linux
+// `roost`), and `iced` (the Rust + iced build). Path resolution mirrors
+// the Rust side so `roostctl` written in Rust and the Swift UI agree on
+// where the Unix socket lives.
 //
 // The `defaultSocketPath` helper that the rest of the Mac codebase
 // has been calling becomes a thin shim over the Mac profile (the
-// Swift app never uses the GTK paths).
+// Swift app never uses the Linux paths).
 
 import Foundation
 
 /// UI variants Roost ships or evaluates. On macOS they coexist on the same
 /// machine with distinct paths so a Swift `Roost.app` and a
-/// `cargo run -p roost-linux` dev session don't fight over the same
-/// socket / state directory.
+/// `cargo run -p roost-iced` dev session don't fight over the same
+/// socket / state directory. `linux` never launches on macOS; it stays
+/// modeled here so this mirror covers every kind the Rust enum has.
 enum BundleProfileKind: String, Sendable {
     case mac
-    case gtk
+    case linux
     case iced
 }
 
 struct BundleProfile: Sendable {
     let kind: BundleProfileKind
-    /// `"Roost"`, `"Roost-gtk"`, or `"Roost-iced"`. Used as the directory component
+    /// `"Roost"`, `"Roost-linux"`, or `"Roost-iced"`. Used as the directory component
     /// under `~/Library/{Caches,Application Support,Logs}/`.
     let appLabel: String
-    /// `CFBundleIdentifier` (Mac) / GApplication application id (GTK).
+    /// `CFBundleIdentifier` (Mac) / desktop-entry id (Linux).
     let appID: String
     let socketPath: String
     let stateDir: String
@@ -77,12 +78,12 @@ struct BundleProfile: Sendable {
         environment env: [String: String] = ProcessInfo.processInfo.environment
     ) -> BundleProfile {
         // Matches Rust's `paths.rs` on macOS, the only OS this runs on.
-        // There the Gtk id is platform-resolved and collapses onto
-        // `ai.stridelabs.Roost` on Linux; `.gtk` is the macOS answer.
+        // There the Linux id is platform-resolved and collapses onto
+        // `ai.stridelabs.Roost` on Linux; `.linux` is the macOS answer.
         let (appLabel, appID): (String, String) = {
             switch kind {
             case .mac: return ("Roost", "ai.stridelabs.Roost")
-            case .gtk: return ("Roost-gtk", "ai.stridelabs.Roost.gtk")
+            case .linux: return ("Roost-linux", "ai.stridelabs.Roost.linux")
             case .iced: return ("Roost-iced", "ai.stridelabs.Roost.iced")
             }
         }()
@@ -143,21 +144,23 @@ struct BundleProfile: Sendable {
         resolve(kind: .mac, environment: env)
     }
 
-    /// GTK profile — what `roost-linux` uses (Linux always, macOS dev).
-    static func gtk(environment env: [String: String] = ProcessInfo.processInfo.environment)
+    /// Linux profile — what the packaged `/usr/bin/roost` uses. Kept
+    /// resolvable on macOS (nothing launches it there) so this mirror
+    /// stays total against the Rust enum.
+    static func linux(environment env: [String: String] = ProcessInfo.processInfo.environment)
         -> BundleProfile
     {
-        resolve(kind: .gtk, environment: env)
+        resolve(kind: .linux, environment: env)
     }
 
-    /// Iced POC profile — isolated from both production UIs.
+    /// Iced profile — isolated from both production UIs.
     static func iced(environment env: [String: String] = ProcessInfo.processInfo.environment)
         -> BundleProfile
     {
         resolve(kind: .iced, environment: env)
     }
 
-    /// Pick a profile, letting `ROOST_BUNDLE_PROFILE=mac|gtk|iced` override
+    /// Pick a profile, letting `ROOST_BUNDLE_PROFILE=mac|linux|iced` override
     /// the caller's preferred default. Unknown values silently fall
     /// through to the default — same policy as Rust.
     static func currentForBinary(
@@ -167,7 +170,7 @@ struct BundleProfile: Sendable {
         let kind: BundleProfileKind = {
             switch env["ROOST_BUNDLE_PROFILE"]?.trimmingCharacters(in: .whitespaces) {
             case "mac": return .mac
-            case "gtk": return .gtk
+            case "linux": return .linux
             case "iced": return .iced
             default: return fallback
             }

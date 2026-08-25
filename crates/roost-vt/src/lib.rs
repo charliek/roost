@@ -5,7 +5,7 @@
 //! OSC semantics that need parsing before the UI sees the bytes, and
 //! (b) on both UIs for in-process VT parse + render. The Mac UI links
 //! libghostty-vt via Swift's bridging header; the Linux UI
-//! (`crates/roost-linux/`) consumes it through this crate.
+//! (`crates/roost-iced/`) consumes it through this crate.
 //!
 //! The FFI layer is gated behind the `ffi` cargo feature so the
 //! workspace builds cleanly before `third_party/ghostty/build.sh` has

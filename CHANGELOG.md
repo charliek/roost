@@ -11,6 +11,29 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Removed
+
+- **The GTK UI is gone** — `crates/roost-linux` (gtk4-rs + libadwaita) has been
+  removed from the repo. Linux ships the iced UI, which v0.0.18 already made
+  `/usr/bin/roost`; nothing about an installed package changes. The hidden
+  alias desktop entry that keeps pre-rename launcher pins working stays.
+
+### Changed
+
+- **`roostctl --target linux` replaces `--target gtk`**, and
+  `ROOST_BUNDLE_PROFILE=linux` replaces `=gtk`. There is no `gtk` alias: a
+  stale `ROOST_BUNDLE_PROFILE=gtk` makes `roostctl` fail loudly with
+  ``expected `mac`, `linux`, or `iced` ``, and a UI started with it logs a
+  warning and falls back to its default profile. Tab environments are
+  unaffected — the UI injects `ROOST_SOCKET`. **On Linux, all on-disk paths
+  are unchanged**: an installed package's socket, `state.json`, both locks,
+  and log directory resolve exactly as before. (The macOS *dev-mode* paths
+  for this profile — never shipped — move from `Roost-gtk` to
+  `Roost-linux`.)
+- **`identify` and `roostctl doctor` report `app_label: Roost-linux`** for the
+  packaged Linux profile, where they used to report `Roost-gtk`. The label is
+  cosmetic — no path or app id is derived from it on Linux.
+
 ## v0.0.18 — 2026-08-25
 
 **Linux switches to the iced UI, and macOS gains an experimental iced build

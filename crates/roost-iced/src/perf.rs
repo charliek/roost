@@ -41,8 +41,7 @@ pub use roost_ui_model::render_stats::{RenderStats, TabRenderStats};
 
 use roost_ui_model::render_stats::RenderStatsAggregate;
 
-/// This UI's process-global aggregate. GTK holds its own in
-/// `roost-linux::perf`; the two never mix.
+/// This UI's process-global aggregate.
 static AGGREGATE: RenderStatsAggregate = RenderStatsAggregate::new();
 
 /// Read the global aggregate. Backs the `app.render_stats` IPC op.

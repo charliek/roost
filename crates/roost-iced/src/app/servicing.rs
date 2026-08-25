@@ -10,9 +10,8 @@ pub(crate) struct AgentMetricsResult {
 
 /// `Workspace::open_tab` commits and broadcasts `TabOpened` before the
 /// caller's `PtySupervisor::spawn` promotes the session, so the attach the
-/// event drives can land in that gap and fail. GTK ships the same bounded
-/// retry for the same race (`roost-linux/src/app.rs`, #267): forty
-/// attempts, 25 ms apart. Attempt one is the reconcile that noticed the
+/// event drives can land in that gap and fail. The bounded retry that
+/// covers it (#267): forty attempts, 25 ms apart. Attempt one is the reconcile that noticed the
 /// tab; the rest are [`Message::AttachRetryTick`].
 pub(super) const ATTACH_RETRY_LIMIT: u32 = 40;
 pub(crate) const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(25);

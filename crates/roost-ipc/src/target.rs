@@ -1,12 +1,12 @@
 //! CLI-side target selection for `roostctl`.
 //!
-//! `roostctl` can dial the Mac, GTK, or Iced UI. With multiple UIs
+//! `roostctl` can dial the Mac, Linux, or Iced UI. With multiple UIs
 //! running, the CLI needs to be told which to
 //! talk to. Resolution order (highest precedence first):
 //!
 //! 1. `--socket <path>` (explicit path).
 //! 2. `ROOST_SOCKET` env var.
-//! 3. `--target {mac,gtk,iced}` shortcut (resolves to that profile's
+//! 3. `--target {mac,linux,iced}` shortcut (resolves to that profile's
 //!    canonical socket path).
 //! 4. `ROOST_BUNDLE_PROFILE` env var (same effect as `--target`).
 //! 5. Auto-detect: probe every distinct known socket path. If exactly
@@ -32,14 +32,14 @@ use crate::paths::{BundleProfile, BundleProfileKind};
 pub struct TargetSelector {
     /// `--socket <path>` value. Highest precedence.
     pub socket_override: Option<PathBuf>,
-    /// `--target {mac,gtk,iced}` value.
+    /// `--target {mac,linux,iced}` value.
     pub kind_override: Option<BundleProfileKind>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum TargetError {
     #[error(
-        "multiple Roost UIs are running ({live}); pass --target mac|gtk|iced or set \
+        "multiple Roost UIs are running ({live}); pass --target mac|linux|iced or set \
          ROOST_BUNDLE_PROFILE"
     )]
     Ambiguous { live: LiveProfiles },
@@ -47,7 +47,7 @@ pub enum TargetError {
     NoLiveTarget { tried: Vec<PathBuf> },
     #[error("path resolution failed: {0}")]
     Path(#[from] anyhow::Error),
-    #[error("unknown ROOST_BUNDLE_PROFILE value {0:?} (expected `mac`, `gtk`, or `iced`)")]
+    #[error("unknown ROOST_BUNDLE_PROFILE value {0:?} (expected `mac`, `linux`, or `iced`)")]
     UnknownProfile(String),
 }
 
@@ -219,7 +219,7 @@ fn classify(
     // 4. ROOST_BUNDLE_PROFILE
     match profile_env.map(str::trim) {
         Some("mac") => Step::Profile(BundleProfileKind::Mac, TargetOrigin::ProfileEnv),
-        Some("gtk") => Step::Profile(BundleProfileKind::Gtk, TargetOrigin::ProfileEnv),
+        Some("linux") => Step::Profile(BundleProfileKind::Linux, TargetOrigin::ProfileEnv),
         Some("iced") => Step::Profile(BundleProfileKind::Iced, TargetOrigin::ProfileEnv),
         // Empty string is the launchd-inherited empty-env case; fall
         // through to auto-detect so a sandboxed process with no profile
@@ -240,7 +240,7 @@ fn for_kind(kind: BundleProfileKind) -> Result<ResolvedTarget, TargetError> {
 /// it belongs to, in precedence order.
 ///
 /// Profiles that resolve to the same path collapse to the later entry.
-/// Today that means Mac + GTK become the lone GTK production target on
+/// Today that means Mac + Linux become the lone production target on
 /// Linux, while Iced remains independently addressable.
 ///
 /// This is the *only* encoding of that set: [`resolve_auto_detect`]
@@ -249,7 +249,7 @@ fn for_kind(kind: BundleProfileKind) -> Result<ResolvedTarget, TargetError> {
 fn auto_detect_candidates() -> Result<Vec<(BundleProfileKind, PathBuf)>, TargetError> {
     let profiles = [
         BundleProfile::mac()?,
-        BundleProfile::gtk()?,
+        BundleProfile::linux()?,
         BundleProfile::iced()?,
     ];
     let mut candidates: Vec<(BundleProfileKind, PathBuf)> = Vec::with_capacity(profiles.len());
@@ -276,7 +276,7 @@ async fn resolve_auto_detect(probe_alive: bool) -> Result<ResolvedTarget, Target
 
     if !probe_alive {
         // Without a probe, prefer the first canonical socket (Mac on
-        // macOS, GTK on Linux). Callers in
+        // macOS, the production Linux profile on Linux). Callers in
         // probe_alive=false mode (Claude hooks) tolerate
         // "no live target" silently — they just no-op when the
         // dial fails downstream.
@@ -383,7 +383,7 @@ mod tests {
             classify(
                 Some(sock),
                 Some(env_sock),
-                Some(BundleProfileKind::Gtk),
+                Some(BundleProfileKind::Linux),
                 Some("mac")
             ),
             Step::Socket(sock.to_path_buf(), TargetOrigin::SocketFlag)
@@ -393,7 +393,7 @@ mod tests {
             classify(
                 None,
                 Some(env_sock),
-                Some(BundleProfileKind::Gtk),
+                Some(BundleProfileKind::Linux),
                 Some("mac")
             ),
             Step::Socket(PathBuf::from(env_sock), TargetOrigin::SocketEnv)
@@ -403,14 +403,14 @@ mod tests {
             classify(
                 None,
                 Some(OsStr::new("")),
-                Some(BundleProfileKind::Gtk),
+                Some(BundleProfileKind::Linux),
                 None
             ),
-            Step::Profile(BundleProfileKind::Gtk, TargetOrigin::TargetFlag)
+            Step::Profile(BundleProfileKind::Linux, TargetOrigin::TargetFlag)
         );
         // 3. --target outranks ROOST_BUNDLE_PROFILE.
         assert_eq!(
-            classify(None, None, Some(BundleProfileKind::Mac), Some("gtk")),
+            classify(None, None, Some(BundleProfileKind::Mac), Some("linux")),
             Step::Profile(BundleProfileKind::Mac, TargetOrigin::TargetFlag)
         );
         // 4. ROOST_BUNDLE_PROFILE, both spellings, whitespace tolerated.
@@ -419,8 +419,8 @@ mod tests {
             Step::Profile(BundleProfileKind::Mac, TargetOrigin::ProfileEnv)
         );
         assert_eq!(
-            classify(None, None, None, Some(" gtk ")),
-            Step::Profile(BundleProfileKind::Gtk, TargetOrigin::ProfileEnv)
+            classify(None, None, None, Some(" linux ")),
+            Step::Profile(BundleProfileKind::Linux, TargetOrigin::ProfileEnv)
         );
         assert_eq!(
             classify(None, None, None, Some("iced")),
@@ -439,6 +439,26 @@ mod tests {
         assert_eq!(
             classify(None, Some(OsStr::new("")), None, Some("")),
             Step::AutoDetect
+        );
+    }
+
+    /// The CLI half of the two divergent stale-value policies. A
+    /// `ROOST_BUNDLE_PROFILE=gtk` left over from before the profile was
+    /// renamed to `linux` is now just an unknown value — and here that
+    /// is a hard error naming the accepted set, which is how a stale env
+    /// gets noticed and fixed. (The UI-side resolver in `paths.rs` warns
+    /// and keeps its default instead; tab environments never hit either
+    /// path because the UI injects `ROOST_SOCKET`.)
+    #[test]
+    fn a_stale_gtk_profile_value_is_a_hard_error_with_the_accepted_set() {
+        assert_eq!(
+            classify(None, None, None, Some("gtk")),
+            Step::UnknownProfile("gtk".into())
+        );
+        let message = TargetError::UnknownProfile("gtk".into()).to_string();
+        assert!(
+            message.contains("expected `mac`, `linux`, or `iced`"),
+            "{message}"
         );
     }
 
@@ -466,7 +486,8 @@ mod tests {
 
     // On non-macOS the production profiles intentionally share one socket
     // path while Iced has its own. The auto-detect picker must treat Mac +
-    // GTK as a single GTK candidate — never as a phantom ambiguity. Calls
+    // Linux as a single production candidate — never as a phantom
+    // ambiguity. Calls
     // `resolve_auto_detect` directly so the assertion is independent of
     // ambient `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`, which the public
     // `resolve` consults ahead of auto-detect.
@@ -474,19 +495,19 @@ mod tests {
     #[tokio::test]
     async fn linux_collapses_production_paths_but_keeps_iced_candidate() {
         let mac = BundleProfile::mac().expect("mac profile");
-        let gtk = BundleProfile::gtk().expect("gtk profile");
+        let linux = BundleProfile::linux().expect("linux profile");
         let iced = BundleProfile::iced().expect("iced profile");
         assert_eq!(
-            mac.socket_path, gtk.socket_path,
+            mac.socket_path, linux.socket_path,
             "precondition: Linux profiles share one socket path"
         );
-        assert_ne!(gtk.socket_path, iced.socket_path);
+        assert_ne!(linux.socket_path, iced.socket_path);
 
         let candidates = auto_detect_candidates().expect("candidates");
         assert_eq!(
             candidates,
             vec![
-                (BundleProfileKind::Gtk, gtk.socket_path.clone()),
+                (BundleProfileKind::Linux, linux.socket_path.clone()),
                 (BundleProfileKind::Iced, iced.socket_path),
             ]
         );
@@ -496,15 +517,15 @@ mod tests {
         let res = resolve_auto_detect(false)
             .await
             .expect("resolve must not be ambiguous when paths collapse");
-        assert_eq!(res.kind, Some(BundleProfileKind::Gtk));
-        assert_eq!(res.socket_path, gtk.socket_path);
+        assert_eq!(res.kind, Some(BundleProfileKind::Linux));
+        assert_eq!(res.socket_path, linux.socket_path);
     }
 
     #[test]
     fn chooser_names_every_live_candidate_in_stable_order() {
         let candidates = vec![
             (BundleProfileKind::Mac, PathBuf::from("/tmp/mac.sock")),
-            (BundleProfileKind::Gtk, PathBuf::from("/tmp/gtk.sock")),
+            (BundleProfileKind::Linux, PathBuf::from("/tmp/linux.sock")),
             (BundleProfileKind::Iced, PathBuf::from("/tmp/iced.sock")),
         ];
         let error = choose_live_candidate(&candidates, &[true, false, true])
@@ -524,7 +545,7 @@ mod tests {
     #[test]
     fn chooser_reports_all_tried_paths_when_none_is_live() {
         let candidates = vec![
-            (BundleProfileKind::Gtk, PathBuf::from("/tmp/gtk.sock")),
+            (BundleProfileKind::Linux, PathBuf::from("/tmp/linux.sock")),
             (BundleProfileKind::Iced, PathBuf::from("/tmp/iced.sock")),
         ];
         let error = choose_live_candidate(&candidates, &[false, false])
@@ -533,7 +554,7 @@ mod tests {
             TargetError::NoLiveTarget { tried } => assert_eq!(
                 tried,
                 vec![
-                    PathBuf::from("/tmp/gtk.sock"),
+                    PathBuf::from("/tmp/linux.sock"),
                     PathBuf::from("/tmp/iced.sock")
                 ]
             ),

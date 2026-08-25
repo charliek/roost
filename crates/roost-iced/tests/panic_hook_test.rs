@@ -151,7 +151,7 @@ fn matching(files: &[PathBuf], matches: impl Fn(&str) -> bool) -> Vec<PathBuf> {
 /// feature set, so these resolve identically here).
 fn expected_app_label() -> &'static str {
     if cfg!(feature = "linux-package") && cfg!(target_os = "linux") {
-        "Roost-gtk"
+        "Roost-linux"
     } else {
         "Roost-iced"
     }

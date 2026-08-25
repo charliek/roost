@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 publish.workspace      = true
-description = "Streaming OSC scanner shared between roost-core (daemon-side routing) and roost-linux (UI-side detection)."
+description = "Streaming OSC scanner for UI-side detection of the OSC sequences Roost acts on."
 
 # Originally `crates/roost-core/src/osc.rs` (Phase 6a P4). Extracted
 # into its own crate during Phase 7 commit 2 so the Linux UI can

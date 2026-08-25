@@ -79,20 +79,20 @@ func bundleProfileMacUsesCapitalRoost() {
 }
 
 @Test
-func bundleProfileGtkIsDistinctFromMac() {
+func bundleProfileLinuxIsDistinctFromMac() {
     let mac = BundleProfile.mac(environment: ["HOME": "/Users/tester"])
-    let gtk = BundleProfile.gtk(environment: ["HOME": "/Users/tester"])
-    #expect(gtk.appID == "ai.stridelabs.Roost.gtk")
-    #expect(gtk.appLabel == "Roost-gtk")
-    #expect(mac.socketPath != gtk.socketPath)
-    #expect(mac.stateDir != gtk.stateDir)
-    #expect(mac.logDir != gtk.logDir)
+    let linux = BundleProfile.linux(environment: ["HOME": "/Users/tester"])
+    #expect(linux.appID == "ai.stridelabs.Roost.linux")
+    #expect(linux.appLabel == "Roost-linux")
+    #expect(mac.socketPath != linux.socketPath)
+    #expect(mac.stateDir != linux.stateDir)
+    #expect(mac.logDir != linux.logDir)
 }
 
 @Test
-func bundleProfileIcedIsDistinctFromMacAndGtk() {
+func bundleProfileIcedIsDistinctFromMacAndLinux() {
     let mac = BundleProfile.mac(environment: ["HOME": "/Users/tester"])
-    let gtk = BundleProfile.gtk(environment: ["HOME": "/Users/tester"])
+    let linux = BundleProfile.linux(environment: ["HOME": "/Users/tester"])
     let iced = BundleProfile.iced(environment: ["HOME": "/Users/tester"])
     #expect(iced.appID == "ai.stridelabs.Roost.iced")
     #expect(iced.appLabel == "Roost-iced")
@@ -100,11 +100,11 @@ func bundleProfileIcedIsDistinctFromMacAndGtk() {
     #expect(iced.stateDir == "/Users/tester/Library/Application Support/Roost-iced")
     #expect(iced.logDir == "/Users/tester/Library/Logs/Roost-iced")
     #expect(iced.socketPath != mac.socketPath)
-    #expect(iced.socketPath != gtk.socketPath)
+    #expect(iced.socketPath != linux.socketPath)
     #expect(iced.socketLockPath != mac.socketLockPath)
-    #expect(iced.socketLockPath != gtk.socketLockPath)
+    #expect(iced.socketLockPath != linux.socketLockPath)
     #expect(iced.stateLockPath != mac.stateLockPath)
-    #expect(iced.stateLockPath != gtk.stateLockPath)
+    #expect(iced.stateLockPath != linux.stateLockPath)
 }
 
 @Test
@@ -113,11 +113,28 @@ func bundleProfileEnvOverridesDefault() {
         default: .mac,
         environment: [
             "HOME": "/Users/tester",
+            "ROOST_BUNDLE_PROFILE": "linux",
+        ]
+    )
+    #expect(p.kind == .linux)
+    #expect(p.appID == "ai.stridelabs.Roost.linux")
+}
+
+/// Lockstep with `paths.rs`'s
+/// `a_stale_gtk_profile_value_falls_through_to_the_default`: `gtk` is no
+/// longer a profile value, and the UI-side policy keeps the caller's
+/// default rather than refusing to launch.
+@Test
+func bundleProfileStaleGtkEnvFallsThroughToDefault() {
+    let p = BundleProfile.currentForBinary(
+        default: .mac,
+        environment: [
+            "HOME": "/Users/tester",
             "ROOST_BUNDLE_PROFILE": "gtk",
         ]
     )
-    #expect(p.kind == .gtk)
-    #expect(p.appID == "ai.stridelabs.Roost.gtk")
+    #expect(p.kind == .mac)
+    #expect(p.appID == "ai.stridelabs.Roost")
 }
 
 @Test
@@ -204,7 +221,7 @@ func stateDirOverrideRelativeKeepsDefault() {
 //
 // Mac analog of the Rust `sidebar_collapsed_persists_across_reopen` test —
 // covers the regression class the CI-skipped relaunch e2e can't, since the
-// Rust GTK state.json test doesn't exercise the Mac UserDefaults path.
+// Rust state.json test doesn't exercise the Mac UserDefaults path.
 
 @Test
 func sidebarVisibleOnLaunchDefaultsToVisibleWhenUnset() {

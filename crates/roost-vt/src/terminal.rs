@@ -271,7 +271,7 @@ impl Terminal {
     }
 
     /// Raw FFI handle. Pass-through for crates that need to call a
-    /// not-yet-wrapped symbol (e.g. `crates/roost-linux/`'s key encoder
+    /// not-yet-wrapped symbol (e.g. `crates/roost-iced/`'s key encoder
     /// sync). Stays `pub(crate)` deliberately — internal modules use
     /// this; external code goes through [`Self::as_ffi`].
     pub(crate) fn handle(&self) -> sys::GhosttyTerminal {

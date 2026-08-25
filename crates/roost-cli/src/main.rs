@@ -1,4 +1,4 @@
-//! roostctl — shell-integration CLI for the Roost UIs (Mac, GTK, and Iced).
+//! roostctl — shell-integration CLI for the Roost UIs (Mac, Linux, and Iced).
 //!
 //! Talks JSON over a Unix-domain socket directly to the running UI
 //! process; there is no daemon. The wire format is documented in
@@ -28,7 +28,7 @@
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
 //!   ROOST_SOCKET env var
-//!   --target {mac,gtk,iced} (resolves to that profile's canonical socket)
+//!   --target {mac,linux,iced} (resolves to that profile's canonical socket)
 //!   ROOST_BUNDLE_PROFILE    (same effect as --target)
 //!   auto-detect             (probes all distinct paths; fails on ambiguity)
 //!
@@ -83,7 +83,7 @@ struct Args {
 #[derive(ValueEnum, Debug, Clone, Copy)]
 enum TargetArg {
     Mac,
-    Gtk,
+    Linux,
     Iced,
 }
 
@@ -91,7 +91,7 @@ impl From<TargetArg> for BundleProfileKind {
     fn from(t: TargetArg) -> Self {
         match t {
             TargetArg::Mac => BundleProfileKind::Mac,
-            TargetArg::Gtk => BundleProfileKind::Gtk,
+            TargetArg::Linux => BundleProfileKind::Linux,
             TargetArg::Iced => BundleProfileKind::Iced,
         }
     }
@@ -1520,8 +1520,8 @@ mod tests {
             BundleProfileKind::Mac
         ));
         assert!(matches!(
-            BundleProfileKind::from(TargetArg::Gtk),
-            BundleProfileKind::Gtk
+            BundleProfileKind::from(TargetArg::Linux),
+            BundleProfileKind::Linux
         ));
         assert!(matches!(
             BundleProfileKind::from(TargetArg::Iced),

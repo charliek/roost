@@ -5,7 +5,7 @@
 //! (mode `0o600`) and the *path* is what gets pasted, as ordinary
 //! bracketed text — that is what makes agents like Claude Code and Codex
 //! recognise the image and offer to attach it. Mirrors
-//! `roost-linux/src/paste_image.rs` and the Mac UI's `PasteImage.swift`.
+//! the Mac UI's `PasteImage.swift`.
 //!
 //! [`materialize`] BLOCKS: `arboard` talks to the display server (or
 //! NSPasteboard) synchronously, and a large paste also spends real time
