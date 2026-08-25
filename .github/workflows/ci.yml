@@ -43,7 +43,6 @@ jobs:
               # The file is a dotfile. The old 'mise.toml' pattern could
               # never match, so a toolchain bump triggered no Rust job.
               - '.mise.toml'
-              - 'clippy.toml'
               - 'crates/**'
               - 'third_party/ghostty/**'
               - 'third_party/swash/**'

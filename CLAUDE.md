@@ -240,7 +240,8 @@ wrapper small.
 **Not part of `make check` or the `ci-success` gate.** The docs site has
 its own toolchain (uv/Python) and its own CI workflows; the Rust/Swift
 gates do not cover it. Run it for commits touching `docs/`,
-`zensical.toml`, `pyproject.toml`, `uv.lock`, or either docs workflow —
+`zensical.toml`, `pyproject.toml`, `uv.lock`, `CHANGELOG.md`, or either
+docs workflow —
 both workflows trigger on those shared inputs (and each additionally on
 its own file), because a dependency or lockfile change can break the
 build just as easily as a content change:

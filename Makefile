@@ -42,7 +42,7 @@ $(GHOSTTY_LIB):
 build: $(GHOSTTY_LIB)  ## cargo build the workspace (Iced UI + roostctl)
 	cargo build
 
-build-iced: $(GHOSTTY_LIB)  ## Build the isolated Iced POC binary
+build-iced: $(GHOSTTY_LIB)  ## Build the isolated Iced UI binary
 	cargo build -p roost-iced
 
 build-mac: $(GHOSTTY_LIB)  ## swift build the Mac app
@@ -59,7 +59,7 @@ build-all: build bundle  ## Build both UIs + the Mac bundle
 # ---- run --------------------------------------------------------------
 
 .PHONY: run-iced run-mac
-run-iced: build-iced  ## Launch the Iced POC (Roost-iced profile)
+run-iced: build-iced  ## Launch the Iced UI (Roost-iced profile)
 	ROOST_BUNDLE_PROFILE=iced ./target/debug/roost-iced
 
 run-mac: bundle  ## Launch the bundled Mac app

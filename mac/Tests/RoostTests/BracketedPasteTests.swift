@@ -1,6 +1,6 @@
 // Bracketed-paste framing tests, Swift companion to the shared suite in
 // `crates/roost-ui-model/src/bracketed_paste.rs::tests`. The vectors are shared
-// verbatim with the Rust side so the three UIs stay byte-identical on the
+// verbatim with the Rust side so the two UIs stay byte-identical on the
 // sanitize + wrap boundary (the cross-UI parity the north star asks for).
 //
 // XCTest, not swift-testing, for the same reason `ShellEscapeTests` is: a swarm

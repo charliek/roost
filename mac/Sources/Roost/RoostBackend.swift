@@ -146,7 +146,7 @@ protocol UiBridge: AnyObject {
 }
 
 /// Outcome from `UiBridge.expandTabSelectionAt` — mirrors
-/// `roost_linux::ipc::ExpandSelectionData`. `text` is the extracted
+/// `roost_engine::ipc::ExpandSelectionData`. `text` is the extracted
 /// selection content, or `nil` when the renderer reports an empty
 /// selection (off-screen row, single-cell span outside the viewport).
 struct ExpandSelectionOutcome: Sendable {

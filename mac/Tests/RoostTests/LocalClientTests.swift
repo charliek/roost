@@ -24,7 +24,7 @@ struct LocalClientOSCTests {
     @Test func osc7ReturnsNilForHostWithoutPath() {
         // `file://host` (no path after host) — must NOT return
         // "host" as the path. The Rust side has the same regression
-        // test (`parse_osc7_path` in roost-linux/src/local_client.rs).
+        // test (`parse_osc7_path` in crates/roost-engine/src/application.rs).
         #expect(parseOSC7Path("file://host") == nil)
     }
 

@@ -1,7 +1,9 @@
 // Pure word- and line-expansion helpers for double-/triple-click
 // selection. Mirrors `crates/roost-ui-model/src/word_selection.rs`
 // (shared by iced) 1:1 (PR B); the shared `tests/word-fixtures/`
-// corpus pins the two ports byte-equal on every supported edge case.
+// corpus pins the two ports byte-equal on every supported edge case —
+// see `WordFixtureRoundTripTests.swift` here and
+// `crates/roost-ui-model/tests/word_fixtures_test.rs` on the Rust side.
 //
 // No AppKit imports here — same shape as `UrlDetection.swift` so the
 // algorithm can be exercised from a swift-testing target without
@@ -26,7 +28,7 @@ import Foundation
 
 /// One word- or line-span inside a terminal row. Both ends are
 /// inclusive scalar-indexed columns. Same shape + semantics as
-/// `roost_linux::word_selection::WordSpan` on the Rust side.
+/// `roost_ui_model::word_selection::WordSpan` on the Rust side.
 struct WordSpan: Equatable {
     let col0: Int
     let col1: Int

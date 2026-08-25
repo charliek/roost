@@ -221,7 +221,7 @@ class TestOscPipeline:
 
     def test_osc11_same_chunk_set_query_replies_pre_chunk_color(self, roost, project):
         """SET + QUERY in ONE chunk answers from the chunk-start
-        colors — pinned behavior on all three UIs, not an accident of
+        colors — pinned behavior on both UIs, not an accident of
         one implementation.
 
         This used to be a skipped "known #145 limitation" slot,
@@ -230,7 +230,7 @@ class TestOscPipeline:
         argument no longer applies, and pinned the SAME semantics
         explicitly: `OscRouter::feed`'s contract (a SET affects a LATER
         chunk's query; SET+QUERY in one chunk sees the pre-chunk value)
-        is what all three UIs implement. Asserting only the negative —
+        is what both UIs implement. Asserting only the negative —
         the just-set color is NOT echoed — keeps this target-agnostic
         without hard-coding a theme color.
         """
