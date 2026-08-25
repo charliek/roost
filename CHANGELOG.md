@@ -11,40 +11,88 @@ release workflow asserts they agree).
 
 ## Unreleased
 
-### Changed
+## v0.0.18 — 2026-08-25
+
+**Linux switches to the iced UI, and macOS gains an experimental iced build
+alongside the Swift app.** The `.deb` now ships the Rust + iced UI as
+`/usr/bin/roost` in place of the GTK app — same socket, same `state.json`,
+same log directory, so `roostctl` and the Claude hooks keep working and
+existing installs upgrade with no migration step. On macOS the Swift app
+remains the product; a second, opt-in `Roost-Iced.dmg` ships beside it with
+its own bundle id, its own Sparkle feed, and its own update key, so the two
+can be installed and run side by side.
+
+### Features
+
+- **The Linux package is the iced UI (#314, #315)** — `/usr/bin/roost` is now
+  the iced binary, built with the `linux-package` feature so it resolves the
+  production `roost` profile the GTK package already owned. GTK4 and libadwaita
+  are no longer runtime dependencies. The GTK UI stays in the repo, built and
+  tested in CI, as the development/parity implementation.
+- **Roost-Iced for macOS, experimental and opt-in (#345, #347, #349)** — a
+  Developer-ID signed, notarized `Roost-Iced-<version>.dmg` with a native menu
+  bar, Dock badge, Sparkle updater, and desktop notifications. It carries a
+  separate appcast (`appcast-iced.xml`) and a separate signing key, so the two
+  macOS apps can never offer each other's updates.
+- **macOS notifications for the iced build (#349)** — banners route through
+  `UNUserNotificationCenter`; clicking one focuses the tab and reveals the
+  sidebar. One live banner per tab, replaced in place rather than stacked,
+  matching the Linux behavior (the Swift app stacks).
+- **Linux notification click-to-focus (#352)** — the iced UI speaks
+  `org.freedesktop.Notifications` directly, so the click that activates a
+  banner is received on the same connection that sent it. Banners no longer
+  expire before they can be clicked, and are withdrawn on click or tab close.
+- **The shipped Linux identity is `ai.stridelabs.Roost` (#337)** — window class,
+  desktop entry, and app id all match the Mac app. A hidden alias desktop entry
+  keeps launcher pins created before the rename working.
+- **Terminal parity work across the iced UI** — IME/dead-key input (#313),
+  sprite and box-drawing rendering (#310), selection and copy semantics (#330),
+  sidebar resize (#294), project lifecycle (#290), tab-strip behavior (#291),
+  and a kitty-keyboard/cursor-shape pass (#348).
+- **`app.notification_status` (#349)** — a test-mode op reporting the macOS
+  notification backend's availability and authorization, so the gated paths are
+  assertable end to end.
+
+### Fixes
+
+- **Crash robustness (#308)** — panics in either Rust UI now produce a crash
+  report instead of a silent exit, and a malformed font can no longer abort the
+  process (#298).
+- **Rendering keeps up under load (#296, #306, #307)** — the engine tracks dirty
+  rows and pushes frames rather than polling, cutting redundant redraws in both
+  Rust UIs.
+- **Single-instance locking and PTY exit handling (#331, #332)** — a second
+  launch surfaces the running window instead of racing it, and a tab whose
+  process exits is reaped deterministically.
+- **Wayland dependency closure (#327)** — the `.deb` declares what a Wayland
+  session actually needs, so a clean-machine install launches.
+
+### Release process
+
+- **The release publishes four assets** — two `.deb`s, `Roost-<version>.dmg`,
+  and `Roost-Iced-<version>.dmg` — and stays a draft until all four are present
+  and correctly sized (#329, #349). A missing or truncated artifact leaves the
+  release invisible rather than half-published.
+- **Two Sparkle feeds** — `docs/appcast.xml` for the Swift app and
+  `docs/appcast-iced.xml` for the iced build, each signed with its own key and
+  published in sequence so the two bot pushes cannot race.
+- **The packaged binary is smoke-tested before publication (#317)** — the real
+  `.deb` is installed and launched, and its dependency closure verified in a
+  clean container.
+
+### Documentation
 
 - **Docs site migrated from Material for MkDocs to
-  [Zensical](https://zensical.org)**, the successor from the same team.
-  Material entered maintenance mode in November 2025 and now warns on every
-  build that MkDocs 2.0 will remove the plugin and theming systems with no
-  migration path. `mkdocs.yml` is replaced by a native `zensical.toml`;
-  documentation content is unchanged aside from a handful of links that
-  `--strict` now validates (out-of-tree paths became GitHub blob URLs; one
-  stale heading anchor was corrected).
-
-  The look now comes from the shared
+  [Zensical](https://zensical.org)**, the successor from the same team. Material
+  entered maintenance mode in November 2025 and warns on every build that MkDocs
+  2.0 will remove the plugin and theming systems with no migration path.
+  `mkdocs.yml` is replaced by a native `zensical.toml`; content is unchanged
+  aside from a handful of links that `--strict` now validates. The look comes
+  from the shared
   [stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
-  package rather than per-repo config, so restyling every site is a version
-  bump instead of an edit in each repo. Fonts are self-hosted by the theme, so
-  the site no longer requests anything from `fonts.googleapis.com` or
-  `fonts.gstatic.com`.
-
-  Working notes previously withheld via MkDocs `exclude_docs` moved to
-  `discovery/` at the repo root — Zensical has no equivalent, and leaving
-  them under `docs/` would have published them.
-
-  Verified against the pre-migration build: identical 27-page set and all
-  374 heading anchors preserved, so existing deep links still resolve.
-  `docs/appcast.xml` still copies through to the published site. Page
-  `<title>` now derives from the page `<h1>` rather than the nav label, which
-  is the one intentional difference.
-
-### Added
-
-- **`Docs PR Build` workflow.** Docs previously built only on push to `main`,
-  and without `--strict`, so a broken link or heading anchor could land on
-  `main` and be caught at deploy time or not at all. Both workflows now build
-  `--strict` and watch `uv.lock`.
+  package rather than per-repo config, and fonts are self-hosted, so the site no
+  longer requests anything from Google Fonts. Verified against the pre-migration
+  build: identical 27-page set and all 374 heading anchors preserved.
 
 ## v0.0.17 — 2026-07-31
 
