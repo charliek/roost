@@ -203,8 +203,7 @@ mod tests {
         let error = materialize_rgba(7_000, 6_000, &[]).expect_err("over the pixel cap");
         assert!(error.contains("exceeds"), "{error}");
         assert_eq!(
-            MAX_PIXELS,
-            41_943_040,
+            MAX_PIXELS, 41_943_040,
             "byte-identical to the removed GTK UI's ceiling"
         );
     }
