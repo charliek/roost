@@ -5,7 +5,7 @@ name: Release
 #   * Roost-Iced-<version>.dmg                  (macOS, arm64 — experimental)
 #   * roost_<version>_amd64.deb / _arm64.deb    (Linux, native per-arch)
 # then fires repository_dispatch at charliek/apt-charliek so the .deb lands in
-# the apt repo. The GTK / ghostty-cache patterns mirror ci.yml.
+# the apt repo. The build-deps / ghostty-cache patterns mirror ci.yml.
 #
 # Mac signing/notarization is GATED on secrets and inert until they're added:
 #   ROOST_DEVELOPER_ID_IDENTITY, MACOS_CERTIFICATE_P12_BASE64,
@@ -187,12 +187,12 @@ jobs:
           persist-credentials: false
 
       # The .deb ships the iced UI as /usr/bin/roost (linux/scripts/
-      # build-deb.sh), not roost-linux — GTK dev packages (libgtk-4-dev,
-      # libadwaita-1-dev) are dead weight now that the package no longer
-      # contains the GTK UI. pkg-config + libclang-dev build roost-vt's
-      # bindgen; the rest mirrors ci.yml's `iced-release` job — the display
-      # + wgpu/vulkan stack the packaged-artifact smoke below needs to
-      # actually launch the binary under Xvfb.
+      # build-deb.sh). No GTK dev packages: roost-iced is GTK-free, which
+      # ci.yml's `iced-build-e2e` boundary grep enforces independently.
+      # pkg-config + libclang-dev build roost-vt's bindgen; the rest mirrors
+      # ci.yml's `iced-release` job — the display + wgpu/vulkan stack the
+      # packaged-artifact smoke below needs to actually launch the binary
+      # under Xvfb.
       - name: Install Iced + build deps
         run: |
           sudo apt-get update
