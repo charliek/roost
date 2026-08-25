@@ -288,11 +288,27 @@ fn start_update_check() -> Result<(), String> {
     Err("app.update_check is not supported on this UI (macOS iced only)".into())
 }
 
-/// The shared precedence for the five macOS-iced-only test ops
+/// The `app.notification_status` read, on the main thread — the
+/// notification seam keeps its state in main-thread `thread_local!`s
+/// (plus a couple of atomics), same reasoning as [`read_update_status`].
+#[cfg(target_os = "macos")]
+fn read_notification_status() -> Result<AppNotificationStatusResult, String> {
+    let mtm = serviced_on_main("app.notification_status")?;
+    Ok(crate::macos::notifications::status(mtm))
+}
+
+/// The UN backend is macOS-only. Same verdict as [`read_dock_badge`]'s
+/// Linux arm.
+#[cfg(not(target_os = "macos"))]
+fn read_notification_status() -> Result<AppNotificationStatusResult, String> {
+    Err("app.notification_status is not supported on this UI (macOS iced only)".into())
+}
+
+/// The shared precedence for the six macOS-iced-only test ops
 /// (`app.dock_badge`, `app.menu_dump`, `app.menu_activate`,
-/// `app.update_status`, `app.update_check`): platform rejection
-/// outranks the test-mode gate, so non-macOS iced answers
-/// not-implemented (from `read` itself) like GTK does, not
+/// `app.update_status`, `app.update_check`, `app.notification_status`):
+/// platform rejection outranks the test-mode gate, so non-macOS iced
+/// answers not-implemented (from `read` itself) like GTK does, not
 /// not-enabled.
 fn macos_test_gated<T>(
     test_mode: bool,
@@ -832,6 +848,28 @@ impl App {
         }
     }
 
+    /// Install the `UNUserNotificationCenter` delegate and request
+    /// authorization — the parity port of `DesktopNotifications.swift`'s
+    /// launch-time setup. A no-op on every other host, and (on macOS) a
+    /// no-op after the first call.
+    ///
+    /// Called from `window_opened` rather than at boot: the delegate is
+    /// retained in a main-thread `thread_local!`, and the seam's own
+    /// convention is that the native surfaces come up once a window
+    /// exists.
+    pub(super) fn init_notifications(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("notifications init") else {
+                return;
+            };
+            crate::macos::notifications::init(mtm);
+        }
+    }
+
     /// Push `SPUUpdater.canCheckForUpdates` onto the "Check for
     /// Updates…" item, when it moved.
     ///
@@ -1292,6 +1330,10 @@ impl App {
                 // greys out for the duration rather than at the next
                 // unrelated reconcile.
                 self.sync_update_menu_item();
+                let _ = reply.send(result);
+            }
+            UiRequest::AppNotificationStatus { reply } => {
+                let result = macos_test_gated(self.test_mode, read_notification_status);
                 let _ = reply.send(result);
             }
             UiRequest::Screenshot { scale, reply } => {

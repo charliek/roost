@@ -628,6 +628,20 @@ class Roost:
         `app_dock_badge`."""
         self.call("app.update_check", {})
 
+    def app_notification_status(self) -> dict:
+        """Read back the macOS iced UI's `UNUserNotificationCenter`
+        backend state: `{"backend": "available"|"unavailable", "reason":
+        str|None, "authorized": bool}`.
+
+        `backend` is `"available"` once the UN delegate installed (a
+        bundled launch that reached its first window), `"unavailable"`
+        for every bare-binary build and a bundled app before its first
+        window. `authorized` is always `False` in this suite — CI's TCC
+        authorization state is unknowable, so nothing here asserts it
+        `True`. Gated by ROOST_TEST_MODE=1, macOS-iced-only, same as
+        `app_dock_badge`."""
+        return self.call("app.notification_status", {})
+
     def tab_expand_selection_at(
         self,
         tab_id: int,

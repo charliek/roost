@@ -9,7 +9,8 @@
 //! `Cargo.toml` carries the version-coupling policy that follows from
 //! that.
 //!
-//! Two rules hold for everything under here:
+//! Two rules hold for every AppKit surface under here — [`dock_badge`],
+//! [`menu`] and [`sparkle`]:
 //!
 //! * **Main thread only.** AppKit is main-thread-only (CLAUDE.md's
 //!   threading table), so every entry point either takes a
@@ -19,10 +20,23 @@
 //! * **Nothing retained escapes.** Callers hand in plain data and get
 //!   plain data back; no `Retained<_>` crosses out of this module.
 //!
+//! [`notifications`] is the documented exception to the first rule, and
+//! it is a framework fact rather than a shortcut: `UNUserNotificationCenter`
+//! is `AnyThread`, its `Retained` handle is `!Send`, and the seam's
+//! `show()` runs on the engine's tokio worker — so that module fetches
+//! the center per call off the main thread, and its delegate callbacks
+//! arrive on an unspecified queue. Those callbacks touch only
+//! cross-thread statics (a `Mutex` map and two atomics), never a
+//! `thread_local!` and never AppKit. Creating and retaining the delegate
+//! still happens on the main thread, under a marker, and the second rule
+//! holds there unchanged.
+//!
 //! First consumer: [`dock_badge`], the parity port of `App.swift`'s
 //! `refreshDockBadge()`. Second: [`menu`], the native menu bar. Third:
-//! [`sparkle`], the runtime-loaded updater.
+//! [`sparkle`], the runtime-loaded updater. Fourth: [`notifications`],
+//! the `UNUserNotificationCenter` backend.
 
 pub(crate) mod dock_badge;
 pub(crate) mod menu;
+pub(crate) mod notifications;
 pub(crate) mod sparkle;

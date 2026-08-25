@@ -2,6 +2,7 @@ name: Release
 
 # Phase 8 bundling. A tag push `v*` builds + uploads the release artifacts:
 #   * Roost-<version>.dmg                       (macOS, arm64)
+#   * Roost-Iced-<version>.dmg                  (macOS, arm64 — experimental)
 #   * roost_<version>_amd64.deb / _arm64.deb    (Linux, native per-arch)
 # then fires repository_dispatch at charliek/apt-charliek so the .deb lands in
 # the apt repo. The GTK / ghostty-cache patterns mirror ci.yml.
@@ -30,6 +31,10 @@ name: Release
 #   redeploys Pages → appcast live. No manual post-release step. That job runs
 #   after publish-release because the enclosure URL it writes is a public
 #   /releases/download/ link, which a draft's assets don't answer.
+#   `mac-iced` + `appcast-iced` are the same two-part shape for the
+#   experimental Roost-Iced build, on a SEPARATE feed (docs/appcast-iced.xml)
+#   with a SEPARATE keypair (mac/keys/README.md) — the two apps must never be
+#   able to offer each other's updates.
 
 on:
   push:
@@ -547,16 +552,290 @@ jobs:
           } > "${RUNNER_TEMP}/relbody.md"
           gh release edit "${tag}" --notes-file "${RUNNER_TEMP}/relbody.md"
 
+  # The experimental Roost-Iced macOS build (plan 030). Mirrors `mac` above —
+  # same runner, same six-secret CAN_NOTARIZE gate, same certificate import,
+  # same notarize/sign/upload shape — with three deliberate carve-outs:
+  #
+  #   * No SwiftPM cache: this bundle is a `cargo build`, not `swift build`,
+  #     and no mac/.build exists here (which is also why the Sparkle signing
+  #     step below uses the vendored third_party/sparkle/out/bin/sign_update
+  #     instead of the SwiftPM artifact path the `mac` job finds).
+  #   * No Swift throwaway-key grep: superseded by the key-file fail-fast
+  #     below, which is strictly stronger (it also checks the secret).
+  #   * No first-launch-note release-body edit: two jobs read-modify-writing
+  #     the same release body would race, and the note already ships INSIDE
+  #     the DMG as FIRST-LAUNCH.txt (make-dmg.sh writes it whenever there is
+  #     no Developer ID identity).
+  mac-iced:
+    needs: create-release
+    runs-on: macos-26   # Same pin as `mac`: bundle-iced.sh shares that job's
+    timeout-minutes: 90 # icon pipeline (bundle-lib.sh), which wants Xcode 26.
+    permissions:
+      contents: write
+    env:
+      CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.ROOST_DEVELOPER_ID_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      # Own cache key, not the `mac` job's `cargo-release-*`: these two jobs
+      # run in parallel and would otherwise both try to SAVE the same key.
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-iced-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-release-iced-${{ runner.os }}-
+
+      # Deliberately uncached (unlike ci.yml's iced lanes): fetch.sh
+      # re-verifies the pinned SHA256 on every download, and the release path
+      # is the one place that check is worth paying for. bundle-iced.sh would
+      # call it anyway; running it up front also guarantees
+      # out/bin/sign_update exists for the signing step below.
+      - name: Stage Sparkle
+        run: ./third_party/sparkle/fetch.sh
+
+      # Same throwaway keychain the `mac` job builds, for the same reason.
+      - name: Import Developer ID certificate
+        if: env.CAN_NOTARIZE == 'true'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # The decoded cert must never outlive this step, even on early failure.
+          # (The keychain itself must persist — later steps sign against it.)
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+          kc="$RUNNER_TEMP/roost-signing.keychain-db"
+          kp="$(openssl rand -base64 24)"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
+          # Prepend our keychain to the user search list, keeping the existing
+          # ones; the command substitution must word-split into separate paths.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      # BEFORE the build, because every one of these failures is a config
+      # mistake that would otherwise surface 40 minutes later, at signing
+      # time — or worse, not at all: a bundle stamped with a public key whose
+      # private half never signed anything looks perfect and simply never
+      # updates. mac/keys/README.md is the install procedure this points at.
+      - name: Verify the iced Sparkle key material
+        env:
+          ICED_PRIVATE_KEY: ${{ secrets.ROOST_ICED_SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          key_file="mac/keys/roost-iced-sparkle-ed-public-key.txt"
+          fixture="tools/roosttest/fixtures/sparkle/TEST-ONLY-public-ed-key.txt"
+          if [ ! -s "${key_file}" ]; then
+            echo "::error::${key_file} is missing or empty — generate the Roost-Iced Sparkle keypair and commit its public half before tagging (mac/keys/README.md)."
+            exit 1
+          fi
+          if [ ! -f "${fixture}" ]; then
+            echo "::error::${fixture} not found — the TEST-ONLY-key guard can no longer compare against it; update this step's path."
+            exit 1
+          fi
+          if cmp -s "${key_file}" "${fixture}"; then
+            echo "::error::${key_file} is the TEST-ONLY fixture key (${fixture}) — a shipped feed must carry the maintainer's real public key (mac/keys/README.md)."
+            exit 1
+          fi
+          # The committed public half must itself be base64 of a 32-byte
+          # ed25519 public key — a malformed value would be PlistBuddy-stamped
+          # verbatim and produce a bundle that looks fine and never updates.
+          pub_bytes="$(base64 --decode < "${key_file}" 2>/dev/null | wc -c | tr -d ' ')"
+          if [ "${pub_bytes}" != "32" ]; then
+            echo "::error::${key_file} does not decode to a 32-byte ed25519 public key (got ${pub_bytes} bytes) — re-run the export in mac/keys/README.md."
+            exit 1
+          fi
+          if [ -z "${ICED_PRIVATE_KEY}" ]; then
+            echo "::error::ROOST_ICED_SPARKLE_ED_PRIVATE_KEY secret is unset — the iced DMG can't be signed for appcast-iced (mac/keys/README.md)."
+            exit 1
+          fi
+          W="$(mktemp -d)"
+          chmod 700 "$W"
+          trap 'rm -rf "$W"' EXIT
+          # Two layers, matching the SPARKLE_ED_PRIVATE_KEY convention: the
+          # secret is base64 of the key FILE, whose own contents are base64 of
+          # the ed25519 seed. Decode both so a mangled paste fails here.
+          # macOS `base64 --decode` is lenient (exit 0 on garbage), so a
+          # mangled paste is caught by the byte-count below rather than the
+          # decode calls — the error message covers both.
+          printf '%s' "${ICED_PRIVATE_KEY}" | base64 --decode > "${W}/key" 2>/dev/null || true
+          seed_bytes="$(base64 --decode < "${W}/key" 2>/dev/null | wc -c | tr -d ' ')"
+          # 32 = the ed25519 seed generate_keys writes today; 96 = the older
+          # format. sign_update accepts exactly these two (its own error
+          # message claims 64/96, but its code takes 32/96 — verified against
+          # the vendored 2.9.5).
+          case "${seed_bytes}" in
+            32|96) ;;
+            *)
+              echo "::error::ROOST_ICED_SPARKLE_ED_PRIVATE_KEY does not decode to a Sparkle ed25519 key (expected 32 or 96 bytes after both base64 layers, got ${seed_bytes}) — set it to \`base64 < <the file generate_keys -x wrote>\` (mac/keys/README.md)."
+              exit 1
+              ;;
+          esac
+          # The two halves are validated independently above, which cannot
+          # catch the failure that matters most: a secret holding a DIFFERENT
+          # valid key than the committed public half. That ships a bundle
+          # whose SUPublicEDKey rejects every signature we produce, and
+          # Sparkle reports it to users as nothing at all — just "no update".
+          # Sparkle's own `sign_update --verify` takes a private key, so it
+          # cannot prove the pair; derive the public half from the seed
+          # instead. 96-byte legacy keys carry their own public half and are
+          # not derivable this way, so they are skipped rather than guessed.
+          if [ "${seed_bytes}" = "32" ]; then
+            derive='import base64,sys; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; from cryptography.hazmat.primitives.serialization import Encoding,PublicFormat; print(base64.b64encode(K.from_private_bytes(sys.stdin.buffer.read()).public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)).decode())'
+            # --no-project: without it uv syncs the repo's docs project first, so a
+            # stale uv.lock or an unreachable theme git tag would fail the KEY
+            # check with a message about keys. Pinned for the same reason the
+            # rest of the release path is pinned.
+            derived="$(base64 --decode < "${W}/key" | uv run --no-project --with 'cryptography==46.0.3' python3 -c "${derive}")"
+            if [ "${derived}" != "$(tr -d '[:space:]' < "${key_file}")" ]; then
+              echo "::error::ROOST_ICED_SPARKLE_ED_PRIVATE_KEY is not the private half of ${key_file}. Signing with it would ship updates no installed Roost-Iced can verify. Re-run the ceremony in mac/keys/README.md."
+              exit 1
+            fi
+            echo "keypair match confirmed (derived public half equals the committed one)"
+          fi
+          rm -f "${W}/key"
+          echo "iced Sparkle key material looks well-formed (public key committed, private secret decodes to ${seed_bytes} bytes)."
+
+      # Unlike the Swift bundle (whose SUFeedURL/SUPublicEDKey are baked into
+      # Info.plist.template), the iced bundle ships feedless by default and
+      # gets the pair injected here — this env pair IS the feed enablement.
+      - name: Bundle Roost-Iced.app
+        env:
+          ROOST_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.ROOST_DEVELOPER_ID_IDENTITY || '' }}
+          ROOST_ICED_SPARKLE_FEED_URL: https://charliek.github.io/roost/appcast-iced.xml
+        run: |
+          set -euo pipefail
+          ROOST_VERSION="${GITHUB_REF_NAME#v}" \
+            ROOST_ICED_SPARKLE_ED_PUBLIC_KEY="$(cat mac/keys/roost-iced-sparkle-ed-public-key.txt)" \
+            ./mac/scripts/bundle-iced.sh release
+
+      # The iced twin of the `mac` job's release-bundle E2E, deliberately a
+      # cheap subset: the point is that the binary we are about to ship gets
+      # launched at least once in the release path (boot, IPC, the Sparkle
+      # seam), not a second full functional suite. test_sparkle's bundle lane
+      # points the updater at a loopback feed via the test-mode delegate
+      # override, so the real feed URL stamped above is not consulted here.
+      - name: E2E against the release bundle
+        env:
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_TEST_MODE: "1"
+          ROOST_ICED_APP: mac/build/Roost-Iced.app
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_sparkle.py
+          --roost-target iced --roost-fresh -v
+
+      # The overrides are what keep this DMG's contents named Roost-Iced.app:
+      # with defaults make-dmg.sh packages the Swift bundle, and an iced DMG
+      # containing a "Roost.app" would drag-install OVER the Swift app.
+      - name: Make DMG
+        env:
+          ROOST_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.ROOST_DEVELOPER_ID_IDENTITY || '' }}
+          ROOST_DMG_APP_DIR: mac/build/Roost-Iced.app
+        run: |
+          set -euo pipefail
+          ROOST_DMG_BASENAME="Roost-Iced-${GITHUB_REF_NAME#v}" \
+            ./mac/scripts/make-dmg.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Notarize + staple (skipped without credentials)
+        if: env.CAN_NOTARIZE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./mac/scripts/notarize.sh "mac/build/Roost-Iced-${GITHUB_REF_NAME#v}.dmg"
+
+      # A distinct label, because the two DMG rows sit next to each other on
+      # the Release page and only the label says which one is the experiment.
+      # The file still downloads as Roost-Iced-<version>.dmg, which is what
+      # appcast-iced's enclosure URL is built from.
+      - name: Upload DMG to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            "mac/build/Roost-Iced-${GITHUB_REF_NAME#v}.dmg#macOS Iced, experimental (.dmg)" --clobber
+
+      # appcast-iced, part 1 of 2. The Swift twin signs with the SwiftPM
+      # artifact's sign_update; there is no SwiftPM build here, so this uses
+      # the vendored (pinned + SHA-verified) stage the bundle already needed.
+      - name: Sign the DMG for Sparkle
+        env:
+          ICED_PRIVATE_KEY: ${{ secrets.ROOST_ICED_SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          DMG="mac/build/Roost-Iced-${VER}.dmg"
+          test -s "${DMG}" || { echo "::error::${DMG} missing — the DMG steps must run first."; exit 1; }
+          SIGN_UPDATE="third_party/sparkle/out/bin/sign_update"
+          test -x "${SIGN_UPDATE}" || { echo "::error::${SIGN_UPDATE} missing — the Stage Sparkle step should have produced it."; exit 1; }
+          W="$(mktemp -d)"
+          chmod 700 "$W"
+          trap 'rm -rf "$W"' EXIT
+          printf '%s' "${ICED_PRIVATE_KEY}" | base64 --decode > "${W}/key"
+          mkdir -p "${RUNNER_TEMP}/appcast-iced"
+          "${SIGN_UPDATE}" --ed-key-file "${W}/key" "${DMG}" > "${RUNNER_TEMP}/appcast-iced/sign-iced.txt"
+          rm -f "${W}/key"
+          # Not a secret — signature and length both end up in the public feed.
+          cat "${RUNNER_TEMP}/appcast-iced/sign-iced.txt"
+
+      - name: Hand sign-iced.txt to the appcast-iced job
+        uses: actions/upload-artifact@v7
+        with:
+          name: sparkle-sign-iced
+          path: ${{ runner.temp }}/appcast-iced/sign-iced.txt
+          if-no-files-found: error
+          # Artifacts are immutable — without this, re-running just this job
+          # dies on the existing name instead of recovering.
+          overwrite: true
+
   # The one irreversible step in the pipeline: everything before it lands on a
   # draft nobody can see, everything after it consumes a public release. So the
   # assertions belong HERE, where the fix is still "delete the draft and
   # re-run" rather than "a broken release is live and apt-charliek already
   # republished the previous version".
   #
-  # `needs: [linux, mac]` (and deliberately no `if: always()`) is what makes a
-  # failed build leave the draft unpublished.
+  # `needs: [linux, mac, mac-iced]` (and deliberately no `if: always()`) is
+  # what makes a failed build leave the draft unpublished. mac-iced is in that
+  # list even though the iced DMG is experimental: publish-release rejects
+  # unexpected AND missing assets, so the artifact set has to be all-or-
+  # nothing. An iced build failure therefore blocks the whole release —
+  # deliberate; draft-until-complete stays absolute.
   publish-release:
-    needs: [linux, mac]
+    needs: [linux, mac, mac-iced]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -641,7 +920,8 @@ jobs:
           expected_names=""
           for raw in "roost_${deb_ver}_amd64.deb" \
                      "roost_${deb_ver}_arm64.deb" \
-                     "Roost-${ver}.dmg"; do
+                     "Roost-${ver}.dmg" \
+                     "Roost-Iced-${ver}.dmg"; do
             expected_names="${expected_names}${expected_names:+ }$(printf '%s' "${raw}" | tr -c 'A-Za-z0-9._-' '.')"
           done
           echo "expected asset names (after GitHub's filename sanitization): ${expected_names}"
@@ -664,7 +944,7 @@ jobs:
           # Reject anything else on the release. A reused draft from an earlier
           # attempt can still be carrying an asset from a PREVIOUS version —
           # apt-charliek globs `roost_*.deb`, so a stale one there is a wrong
-          # package shipped, and the three named checks above would not see it.
+          # package shipped, and the named checks above would not see it.
           unexpected="$(printf '%s\n' "${assets}" | cut -f1 \
             | grep -vxF "$(printf '%s' "${expected_names}" | tr ' ' '\n')" || true)"
           if [ -n "${unexpected}" ]; then
@@ -811,6 +1091,131 @@ jobs:
             git fetch "${TOKEN_URL}" main
             git rebase FETCH_HEAD || {
               echo "::error::rebase conflict on docs/appcast.xml — concurrent appcast write? Re-run after investigating."
+              exit 1
+            }
+          done
+          echo "::error::push failed after 3 attempts; main moved faster than the retry loop. Re-run the workflow."
+          exit 1
+
+  # The Roost-Iced twin of `appcast`, writing docs/appcast-iced.xml — a
+  # separate feed signed with a separate keypair, so the two bundles can never
+  # offer each other's updates (mac/keys/README.md).
+  #
+  # `needs: appcast`, not `needs: publish-release`: both jobs push a bot commit
+  # to main, and running them in parallel makes those pushes race for the same
+  # ref. The cost is that a failed Swift appcast strands this one — recover
+  # with "Re-run failed jobs", which reruns `appcast` and then this.
+  appcast-iced:
+    needs: appcast
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Read-only for the same reason as `appcast`: the commit is pushed with
+    # the release-bot App token, not GITHUB_TOKEN (#136).
+    permissions:
+      contents: read
+    steps:
+      # `ref: main` and not the tag: docs/appcast-iced.xml is served from main
+      # via Pages, and starting from main means this checkout already carries
+      # the Swift appcast commit `appcast` just pushed, so the push below
+      # fast-forwards instead of needing a rebase.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the Sparkle signature
+        uses: actions/download-artifact@v7
+        with:
+          name: sparkle-sign-iced
+          path: ${{ runner.temp }}/appcast-iced
+
+      - name: Ensure xmllint is available
+        run: |
+          set -euo pipefail
+          command -v xmllint >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y libxml2-utils
+          }
+
+      - name: Mint release-bot App token
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:      ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+
+      # Same assertion as the Swift job makes, against the ICED asset name:
+      # a feed entry pointing at a 404 breaks in-app updates for every user
+      # of that build until someone notices.
+      - name: Verify the published DMG URL resolves
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/Roost-Iced-${GITHUB_REF_NAME#v}.dmg"
+          echo "checking ${url}"
+          if ! curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors \
+                 --range 0-0 -o /dev/null "${url}"; then
+            echo "::error::${url} does not resolve — refusing to publish an appcast-iced entry that points at a 404. Confirm the Roost-Iced DMG asset is on the published release, then re-run this job."
+            exit 1
+          fi
+
+      - name: Append signed appcast-iced entry
+        run: |
+          set -euo pipefail
+          SIGN_FILE="${RUNNER_TEMP}/appcast-iced/sign-iced.txt"
+          test -s "${SIGN_FILE}" || { echo "::error::${SIGN_FILE} missing or empty — the mac-iced job's signing step should have uploaded it."; exit 1; }
+          # ROOST_APPCAST + ROOST_DMG_NAME are what make this the iced feed;
+          # ROOST_REPO must match the URL verified above.
+          ROOST_VERSION="${GITHUB_REF_NAME#v}" \
+            ROOST_TAG="${GITHUB_REF_NAME}" \
+            ROOST_REPO="${GITHUB_REPOSITORY}" \
+            ROOST_APPCAST="docs/appcast-iced.xml" \
+            ROOST_DMG_NAME="Roost-Iced-${GITHUB_REF_NAME#v}.dmg" \
+            ROOST_SIGN_FILE="${SIGN_FILE}" \
+            python3 mac/scripts/update-appcast.py
+          xmllint --noout docs/appcast-iced.xml
+
+      - name: Push signed appcast-iced to main as release-bot
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          BOT_SLUG: ${{ steps.bot-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet docs/appcast-iced.xml; then
+            # Genuinely unchanged: re-running the same tag against a feed that
+            # already carries it. update-appcast.py preserves the prior
+            # pubDate, so the diff is empty when nothing else moved.
+            echo "::notice::docs/appcast-iced.xml unchanged for ${GITHUB_REF_NAME} — nothing to push."
+            exit 0
+          fi
+          bot_id="$(gh api "/users/${BOT_SLUG}[bot]" --jq '.id')"
+          git config user.name  "${BOT_SLUG}[bot]"
+          git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
+          git add docs/appcast-iced.xml
+          # Defensive, as in `appcast`: ONLY the iced feed may be staged. The
+          # Swift feed is explicitly not ours to touch — if it shows up here,
+          # something wrote to it after the `appcast` job's own commit.
+          staged="$(git diff --cached --name-only)"
+          if [ "${staged}" != "docs/appcast-iced.xml" ]; then
+            echo "::error::unexpected staged paths beyond docs/appcast-iced.xml:"
+            echo "${staged}"
+            exit 1
+          fi
+          git commit -m "chore(appcast-iced): publish ${GITHUB_REF_NAME} (#303)"
+
+          # URL-embedded token — see the `appcast` job for why http.extraheader
+          # is not usable here.
+          TOKEN_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          push() { git push "${TOKEN_URL}" HEAD:main; }
+          for attempt in 1 2 3; do
+            if push; then
+              echo "::notice::appcast-iced pushed for ${GITHUB_REF_NAME} — docs.yml will redeploy Pages."
+              exit 0
+            fi
+            echo "::warning::push attempt ${attempt} failed; rebasing onto origin/main and retrying"
+            git fetch "${TOKEN_URL}" main
+            git rebase FETCH_HEAD || {
+              echo "::error::rebase conflict on docs/appcast-iced.xml — concurrent appcast write? Re-run after investigating."
               exit 1
             }
           done

@@ -1094,6 +1094,15 @@ after it updates in place. Interactive panel flow + Gatekeeper behavior
 remain morning-checklist/manual (locked-Mac constraint); DMG/release.yml
 wiring deliberately untouched.
 
+**Feed wired (plan 030, 2026-08-17).** The "when a real iced feed
+happens" step above is now done: a separate iced keypair and
+`docs/appcast-iced.xml`, plus `release.yml` `mac-iced` and
+`appcast-iced` jobs, feed URL
+`https://charliek.github.io/roost/appcast-iced.xml`. Production key
+generation and installation stays
+Charlie-gated — `mac/keys/README.md` documents the procedure — no key
+was generated or installed in this session.
+
 * **6d. Menu bar.** ~~winit installs none~~ (correction, verified
   against winit 0.30.13 source: winit installs a minimal default menu —
   About/Hide/Quit via `terminate:` — so the real gap was app commands
@@ -1139,6 +1148,49 @@ interception and OS menu rendering are morning-checklist items.
   run-iced`. Match `mac/Sources/Roost/DesktopNotifications.swift`
   semantics. Replace-by-server-id becomes UN's stable per-tab identifier,
   which is simpler than the D-Bus version.
+
+**Shipped (plan 030, 2026-08-17).**
+`crates/roost-iced/src/macos/notifications.rs` adds the
+`UNUserNotificationCenter` backend behind the existing seam. Two
+conscious divergences from the Swift app, recorded in plan 030 and its
+PR: (a) **replace, not stack** — the seam's replace contract is
+honored via a stable per-tab identifier `roost-tab-{tab_id}`, so a new
+event for a tab replaces its own live banner, where Swift stacks under a
+unique id per event; (b) **no cold-launch banner-click routing** — the
+delegate installs at `window_opened` and its activation futures are
+process-local oneshots keyed by identifier, so a banner clicked after
+quit/relaunch is not routed back to a tab, unlike Swift's userInfo-based
+routing.
+
+**Open before iced could replace the Swift app: [#355]** — authorization
+is read once at launch in *both* apps, so a permission change made in
+System Settings afterwards is invisible (and silent) until relaunch. Not
+a release blocker — the normal first run prompts and applies the answer
+immediately — but it is a macOS parity item to settle, in both apps
+together, before the Swift build is retired.
+
+[#355]: https://github.com/charliek/roost/issues/355
+
+**Testing 6e needs a Developer-ID bundle — an ad-hoc one cannot work**
+(learned the hard way, 2026-08-24). macOS refuses notification
+authorization outright to an ad-hoc-signed app: `requestAuthorization`
+answers `granted=false` with "Notifications are not allowed for this
+application", and no prompt is ever shown. That is the CDHash caveat
+above in its sharpest form. Two traps follow:
+
+* `make e2e-iced-sparkle` re-bundles `mac/build/Roost-Iced.app`
+  ad-hoc-signed with the TEST-ONLY key, **clobbering** any Developer-ID
+  build sitting there. After running it, `mac/build/Roost-Iced.app` can
+  never show a banner. Test from a Developer-ID build — in practice,
+  install the notarized DMG's app to `/Applications` and drive that.
+* Notification permission is **not** TCC data, so `tccutil reset
+  Notifications <bundle-id>` does not exist and always fails; the
+  record lives in `usernoted`'s SIP-protected store. A denial recorded
+  against `ai.stridelabs.Roost.iced` by earlier ad-hoc builds survives
+  the upgrade to a signed build, and the only practical reset is
+  **System Settings → Notifications → Roost-Iced → Allow
+  notifications**. The grant is read once at startup, so the app must
+  be relaunched afterward before banners appear.
 * **6f. Window vibrancy.** Moved here from 3h by plan 026 (2026-08-15,
   Charlie's call, Q9): the frosted/translucent spike is an M6 mac-parity
   exploration item, not something the Linux release needs, so it no
@@ -1164,11 +1216,32 @@ interception and OS menu rendering are morning-checklist items.
   error (see the rationale comment in `mac/Resources/Roost.entitlements`,
   including which entitlements we deliberately omit). **Dock badge:
   done** — pulled forward as 6b's seam proof-consumer (2026-08-16, see
-  6b above for the implementation + test coverage). Still open: dock
-  menu, `NSApplicationDelegate` lifecycle (reopen-from-Dock, open-file/
-  URL, graceful terminate), activation policy, and Secure Keyboard Entry
-  (`EnableSecureEventInput` — a terminal convention neither app has
-  today).
+  6b above for the implementation + test coverage). Dispositions for the
+  rest (plan 030, 2026-08-17):
+    * **Dock menu, reopen-from-Dock, open-file/URL: winit-blocked.**
+      winit 0.30.13's private app delegate implements only
+      `applicationDidFinishLaunching` and `applicationWillTerminate`
+      (`app_state.rs:47-70`ish) — no extension point for the rest — and
+      there is no Swift parity bar to chase either: `App.swift`
+      implements none of these. Not planned unless winit grows the API
+      (or a deliberate future vendored-winit decision — Charlie's).
+    * **Graceful terminate: covered.** `applicationWillTerminate` →
+      `LoopExiting` → `Drop for App` → `workspace.flush()`
+      (`app.rs:3200-3210`). An OS-initiated terminate blocks on the
+      delegate, so `Drop` still runs; only `kill -9` bypasses it. A
+      cancelable `applicationShouldTerminate:` is winit-blocked the same
+      way as the dock/reopen/open-file gap above.
+    * **Activation policy: fine by manifest.** The bundled app is
+      `Regular` (`LSUIElement` false + a real icon); the bare-binary
+      generic Dock icon is the known non-bug. `iced_winit` 0.14 exposes
+      no policy hook, so there is nothing to do.
+    * **Secure Keyboard Entry: feasible, DEFERRED.** Carbon
+      `EnableSecureEventInput` FFI at the window-focus edges would work
+      (the Ghostty reference lands with the pinned checkout at
+      `third_party/ghostty/.../SecureInput.swift` once `build.sh`
+      runs), but it's deferred
+      pending a product decision on the toggle surface — always-on
+      breaks text expanders — Charlie's call.
 * **6h. macOS verification tier.** What makes the parity claim honest
   instead of hand-verified: a CGEvent real-input harness ([#285] — the
   uinput tier is Linux-only, a gap that matters far more once Mac is a

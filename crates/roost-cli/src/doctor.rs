@@ -65,7 +65,7 @@ macro_rules! docs_base {
 /// [`doc`], so the link doctor prints and the anchor the test verifies
 /// cannot drift apart.
 /// `page` + `anchor` are read only by `doc_anchors_resolve`, which
-/// resolves them against `docs/` and `mkdocs.yml`'s nav; `url` is what
+/// resolves them against `docs/` and `zensical.toml`'s nav; `url` is what
 /// production emits. Carrying all three on one row built by [`doc`] is
 /// what makes the printed link and the verified anchor impossible to
 /// drift apart — hence the struct-level allow.
@@ -6072,43 +6072,51 @@ mod tests {
         out
     }
 
-    /// Is `rel` an actual nav entry — `- Title: page.md` or `- page.md` —
-    /// rather than a substring of a comment or a longer path?
+    /// Is `rel` an actual nav entry — `{ "Title" = "page.md" }` — rather
+    /// than a substring of a comment or of a longer path? Zensical's nav
+    /// is a TOML array of one-key tables, so the entry is the quoted
+    /// value; matching the quotes is what keeps `cli.md` from passing on
+    /// `reference/cli.md`.
     fn nav_lists(nav: &str, rel: &str) -> bool {
+        let quoted = format!("\"{rel}\"");
         nav.lines().any(|line| {
             let line = line.split('#').next().unwrap_or_default();
-            let Some(entry) = line.trim().strip_prefix("- ") else {
-                return false;
-            };
-            let value = entry.rsplit_once(": ").map_or(entry, |(_, v)| v);
-            value.trim() == rel
+            line.split('=')
+                .skip(1)
+                .any(|value| value.trim().trim_end_matches([',', '}', ']', ' ']) == quoted)
         })
     }
 
-    /// mkdocs' `nav:` block, bounded at the next top-level key — `extra:`
-    /// follows it today, and its entries are not nav entries.
-    fn nav_block(mkdocs: &str) -> String {
-        mkdocs
-            .split("\nnav:")
+    /// Zensical's `nav = [` array, bounded at the line that closes it.
+    /// `mkdocs.yml`'s `nav:` block was the pre-Zensical equivalent.
+    fn nav_block(zensical: &str) -> String {
+        zensical
+            .split("\nnav = [")
             .nth(1)
-            .expect("mkdocs.yml has a nav:")
+            .expect("zensical.toml has a nav = [")
             .lines()
+            // Indentation, not the closing bracket: nav entries are
+            // indented, so this stops at a column-0 `]` AND at the next
+            // `[table]` header. Keying on `]` alone would swallow the rest
+            // of the file if the array close were ever indented.
             .take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
     /// Deliberately one-directional: for each `(page, anchor)` doctor can
-    /// emit, assert the page exists, that it is in `mkdocs.yml`'s
-    /// hand-maintained nav (`docs/reference/terminal-queries.md` is the
-    /// counterexample on disk today), and that some heading slugifies to
-    /// the anchor. It does NOT reimplement mkdocs' slugify over every
+    /// emit, assert the page exists, that it is in `zensical.toml`'s
+    /// hand-maintained nav (Zensical publishes everything under `docs/`,
+    /// so nav membership is about being *reachable*, not about publishing
+    /// — `docs/reference/terminal-queries.md` publishes while unlinked),
+    /// and that some heading slugifies to
+    /// the anchor. It does NOT reimplement the site generator's slugify over every
     /// heading in the repo — only these URLs matter.
     #[test]
     fn doc_anchors_resolve() {
         let root = repo_root();
-        let mkdocs = std::fs::read_to_string(root.join("mkdocs.yml")).expect("mkdocs.yml");
-        let nav = nav_block(&mkdocs);
+        let zensical = std::fs::read_to_string(root.join("zensical.toml")).expect("zensical.toml");
+        let nav = nav_block(&zensical);
 
         let mut targets: Vec<Doc> = DOC_TARGETS.iter().map(|(_, d)| *d).collect();
         targets.push(EXIT_CODES_DOC);
@@ -6125,7 +6133,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert!(
                 nav_lists(&nav, &rel),
-                "{rel} is not in mkdocs.yml's nav, so its URL would not publish"
+                "{rel} is not in zensical.toml's nav, so nothing in the site links to it"
             );
             let found = headings(&body)
                 .into_iter()
@@ -6145,7 +6153,7 @@ mod tests {
         let body = "# Real\n\n```bash\n# 1. Allow it as a login shell\n```\n\n## Also Real\n";
         assert_eq!(headings(body), vec![" Real", " Also Real"]);
 
-        let nav = "  - CLI: reference/cli.md\n  # - Queries: reference/terminal-queries.md\n";
+        let nav = "  { \"CLI\" = \"reference/cli.md\" },\n  # { \"Queries\" = \"reference/terminal-queries.md\" },\n";
         assert!(nav_lists(nav, "reference/cli.md"));
         assert!(
             !nav_lists(nav, "reference/terminal-queries.md"),
@@ -6156,7 +6164,7 @@ mod tests {
             "a suffix of a nav path is not a nav entry"
         );
         assert!(!nav_lists(
-            &nav_block(&std::fs::read_to_string(repo_root().join("mkdocs.yml")).unwrap()),
+            &nav_block(&std::fs::read_to_string(repo_root().join("zensical.toml")).unwrap()),
             "reference/terminal-queries.md"
         ));
     }

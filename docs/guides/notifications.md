@@ -25,6 +25,8 @@ A notification has four places it can show up. Under normal use three of them mo
    - macOS: `UNUserNotificationCenter` (`mac/Sources/Roost/DesktopNotifications.swift`). Click the banner and the tab is focused in-process — no `roostctl` round-trip needed. Each banner gets a unique identifier (tab id + timestamp), so repeated notifications on the same tab stack in Notification Center rather than replacing one another.
    - Linux: `org.freedesktop.Notifications` on the session bus (the Desktop Notifications spec — GNOME, KDE, COSMIC, and other spec servers). The GTK UI talks to that bus through `gio.Notification` (`app.focus-tab` as the default action). The iced UI talks to the same bus directly (`default` action + `ActionInvoked`). The notification id is fixed per tab, so a new banner *does* replace the previous one for that tab. Click-to-focus is the spec default action → focus that tab, clear its badge, reveal the sidebar, and best-effort raise the window (Wayland raise still needs an `xdg-activation` token iced 0.14 cannot consume).
 
+   The macOS bullet above describes the Swift app. Roost-Iced on macOS (experimental) uses `UNUserNotificationCenter` too, but with a stable per-tab identifier rather than a unique one per event: a new notification for a tab **replaces** that tab's live banner instead of stacking another one in Notification Center — matching the Linux behavior above, not the Swift stacking. One live banner per tab, and a new event updates it in place. Banner clicks focus the tab while the app is running; a banner clicked after the app has quit and relaunched is not routed (unlike the Swift app).
+
 ## Focus policy
 
 One predicate governs the badge, the inbox row, and the banner together:
