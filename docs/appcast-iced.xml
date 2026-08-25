@@ -5,5 +5,13 @@
     <link>https://github.com/charliek/roost</link>
     <description>Appcast for the experimental Roost-Iced macOS build's auto-updates (Sparkle). Separate feed and separate signing keypair from docs/appcast.xml — the two bundles must never be able to offer each other's updates.</description>
     <language>en</language>
+    <item>
+      <title>0.0.18</title>
+      <pubDate>Tue, 25 Aug 2026 03:32:58 +0000</pubDate>
+      <sparkle:version>0.0.18</sparkle:version>
+      <sparkle:shortVersionString>0.0.18</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/charliek/roost/releases/download/v0.0.18/Roost-Iced-0.0.18.dmg" type="application/octet-stream" sparkle:edSignature="iUttgKadeci38ILkhISmAluH+W42SL1ZQL1hy6px256DVZiCTUN9DBNe8zO4nASHkCgTKQIWexeHYAKo/qU3AA==" length="12053137" />
+    </item>
   </channel>
 </rss>
