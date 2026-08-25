@@ -1,11 +1,11 @@
 # Roost Cargo workspace.
 #
-# Post-M7 layout:
+# Layout:
 #   * roost-ipc   — JSON IPC wire format, framing, client + server,
 #                   bundle-profile path resolution, target selection.
 #   * roost-vt    — libghostty-vt FFI wrapper with optional `--features ffi`.
 #   * roost-osc   — OSC scanner that lifts (command, payload) pairs out of
-#                   PTY byte streams. Used by both the Linux UI and the
+#                   PTY byte streams. Used by the Linux UI and the
 #                   roost-osc test fixtures.
 #   * roost-agent — pure agent adapters: hook event JSON in,
 #                   `tab.agent_report` params out. No I/O.
@@ -13,15 +13,8 @@
 #                    application commands/events, and IPC dispatch.
 #   * roost-ui-model — toolkit-neutral config, theme, palette, keybind,
 #                      provider, agent projection, and selection models.
-#   * roost-linux — gtk4-rs + libadwaita Linux UI adapter.
-#   * roost-iced — Iced POC UI adapter, isolated from GTK dependencies.
+#   * roost-iced — the Linux UI, packaged as `/usr/bin/roost`.
 #   * roost-cli   — shell-integration CLI; binary is `roostctl`.
-#
-# `roost-linux` is in `default-members`: the workspace builds the whole
-# product by default. Contributors on Mac without GTK installed get a
-# clear error from the GTK pkg-config probe at build time (Homebrew:
-# `brew install gtk4 libadwaita`; apt: `apt install libgtk-4-dev
-# libadwaita-1-dev`).
 #
 # The pre-M7 daemon-era crates (roost-core, roost-proto, roost-common,
 # roost-smoke) are gone; `proto/roost.proto` has moved to
@@ -38,7 +31,6 @@ members = [
     "crates/roost-engine",
     "crates/roost-ui-model",
     "crates/roost-cli",
-    "crates/roost-linux",
     "crates/roost-iced",
 ]
 

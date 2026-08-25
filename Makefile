@@ -1,7 +1,6 @@
 # Roost — common dev tasks. Run `make` (or `make help`) to list them.
 #
-# Three native UIs around libghostty-vt: Swift + AppKit (mac/),
-# Rust + gtk4-rs (crates/roost-linux, in-repo dev/parity), and Rust +
+# Two native UIs around libghostty-vt: Swift + AppKit (mac/) and Rust +
 # iced (crates/roost-iced, what the Linux package ships), plus the
 # roostctl CLI. See docs/development/vision.md for the architecture +
 # north star.
@@ -40,7 +39,7 @@ $(GHOSTTY_LIB):
 # ---- build ------------------------------------------------------------
 
 .PHONY: build build-iced build-mac bundle bundle-iced build-all
-build: $(GHOSTTY_LIB)  ## cargo build the workspace (GTK UI + roostctl)
+build: $(GHOSTTY_LIB)  ## cargo build the workspace (Iced UI + roostctl)
 	cargo build
 
 build-iced: $(GHOSTTY_LIB)  ## Build the isolated Iced POC binary
@@ -59,10 +58,7 @@ build-all: build bundle  ## Build both UIs + the Mac bundle
 
 # ---- run --------------------------------------------------------------
 
-.PHONY: run-gtk run-iced run-mac
-run-gtk: build  ## Launch the GTK UI (Roost-gtk profile)
-	./target/debug/roost
-
+.PHONY: run-iced run-mac
 run-iced: build-iced  ## Launch the Iced POC (Roost-iced profile)
 	ROOST_BUNDLE_PROFILE=iced ./target/debug/roost-iced
 
@@ -231,11 +227,7 @@ fmt-check:  ## Check formatting (what CI's rust-lint runs)
 clippy:  ## Lint Rust at CI parity (warnings are errors)
 	# `-D warnings` matches the `rust-lint` CI job. Without it `make check`
 	# passed while CI failed, which is worse than no local gate at all.
-	# roost-linux is linted separately (it needs GTK), mirroring CI's split;
-	# it's clippy-clean (issue #283) so it gets the same full `-D warnings`
-	# gate, not a narrow denylist.
-	cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
-	cargo clippy -p roost-linux --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # `linux-package` is off in every dev build, so without the second test +
 # clippy pair the packaging configuration would compile for the first time
