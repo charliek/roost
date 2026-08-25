@@ -141,8 +141,8 @@ func popAtRootReturnsNil() {
 //
 // The agents frame rebuilds on every workspace event while it's open
 // (plan 005 §3.8), so the refresh must not disturb the query or the
-// user's highlight. Mirrors the GTK `update_items` cases in
-// `crates/roost-linux/src/palette.rs`.
+// user's highlight. Mirrors the `update_items` cases in
+// `crates/roost-ui-model/src/palette.rs` (shared with iced).
 
 @Test
 func updateItemsKeepsTheHighlightedRowByID() {

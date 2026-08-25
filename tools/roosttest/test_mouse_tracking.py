@@ -171,9 +171,10 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
 
 def _skip_unless_iced(target) -> None:
     """The same-cell drag gate is wired from iced only (plan 026 D11):
-    AppKit and X11 never synthesize a same-cell drag, so mac and GTK
-    forward what they are given. Adopting the gate there is a later
-    parity choice; until then these cases are iced-scoped."""
+    AppKit never synthesizes a same-cell drag, so mac forwards what it
+    is given (the now-removed GTK UI's X11 backend did the same).
+    Adopting the gate there is a later parity choice; until then these
+    cases are iced-scoped."""
     if target != "iced":
         pytest.skip("same-cell drag gate is iced-wired only (plan 026 D11)")
 

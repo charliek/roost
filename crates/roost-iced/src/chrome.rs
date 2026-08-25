@@ -321,8 +321,9 @@ pub fn close_button(_: &Theme, status: button::Status) -> button::Style {
 }
 
 /// The sidebar-footer "+ New Project" chip: a centered rounded button with
-/// a resting fill, matching the shipped Mac bezel and GTK chip affordances
-/// rather than the flat text buttons used elsewhere in the chrome.
+/// a resting fill, matching the shipped Mac bezel (and the now-removed
+/// GTK UI's chip affordance) rather than the flat text buttons used
+/// elsewhere in the chrome.
 pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
     let background = match status {
         button::Status::Hovered => FOOTER_CHIP_HOVER,

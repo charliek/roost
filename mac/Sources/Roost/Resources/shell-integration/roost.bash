@@ -33,7 +33,7 @@
 # The inject block is adapted from Ghostty's ghostty.bash (GPLv3 header
 # below); the integration body is Roost's.
 #
-# KEEP IN SYNC with crates/roost-linux/src/resources/shell-integration/roost.bash
+# KEEP IN SYNC with crates/roost-engine/resources/shell-integration/roost.bash (shared by iced)
 #
 # Parts of the inject block are based on Ghostty's bash integration, which
 # is based on Kitty's. Kitty is distributed under GPLv3, so that block is

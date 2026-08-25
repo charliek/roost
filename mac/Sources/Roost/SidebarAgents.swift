@@ -1,15 +1,16 @@
-// Sidebar agent rows, the Mac half of the feature GTK ships in
-// `crates/roost-linux/src/app.rs` (`refresh_agent_rows` /
-// `build_agent_row`) plus `resources/style.css`. Rows are a lifecycle
-// dot, the agent name, and a right-aligned elapsed time, with
-// `status_text` as the tooltip.
+// Sidebar agent rows, the Mac half of the feature iced ships in
+// `crates/roost-iced/src/app.rs` (the now-removed GTK UI's twin was
+// `refresh_agent_rows` / `build_agent_row` plus its own stylesheet).
+// Rows are a lifecycle dot, the agent name, and a right-aligned
+// elapsed time, with `status_text` as the tooltip.
 
 import AppKit
 
 /// One agent row as actually rendered, plus whether it is the active
-/// tab. Mirrors GTK's `RenderedAgentRow`. Both UIs keep this per
-/// project so a missed refresh is observable over IPC rather than
-/// invisible: rendering and the dump read the same cache.
+/// tab. Mirrors the now-removed GTK UI's `RenderedAgentRow` shape.
+/// Both UIs keep this per project so a missed refresh is observable
+/// over IPC rather than invisible: rendering and the dump read the
+/// same cache.
 struct RenderedAgentRow: Equatable {
     let row: AgentPalette.SidebarAgentRow
     let isActive: Bool
@@ -70,7 +71,8 @@ final class SidebarOutlineView: NSOutlineView {
 /// sidebar draws its own dark palette behind window vibrancy rather
 /// than inheriting the window's dark appearance), which darkens the row
 /// instead of lifting it. This is the same weight, and the same
-/// direction, as the GTK rule `alpha(currentColor, 0.08)`.
+/// direction, as the now-removed GTK UI's rule
+/// `alpha(currentColor, 0.08)`.
 private final class AgentActiveHighlightView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSColor(white: 1.0, alpha: 0.09).setFill()

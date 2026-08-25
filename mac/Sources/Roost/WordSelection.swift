@@ -1,7 +1,7 @@
 // Pure word- and line-expansion helpers for double-/triple-click
-// selection. Mirrors `crates/roost-linux/src/word_selection.rs` 1:1
-// (PR B); the shared `tests/word-fixtures/` corpus pins the two ports
-// byte-equal on every supported edge case.
+// selection. Mirrors `crates/roost-ui-model/src/word_selection.rs`
+// (shared by iced) 1:1 (PR B); the shared `tests/word-fixtures/`
+// corpus pins the two ports byte-equal on every supported edge case.
 //
 // No AppKit imports here — same shape as `UrlDetection.swift` so the
 // algorithm can be exercised from a swift-testing target without

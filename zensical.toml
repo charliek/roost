@@ -53,6 +53,7 @@ nav = [
     { "Terminal Queries" = "reference/terminal-queries.md" },
     { "Architecture" = "reference/architecture.md" },
   ] },
+  { "Changelog" = "changelog.md" },
   { "Development" = [
     { "Architecture & principles" = "development/vision.md" },
     { "Iced migration" = "development/iced-migration.md" },

@@ -1,6 +1,6 @@
 // Config parser tests for the `word-break-chars` setting. Mirrors
-// `crates/roost-linux/src/config.rs::tests::word_break_chars_*` (PR B)
-// so both UIs agree on the wire surface.
+// `crates/roost-ui-model/src/config.rs::tests::word_break_chars_*`
+// (PR B; shared by iced) so both UIs agree on the wire surface.
 //
 // The key is named `word-break-chars` for Ghostty compatibility, but
 // the value is treated as the EXTRA word-char set (chars that count

@@ -64,8 +64,8 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// Monotonic panel generation — the token an async git-metrics fill
     /// captures at spawn so a dismiss→reopen can't let a stale result
-    /// mutate the new palette (plan 005 §3.7's ABA guard; the GTK twin
-    /// is `PaletteInner::session_id`). Consumed by C5.
+    /// mutate the new palette (plan 005 §3.7's ABA guard; the now-removed
+    /// GTK UI's twin was `PaletteInner::session_id`). Consumed by C5.
     let generation: Int
     private static var nextGeneration = 0
 
@@ -467,8 +467,8 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard row < matches.count else { return nil }
         // Two disjoint row layouts, so two reuse queues: the agents
         // frame's multi-column row shares no widget with the generic
-        // title/subtitle one (GTK splits the same way, `build_agent_row`
-        // vs the generic builder).
+        // title/subtitle one (the now-removed GTK UI split the same way,
+        // `build_agent_row` vs the generic builder).
         if let agent = matches[row].item.agent {
             let cell =
                 (tableView.makeView(withIdentifier: PaletteAgentCellView.id, owner: self)
@@ -627,8 +627,8 @@ private final class PaletteAgentCellView: NSView {
     private let left = NSStackView()
     private let right = NSStackView()
 
-    /// Diameter of the leading status dot. Matches the GTK
-    /// `AGENT_DOT_PX`.
+    /// Diameter of the leading status dot. Matches the now-removed GTK
+    /// UI's `AGENT_DOT_PX`.
     private static let dotSize: CGFloat = 8
     private static let metricsFont = NSFont.monospacedSystemFont(
         ofSize: 12, weight: .regular)
@@ -648,8 +648,9 @@ private final class PaletteAgentCellView: NSView {
         status.font = .systemFont(ofSize: 13)
         status.lineBreakMode = .byTruncatingTail
         // The right column is its own gray: `AgentPalette`'s muted role
-        // (#7a7a7a), shared with the GTK `.palette-agent-time` CSS, so
-        // the time label matches the muted metrics segments beside it.
+        // (#7a7a7a; the now-removed GTK UI shared the same hex via its
+        // `.palette-agent-time` CSS), so the time label matches the
+        // muted metrics segments beside it.
         for label in [metrics, time] {
             label.font = Self.metricsFont
             label.textColor = AgentPalette.metricsColor(.muted)

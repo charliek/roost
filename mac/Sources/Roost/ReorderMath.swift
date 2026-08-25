@@ -3,9 +3,9 @@
 // Pure, sync, no AppKit dependency so it can be unit-tested without
 // driving NSDraggingSession headlessly. Tested with a 20-case table
 // in ReorderMathTests. The Linux UI's
-// `crates/roost-linux/src/app.rs::compute_insert_idx` mirrors this —
-// keep both byte-equivalent so dragging behaves identically on
-// either UI.
+// `crates/roost-ui-model/src/reorder.rs::compute_insert_idx` (shared
+// by iced) mirrors this — keep both byte-equivalent so dragging
+// behaves identically on either UI.
 
 import Foundation
 

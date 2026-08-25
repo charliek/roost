@@ -346,9 +346,9 @@ struct IPCAgentReportDispatchTests {
 /// frame produces. These decode/re-encode fixtures pin both shapes so a
 /// drift in `IPCPaletteAgentRow`'s `CodingKeys` or the omit-when-nil
 /// behavior surfaces here rather than in the agents-frame commit.
-/// Byte-parity with GTK's `{:?}` in the invalid-kind message
-/// (crates/roost-linux/src/ipc.rs) — quotes and escapes must not
-/// diverge between the two UIs.
+/// Byte-parity with Rust's `{:?}` in the invalid-kind message
+/// (`crates/roost-engine/src/ipc.rs`, shared by iced) — quotes and
+/// escapes must not diverge between the two UIs.
 @Suite("Rust {:?} string parity")
 struct RustDebugQuotedTests {
     @Test func matchesRustDebugFormatting() {

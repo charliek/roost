@@ -1,7 +1,7 @@
 // Config parser tests for the `show-sidebar-agents` setting (plan
-// 007 §3.7). Mirrors `crates/roost-linux/src/config.rs::tests`
-// (`show_sidebar_agents_*`) 1:1 so the two UIs agree on parsing
-// semantics.
+// 007 §3.7). Mirrors `crates/roost-ui-model/src/config.rs::tests`
+// (`show_sidebar_agents_*`; shared by iced) 1:1 so the two UIs agree
+// on parsing semantics.
 
 import Testing
 

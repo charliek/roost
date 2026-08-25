@@ -25,9 +25,9 @@ of hardcoding it. wgpu writes exact fg for opaque quads (C3 evidence);
 `COLOR_TOL` leaves room for compositing rounding only — a real AA band
 sits far outside it and fails the no-intermediate assertion.
 
-Iced-target-only (walking-skeleton precedent): the GTK sprite path has
-its own byte-exact Cairo suite + golden-hash fixture, and the Mac path
-is covered by `Sprite.swift`'s reference tests.
+Iced-target-only (walking-skeleton precedent): the now-removed GTK
+sprite path had its own byte-exact Cairo suite + golden-hash fixture,
+and the Mac path is covered by `Sprite.swift`'s reference tests.
 """
 
 from __future__ import annotations

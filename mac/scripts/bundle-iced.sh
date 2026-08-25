@@ -93,7 +93,7 @@ source "${SCRIPT_DIR}/bundle-lib.sh"
 # Default the marketing version to the workspace's single source of
 # truth — see roost_workspace_version in bundle-lib.sh — so a local
 # `bundle-iced.sh debug` reports the same version the Swift app, the
-# GTK UI, the .deb, and `roostctl identify` do.
+# .deb, and `roostctl identify` do.
 VERSION="${ROOST_VERSION:-$(roost_workspace_version "${REPO_ROOT}")}"
 APP_NAME="Roost-Iced"
 BUNDLE_ID="ai.stridelabs.Roost.iced"

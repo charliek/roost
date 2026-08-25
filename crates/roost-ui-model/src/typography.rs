@@ -1,8 +1,9 @@
 //! Toolkit-neutral terminal typography state and config policy.
 //!
 //! Glyph discovery and measurement belong to each renderer adapter. This
-//! module owns the shared Rust UI transitions so GTK and Iced do not grow
-//! competing zoom, reset, preview, and confirmation state machines.
+//! module owns the shared Rust UI transitions — zoom, reset, preview,
+//! and confirmation state — toolkit-neutral and unit-tested apart from
+//! the Rust UI adapter (Iced) itself.
 
 /// Preferred Rust UI terminal family chain when config does not override it.
 pub const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono, Monospace";

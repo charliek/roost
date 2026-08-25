@@ -1,5 +1,6 @@
 // `provider =` config parsing + providers/ directory discovery. Mirrors
-// the Rust peer's config tests in `crates/roost-linux/src/config.rs`.
+// the Rust peer's config tests in `crates/roost-ui-model/src/config.rs`
+// (shared by iced).
 
 import Foundation
 import Testing

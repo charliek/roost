@@ -1770,8 +1770,8 @@ fn enqueue_selection_copy(
 ///
 /// The queue goes first so a clipboard effect already waiting behind this
 /// read doesn't stall for the length of a blocking image read. Selection
-/// pastes never probe: PRIMARY carries text, and the GTK UI's
-/// `paste_from_clipboard` has no image branch for it either.
+/// pastes never probe: PRIMARY carries text, and the now-removed GTK
+/// UI's `paste_from_clipboard` had no image branch for it either.
 fn paste_read_followup(
     clipboard: &mut ClipboardQueue,
     target: ClipboardOp,
@@ -3685,7 +3685,7 @@ mod tests {
             paste_read_followup(&mut queue, ClipboardOp::System, 7, Some("text")),
             UiTask::None
         ));
-        // GTK parity: a PRIMARY paste has no image branch at all.
+        // Matches the (now-removed) GTK UI: a PRIMARY paste has no image branch at all.
         assert!(matches!(
             paste_read_followup(&mut queue, ClipboardOp::Selection, 7, None),
             UiTask::None

@@ -1,5 +1,5 @@
-// Clipboard image-paste extraction tests, Swift companion to the GTK
-// suite in `crates/roost-linux/src/paste_image.rs::tests`. Covers the
+// Clipboard image-paste extraction tests, Swift companion to the suite
+// in `crates/roost-iced/src/paste_image.rs::tests`. Covers the
 // three input shapes `TerminalView.paste(_:)` falls back through:
 // file URLs, PNG passthrough, and ImageIO-driven re-encode.
 //

@@ -58,8 +58,8 @@ struct LocalClientOSCTests {
 }
 
 // OSC routing through the workspace. Mirrors the Rust suite in
-// `crates/roost-linux/src/local_client.rs`. No PTY is ever spawned —
-// `applyOSC` only touches the workspace.
+// `crates/roost-engine/src/application.rs` (shared by iced). No PTY
+// is ever spawned — `applyOSC` only touches the workspace.
 @MainActor
 @Suite("LocalClient OSC routing")
 struct LocalClientOSCRoutingTests {

@@ -182,13 +182,14 @@ def test_theme_frame_keeps_selection_in_view(target, palette):
     """The theme list opens pre-positioned on the active theme; the palette
     must scroll that row into the viewport so its highlight is visible.
 
-    Regression for a GTK bug where the pre-selected row rode off the bottom
-    (invisible highlight, though arrowing still changed the theme) because
-    nothing scrolled the list to the selection. The bundled theme set
-    overflows the palette viewport and a fresh instance's default active
-    theme (`roost-dark`) sorts last, so the pre-selected row starts
-    off-screen — exercising the scroll. GTK and Iced report measured geometry;
-    the Mac UI scrolls correctly but does not expose the field."""
+    Regression for a bug (originally found in the now-removed GTK UI)
+    where the pre-selected row rode off the bottom (invisible highlight,
+    though arrowing still changed the theme) because nothing scrolled the
+    list to the selection. The bundled theme set overflows the palette
+    viewport and a fresh instance's default active theme (`roost-dark`)
+    sorts last, so the pre-selected row starts off-screen — exercising
+    the scroll. Iced reports measured geometry; the Mac UI scrolls
+    correctly but does not expose the field."""
     if target == "mac":
         pytest.skip("selected_in_view geometry is not exposed by the Mac UI")
     palette.palette_open()

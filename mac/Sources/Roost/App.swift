@@ -2267,7 +2267,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 // or a state.json predating tab persistence — seeds a
                 // single tab. Eager (not lazy-on-select) so `tab list`
                 // and screenshots reflect every project's tabs, and so
-                // the GTK + Mac builds restore identically.
+                // the Mac and iced builds restore identically.
                 for project in self.projects {
                     let saved = restore?.projects
                         .first(where: { $0.projectID == project.id })?.tabs ?? []
@@ -4377,8 +4377,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Rename the active tab. M5 of `goal-mac-parity-2026-05-18.md`
     /// replaced the pre-existing NSAlert with an NSPopover anchored
     /// to the active pill — same inline-rename UX as Linux M9. Mirrors
-    /// the popover-over-the-strip pattern documented at Linux
-    /// `crates/roost-linux/src/app.rs:1057-1119`.
+    /// the inline-editor-over-the-strip pattern in iced's
+    /// `rename_editor` state (`crates/roost-iced/src/app/interactions.rs`).
     /// On commit the daemon sets the per-tab `user_titled` lock so
     /// shell-emitted OSC 1/2 stops overwriting. ⌘R by default.
     @objc @MainActor
@@ -5225,7 +5225,9 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
     /// `configure(...)` skips overwriting `stringValue` while editing
     /// so a sibling `roost-cli-rs project rename` arriving mid-edit
     /// doesn't clobber the user's in-progress text. Mirrors Linux M9
-    /// (`crates/roost-linux/src/app.rs::commit_rename_project`).
+    /// (iced's `rename_editor` state, which likewise stays on screen
+    /// with its draft until the engine confirms the rename landed —
+    /// `crates/roost-iced/src/app/interactions.rs`).
     private(set) var isEditing = false
     private var onCommit: (@MainActor (String) -> Void)?
     private var onCancel: (@MainActor () -> Void)?

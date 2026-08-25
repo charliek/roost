@@ -26,7 +26,7 @@ roost_check_libghostty_archive() {
 #
 # Prints the marketing version derived from the workspace's single
 # source of truth — `[workspace.package].version` in Cargo.toml — so a
-# local bundle build reports the same version the GTK UI, the .deb, and
+# local bundle build reports the same version the iced UI, the .deb, and
 # `roostctl identify` do. Callers should let $ROOST_VERSION override the
 # result. The `^version` anchor matches only the top-level key, not the
 # `version = "…"` entries nested under `[workspace.dependencies]`.

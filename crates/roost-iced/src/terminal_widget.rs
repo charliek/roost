@@ -372,7 +372,7 @@ pub struct TerminalSnapshot {
     pub background: ColorRgb,
     pub cursor: Option<CursorInfo>,
     /// Theme cursor color — the fallback when `cursor.color` (an OSC-12
-    /// set, cleared by OSC 112) is `None`. GTK/mac parity: both fall back
+    /// set, cleared by OSC 112) is `None`. Mac parity: both fall back
     /// to `theme.cursor`, not `foreground`.
     pub cursor_color: ColorRgb,
     /// Indexed by viewport row; `grid.len() == rows`.
@@ -426,7 +426,7 @@ impl TerminalSnapshot {
 
 /// The cursor color the renderer should paint: an OSC-12 override
 /// (`cursor.color`) wins when present, otherwise the theme's cursor color
-/// carried on the snapshot. GTK/mac parity (both fall back to
+/// carried on the snapshot. Mac parity (both fall back to
 /// `theme.cursor`, not `foreground`). Pure so it's unit-testable — the
 /// draw path that consumes it needs a live `Renderer` and can't be.
 fn effective_cursor_color(cursor: &CursorInfo, snapshot: &TerminalSnapshot) -> ColorRgb {
@@ -980,8 +980,8 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                     }
                     if !cell.text.is_empty() && cell.text != " " {
                         // Sprite-render single-codepoint cells whose codepoint
-                        // falls in one of the geometric ranges (GTK does the
-                        // same in `terminal_view::paint`). Multi-codepoint
+                        // falls in one of the geometric ranges (the now-removed
+                        // GTK UI did the same in `terminal_view::paint`). Multi-codepoint
                         // graphemes skip this path because the sprite layer is
                         // by-codepoint, not by-grapheme.
                         let mut chars = cell.text.chars();
@@ -993,7 +993,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                             ) {
                                 draw_sprite(renderer, position, &geometry, color(cell.foreground));
                                 // A sprite *replaces* a glyph draw, so it counts
-                                // as one — same semantics as GTK.
+                                // as one — same semantics the now-removed GTK UI used.
                                 fill_text_calls += 1;
                                 continue;
                             }
@@ -1108,9 +1108,9 @@ impl From<TerminalWidget> for Element<'_, crate::Message> {
 
 /// Draw one cell's sprite geometry as quads at `origin`.
 ///
-/// iced has no per-quad antialiasing switch (GTK gets `Antialias::None`
-/// for the block layer, hence `SpriteGeometry::antialias` being ignored
-/// here). A fractional shared edge between two quads composites to a
+/// iced has no per-quad antialiasing switch (the now-removed GTK UI got
+/// `Antialias::None` for the block layer, hence `SpriteGeometry::antialias`
+/// being ignored here). A fractional shared edge between two quads composites to a
 /// hairline — partial coverage twice is not full coverage — so the seam
 /// story on this side is **integer edge snapping**: each rect's absolute
 /// edges are rounded before the `Rectangle` is built. Cell strides are

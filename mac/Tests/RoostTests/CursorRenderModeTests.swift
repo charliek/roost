@@ -1,9 +1,11 @@
-// Strict-DECTCEM cursor decision tests, Swift companion to the Rust
-// `cursor_render_mode` suite in
-// `crates/roost-linux/src/terminal_view.rs::tests`. Both renderers
-// MUST implement the identical truth table — mirroring Ghostty's
-// `renderer/cursor.zig` `style()` priority chain (#246). Add Rust
-// cases in lockstep when this file grows.
+// Strict-DECTCEM cursor decision tests. Historically had a Rust
+// companion suite, `cursor_render_mode`, in the now-removed GTK UI
+// that cross-checked this same truth table — mirroring Ghostty's
+// `renderer/cursor.zig` `style()` priority chain (#246). iced resolves
+// cursor visibility + visual style from libghostty's render state
+// directly (`crates/roost-vt/src/render_state.rs`) rather than
+// through an equivalent standalone decision function, so there is no
+// current Rust peer to add cases to in lockstep.
 
 import CGhosttyVT
 import Testing

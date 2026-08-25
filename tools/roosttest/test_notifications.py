@@ -137,7 +137,7 @@ def test_focused_active_tab_gets_no_badge_and_no_inbox_row(roost, project, palet
 
     roost.notify(active, "Foreground", "should be suppressed")
     if _delivered(roost, active):
-        # The window half of the predicate is false: a headless GTK UI
+        # The window half of the predicate is false: a headless UI
         # under xvfb (no window manager) never becomes active, so the
         # suppression arm is genuinely unobservable here. Not a silent
         # gap — the full four-way matrix is covered by the workspace

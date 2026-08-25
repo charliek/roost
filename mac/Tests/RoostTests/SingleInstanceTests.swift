@@ -1,7 +1,7 @@
 // SingleInstanceTests — covers the M4c flock-based single-instance
 // enforcement. The Rust side has its own coverage in
-// `crates/roost-linux/src/single_instance.rs`'s embedded #[cfg(test)]
-// module; this file is the Swift mirror.
+// `crates/roost-engine/src/single_instance.rs`'s (shared by iced)
+// embedded #[cfg(test)] module; this file is the Swift mirror.
 
 import Darwin
 import Foundation

@@ -1,7 +1,7 @@
 // Pure-logic tests for the agents palette frame (plan 005 §3.2–§3.6).
 //
-// Mirrors `crates/roost-linux/src/agent_palette.rs`'s `mod tests` case
-// for case: the same status vocabulary, time buckets, ordering
+// Mirrors `crates/roost-ui-model/src/agent_palette.rs`'s (shared by
+// iced) `mod tests` case for case: the same status vocabulary, time buckets, ordering
 // tiebreaks, population filter, name fallback, and normalization rules,
 // asserted on the same strings. A divergence between the two UIs is a
 // red test here rather than a user noticing the palettes disagree.
@@ -268,14 +268,17 @@ func agentMetricsRoleColorsArePinned() {
             sourceLocation: sourceLocation)
         #expect(color.alphaComponent == 1.0, sourceLocation: sourceLocation)
     }
-    // The GTK twins in `agent_palette.rs`'s `metrics_role_hex`.
+    // Matches `crates/roost-ui-model/src/agent_palette.rs`'s
+    // `metrics_role_hex` (Mac-only today — iced paints these strings
+    // in a single flat `chrome::MUTED_TEXT` instead).
     expectRGB(.muted, 0x7a, 0x7a, 0x7a)
     expectRGB(.adds, 0x7f, 0xbf, 0x7f)
     expectRGB(.dels, 0xe0, 0x52, 0x52)
 }
 
-// The GTK side also pins markup escaping (`metrics_markup_escapes_segment_text`);
-// `NSAttributedString` carries no markup, so that pair has no Swift counterpart.
+// The now-removed GTK UI also pinned markup escaping
+// (`metrics_markup_escapes_segment_text`); `NSAttributedString` carries
+// no markup, so that pair has no Swift counterpart.
 
 @Test
 func agentMetricsAttributedColorsEachSegment() {

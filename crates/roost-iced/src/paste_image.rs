@@ -21,16 +21,16 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
-/// Decoded-pixel cap. Unlike the GTK UI — which streams a compressed
-/// payload into gdk-pixbuf and can bail from `size-prepared` before the
-/// RGBA buffer exists — arboard hands us pixels already allocated, so
-/// this cap bounds the *encode* rather than the decode. 40 MP comfortably
-/// covers 5K and 8K screenshots.
+/// Decoded-pixel cap. Unlike the now-removed GTK UI — which streamed a
+/// compressed payload into gdk-pixbuf and could bail from `size-prepared`
+/// before the RGBA buffer existed — arboard hands us pixels already
+/// allocated, so this cap bounds the *encode* rather than the decode.
+/// 40 MP comfortably covers 5K and 8K screenshots.
 pub(crate) const MAX_PIXELS: u64 = 40 * 1024 * 1024;
 
-/// Maximum PNG we'll write. Matches the GTK and Mac ceilings; GTK applies
-/// it to the re-encoded output too (`paste_image.rs`), which is the check
-/// we mirror here since our input is never compressed.
+/// Maximum PNG we'll write. Matches the Mac ceiling (and the removed GTK
+/// UI's, which applied it to the re-encoded output too, the check we
+/// mirror here since our input is never compressed).
 pub(crate) const MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// Read the system clipboard's image and write it to a temp PNG.
@@ -93,9 +93,9 @@ fn ensure_encoded_size(len: usize) -> Result<(), String> {
 }
 
 /// Write `data` to `roost-image-{unix_nanos}-{16 hex}.png` in the temp
-/// dir. Byte-for-byte the GTK scheme: `create_new` so a collision fails
-/// rather than clobbering, and mode `0o600` so the file is unreadable by
-/// other users on a shared box.
+/// dir. Byte-for-byte the now-removed GTK UI's scheme: `create_new` so
+/// a collision fails rather than clobbering, and mode `0o600` so the
+/// file is unreadable by other users on a shared box.
 fn write_temp_png(data: &[u8]) -> Result<PathBuf, String> {
     let path = std::env::temp_dir().join(temp_png_name()?);
     let mut options = std::fs::OpenOptions::new();
@@ -114,8 +114,8 @@ fn temp_png_name() -> Result<String, String> {
     let mut rnd = [0u8; 8];
     {
         // /dev/urandom is POSIX-portable and avoids pulling in
-        // `getrandom` for 8 bytes — the same trade the GTK UI makes. This
-        // path only ever runs on macOS and Linux.
+        // `getrandom` for 8 bytes — the same trade the now-removed GTK
+        // UI made. This path only ever runs on macOS and Linux.
         use std::io::Read;
         std::fs::File::open("/dev/urandom")
             .and_then(|mut file| file.read_exact(&mut rnd))
@@ -202,7 +202,11 @@ mod tests {
     fn pixel_cap_rejects_before_any_file_is_created() {
         let error = materialize_rgba(7_000, 6_000, &[]).expect_err("over the pixel cap");
         assert!(error.contains("exceeds"), "{error}");
-        assert_eq!(MAX_PIXELS, 41_943_040, "byte-identical to the GTK ceiling");
+        assert_eq!(
+            MAX_PIXELS,
+            41_943_040,
+            "byte-identical to the removed GTK UI's ceiling"
+        );
     }
 
     #[test]
@@ -219,10 +223,10 @@ mod tests {
     }
 
     /// The output cap is a seam of its own because a real 10 MiB PNG is
-    /// expensive to build; GTK applies the same ceiling to its re-encoded
-    /// bytes.
+    /// expensive to build; the now-removed GTK UI applied the same
+    /// ceiling to its re-encoded bytes.
     #[test]
-    fn encoded_size_cap_matches_the_gtk_ceiling() {
+    fn encoded_size_cap_matches_the_removed_gtk_uis_ceiling() {
         assert_eq!(MAX_BYTES, 10 * 1024 * 1024);
         assert!(ensure_encoded_size(MAX_BYTES).is_ok());
         assert!(ensure_encoded_size(MAX_BYTES + 1)

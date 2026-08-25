@@ -1,7 +1,7 @@
 // Config parser tests for the `clipboard-write` setting (OSC 52
 // program-initiated clipboard writes). Mirrors
-// `crates/roost-linux/src/config.rs::tests` 1:1 so the two UIs
-// agree on parsing semantics.
+// `crates/roost-ui-model/src/config.rs::tests` (shared by iced) 1:1
+// so the two UIs agree on parsing semantics.
 
 import Testing
 

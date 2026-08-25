@@ -27,7 +27,7 @@ Engine references (verified this session, see plan 010 §2):
   UI-flow behavior (iced's `new_project()` does an explicit
   `focus_tab`), not raw-op behavior.
 - `project.delete`'s active-fallback pick differs by engine: the Rust
-  workspace (GTK + Iced) falls back to `projects.keys().next()` — the
+  workspace (Iced) falls back to `projects.keys().next()` — the
   lowest remaining project id, a BTreeMap (workspace.rs:714). Mac's
   `Workspace.deleteProject` picks the first project in DISPLAY order
   (`(position, id)` sort, Workspace.swift:320-326 — deliberately not by
@@ -327,14 +327,13 @@ def test_iced_deleting_a_project_keeps_the_remaining_workspace_live(roost, targe
     Iced-only: this walks the same delete path the exit policy hangs off,
     and pins that the exit is gated on the workspace becoming EMPTY rather
     than on any project deletion. Mac terminates on the last project's
-    window close; GTK keeps its empty-workspace state (recorded
-    divergence).
+    window close (the now-removed GTK UI kept its empty-workspace state
+    instead — recorded divergence).
     """
     if target != "iced":
         pytest.skip(
             "pins iced's exit-on-empty gate (empty workspace, not any "
-            "delete); mac terminates on the last window close and GTK "
-            "keeps its empty state"
+            "delete); mac terminates on the last window close instead"
         )
 
     a = roost.create_project(name="pytest-live-a", cwd="/tmp")

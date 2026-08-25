@@ -1,8 +1,9 @@
 // Path display helpers for window chrome.
 //
-// Keeps the Mac subtitle string identical to what the GTK headerbar
-// shows for the same cwd. Pure functions so they can be unit-tested
-// without AppKit / a window context.
+// Keeps the Mac subtitle string identical to what iced's window title
+// shows for the same cwd (`roost-ui-model::window_title`). Pure
+// functions so they can be unit-tested without AppKit / a window
+// context.
 
 import Foundation
 

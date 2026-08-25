@@ -1,9 +1,10 @@
 // Config parser tests for the shared value-normalization step: one
 // matched quote pair stripped, no recursion, no re-trim, and a CRLF
 // file parsing exactly like an LF one. Mirrors the `unquote_*` block in
-// `crates/roost-linux/src/config.rs::tests` so both UIs read the same
-// file the same way (plan 008 §3.1); `tabWidthsAcceptQuotedValues` has
-// no Rust twin because `tab-*-width` is Mac-only.
+// `crates/roost-ui-model/src/config.rs::tests` (shared by iced) so
+// both UIs read the same file the same way (plan 008 §3.1);
+// `tabWidthsAcceptQuotedValues` has no Rust twin because
+// `tab-*-width` is Mac-only.
 
 import Testing
 

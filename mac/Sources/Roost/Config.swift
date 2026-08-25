@@ -22,7 +22,8 @@ import Foundation
 /// (last-write-wins).
 /// Three-state `copy-on-select` config value matching Ghostty's
 /// `off | true | clipboard` semantics. Mirrors
-/// `crates/roost-linux/src/config.rs::CopyOnSelect` 1:1.
+/// `crates/roost-ui-model/src/config.rs::CopyOnSelect` (shared by
+/// iced) 1:1.
 ///
 /// * `.off` — never auto-copy; the user must press the explicit copy
 ///   shortcut (`⌘C` on Mac, Ctrl+Shift+C on Linux).
@@ -88,7 +89,8 @@ func parseBoolLike(_ s: String) -> Bool? {
 }
 
 /// Strip one matched quote pair. Mirrors `unquote` in
-/// `crates/roost-linux/src/config.rs`: no recursion (`""x""` → `"x"`),
+/// `crates/roost-ui-model/src/config.rs` (shared by iced): no
+/// recursion (`""x""` → `"x"`),
 /// and no re-trim afterward, so `word-break-chars = " -"` keeps its
 /// leading space. Operates on unicode scalars, not `Character`s — a
 /// combining mark after the opening quote must not fuse with it into
@@ -143,7 +145,8 @@ struct RoostConfig: Sendable {
     /// `show-sidebar-agents` — whether the sidebar renders one row
     /// per agent-owned tab under its project (plan 007). Defaults to
     /// `true`. Mirrors
-    /// `crates/roost-linux/src/config.rs::RoostConfig::show_sidebar_agents`.
+    /// `crates/roost-ui-model/src/config.rs::RoostConfig::show_sidebar_agents`
+    /// (shared by iced).
     var showSidebarAgents: Bool = true
 
     static let empty = RoostConfig(
@@ -176,7 +179,8 @@ struct RoostConfig: Sendable {
     /// deliberate divergence from Apple HIG (matches Ghostty / nvim
     /// / fish / the Linux UI's behavior). `ROOST_CONFIG` overrides it
     /// with an absolute file — used by the E2E harness to drive the
-    /// command launcher off a seeded config (mirrors the GTK side).
+    /// command launcher off a seeded config (mirrors
+    /// `roost-ui-model::config`, shared with iced).
     static func defaultPath() -> URL {
         if let override = ProcessInfo.processInfo.environment["ROOST_CONFIG"],
            !override.isEmpty {
@@ -207,7 +211,8 @@ struct RoostConfig: Sendable {
     /// keys (`theme`, `font-family`, `font-size`,
     /// `show-sidebar-agents`).
     ///
-    /// Mirrors `crates/roost-linux/src/config.rs::set_key`.
+    /// Mirrors `crates/roost-ui-model/src/config.rs::set_key` (shared
+    /// by iced).
     @discardableResult
     static func setKey(_ key: String, value: String, at path: URL = defaultPath()) -> Error? {
         // Distinguish "file doesn't exist" (treat as empty, the

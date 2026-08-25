@@ -316,11 +316,11 @@ def test_crossproject_focus_not_overwritten(roost):
         roost.focus(a1)
         Roost._wait(lambda: roost.identify()["active_tab_id"] == a1,
                     timeout=4.0, what="core active tab to reach a1")
-        # The overwrite is in the ASYNC GTK ActiveChanged reaction that runs
-        # after focus(a1) returns — it would echo focus_tab(a2) over a1. So
-        # require the core to *stay* on a1 across the reaction window, not
-        # just read a1 once (which the immediate focus_tab result satisfies
-        # even with the bug).
+        # The overwrite is in the ASYNC active-project-changed reaction that
+        # runs after focus(a1) returns — it would echo focus_tab(a2) over
+        # a1. So require the core to *stay* on a1 across the reaction
+        # window, not just read a1 once (which the immediate focus_tab
+        # result satisfies even with the bug).
         deadline = time.monotonic() + scaled_timeout(1.5)
         while time.monotonic() < deadline:
             assert roost.identify()["active_tab_id"] == a1, \

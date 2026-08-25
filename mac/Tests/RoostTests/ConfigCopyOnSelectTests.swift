@@ -1,6 +1,6 @@
 // Config parser tests for the `copy-on-select` setting. Mirrors the
-// Rust tests in `crates/roost-linux/src/config.rs::tests` so the two
-// UIs agree on parsing semantics.
+// Rust tests in `crates/roost-ui-model/src/config.rs::tests` (shared
+// by iced) so the two UIs agree on parsing semantics.
 
 import Testing
 

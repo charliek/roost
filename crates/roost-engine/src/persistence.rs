@@ -52,7 +52,7 @@ pub struct SnapshotFile {
     /// relaunch restores the user's hide/show choice. Defaulted so a
     /// file from an older build (no key) loads as "expanded". The Mac
     /// UI persists the same choice in UserDefaults (`RoostSidebarVisible`);
-    /// this is the Rust UI adapters' (GTK, Iced) equivalent, kept at
+    /// this is the Rust UI adapter's (Iced) equivalent, kept at
     /// behavioral parity.
     #[serde(default)]
     pub sidebar_collapsed: bool,
@@ -60,7 +60,7 @@ pub struct SnapshotFile {
     /// relaunch restores the user's drag. Defaulted so a file from an
     /// older build (no key) loads as the default width. The Mac UI
     /// persists the same value in UserDefaults (`RoostSidebarWidth`);
-    /// this is the Rust UI adapters' (GTK, Iced) equivalent, kept at
+    /// this is the Rust UI adapter's (Iced) equivalent, kept at
     /// behavioral parity. Values outside
     /// [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`] are clamped when
     /// the workspace loads them.

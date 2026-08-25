@@ -38,10 +38,11 @@ of the two, and it is the path the `tools/perf/echo-latency.py` probe
 rides too.
 
 Iced-only: `view_calls`/`elide_calls` are iced instrumentation (plan 029
-C1). GTK reports structurally-uniform zeros, which would green this
-module vacuously, and the Mac handler does not send the fields at all —
-so the whole module skips off `--roost-target`, the way
-`test_tab_strip_pixels.py` guards its iced-only chrome assertions.
+C1). The now-removed GTK UI reported structurally-uniform zeros, which
+would have greened this module vacuously, and the Mac handler does not
+send the fields at all — so the whole module skips off
+`--roost-target`, the way `test_tab_strip_pixels.py` guards its
+iced-only chrome assertions.
 """
 
 from __future__ import annotations
@@ -72,7 +73,7 @@ def _iced_only(target):
     if target != "iced":
         pytest.skip(
             "view/elide render-stats counters are iced instrumentation "
-            "(plan 029 C1); gtk reports zeros and mac omits the fields"
+            "(plan 029 C1); mac omits the fields"
         )
 
 

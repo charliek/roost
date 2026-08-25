@@ -2,9 +2,9 @@
 //!
 //! Parses the repeated `command =` config key into [`CustomCommand`]s,
 //! builds the login-shell argv that runs one in a fresh tab, and turns a
-//! command list into launcher [`PaletteItem`]s. Kept split from each UI
-//! adapter's `app.rs` (GTK, Iced) so the tokenizer + argv builder are
-//! unit-tested in isolation, mirroring
+//! command list into launcher [`PaletteItem`]s. Kept split from the
+//! Rust UI adapter's `app.rs` (Iced) so the tokenizer + argv builder
+//! are unit-tested in isolation, mirroring
 //! `mac/Sources/Roost/CustomCommand.swift`.
 //!
 //! Format — one record per `command =` line; the value is

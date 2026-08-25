@@ -38,8 +38,8 @@ enum Request {
         title: String,
         body: String,
     },
-    /// The tab closed or its notification was cleared. gio owns the map on
-    /// the GTK side; here it is ours, so it needs telling.
+    /// The tab closed or its notification was cleared. The now-removed
+    /// GTK UI let gio own this map; here it is ours, so it needs telling.
     Retire { tab_id: i64 },
 }
 
@@ -48,7 +48,8 @@ enum Request {
 struct TabSlot {
     /// The id the server returned for this tab's last shown notification.
     /// Handing it back is what makes the next one replace rather than
-    /// stack — GTK gets the same from its fixed per-tab gio id.
+    /// stack — the now-removed GTK UI got the same from its fixed
+    /// per-tab gio id.
     server_id: Option<u32>,
     /// The task awaiting a click on that notification. At most one per tab,
     /// ever: a replace emits no `NotificationClosed`, and some servers emit
@@ -98,7 +99,8 @@ pub(crate) struct Payload {
     pub(crate) tab_id: i64,
     pub(crate) title: String,
     /// `None` when the notification carried no body — an empty body line
-    /// is worse than none, and GTK omits it the same way.
+    /// is worse than none, and the now-removed GTK UI omitted it the
+    /// same way.
     pub(crate) body: Option<String>,
     pub(crate) replaces: Option<u32>,
 }

@@ -1,6 +1,7 @@
-// Shell-escape + drop-payload-resolver tests, Swift companion to the GTK suite
-// in `crates/roost-ui-model/src/shell_escape.rs::tests`. The escape vectors are
-// shared verbatim with the Rust side so the two drag-and-drop implementations
+// Shell-escape + drop-payload-resolver tests, Swift companion to the suite
+// in `crates/roost-ui-model/src/shell_escape.rs::tests` (shared with iced).
+// The escape vectors are shared verbatim with the Rust side so the two
+// drag-and-drop implementations
 // stay byte-identical (the cross-UI parity the north star asks for).
 //
 // XCTest, not swift-testing (the repo's usual choice): a swarm of trivially

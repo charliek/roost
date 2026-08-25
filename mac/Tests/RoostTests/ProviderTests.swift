@@ -1,7 +1,8 @@
 // Pure-logic tests for dynamic command providers: the `provider =`
 // parser, directory-entry builder, subprocess invocation (argv/env/
 // stdin), and stdout parsing. Mirrors the Rust peer in
-// `crates/roost-linux/src/provider.rs` (same cases, same expectations).
+// `crates/roost-ui-model/src/provider.rs` (shared by iced; same
+// cases, same expectations).
 
 import Foundation
 import Testing

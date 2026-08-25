@@ -2,10 +2,10 @@
 //!
 //! Port of `mac/Sources/Roost/Palette.swift`: the items, the fuzzy
 //! matcher, and the `PaletteState` navigation/filter/selection machine.
-//! Kept split from each UI adapter's overlay (GTK's `palette_ui.rs`,
-//! Iced's `palette_scroll.rs`) so the logic is
-//! unit-tested in isolation. Themes, commands, and any future picker are
-//! just different `PaletteFrame`s pushed onto the state.
+//! Kept split from the Rust UI adapter's overlay (Iced's
+//! `palette_scroll.rs`) so the logic is unit-tested in isolation.
+//! Themes, commands, and any future picker are just different
+//! `PaletteFrame`s pushed onto the state.
 
 use std::ops::Range;
 
