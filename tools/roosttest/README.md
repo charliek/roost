@@ -1,6 +1,6 @@
 # roosttest — pytest E2E harness
 
-Functional end-to-end tests that drive a **real** Roost UI (Mac, GTK, or Iced)
+Functional end-to-end tests that drive a **real** Roost UI (Mac or Iced)
 over the JSON IPC socket and assert on the op set — exactly what users
 and `roostctl` drive (the [north star](../../docs/development/vision.md#the-command-core-north-star)).
 Most tests read back via `tab.dump` / `tab.list` / `identify`; the
@@ -12,10 +12,10 @@ regression patterns" below.
 ## Run
 
 ```bash
-make e2e            # default target ($ROOST_TARGET or gtk); reuses a running UI
-make e2e-gtk        # against the GTK UI
-make e2e-mac        # against the Mac app
-make e2e-gtk-ci     # CI parity: ROOST_TEST_MODE=1 + --roost-fresh (owns a fresh UI)
+make e2e            # dispatch on $ROOST_TARGET (default iced): the curated e2e-iced lane, or e2e-mac
+make e2e-iced       # the curated iced lane (see ICED_E2E_TESTS in the Makefile)
+make e2e-mac        # against the Mac app (full tools/roosttest directory)
+make e2e-iced-ci    # CI parity: ROOST_TEST_MODE=1 + --roost-fresh (owns a fresh UI)
 make e2e-mac-ci     # CI parity (DESTRUCTIVE: force-quits any running Roost.app)
 # or directly:
 uv run --group test pytest tools/roosttest --roost-target mac -v
@@ -24,8 +24,8 @@ uv run --group test pytest tools/roosttest --roost-target iced -v
 
 The session fixture launches the UI if it isn't already running (and
 quits only what it launched), so a bare `make e2e` is self-contained.
-Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
-`ROOST_GTK_BIN` and `ROOST_ICED_BIN` select explicit Rust UI executables;
+Build first if needed: `make build` (iced + roostctl) / `make bundle` (Mac).
+`ROOST_ICED_BIN` selects an explicit iced UI executable;
 `ROOST_ROOSTCTL` selects the CLI. The shed uses these to run shed-local ELF
 artifacts while the mounted repository's `target/` contains macOS output.
 
@@ -67,7 +67,7 @@ and is asserted present on whichever UI is under test.
 ## Seeding config (`ROOST_CONFIG`)
 
 `ui.launch` sets `ROOST_CONFIG=fixtures/launcher.conf` on the UIs it
-starts (GTK via env; Mac via `open --env`), so the launcher reads a
+starts (iced via env; Mac via `open --env`), so the launcher reads a
 known command list. It applies only to harness-launched UIs — a
 developer's already-running UI keeps its own config, so the launcher
 tests `precondition` on the seed: a graceful skip against an ad-hoc dev
@@ -123,7 +123,7 @@ A UI that exits *refusing* to start because another process holds the state
 lock is surfaced by `wait_alive` as that refusal (a `RuntimeError` carrying
 the UI's own message), not as a boot timeout.
 
-The GTK launch env is sanitized (the UI inherits the parent env): the
+The iced launch env is sanitized (the UI inherits the parent env): the
 per-tab vars Roost injects itself — `ROOST_SHELL_FEATURES`, etc. — and the
 profile selector are stripped, so a value exported in the shell that ran
 pytest can't leak into the UI and every tab.
@@ -146,7 +146,7 @@ Helpers in `util.py`:
 Every run prints a **`SKIPS: N`** summary (each skipped test + reason) via
 `conftest.py::pytest_terminal_summary`, so a half-skipped run can't read as
 "all green." The zsh + modern-bash CI-provisioning gap (issue #197) is
-closed: the GTK and Mac CI runners install zsh and modern bash; the
+closed: the iced and Mac CI runners install zsh and modern bash; the
 auto-bootstrap tests now use `precondition(...)` rather than `pytest.skip`,
 so a missed CI install hard-fails in fresh mode rather than silently
 skipping. The `wait_shell_ready` helper in `util.py` is the canonical
@@ -221,9 +221,9 @@ writing them to the terminal. So these tests still walk the production
 scan, the production color state and the production input channel — but
 they cannot prove the reply left *without* the UI. That property has its
 own test at the engine level:
-`crates/roost-engine/tests/osc_drain_reply_test.rs`. GTK and Mac keep
-their own UI-side routers, and `feed_pty_bytes` is their production path
-by construction.
+`crates/roost-engine/tests/osc_drain_reply_test.rs`. Mac keeps its own
+UI-side router, and `feed_pty_bytes` is its production path by
+construction.
 
 **Corollary — feed a quiet tab.** Because the injector bypasses the
 drain, injected bytes and live PTY bytes are two producers into one
@@ -259,7 +259,7 @@ it's pixel- or input- or shell-level. It lives elsewhere, by design:
 
 | Behavior | Why not here | Where |
 |---|---|---|
-| Real mouse selection, real clipboard paste | a physical drag + the OS pasteboard, not IPC (what copy *contains* is covered here by `test_selection.py` via `selection.set`/`selection.dump`) | `tools/input/linux` (uinput inject + clipread) |
+| Real mouse selection, real clipboard paste | a physical drag + the OS pasteboard, not IPC (what copy *contains* is covered here by `test_selection.py` via `selection.set`/`selection.dump`) | `tools/input/linux` (uinput injectors + `iced_clipboard_check.py`) |
 | Live resize / reflow | the UI sizes the grid to the window, so `tab.resize` doesn't pin a size | `tools/screenshot` (resize window, check reflow) |
 | Theme color rendering | `tab.dump` is text-only (no color) | `tools/screenshot` screenshots |
 | OSC 2 window-title | cwd-derived title + the shell re-emits each prompt overwrites it | `tools/screenshot` (visible title) |

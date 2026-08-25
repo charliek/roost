@@ -7,7 +7,7 @@ regression net for the scaffolding ITSELF — one assertion per op,
 exercising the round trip without exercising any downstream
 correctness (that's PR C's job).
 
-Both targets run these in CI (e2e-gtk + e2e-mac) with
+Both targets run these in CI (iced-build-e2e + e2e-mac) with
 `ROOST_TEST_MODE: "1"` set in the workflow env block.
 """
 
@@ -96,7 +96,7 @@ class TestTestOps:
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
         # Use the existing tab.list to find the open dims — the
-        # IPC handler decides defaults (mac/gtk may differ on the
+        # IPC handler decides defaults (mac/iced may differ on the
         # very first tab). What we assert is internal consistency
         # of the dump, not specific numbers.
         dump = roost.tab_dump_resolved(tab)

@@ -31,8 +31,8 @@ def _config_lines(path, key: str) -> list[str]:
 
 
 def _require_owned_rust(target: str):
-    if target not in {"gtk", "iced"}:
-        pytest.skip("shared typography adapters are exercised by the Rust UIs")
+    if target != "iced":
+        pytest.skip("shared typography adapters are exercised by the Rust UI")
     config_path = ui.owned_session_config_path()
     if config_path is None:
         pytest.skip("typography persistence requires a harness-owned config copy")
@@ -124,7 +124,7 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
     roost._wait(
         lambda: _grid(roost, third) != enlarged,
         5.0,
-        "font reset reflows the active GTK tab away from the enlarged grid",
+        "font reset reflows the active Rust UI tab away from the enlarged grid",
     )
     reset_grid = _grid(roost, third)
     for tab_id in (first, second):

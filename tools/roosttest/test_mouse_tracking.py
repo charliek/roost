@@ -18,11 +18,10 @@ All tests use the `tab.feed_pty_bytes` (to enable a mode) +
 `app.cursor_shape` IPC ops; capture via `tab.capture_pty_input`.
 
 Cross-platform behavioral-parity gate: every case runs against
-`--roost-target mac` (PR A wiring) and `--roost-target gtk`
-(PR B wiring) and `--roost-target iced`. A regression on any
-side fails the matching job in CI. The same-cell drag-gate cases
-are the one exception — the gate is wired from iced only (plan
-026 D11), so they skip on mac and gtk.
+`--roost-target mac` and `--roost-target iced`. A regression on
+either side fails the matching job in CI. The same-cell drag-gate
+cases are the one exception — the gate is wired from iced only
+(plan 026 D11), so they skip on mac.
 """
 
 from __future__ import annotations
@@ -39,9 +38,8 @@ from util import drain, drain_until_match, wait_tab_attached
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
-# The whole module is gated on test mode. Both platforms run it now
-# (PR B dropped the PR-A skip-on-gtk markers); it's the cross-
-# platform behavioral-parity gate the plan called for.
+# The whole module is gated on test mode. Both platforms run it now;
+# it's the cross-platform behavioral-parity gate the plan called for.
 pytestmark = [
     pytest.mark.skipif(
         not TEST_MODE,

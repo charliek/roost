@@ -31,14 +31,12 @@ from client import Roost, RoostError, scaled_timeout
 # removing it is not a plain `rmtree` — see `_remove_session_state`.
 _SESSION_STATE_DIR: Path | None = None
 
-# Harness-launched Rust UI process handles + files capturing their
+# Harness-launched Rust UI process handle + file capturing its
 # stdout+stderr (the UI tees its log to stdout). Retained so `wait_alive`
 # can tell a UI that crashed on boot (process already exited) from one
 # that's merely slow, and surface the captured log instead of an opaque
 # "did not boot". `None` until launch; the Mac path launches via
 # `open` (no direct child) and leaves these unset.
-_GTK_PROC: "subprocess.Popen[bytes] | None" = None
-_GTK_LOG: Path | None = None
 _ICED_PROC: "subprocess.Popen[bytes] | None" = None
 _ICED_LOG: Path | None = None
 
@@ -75,8 +73,8 @@ ICED_BUNDLE_EXECUTABLE_NAME = "Roost-Iced"
 ICED_BUNDLE_APP_ID = "ai.stridelabs.Roost.iced"
 
 # The UI's own words when it refuses to start because another process holds
-# the state lock (`crates/roost-{iced,linux}/src/main.rs`,
-# `mac/Sources/Roost/App.swift` — all three share this wording).
+# the state lock (`crates/roost-iced/src/main.rs`,
+# `mac/Sources/Roost/App.swift` — both share this wording).
 _STATE_LOCK_REFUSAL = "is using this state directory"
 
 # Env vars to strip from a harness-launched Rust UI's inherited environment.
@@ -109,7 +107,6 @@ class TargetSpec:
     linux_namespace: str
     rust_package: str | None = None
     binary_name: str | None = None
-    scans_gtk_criticals: bool = False
     isolates_user_defaults: bool = False
 
 
@@ -120,15 +117,6 @@ TARGET_SPECS = {
         mac_label="Roost",
         linux_namespace="roost",
         isolates_user_defaults=True,
-    ),
-    "gtk": TargetSpec(
-        name="gtk",
-        profile="gtk",
-        mac_label="Roost-gtk",
-        linux_namespace="roost",
-        rust_package="roost-linux",
-        binary_name="roost",
-        scans_gtk_criticals=True,
     ),
     "iced": TargetSpec(
         name="iced",
@@ -326,10 +314,7 @@ def _launch_output(target: str) -> str:
         log = _iced_bundle_ui_log_path()
         offset = _ICED_BUNDLE_LOG_OFFSET
     else:
-        proc, log = {
-            "gtk": (_GTK_PROC, _GTK_LOG),
-            "iced": (_ICED_PROC, _ICED_LOG),
-        }.get(target, (None, None))
+        proc, log = (_ICED_PROC, _ICED_LOG) if target == "iced" else (None, None)
         if proc is None:
             return ""
         offset = 0
@@ -353,7 +338,7 @@ def _boot_failure_detail(target: str) -> str:
     already exited (so it crashed, not just slow) and the tail of what it
     logged since launch."""
     parts = []
-    proc = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+    proc = _ICED_PROC if target == "iced" else None
     if proc is not None and (rc := proc.poll()) is not None:
         parts.append(f" — UI process exited (code {rc}) before becoming ready")
     tail = _launch_output(target).splitlines()[-40:]
@@ -385,7 +370,7 @@ def _boot_refusal(target: str) -> str | None:
         if _roost_iced_bundle_running():
             return None
     else:
-        proc = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+        proc = _ICED_PROC if target == "iced" else None
         rc = proc.poll() if proc is not None else None
         if rc is None or rc == 0:
             return None
@@ -422,8 +407,8 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
 
     A tab opened via IPC *before* the subscription is live no longer
     races permanently: both UIs reconcile against a full snapshot as the
-    first thing the subscription does (resync-on-subscribe — GTK
-    `events.rs`, Mac `RoostEvent.resync`), so it materializes regardless.
+    first thing the subscription does (resync-on-subscribe — iced
+    `engine_feed.rs`, Mac `RoostEvent.resync`), so it materializes regardless.
     This probe is therefore a readiness gate (don't make the first test
     absorb boot latency), not a workaround for a dropped event.
     """
@@ -522,7 +507,7 @@ def owned_process(target: str) -> "subprocess.Popen[bytes] | None":
     own) need the handle the harness already holds — polling by pid would
     race a replacement onto the same number.
     """
-    return {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+    return _ICED_PROC if target == "iced" else None
 
 
 def session_state_dir() -> Path | None:
@@ -583,11 +568,9 @@ def end_session(target: str) -> None:
     out-of-order non-blocking probes produce spurious refusals when a
     harness runs beside anything else taking the same pair.
     """
-    global _SESSION_STATE_DIR, _GTK_PROC, _GTK_LOG, _ICED_PROC, _ICED_LOG
+    global _SESSION_STATE_DIR, _ICED_PROC, _ICED_LOG
     quit(target)
     _cleanup_owned_rust_runtime(target)
-    _GTK_PROC = None
-    _GTK_LOG = None
     _ICED_PROC = None
     _ICED_LOG = None
     if _SESSION_STATE_DIR is not None:
@@ -610,7 +593,7 @@ def _cleanup_owned_rust_runtime(target: str) -> None:
     This is the socket/bind lock only. `state.lock` lives in the state dir
     and is cleared by `_remove_session_state`.
     """
-    process = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+    process = _ICED_PROC if target == "iced" else None
     if process is None:
         return
     try:
@@ -732,18 +715,17 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         _launch_mac(app, state_dir=state_dir)
     elif target == "iced" and (bundle_app := iced_bundle_app()) is not None:
         _launch_iced_bundle(bundle_app, state_dir=state_dir)
-    elif target in ("gtk", "iced"):
-        if target == "iced":
-            # A prior launch in this same process may have gone through
-            # bundle mode (ROOST_ICED_APP was set then, unset now); clear
-            # the flag `_launch_output`/`_boot_refusal` key off so this
-            # Popen launch isn't mistaken for one still in flight, and clear
-            # any pid it recorded — otherwise a stale bundle pid from an
-            # earlier (now-dead) bundle would make `quit("iced")` dispatch
-            # to bundle teardown instead of terminating this live process.
-            global _ICED_BUNDLE_LOG_OFFSET, _ICED_BUNDLE_PID
-            _ICED_BUNDLE_LOG_OFFSET = None
-            _ICED_BUNDLE_PID = None
+    elif target == "iced":
+        # A prior launch in this same process may have gone through
+        # bundle mode (ROOST_ICED_APP was set then, unset now); clear
+        # the flag `_launch_output`/`_boot_refusal` key off so this
+        # Popen launch isn't mistaken for one still in flight, and clear
+        # any pid it recorded — otherwise a stale bundle pid from an
+        # earlier (now-dead) bundle would make `quit("iced")` dispatch
+        # to bundle teardown instead of terminating this live process.
+        global _ICED_BUNDLE_LOG_OFFSET, _ICED_BUNDLE_PID
+        _ICED_BUNDLE_LOG_OFFSET = None
+        _ICED_BUNDLE_PID = None
         spec = TARGET_SPECS[target]
         assert spec.binary_name is not None and spec.rust_package is not None
         binary, explicit_binary = rust_binary_path(target)
@@ -773,7 +755,7 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         # panic that predates the file logger only shows on stderr) so a boot
         # failure isn't blind — `wait_alive` reads this on timeout and CI
         # uploads it. Detached: outlive this call; quit() SIGTERMs it by pid.
-        global _GTK_PROC, _GTK_LOG, _ICED_PROC, _ICED_LOG
+        global _ICED_PROC, _ICED_LOG
         log_path = _rust_log_path(target)
         log_fh = open(log_path, "wb")
         try:
@@ -784,10 +766,7 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
             )
         finally:
             log_fh.close()  # the child holds its own dup of the fd
-        if target == "gtk":
-            _GTK_PROC, _GTK_LOG = proc, log_path
-        else:
-            _ICED_PROC, _ICED_LOG = proc, log_path
+        _ICED_PROC, _ICED_LOG = proc, log_path
         wait_alive(target)
     else:
         raise ValueError(f"unknown target {target!r}")
@@ -984,8 +963,8 @@ def _launch_mac(app: Path, *, state_dir: Path | None = None) -> None:
     fresh `open` silently terminates against the held lock and never
     answers. `_mac_cleanup()` clears that before launching; the second
     attempt also absorbs a slow/contended LaunchServices spawn under CI
-    load. (GTK launches a detached binary on a fresh DISPLAY — no shared
-    state, so it needs neither.)
+    load. (A bare-binary iced launch is a detached process with its own
+    fresh env — no shared state, so it needs neither.)
     """
     global _MAC_LOG_OFFSET
     last: TimeoutError | None = None
@@ -1000,8 +979,9 @@ def _launch_mac(app: Path, *, state_dir: Path | None = None) -> None:
         # (LaunchServices otherwise drops the caller's env). Forward
         # ROOST_TEST_MODE + ROOST_STATE_DIR the same way so the bundled UI
         # sees the test-mode gate and writes state.json to the throwaway
-        # dir (not the dev's ~/Library/Application Support/Roost). The GTK
-        # launch path inherits parent env directly via `**os.environ`.
+        # dir (not the dev's ~/Library/Application Support/Roost). The
+        # bare-binary iced launch path inherits parent env directly via
+        # `**os.environ`.
         # This hand-maintained allowlist is the one place a new override
         # can silently no-op on Mac, so keep it in sync with `launch`.
         config_path = _session_config_path() if state_dir is not None else SEED_CONFIG
@@ -1214,7 +1194,7 @@ def quit(target: str) -> None:
     pid = _answering_pid(target)
     if pid is None:
         return
-    owned = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+    owned = _ICED_PROC if target == "iced" else None
     if owned is not None:
         if owned.poll() is not None:
             raise RuntimeError(

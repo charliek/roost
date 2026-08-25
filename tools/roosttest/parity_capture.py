@@ -513,7 +513,7 @@ def test_capture_visual_parity_fixture(roost, target):
         # is more useful than publishing a detached field as parity evidence.
         chrome_unavailable_reason = (
             "AppKit product screenshots do not reliably place native inline "
-            "text editors; compare GTK and Iced editor captures"
+            "text editors; compare the Iced editor capture instead"
         )
     else:
         # A command-palette rename activation enters application-owned chrome

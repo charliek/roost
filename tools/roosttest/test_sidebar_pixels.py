@@ -1,5 +1,5 @@
-"""Sidebar agent-row pixel guards — plan 007, all three targets
-(`--roost-target mac|gtk|iced`). The only two things about the rendered rows
+"""Sidebar agent-row pixel guards — plan 007, both targets
+(`--roost-target mac|iced`). The only two things about the rendered rows
 that `app.sidebar_dump` cannot see: the lifecycle DOT COLOUR and the
 column the dots line up in.
 
@@ -7,11 +7,11 @@ Low-flake by construction, so the scope is deliberately narrow:
 
 *Asserted* — the four lifecycle colours (`#5fa3f0` working, `#f0a040`
 waiting, `#7a7a7a` finished, `#e05252` failed), which are our own
-constants spelled in `resources/style.css` and `ProjectRollup.swift`,
+constants spelled in `crates/roost-iced` and `ProjectRollup.swift`,
 and the dots' shared LEFT EDGE, which comes from layout constraints
-(Mac: `dot.leadingAnchor + 8` inside the row's leading inset) and CSS
-padding (GTK: `.roost-sidebar-agent { padding-left: 10px }` inside a
-6px margin). Neither depends on font metrics or on the theme.
+(Mac: `dot.leadingAnchor + 8` inside the row's leading inset; Iced:
+fixed row padding in its sidebar layout). Neither depends on font
+metrics or on the theme.
 
 *Not asserted*, on purpose — whole-image golden diffs (antialiasing and
 font rasterization differ per machine), anything derived from text
@@ -72,21 +72,18 @@ ICED_ACTIVE_PROJECT = (0x13, 0x50, 0x9D)
 # dot: the centre of the band it must fall in, per target.
 #
 # The dot sits a fixed distance inside its ROW (our own margin+padding),
-# but the row's own origin is set by the toolkit's padding, and that is
-# not the same everywhere: the gtk target measures x=25 against macOS
-# Homebrew GTK and x=29 against libadwaita on the Ubuntu CI runner. The
-# gtk band is therefore centred between them and widened to cover both;
-# AppKit does not vary that way, so mac keeps a tight band.
+# but the row's own origin is set by the toolkit's padding, and AppKit
+# does not vary that way, so mac keeps a tight band.
 #
 # This is deliberately a coarse guard. The precise, platform-independent
 # invariant — every dot on one edge — is asserted exactly below; this
 # band only catches gross indentation, which is the regression it exists
 # for (the dot was 10px past the project name and still is caught).
-DOT_LEFT_X = {"gtk": 27, "iced": 25, "mac": 25}
-DOT_LEFT_TOLERANCE = {"gtk": 6, "iced": 2, "mac": 3}
+DOT_LEFT_X = {"iced": 25, "mac": 25}
+DOT_LEFT_TOLERANCE = {"iced": 2, "mac": 3}
 
-# All three UIs draw an 8x8 rounded dot (AppKit/GTK use a 4px radius; Iced
-# uses 3px to retain a solid renderer-neutral edge). The saturated core is
+# Both UIs draw an 8x8 rounded dot (AppKit uses a 4px radius; Iced uses
+# 3px to retain a solid renderer-neutral edge). The saturated core is
 # at least 5x5, while the project lifecycle stripe is only 3px wide.
 MIN_DOT_SIDE = 5
 # Colour match tolerance for *finding* a dot. 0 and 2 select identical
@@ -186,10 +183,9 @@ def _color_components(shot, max_x: int, color: tuple[int, int, int]):
 
 def _capture(roost, path: Path):
     """Decode one `app.screenshot` (scale 1) capture, or None while the
-    window is mid-relayout. GTK renders the capture off a live widget
-    snapshot, which comes back empty (`internal: empty snapshot`) for a
-    frame or two right after a resize — a transient to poll through, not
-    a failure."""
+    window is mid-relayout — a capture taken off a live widget snapshot
+    can come back empty (`internal: empty snapshot`) for a frame or two
+    right after a resize — a transient to poll through, not a failure."""
     try:
         png, _w, _h = roost.screenshot()
     except RoostError as e:

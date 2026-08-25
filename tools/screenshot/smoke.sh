@@ -16,7 +16,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-TARGET="${1:?usage: smoke.sh <mac|gtk|iced> [outdir]}"
+TARGET="${1:?usage: smoke.sh <mac|iced> [outdir]}"
 ut_init "${TARGET}"
 OUT="${2:-/tmp/roost-uitest-${TARGET}-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${OUT}"

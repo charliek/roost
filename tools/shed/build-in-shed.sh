@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build GTK, Iced, and roostctl INSIDE a shed, keeping every artifact shed-local
+# Build Iced and roostctl INSIDE a shed, keeping every artifact shed-local
 # so the VirtioFS-mounted repo's macOS build outputs are never clobbered.
 #
 # The repo is mounted (different arch), and three build outputs use hardcoded
@@ -25,6 +25,6 @@ done
 cd "$REPO"
 log "ghostty (zig) build — cached after first run"
 ./third_party/ghostty/build.sh
-log "cargo build GTK + Iced + roostctl (target -> $CARGO_TARGET_DIR)"
-cargo build -p roost-linux -p roost-iced -p roost-cli
-log "done: $CARGO_TARGET_DIR/debug/{roost,roost-iced,roostctl}"
+log "cargo build Iced + roostctl (target -> $CARGO_TARGET_DIR)"
+cargo build -p roost-iced -p roost-cli
+log "done: $CARGO_TARGET_DIR/debug/{roost-iced,roostctl}"

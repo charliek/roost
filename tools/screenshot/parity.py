@@ -300,7 +300,7 @@ def measure_agent_palette(path: Path, sidebar_width: int) -> dict:
 
     This deliberately checks relationships rather than whole-image equality:
     the status must trail the name, while muted metrics/time remain visible to
-    its right. GTK and Iced use the same selection/lifecycle colors but retain
+    its right. Mac and Iced use the same selection/lifecycle colors but retain
     their normal font rasterization differences.
     """
     image = pngtool.load(str(path))
@@ -346,16 +346,15 @@ def measure_agent_palette(path: Path, sidebar_width: int) -> dict:
         "status_ink_span": status_right - status_left + 1,
         "name_status_gap": status_left - name_right - 1,
         # The rightmost 80px are reserved for the compact metrics/time column.
-        # Count rasterized ink rather than one exact foreground because GTK
-        # alpha-blends its text color into the selected-row background.
+        # Count rasterized ink rather than one exact foreground because text
+        # rasterizers alpha-blend the text color into the selected-row
+        # background.
         "trailing_ink_pixels": trailing_ink_pixels,
     }
 def environment_metadata(target: str, run_id: str, commit: str) -> dict[str, object]:
     system = platform.system().lower()
     backend_override = None
-    if system == "linux" and target == "gtk":
-        backend_override = os.environ.get("GDK_BACKEND")
-    elif system == "linux" and target == "iced":
+    if system == "linux" and target == "iced":
         backend_override = os.environ.get("WINIT_UNIX_BACKEND")
     if backend_override:
         display = backend_override
@@ -367,8 +366,6 @@ def environment_metadata(target: str, run_id: str, commit: str) -> dict[str, obj
         display = "native"
     if target == "iced":
         renderer = os.environ.get("ICED_BACKEND", "default")
-    elif target == "gtk":
-        renderer = os.environ.get("GSK_RENDERER", "gtk-default")
     else:
         renderer = "appkit"
     executable = Path(os.environ["ROOST_PARITY_EXECUTABLE"])
@@ -384,7 +381,7 @@ def environment_metadata(target: str, run_id: str, commit: str) -> dict[str, obj
         "run_id": run_id,
         "backend_environment": {
             name: os.environ[name]
-            for name in ("GDK_BACKEND", "WINIT_UNIX_BACKEND", "WAYLAND_DISPLAY", "DISPLAY")
+            for name in ("WINIT_UNIX_BACKEND", "WAYLAND_DISPLAY", "DISPLAY")
             if name in os.environ
         },
         "dynamic_regions": ["agent elapsed time"],
@@ -612,19 +609,16 @@ def _source_dirty(repo: Path) -> bool:
 def _executable_path(repo: Path, target: str) -> Path:
     if target == "mac":
         return repo / "mac/build/Roost.app/Contents/MacOS/Roost"
-    environment_name = "ROOST_GTK_BIN" if target == "gtk" else "ROOST_ICED_BIN"
-    default_name = "roost" if target == "gtk" else "roost-iced"
-    configured = os.environ.get(environment_name)
+    configured = os.environ.get("ROOST_ICED_BIN")
     if configured:
         path = Path(configured)
         return path if path.is_absolute() else repo / path
-    return repo / "target/debug" / default_name
+    return repo / "target/debug/roost-iced"
 
 
 def _build_targets(repo: Path, targets: Iterable[str]) -> None:
     commands = {
         "mac": (["./scripts/bundle.sh", "debug"], repo / "mac"),
-        "gtk": (["cargo", "build", "-p", "roost-linux"], repo),
         "iced": (["cargo", "build", "-p", "roost-iced"], repo),
     }
     for target in targets:
@@ -633,7 +627,7 @@ def _build_targets(repo: Path, targets: Iterable[str]) -> None:
 
 
 def _default_targets() -> list[str]:
-    return ["mac", "gtk", "iced"] if platform.system() == "Darwin" else ["gtk", "iced"]
+    return ["mac", "iced"] if platform.system() == "Darwin" else ["iced"]
 
 
 def _pytest_command() -> list[str]:
@@ -653,7 +647,7 @@ def _validate_run_id(run_id: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=Path("target/visual-parity"))
-    parser.add_argument("--targets", nargs="+", choices=("mac", "gtk", "iced"))
+    parser.add_argument("--targets", nargs="+", choices=("mac", "iced"))
     parser.add_argument("--run-id")
     parser.add_argument(
         "--no-build",

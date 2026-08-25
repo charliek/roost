@@ -11,7 +11,7 @@ locks in the parity assertion on both UIs.
 `not-enabled` and produce noisy "wrong reason" failures.
 
 Capability gate (instead of a blanket CI skip): a resize only lands if
-the environment honors it up to the available screen. GTK CI runs xvfb
+the environment honors it up to the available screen. Iced CI runs xvfb
 with a large virtual screen (`-screen 0 2560x1440x24`) so the toplevel
 resizes the full amount and these run there; but a tiling/constraining
 compositor (some local setups) or a small screen may grant only a

@@ -41,9 +41,9 @@ pointer inside the window; the zero-width scrollbar draws nothing in any
 state anyway). The divider is sampled at a handful of rows, not scanned:
 it is one container fill, so a full scan buys no signal.
 
-Iced-only: the mac/gtk strips are native scroll views with overlay
-scrollers and have never shown this artifact, mac's divider is
-NSSplitView's own and gtk has none; their band colors differ.
+Iced-only: mac's strip is a native scroll view with overlay scrollers
+and has never shown this artifact; mac's divider is NSSplitView's own,
+and its band colors differ from iced's.
 
 `window.resize` is test-mode-gated, so the file skips without
 `ROOST_TEST_MODE=1` — same convention as `test_sidebar_pixels.py`.
@@ -209,7 +209,7 @@ def _rightmost_title_pixel(shot, x0: int, x1: int, y1: int) -> int:
 )
 def test_overflowing_tab_strip_paints_no_scrollbar_band(roost, project, target, tmp_path):
     if target != "iced":
-        pytest.skip("#281 is an iced scrollable artifact; mac/gtk strips are native")
+        pytest.skip("#281 is an iced scrollable artifact; mac's strip is native")
 
     tabs = [
         roost.open_tab(
@@ -290,7 +290,7 @@ def test_sidebar_divider_hairline_only_while_expanded(roost, target, tmp_path):
     subject is renderer-only chrome with no textual IPC surface — the
     narrow, documented exception to roosttest's text-not-pixels rule."""
     if target != "iced":
-        pytest.skip("iced chrome hairline; mac uses NSSplitView's divider and gtk has none")
+        pytest.skip("iced chrome hairline; mac uses NSSplitView's divider")
 
     roost.window_resize(WINDOW_W, WINDOW_H)
     _toggle_to_visible(roost)
@@ -370,7 +370,7 @@ def test_notification_dots_paint_the_accent(roost, project, target, tmp_path):
     accent — is invisible to every dump op.
     """
     if target != "iced":
-        pytest.skip("iced chrome fill; mac reads controlAccentColor live and gtk uses CSS")
+        pytest.skip("iced chrome fill; mac reads controlAccentColor live")
 
     roost.window_resize(WINDOW_W, WINDOW_H)
     _toggle_to_visible(roost)

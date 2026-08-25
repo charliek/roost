@@ -12,7 +12,6 @@ lives in `test_osc52.py` alongside the OSC 52 tests that need it.
 Run against any UI:
 
     pytest -q tools/roosttest/test_selection.py --roost-target mac
-    pytest -q tools/roosttest/test_selection.py --roost-target gtk
     pytest -q tools/roosttest/test_selection.py --roost-target iced
 """
 

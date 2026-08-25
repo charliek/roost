@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 # Shared helpers for the Roost UI test harness.
 #
-# All three UIs (Swift Mac, gtk4-rs, and Iced) speak the same JSON IPC
-# surface, so the driver is one `roostctl` parameterized by
-# `--target {mac,gtk,iced}`. Only *launch* and *quit* differ per UI; this
-# file isolates those so the scenario scripts stay UI-agnostic.
+# Both UIs (Swift Mac and Iced) speak the same JSON IPC surface, so the
+# driver is one `roostctl` parameterized by `--target {mac,iced}`. Only
+# *launch* and *quit* differ per UI; this file isolates those so the
+# scenario scripts stay UI-agnostic.
 #
 # Source it, then call `ut_init <target>` before anything else.
 
@@ -31,22 +31,15 @@ ut_resolve_roostctl() {
 }
 
 # Per-target socket path (matches roost-ipc's BundleProfile resolver).
-# macOS uses three `~/Library/Caches/Roost*` namespaces. Linux keeps the
-# production `roost/` namespace — owned by the gtk profile, which the
-# packaged iced UI adopts — and the isolated iced dev profile on
-# `roost-iced/`.
+# macOS uses two `~/Library/Caches/Roost*` namespaces. Linux keeps the
+# isolated iced dev profile on `roost-iced/`; the production `roost/`
+# namespace (the packaged iced UI's default profile — formerly owned by
+# the retired gtk profile, byte-identical since the rename) is pinned by
+# the Rust golden-path tests in `crates/roost-ipc/tests/`, not by this
+# harness.
 ut_socket_for() {
   case "$1" in
     mac) echo "${HOME}/Library/Caches/Roost/roost.sock" ;;
-    gtk)
-      if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "${HOME}/Library/Caches/Roost-gtk/roost.sock"
-      elif [[ -n "${XDG_RUNTIME_DIR:-}" && "${XDG_RUNTIME_DIR}" == /* ]]; then
-        echo "${XDG_RUNTIME_DIR}/roost/roost.sock"
-      else
-        echo "/tmp/roost-$(id -u)/roost.sock"
-      fi
-      ;;
     iced)
       if [[ "$(uname -s)" == "Darwin" ]]; then
         echo "${HOME}/Library/Caches/Roost-iced/roost.sock"
@@ -56,17 +49,17 @@ ut_socket_for() {
         echo "/tmp/roost-iced-$(id -u)/roost.sock"
       fi
       ;;
-    *) echo "error: unknown target '$1' (want mac|gtk|iced)" >&2; return 1 ;;
+    *) echo "error: unknown target '$1' (want mac|iced)" >&2; return 1 ;;
   esac
 }
 
 # --- init ---------------------------------------------------------------
 
-# ut_init <mac|gtk|iced> — sets UT_TARGET, UT_RC (roostctl path), UT_SOCK.
+# ut_init <mac|iced> — sets UT_TARGET, UT_RC (roostctl path), UT_SOCK.
 ut_init() {
-  UT_TARGET="${1:?usage: ut_init <mac|gtk|iced>}"
-  case "${UT_TARGET}" in mac|gtk|iced) ;; *)
-    echo "error: target must be mac, gtk, or iced, got '${UT_TARGET}'" >&2; return 1 ;;
+  UT_TARGET="${1:?usage: ut_init <mac|iced>}"
+  case "${UT_TARGET}" in mac|iced) ;; *)
+    echo "error: target must be mac or iced, got '${UT_TARGET}'" >&2; return 1 ;;
   esac
   UT_RC="$(ut_resolve_roostctl)"
   UT_SOCK="$(ut_socket_for "${UT_TARGET}")"
@@ -107,12 +100,6 @@ ut_launch() {
       echo "==> launching Roost.app"
       open "${app}"
       ;;
-    gtk)
-      local bin="${UT_REPO_ROOT}/target/debug/roost"
-      [[ -x "${bin}" ]] || { echo "==> building roost (GTK)"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-linux >/dev/null ); }
-      echo "==> launching roost (GTK)"
-      ( cd "${UT_REPO_ROOT}" && RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-gtk-uitest.log 2>&1 & )
-      ;;
     iced)
       local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
       [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
@@ -129,7 +116,7 @@ ut_quit() {
   ut_alive || { echo "==> ${UT_TARGET} UI not running"; return 0; }
   case "${UT_TARGET}" in
     mac) osascript -e 'tell application "Roost" to quit' >/dev/null 2>&1 || true ;;
-    gtk|iced)
+    iced)
       local pid; pid="$(rc identify 2>/dev/null | sed -n 's/^pid=//p')"
       [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
       ;;

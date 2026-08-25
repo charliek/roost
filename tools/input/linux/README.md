@@ -3,7 +3,7 @@
 The **real-OS-input** layer for Linux — the only way to exercise the actual
 key-encoder + mouse-gesture + clipboard path that IPC (`tools/roosttest/`) and
 in-process screenshots (`tools/screenshot/`) can't reach. Drives the
-`roost-linux` GTK app by injecting input as a real user would, without
+`roost-iced` app by injecting input as a real user would, without
 Pillow/ImageMagick/`wtype`/`ydotool` installed. (A Mac CGEvent sibling would
 live at `tools/input/mac/`; see [`../../README.md`](../../README.md) for the
 layer map.)
@@ -28,7 +28,11 @@ Everything is stdlib Python 3 + bash. No build step.
 - `/dev/uinput` writable by your user (`ls -l /dev/uinput`). If not, add a udev
   rule or run the injectors via a wrapper with access.
 - `roostctl` built (`cargo build -p roost-cli --bin roostctl`).
-- `clipread.py` only: PyGObject (`gi`) with GTK4 typelibs.
+- `iced_native_file_drop_check.py` only: a GTK4 runtime (it launches a small
+  GTK app as its XDND drag *source* — `roost-iced` itself stays GTK-free, and
+  the Cargo boundary gate in `make check-iced` verifies that independently).
+  This is why the GTK apt dev packages remain a test dependency in
+  `.shed/scripts/install.sh` and the iced CI job.
 
 ## The tools
 
@@ -37,51 +41,13 @@ Everything is stdlib Python 3 + bash. No build step.
 | `inject_key.py` | Press a key chord (`CTRL SHIFT C`) or type a string (`--type "ls\n"`). Follows keyboard focus. |
 | `inject_pointer.py` | Absolute pointer: `move X Y`, `down/up LEFT\|MIDDLE\|RIGHT`, optional `keydown/keyup CTRL\|ALT\|SUPER`, drags. Needs single monitor. |
 | `inject_wheel.py` | Relative uinput mouse-wheel diagnostic with legacy + high-resolution detents. Position/focus the seat first; cage's headless backend currently observes it in libinput but does not forward it to the client. |
-| `clipread.py` | Print the CLIPBOARD + PRIMARY selections via Gdk4 (see the caveat below). |
 | `single_monitor.sh` | `solo <OUTPUT>` / `restore` — collapse to one enabled output for pointer work, then put the others back. |
-| `real_input_check.py` | Self-contained real-input regression: focus + core-sync (click-to-focus, project switch, Alt+digit, Ctrl+PageDown, cycle_tab, pill click, context menu) **and** drag reorder (tab pills + project rows). Spins up its own Xvfb + throwaway Roost and drives **`xdotool`** — no `/dev/uinput`, no single monitor, no COSMIC. |
-| `iced_clipboard_check.py` | Self-contained Iced/X11 text/click/wheel gate: Copy/Paste, drag copy-on-select, middle-click PRIMARY, local/tracked/alternate terminal wheel routing, key snap, double/triple-click selection, and modifier-link hover under Xvfb + xdotool. |
-| `iced_wayland_clipboard_check.py` | Shed/real-kernel Iced Wayland proof under cage + uinput: system Copy/Paste, drag copy-on-select, double/triple-click selection, and combined modifier-link hover. PRIMARY is a named compositor limitation. |
+| `iced_clipboard_check.py` | Self-contained Iced/X11 text/click/wheel gate: Copy/Paste, drag copy-on-select, middle-click PRIMARY, local/tracked/alternate terminal wheel routing, key snap, double/triple-click selection, tab/project drag reorder, and modifier-link hover under Xvfb + xdotool. |
+| `iced_native_file_drop_check.py` | Self-contained Iced native XDND file-drop gate under Xvfb: drags a file from a throwaway GTK source app onto a roost-iced tab and asserts the drop lands. |
+| `iced_wayland_clipboard_check.py` | Shed/real-kernel Iced Wayland proof under cage + uinput: system Copy/Paste, drag copy-on-select, double/triple-click selection, tab/project drag reorder (`_wayland_tab_reorder`), and combined modifier-link hover. PRIMARY is a named compositor limitation. |
 
 PNG inspection (`info`/`pixel`/`textscan`/`findcolor`/`crop`) is in the visual
 layer: [`../../screenshot/pngtool.py`](../../screenshot/pngtool.py).
-
-## Real-input regression (`real_input_check.py`)
-
-Several behaviors can only be exercised by **real** pointer/key input through the
-GTK gesture/shortcut stack, so the IPC e2e suite can't reach them
-(`tab.dispatch_mouse_event` writes mouse-report bytes to the PTY without entering
-the gesture stack; the IPC project switch never focuses a row; reorder is a
-gesture, not an op). This check drives real `xdotool` input to cover:
-
-- **focus + core-sync** — click-to-focus, project-switch focus + core-sync (#1),
-  Alt+digit (project-only switching), Ctrl+PageDown / cycle_tab core-sync (#229),
-  pill-click core-sync (#228), and tab right-click context menu (no crash).
-- **drag reorder** — drag a tab pill to reorder tabs, and a sidebar row to reorder
-  projects (the `GtkGestureDrag` path that replaced GTK DnD). The content-area
-  sidebar reorder is the reliable gate; the title-row tab-pill drag is best-effort
-  under Xvfb (the press races the window title-drag), but a tab-drag *crash* still
-  fails. NB: X11/Xvfb can't reproduce the *Wayland* `frame_callback` crash — a true
-  Wayland-crash guard needs ydotool under [`../../wayland/weston-run.sh`](../../wayland/weston-run.sh).
-
-Unlike the `inject_*` tools above (which target a live COSMIC/Wayland session via
-`/dev/uinput`), this one is fully self-contained — it launches its own headless
-Xvfb + a throwaway Roost (private of your session: no shared socket, no session
-bus, isolated `ROOST_STATE_DIR`) and injects with `xdotool`. So it needs only
-`Xvfb` + `xdotool` and runs anywhere, but it does **not** exercise the
-Wayland/uinput path (use the injectors for that). It runs in CI as the
-`continue-on-error` "Real-input regressions" step in the `e2e-gtk` job.
-
-```sh
-make test-real-input            # or:
-python3 tools/input/linux/real_input_check.py
-```
-
-Each check defocuses the terminal first (a non-terminal click), so the
-unfocused→focused transition pins the focus path under test. Focus is read via the
-`app.active_terminal_focused` IPC op (GTK logical focus, observable without a
-window manager). PASS exits 0; a missing `Xvfb`/`xdotool`/binary prints `SKIP` and
-exits 0.
 
 ## Iced clipboard real-input checks
 
@@ -158,12 +124,6 @@ height ≈ spacing between rows.
 
 ## Gotchas learned the hard way
 
-- **Sidebar GtkPaned handle.** GtkPaned's stock capture-phase gesture
-  claimed presses well into the terminal's first columns (sidebar resize
-  instead of selection). Fixed by `App::tighten_paned_grab_zone` — the
-  resize hit zone is now the separator ±2px, so left-to-right drags from
-  column 0 select normally (`real_input_check.py::_check_left_edge_drag_selects`
-  guards this). Resize drags must start on the separator itself.
 - **IPC input doesn't clear a selection.** `roostctl tab send` writes straight
   to the PTY; the selection highlight is a UI overlay cleared only by a real
   keypress or a new drag. Don't expect a sent command to drop the highlight.
@@ -187,11 +147,7 @@ roostctl screenshot --out /tmp/after.png    # MARKER appears at the prompt
 python3 tools/screenshot/pngtool.py crop /tmp/after.png /tmp/after_top.png 0 0 1680 205
 ```
 
-## Caveat: cross-process clipboard on COSMIC
-
-On COSMIC/Wayland, a separate Gdk reader (`clipread.py`) has been observed to
-read roost's CLIPBOARD/PRIMARY as empty even when in-roost copy/paste works.
-So a `None` from `clipread.py` does **not** prove roost's copy failed — verify
-with an in-roost round-trip (copy, then paste, screenshot the prompt) instead.
-This is an open question about GTK clipboard propagation on COSMIC, not a
-harness bug.
+Verify a clipboard round trip in-process (copy, then paste, screenshot the
+prompt) rather than reading the CLIPBOARD/PRIMARY selection from a separate
+process — `iced_clipboard_check.py` and `iced_wayland_clipboard_check.py`
+both use this in-roost round-trip technique for exactly that reason.

@@ -98,14 +98,13 @@ driving W1 and W2 toward 0 while W3 stays high.
 ```bash
 tools/perf/render-stats.sh iced           # interactive: prompt before reading
 tools/perf/render-stats.sh iced 10        # reset, sleep 10s, read
-tools/perf/render-stats.sh mac
-tools/perf/render-stats.sh gtk            # GTK has no instrumentation yet — reports all zeros
+tools/perf/render-stats.sh mac            # errors — app.render_stats is iced-only
 ```
 
 Resets the counters, waits for you to exercise the running UI (either
 interactively or for a fixed duration), then prints `roostctl
 render-stats`'s delta since the reset. `--target` follows the rest of
-`tools/`: `mac|gtk|iced` (see [`../screenshot/README.md`](../screenshot/README.md)
+`tools/`: `mac|iced` (see [`../screenshot/README.md`](../screenshot/README.md)
 for the per-target launch/socket details this script reuses via
 `../screenshot/lib.sh`).
 

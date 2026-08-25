@@ -5,7 +5,7 @@ Closes both coverage gaps that #142 and #145 left open:
 * **#142** (`bold-color`): the existing resolver tests pass
   `boldColor` explicitly into `resolve_cell_colors` /
   `resolveCellColors`. They don't exercise the production
-  call sites (`crates/roost-linux/src/terminal_view.rs::paint` /
+  call sites (`crates/roost-iced/src/terminal_widget.rs::draw` /
   `mac/Sources/Roost/TerminalView.swift::draw`). A revert to
   `None`/`nil` would still pass the unit tests. The
   `tab.dump_resolved` IPC op walks the SAME `resolve_cell_colors`
@@ -23,8 +23,8 @@ Closes both coverage gaps that #142 and #145 left open:
 Plus parity coverage for the other OSC-routed behaviors (title /
 cwd / notification) that are currently unit-tested only.
 
-Every UI target runs these in CI (e2e-gtk, e2e-mac, and the three iced
-lanes) with `ROOST_TEST_MODE: "1"` set in the workflow env block.
+Every UI target runs these in CI (e2e-mac and the iced lanes) with
+`ROOST_TEST_MODE: "1"` set in the workflow env block.
 """
 
 from __future__ import annotations

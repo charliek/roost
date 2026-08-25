@@ -167,7 +167,7 @@ class PixelMeasurementTests(unittest.TestCase):
 
     def test_target_backend_override_wins_over_ambient_display(self):
         environment = {
-            "GDK_BACKEND": "x11",
+            "WINIT_UNIX_BACKEND": "x11",
             "WAYLAND_DISPLAY": "wayland-1",
         }
         with tempfile.NamedTemporaryFile() as executable:
@@ -176,11 +176,11 @@ class PixelMeasurementTests(unittest.TestCase):
                 mock.patch.dict(parity.os.environ, environment, clear=True),
                 mock.patch.object(parity.platform, "system", return_value="Linux"),
             ):
-                metadata = parity.environment_metadata("gtk", "run", "commit")
+                metadata = parity.environment_metadata("iced", "run", "commit")
         self.assertEqual(metadata["display_backend"], "x11")
         self.assertEqual(
             metadata["backend_environment"],
-            {"GDK_BACKEND": "x11", "WAYLAND_DISPLAY": "wayland-1"},
+            {"WINIT_UNIX_BACKEND": "x11", "WAYLAND_DISPLAY": "wayland-1"},
         )
 
     def test_darwin_ignores_ambient_unix_display_variables(self):

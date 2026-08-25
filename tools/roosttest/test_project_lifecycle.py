@@ -3,8 +3,8 @@
 Plan 010 C4. Most assertions are **target-agnostic parity checks**: they
 drive `project.create` / `project.delete` / `project.reorder` directly
 (no palette, no keybind) and assert on `tab.list` / `identify` /
-`app.sidebar_dump`, so the same test runs against mac/gtk/iced and pins
-op-level behavior all three engines share. A couple of tests are
+`app.sidebar_dump`, so the same test runs against mac/iced and pins
+op-level behavior both engines share. A couple of tests are
 Iced-only because they exercise UI-flow behavior that has no cross-target
 analog (the full palette-dispatch path) or that diverges by UI (Mac quits
 the whole process when the last project's window closes — see
@@ -277,12 +277,12 @@ def test_iced_palette_new_project_creates_active_project_with_one_tab(roost, tar
     """`palette.open` + `palette.activate("new_project")` drives the full
     UI dispatch path (`new_project()`), unlike the raw `project.create`
     op tested above: it seeds one shell tab AND activates the project.
-    Iced-only — mac/gtk have their own native create affordances (footer
+    Iced-only — mac has its own native create affordances (footer
     button / menu), not a cross-target op-level behavior."""
     if target != "iced":
         pytest.skip(
             "palette-driven new_project exercises iced's UI dispatch path "
-            "(new_project()); mac/gtk create through their own native "
+            "(new_project()); mac creates through its own native "
             "affordances, not this op sequence"
         )
 

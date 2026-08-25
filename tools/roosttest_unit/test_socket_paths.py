@@ -29,7 +29,7 @@ UID = os.getuid()
 def _write_fake_uname(bin_dir: Path, kernel_name: str) -> None:
     """Write a stub `uname` that always reports `kernel_name`.
 
-    lib.sh's gtk/iced arms branch on `uname -s`. Faking it forces the
+    lib.sh's iced arm branches on `uname -s`. Faking it forces the
     non-Darwin branch deterministically regardless of the host OS,
     instead of relying on (or re-deriving) the runner's real platform.
     """
@@ -62,32 +62,14 @@ def _ut_socket_for(target: str, *, xdg_runtime_dir: "str | None") -> str:
     return result.stdout.strip()
 
 
-class UtSocketForGtkTests(unittest.TestCase):
-    """Parity with roost-ipc's non-macOS resolve_paths() for BundleProfileKind::Gtk."""
-
-    def test_absolute_xdg_runtime_dir_is_used(self) -> None:
-        self.assertEqual(
-            _ut_socket_for("gtk", xdg_runtime_dir="/run/user/1000"),
-            "/run/user/1000/roost/roost.sock",
-        )
-
-    def test_unset_xdg_runtime_dir_falls_back(self) -> None:
-        self.assertEqual(
-            _ut_socket_for("gtk", xdg_runtime_dir=None),
-            f"/tmp/roost-{UID}/roost.sock",
-        )
-
-    def test_empty_xdg_runtime_dir_falls_back(self) -> None:
-        self.assertEqual(
-            _ut_socket_for("gtk", xdg_runtime_dir=""),
-            f"/tmp/roost-{UID}/roost.sock",
-        )
-
-    def test_relative_xdg_runtime_dir_falls_back(self) -> None:
-        self.assertEqual(
-            _ut_socket_for("gtk", xdg_runtime_dir="relative/path"),
-            f"/tmp/roost-{UID}/roost.sock",
-        )
+# The gtk profile (and its bash `ut_socket_for` case) is retired along with
+# crates/roost-linux (plan 031). Its production namespace lives on: the
+# packaged iced UI's default `Linux` profile resolves the same `roost/`
+# socket on Linux that `Gtk` did (byte-identical, plan 031 §3.1) — but that
+# resolution is pinned by the Rust golden-path tests in
+# `crates/roost-ipc/tests/` against the real resolver, not duplicated here
+# against this bash reimplementation, since this harness never launches a
+# `linux`-profile UI (only `mac` and dev `iced`).
 
 
 class UtSocketForIcedTests(unittest.TestCase):

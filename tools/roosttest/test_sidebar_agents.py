@@ -1,5 +1,5 @@
 """Sidebar agent rows E2E — plan 007 §7 A9/A10, both targets
-(`--roost-target mac|gtk`). Drives `app.sidebar_dump` (plan 007 §3.8),
+(`--roost-target mac|iced`). Drives `app.sidebar_dump` (plan 007 §3.8),
 the same per-project `rendered_agents` cache both UIs paint the sidebar
 from, so a missed refresh is a stale dump rather than an invisible bug.
 

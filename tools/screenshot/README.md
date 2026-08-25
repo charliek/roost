@@ -1,6 +1,6 @@
 # Roost screenshot harness (`tools/screenshot/`)
 
-The **visual** layer: screenshot-driven smoke testing for all three Roost UIs,
+The **visual** layer: screenshot-driven smoke testing for both Roost UIs,
 driven entirely through `roostctl`, plus `pngtool.py` to inspect the
 captures with no image libraries. Use it to verify what IPC can't *see* —
 pill-dot/badge colors, theme rendering, which tab is on screen, reflow —
@@ -16,37 +16,36 @@ Two halves:
 
 See [`../README.md`](../README.md) for how this fits the three test layers.
 
-## Why one harness for three UIs
+## Why one harness for both UIs
 
-The Swift (Mac), gtk4-rs, and Iced UIs speak the **same** workspace and
+The Swift (Mac) and Iced UIs speak the **same** workspace and
 newline-delimited JSON IPC contract, so
 the test driver is a single `roostctl` parameterized by
-`--target {mac,gtk,iced}`. Only two things differ per UI, and `lib.sh`
+`--target {mac,iced}`. Only two things differ per UI, and `lib.sh`
 isolates them:
 
-| Concern | Mac | GTK | Iced |
-|---|---|---|---|
-| Launch | `open mac/build/Roost.app` | `target/debug/roost` | `target/debug/roost-iced` |
-| Quit | AppleScript | `SIGTERM` identified pid | `SIGTERM` identified pid |
-| Socket on macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` | `~/Library/Caches/Roost-iced/roost.sock` |
-| Socket on Linux | n/a | `$XDG_RUNTIME_DIR/roost/roost.sock` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock` |
+| Concern | Mac | Iced |
+|---|---|---|
+| Launch | `open mac/build/Roost.app` | `target/debug/roost-iced` |
+| Quit | AppleScript | `SIGTERM` identified pid |
+| Socket on macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-iced/roost.sock` |
+| Socket on Linux | n/a | `$XDG_RUNTIME_DIR/roost-iced/roost.sock` |
 
-Both Rust binaries run on macOS, so all three UIs can be driven side by
-side there; their profiles keep sockets, locks, logs, and state distinct.
+Both UIs can run side by side on macOS; their profiles keep sockets,
+locks, logs, and state distinct.
 
 ## Quick start
 
 ```bash
 # Launch a UI (idempotent — no-op if already running)
-tools/screenshot/launch.sh mac        # or: gtk / iced
+tools/screenshot/launch.sh mac        # or: iced
 
 # Run the full smoke scenario; writes PNGs + manifest.md to an outdir
 tools/screenshot/smoke.sh mac /tmp/ut-mac
-tools/screenshot/smoke.sh gtk /tmp/ut-gtk
 tools/screenshot/smoke.sh iced /tmp/ut-iced
 
-# Hermetic same-fixture comparison. Defaults to mac+gtk+iced on macOS and
-# gtk+iced on Linux; every environment gets a unique provenance directory.
+# Hermetic same-fixture comparison. Defaults to mac+iced on macOS and
+# iced on Linux; every environment gets a unique provenance directory.
 make visual-parity
 python3 tools/screenshot/parity.py --out target/visual-parity --targets iced
 
@@ -82,15 +81,14 @@ remain dynamic and are explicitly excluded from visual comparison.
 
 Local runs rebuild every requested target before capture and record both dirty
 source state and the launched executable's path/SHA-256. In the Linux shed,
-build with `tools/shed/shed-test.sh --build-only`, point `ROOST_GTK_BIN` or
-`ROOST_ICED_BIN` at the shed-local `~/rt/debug` executable, and pass
-`--no-build`; this prevents Linux outputs from overwriting macOS artifacts on
-the shared mount.
+build with `tools/shed/shed-test.sh --build-only`, point `ROOST_ICED_BIN` at
+the shed-local `~/rt/debug` executable, and pass `--no-build`; this prevents
+Linux outputs from overwriting macOS artifacts on the shared mount.
 
 AppKit's product screenshot renders the main window content view but not its
 child `NSPanel`, so the Mac document records palette capture as unavailable and
-does not write misleading palette images. Shell captures compare all three
-targets; the five palette variants compare GTK and Iced. A future AppKit
+does not write misleading palette images. Shell captures compare both
+targets; the five palette variants compare only Iced. A future AppKit
 compositor for child panels can remove that declared capability gap.
 
 ## How verification works
@@ -124,7 +122,7 @@ caught — `03-focus-clears.png` calls it out explicitly.
 
 ## Building blocks (`lib.sh`)
 
-Source `lib.sh` and call `ut_init <mac|gtk|iced>` to write your own scenario:
+Source `lib.sh` and call `ut_init <mac|iced>` to write your own scenario:
 
 - `rc …` — run `roostctl --target <target> …`
 - `ut_launch` / `ut_quit` / `ut_alive` / `ut_wait_alive`

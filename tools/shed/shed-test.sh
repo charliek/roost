@@ -3,10 +3,11 @@
 #
 # Why a shed and not Docker: a shed boots a real Ubuntu kernel with /dev/uinput,
 # so it runs the FULL suite — including the cage+uinput Wayland pointer-drag
-# guard that Docker Desktop fundamentally can't (its LinuxKit kernel has no
-# uinput). The repo is mounted via --local-dir (edit on the Mac, build+test in
-# the VM); .shed/provision.yaml installs deps (install hook) and opens
-# /dev/uinput + the seatd socket each boot (startup hook).
+# guard (iced_wayland_clipboard_check.py) that Docker Desktop fundamentally
+# can't (its LinuxKit kernel has no uinput). The repo is mounted via
+# --local-dir (edit on the Mac, build+test in the VM); .shed/provision.yaml
+# installs deps (install hook) and opens /dev/uinput + the seatd socket each
+# boot (startup hook).
 #
 # Box model: a long-lived `roost-dev` shed + a `roost-base` snapshot cache.
 # Treat both as a CACHE — on a shed upgrade, run with --reprovision (or
@@ -15,8 +16,8 @@
 # target/ (different arch).
 #
 # Usage:
-#   tools/shed/shed-test.sh                 # ensure box, build, run the drag guard
-#   tools/shed/shed-test.sh --build-only    # build GTK + Iced + roostctl in the shed
+#   tools/shed/shed-test.sh                 # ensure box, build, run the iced real-input lanes
+#   tools/shed/shed-test.sh --build-only    # build Iced + roostctl in the shed
 #   tools/shed/shed-test.sh --shell         # ensure box + drop into a shell
 #   tools/shed/shed-test.sh --snapshot-base # cache the provisioned box as roost-base
 #   tools/shed/shed-test.sh --reprovision   # delete box + snapshot, rebuild from scratch
@@ -54,21 +55,15 @@ ensure_box() {
 }
 
 build() {
-  log "building GTK + Iced + roostctl in the shed (all artifacts shed-local; Mac target/ + ghostty untouched)"
+  log "building Iced + roostctl in the shed (all artifacts shed-local; Mac target/ + ghostty untouched)"
   in_shed "chmod +x ~/roost/tools/shed/build-in-shed.sh; ~/roost/tools/shed/build-in-shed.sh"
 }
 
 run_drag() {
-  log "running the cage+uinput Wayland pointer-drag guard"
   # The startup hook already opened /dev/uinput + the seatd socket this boot.
   # SCALE=5: a just-booted-from-snapshot VM is cold — the first tab spawns can
   # be slow enough to trip wait_tab_attached at the CI default (3); the extra
   # headroom only matters on a cold box and never slows a passing run.
-  in_shed "cd ~/roost && \
-    ROOST_BIN=$RT/debug/roost ROOSTCTL=$RT/debug/roostctl \
-    ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 ROOST_TEST_TIMEOUT_SCALE=5 \
-    python3 tools/input/linux/wayland_drag_check.py"
-
   log "running the Iced X11 real-input clipboard guard"
   in_shed "cd ~/roost && \
     ROOST_ICED_BIN=$RT/debug/roost-iced \
