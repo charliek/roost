@@ -1162,6 +1162,15 @@ process-local oneshots keyed by identifier, so a banner clicked after
 quit/relaunch is not routed back to a tab, unlike Swift's userInfo-based
 routing.
 
+**Open before iced could replace the Swift app: [#355]** — authorization
+is read once at launch in *both* apps, so a permission change made in
+System Settings afterwards is invisible (and silent) until relaunch. Not
+a release blocker — the normal first run prompts and applies the answer
+immediately — but it is a macOS parity item to settle, in both apps
+together, before the Swift build is retired.
+
+[#355]: https://github.com/charliek/roost/issues/355
+
 **Testing 6e needs a Developer-ID bundle — an ad-hoc one cannot work**
 (learned the hard way, 2026-08-24). macOS refuses notification
 authorization outright to an ad-hoc-signed app: `requestAuthorization`
