@@ -844,6 +844,12 @@ jobs:
       - name: Assert the artifact set, then publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job deliberately has no checkout — it only talks to the API.
+          # But `gh release …` (unlike `gh api <path>`) resolves the repo from
+          # a git remote, so without this every call fails with "not a git
+          # repository" and the existence check below reports it as "no
+          # release exists". v0.0.18 died here on this job's first real run.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
