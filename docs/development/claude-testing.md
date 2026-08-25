@@ -9,11 +9,11 @@ verify any UI change in the area, or to demo the integration.
 
 | Surface | What it means | Where it lives |
 |---|---|---|
-| **Pill dot** (10pt circle, leading edge of a tab pill) | The tab's *effective* agent state — blue (running), orange (needs-input), gray (idle), red (failed), or none. Derived from the shell axis (OSC 133 marks) when no agent owns the tab, or the owning agent's own lifecycle when one does. | `TabPillView.statusSlot` (Mac); Linux uses an `Adw.TabPage` icon. |
-| **Sidebar stripe** (3pt vertical band on the leading edge of a project row) | The *rollup* of all tabs in the project's effective states. Ranked `failed > needs_input > running > idle` (`crates/roost-ipc/src/agent.rs::rank`, shared with the per-tab dot). Every tab participates, including one a hook currently owns — a project whose only blocked tab is a live Claude session gets a stripe, not silence. | `ProjectRowCellView.stripe` (Mac); Linux uses a CSS class on the row. |
+| **Pill dot** (10pt circle, leading edge of a tab pill) | The tab's *effective* agent state — blue (running), orange (needs-input), gray (idle), red (failed), or none. Derived from the shell axis (OSC 133 marks) when no agent owns the tab, or the owning agent's own lifecycle when one does. | `TabPillView.statusSlot` (Mac); the iced UI draws it in the tab strip (`crates/roost-iced/src/app.rs`). |
+| **Sidebar stripe** (3pt vertical band on the leading edge of a project row) | The *rollup* of all tabs in the project's effective states. Ranked `failed > needs_input > running > idle` (`crates/roost-ipc/src/agent.rs::rank`, shared with the per-tab dot). Every tab participates, including one a hook currently owns — a project whose only blocked tab is a live Claude session gets a stripe, not silence. | `ProjectRowCellView.stripe` (Mac); the iced UI draws the `stripe` container on the sidebar row (`crates/roost-iced/src/app.rs`). |
 | **Tab pill badge dot** (8pt accent circle, trailing edge of inactive notified pills) | The tab has a pending notification. Cleared when the user focuses the tab. | `TabPillView.badgeDot` (Mac). |
 | **Project row badge dot** (sidebar trailing-edge dot on a project row) | At least one tab in this project has a pending notification. Same focus-clear behavior. | `ProjectRowCellView.badgeDot` (Mac). |
-| **Desktop banner** | A macOS banner (`UNUserNotificationCenter`) with title + body. Clicking it brings Roost to front and focuses the originating tab. | `DesktopNotifications` (Mac); Linux uses `gio.Notification`. |
+| **Desktop banner** | A desktop banner with title + body. Clicking it brings Roost to front and focuses the originating tab. | `DesktopNotifications` (Mac, `UNUserNotificationCenter`); `crates/roost-iced/src/notifications.rs` — `org.freedesktop.Notifications` over the session bus on Linux, `UNUserNotificationCenter` via the `objc2` seam for `Roost-Iced.app`. |
 
 ## State model
 
@@ -166,7 +166,8 @@ no OS screen-capture permission needed.
 
 1. Drive a visible change, e.g. `tab set-state --state needs_input --tab N`.
 2. `roostctl screenshot --out /tmp/roost.png` (add `--scale 2` for a
-   crisper image; target a specific UI with `--target mac` / `--target gtk`).
+   crisper image; target a specific UI with `--target mac` /
+   `--target linux` / `--target iced`).
 3. Open `/tmp/roost.png` — confirm the pill dot color, sidebar stripe,
    and badge match what the state change should produce.
 

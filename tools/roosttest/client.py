@@ -435,7 +435,8 @@ class Roost:
     # round-trips, and other byte-level wiring end-to-end — the
     # missing rung between Rust/Swift unit tests and the user-driven
     # IO injectors under `tools/input/`. See
-    # `docs/development/test-automation.md` §5.4 for the full rationale.
+    # `docs/development/test-automation.md` ("Test-mode IPC ops") for
+    # the full rationale.
 
     def tab_feed_pty_bytes(self, tab_id: int, data: bytes) -> None:
         """Inject raw bytes into a tab's PTY-output drain as if the

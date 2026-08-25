@@ -581,7 +581,8 @@ pub struct ClipboardWriteParams {
 // into a live tab and observe what the UI would have written back —
 // the missing rung that lets `tools/roosttest/` cover OSC drains,
 // reply round-trips, and other byte-level wiring end-to-end. See
-// `docs/development/test-automation.md` §5.4 for the full rationale.
+// `docs/development/test-automation.md` ("Test-mode IPC ops") for the
+// full rationale.
 //
 // `tab.dump_resolved` is NOT gated: it's a richer read of the same
 // render state `tab.dump` already exposes, useful to anyone debugging

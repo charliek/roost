@@ -55,9 +55,7 @@ nav = [
   ] },
   { "Development" = [
     { "Architecture & principles" = "development/vision.md" },
-    { "Iced migration roadmap" = "development/iced-migration-roadmap.md" },
-    { "Iced POC plan (archived)" = "development/iced-poc-plan.md" },
-    { "Iced POC development" = "development/iced-poc.md" },
+    { "Iced migration" = "development/iced-migration.md" },
     { "Shared Rust engine" = "development/shared-rust-engine.md" },
     { "Test automation" = "development/test-automation.md" },
     { "Setup" = "development/setup.md" },

@@ -19,8 +19,8 @@
 //! synthesis) has no C-API counterpart and would survive regardless.
 //!
 //! Re-evaluate only if libghostty-vt grows `GHOSTTY_OSC_DATA_*`
-//! accessors beyond window title — tracked as a watch item in
-//! `docs/development/iced-migration-roadmap.md`.
+//! accessors beyond window title — which would ride in with a Ghostty
+//! pin bump (`docs/development/iced-migration.md`).
 //!
 //! Architecture:
 //!
