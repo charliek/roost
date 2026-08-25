@@ -1161,6 +1161,27 @@ delegate installs at `window_opened` and its activation futures are
 process-local oneshots keyed by identifier, so a banner clicked after
 quit/relaunch is not routed back to a tab, unlike Swift's userInfo-based
 routing.
+
+**Testing 6e needs a Developer-ID bundle — an ad-hoc one cannot work**
+(learned the hard way, 2026-08-24). macOS refuses notification
+authorization outright to an ad-hoc-signed app: `requestAuthorization`
+answers `granted=false` with "Notifications are not allowed for this
+application", and no prompt is ever shown. That is the CDHash caveat
+above in its sharpest form. Two traps follow:
+
+* `make e2e-iced-sparkle` re-bundles `mac/build/Roost-Iced.app`
+  ad-hoc-signed with the TEST-ONLY key, **clobbering** any Developer-ID
+  build sitting there. After running it, `mac/build/Roost-Iced.app` can
+  never show a banner. Test from a Developer-ID build — in practice,
+  install the notarized DMG's app to `/Applications` and drive that.
+* Notification permission is **not** TCC data, so `tccutil reset
+  Notifications <bundle-id>` does not exist and always fails; the
+  record lives in `usernoted`'s SIP-protected store. A denial recorded
+  against `ai.stridelabs.Roost.iced` by earlier ad-hoc builds survives
+  the upgrade to a signed build, and the only practical reset is
+  **System Settings → Notifications → Roost-Iced → Allow
+  notifications**. The grant is read once at startup, so the app must
+  be relaunched afterward before banners appear.
 * **6f. Window vibrancy.** Moved here from 3h by plan 026 (2026-08-15,
   Charlie's call, Q9): the frosted/translucent spike is an M6 mac-parity
   exploration item, not something the Linux release needs, so it no
