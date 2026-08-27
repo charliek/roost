@@ -201,6 +201,7 @@ to drive the shell into emitting the sequence. They require
 ```python
 def test_osc11_set_then_query_replies_with_new_bg(roost, project):
     tab = roost.open_tab(project, cwd="/tmp")
+    wait_tab_quiet(roost, tab)  # a late shell byte would join the capture
     # SET then QUERY. libghostty answers the query from
     # `override orelse default`, in wire order — so a SET is visible to
     # any QUERY behind it, in a later chunk OR the same one.

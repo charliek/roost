@@ -40,7 +40,7 @@ import time
 import pytest
 
 from client import scaled_timeout
-from util import drain, drain_until_match, wait_tab_attached, wait_tab_quiet
+from util import drain, drain_until_match, wait_tab_quiet
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
@@ -162,7 +162,7 @@ class TestOscPipeline:
         `override orelse default`, and the set moved the override. SET
         in one feed, QUERY in a second."""
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]11;rgb:00/11/22\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
         # The 16-bit-per-channel form spells `0000/1111/2222`.
@@ -175,7 +175,7 @@ class TestOscPipeline:
 
     def test_osc10_set_then_query_replies_with_new_fg(self, roost, project):
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]10;rgb:aa/bb/cc\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]10;?\x07")
         captured = _drain_settled(roost, tab, rb"aaaa/bbbb/cccc")
@@ -185,7 +185,7 @@ class TestOscPipeline:
 
     def test_osc12_set_then_query_replies_with_new_cursor(self, roost, project):
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]12;rgb:de/ad/be\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]12;?\x07")
         captured = _drain_settled(roost, tab, rb"dede/adad/bebe")
@@ -204,7 +204,7 @@ class TestOscPipeline:
         is theme-dependent) — only that exactly one well-formed OSC 4
         reply for index 0 comes back, which is what unblocks opencode."""
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]4;0;?\x07")
         captured = _drain_settled(
             roost, tab, rb"\x1b\]4;0;rgb:[0-9a-f]{4}/[0-9a-f]{4}/[0-9a-f]{4}"
@@ -216,7 +216,7 @@ class TestOscPipeline:
         be reflected in the next `OSC 4;5;?` reply. SET in one feed,
         QUERY in a second."""
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]4;5;rgb:de/ad/be\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]4;5;?\x07")
         captured = _drain_settled(roost, tab, rb"\x1b\]4;5;rgb:dede/adad/bebe")
@@ -237,7 +237,7 @@ class TestOscPipeline:
         value, once.
         """
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(
             tab,
             b"\x1b]11;rgb:00/11/22\x07\x1b]11;?\x07",
@@ -257,7 +257,7 @@ class TestOscPipeline:
         anything slower leaks the answer into the shell prompt.
         """
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
         captured = drain_until_match(
             roost, tab, rb"\x1b\]11;rgb:[0-9a-f]{4}/[0-9a-f]{4}/[0-9a-f]{4}"
@@ -323,7 +323,7 @@ class TestOscPipeline:
         happens to hold focus."""
         tab = roost.open_tab(project, cwd="/tmp")
         roost.open_tab(project, cwd="/tmp")  # steals active
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]9;build complete\x07")
         deadline = time.monotonic() + scaled_timeout(5.0)
         while time.monotonic() < deadline:
