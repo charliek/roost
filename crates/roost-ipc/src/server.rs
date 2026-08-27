@@ -81,6 +81,10 @@ pub struct IpcServer<H: Handler> {
     listener: UnixListener,
     handler: Arc<H>,
     socket_path: PathBuf,
+    /// When set, the accept loop drops any connection whose peer
+    /// effective UID differs. Unset by default — the UI sockets keep
+    /// the behavior they have always had.
+    required_uid: Option<u32>,
 }
 
 impl<H: Handler> IpcServer<H> {
@@ -150,7 +154,31 @@ impl<H: Handler> IpcServer<H> {
             listener,
             handler: Arc::new(handler),
             socket_path,
+            required_uid: None,
         })
+    }
+
+    /// Serve only peers whose effective UID is `expected_uid`; drop
+    /// every other connection at accept.
+    ///
+    /// The uid is injected rather than read here so the reject branch is
+    /// reachable from a test over a real socket (`require_uid(euid + 1)`).
+    /// Production callers want [`Self::require_same_uid`].
+    ///
+    /// Socket mode bits alone stop nothing once the socket is forwarded
+    /// (sshd opens a remote-forwarded socket as the forwarding user), so
+    /// a session serving over SSH needs the kernel's answer to "who is
+    /// on the other end", not the filesystem's.
+    #[must_use]
+    pub fn require_uid(mut self, expected_uid: u32) -> Self {
+        self.required_uid = Some(expected_uid);
+        self
+    }
+
+    /// Serve only peers running as this process's own user.
+    #[must_use]
+    pub fn require_same_uid(self) -> Self {
+        self.require_uid(crate::peer::current_euid())
     }
 
     /// Run the accept loop until the listener returns an error.
@@ -160,6 +188,14 @@ impl<H: Handler> IpcServer<H> {
     pub async fn run(self) -> anyhow::Result<()> {
         loop {
             let (conn, _) = self.listener.accept().await?;
+            // `None` means enforcement is off, so the connection is
+            // served. Dropping `conn` here closes it; the peer sees EOF.
+            if self
+                .required_uid
+                .is_some_and(|expected_uid| !peer_is_allowed(&conn, expected_uid))
+            {
+                continue;
+            }
             let handler = self.handler.clone();
             tokio::spawn(async move {
                 if let Err(e) = serve_connection(conn, handler).await {
@@ -171,6 +207,31 @@ impl<H: Handler> IpcServer<H> {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+}
+
+/// The accept loop is the boundary that handles a peer-check failure,
+/// so it is where the failure is logged. Fail-closed: a lookup that
+/// errors is a reject, because a connection we cannot attribute is
+/// exactly the one not to trust.
+fn peer_is_allowed(conn: &UnixStream, expected_uid: u32) -> bool {
+    match crate::peer::peer_uid(conn) {
+        Ok(uid) if uid == expected_uid => true,
+        Ok(uid) => {
+            warn!(
+                peer_uid = uid,
+                expected_uid, "dropping ipc connection from a foreign uid"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                expected_uid,
+                "dropping ipc connection: peer credential lookup failed"
+            );
+            false
+        }
     }
 }
 

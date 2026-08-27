@@ -434,17 +434,17 @@ fn valid_dir(raw: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     (!p.as_os_str().is_empty() && p.is_absolute()).then_some(p)
 }
 
-#[cfg(not(target_os = "macos"))]
-#[cfg(unix)]
-extern "C" {
-    fn getuid() -> u32;
-}
-
+/// The **real** uid, deliberately not the effective one
+/// ([`crate::current_euid`]): this names the `/tmp/<ns>-<uid>` fallback
+/// namespace, whose bytes are pinned by the golden tests below.
 #[cfg(not(target_os = "macos"))]
 fn libc_getuid() -> u32 {
     #[cfg(unix)]
-    unsafe {
-        getuid()
+    {
+        // SAFETY: `getuid` reads process-global state, takes no
+        // arguments and cannot fail; there is no unsafe precondition to
+        // uphold.
+        unsafe { libc::getuid() }
     }
     #[cfg(not(unix))]
     {
