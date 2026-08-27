@@ -76,13 +76,22 @@ final class RenderState {
     /// Must be called on the same thread as the terminal (main).
     func update(terminal: GhosttyTerminal) {
         guard let rs else { return }
-        let rc = ghostty_render_state_update(rs, terminal)
-        if rc.rawValue != 0 {
-            // Update failures are unexpected at this stage of the
-            // refactor — bail loudly so we notice in dev. Promotes to
-            // a real error path once the renderer has a recovery
-            // story (probably "skip this frame").
-            fatalError("ghostty_render_state_update failed (rc.rawValue=\(rc.rawValue))")
+        // Two-phase form of the fused `ghostty_render_state_update`:
+        // only `begin` touches the terminal, `end` works purely on
+        // render-state memory. The render state is incomplete until
+        // `end` runs, so `end` is skipped when `begin` fails.
+        //
+        // Update failures are unexpected at this stage of the
+        // refactor — bail loudly so we notice in dev. Promotes to a
+        // real error path once the renderer has a recovery story
+        // (probably "skip this frame").
+        let beginRc = ghostty_render_state_begin_update(rs, terminal)
+        if beginRc.rawValue != 0 {
+            fatalError("ghostty_render_state_begin_update failed (rc.rawValue=\(beginRc.rawValue))")
+        }
+        let endRc = ghostty_render_state_end_update(rs)
+        if endRc.rawValue != 0 {
+            fatalError("ghostty_render_state_end_update failed (rc.rawValue=\(endRc.rawValue))")
         }
     }
 

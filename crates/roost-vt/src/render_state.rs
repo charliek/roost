@@ -258,8 +258,16 @@ impl RenderState {
     /// Call once per frame; subsequent `walk` / `cursor` / `colors`
     /// reads see the snapshot, not the live terminal.
     pub fn update(&mut self, terminal: &Terminal) -> Result<()> {
+        // Two-phase form of the fused `ghostty_render_state_update`:
+        // only `begin` touches the terminal, `end` works purely on
+        // render-state memory. The render state is incomplete until
+        // `end` runs, so `end` is skipped when `begin` fails.
         // SAFETY: both handles non-null per constructors.
-        let rc = unsafe { sys::ghostty_render_state_update(self.handle, terminal.handle()) };
+        let rc = unsafe { sys::ghostty_render_state_begin_update(self.handle, terminal.handle()) };
+        Error::from_result(rc)?;
+        // SAFETY: handle non-null per constructor; the end phase reads
+        // and writes only render-state memory.
+        let rc = unsafe { sys::ghostty_render_state_end_update(self.handle) };
         Error::from_result(rc)
     }
 
