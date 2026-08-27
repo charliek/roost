@@ -280,7 +280,7 @@ edit did what you meant; and the `pymdownx.emoji` callables live in the
   `third_party/ghostty/build.sh`. Run it once before the first
   `cargo build` or `swift build`; it caches.
 - Toolchain via `mise`: rust pinned in `rust-toolchain.toml`, zig
-  `0.15.x`. Run `mise install` after cloning.
+  `0.16.x`. Run `mise install` after cloning.
 - Linux dev: the iced UI itself needs no GTK packages; `apt install
   libgtk-4-dev libadwaita-1-dev` (Ubuntu) is only needed to build
   `tools/input/linux/iced_native_file_drop_check.py`'s throwaway GTK

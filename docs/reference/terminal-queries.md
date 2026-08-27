@@ -181,9 +181,9 @@ macOS),
 routed through the **same per-tab PTY-input sink as keystrokes** (`onKey`
 / `input_callback` → `send_input`) so it stays FIFO-ordered with input
 and is visible to `tab.capture_pty_input`. Gating: only when the tab's
-terminal reports mode 2031 set (`ghostty_terminal_mode_get`), and only on
-an actual theme switch — merely *enabling* the mode emits nothing (an app
-that wants the current state queries `?996`).
+terminal reports mode 2031 set (`ghostty_terminal_get(DATA_MODE)`), and
+only on an actual theme switch — merely *enabling* the mode emits nothing
+(an app that wants the current state queries `?996`).
 
 **Still deferred (#209):** the DSR `?996` *query* (`ESC[?996n`, "what
 scheme are you now?") stays unanswered — it needs the `color_scheme`

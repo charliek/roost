@@ -46,7 +46,7 @@ release — the iced UI built for macOS, installed side by side with
 ```bash
 git clone https://github.com/charliek/roost
 cd roost
-mise install                          # Rust (rust-toolchain.toml) + Zig 0.15.x
+mise install                          # Rust (rust-toolchain.toml) + Zig 0.16.x
 ./third_party/ghostty/build.sh        # clones Ghostty at the pinned SHA, builds libghostty-vt
 
 # Linux UI — iced, what the packaged .deb ships (needs: sudo apt install libclang-dev pkg-config):

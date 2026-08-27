@@ -20,7 +20,7 @@
 #
 # Prerequisites (Ubuntu/Debian):
 #   sudo apt-get install -y libclang-dev pkg-config
-#   mise install            # rust (rust-toolchain.toml) + zig 0.15.x
+#   mise install            # rust (rust-toolchain.toml) + zig 0.16.x
 #   nfpm on PATH            # https://nfpm.goreleaser.com
 #
 # Usage:
