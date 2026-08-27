@@ -151,6 +151,106 @@ func scrollbackCopyKeepsInteriorBlankRows() {
     #expect(copied(view) == "alpha\n\nbravo")
 }
 
+// MARK: - Scrollback eviction (issue #334)
+
+// Endpoints are tracked grid refs, so eviction has exactly two outcomes
+// and no third: while the selected row survives the selection follows
+// it, and once the row itself is pruned the selection resolves to
+// nothing. It never lands on whatever content inherited the old
+// coordinate — which is what stored screen-y endpoints used to do.
+//
+// The setup numbers are load-bearing. libghostty prunes at *page*
+// granularity, so a scrollback limit smaller than one page evicts
+// nothing until a whole page has filled and then drops the lot; to get
+// a moment where older rows are gone and the selected row is not, the
+// limit has to span several pages. Rows per page scale inversely with
+// the column count (a page's byte budget comes from ghostty's standard
+// capacity; the OS page size only rounds the allocation), so these
+// tests run wide — 80 columns is ~594 rows/page on every target, and
+// `TerminalView.defaultScrollback` (2000) therefore covers 3-4 pages.
+// Rust twins in `crates/roost-vt/tests/selection_test.rs` use the same
+// numbers.
+
+/// Columns for the eviction tests. Wide on purpose (see above).
+private let evictCols = 80
+/// Filler written before the marker, so the marker is not in the very
+/// first page — the page that gets pruned first.
+private let evictPre = 1000
+/// Rows written after the marker for the "older rows pruned" case.
+private let evictSurvives = 1300
+/// Rows written after the marker for the "selected row pruned" case.
+private let evictPruned = 3000
+
+@MainActor
+private func makeEvictionView() -> TerminalView {
+    TerminalView(
+        cols: UInt16(evictCols),
+        rows: UInt16(selectionCopyRows),
+        theme: selectionCopyTheme()
+    )
+}
+
+/// Fill history, then put `MARKER` on the bottom row and select it.
+@MainActor
+private func anchorMarker(_ view: TerminalView) {
+    for i in 0..<evictPre { write(view, "filler\(i)\r\n") }
+    write(view, "MARKER")
+    #expect(view.setSelection(
+        anchorCol: 0, anchorRow: selectionCopyRows - 1,
+        cursorCol: evictCols - 1, cursorRow: selectionCopyRows - 1
+    ))
+}
+
+/// Assert history really was pruned, so a green test cannot mean "the
+/// scenario never happened": libghostty is holding fewer rows than were
+/// written.
+@MainActor
+private func expectHistoryPruned(_ view: TerminalView, written: Int) {
+    let total = view.totalScrollableRowsForTest()
+    #expect(
+        total < UInt64(written),
+        "no history was pruned (\(total) rows held, \(written) written); the eviction scenario did not run"
+    )
+}
+
+/// Scenario 1: rows *older* than the selection are pruned. The tracked
+/// endpoints move with their content, so the copy is unchanged.
+@Test @MainActor
+func selectionFollowsItsContentWhenOlderHistoryIsPruned() {
+    let view = makeEvictionView()
+    anchorMarker(view)
+    #expect(copied(view) == "MARKER")
+
+    write(view, "\r\n")
+    writeLines(view, evictSurvives)
+    expectHistoryPruned(view, written: evictPre + 1 + evictSurvives)
+
+    #expect(
+        copied(view) == "MARKER",
+        "selection drifted off its content instead of following it"
+    )
+}
+
+/// Scenario 2: the selected row itself is pruned. Tracked refs cannot
+/// follow discarded content, so the selection reports nothing — never
+/// some other row's text.
+@Test @MainActor
+func selectionReportsNothingOnceItsOwnRowIsPruned() {
+    let view = makeEvictionView()
+    anchorMarker(view)
+
+    write(view, "\r\n")
+    writeLines(view, evictPruned)
+    expectHistoryPruned(view, written: evictPre + 1 + evictPruned)
+
+    #expect(copied(view) == nil, "a pruned selection resolved to text")
+    let dump = view.dumpSelection()
+    #expect(dump != nil, "the selection is still held, it just resolves to nothing")
+    #expect(dump?.text == nil)
+    #expect(dump?.anchorVisible == false)
+    #expect(dump?.cursorVisible == false)
+}
+
 // MARK: - Viewport path vs formatter path
 
 /// Copy the same selection twice — once while it is fully visible (the

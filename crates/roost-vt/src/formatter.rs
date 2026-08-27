@@ -17,12 +17,16 @@
 //! [`selection_text`] therefore pins, formats, and frees inside a single
 //! synchronous call holding `&Terminal`. No `GridRef` and no formatter
 //! handle escapes it, which makes the hazardous interleaving
-//! unrepresentable instead of merely documented.
+//! unrepresentable instead of merely documented. Selection endpoints
+//! live outside as [`crate::TrackedRef`]s, which libghostty keeps
+//! current; snapshotting them into raw pins happens *here*, immediately
+//! before the `GhosttySelection` is built, and the pins die with the
+//! call.
 
 use std::ptr;
 
 use crate::sys;
-use crate::{Error, Point, Result, Terminal};
+use crate::{Error, Result, Terminal, TrackedRef};
 
 /// Join soft-wrapped rows into one line when copying.
 ///
@@ -73,15 +77,22 @@ impl Drop for FormatterBuf {
 /// half-open range. Drag order does not matter: libghostty normalizes
 /// reversed endpoints itself via `Selection.order`.
 ///
-/// Returns `None` when an endpoint no longer names a cell on the active
-/// screen — an alt-screen switch, or a row evicted from scrollback. That
-/// is an empty selection, not a failure.
+/// Returns `None` when an endpoint no longer names a cell — a row
+/// evicted from scrollback, or a terminal reset. That is an empty
+/// selection, not a failure.
+///
+/// Both endpoints must belong to the terminal's currently active screen;
+/// the caller gates on that and [`TrackedRef::snapshot`] debug-asserts
+/// it, because libghostty's formatter treats it as a precondition.
 pub(crate) fn selection_text(
     terminal: &Terminal,
-    start: Point,
-    end: Point,
+    start: &TrackedRef,
+    end: &TrackedRef,
 ) -> Result<Option<String>> {
-    let (Some(start_ref), Some(end_ref)) = (terminal.grid_ref(start), terminal.grid_ref(end))
+    // Snapshot here, not in the caller: the pins are only valid until
+    // the terminal's next update, and nothing between this line and
+    // `ghostty_formatter_free` touches the terminal.
+    let (Some(start_ref), Some(end_ref)) = (start.snapshot(terminal)?, end.snapshot(terminal)?)
     else {
         return Ok(None);
     };

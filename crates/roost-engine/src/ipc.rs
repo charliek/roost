@@ -136,8 +136,8 @@ type DumpResolvedReply = tokio::sync::oneshot::Sender<Result<ResolvedCellsData, 
 
 /// Reply for [`UiRequest::TabExpandSelectionAt`]: the (col0, col1, text)
 /// triple matching the committed selection. `Err` for unknown tab,
-/// missing test-mode env var, or an out-of-range coord that the
-/// renderer can't anchor a screen-y for.
+/// missing test-mode env var, or an out-of-range coord the renderer
+/// can't pin.
 pub struct ExpandSelectionData {
     pub col0: u16,
     pub col1: u16,
@@ -210,8 +210,8 @@ pub enum UiRequest {
         reply: PalettePresentReply,
     },
     /// `selection.set` — anchor a selection on a tab's terminal.
-    /// Both points are viewport `(col, row)`; the UI converts to
-    /// scrollback-stable screen-y space.
+    /// Both points are viewport `(col, row)`; the UI pins each endpoint
+    /// with a tracked grid ref.
     SelectionSet {
         tab_id: i64,
         anchor: (u16, u16),

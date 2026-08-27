@@ -4241,7 +4241,10 @@ mod tests {
             tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
         }
         tab.refresh_snapshot().expect("baseline snapshot");
-        assert!(tab.selection.set(&tab.terminal, (0, 0), (6, 0)));
+        assert!(tab
+            .selection
+            .set(&tab.terminal, (0, 0), (6, 0))
+            .expect("set selection"));
         let selected = tab.selected_text().expect("selection text");
         assert_eq!(selected.as_deref(), Some("history"));
 
@@ -4546,7 +4549,10 @@ mod tests {
     async fn regex_and_osc8_links_override_tracking_and_preserve_selection() {
         let (mut tab, supervisor) = attached_test_terminal(96);
         tab.write_vt(b"\x1b[2J\x1b[Hkeep https://visible.test");
-        assert!(tab.selection.set(&tab.terminal, (0, 0), (3, 0)));
+        assert!(tab
+            .selection
+            .set(&tab.terminal, (0, 0), (3, 0))
+            .expect("set selection"));
         tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
         let opened = native_pointer(
             &mut tab,

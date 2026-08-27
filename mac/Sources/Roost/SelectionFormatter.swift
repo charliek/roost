@@ -19,7 +19,10 @@
 // `SelectionFormatter.text` therefore pins, formats, and frees inside a
 // single synchronous call. No grid ref and no formatter handle escapes
 // it, which makes the hazardous interleaving unrepresentable instead of
-// merely documented.
+// merely documented. Selection endpoints live outside as libghostty
+// *tracked* refs, which the engine keeps current; snapshotting them into
+// raw pins happens here, immediately before the `GhosttySelection` is
+// built, and the pins die with the call.
 
 import CGhosttyVT
 import Foundation
@@ -49,20 +52,20 @@ enum SelectionFormatter {
     /// not a half-open range. Drag order does not matter: libghostty
     /// normalizes reversed endpoints itself via `Selection.order`.
     ///
-    /// Returns `nil` when an endpoint no longer names a cell on the
-    /// active screen — an alt-screen switch, or a row evicted from
-    /// scrollback. That is an empty selection, not a failure.
+    /// Returns `nil` when an endpoint no longer names a cell — a row
+    /// evicted from scrollback, or a terminal reset. That is an empty
+    /// selection, not a failure.
+    ///
+    /// Both endpoints must belong to the terminal's currently active
+    /// screen; the caller gates on that, because libghostty's formatter
+    /// treats it as a precondition.
     @MainActor
     static func text(
         terminal: GhosttyTerminal,
-        startCol: Int,
-        startScreenY: UInt32,
-        endCol: Int,
-        endScreenY: UInt32
+        start: GhosttyTrackedGridRef,
+        end: GhosttyTrackedGridRef
     ) -> String? {
-        guard let startRef = gridRef(terminal, col: startCol, screenY: startScreenY),
-              let endRef = gridRef(terminal, col: endCol, screenY: endScreenY)
-        else { return nil }
+        guard let startRef = snapshot(start), let endRef = snapshot(end) else { return nil }
 
         var selection = GhosttySelection()
         selection.size = MemoryLayout<GhosttySelection>.size
@@ -141,21 +144,17 @@ enum SelectionFormatter {
         return String(out)
     }
 
-    /// Pin a `PointTag::Screen` cell. `nil` when the coordinate no
-    /// longer names a live cell.
+    /// Snapshot a tracked ref into an untracked pin. `nil` when the
+    /// tracked content was discarded (`GHOSTTY_NO_VALUE`).
+    ///
+    /// Private, and called only from `text` above: the pin is valid
+    /// only until the terminal's next update, so it must not outlive
+    /// the one synchronous call that formats with it.
     @MainActor
-    private static func gridRef(
-        _ terminal: GhosttyTerminal,
-        col: Int,
-        screenY: UInt32
-    ) -> GhosttyGridRef? {
-        var point = GhosttyPoint()
-        point.tag = GHOSTTY_POINT_TAG_SCREEN
-        point.value.coordinate.x = UInt16(clamping: max(col, 0))
-        point.value.coordinate.y = screenY
+    private static func snapshot(_ tracked: GhosttyTrackedGridRef) -> GhosttyGridRef? {
         var ref = GhosttyGridRef()
         ref.size = MemoryLayout<GhosttyGridRef>.size
-        guard ghostty_terminal_grid_ref(terminal, point, &ref) == GHOSTTY_SUCCESS,
+        guard ghostty_tracked_grid_ref_snapshot(tracked, &ref) == GHOSTTY_SUCCESS,
               ref.node != nil
         else { return nil }
         return ref

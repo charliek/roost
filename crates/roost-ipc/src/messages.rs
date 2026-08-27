@@ -492,9 +492,10 @@ pub struct PalettePresentResult {
 // per CLAUDE.md's "one core, two implementations" principle.
 
 /// (col, row) in **viewport** coordinates — what the user would see if they
-/// could click the cell. Server-side the UI converts to libghostty's
-/// `PointTag::Screen` so the selection survives subsequent scrolling
-/// (mirrors mouseDown / drag_begin).
+/// could click the cell. Server-side the UI pins each endpoint with a
+/// libghostty tracked grid ref, so the selection follows its content
+/// through scrolling, eviction and reflow (mirrors mouseDown /
+/// drag_begin).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectionPoint {
     pub col: u16,

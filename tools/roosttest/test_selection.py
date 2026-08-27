@@ -138,6 +138,61 @@ def test_selection_survives_scroll(roost, project):
     )
 
 
+def _flood_scrollback(roost, tab, count: int) -> None:
+    """Print `count` lines and wait for the last one.
+
+    Sized by the caller because the point is to cross the UI's
+    2000-line scrollback limit — see the eviction test below.
+    """
+    pad = uuid.uuid4().hex[:6]
+    roost.run(
+        tab,
+        f"for i in $(seq 1 {count}); do printf '{pad}-flood%05d\\n' $i; done",
+        ready_timeout=20,
+    )
+    roost.wait_text(tab, f"{pad}-flood{count:05d}", timeout=60)
+
+
+def test_selection_follows_then_vanishes_when_evicted(roost, project):
+    """Regression for #334, on both UIs.
+
+    Endpoints are libghostty tracked grid refs, so a selection follows
+    its content while the content exists and reports *nothing* once the
+    row is evicted from scrollback. The failure this guards against is
+    the third outcome the old screen-coordinate endpoints produced:
+    silently copying whichever row moved into the stored coordinate.
+
+    Row counts are sized off the 2000-line scrollback limit both UIs
+    ship. libghostty prunes at page granularity — how many rows a page
+    holds depends on the window's column count and the host's memory
+    page size — so the first flood stays comfortably under the limit
+    (nothing is pruned at all) and the second overshoots it by a wide
+    margin (the marker sits in the very first page, which goes first).
+    """
+    tab = roost.open_tab(project, cwd="/tmp")
+    marker = _seed_lines(roost, tab, n=5)
+    target = f"{marker}-row03"
+    row, col0, col1 = _row_span(roost.dump(tab), target)
+    roost.selection_set(tab, anchor=(col0, row), cursor=(col1, row))
+    assert roost.selection_dump(tab).get("text") == target
+
+    # Well under the limit: the row is deep in scrollback but still held,
+    # so the selection still names it.
+    _flood_scrollback(roost, tab, 1000)
+    assert roost.selection_dump(tab).get("text") == target, (
+        "selection stopped following its row while the row still existed"
+    )
+
+    # Past the limit by a wide margin: the row itself is gone.
+    _flood_scrollback(roost, tab, 6000)
+    sel = roost.selection_dump(tab)
+    assert sel.get("text") is None, (
+        f"evicted selection copied {sel.get('text')!r}; it must report nothing"
+    )
+    assert sel["anchor_visible"] is False
+    assert sel["cursor_visible"] is False
+
+
 def test_selection_spanning_scrollback_copies_every_row(roost, project):
     """A multi-row selection copies every row, in order, whether the
     rows are on screen or in scrollback.

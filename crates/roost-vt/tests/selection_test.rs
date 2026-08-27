@@ -34,6 +34,19 @@ fn scroll_out(terminal: &mut Terminal, count: usize) {
     write_lines(terminal, count);
 }
 
+/// Commit a selection between two viewport cells, asserting it landed.
+/// `Err` from `set` is a libghostty failure, not a rejected coordinate.
+fn select(
+    selection: &mut TerminalSelection,
+    terminal: &Terminal,
+    anchor: (u16, u16),
+    cursor: (u16, u16),
+) {
+    assert!(selection
+        .set(terminal, anchor, cursor)
+        .expect("set selection"));
+}
+
 fn text(
     selection: &TerminalSelection,
     terminal: &Terminal,
@@ -49,7 +62,7 @@ fn committed_selection_extracts_exact_text() {
     let (mut terminal, mut render_state) = terminal();
     terminal.vt_write(b"hello world");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (4, 0)));
+    select(&mut selection, &terminal, (0, 0), (4, 0));
     assert_eq!(
         selection
             .selected_text(&terminal, &mut render_state, 20, 5)
@@ -63,7 +76,7 @@ fn clear_returns_to_empty_snapshot() {
     let (mut terminal, mut render_state) = terminal();
     terminal.vt_write(b"abc");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (2, 0)));
+    select(&mut selection, &terminal, (0, 0), (2, 0));
     assert!(selection.clear());
     assert_eq!(
         selection
@@ -78,8 +91,10 @@ fn out_of_range_begin_clears_stale_selection() {
     let (mut terminal, _) = terminal();
     terminal.vt_write(b"abc");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (2, 0)));
-    assert!(!selection.begin(&terminal, 0, u16::MAX));
+    select(&mut selection, &terminal, (0, 0), (2, 0));
+    assert!(!selection
+        .begin(&terminal, 0, u16::MAX)
+        .expect("begin selection"));
     assert!(!selection.is_active());
 }
 
@@ -88,7 +103,7 @@ fn multi_row_selection_yields_shared_spans_and_text() {
     let (mut terminal, mut render_state) = terminal();
     terminal.vt_write(b"abc\r\ndef\r\nghi");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (1, 0), (1, 2)));
+    select(&mut selection, &terminal, (1, 0), (1, 2));
     assert_eq!(
         selection.visible_spans(&terminal, 20, 5),
         vec![
@@ -121,9 +136,9 @@ fn multi_row_selection_yields_shared_spans_and_text() {
 fn drag_is_hidden_until_it_moves_and_invalid_update_clears_it() {
     let (terminal, _) = terminal();
     let mut selection = TerminalSelection::new();
-    assert!(selection.begin(&terminal, 2, 1));
+    assert!(selection.begin(&terminal, 2, 1).expect("begin selection"));
     assert!(selection.visible_spans(&terminal, 20, 5).is_empty());
-    assert!(selection.update(&terminal, 4, 1));
+    assert!(selection.update(&terminal, 4, 1).expect("update selection"));
     assert_eq!(
         selection.visible_spans(&terminal, 20, 5),
         vec![roost_vt::SelectionSpan {
@@ -132,7 +147,9 @@ fn drag_is_hidden_until_it_moves_and_invalid_update_clears_it() {
             col1: 5,
         }]
     );
-    assert!(!selection.update(&terminal, 4, u16::MAX));
+    assert!(!selection
+        .update(&terminal, 4, u16::MAX)
+        .expect("update selection"));
     assert!(!selection.is_active());
 }
 
@@ -150,7 +167,7 @@ fn selection_scrolled_entirely_above_the_viewport_is_not_clipped() {
     let (mut terminal, mut render_state) = terminal();
     terminal.vt_write(b"alpha\r\nbravo\r\ncharlie");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (6, 2)));
+    select(&mut selection, &terminal, (0, 0), (6, 2));
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
         Some("alpha\nbravo\ncharlie".into())
@@ -168,7 +185,7 @@ fn selection_straddling_the_top_edge_keeps_its_scrolled_off_rows() {
     let (mut terminal, mut render_state) = terminal();
     terminal.vt_write(b"alpha\r\nbravo\r\ncharlie\r\ndelta");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (4, 3)));
+    select(&mut selection, &terminal, (0, 0), (4, 3));
 
     // Two rows scroll off; the rest stay visible.
     scroll_out(&mut terminal, 2);
@@ -185,9 +202,11 @@ fn selection_dragged_across_the_whole_history_copies_every_row() {
 
     terminal.scroll_viewport(ScrollViewport::Top);
     let mut selection = TerminalSelection::new();
-    assert!(selection.begin(&terminal, 0, 0));
+    assert!(selection.begin(&terminal, 0, 0).expect("begin selection"));
     terminal.scroll_viewport(ScrollViewport::Bottom);
-    assert!(selection.update(&terminal, 0, ROWS - 1));
+    assert!(selection
+        .update(&terminal, 0, ROWS - 1)
+        .expect("update selection"));
 
     let copied = text(&selection, &terminal, &mut render_state).expect("text");
     let lines: Vec<&str> = copied.split('\n').collect();
@@ -202,7 +221,7 @@ fn reversed_drag_into_scrollback_copies_in_document_order() {
     terminal.vt_write(b"alpha\r\nbravo\r\ncharlie");
     let mut selection = TerminalSelection::new();
     // Anchor below, cursor above: libghostty orders the endpoints itself.
-    assert!(selection.set(&terminal, (6, 2), (0, 0)));
+    select(&mut selection, &terminal, (6, 2), (0, 0));
     scroll_out(&mut terminal, 30);
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
@@ -215,7 +234,7 @@ fn scrollback_copy_preserves_wide_and_combining_glyphs() {
     let (mut terminal, mut render_state) = terminal();
     terminal.vt_write("\u{4f60}\u{597d}\r\na\u{301}bc".as_bytes());
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (COLS - 1, 1)));
+    select(&mut selection, &terminal, (0, 0), (COLS - 1, 1));
     scroll_out(&mut terminal, 30);
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
@@ -228,7 +247,7 @@ fn scrollback_copy_keeps_interior_blank_rows() {
     let (mut terminal, mut render_state) = terminal();
     terminal.vt_write(b"alpha\r\n\r\nbravo");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (COLS - 1, 2)));
+    select(&mut selection, &terminal, (0, 0), (COLS - 1, 2));
     scroll_out(&mut terminal, 30);
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
@@ -236,44 +255,142 @@ fn scrollback_copy_keeps_interior_blank_rows() {
     );
 }
 
-/// Honest limit: screen coordinates are relative to the top of the page
-/// list, so an evicted row shifts every stored endpoint by one. libghostty
-/// has tracked pins that would follow the content, but
-/// `ghostty_terminal_grid_ref` hands back untracked ones. The bumped pin
-/// does export the tracking API (`ghostty_terminal_grid_ref_track`);
-/// adopting it is #334, and this assertion pins today's drift until then.
-///
-/// The row count is load-bearing: libghostty prunes at *page*
-/// granularity, so a `max_scrollback` of 0 evicts nothing at all until a
-/// whole page of history has filled — at 20 columns that is a few
-/// thousand rows, not the dozens an intuitive setup would write.
-#[test]
-fn evicted_history_drifts_rather_than_failing() {
-    let (mut terminal, mut render_state) = sized_terminal(0);
-    terminal.vt_write(b"MARKER\r\n");
+// ============================================================================
+// Scrollback eviction (issue #334)
+// ============================================================================
+//
+// Endpoints are tracked refs, so eviction has exactly two outcomes and
+// no third: while the selected row survives the selection follows it,
+// and once the row itself is pruned the selection resolves to nothing.
+// It never lands on whatever content inherited the old coordinate —
+// which is what stored screen-y endpoints used to do.
+//
+// The setup numbers are load-bearing. libghostty prunes at *page*
+// granularity, so a scrollback limit smaller than one page evicts
+// nothing until a whole page has filled and then drops the lot; to get
+// a moment where older rows are gone and the selected row is not, the
+// limit has to span several pages. Rows per page scale inversely with
+// the column count (a page's byte budget comes from ghostty's standard
+// capacity; the OS page size only rounds the allocation), so these
+// tests run wide — 80 columns is ~594 rows/page on every target, and
+// the 2000-line limit both UIs ship therefore covers 3-4 pages.
+
+/// Columns for the eviction tests. Wide on purpose (see above).
+const EVICT_COLS: u16 = 80;
+/// The scrollback limit both UIs ship (`terminal.rs`'s doc, and
+/// `TerminalView.defaultScrollback` on the Mac side).
+const EVICT_SCROLLBACK: usize = 2000;
+/// Filler written before the marker, so the marker is not in the very
+/// first page — the page that gets pruned first.
+const EVICT_PRE: usize = 1000;
+/// Rows written after the marker for the "older rows pruned" case.
+/// Above the limit (pruning has to have happened) and far enough below
+/// the marker's own depth that its page survives: measured, the marker
+/// is dropped at ~1595 on arm64-macos and ~2000 on Linux.
+const EVICT_SURVIVES: usize = 1300;
+/// Rows written after the marker for the "selected row pruned" case —
+/// past the point where the marker's page can survive on either target.
+const EVICT_PRUNED: usize = 3000;
+
+fn eviction_terminal() -> (Terminal, RenderState) {
+    (
+        Terminal::new(TerminalOptions {
+            cols: EVICT_COLS,
+            rows: ROWS,
+            max_scrollback: EVICT_SCROLLBACK,
+        })
+        .expect("terminal"),
+        RenderState::new().expect("render state"),
+    )
+}
+
+fn eviction_text(
+    selection: &TerminalSelection,
+    terminal: &Terminal,
+    render_state: &mut RenderState,
+) -> Option<String> {
+    selection
+        .selected_text(terminal, render_state, EVICT_COLS, ROWS)
+        .expect("selected text")
+}
+
+/// Fill history, then put `MARKER` on the bottom row and select it.
+fn anchor_marker(terminal: &mut Terminal) -> TerminalSelection {
+    for i in 0..EVICT_PRE {
+        terminal.vt_write(format!("filler{i}\r\n").as_bytes());
+    }
+    terminal.vt_write(b"MARKER");
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 0), (COLS - 1, 0)));
+    select(
+        &mut selection,
+        terminal,
+        (0, ROWS - 1),
+        (EVICT_COLS - 1, ROWS - 1),
+    );
+    selection
+}
+
+/// Assert history really was pruned, so a green test cannot mean "the
+/// scenario never happened": libghostty is holding fewer rows than were
+/// written.
+fn assert_history_pruned(terminal: &Terminal, written: usize) {
+    let total = terminal.scrollbar().expect("scrollbar").total;
+    assert!(
+        total < written as u64,
+        "no history was pruned ({total} rows held, {written} written); \
+         the eviction scenario did not run"
+    );
+}
+
+/// Scenario 1: rows *older* than the selection are pruned. The tracked
+/// endpoints move with their content, so the copy is unchanged.
+#[test]
+fn selection_follows_its_content_when_older_history_is_pruned() {
+    let (mut terminal, mut render_state) = eviction_terminal();
+    let selection = anchor_marker(&mut terminal);
     assert_eq!(
-        text(&selection, &terminal, &mut render_state),
+        eviction_text(&selection, &terminal, &mut render_state),
         Some("MARKER".into())
     );
 
-    write_lines(&mut terminal, 5000);
-    // Eviction prunes whole pages, and rows-per-page depends on the
-    // compile target's page size (16 KiB arm64-macos, 4 KiB Linux), so
-    // the exact row the selection drifts onto is not portable. Pin the
-    // drift property instead: the selection now names some other intact
-    // line, never the content it was anchored to.
-    let drifted = text(&selection, &terminal, &mut render_state)
-        .expect("drifted selection still resolves to a row");
-    assert_ne!(
-        drifted, "MARKER",
-        "selection followed content; expected drift"
+    terminal.vt_write(b"\r\n");
+    write_lines(&mut terminal, EVICT_SURVIVES);
+    assert_history_pruned(&terminal, EVICT_PRE + 1 + EVICT_SURVIVES);
+
+    assert_eq!(
+        eviction_text(&selection, &terminal, &mut render_state),
+        Some("MARKER".into()),
+        "selection drifted off its content instead of following it"
     );
-    assert!(
-        drifted.starts_with("line") && drifted[4..].parse::<u32>().is_ok(),
-        "drifted selection landed on garbage: {drifted:?}"
+}
+
+/// Scenario 2: the selected row itself is pruned. Tracked refs cannot
+/// follow discarded content, so the selection reports nothing — never
+/// some other row's text.
+#[test]
+fn selection_reports_nothing_once_its_own_row_is_pruned() {
+    let (mut terminal, mut render_state) = eviction_terminal();
+    let selection = anchor_marker(&mut terminal);
+
+    terminal.vt_write(b"\r\n");
+    write_lines(&mut terminal, EVICT_PRUNED);
+    assert_history_pruned(&terminal, EVICT_PRE + 1 + EVICT_PRUNED);
+
+    assert_eq!(
+        eviction_text(&selection, &terminal, &mut render_state),
+        None,
+        "a pruned selection resolved to text"
     );
+    assert!(selection
+        .visible_spans(&terminal, EVICT_COLS, ROWS)
+        .is_empty());
+    let snapshot = selection
+        .snapshot(&terminal, &mut render_state, EVICT_COLS, ROWS)
+        .expect("snapshot")
+        .expect("the selection is still held, it just resolves to nothing");
+    assert_eq!(snapshot.text, None);
+    assert!(!snapshot.anchor_visible);
+    assert!(!snapshot.cursor_visible);
 }
 
 // ============================================================================
@@ -290,7 +407,7 @@ fn assert_paths_agree(lines: [&str; 3]) {
     terminal.vt_write(lines.join("\r\n").as_bytes());
 
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (0, 2), (COLS - 1, ROWS - 1)));
+    select(&mut selection, &terminal, (0, 2), (COLS - 1, ROWS - 1));
     let visible = text(&selection, &terminal, &mut render_state);
 
     terminal.scroll_viewport(ScrollViewport::Top);
@@ -357,7 +474,7 @@ fn assert_wrapped_copy(
     let (mut terminal, mut render_state) = sized_terminal(4096);
     terminal.vt_write(input.as_bytes());
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, anchor, cursor));
+    select(&mut selection, &terminal, anchor, cursor);
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
         Some(expected.into()),
@@ -511,7 +628,7 @@ fn selection_starting_on_a_wide_placeholder_matches_the_formatter() {
     let (mut terminal, mut render_state) = sized_terminal(4096);
     terminal.vt_write("ab\u{754c}cd".as_bytes());
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (3, 0), (5, 0)));
+    select(&mut selection, &terminal, (3, 0), (5, 0));
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
         Some("\u{754c}cd".into())
@@ -527,7 +644,7 @@ fn selection_starting_on_a_wide_placeholder_matches_the_formatter() {
     // is left as a placeholder and the grapheme wraps.
     terminal.vt_write("1234567890123456789\u{754c}".as_bytes());
     let mut selection = TerminalSelection::new();
-    assert!(selection.set(&terminal, (COLS - 1, 0), (1, 1)));
+    select(&mut selection, &terminal, (COLS - 1, 0), (1, 1));
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
         Some("\u{754c}".into())
@@ -546,7 +663,7 @@ fn assert_copies_as(input: &str, expected: &str) {
     terminal.vt_write(input.as_bytes());
     let mut selection = TerminalSelection::new();
     let last_row = u16::try_from(input.matches("\r\n").count()).expect("row count");
-    assert!(selection.set(&terminal, (0, 0), (COLS - 1, last_row)));
+    select(&mut selection, &terminal, (0, 0), (COLS - 1, last_row));
     assert_eq!(
         text(&selection, &terminal, &mut render_state),
         Some(expected.into()),
