@@ -2211,7 +2211,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn file_drop_batch_reaches_terminal_session_capture_exactly_once() {
         let (mut tab, supervisor) = attached_test_terminal(9_043);
-        let capture = tab.input_capture.as_ref().unwrap();
+        let capture = tab.session.capture().unwrap();
         let batch = || PendingFileDrop {
             tab_id: 9_043,
             paths: vec![
@@ -3709,7 +3709,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_materialized_image_path_reaches_only_the_tab_that_pasted() {
         let (tab, supervisor) = attached_test_terminal(9_101);
-        let capture = tab.input_capture.clone().expect("test-mode input capture");
+        let capture = tab
+            .session
+            .capture()
+            .cloned()
+            .expect("test-mode input capture");
         let mut tabs = HashMap::from([(9_101_i64, tab)]);
 
         deliver_paste_image(
@@ -3830,7 +3834,7 @@ mod tests {
         assert_eq!(tab.tracking_pointer, None);
         assert_eq!(tab.local_pointer_gesture, None);
 
-        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        let captured = captured_input(&tab);
         assert!(captured.windows(3).any(|bytes| bytes == b"\x1b[<"));
         supervisor.close(91);
     }
@@ -3842,7 +3846,7 @@ mod tests {
         // IPC op bypasses.
         let (mut tab, supervisor) = attached_test_terminal(403);
         tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
 
         native_pointer(
             &mut tab,
@@ -3874,12 +3878,12 @@ mod tests {
             false,
         );
 
-        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        let captured = captured_input(&tab);
         assert_eq!(captured, b"\x1b[<0;3;3M\x1b[<0;3;3m".to_vec());
 
         // A real crossing still reports, and returning to the press cell
         // reports again — this is a cell gate, not a time throttle.
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         native_pointer(
             &mut tab,
             PointerAction::Press,
@@ -3902,7 +3906,7 @@ mod tests {
             false,
         );
 
-        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        let captured = captured_input(&tab);
         assert_eq!(
             captured,
             b"\x1b[<0;3;3M\x1b[<32;5;3M\x1b[<32;3;3M\x1b[<0;3;3m".to_vec()
@@ -3914,7 +3918,7 @@ mod tests {
     async fn geometry_transaction_defers_in_band_reports_until_commit() {
         let (mut tab, supervisor) = attached_test_terminal(92);
         tab.write_vt(b"\x1b[?2048h");
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
 
         let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
         let change = tab
@@ -3922,26 +3926,16 @@ mod tests {
             .expect("stage candidate geometry")
             .expect("candidate changes geometry");
         assert!(
-            tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            captured_input(&tab).is_empty(),
             "libghostty size reports must remain internal until batch commit"
         );
         tab.commit_geometry(change);
         assert!(
-            !tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            !captured_input(&tab).is_empty(),
             "successful commit delivers the staged in-band report"
         );
 
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         let smaller = TerminalMetrics::measure(13.0).expect("smaller metrics");
         let change = tab
             .apply_geometry(100, 32, smaller, 3)
@@ -3950,12 +3944,7 @@ mod tests {
         tab.rollback_geometry(change.previous.expect("installed prior geometry"))
             .expect("rollback candidate geometry");
         assert!(
-            tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            captured_input(&tab).is_empty(),
             "candidate and rollback reports must not escape a failed transaction"
         );
         supervisor.close(92);
@@ -3975,7 +3964,7 @@ mod tests {
             true,
             false,
         );
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
 
         let grid_change = tab
             .apply_geometry(99, 31, original, 1)
@@ -3994,7 +3983,7 @@ mod tests {
         );
         assert_eq!(tab.tracking_pointer, None);
         assert_eq!(
-            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
+            captured_input(&tab).last(),
             Some(&b'm'),
             "the native release reaches the tracked application after grid-only resize"
         );
@@ -4008,33 +3997,21 @@ mod tests {
             true,
             false,
         );
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
         let metric_change = tab
             .apply_geometry(92, 28, larger, 2)
             .expect("apply metric change")
             .expect("metrics changed");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
-        assert!(tab
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(captured_input(&tab).is_empty());
         let release = tab.prepare_pointer_cancel().expect("stage tracked release");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
-        assert!(tab
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(captured_input(&tab).is_empty());
         tab.commit_pointer_cancel(release);
         assert_eq!(tab.tracking_pointer, None);
         assert_eq!(
-            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
+            captured_input(&tab).last(),
             Some(&b'm'),
             "committed metric replacement sends its staged release"
         );
@@ -4049,7 +4026,7 @@ mod tests {
             true,
             false,
         );
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         let rollback = tab
             .apply_geometry(99, 31, original, 3)
             .expect("stage failed metric candidate")
@@ -4058,12 +4035,7 @@ mod tests {
             .expect("roll back failed metric candidate");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
         assert!(
-            tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            captured_input(&tab).is_empty(),
             "failed metric transition must not release or clear mouse ownership"
         );
         native_pointer(
@@ -4076,10 +4048,7 @@ mod tests {
             false,
         );
         assert_eq!(tab.tracking_pointer, None);
-        assert_eq!(
-            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
-            Some(&b'm')
-        );
+        assert_eq!(captured_input(&tab).last(), Some(&b'm'));
         supervisor.close(93);
     }
 
@@ -4101,44 +4070,20 @@ mod tests {
 
         let (mut tracked, tracked_supervisor) = attached_test_terminal(192);
         tracked.write_vt(b"\x1b[?1000h\x1b[?1006h");
-        tracked
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clear();
+        clear_captured_input(&tracked);
         tracked.handle_wheel(2.0, 3, 1, 0).expect("tracked wheel");
-        let captured = tracked
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clone();
+        let captured = captured_input(&tracked);
         assert_eq!(captured.iter().filter(|byte| **byte == b'M').count(), 2);
         assert!(captured.windows(5).any(|bytes| bytes == b"\x1b[<64"));
         tracked_supervisor.close(192);
 
         let (mut alternate, alternate_supervisor) = attached_test_terminal(193);
         alternate.write_vt(b"\x1b[?1049h");
-        alternate
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clear();
+        clear_captured_input(&alternate);
         alternate
             .handle_wheel(2.0, 3, 1, 0)
             .expect("alternate-screen wheel");
-        let captured = alternate
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clone();
+        let captured = captured_input(&alternate);
         assert_eq!(captured, b"\x1b[A\x1b[A");
         alternate_supervisor.close(193);
     }
@@ -4173,11 +4118,11 @@ mod tests {
     }
 
     fn captured_input(tab: &TerminalTab) -> Vec<u8> {
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clone()
+        tab.session.capture().unwrap().lock().unwrap().clone()
     }
 
     fn clear_captured_input(tab: &TerminalTab) {
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        tab.session.capture().unwrap().lock().unwrap().clear();
     }
 
     fn viewport_offset(tab: &TerminalTab) -> u64 {

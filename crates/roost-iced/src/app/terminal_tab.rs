@@ -166,9 +166,8 @@ pub(super) fn attach_test_terminal(
         )
         .expect("spawn test PTY");
     let mut tab = TerminalTab::attach(
-        Arc::clone(&supervisor),
+        &TabBackend::in_process(Arc::clone(&supervisor), true),
         tab_id,
-        true,
         Theme::roost_dark_fallback(),
         roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
         feed,
@@ -179,6 +178,38 @@ pub(super) fn attach_test_terminal(
         .expect("install test terminal metrics")
         .expect("new test terminal changes geometry");
     (tab, supervisor)
+}
+
+/// Accumulate one tab's PTY bytes off `rx` until `needle` shows up or
+/// the window elapses. Returns what was seen either way, so the same
+/// helper serves the positive and the negative assertion.
+#[cfg(test)]
+pub(super) async fn feed_text_until(
+    rx: &mut EngineFeedReceiver,
+    tab_id: i64,
+    needle: &str,
+    window: Duration,
+) -> String {
+    let deadline = Instant::now() + window;
+    let mut seen = String::new();
+    loop {
+        let mut batch = EngineBatch::default();
+        while let Some(item) = rx.try_next(&mut batch) {
+            if let EngineFeed::Tab(
+                id,
+                TabOutput::Bytes(bytes) | TabOutput::Scanned { data: bytes, .. },
+            ) = item
+            {
+                if id == tab_id {
+                    seen.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+        if seen.contains(needle) || Instant::now() >= deadline {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 pub(super) fn terminal_grid(
@@ -213,10 +244,10 @@ pub(super) struct TerminalTab {
     pub(super) selection: TerminalSelection,
     pub(super) word_break_chars: String,
     input_started_at: Instant,
-    pub(super) session: TabSession,
-    output_forwarder: tokio::task::AbortHandle,
+    /// This tab's attachment to whatever runs its process — the one
+    /// place UI code reaches the terminal's backend.
+    pub(super) session: TabHandle,
     reply_buffer: Arc<Mutex<Vec<u8>>>,
-    pub(super) input_capture: Option<InputCapture>,
     pub(super) pointer_shape: String,
     pub(super) theme: Theme,
     /// The live platform-IME composition, mirrored into every snapshot
@@ -245,21 +276,6 @@ pub(super) struct TerminalTab {
     pub(super) render_stats: crate::perf::TabRenderStats,
 }
 
-impl Drop for TerminalTab {
-    /// The forwarder owns this tab's PTY receiver, so its life must end
-    /// with the tab's. A tab that is built and then discarded — the
-    /// failed-geometry arm of `reconcile` — would otherwise leave a live
-    /// stream behind, and the retry that attaches the same PTY again
-    /// cannot reuse the initial receiver (`TabSession::attach` falls back
-    /// to a fresh subscription), so two streams would interleave into one
-    /// terminal. Aborting drops the receiver, which ends the engine-side
-    /// bridge on its next send: the cascade that holding the receiver on
-    /// the tab used to give for free.
-    fn drop(&mut self) {
-        self.output_forwarder.abort();
-    }
-}
-
 /// The drain-side scanner's color seed for a theme.
 ///
 /// This is what the terminal itself is seeded with at attach
@@ -267,7 +283,7 @@ impl Drop for TerminalTab {
 /// theme application, so the drain's answers and the terminal's
 /// rendering start from the same colors and are moved by the same OSC
 /// sequences from there.
-fn theme_osc_colors(theme: &Theme) -> OscColorSnapshot {
+pub(super) fn theme_osc_colors(theme: &Theme) -> OscColorSnapshot {
     let rgb = |color: roost_vt::ColorRgb| (color.r, color.g, color.b);
     OscColorSnapshot::new(
         rgb(theme.foreground),
@@ -278,13 +294,12 @@ fn theme_osc_colors(theme: &Theme) -> OscColorSnapshot {
 }
 
 impl TerminalTab {
-    /// Attach the UI to a spawned PTY. Must be called inside the app
-    /// runtime (`Runtime::enter`): both `TabSession::attach_scanned` and
-    /// the output forwarder this spawns bind to the ambient runtime.
+    /// Attach the UI to a tab the backend already has a live session
+    /// for. Must be called inside the app runtime (`Runtime::enter`):
+    /// the backend's attach binds to the ambient runtime.
     pub(super) fn attach(
-        supervisor: Arc<PtySupervisor>,
+        backend: &TabBackend,
         tab_id: i64,
-        test_mode: bool,
         theme: Theme,
         word_break_chars: String,
         feed: EngineFeedSender,
@@ -305,24 +320,7 @@ impl TerminalTab {
         let render_state = RenderState::new()?;
         let encoder = KeyEncoder::new()?;
         let mouse_encoder = MouseEncoder::new()?;
-        let input_capture = test_mode.then(|| Arc::new(Mutex::new(Vec::new())));
-        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
-        // The OSC opt-in: this session's forwarding task owns the sole
-        // router for the tab and answers color queries straight off the
-        // drain. `TerminalTab` keeps no router of its own — a second
-        // one would double every reply.
-        let session = TabSession::attach_scanned(
-            supervisor,
-            tab_id,
-            output_tx,
-            input_capture.clone(),
-            Some(theme_osc_colors(&theme)),
-        )?;
-        // The per-tab channel stays — only its drain moves. This forwarder
-        // is what puts PTY output in the same arrival order as everything
-        // else the app reacts to, and what arms the feed's wake for it.
-        let output_forwarder =
-            tokio::spawn(engine_feed::pump_tab_output(tab_id, output_rx, feed)).abort_handle();
+        let session = backend.attach(tab_id, theme_osc_colors(&theme), feed)?;
         Ok(Self {
             terminal,
             render_state,
@@ -340,9 +338,7 @@ impl TerminalTab {
             word_break_chars,
             input_started_at: Instant::now(),
             session,
-            output_forwarder,
             reply_buffer,
-            input_capture,
             pointer_shape: "default".into(),
             theme,
             preedit: None,
@@ -387,7 +383,7 @@ impl TerminalTab {
     }
 
     fn drain_terminal_replies(&self) {
-        self.session.send_input(self.take_terminal_replies());
+        self.session.send_replies(self.take_terminal_replies());
     }
 
     fn take_terminal_replies(&self) -> Vec<u8> {
@@ -475,7 +471,7 @@ impl TerminalTab {
     }
 
     pub(super) fn commit_geometry(&self, change: GeometryChange) {
-        self.session.send_input(change.deferred_replies);
+        self.session.send_replies(change.deferred_replies);
         if change.grid_changed {
             self.session
                 .send_resize(change.current.cols, change.current.rows);
@@ -973,7 +969,9 @@ impl TerminalTab {
             });
         }
         if self.terminal.mode_get(2031) {
-            self.session.send_input(if theme.background.is_light() {
+            // Synthesized by this client's VT, so it travels the same
+            // reply policy the write- and resize-side drains do.
+            self.session.send_replies(if theme.background.is_light() {
                 b"\x1b[?997;2n".to_vec()
             } else {
                 b"\x1b[?997;1n".to_vec()
@@ -995,7 +993,7 @@ impl TerminalTab {
         // to learn about a theme the same moment the terminal does —
         // including on `set_theme`'s rollback, which is why this sits
         // in the one place every application lands.
-        self.session.reseed_osc_colors(theme_osc_colors(theme));
+        self.session.reseed_theme(theme_osc_colors(theme));
         self.refresh_snapshot()
     }
 

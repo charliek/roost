@@ -74,6 +74,7 @@ use crate::{chrome, input};
 mod interactions;
 mod palettes;
 mod servicing;
+mod tab_backend;
 mod terminal_tab;
 // The in-crate `#[ignore]`d perf harness — see `tools/perf/README.md` for
 // how to run it. Gated on `cfg(test)` like `terminal_tab`'s test-only
@@ -97,14 +98,15 @@ use self::palettes::{
     PALETTE_AGENT_PROJECT_MAX_COLUMNS,
 };
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
+use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
     apply_geometry_batch, clear_preedit_or_warn, pointer_origin_tab, refresh_or_warn,
     terminal_grid, GeometryBatchOperation, NativePointerDispatch, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
-    attach_test_terminal, GeometryBatchFailure, GeometryChange, LocalPointerGesture,
-    NativePointerOutcome, TerminalGeometry,
+    attach_test_terminal, feed_text_until, GeometryBatchFailure, GeometryChange,
+    LocalPointerGesture, NativePointerOutcome, TerminalGeometry,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -1114,7 +1116,7 @@ fn pill_display_title(title: &str) -> &str {
 
 pub struct App {
     workspace: Arc<Workspace>,
-    supervisor: Arc<PtySupervisor>,
+    backend: TabBackend,
     client: LocalClient,
     tabs: HashMap<i64, TerminalTab>,
     projects: Vec<Project>,
@@ -1318,9 +1320,13 @@ impl App {
             }
         });
 
+        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
         let mut app = Self {
             workspace,
-            supervisor,
+            // The engine keeps its direct supervisor reference (the
+            // clones handed to `LocalClient` and `IpcHandler` above);
+            // only UI-side terminal ops route through the backend.
+            backend: TabBackend::in_process(supervisor, test_mode),
             client,
             tabs: HashMap::new(),
             projects: Vec::new(),
@@ -1335,7 +1341,7 @@ impl App {
             title_fallback: title_fallback(profile.kind),
             ime_discard: ImeDiscard::default(),
             modifiers: keyboard::Modifiers::default(),
-            test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
+            test_mode,
             status: StatusBanner::default(),
             rename_editor: None,
             rename_input_id: Id::unique(),
@@ -3141,7 +3147,7 @@ impl App {
 
     fn launch_cwd(&self, project_id: i64) -> String {
         let active_tab = self.workspace.active().1;
-        if let Some(native) = self.supervisor.foreground_cwd(active_tab) {
+        if let Some(native) = self.backend.foreground_cwd(active_tab) {
             if !native.is_empty() {
                 return native;
             }

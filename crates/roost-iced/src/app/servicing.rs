@@ -419,19 +419,18 @@ impl App {
     /// attempt that preceded it.
     fn attach_tab(&mut self, tab_id: i64) -> bool {
         // Loading the theme and building the terminal costs a 256-entry
-        // palette, a scrollback and the encoders — all discarded when
-        // `TabSession::attach` consults this very map and finds nothing.
-        // The retry driver runs 40 times a second, so ask first.
-        if !self.supervisor.has(tab_id) {
+        // palette, a scrollback and the encoders — all discarded when the
+        // backend's attach finds no session for the id. The retry driver
+        // runs 40 times a second, so ask first.
+        if !self.backend.is_live(tab_id) {
             tracing::debug!(tab_id, "PTY not ready for UI attach");
             return false;
         }
         let attached = {
             let _guard = self.runtime.enter();
             TerminalTab::attach(
-                Arc::clone(&self.supervisor),
+                &self.backend,
                 tab_id,
-                self.test_mode,
                 Theme::load_bundled(&self.active_theme_name),
                 self.config.word_break_chars.clone(),
                 self.feed_tx.clone(),
@@ -1138,7 +1137,7 @@ impl App {
                 let result = self
                     .tabs
                     .get(&tab_id)
-                    .and_then(|tab| tab.input_capture.as_ref())
+                    .and_then(|tab| tab.session.capture())
                     .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
                     .and_then(|capture| {
                         capture
@@ -1555,11 +1554,11 @@ mod tests {
     async fn a_tab_whose_pty_is_not_spawned_yet_attaches_on_a_retry() {
         let supervisor = Arc::new(PtySupervisor::new());
         let (feed_tx, _feed_rx) = engine_feed::channel();
+        let backend = TabBackend::in_process(Arc::clone(&supervisor), true);
         let attach = |feed: EngineFeedSender| {
             TerminalTab::attach(
-                Arc::clone(&supervisor),
+                &backend,
                 75,
-                true,
                 Theme::roost_dark_fallback(),
                 roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
                 feed,
@@ -1635,9 +1634,8 @@ mod tests {
 
         assert!(supervisor.has(76));
         let tab = TerminalTab::attach(
-            Arc::clone(&supervisor),
+            &TabBackend::in_process(Arc::clone(&supervisor), true),
             76,
-            true,
             Theme::roost_dark_fallback(),
             roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
             feed_tx,
@@ -1913,35 +1911,6 @@ mod tests {
         supervisor.close(73);
     }
 
-    /// Accumulate one tab's PTY bytes off `rx` until `needle` shows up or
-    /// the window elapses. Returns what was seen either way, so the same
-    /// helper serves the positive and the negative assertion.
-    async fn feed_text_until(
-        rx: &mut EngineFeedReceiver,
-        tab_id: i64,
-        needle: &str,
-        window: Duration,
-    ) -> String {
-        let deadline = Instant::now() + window;
-        let mut seen = String::new();
-        while Instant::now() < deadline && !seen.contains(needle) {
-            let mut batch = EngineBatch::default();
-            while let Some(item) = rx.try_next(&mut batch) {
-                if let EngineFeed::Tab(
-                    id,
-                    TabOutput::Bytes(bytes) | TabOutput::Scanned { data: bytes, .. },
-                ) = item
-                {
-                    if id == tab_id {
-                        seen.push_str(&String::from_utf8_lossy(&bytes));
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        seen
-    }
-
     /// `reconcile`'s failed-geometry arm builds a tab and then discards it,
     /// and a later attach takes the same PTY over. The discarded tab's
     /// forwarder must not outlive it: the second `TabSession::attach`
@@ -1955,9 +1924,8 @@ mod tests {
 
         let (live_feed, mut live_rx) = engine_feed::channel();
         let tab = TerminalTab::attach(
-            Arc::clone(&supervisor),
+            &TabBackend::in_process(Arc::clone(&supervisor), true),
             74,
-            true,
             Theme::roost_dark_fallback(),
             roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
             live_feed,
