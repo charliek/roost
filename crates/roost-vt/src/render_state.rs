@@ -333,7 +333,8 @@ impl RenderState {
         let style = self
             .read_enum(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE)
             .unwrap_or(
-                sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK,
+                sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK
+                    as _,
             );
 
         let cursor_has_color = self
@@ -351,7 +352,7 @@ impl RenderState {
             wide_tail,
             visible,
             blinking,
-            visual_style: CursorVisualStyle::from_raw(style),
+            visual_style: CursorVisualStyle::from_raw(style as _),
             color,
         })
     }
@@ -411,7 +412,7 @@ impl RenderState {
     /// Global dirty state. Pure read — clears nothing.
     pub fn dirty(&self) -> Result<Dirty> {
         let raw = self.read_enum(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_DIRTY)?;
-        Ok(Dirty::from_raw(raw))
+        Ok(Dirty::from_raw(raw as _))
     }
 
     /// Raise the global dirty state to `Full`, forcing the next
@@ -737,8 +738,13 @@ impl RenderState {
     }
 
     /// Read a data key whose documented output type is one of
-    /// libghostty's `GHOSTTY_ENUM_TYPED` enums — explicitly `int` at the
-    /// ABI, so the out-parameter must be `c_int`-shaped, not `u32`.
+    /// libghostty's `GHOSTTY_ENUM_TYPED` enums. The ABI is a 4-byte
+    /// write either way, but the Rust-side alias signedness is
+    /// platform-dependent: Apple clang honors the header's
+    /// `c_fixed_enum` `: int` (bindgen emits `c_int`) while Linux clang
+    /// in default C mode expands the macro empty (bindgen infers
+    /// `c_uint` for non-negative enums). Read as `c_int` and let call
+    /// sites `as _` into the alias type, never assume one signedness.
     fn read_enum(&self, data: sys::GhosttyRenderStateData) -> Result<std::os::raw::c_int> {
         let mut out: std::os::raw::c_int = 0;
         // SAFETY: handle non-null; out is local.
