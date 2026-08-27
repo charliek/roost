@@ -12,6 +12,13 @@ window, with native iced chrome. Default Roost stays what it is today.
 Companion: expanding agent coverage without blocking this work is
 [`agent-watching.md`](agent-watching.md).
 
+2026-08-26 update: this note graduated to a roadmap and a design —
+[`host-sessions-roadmap.md`](host-sessions-roadmap.md) (agreed
+direction + milestones) and
+[`host-sessions-architecture.md`](host-sessions-architecture.md)
+(technical design). Where they differ from this note, they win. The
+Ghostty pin bump this note calls "E8" is now plan 032.
+
 ---
 
 ## Product
