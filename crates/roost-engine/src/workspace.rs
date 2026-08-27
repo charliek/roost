@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use crate::persistence::{persist_state, read_state, ProjectSnapshot, SnapshotFile};
+use crate::persistence::{persist_state, read_state, HostSnapshot, ProjectSnapshot, SnapshotFile};
 
 /// How many events the broadcast channel buffers per subscriber.
 /// Subscribers that fall behind get a `Lagged` and resync via
@@ -111,6 +111,13 @@ struct Inner {
     /// (Rust UI adapter (Iced) parity with the Mac UI's
     /// `RoostSidebarWidth`).
     sidebar_width: f64,
+    /// Saved hosts, carried opaquely from `state.json` back into every
+    /// rewrite. The workspace neither reads nor mutates them — HS-2
+    /// owns the mutation API and the `HostSnapshot.id` ↔ `HostId`
+    /// mapping — but they must live here, because a snapshot rebuilt
+    /// without them silently erases the user's hosts on the first
+    /// ordinary write-through.
+    hosts: Vec<HostSnapshot>,
     /// Whether the UI window currently has focus. Half of the
     /// notification-suppression predicate (plan §3.5); reported by the
     /// UI via [`Workspace::set_window_focused`]. Never persisted — focus
@@ -135,6 +142,7 @@ impl Default for Inner {
             active_tab_id: 0,
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+            hosts: Vec::new(),
             // Focused until a UI says otherwise: a headless or IPC-only
             // workspace never reports focus, and the alternative default
             // would leave the active tab permanently "unseen" — silently
@@ -430,6 +438,7 @@ impl Workspace {
             sidebar_collapsed: snapshot.sidebar_collapsed,
             sidebar_width: normalize_sidebar_width(snapshot.sidebar_width)
                 .unwrap_or(SIDEBAR_DEFAULT_WIDTH),
+            hosts: std::mem::take(&mut snapshot.hosts),
             ..Inner::default()
         };
 
@@ -1636,6 +1645,7 @@ impl Inner {
             active_tab_position,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
+            hosts: self.hosts.clone(),
             projects: self
                 .projects
                 .values()

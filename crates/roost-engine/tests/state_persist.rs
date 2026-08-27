@@ -3,6 +3,7 @@
 //! survive as restore *descriptors* (the layout the UI re-opens as
 //! fresh shells), not as live tabs in the workspace.
 
+use roost_engine::persistence::read_state;
 use roost_engine::Workspace;
 use tempfile::tempdir;
 
@@ -55,6 +56,88 @@ fn projects_and_next_id_survive_reopen() {
         first_tab_id,
         next_tab.id,
     );
+}
+
+/// Saved hosts are client-side state the workspace itself never
+/// touches, so the risk is an ordinary write-through silently erasing
+/// them. Load a file that has them, mutate, and check the rewrite.
+#[test]
+fn saved_hosts_survive_an_ordinary_rewrite() {
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    std::fs::write(
+        &state_path,
+        br#"{
+            "next_id": 3,
+            "projects": [{
+                "id": 1, "name": "Old", "cwd": "/tmp",
+                "position": 0, "created_at": 1, "tabs": []
+            }],
+            "hosts": [
+                { "id": "h1", "label": "shed", "target": "test1@localhost",
+                  "last_connected": "2026-08-27T00:00:00Z" },
+                { "id": "h2", "label": "laptop", "target": "localhost" }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    {
+        let ws = Workspace::open(state_path.clone());
+        let p = ws.create_project("Roost", "/tmp").unwrap();
+        ws.open_tab(p.id, "/tmp", "shell").unwrap();
+    }
+
+    let back = read_state(&state_path).unwrap().expect("present");
+    assert_eq!(back.hosts.len(), 2, "hosts must survive the rewrite");
+    assert_eq!(back.hosts[0].id, "h1");
+    assert_eq!(back.hosts[0].label, "shed");
+    assert_eq!(back.hosts[0].target, "test1@localhost");
+    assert_eq!(
+        back.hosts[0].last_connected.as_deref(),
+        Some("2026-08-27T00:00:00Z")
+    );
+    assert_eq!(back.hosts[1].id, "h2");
+    assert_eq!(back.hosts[1].target, "localhost");
+    assert_eq!(back.hosts[1].last_connected, None);
+    assert_eq!(back.projects.len(), 2, "the mutation still landed");
+
+    let ws2 = Workspace::open(state_path);
+    ws2.create_project("Third", "/tmp").unwrap();
+}
+
+#[test]
+fn legacy_state_without_hosts_loads_and_rewrites_empty() {
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    std::fs::write(
+        &state_path,
+        br#"{"next_id":5,"projects":[{"id":1,"name":"Old","cwd":"/tmp","position":0,"created_at":1}]}"#,
+    )
+    .unwrap();
+
+    {
+        let ws = Workspace::open(state_path.clone());
+        assert_eq!(ws.snapshot().len(), 1);
+        ws.create_project("New", "/tmp").unwrap();
+    }
+
+    let back = read_state(&state_path).unwrap().expect("present");
+    assert!(back.hosts.is_empty(), "absent hosts key loads as none");
+}
+
+#[test]
+fn fresh_workspace_persists_empty_hosts() {
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    {
+        let ws = Workspace::open(state_path.clone());
+        ws.create_project("Roost", "/tmp").unwrap();
+    }
+    let raw = std::fs::read_to_string(&state_path).unwrap();
+    assert!(raw.contains("\"hosts\": []"), "hosts key written: {raw}");
+    let back = read_state(&state_path).unwrap().expect("present");
+    assert!(back.hosts.is_empty());
 }
 
 #[test]

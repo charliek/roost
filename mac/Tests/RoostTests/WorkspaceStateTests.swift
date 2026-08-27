@@ -869,6 +869,78 @@ struct WorkspaceStatePersistenceTests {
         )
     }
 
+    /// Saved hosts are client-side state the workspace itself never
+    /// touches, so the risk is an ordinary write-through silently
+    /// erasing them. Load a file that has them, mutate, check the
+    /// rewrite.
+    @Test func savedHostsSurviveAnOrdinaryRewrite() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let seeded = """
+        {
+            "next_id": 3,
+            "projects": [{
+                "id": 1, "name": "Old", "cwd": "/tmp",
+                "position": 0, "created_at": 1, "tabs": []
+            }],
+            "hosts": [
+                { "id": "h1", "label": "shed", "target": "test1@localhost",
+                  "last_connected": "2026-08-27T00:00:00Z" },
+                { "id": "h2", "label": "laptop", "target": "localhost" }
+            ]
+        }
+        """
+        try seeded.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        let p = await ws.createProject(name: "Roost", cwd: "/tmp")
+        _ = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "shell")
+
+        let back = try #require(Self.decodeSnapshot(at: path))
+        #expect(back.hosts.count == 2, "hosts must survive the rewrite")
+        #expect(back.hosts[0].id == "h1")
+        #expect(back.hosts[0].label == "shed")
+        #expect(back.hosts[0].target == "test1@localhost")
+        #expect(back.hosts[0].lastConnected == "2026-08-27T00:00:00Z")
+        #expect(back.hosts[1].id == "h2")
+        #expect(back.hosts[1].target == "localhost")
+        #expect(back.hosts[1].lastConnected == nil)
+        #expect(back.projects.count == 2, "the mutation still landed")
+    }
+
+    @Test func legacyStateWithoutHostsLoadsAndRewritesEmpty() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let legacy = """
+        {"next_id":5,"projects":[{"id":1,"name":"Old","cwd":"/tmp","position":0,"created_at":1}]}
+        """
+        try legacy.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        #expect(await ws.snapshot().count == 1)
+        _ = await ws.createProject(name: "New", cwd: "/tmp")
+
+        let back = try #require(Self.decodeSnapshot(at: path))
+        #expect(back.hosts.isEmpty, "absent hosts key loads as none")
+    }
+
+    @Test func freshWorkspacePersistsEmptyHosts() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let ws = await Workspace(statePath: path)
+        _ = await ws.createProject(name: "Roost", cwd: "/tmp")
+
+        let raw = try String(contentsOfFile: path, encoding: .utf8)
+        #expect(raw.contains("\"hosts\""), "hosts key written: \(raw)")
+        let back = try #require(Self.decodeSnapshot(at: path))
+        #expect(back.hosts.isEmpty)
+    }
+
+    private static func decodeSnapshot(at path: String) -> Workspace.SnapshotFile? {
+        guard let data = FileManager.default.contents(atPath: path) else { return nil }
+        return try? JSONDecoder().decode(Workspace.SnapshotFile.self, from: data)
+    }
+
     /// A `state.json` that still restores with tied project positions.
     ///
     /// `createProject` hands out `max + 1` and the load path now
