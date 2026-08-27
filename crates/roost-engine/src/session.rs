@@ -200,7 +200,7 @@ impl TabSession {
         tokio::spawn(async move {
             loop {
                 match output_rx.recv().await {
-                    Ok(PtyOutputEvent::Bytes(data)) => {
+                    Ok(PtyOutputEvent::Bytes { data, .. }) => {
                         let output = match &scanner {
                             Some(osc) => {
                                 let actions = scan(osc, &data);
@@ -226,7 +226,7 @@ impl TabSession {
                     // afterwards are dropped by the `break` below.
                     // That is the deliberate trade: a tab that never
                     // reports its exit would never auto-close.
-                    Ok(PtyOutputEvent::Exit(status)) => {
+                    Ok(PtyOutputEvent::Exit { code: status, .. }) => {
                         let _ = output_tx.send(TabOutput::Exit {
                             status,
                             reason: String::new(),

@@ -14,6 +14,7 @@
 //! same receiver the supervisor hands out. There is no terminal here,
 //! so anything in the capture came from the drain.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,10 @@ struct Harness {
     pty_tx: broadcast::Sender<PtyOutputEvent>,
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TabOutput>,
     capture: InputCapture,
+    /// This harness plays the supervisor, so it also plays its per-spawn
+    /// sequence counter. Nothing here asserts on seqs; `pty_seq_test.rs`
+    /// covers the real assignment.
+    next_seq: AtomicU64,
 }
 
 /// Attach a session to a synthetic PTY broadcast. No PTY is spawned:
@@ -61,13 +66,17 @@ fn harness(tab_id: i64, scanned: bool) -> Harness {
         pty_tx,
         output_rx,
         capture,
+        next_seq: AtomicU64::new(1),
     }
 }
 
 impl Harness {
     fn emit(&self, bytes: &[u8]) {
         self.pty_tx
-            .send(PtyOutputEvent::Bytes(bytes.to_vec()))
+            .send(PtyOutputEvent::Bytes {
+                seq: self.next_seq.fetch_add(1, Ordering::SeqCst),
+                data: bytes.to_vec(),
+            })
             .expect("the forwarding task is subscribed");
     }
 
