@@ -182,10 +182,14 @@ impl Response {
 // Event envelope (server push)
 // ============================================================================
 
-/// Server-push event. Only delivered after the client calls
-/// `events.subscribe`. (`events.subscribe` is stubbed in M0 — it
-/// replies success but the server never emits events on the
-/// connection. M2 wires up the type system; M3+ implement the push.)
+/// Server-push event. **Not delivered today**: the only way to start
+/// a push stream is `events.subscribe`, and the server answers that op
+/// with `not-implemented` rather than a false ACK (see the
+/// `ops::EVENTS_SUBSCRIBE` arm in `roost-engine/src/ipc.rs`), so no
+/// event is ever written on a connection. The type exists because it
+/// is the shape both UIs and `roostctl` will decode once HS-1
+/// implements the push, delivering these envelopes inside an
+/// [`EventBatch`].
 ///
 /// Permissive by default (no `deny_unknown_fields`) so future
 /// server-side additions to the event envelope itself don't break
@@ -1400,6 +1404,94 @@ pub struct AgentReportChangedEvent {
     /// subscriber never re-derives it.
     pub state: TabState,
     pub hook_active: bool,
+}
+
+// ============================================================================
+// Host sessions (plan 033 §D4) — wire types only, no op serves them yet
+// ============================================================================
+
+/// Version of the host-session protocol: the `session.*` handshake, the
+/// attach handshake, and the binary data-plane framing that HS-1 adds.
+///
+/// Deliberately separate from [`crate::PROTOCOL_VERSION`], which
+/// versions the request/response wire format every client already
+/// speaks. A host-session change must not force every `roostctl` build
+/// to be re-gated, and vice versa.
+pub const SESSION_PROTOCOL_VERSION: u32 = 1;
+
+/// What a host session can encode a tab's attach payload as.
+///
+/// An open string, not a closed enum: a client must be able to read a
+/// newer host's `payload_kinds` list, preserve the values it doesn't
+/// recognize, and negotiate on the ones it does. A closed enum would
+/// make an unknown kind a decode error and turn "one extra kind" into
+/// a hard incompatibility.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AttachPayloadKind(pub String);
+
+impl AttachPayloadKind {
+    /// libghostty's own terminal-state snapshot. Requires an exact
+    /// `libghostty_build` match between host and client.
+    pub const GHOSTTY_SNAPSHOT: &str = "ghostty-snapshot";
+    /// A VT byte stream the client replays into its own terminal.
+    pub const VT: &str = "vt";
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for AttachPayloadKind {
+    fn from(s: &str) -> Self {
+        AttachPayloadKind(s.to_string())
+    }
+}
+
+impl From<String> for AttachPayloadKind {
+    fn from(s: String) -> Self {
+        AttachPayloadKind(s)
+    }
+}
+
+impl std::fmt::Display for AttachPayloadKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `session.identify` result — the first thing a client asks a host
+/// session for, so every incompatibility is caught on stable JSON
+/// before any binary frame exists.
+///
+/// `libghostty_build` is the pinned Ghostty build identity; it must
+/// match exactly for [`AttachPayloadKind::GHOSTTY_SNAPSHOT`] to be
+/// negotiable. `started_at` is an RFC3339 timestamp, carried as a
+/// string so the wire stays human-readable and free of a date-time
+/// dependency on either side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIdentify {
+    pub app_version: String,
+    pub session_protocol: u32,
+    pub payload_kinds: Vec<AttachPayloadKind>,
+    pub libghostty_build: String,
+    pub session_id: String,
+    pub started_at: String,
+}
+
+/// One atomic push on the events connection.
+///
+/// A single workspace commit can publish several events under the same
+/// `revision`, so a per-envelope revision cannot detect loss mid-commit.
+/// Batching the envelopes that share a revision makes the client's gap
+/// check ("did I skip a revision?") sufficient: a client that sees a
+/// jump re-pulls `tab.list` / `project.list` rather than trying to
+/// reconstruct what it missed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventBatch {
+    pub revision: u64,
+    #[serde(default)]
+    pub events: Vec<EventEnvelope>,
 }
 
 // ============================================================================

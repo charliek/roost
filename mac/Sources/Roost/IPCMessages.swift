@@ -387,6 +387,90 @@ struct IPCIdentifyResult: Codable, Sendable {
     }
 }
 
+// MARK: - Host sessions (wire types only — no op serves them yet)
+
+/// What a host session can encode a tab's attach payload as. Mirrors
+/// Rust's `AttachPayloadKind`: an open string, not a closed enum, so a
+/// client reading a newer host's `payload_kinds` preserves the values
+/// it doesn't recognize instead of failing to decode.
+struct IPCAttachPayloadKind: Codable, Equatable, Hashable, Sendable {
+    var value: String
+
+    init(_ value: String) {
+        self.value = value
+    }
+
+    init(from decoder: Decoder) throws {
+        self.value = try decoder.singleValueContainer().decode(String.self)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(value)
+    }
+
+    /// libghostty's own terminal-state snapshot. Requires an exact
+    /// `libghosttyBuild` match between host and client.
+    static let ghosttySnapshot = IPCAttachPayloadKind("ghostty-snapshot")
+    /// A VT byte stream the client replays into its own terminal.
+    static let vt = IPCAttachPayloadKind("vt")
+}
+
+/// `session.identify` result — the first thing a client asks a host
+/// session for, so every incompatibility is caught on stable JSON
+/// before any binary frame exists. `startedAt` is RFC3339, carried as
+/// a string.
+struct IPCSessionIdentify: Codable, Equatable, Sendable {
+    var appVersion: String
+    var sessionProtocol: UInt32
+    var payloadKinds: [IPCAttachPayloadKind]
+    var libghosttyBuild: String
+    var sessionID: String
+    var startedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case appVersion = "app_version"
+        case sessionProtocol = "session_protocol"
+        case payloadKinds = "payload_kinds"
+        case libghosttyBuild = "libghostty_build"
+        case sessionID = "session_id"
+        case startedAt = "started_at"
+    }
+}
+
+/// One atomic push on the events connection. A single workspace commit
+/// can publish several events under the same `revision`, so the batch —
+/// not the envelope — is the unit a client checks for gaps.
+struct IPCEventBatch: Codable, Sendable {
+    var revision: UInt64
+    var events: [IPCEventEnvelope]
+
+    enum CodingKeys: String, CodingKey {
+        case revision, events
+    }
+
+    init(revision: UInt64, events: [IPCEventEnvelope]) {
+        self.revision = revision
+        self.events = events
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.revision = try c.decode(UInt64.self, forKey: .revision)
+        // Matches the Rust `#[serde(default)]` exactly: an absent key is
+        // an empty fence, but an explicit `"events": null` is a decode
+        // error there, so `decodeIfPresent` (which accepts null) would
+        // drift the two sides apart.
+        self.events = c.contains(.events) ? try c.decode([IPCEventEnvelope].self, forKey: .events) : []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(revision, forKey: .revision)
+        try c.encode(events, forKey: .events)
+    }
+}
+
 // MARK: - String-wrapped int64 helpers
 
 enum StringInt64DecodeError: Error, CustomStringConvertible {
@@ -520,6 +604,13 @@ struct AnyCodable: Codable, @unchecked Sendable {
 
 /// Protocol version on the wire. M0 ships `1`.
 let ipcProtocolVersion: UInt32 = 1
+
+/// Version of the host-session protocol (`session.*` handshake, attach
+/// handshake, binary data plane). Separate from `ipcProtocolVersion`,
+/// which versions the request/response format every client speaks —
+/// the two move independently. Mirrors Rust's
+/// `messages::SESSION_PROTOCOL_VERSION`.
+let ipcSessionProtocolVersion: UInt32 = 1
 
 /// Maximum length of a single framed line. Matches roost-ipc's
 /// `MAX_FRAME_BYTES`.
