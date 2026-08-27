@@ -43,6 +43,7 @@ use roost_ui_model::{
     config::{self, RoostConfig},
     custom_command,
     keybind::{self, Accel, AccelMods, KeybindAction},
+    keys::TabKey,
     notification_inbox, palette, provider,
     rollup::project_rollup,
     window_title,
@@ -737,22 +738,22 @@ impl ImeDiscard {
 /// pulsing `InputMethod::Disabled` for a frame, which needs verification
 /// against a real IME before it goes in.
 fn cancel_preedits(
-    tabs: &mut HashMap<i64, TerminalTab>,
+    tabs: &mut HashMap<TabKey, TerminalTab>,
     discard: &mut ImeDiscard,
-    keep: Option<i64>,
+    keep: Option<TabKey>,
 ) {
     let mut cancelled = false;
-    for (tab_id, tab) in tabs.iter_mut() {
-        if Some(*tab_id) == keep {
+    for (key, tab) in tabs.iter_mut() {
+        if Some(*key) == keep {
             continue;
         }
-        cancelled |= clear_preedit_or_warn(*tab_id, tab);
+        cancelled |= clear_preedit_or_warn(key.tab, tab);
     }
     discard.arm(cancelled);
 }
 
 fn set_preedit_in(
-    tabs: &mut HashMap<i64, TerminalTab>,
+    tabs: &mut HashMap<TabKey, TerminalTab>,
     discard: &mut ImeDiscard,
     route: KeyboardRoute,
     text: String,
@@ -761,7 +762,7 @@ fn set_preedit_in(
     let Some(tab_id) = ime_preedit_target(route) else {
         return;
     };
-    let Some(tab) = tabs.get_mut(&tab_id) else {
+    let Some(tab) = tabs.get_mut(&TabKey::local(tab_id)) else {
         return;
     };
     // Only a fresh composition disarms the latch. An empty preedit is the
@@ -777,7 +778,7 @@ fn set_preedit_in(
 }
 
 fn commit_ime_in(
-    tabs: &mut HashMap<i64, TerminalTab>,
+    tabs: &mut HashMap<TabKey, TerminalTab>,
     discard: &mut ImeDiscard,
     route: KeyboardRoute,
     text: &str,
@@ -788,11 +789,11 @@ fn commit_ime_in(
     let holder = tabs
         .iter()
         .find(|(_, tab)| tab.preedit.is_some())
-        .map(|(tab_id, _)| *tab_id);
+        .map(|(key, _)| key.tab);
     let Some(tab_id) = ime_commit_target(holder, route) else {
         return;
     };
-    let Some(tab) = tabs.get_mut(&tab_id) else {
+    let Some(tab) = tabs.get_mut(&TabKey::local(tab_id)) else {
         return;
     };
     if let Err(error) = tab.commit_ime(text) {
@@ -1118,7 +1119,7 @@ pub struct App {
     workspace: Arc<Workspace>,
     backend: TabBackend,
     client: LocalClient,
-    tabs: HashMap<i64, TerminalTab>,
+    tabs: HashMap<TabKey, TerminalTab>,
     projects: Vec<Project>,
     sidebar_agents: HashMap<i64, Vec<SidebarDumpAgentRow>>,
     notification_inbox: notification_inbox::NotificationInbox,
@@ -1686,7 +1687,7 @@ impl App {
         self.window_size = size;
         let (cols, rows) =
             terminal_grid(size, self.effective_sidebar_width(), self.terminal_metrics);
-        for (tab_id, tab) in &mut self.tabs {
+        for (key, tab) in &mut self.tabs {
             match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
                 Ok(Some(change)) => {
                     tab.commit_geometry(change);
@@ -1694,11 +1695,17 @@ impl App {
                     // the snapshot the widget draws describes the old
                     // dimensions until it is rebuilt. Window resizes,
                     // sidebar width drags and collapse all land here.
-                    refresh_or_warn(*tab_id, tab, "window re-grid");
+                    refresh_or_warn(key.tab, tab, "window re-grid");
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(?error, tab_id, cols, rows, "terminal resize failed")
+                    tracing::warn!(
+                        ?error,
+                        tab_id = key.tab,
+                        cols,
+                        rows,
+                        "terminal resize failed"
+                    )
                 }
             }
         }
@@ -1715,7 +1722,7 @@ impl App {
             self.modifiers = *modifiers;
             let held = self.link_modifier_held();
             let tab_id = self.workspace.active().1;
-            if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            if let Some(tab) = self.tabs.get_mut(&TabKey::local(tab_id)) {
                 if let Err(error) = tab
                     .set_link_modifier_held(held)
                     .and_then(|()| tab.refresh_snapshot())
@@ -1797,7 +1804,7 @@ impl App {
         let KeyboardRoute::Terminal(active_tab) = self.keyboard_route() else {
             return UiTask::None;
         };
-        let Some(tab) = self.tabs.get_mut(&active_tab) else {
+        let Some(tab) = self.tabs.get_mut(&TabKey::local(active_tab)) else {
             return UiTask::None;
         };
         // A bare page key scrolls this tab's own scrollback whenever the shared
@@ -1834,7 +1841,7 @@ impl App {
     /// Whether the terminal that owns the keyboard is mid-composition.
     fn terminal_composing(&self) -> bool {
         ime_preedit_target(self.keyboard_route())
-            .and_then(|tab_id| self.tabs.get(&tab_id))
+            .and_then(|tab_id| self.tabs.get(&TabKey::local(tab_id)))
             .is_some_and(|tab| tab.preedit.is_some())
     }
 
@@ -2078,7 +2085,7 @@ impl App {
             self.rename_editor.is_some(),
             self.palette.is_some(),
             active_tab,
-            self.tabs.contains_key(&active_tab),
+            self.tabs.contains_key(&TabKey::local(active_tab)),
         )
     }
 
@@ -2101,7 +2108,7 @@ impl App {
         }
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
-        if let Some(tab) = self.tabs.get(&self.workspace.active().1) {
+        if let Some(tab) = self.tabs.get(&TabKey::local(self.workspace.active().1)) {
             tab.set_window_focus(focused);
         }
     }
@@ -2596,7 +2603,7 @@ impl App {
             .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
             .style(chrome::band);
 
-        let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {
+        let terminal: Element<'_, Message> = match self.tabs.get(&TabKey::local(active_tab)) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
                 tab_id: active_tab,
                 snapshot: tab.snapshot.clone(),
@@ -2618,7 +2625,7 @@ impl App {
             _ => {
                 let background = self
                     .tabs
-                    .get(&active_tab)
+                    .get(&TabKey::local(active_tab))
                     .map(|tab| tab.snapshot.background)
                     .unwrap_or_else(|| Theme::load_bundled(&self.active_theme_name).background);
                 container(Space::new())
@@ -3000,17 +3007,21 @@ impl App {
         // The modal drops pointer events, so a held terminal button would
         // never see its release: settle every tab's pointer state (synthetic
         // release into tracking PTYs) before the modal owns input.
-        for (tab_id, tab) in &mut self.tabs {
+        for (key, tab) in &mut self.tabs {
             match tab.prepare_pointer_cancel() {
                 Ok(release) => {
                     tab.commit_pointer_cancel(release);
                     // The cancel drops hover, so the link underline and
                     // pointer shape the snapshot carries are decorations
                     // for a gesture that no longer exists.
-                    refresh_or_warn(*tab_id, tab, "pointer cancel before delete confirm");
+                    refresh_or_warn(key.tab, tab, "pointer cancel before delete confirm");
                 }
                 Err(error) => {
-                    tracing::warn!(?error, tab_id, "pointer cancel before delete confirm")
+                    tracing::warn!(
+                        ?error,
+                        tab_id = key.tab,
+                        "pointer cancel before delete confirm"
+                    )
                 }
             }
         }
@@ -4502,15 +4513,16 @@ mod tests {
 
     #[test]
     fn pointer_origin_routing_never_substitutes_the_active_or_a_closed_tab() {
-        let mut tabs = HashMap::from([(41, "origin"), (42, "active")]);
+        let mut tabs =
+            HashMap::from([(TabKey::local(41), "origin"), (TabKey::local(42), "active")]);
         assert_eq!(
-            pointer_origin_tab(&mut tabs, 41).map(|value| *value),
+            pointer_origin_tab(&mut tabs, TabKey::local(41)).map(|value| *value),
             Some("origin")
         );
-        tabs.remove(&41);
-        assert_eq!(pointer_origin_tab(&mut tabs, 41), None);
+        tabs.remove(&TabKey::local(41));
+        assert_eq!(pointer_origin_tab(&mut tabs, TabKey::local(41)), None);
         assert_eq!(
-            pointer_origin_tab(&mut tabs, 42).map(|value| *value),
+            pointer_origin_tab(&mut tabs, TabKey::local(42)).map(|value| *value),
             Some("active")
         );
     }

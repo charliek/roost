@@ -8,6 +8,7 @@ pub mod config;
 pub mod custom_command;
 pub mod drop_content;
 pub mod keybind;
+pub mod keys;
 pub mod notification_inbox;
 pub mod palette;
 pub mod provider;

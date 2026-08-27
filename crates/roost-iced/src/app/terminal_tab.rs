@@ -26,8 +26,8 @@ pub(super) enum LocalPointerGesture {
     Url,
 }
 
-pub(super) fn pointer_origin_tab<V>(tabs: &mut HashMap<i64, V>, tab_id: i64) -> Option<&mut V> {
-    tabs.get_mut(&tab_id)
+pub(super) fn pointer_origin_tab<V>(tabs: &mut HashMap<TabKey, V>, tab: TabKey) -> Option<&mut V> {
+    tabs.get_mut(&tab)
 }
 
 /// Republish what a tab renders after something moved its terminal state.
@@ -186,7 +186,7 @@ pub(super) fn attach_test_terminal(
 #[cfg(test)]
 pub(super) async fn feed_text_until(
     rx: &mut EngineFeedReceiver,
-    tab_id: i64,
+    tab: TabKey,
     needle: &str,
     window: Duration,
 ) -> String {
@@ -196,11 +196,11 @@ pub(super) async fn feed_text_until(
         let mut batch = EngineBatch::default();
         while let Some(item) = rx.try_next(&mut batch) {
             if let EngineFeed::Tab(
-                id,
+                key,
                 TabOutput::Bytes(bytes) | TabOutput::Scanned { data: bytes, .. },
             ) = item
             {
-                if id == tab_id {
+                if key == tab {
                     seen.push_str(&String::from_utf8_lossy(&bytes));
                 }
             }

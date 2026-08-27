@@ -22,6 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use roost_ui_model::keys::TabKey;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -220,7 +221,9 @@ fn spawn_listener(
     tokio::spawn(async move {
         if activation.await {
             tracing::info!(tab_id, "desktop notification clicked");
-            feed.send(EngineFeed::NotificationActivated { tab_id });
+            feed.send(EngineFeed::NotificationActivated {
+                tab: TabKey::local(tab_id),
+            });
         }
     })
 }
@@ -754,7 +757,7 @@ mod tests {
         let mut batch = engine_feed::EngineBatch::default();
         assert!(matches!(
             feed_rx.try_next(&mut batch),
-            Some(EngineFeed::NotificationActivated { tab_id: 7 })
+            Some(EngineFeed::NotificationActivated { tab }) if tab == TabKey::local(7)
         ));
     }
 
@@ -779,7 +782,7 @@ mod tests {
             .expect("the listener ended");
         assert!(matches!(
             feed_rx.try_next(&mut batch),
-            Some(EngineFeed::NotificationActivated { tab_id: 7 })
+            Some(EngineFeed::NotificationActivated { tab }) if tab == TabKey::local(7)
         ));
     }
 }

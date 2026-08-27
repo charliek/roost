@@ -322,8 +322,13 @@ mod tests {
     async fn send_input_reaches_the_pty() {
         let (_backend, handle, mut feed, supervisor) = cat(8_602);
         handle.send_input(b"backend-marker\n".to_vec());
-        let seen =
-            feed_text_until(&mut feed, 8_602, "backend-marker", Duration::from_secs(5)).await;
+        let seen = feed_text_until(
+            &mut feed,
+            TabKey::local(8_602),
+            "backend-marker",
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(
             seen.contains("backend-marker"),
             "input never round-tripped: {seen:?}"
@@ -339,7 +344,13 @@ mod tests {
     async fn send_replies_takes_the_input_path_under_drain_to_pty() {
         let (_backend, handle, mut feed, supervisor) = cat(8_603);
         handle.send_replies(b"reply-marker\n".to_vec());
-        let seen = feed_text_until(&mut feed, 8_603, "reply-marker", Duration::from_secs(5)).await;
+        let seen = feed_text_until(
+            &mut feed,
+            TabKey::local(8_603),
+            "reply-marker",
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(
             seen.contains("reply-marker"),
             "reply never round-tripped: {seen:?}"
@@ -361,7 +372,13 @@ mod tests {
         let (_backend, handle, mut feed, supervisor) = attached(8_604, &["/bin/sh".into()], true);
         handle.send_resize(90, 40);
         handle.send_input(b"stty size\nexit\n".to_vec());
-        let seen = feed_text_until(&mut feed, 8_604, "40 90", Duration::from_secs(10)).await;
+        let seen = feed_text_until(
+            &mut feed,
+            TabKey::local(8_604),
+            "40 90",
+            Duration::from_secs(10),
+        )
+        .await;
         assert!(
             seen.contains("40 90"),
             "resize never reached the PTY: {seen:?}"

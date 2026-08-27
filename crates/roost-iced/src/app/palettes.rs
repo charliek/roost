@@ -602,7 +602,7 @@ impl App {
     ) -> Result<(), String> {
         let metric_generation = self.metric_generation.wrapping_add(1).max(1);
         let (cols, rows) = terminal_grid(self.window_size, self.effective_sidebar_width(), metrics);
-        let mut tab_ids = self.tabs.keys().copied().collect::<Vec<_>>();
+        let mut tab_ids = self.tabs.keys().map(|key| key.tab).collect::<Vec<_>>();
         tab_ids.sort_unstable();
         let batched = apply_geometry_batch(
             &tab_ids,
@@ -619,7 +619,7 @@ impl App {
                     metric_generation,
                 } => self
                     .tabs
-                    .get_mut(&tab_id)
+                    .get_mut(&TabKey::local(tab_id))
                     .ok_or_else(|| {
                         format!("tab {tab_id} disappeared during {operation} application")
                     })?
@@ -627,7 +627,7 @@ impl App {
                     .map_err(|error| error.to_string()),
                 GeometryBatchOperation::Rollback { tab_id, previous } => self
                     .tabs
-                    .get_mut(&tab_id)
+                    .get_mut(&TabKey::local(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} disappeared during {operation} rollback"))?
                     .rollback_geometry(previous)
                     .map(|()| None)
@@ -656,7 +656,7 @@ impl App {
             if !change.metrics_changed {
                 continue;
             }
-            let release = match self.tabs.get_mut(tab_id) {
+            let release = match self.tabs.get_mut(&TabKey::local(*tab_id)) {
                 Some(tab) => tab.prepare_pointer_cancel(),
                 None => Err(anyhow::anyhow!(
                     "tab {tab_id} disappeared while staging pointer release"
@@ -674,7 +674,7 @@ impl App {
                         };
                         if let Err(rollback_error) = self
                             .tabs
-                            .get_mut(rollback_id)
+                            .get_mut(&TabKey::local(*rollback_id))
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "tab {rollback_id} disappeared during {operation} rollback"
@@ -697,12 +697,12 @@ impl App {
         self.terminal_metrics = metrics;
         self.metric_generation = metric_generation;
         for (tab_id, release) in pointer_releases {
-            if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            if let Some(tab) = self.tabs.get_mut(&TabKey::local(tab_id)) {
                 tab.commit_pointer_cancel(release);
             }
         }
         for (tab_id, change) in applied {
-            if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            if let Some(tab) = self.tabs.get_mut(&TabKey::local(tab_id)) {
                 tab.commit_geometry(change);
                 refresh_or_warn(tab_id, tab, operation);
             }
@@ -717,7 +717,7 @@ impl App {
     /// re-grid — so they refresh every tab they touched.
     fn refresh_regridded(&mut self, tab_ids: &[i64], operation: &str) {
         for tab_id in tab_ids {
-            if let Some(tab) = self.tabs.get_mut(tab_id) {
+            if let Some(tab) = self.tabs.get_mut(&TabKey::local(*tab_id)) {
                 refresh_or_warn(*tab_id, tab, operation);
             }
         }
@@ -1439,12 +1439,12 @@ impl App {
         let mut targets = self
             .tabs
             .iter()
-            .map(|(tab_id, tab)| (*tab_id, tab.theme.clone()))
+            .map(|(key, tab)| (key.tab, tab.theme.clone()))
             .collect::<Vec<_>>();
         targets.sort_by_key(|(tab_id, _)| *tab_id);
         if let Err(failure) = apply_theme_batch(&targets, &theme, |tab_id, candidate| {
             self.tabs
-                .get_mut(&tab_id)
+                .get_mut(&TabKey::local(tab_id))
                 .ok_or_else(|| format!("tab {tab_id} disappeared during theme application"))?
                 .set_theme(candidate)
                 .map_err(|error| error.to_string())

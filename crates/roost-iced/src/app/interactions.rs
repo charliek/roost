@@ -1350,7 +1350,7 @@ impl App {
             self.cancel_editor_for_interaction();
         }
         let link_modifier_held = self.link_modifier_held();
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, TabKey::local(tab_id)) else {
             tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
             return UiTask::None;
         };
@@ -1410,7 +1410,7 @@ impl App {
             col,
             row,
         } = event;
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, TabKey::local(tab_id)) else {
             tracing::debug!(tab_id, "ignored terminal wheel event for a closed tab");
             return UiTask::None;
         };
@@ -1429,7 +1429,7 @@ impl App {
     }
 
     pub fn pointer_leave(&mut self, tab_id: i64) {
-        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+        if let Some(tab) = self.tabs.get_mut(&TabKey::local(tab_id)) {
             tab.pointer_leave();
             if let Err(error) = tab.refresh_snapshot() {
                 tracing::warn!(?error, tab_id, "terminal hover refresh failed after leave");
@@ -1790,11 +1790,11 @@ fn paste_read_followup(
 /// — never the active tab, which may have changed while the clipboard
 /// read blocked. `None` means the probe found no image and already
 /// logged why.
-fn deliver_paste_image(tabs: &HashMap<i64, TerminalTab>, tab_id: i64, path: Option<&str>) {
+fn deliver_paste_image(tabs: &HashMap<TabKey, TerminalTab>, tab_id: i64, path: Option<&str>) {
     let Some(path) = path else {
         return;
     };
-    match tabs.get(&tab_id) {
+    match tabs.get(&TabKey::local(tab_id)) {
         Some(tab) => tab.paste(Some(path)),
         None => tracing::debug!(tab_id, "discarded clipboard image paste for a closed tab"),
     }
@@ -1810,12 +1810,13 @@ pub(super) fn paste_bytes(terminal: &Terminal, text: Option<&str>) -> Vec<u8> {
 impl App {
     pub(super) fn deliver_file_drop(&mut self, batch: PendingFileDrop) {
         let tab_id = batch.tab_id;
-        let origin_live = self.workspace.tab(tab_id).is_ok() && self.tabs.contains_key(&tab_id);
+        let key = TabKey::local(tab_id);
+        let origin_live = self.workspace.tab(tab_id).is_ok() && self.tabs.contains_key(&key);
         let disposition = dispatch_file_drop_batch(batch, origin_live, |text| {
             // The stable origin was stamped by the first window event. It
             // cannot change when another tab gains focus during debounce.
             self.tabs
-                .get(&tab_id)
+                .get(&key)
                 .expect("live file-drop origin must have a terminal adapter")
                 .paste(Some(text));
         });
@@ -1845,7 +1846,7 @@ impl App {
                 target,
                 value,
             } => {
-                let Some(tab) = self.tabs.get(&tab_id) else {
+                let Some(tab) = self.tabs.get(&TabKey::local(tab_id)) else {
                     tracing::debug!(tab_id, request_id, "discarded paste for a closed tab");
                     return self.clipboard.start_next();
                 };
@@ -1872,7 +1873,7 @@ impl App {
 
     pub(super) fn copy_active_selection(&mut self) -> UiTask {
         let tab_id = self.workspace.active().1;
-        let text = match self.tabs.get_mut(&tab_id) {
+        let text = match self.tabs.get_mut(&TabKey::local(tab_id)) {
             Some(tab) => match tab.selected_text() {
                 Ok(text) => text,
                 Err(error) => {
@@ -1888,7 +1889,7 @@ impl App {
 
     pub(super) fn paste_into_active(&mut self, target: ClipboardOp) -> UiTask {
         let tab_id = self.workspace.active().1;
-        if !self.tabs.contains_key(&tab_id) {
+        if !self.tabs.contains_key(&TabKey::local(tab_id)) {
             return UiTask::None;
         }
         self.clipboard.enqueue_paste_read(target, tab_id);
@@ -3714,7 +3715,7 @@ mod tests {
             .capture()
             .cloned()
             .expect("test-mode input capture");
-        let mut tabs = HashMap::from([(9_101_i64, tab)]);
+        let mut tabs = HashMap::from([(TabKey::local(9_101), tab)]);
 
         deliver_paste_image(
             &tabs,
@@ -3727,7 +3728,9 @@ mod tests {
         );
 
         capture.lock().unwrap().clear();
-        tabs.get_mut(&9_101).unwrap().write_vt(b"\x1b[?2004h");
+        tabs.get_mut(&TabKey::local(9_101))
+            .unwrap()
+            .write_vt(b"\x1b[?2004h");
         deliver_paste_image(
             &tabs,
             9_101,
@@ -4720,10 +4723,10 @@ mod tests {
     fn composing_pair(
         first: i64,
         second: i64,
-    ) -> (HashMap<i64, TerminalTab>, Vec<Arc<PtySupervisor>>) {
+    ) -> (HashMap<TabKey, TerminalTab>, Vec<Arc<PtySupervisor>>) {
         let (one, one_supervisor) = attached_test_terminal(first);
         let (two, two_supervisor) = attached_test_terminal(second);
-        let tabs = HashMap::from_iter([(first, one), (second, two)]);
+        let tabs = HashMap::from_iter([(TabKey::local(first), one), (TabKey::local(second), two)]);
         for tab in tabs.values() {
             clear_captured_input(tab);
         }
@@ -4744,8 +4747,8 @@ mod tests {
         );
         // The active tab already moved; the composition still owns the commit.
         commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(404), "你");
-        assert_eq!(captured_input(&tabs[&403]), "你".as_bytes());
-        assert!(captured_input(&tabs[&404]).is_empty());
+        assert_eq!(captured_input(&tabs[&TabKey::local(403)]), "你".as_bytes());
+        assert!(captured_input(&tabs[&TabKey::local(404)]).is_empty());
         supervisors[0].close(403);
         supervisors[1].close(404);
     }
@@ -4768,14 +4771,14 @@ mod tests {
         );
         // What a tab switch does: reconcile cancels every composition the
         // newly active tab does not own.
-        cancel_preedits(&mut tabs, &mut discard, Some(406));
+        cancel_preedits(&mut tabs, &mut discard, Some(TabKey::local(406)));
         commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(406), "你");
         assert!(
-            captured_input(&tabs[&405]).is_empty(),
+            captured_input(&tabs[&TabKey::local(405)]).is_empty(),
             "the cancelled composition must not type into the tab it left"
         );
         assert!(
-            captured_input(&tabs[&406]).is_empty(),
+            captured_input(&tabs[&TabKey::local(406)]).is_empty(),
             "nor into the tab that now owns the route"
         );
 
@@ -4790,8 +4793,8 @@ mod tests {
             );
         }
         commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(406), "好");
-        assert_eq!(captured_input(&tabs[&406]), "好".as_bytes());
-        assert!(captured_input(&tabs[&405]).is_empty());
+        assert_eq!(captured_input(&tabs[&TabKey::local(406)]), "好".as_bytes());
+        assert!(captured_input(&tabs[&TabKey::local(405)]).is_empty());
         supervisors[0].close(405);
         supervisors[1].close(406);
     }
@@ -4802,13 +4805,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_commit_with_no_composition_behind_it_still_reaches_the_route() {
         let (tab, supervisor) = attached_test_terminal(407);
-        let mut tabs = HashMap::from_iter([(407, tab)]);
-        clear_captured_input(&tabs[&407]);
+        let mut tabs = HashMap::from_iter([(TabKey::local(407), tab)]);
+        clear_captured_input(&tabs[&TabKey::local(407)]);
         let mut discard = ImeDiscard::default();
 
         commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(407), "👍");
-        assert_eq!(captured_input(&tabs[&407]), "👍".as_bytes());
-        clear_captured_input(&tabs[&407]);
+        assert_eq!(captured_input(&tabs[&TabKey::local(407)]), "👍".as_bytes());
+        clear_captured_input(&tabs[&TabKey::local(407)]);
 
         set_preedit_in(
             &mut tabs,
@@ -4820,7 +4823,7 @@ mod tests {
         cancel_preedits(&mut tabs, &mut discard, None);
         commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(407), "é");
         assert_eq!(
-            captured_input(&tabs[&407]),
+            captured_input(&tabs[&TabKey::local(407)]),
             "é".as_bytes(),
             "cancelling an already-empty composition arms nothing"
         );
