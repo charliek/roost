@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use roost_ui_model::keys::HostId;
+
 use super::*;
 
 pub(crate) struct AgentMetricsResult {
@@ -83,11 +85,18 @@ impl PendingAttachments {
         self.tabs.remove(&key);
     }
 
-    /// Forget every tab the workspace no longer lists — a spawn that
-    /// failed and rolled back, or a tab closed while it waited. Exhausted
-    /// entries go too: the mark belongs to a tab, not to an id.
-    pub(super) fn retain_live(&mut self, live: &HashSet<TabKey>) {
-        self.tabs.retain(|key, _| live.contains(key));
+    /// Forget every tab of `host` that its workspace no longer lists — a
+    /// spawn that failed and rolled back, or a tab closed while it
+    /// waited. Exhausted entries go too: the mark belongs to a tab, not
+    /// to an id.
+    ///
+    /// Scoped to one instance because `live` is one instance's snapshot:
+    /// another host's pending attaches are that host's reconcile to
+    /// prune, and dropping them here would be inferring their absence
+    /// from a listing they were never in.
+    pub(super) fn retain_live(&mut self, host: HostId, live: &HashSet<TabKey>) {
+        self.tabs
+            .retain(|key, _| key.host != host || live.contains(key));
     }
 
     /// Whether any tab is still owed a retry — the attach-retry
@@ -191,16 +200,12 @@ fn notification_activation(
     key: TabKey,
 ) -> Option<UiTask> {
     // The local workspace owns only the local id-space: a banner minted
-    // by a connection epoch that has since died carries that instance,
-    // and focusing its numeric id here would jump to whatever local tab
-    // happens to share the number.
-    if !key.is_local() {
-        tracing::debug!(?key, "notification click from another host instance");
-        return None;
-    }
-    let tab_id = key.tab;
-    if let Err(error) = focus_tab_in_core(workspace, tab_id) {
-        tracing::debug!(tab_id, %error, "notification click named a tab that is gone");
+    // by a connection epoch that has since died carries that instance, and
+    // focusing its numeric id here would jump to whatever local tab
+    // happens to share the number. `focus_tab_in_core` refuses it, which
+    // is the same guard every other engine sink now applies.
+    if let Err(error) = focus_tab_in_core(workspace, key) {
+        tracing::debug!(?key, %error, "notification click named a tab that is gone");
         return None;
     }
     Some(window_id.map_or(UiTask::None, UiTask::Focus))
@@ -365,19 +370,22 @@ impl App {
         self.refresh_notification_palette();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
-        // The workspace is the local id-space, so its ids qualify at
-        // `HostId::LOCAL`; a connected host's tabs are pruned by that
-        // host's own reconcile, never by this one.
+        // The workspace is one backend's id-space, so its ids qualify at
+        // that backend's instance — and the prune below is scoped to it
+        // for the same reason: a connected host's tabs are pruned by that
+        // host's own reconcile, and a snapshot this workspace never
+        // listed them in says nothing about them.
+        let host = self.backend.host();
         let live: HashSet<TabKey> = self
             .projects
             .iter()
-            .flat_map(|project| project.tabs.iter().map(|tab| TabKey::local(tab.id)))
+            .flat_map(|project| project.tabs.iter().map(|tab| TabKey::new(host, tab.id)))
             .collect();
-        self.tabs.retain(|key, _| live.contains(key));
-        self.pending_attachments.retain_live(&live);
-        let active_tab_id = self.workspace.active().1;
-        let active_key = TabKey::local(active_tab_id);
-        self.request_tab_reveal(active_tab_id);
+        self.tabs
+            .retain(|key, _| key.host != host || live.contains(key));
+        self.pending_attachments.retain_live(host, &live);
+        let active_key = self.active_tab_key();
+        self.request_tab_reveal(active_key);
         for (key, tab) in &mut self.tabs {
             if *key != active_key && tab.reset_pointer_state() {
                 refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
@@ -419,19 +427,28 @@ impl App {
     /// over IPC mutates the workspace in its handler and reaches the UI
     /// only as a broadcast, so a UI-side funnel would miss exactly the
     /// path the missing reveal was reported on.
-    fn request_tab_reveal(&mut self, active_tab_id: i64) {
-        if self.revealed_tab_id == Some(active_tab_id) {
+    fn request_tab_reveal(&mut self, active_tab: TabKey) {
+        if self.revealed_tab == Some(active_tab) {
             return;
         }
-        self.revealed_tab_id = Some(active_tab_id);
-        self.tab_reveal_request = Some(active_tab_id);
+        self.revealed_tab = Some(active_tab);
+        self.tab_reveal_request = Some(active_tab);
     }
 
     /// One attach attempt for a tab the workspace lists but the UI has no
     /// terminal for. Returns whether the tab is attached now — reconcile
     /// and the retry driver share this so a retry cannot drift from the
     /// attempt that preceded it.
-    fn attach_tab(&mut self, tab_id: i64) -> bool {
+    fn attach_tab(&mut self, key: TabKey) -> bool {
+        // The backend is asked for one of its OWN tabs. A key minted
+        // against another instance names nothing this backend has, and
+        // handing its number over would attach whichever local session
+        // shares the number.
+        if key.host != self.backend.host() {
+            tracing::debug!(?key, "attach requested for a tab on another instance");
+            return false;
+        }
+        let tab_id = key.tab;
         // Loading the theme and building the terminal costs a 256-entry
         // palette, a scrollback and the encoders — all discarded when the
         // backend's attach finds no session for the id. The retry driver
@@ -469,7 +486,7 @@ impl App {
                 // something refreshes it; nothing else will until the PTY
                 // emits its first bytes.
                 refresh_or_warn(tab_id, &mut tab, "newly attached tab");
-                self.tabs.insert(TabKey::local(tab_id), tab);
+                self.tabs.insert(key, tab);
                 true
             }
             Ok(None) => {
@@ -498,7 +515,7 @@ impl App {
     /// What exhaustion ends is the 25 ms timer and the warning, not the
     /// tab's chance to attach.
     fn attach_tab_tracked(&mut self, key: TabKey, now: Instant) {
-        if self.attach_tab(key.tab) {
+        if self.attach_tab(key) {
             self.pending_attachments.clear(key);
             return;
         }
@@ -526,7 +543,13 @@ impl App {
             }
             // Ask the workspace, not the last snapshot: a spawn that
             // failed rolls the tab back without the UI having reconciled.
-            if self.workspace.tab(key.tab).is_err() {
+            // The probe is a LOCAL liveness oracle, so it only disproves
+            // local keys — a non-local pending entry is its own host's to
+            // prune (reconcile is host-scoped the same way).
+            if key
+                .local_tab()
+                .is_some_and(|tab_id| self.workspace.tab(tab_id).is_err())
+            {
                 tracing::debug!(
                     tab_id = key.tab,
                     "dropped a pending attach the workspace no longer lists"
@@ -635,7 +658,18 @@ impl App {
             self.reconcile();
         }
         for key in pty.exited {
-            let _ = self.workspace.close_tab(key.tab);
+            // The exit closes the tab in the backend that owns it. The
+            // local workspace owns only the local id-space, so a key from
+            // any other instance must not reach `close_tab` — its number
+            // would close whichever local tab happens to share it. HS-2
+            // routes those to their own host's client; until then the
+            // drop below is the whole of it.
+            match key.local_tab() {
+                Some(tab_id) => {
+                    let _ = self.workspace.close_tab(tab_id);
+                }
+                None => tracing::debug!(?key, "PTY exit for a tab on another instance"),
+            }
             self.tabs.remove(&key);
         }
         // Idle ticks would otherwise bury every informative record under
@@ -659,16 +693,18 @@ impl App {
                 title,
                 body,
             } => {
-                if let Some((project_id, row_title)) = self.notification_title(tab_id) {
+                // The workspace broadcast is one backend's id-space.
+                let tab = self.backend.tab_key(tab_id);
+                if let Some((project, row_title)) = self.notification_title(tab) {
                     self.notification_inbox
                         .upsert(notification_inbox::NotificationRecord::new(
-                            tab_id,
-                            project_id,
+                            tab,
+                            project,
                             row_title,
                             body.clone(),
                         ));
                 }
-                self.desktop_notifications.fire(tab_id, title, body);
+                self.desktop_notifications.fire(tab, title, body);
             }
             WorkspaceEvent::TabNotification {
                 tab_id,
@@ -679,22 +715,24 @@ impl App {
                 // now-removed GTK UI used too) makes a later re-notify
                 // replace it — forgetting the id here would stack a
                 // duplicate beside it instead.
-                self.notification_inbox.remove(tab_id);
+                self.notification_inbox.remove(self.backend.tab_key(tab_id));
             }
             WorkspaceEvent::TabClosed { tab_id } => {
-                self.notification_inbox.remove(tab_id);
-                self.desktop_notifications.retire(tab_id);
+                let tab = self.backend.tab_key(tab_id);
+                self.notification_inbox.remove(tab);
+                self.desktop_notifications.retire(tab);
             }
             WorkspaceEvent::ProjectDeleted { project_id } => {
-                let stale: Vec<i64> = self
+                let project = ProjectKey::new(self.backend.host(), project_id);
+                let stale: Vec<TabKey> = self
                     .notification_inbox
                     .snapshot()
                     .iter()
-                    .filter(|record| record.project_id == project_id)
-                    .map(|record| record.tab_id)
+                    .filter(|record| record.project == project)
+                    .map(|record| record.tab)
                     .collect();
-                for tab_id in stale {
-                    self.notification_inbox.remove(tab_id);
+                for tab in stale {
+                    self.notification_inbox.remove(tab);
                 }
             }
             // The bridge turns a lagged broadcast into a full-snapshot
@@ -707,8 +745,12 @@ impl App {
         }
     }
 
-    fn notification_title(&self, tab_id: i64) -> Option<(i64, String)> {
+    fn notification_title(&self, key: TabKey) -> Option<(ProjectKey, String)> {
+        let tab_id = key.local_tab()?;
+        let host = self.backend.host();
         self.workspace.snapshot().into_iter().find_map(|project| {
+            let project_key = ProjectKey::new(host, project.id);
+            let project_name = project.name;
             project.tabs.into_iter().find_map(|tab| {
                 (tab.id == tab_id).then(|| {
                     let tab_title = if !tab.title.is_empty() {
@@ -719,8 +761,8 @@ impl App {
                         "Tab".to_string()
                     };
                     (
-                        project.id,
-                        notification_inbox::compose_title(&project.name, &tab_title),
+                        project_key,
+                        notification_inbox::compose_title(&project_name, &tab_title),
                     )
                 })
             })
@@ -728,7 +770,8 @@ impl App {
     }
 
     fn reconcile_notification_inbox(&mut self) {
-        let pending_rows: Vec<(i64, i64, String)> = self
+        let host = self.backend.host();
+        let pending_rows: Vec<(TabKey, ProjectKey, String)> = self
             .projects
             .iter()
             .flat_map(|project| {
@@ -745,25 +788,28 @@ impl App {
                             "Tab".to_string()
                         };
                         (
-                            tab.id,
-                            project.id,
+                            TabKey::new(host, tab.id),
+                            ProjectKey::new(host, project.id),
                             notification_inbox::compose_title(&project.name, &tab_title),
                         )
                     })
             })
             .collect();
-        let pending_ids: HashSet<i64> = pending_rows.iter().map(|row| row.0).collect();
-        let stale: Vec<i64> = self
+        let pending: HashSet<TabKey> = pending_rows.iter().map(|row| row.0).collect();
+        // Scoped to this backend's instance for `retain_live`'s reason: a
+        // connected host's rows are absent from this snapshot because it
+        // is not their snapshot, not because they were cleared.
+        let stale: Vec<TabKey> = self
             .notification_inbox
-            .tab_ids()
+            .tab_keys()
             .into_iter()
-            .filter(|tab_id| !pending_ids.contains(tab_id))
+            .filter(|tab| tab.host == host && !pending.contains(tab))
             .collect();
-        for tab_id in stale {
-            self.notification_inbox.remove(tab_id);
+        for tab in stale {
+            self.notification_inbox.remove(tab);
         }
 
-        let existing: HashSet<i64> = self.notification_inbox.tab_ids().into_iter().collect();
+        let existing: HashSet<TabKey> = self.notification_inbox.tab_keys().into_iter().collect();
         let slots = notification_inbox::CAP.saturating_sub(self.notification_inbox.count());
         let mut additions = Vec::with_capacity(slots);
         for row in pending_rows
@@ -775,10 +821,10 @@ impl App {
         }
         // Insert in reverse snapshot order so the first deterministic
         // project/tab fallback remains at the front after repeated prepends.
-        while let Some((tab_id, project_id, title)) = additions.pop() {
+        while let Some((tab, project, title)) = additions.pop() {
             self.notification_inbox
                 .upsert(notification_inbox::NotificationRecord::new(
-                    tab_id, project_id, title, "",
+                    tab, project, title, "",
                 ));
         }
     }
@@ -927,17 +973,20 @@ impl App {
             if self.window_id.is_none() {
                 return;
             }
-            let (active_project_id, active_tab_id) = self.workspace.active();
+            let host = self.backend.host();
+            let active_project = self.active_project_key();
+            let active_tab = self.active_tab_key();
             if self
                 .menu_window_rows
-                .matches(&self.projects, active_project_id, active_tab_id)
+                .matches(&self.projects, host, active_project, active_tab)
             {
                 return;
             }
             let rows = crate::macos::menu::WindowRows::derive(
                 &self.projects,
-                active_project_id,
-                active_tab_id,
+                host,
+                active_project,
+                active_tab,
             );
             let Some(mtm) = seam_on_main("window-menu rebuild") else {
                 return;
@@ -979,29 +1028,23 @@ impl App {
     }
 
     fn refresh_sidebar_agents(&mut self) {
-        let active_tab = self.workspace.active().1;
+        let host = self.backend.host();
         let now = agent_palette::now_unix();
         self.sidebar_agents = self
             .projects
             .iter()
             .map(|project| {
-                let rows = agent_palette::sidebar_agents(project, now)
-                    .into_iter()
-                    .map(|row| SidebarDumpAgentRow {
-                        tab_id: row.tab_id,
-                        name: row.name,
-                        lifecycle: row.lifecycle,
-                        status_text: row.status_text,
-                        time_text: row.time_text,
-                        is_active: row.tab_id == active_tab,
-                    })
-                    .collect();
-                (project.id, rows)
+                (
+                    ProjectKey::new(host, project.id),
+                    agent_palette::sidebar_agents(project, host, now),
+                )
             })
             .collect();
     }
 
     fn sidebar_dump(&self) -> SidebarDumpResult {
+        let host = self.backend.host();
+        let active_tab = self.active_tab_key();
         let projects = self
             .workspace
             .snapshot()
@@ -1010,9 +1053,20 @@ impl App {
                 project_id: project.id,
                 agents: self
                     .sidebar_agents
-                    .get(&project.id)
-                    .cloned()
-                    .unwrap_or_default(),
+                    .get(&ProjectKey::new(host, project.id))
+                    .into_iter()
+                    .flatten()
+                    // The dump is a wire result, so the keys narrow back
+                    // to the bare ids a client speaks.
+                    .map(|row| SidebarDumpAgentRow {
+                        tab_id: row.tab.tab,
+                        name: row.name.clone(),
+                        lifecycle: row.lifecycle,
+                        status_text: row.status_text.clone(),
+                        time_text: row.time_text.clone(),
+                        is_active: row.tab == active_tab,
+                    })
+                    .collect(),
             })
             .collect();
         SidebarDumpResult {
@@ -1023,14 +1077,14 @@ impl App {
 
     pub(super) fn apply_metrics_cache(
         &self,
-        cwds: &HashMap<i64, String>,
+        cwds: &HashMap<TabKey, String>,
         items: &mut [palette::PaletteItem],
     ) {
         for item in items {
-            let Some(tab_id) = agent_palette::agent_tab_id(&item.id) else {
+            let Some(tab) = agent_palette::agent_tab_key(&item.id) else {
                 continue;
             };
-            let (Some(agent), Some(cwd)) = (item.agent.as_mut(), cwds.get(&tab_id)) else {
+            let (Some(agent), Some(cwd)) = (item.agent.as_mut(), cwds.get(&tab)) else {
                 continue;
             };
             agent.metrics_text = self
@@ -1040,7 +1094,7 @@ impl App {
         }
     }
 
-    pub(super) fn spawn_agent_metrics(&mut self, cwds: &HashMap<i64, String>) {
+    pub(super) fn spawn_agent_metrics(&mut self, cwds: &HashMap<TabKey, String>) {
         self.metrics_cache.begin_session(self.palette_session);
         let claimed = self.metrics_cache.claim_unprobed(cwds.values().cloned());
         if claimed.is_empty() {
@@ -1101,6 +1155,10 @@ impl App {
         }
     }
 
+    /// The IPC wire is host-unaware by pin, so every `tab_id` below is
+    /// one of the local backend's bare ids — `backend.tab_key` is the
+    /// joint that qualifies them, exactly as the workspace's active
+    /// selection is qualified.
     fn apply_ui_request(&mut self, request: UiRequest) -> UiTask {
         let mut task = UiTask::None;
         match request {
@@ -1112,7 +1170,7 @@ impl App {
             UiRequest::Dump { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&TabKey::local(tab_id))
+                    .get(&self.backend.tab_key(tab_id))
                     .map(TerminalTab::dump)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -1122,7 +1180,7 @@ impl App {
                 data,
                 reply,
             } => {
-                let key = TabKey::local(tab_id);
+                let key = self.backend.tab_key(tab_id);
                 // Same ordering as the feed batch's tail: an OSC action can
                 // mutate the tab (pointer shape), so it lands before the
                 // refresh that publishes it, never after. That second
@@ -1151,7 +1209,7 @@ impl App {
             } => {
                 let result = self
                     .tabs
-                    .get(&TabKey::local(tab_id))
+                    .get(&self.backend.tab_key(tab_id))
                     .and_then(|tab| tab.session.capture())
                     .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
                     .and_then(|capture| {
@@ -1179,7 +1237,12 @@ impl App {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
                 } else {
                     match self.keyboard_route() {
-                        KeyboardRoute::Terminal(active_tab) if active_tab == tab_id => {
+                        // `tab_id` arrives off the wire, which is bare by
+                        // pin; the route it is checked against carries the
+                        // key, so both halves have to agree.
+                        KeyboardRoute::Terminal(active)
+                            if active == self.backend.tab_key(tab_id) =>
+                        {
                             match action.as_str() {
                                 "preedit" => {
                                     self.ime_preedit(text, cursor);
@@ -1196,9 +1259,10 @@ impl App {
                                 other => Err(format!("unknown tab.feed_ime action: {other}")),
                             }
                         }
-                        KeyboardRoute::Terminal(active_tab) => Err(format!(
+                        KeyboardRoute::Terminal(active) => Err(format!(
                             "tab {tab_id} is not the active terminal \
-                                 (keyboard route owns tab {active_tab})"
+                                 (keyboard route owns tab {})",
+                            active.tab
                         )),
                         KeyboardRoute::None
                         | KeyboardRoute::Confirm
@@ -1214,7 +1278,7 @@ impl App {
             UiRequest::TabDumpResolved { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&TabKey::local(tab_id))
+                    .get(&self.backend.tab_key(tab_id))
                     .map(TerminalTab::resolved_cells)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -1307,7 +1371,7 @@ impl App {
             UiRequest::AppCursorShape { reply } => {
                 let shape = self
                     .tabs
-                    .get(&TabKey::local(self.workspace.active().1))
+                    .get(&self.active_tab_key())
                     .map_or("default", TerminalTab::effective_pointer_shape);
                 let _ = reply.send(Ok(shape.into()));
             }
@@ -1411,7 +1475,7 @@ impl App {
             } => {
                 let result = self
                     .tabs
-                    .get_mut(&TabKey::local(tab_id))
+                    .get_mut(&self.backend.tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         let anchored = tab
@@ -1430,7 +1494,7 @@ impl App {
             UiRequest::SelectionClear { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get_mut(&TabKey::local(tab_id))
+                    .get_mut(&self.backend.tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         tab.selection.clear();
@@ -1441,7 +1505,7 @@ impl App {
             UiRequest::SelectionDump { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get_mut(&TabKey::local(tab_id))
+                    .get_mut(&self.backend.tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| tab.selection_dump().map_err(|error| error.to_string()));
                 let _ = reply.send(result);
@@ -1465,7 +1529,7 @@ impl App {
                     Err("tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch".into())
                 } else {
                     self.tabs
-                        .get_mut(&TabKey::local(tab_id))
+                        .get_mut(&self.backend.tab_key(tab_id))
                         .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                         .and_then(|tab| {
                             let expanded = tab.expand_selection_at(col, row, click_count);
@@ -1506,7 +1570,7 @@ impl App {
                         .map_err(|_| format!("modifier mask {mods} exceeds u16"))
                         .and_then(|mods| {
                             self.tabs
-                                .get_mut(&TabKey::local(tab_id))
+                                .get_mut(&self.backend.tab_key(tab_id))
                                 .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?
                                 .dispatch_pointer(kind, button, cell_x, cell_y, mods)
                                 .map_err(|error| error.to_string())
@@ -1522,9 +1586,18 @@ impl App {
         let tab_id = key.tab;
         for action in actions {
             match action {
-                OscAction::Workspace { command, payload } => {
-                    self.client.apply_osc(tab_id, command, &payload);
-                }
+                // The only arm that leaves the UI: `LocalClient` drives the
+                // local workspace, so a non-local tab's OSC would apply a
+                // title/cwd/agent claim to whatever local tab shares its
+                // number. HS-2 sends it to that host's client instead.
+                OscAction::Workspace { command, payload } => match key.local_tab() {
+                    Some(local_tab) => self.client.apply_osc(local_tab, command, &payload),
+                    None => tracing::debug!(
+                        ?key,
+                        %command,
+                        "workspace OSC from another instance is not the local client's to apply"
+                    ),
+                },
                 OscAction::ClipboardWrite { target, text } => {
                     if !enqueue_osc_clipboard_write(
                         &mut self.clipboard,
@@ -1736,7 +1809,7 @@ mod tests {
         assert!(!pending.has_retryable(), "and never re-arms the timer");
         assert_eq!(pending.tracked_keys(), vec![TabKey::local(9)]);
 
-        pending.retain_live(&HashSet::new());
+        pending.retain_live(HostId::LOCAL, &HashSet::new());
         assert!(
             pending.tracked_keys().is_empty(),
             "a closed tab is pruned exhausted mark and all"
@@ -1787,7 +1860,10 @@ mod tests {
             vec![TabKey::local(3), TabKey::local(5), TabKey::local(7)]
         );
 
-        pending.retain_live(&HashSet::from([TabKey::local(3), TabKey::local(7)]));
+        pending.retain_live(
+            HostId::LOCAL,
+            &HashSet::from([TabKey::local(3), TabKey::local(7)]),
+        );
         assert_eq!(
             pending.retry_keys(),
             vec![TabKey::local(3), TabKey::local(7)],
@@ -1796,7 +1872,7 @@ mod tests {
         pending.clear(TabKey::local(3));
         pending.clear(TabKey::local(7));
         assert!(pending.tracked_keys().is_empty());
-        pending.retain_live(&HashSet::from([TabKey::local(1)]));
+        pending.retain_live(HostId::LOCAL, &HashSet::from([TabKey::local(1)]));
         assert!(
             !pending.has_retryable(),
             "a live tab with no failed attach is not pending"
@@ -1928,6 +2004,100 @@ mod tests {
             "no stale byte was written through to the live terminal"
         );
         supervisor.close(77);
+    }
+
+    /// The same collision walked through the REAL drain, not the helper:
+    /// items are sent on a live feed, taken with `try_next`, dispatched by
+    /// the arms `service_engine` uses, and finished by its batch tail —
+    /// the tail being where `TabOutput::Exit` reaches `workspace.close_tab`
+    /// and a banner click reaches `focus_tab_in_core`. Those two are the
+    /// engine sinks, so this is the test that pins them: a dead epoch's
+    /// items must close nothing, focus nothing and write nothing.
+    ///
+    /// `App` has no test constructor (bootstrap needs a profile, the
+    /// instance lock and the Iced runtime), so the drain is reproduced
+    /// here against a real `Workspace` and a real attached tab.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_instances_items_survive_the_whole_drain_without_touching_the_local_tab() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").expect("project");
+        let live = workspace.open_tab(project.id, "/tmp", "live").expect("tab");
+        let other = workspace
+            .open_tab(project.id, "/tmp", "other")
+            .expect("tab");
+        workspace.focus_tab(other.id).expect("focus elsewhere");
+        workspace
+            .set_tab_has_notification(live.id, true)
+            .expect("mark pending");
+
+        let (feed_tx, _keep) = engine_feed::channel();
+        let (mut terminal, supervisor) = attach_test_terminal(live.id, feed_tx);
+        terminal.refresh_snapshot().expect("initial snapshot");
+        let mut tabs = HashMap::from([(TabKey::local(live.id), terminal)]);
+
+        // The dead epoch reuses the live tab's number — the whole point.
+        let stale = TabKey::new(HostId::new(9), live.id);
+        let (tx, mut rx) = engine_feed::channel();
+        assert!(tx.send(EngineFeed::Tab(
+            stale,
+            TabOutput::Bytes(b"\x1b[2J\x1b[Hstale".to_vec())
+        )));
+        assert!(tx.send(EngineFeed::Tab(
+            stale,
+            TabOutput::Exit {
+                status: 0,
+                reason: "shell exited".into(),
+            }
+        )));
+        assert!(tx.send(EngineFeed::NotificationActivated { tab: stale }));
+
+        // `service_engine`'s drain loop and batch tail, verbatim in shape.
+        let mut batch = EngineBatch::default();
+        let mut pty = TabOutputBatch::default();
+        let mut raised = 0;
+        while let Some(item) = rx.try_next(&mut batch) {
+            match item {
+                EngineFeed::Tab(key, output) => {
+                    collect_tab_output(&mut tabs, &mut pty, key, output);
+                }
+                EngineFeed::NotificationActivated { tab } => {
+                    if notification_activation(&workspace, Some(window::Id::unique()), tab)
+                        .is_some()
+                    {
+                        raised += 1;
+                    }
+                }
+                _ => panic!("only the two host-keyed arms were sent"),
+            }
+        }
+        for key in pty.exited {
+            if let Some(tab_id) = key.local_tab() {
+                let _ = workspace.close_tab(tab_id);
+            }
+            tabs.remove(&key);
+        }
+
+        assert_eq!(raised, 0, "a dead epoch's banner click earns no raise");
+        assert!(pty.error.is_none());
+        assert!(
+            workspace.tab(live.id).is_ok(),
+            "the exit must not have closed the local tab of that number"
+        );
+        assert_eq!(
+            workspace.active().1,
+            other.id,
+            "and the click must not have moved the focus"
+        );
+        let terminal = tabs
+            .get_mut(&TabKey::local(live.id))
+            .expect("the local tab is still attached");
+        terminal.refresh_snapshot().expect("refresh the live tab");
+        assert_eq!(
+            terminal.snapshot.grid[0].text.trim(),
+            "",
+            "and no stale byte was written through to it"
+        );
+        supervisor.close(live.id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

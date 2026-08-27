@@ -36,6 +36,7 @@ use objc2_app_kit::{
 use objc2_foundation::NSString;
 use roost_ipc::messages::{AppMenuDumpResult, MenuDump, MenuItemDump, Project};
 use roost_ui_model::keybind::{menu_accel_for_action, Accel, AccelMods, KeybindAction};
+use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 
@@ -55,9 +56,12 @@ pub(crate) enum MenuEvent {
     /// its row position: the activation rides the feed and is acted on a
     /// turn later, by which time a position could name a different project
     /// (plan 028 § 3.3).
-    SelectProject(i64),
-    /// A Window-menu tab row, by stable tab id — same reasoning.
-    SelectTab(i64),
+    /// Host-qualified: the row was built from one backend's snapshot, and
+    /// the turn's delay is exactly when a second id-space could reinterpret
+    /// a bare number.
+    SelectProject(ProjectKey),
+    /// A Window-menu tab row, by stable tab key — same reasoning.
+    SelectTab(TabKey),
     /// The App menu's "Check for Updates…". Like [`MenuEvent::Quit`] it
     /// is deliberately outside the command gating: Swift's item targets
     /// the updater controller, not the app delegate, so its
@@ -93,10 +97,11 @@ pub(crate) fn command_enabled(gating: MenuGating, palette_toggle: bool) -> bool 
 
 /// One dynamic Window-menu row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WindowRow {
-    /// The workspace id the row selects — stable, never a position, for
-    /// [`MenuEvent::SelectProject`]'s reason.
-    pub(crate) id: i64,
+pub(crate) struct WindowRow<K> {
+    /// The workspace key the row selects — stable, never a position, for
+    /// [`MenuEvent::SelectProject`]'s reason. Generic so a project row and
+    /// a tab row cannot be swapped for one another.
+    pub(crate) id: K,
     pub(crate) title: String,
     /// Renders as the row's checkmark.
     pub(crate) active: bool,
@@ -107,10 +112,10 @@ pub(crate) struct WindowRow {
 /// that moved nothing never touches AppKit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WindowRows {
-    pub(crate) projects: Vec<WindowRow>,
+    pub(crate) projects: Vec<WindowRow<ProjectKey>>,
     /// The tabs of the ACTIVE project only — `App.swift:3852`'s
     /// `tabsForActiveProject()`.
-    pub(crate) tabs: Vec<WindowRow>,
+    pub(crate) tabs: Vec<WindowRow<TabKey>>,
 }
 
 impl WindowRows {
@@ -118,26 +123,40 @@ impl WindowRows {
     /// (`App.swift:3830-3869`): projects by name, then the active
     /// project's tabs as "Tab N" — the position the user counts, not the
     /// tab's own title.
-    pub(crate) fn derive(projects: &[Project], active_project_id: i64, active_tab_id: i64) -> Self {
+    /// `host` is the instance `projects` was snapshotted from — the wire
+    /// type carries bare ids, so the caller is the only thing that knows
+    /// which id-space they belong to.
+    pub(crate) fn derive(
+        projects: &[Project],
+        host: HostId,
+        active_project: ProjectKey,
+        active_tab: TabKey,
+    ) -> Self {
         Self {
             projects: projects
                 .iter()
-                .map(|project| WindowRow {
-                    id: project.id,
-                    title: project.name.clone(),
-                    active: project.id == active_project_id,
+                .map(|project| {
+                    let key = ProjectKey::new(host, project.id);
+                    WindowRow {
+                        id: key,
+                        title: project.name.clone(),
+                        active: key == active_project,
+                    }
                 })
                 .collect(),
             tabs: projects
                 .iter()
-                .find(|project| project.id == active_project_id)
+                .find(|project| ProjectKey::new(host, project.id) == active_project)
                 .into_iter()
                 .flat_map(|project| project.tabs.iter())
                 .enumerate()
-                .map(|(index, tab)| WindowRow {
-                    id: tab.id,
-                    title: format!("Tab {}", index + 1),
-                    active: tab.id == active_tab_id,
+                .map(|(index, tab)| {
+                    let key = TabKey::new(host, tab.id);
+                    WindowRow {
+                        id: key,
+                        title: format!("Tab {}", index + 1),
+                        active: key == active_tab,
+                    }
                 })
                 .collect(),
         }
@@ -152,8 +171,9 @@ impl WindowRows {
     pub(crate) fn matches(
         &self,
         projects: &[Project],
-        active_project_id: i64,
-        active_tab_id: i64,
+        host: HostId,
+        active_project: ProjectKey,
+        active_tab: TabKey,
     ) -> bool {
         if self.projects.len() != projects.len() {
             return false;
@@ -163,9 +183,8 @@ impl WindowRows {
             .iter()
             .zip(projects.iter())
             .all(|(row, project)| {
-                row.id == project.id
-                    && row.title == project.name
-                    && row.active == (project.id == active_project_id)
+                let key = ProjectKey::new(host, project.id);
+                row.id == key && row.title == project.name && row.active == (key == active_project)
             });
         if !projects_match {
             return false;
@@ -173,7 +192,7 @@ impl WindowRows {
 
         let active_tabs = projects
             .iter()
-            .find(|project| project.id == active_project_id)
+            .find(|project| ProjectKey::new(host, project.id) == active_project)
             .into_iter()
             .flat_map(|project| project.tabs.iter());
 
@@ -182,8 +201,9 @@ impl WindowRows {
             let Some(row) = stored.next() else {
                 return false;
             };
-            if row.id != tab.id
-                || row.active != (tab.id == active_tab_id)
+            let key = TabKey::new(host, tab.id);
+            if row.id != key
+                || row.active != (key == active_tab)
                 || !title_is_tab_number(&row.title, index + 1)
             {
                 return false;
@@ -709,11 +729,11 @@ fn positional_accel(
         .and_then(|accel| accel_to_key_equivalent(&accel))
 }
 
-fn add_window_row(
+fn add_window_row<K>(
     mtm: MainThreadMarker,
     menu: &mut MainMenu,
     parent: &NSMenu,
-    row: &WindowRow,
+    row: &WindowRow<K>,
     event: MenuEvent,
     key: Option<(String, usize)>,
     gating: MenuGating,
@@ -972,8 +992,10 @@ fn menu_event_wire_name(event: &MenuEvent) -> String {
         MenuEvent::Action(action) => action.to_wire_name(),
         MenuEvent::Quit => "quit".into(),
         MenuEvent::CheckForUpdates => "check_for_updates".into(),
-        MenuEvent::SelectProject(id) => format!("select_project:{id}"),
-        MenuEvent::SelectTab(id) => format!("select_tab:{id}"),
+        // Wire names, so the key renders as the form a client speaks —
+        // bare for the local instance, qualified for any other.
+        MenuEvent::SelectProject(project) => format!("select_project:{project}"),
+        MenuEvent::SelectTab(tab) => format!("select_tab:{tab}"),
     }
 }
 
@@ -1214,30 +1236,118 @@ mod tests {
     /// by position rather than by title (`App.swift:3856`).
     #[test]
     fn the_rows_are_every_project_and_the_active_projects_tabs() {
-        let rows = WindowRows::derive(&workspace(), 1, 11);
+        let rows = WindowRows::derive(
+            &workspace(),
+            HostId::LOCAL,
+            ProjectKey::local(1),
+            TabKey::local(11),
+        );
 
         let projects: Vec<_> = rows
             .projects
             .iter()
             .map(|row| (row.id, row.title.as_str(), row.active))
             .collect();
-        assert_eq!(projects, vec![(1, "alpha", true), (2, "beta", false)]);
+        assert_eq!(
+            projects,
+            vec![
+                (ProjectKey::local(1), "alpha", true),
+                (ProjectKey::local(2), "beta", false)
+            ]
+        );
 
         let tabs: Vec<_> = rows
             .tabs
             .iter()
             .map(|row| (row.id, row.title.as_str(), row.active))
             .collect();
-        assert_eq!(tabs, vec![(10, "Tab 1", false), (11, "Tab 2", true)]);
+        assert_eq!(
+            tabs,
+            vec![
+                (TabKey::local(10), "Tab 1", false),
+                (TabKey::local(11), "Tab 2", true)
+            ]
+        );
+    }
+
+    /// A Window-menu activation rides the feed and is acted on a turn
+    /// later, so its row carries the instance the snapshot came from — not
+    /// a bare number to be re-read against whatever id-space is live by
+    /// then. The same snapshot read as two instances must therefore
+    /// produce rows that select two different tabs, and the active marks
+    /// of one instance must never land on the other's rows.
+    #[test]
+    fn a_window_row_selects_its_own_instances_tab_not_the_number() {
+        let host = HostId::new(4);
+        let remote = WindowRows::derive(
+            &workspace(),
+            host,
+            ProjectKey::new(host, 1),
+            TabKey::new(host, 11),
+        );
+        assert_eq!(remote.tabs[1].id, TabKey::new(host, 11));
+        assert!(remote.tabs[1].active);
+        assert_ne!(remote.tabs[1].id, TabKey::local(11));
+
+        // The local rows for the same numbers are a different selection.
+        let local = WindowRows::derive(
+            &workspace(),
+            HostId::LOCAL,
+            ProjectKey::local(1),
+            TabKey::local(11),
+        );
+        assert_ne!(local, remote);
+
+        // A local active mark cannot check a host's row, and vice versa.
+        let mismatched = WindowRows::derive(
+            &workspace(),
+            host,
+            ProjectKey::new(host, 1),
+            TabKey::local(11),
+        );
+        assert!(
+            mismatched.tabs.iter().all(|row| !row.active),
+            "tab 11 on the local instance is not tab 11 on this host"
+        );
+        assert!(!mismatched.matches(
+            &workspace(),
+            host,
+            ProjectKey::new(host, 1),
+            TabKey::new(host, 11)
+        ));
+
+        // The wire name a client sees stays bare for the local instance
+        // and is qualified for any other.
+        assert_eq!(
+            menu_event_wire_name(&MenuEvent::SelectTab(TabKey::local(11))),
+            "select_tab:11"
+        );
+        assert_eq!(
+            menu_event_wire_name(&MenuEvent::SelectTab(TabKey::new(host, 11))),
+            "select_tab:h4.11"
+        );
+        assert_eq!(
+            menu_event_wire_name(&MenuEvent::SelectProject(ProjectKey::local(1))),
+            "select_project:1"
+        );
+        assert_eq!(
+            menu_event_wire_name(&MenuEvent::SelectProject(ProjectKey::new(host, 1))),
+            "select_project:h4.1"
+        );
     }
 
     /// Selecting the other project re-aims the tab rows at ITS tabs.
     #[test]
     fn switching_project_switches_which_tabs_the_rows_show() {
-        let rows = WindowRows::derive(&workspace(), 2, 20);
+        let rows = WindowRows::derive(
+            &workspace(),
+            HostId::LOCAL,
+            ProjectKey::local(2),
+            TabKey::local(20),
+        );
         assert_eq!(
             rows.tabs.iter().map(|row| row.id).collect::<Vec<_>>(),
-            vec![20]
+            vec![TabKey::local(20)]
         );
         assert!(rows.projects[1].active && !rows.projects[0].active);
     }
@@ -1247,42 +1357,111 @@ mod tests {
     /// never a panic and never a row pointing at a project that is gone.
     #[test]
     fn an_unknown_active_project_leaves_the_tab_rows_empty() {
-        let rows = WindowRows::derive(&workspace(), 99, 10);
+        let rows = WindowRows::derive(
+            &workspace(),
+            HostId::LOCAL,
+            ProjectKey::local(99),
+            TabKey::local(10),
+        );
         assert_eq!(rows.projects.len(), 2);
         assert!(rows.projects.iter().all(|row| !row.active));
         assert!(rows.tabs.is_empty());
-        assert_eq!(WindowRows::derive(&[], 0, 0), WindowRows::default());
+        assert_eq!(
+            WindowRows::derive(&[], HostId::LOCAL, ProjectKey::local(0), TabKey::local(0)),
+            WindowRows::default()
+        );
     }
 
     /// The change detection reconcile leans on: every field the menu
     /// renders is part of the comparison, and nothing else is.
     #[test]
     fn the_model_compares_equal_only_when_the_menu_would_look_the_same() {
-        let base = WindowRows::derive(&workspace(), 1, 10);
-        assert_eq!(base, WindowRows::derive(&workspace(), 1, 10));
+        let base = WindowRows::derive(
+            &workspace(),
+            HostId::LOCAL,
+            ProjectKey::local(1),
+            TabKey::local(10),
+        );
+        assert_eq!(
+            base,
+            WindowRows::derive(
+                &workspace(),
+                HostId::LOCAL,
+                ProjectKey::local(1),
+                TabKey::local(10)
+            )
+        );
 
         // A tab's own title is not rendered, so churning it is not a
         // rebuild; its cwd and position aren't either.
         let mut untouched = workspace();
         untouched[0].tabs[0].title = "renamed by the shell".into();
         untouched[0].tabs[0].cwd = "/elsewhere".into();
-        assert_eq!(base, WindowRows::derive(&untouched, 1, 10));
+        assert_eq!(
+            base,
+            WindowRows::derive(
+                &untouched,
+                HostId::LOCAL,
+                ProjectKey::local(1),
+                TabKey::local(10)
+            )
+        );
 
         // Everything the menu does render is.
         let mut renamed = workspace();
         renamed[0].name = "renamed".into();
-        assert_ne!(base, WindowRows::derive(&renamed, 1, 10));
+        assert_ne!(
+            base,
+            WindowRows::derive(
+                &renamed,
+                HostId::LOCAL,
+                ProjectKey::local(1),
+                TabKey::local(10)
+            )
+        );
 
         let mut reordered = workspace();
         reordered.swap(0, 1);
-        assert_ne!(base, WindowRows::derive(&reordered, 1, 10));
+        assert_ne!(
+            base,
+            WindowRows::derive(
+                &reordered,
+                HostId::LOCAL,
+                ProjectKey::local(1),
+                TabKey::local(10)
+            )
+        );
 
         let mut closed = workspace();
         closed[0].tabs.pop();
-        assert_ne!(base, WindowRows::derive(&closed, 1, 10));
+        assert_ne!(
+            base,
+            WindowRows::derive(
+                &closed,
+                HostId::LOCAL,
+                ProjectKey::local(1),
+                TabKey::local(10)
+            )
+        );
 
-        assert_ne!(base, WindowRows::derive(&workspace(), 1, 11));
-        assert_ne!(base, WindowRows::derive(&workspace(), 2, 10));
+        assert_ne!(
+            base,
+            WindowRows::derive(
+                &workspace(),
+                HostId::LOCAL,
+                ProjectKey::local(1),
+                TabKey::local(11)
+            )
+        );
+        assert_ne!(
+            base,
+            WindowRows::derive(
+                &workspace(),
+                HostId::LOCAL,
+                ProjectKey::local(2),
+                TabKey::local(10)
+            )
+        );
     }
 
     /// The equivalence pin `sync_window_menu` leans on for skipping
@@ -1298,16 +1477,19 @@ mod tests {
             active_project_id: i64,
             active_tab_id: i64,
         ) {
-            let expected = WindowRows::derive(projects, active_project_id, active_tab_id) == *rows;
+            let active_project = ProjectKey::local(active_project_id);
+            let active_tab = TabKey::local(active_tab_id);
+            let expected =
+                WindowRows::derive(projects, HostId::LOCAL, active_project, active_tab) == *rows;
             assert_eq!(
-                rows.matches(projects, active_project_id, active_tab_id),
+                rows.matches(projects, HostId::LOCAL, active_project, active_tab),
                 expected,
                 "projects={projects:?} active_project_id={active_project_id} active_tab_id={active_tab_id} rows={rows:?}"
             );
         }
 
         let ws = workspace();
-        let base = WindowRows::derive(&ws, 1, 11);
+        let base = WindowRows::derive(&ws, HostId::LOCAL, ProjectKey::local(1), TabKey::local(11));
 
         // Exact match.
         check(&base, &ws, 1, 11);

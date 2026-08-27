@@ -6,6 +6,20 @@
 //! stops identifying anything. These keys are what the UI's maps, feed
 //! events and lookups are keyed on instead.
 
+use std::fmt;
+
+/// The one wire encoder both keys share: a local key renders as the bare
+/// engine id, so every id on the wire today is byte-identical to what it
+/// was before keys existed; another instance's key is prefixed, so two
+/// instances' rows can never collide in a client's hands.
+fn write_wire(f: &mut fmt::Formatter<'_>, host: HostId, id: i64) -> fmt::Result {
+    if host.is_local() {
+        write!(f, "{id}")
+    } else {
+        write!(f, "h{}.{id}", host.raw())
+    }
+}
+
 /// A UI-local id for one connection *instance*, not for a host name.
 ///
 /// Connecting a host mints a fresh `HostId`; reconnecting the same saved
@@ -47,6 +61,14 @@ pub struct TabKey {
     pub tab: i64,
 }
 
+/// The id-space-qualified form a wire-facing row id carries (palette rows,
+/// native menu wire names, the macOS notification identifier).
+impl fmt::Display for TabKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_wire(f, self.host, self.tab)
+    }
+}
+
 impl TabKey {
     pub const fn new(host: HostId, tab: i64) -> Self {
         Self { host, tab }
@@ -61,6 +83,49 @@ impl TabKey {
     pub const fn is_local(self) -> bool {
         self.host.is_local()
     }
+
+    /// The bare id to hand the in-process engine, or `None` when this key
+    /// belongs to another instance.
+    ///
+    /// The engine and the IPC wire are host-unaware by design, so every
+    /// call into them is a narrowing — and a key from a dead (or another)
+    /// connection epoch names a tab the local workspace has never heard
+    /// of. Answering `None` is what stops that numeric id being applied
+    /// to whichever local tab happens to share it.
+    pub const fn local_tab(self) -> Option<i64> {
+        if self.is_local() {
+            Some(self.tab)
+        } else {
+            None
+        }
+    }
+
+    /// The id-space-qualified form a wire-facing row id carries (palette
+    /// rows, native menu wire names), as an owned string.
+    ///
+    /// [`Display`](std::fmt::Display) is the encoder; prefer interpolating
+    /// the key directly when the result is going into a larger string.
+    pub fn to_wire(self) -> String {
+        self.to_string()
+    }
+
+    /// Inverse of [`Self::to_wire`]. `None` for anything malformed — the
+    /// empty-sentinel row ids included — and for any non-canonical
+    /// spelling: the round-trip `from_wire(s)?.to_wire() == s` is the
+    /// contract, so `h0.7` (the local host is always bare), `+7`, or a
+    /// leading zero are rejected rather than normalized. A parser that
+    /// aliased several spellings onto one key would let a crafted row id
+    /// reach a tab its literal text never named.
+    pub fn from_wire(text: &str) -> Option<Self> {
+        let key = match text.strip_prefix('h') {
+            Some(qualified) => {
+                let (host, tab) = qualified.split_once('.')?;
+                Self::new(HostId::new(host.parse().ok()?), tab.parse().ok()?)
+            }
+            None => Self::local(text.parse().ok()?),
+        };
+        (key.to_string() == text).then_some(key)
+    }
 }
 
 /// One project, qualified the same way [`TabKey`] is.
@@ -68,6 +133,14 @@ impl TabKey {
 pub struct ProjectKey {
     pub host: HostId,
     pub project: i64,
+}
+
+/// [`TabKey`]'s wire form, on the same encoder — so a project row id
+/// never has to borrow `TabKey`'s to render.
+impl fmt::Display for ProjectKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_wire(f, self.host, self.project)
+    }
 }
 
 impl ProjectKey {
@@ -81,6 +154,15 @@ impl ProjectKey {
 
     pub const fn is_local(self) -> bool {
         self.host.is_local()
+    }
+
+    /// [`TabKey::local_tab`]'s twin, for the ops that take a project.
+    pub const fn local_project(self) -> Option<i64> {
+        if self.is_local() {
+            Some(self.project)
+        } else {
+            None
+        }
     }
 }
 
@@ -131,6 +213,54 @@ mod tests {
             Some(&"local"),
             "dropping a host's tab leaves the local tab of the same id"
         );
+    }
+
+    /// The narrowing every engine and IPC call goes through: a key from
+    /// another instance names nothing the local workspace owns.
+    #[test]
+    fn only_a_local_key_yields_an_engine_id() {
+        assert_eq!(TabKey::local(7).local_tab(), Some(7));
+        assert_eq!(TabKey::new(HostId::new(1), 7).local_tab(), None);
+        assert_eq!(ProjectKey::local(3).local_project(), Some(3));
+        assert_eq!(ProjectKey::new(HostId::new(1), 3).local_project(), None);
+    }
+
+    /// The wire form stays byte-identical for local keys — every palette
+    /// row id and menu wire name a client sees today is a bare number.
+    #[test]
+    fn the_wire_form_is_bare_for_local_and_qualified_otherwise() {
+        assert_eq!(TabKey::local(42).to_wire(), "42");
+        assert_eq!(TabKey::new(HostId::new(3), 42).to_wire(), "h3.42");
+
+        for key in [
+            TabKey::local(0),
+            TabKey::local(42),
+            TabKey::new(HostId::new(1), 42),
+            TabKey::new(HostId::new(9), -1),
+        ] {
+            assert_eq!(TabKey::from_wire(&key.to_wire()), Some(key));
+        }
+        assert_eq!(TabKey::from_wire("none"), None);
+        assert_eq!(TabKey::from_wire(""), None);
+        assert_eq!(TabKey::from_wire("h1"), None);
+        assert_eq!(TabKey::from_wire("h.1"), None);
+        assert_eq!(TabKey::from_wire("hx.1"), None);
+        // Non-canonical spellings are rejected, not normalized: the
+        // local host is always bare, and integers have one spelling.
+        assert_eq!(TabKey::from_wire("h0.7"), None);
+        assert_eq!(TabKey::from_wire("+7"), None);
+        assert_eq!(TabKey::from_wire("07"), None);
+        assert_eq!(TabKey::from_wire("h01.7"), None);
+        assert_ne!(
+            TabKey::from_wire("h1.42"),
+            TabKey::from_wire("42"),
+            "the same number on two instances parses to two keys"
+        );
+
+        // Projects render on the same encoder, so a menu wire name never
+        // has to borrow `TabKey`'s.
+        assert_eq!(ProjectKey::local(1).to_string(), "1");
+        assert_eq!(ProjectKey::new(HostId::new(4), 1).to_string(), "h4.1");
     }
 
     #[test]

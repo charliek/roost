@@ -74,30 +74,34 @@ pub(super) struct GeometryChange {
     pub(super) deferred_replies: Vec<u8>,
 }
 
+/// One step of a geometry batch, addressed by the SAME key the caller's
+/// tab map is keyed on. The walk never narrows to a bare id and re-widens
+/// it: the tab whose geometry moved is the tab the key names, whichever
+/// instance that is.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum GeometryBatchOperation {
     Apply {
-        tab_id: i64,
+        tab: TabKey,
         cols: u16,
         rows: u16,
         metrics: TerminalMetrics,
         metric_generation: u64,
     },
     Rollback {
-        tab_id: i64,
+        tab: TabKey,
         previous: TerminalGeometry,
     },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct GeometryBatchFailure {
-    pub(super) tab_id: i64,
+    pub(super) tab: TabKey,
     pub(super) apply: String,
-    pub(super) rollback: Vec<(i64, String)>,
+    pub(super) rollback: Vec<(TabKey, String)>,
 }
 
 pub(super) fn apply_geometry_batch(
-    tab_ids: &[i64],
+    keys: &[TabKey],
     cols: u16,
     rows: u16,
     metrics: TerminalMetrics,
@@ -105,35 +109,35 @@ pub(super) fn apply_geometry_batch(
     mut transition: impl FnMut(
         GeometryBatchOperation,
     ) -> std::result::Result<Option<GeometryChange>, String>,
-) -> std::result::Result<Vec<(i64, GeometryChange)>, GeometryBatchFailure> {
-    let mut applied = Vec::with_capacity(tab_ids.len());
-    for tab_id in tab_ids {
+) -> std::result::Result<Vec<(TabKey, GeometryChange)>, GeometryBatchFailure> {
+    let mut applied = Vec::with_capacity(keys.len());
+    for key in keys {
         let operation = GeometryBatchOperation::Apply {
-            tab_id: *tab_id,
+            tab: *key,
             cols,
             rows,
             metrics,
             metric_generation,
         };
         match transition(operation) {
-            Ok(Some(change)) => applied.push((*tab_id, change)),
+            Ok(Some(change)) => applied.push((*key, change)),
             Ok(None) => {}
             Err(error) => {
                 let rollback = applied
                     .iter()
                     .rev()
-                    .filter_map(|(rollback_id, change): &(i64, GeometryChange)| {
+                    .filter_map(|(rollback_key, change): &(TabKey, GeometryChange)| {
                         let previous = change.previous?;
                         transition(GeometryBatchOperation::Rollback {
-                            tab_id: *rollback_id,
+                            tab: *rollback_key,
                             previous,
                         })
                         .err()
-                        .map(|error| (*rollback_id, error))
+                        .map(|error| (*rollback_key, error))
                     })
                     .collect();
                 return Err(GeometryBatchFailure {
-                    tab_id: *tab_id,
+                    tab: *key,
                     apply: error,
                     rollback,
                 });

@@ -32,6 +32,7 @@ use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcClient;
+use roost_ui_model::keys::{ProjectKey, TabKey};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -76,8 +77,13 @@ enum Message {
     ClipboardWriteCompleted(u64),
     /// A clipboard image probe finished. `path` is the temp PNG to paste,
     /// or `None` when the clipboard held no usable image.
+    ///
+    /// `tab` is the tab whose paste asked for it, host-qualified: the
+    /// probe blocks, so this is a delayed callback and its target must
+    /// not be reinterpreted against whatever id-space is live when it
+    /// lands.
     PasteImageMaterialized {
-        tab_id: i64,
+        tab: TabKey,
         path: Option<String>,
     },
     UrlOpenCompleted(Result<(), String>),
@@ -93,18 +99,18 @@ enum Message {
         window_id: window::Id,
         path: std::path::PathBuf,
     },
-    ProjectSelected(i64),
-    BeginRenameProject(i64),
-    AgentSelected(i64),
-    TabSelected(i64),
-    BeginRenameTab(i64),
+    ProjectSelected(ProjectKey),
+    BeginRenameProject(ProjectKey),
+    AgentSelected(TabKey),
+    TabSelected(TabKey),
+    BeginRenameTab(TabKey),
     TabStrip(strip_reorder::StripEvent),
     ProjectStrip(strip_reorder::StripEvent),
     StripPointerReleased,
     RenameDraftChanged(String),
     RenameSubmit,
     RenamePointerDismiss,
-    CloseTab(i64),
+    CloseTab(TabKey),
     NewTab,
     NewProject,
     ConfirmDeleteCancel,
@@ -412,8 +418,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::ClipboardWriteCompleted(request_id) => {
             app.clipboard_write_completed(request_id).map_task()
         }
-        Message::PasteImageMaterialized { tab_id, path } => {
-            app.paste_image_materialized(tab_id, path.as_deref());
+        Message::PasteImageMaterialized { tab, path } => {
+            app.paste_image_materialized(tab, path.as_deref());
             Task::none()
         }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
@@ -730,9 +736,10 @@ impl UiTask for app::UiTask {
             // `update` in `Executor::enter`, i.e. this runs inside the
             // application's tokio runtime. The blocking pool is what keeps
             // the clipboard round-trip and the PNG encode off the UI thread.
-            app::UiTask::PasteImageProbe { tab_id } => Task::perform(
+            app::UiTask::PasteImageProbe { tab } => Task::perform(
                 tokio::task::spawn_blocking(paste_image::materialize),
                 move |joined| {
+                    let tab_id = tab.tab;
                     let path = match joined {
                         Ok(Ok(path)) => Some(path.to_string_lossy().into_owned()),
                         Ok(Err(error)) => {
@@ -744,7 +751,7 @@ impl UiTask for app::UiTask {
                             None
                         }
                     };
-                    Message::PasteImageMaterialized { tab_id, path }
+                    Message::PasteImageMaterialized { tab, path }
                 },
             ),
             app::UiTask::FileDropDeadline(delay) => {

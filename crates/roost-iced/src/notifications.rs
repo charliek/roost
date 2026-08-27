@@ -35,13 +35,13 @@ const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 /// What the UI thread hands the worker.
 enum Request {
     Fire {
-        tab_id: i64,
+        tab: TabKey,
         title: String,
         body: String,
     },
     /// The tab closed or its notification was cleared. The now-removed
     /// GTK UI let gio own this map; here it is ours, so it needs telling.
-    Retire { tab_id: i64 },
+    Retire { tab: TabKey },
 }
 
 /// One tab's live desktop notification, as far as this adapter knows.
@@ -94,10 +94,13 @@ impl Shown {
 /// Linux and a second backend has one shape to implement.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Payload {
-    /// The tab this fired for. Backends that key their notifications by
-    /// tab rather than by server id build their identifier from it; the
-    /// freedesktop one replaces via [`Payload::replaces`] and ignores it.
-    pub(crate) tab_id: i64,
+    /// The tab this fired for, host-qualified. Backends that key their
+    /// notifications by tab rather than by server id build their
+    /// identifier from it, and the OS identifier space is process-wide —
+    /// so two instances' tab 7 must not name the same banner. The
+    /// freedesktop backend replaces via [`Payload::replaces`] and ignores
+    /// this field.
+    pub(crate) tab: TabKey,
     pub(crate) title: String,
     /// `None` when the notification carried no body — an empty body line
     /// is worse than none, and the now-removed GTK UI omitted it the
@@ -136,16 +139,12 @@ impl DesktopNotifications {
         Self { tx }
     }
 
-    pub(crate) fn fire(&self, tab_id: i64, title: String, body: String) {
-        self.send(Request::Fire {
-            tab_id,
-            title,
-            body,
-        });
+    pub(crate) fn fire(&self, tab: TabKey, title: String, body: String) {
+        self.send(Request::Fire { tab, title, body });
     }
 
-    pub(crate) fn retire(&self, tab_id: i64) {
-        self.send(Request::Retire { tab_id });
+    pub(crate) fn retire(&self, tab: TabKey) {
+        self.send(Request::Retire { tab });
     }
 
     fn send(&self, request: Request) {
@@ -160,11 +159,11 @@ where
     F: Fn(Payload) -> Fut,
     Fut: Future<Output = Result<Shown, String>>,
 {
-    let mut slots: HashMap<i64, TabSlot> = HashMap::new();
+    let mut slots: HashMap<TabKey, TabSlot> = HashMap::new();
     while let Some(request) = rx.recv().await {
-        let (tab_id, title, body) = match request {
-            Request::Retire { tab_id } => {
-                if let Some(mut slot) = slots.remove(&tab_id) {
+        let (tab, title, body) = match request {
+            Request::Retire { tab } => {
+                if let Some(mut slot) = slots.remove(&tab) {
                     slot.abort_listener();
                     #[cfg(target_os = "linux")]
                     if let Some(id) = slot.server_id {
@@ -178,16 +177,13 @@ where
                 }
                 continue;
             }
-            Request::Fire {
-                tab_id,
-                title,
-                body,
-            } => (tab_id, title, body),
+            Request::Fire { tab, title, body } => (tab, title, body),
         };
-        let previous = slots.get(&tab_id).and_then(|slot| slot.server_id);
+        let tab_id = tab.tab;
+        let previous = slots.get(&tab).and_then(|slot| slot.server_id);
         let shown = match tokio::time::timeout(
             SHOW_TIMEOUT,
-            show(build_payload(tab_id, title, body, previous)),
+            show(build_payload(tab, title, body, previous)),
         )
         .await
         {
@@ -203,8 +199,8 @@ where
         };
         let listener = shown
             .activation
-            .map(|activation| spawn_listener(&feed, tab_id, activation).abort_handle());
-        record_shown(&mut slots, tab_id, shown.server_id, listener);
+            .map(|activation| spawn_listener(&feed, tab, activation).abort_handle());
+        record_shown(&mut slots, tab, shown.server_id, listener);
     }
 }
 
@@ -214,23 +210,25 @@ where
 /// worker abort it at any moment.
 fn spawn_listener(
     feed: &EngineFeedSender,
-    tab_id: i64,
+    tab: TabKey,
     activation: Activation,
 ) -> tokio::task::JoinHandle<()> {
     let feed = feed.clone();
     tokio::spawn(async move {
         if activation.await {
-            tracing::info!(tab_id, "desktop notification clicked");
-            feed.send(EngineFeed::NotificationActivated {
-                tab: TabKey::local(tab_id),
-            });
+            tracing::info!(tab_id = tab.tab, "desktop notification clicked");
+            // The key the fire was raised under, carried verbatim: a
+            // banner outlives the connection epoch that raised it, and
+            // re-minting a local key here is exactly how a dead epoch's
+            // click would land on a live tab of the same number.
+            feed.send(EngineFeed::NotificationActivated { tab });
         }
     })
 }
 
-fn build_payload(tab_id: i64, title: String, body: String, replaces: Option<u32>) -> Payload {
+fn build_payload(tab: TabKey, title: String, body: String, replaces: Option<u32>) -> Payload {
     Payload {
-        tab_id,
+        tab,
         title,
         body: (!body.is_empty()).then_some(body),
         replaces,
@@ -250,15 +248,15 @@ fn build_payload(tab_id: i64, title: String, body: String, replaces: Option<u32>
 /// while a show that produced none leaves the previous listener awaiting
 /// the banner that is still up.
 fn record_shown(
-    slots: &mut HashMap<i64, TabSlot>,
-    tab_id: i64,
+    slots: &mut HashMap<TabKey, TabSlot>,
+    tab: TabKey,
     server_id: Option<u32>,
     listener: Option<AbortHandle>,
 ) {
     if server_id.is_none() && listener.is_none() {
         return;
     }
-    let slot = slots.entry(tab_id).or_default();
+    let slot = slots.entry(tab).or_default();
     if server_id.is_some() {
         slot.server_id = server_id;
     }
@@ -503,7 +501,7 @@ mod backend {
     /// pretending a banner reached anyone.
     pub(super) async fn show(payload: Payload, _app_id: String) -> Result<Shown, String> {
         let Payload {
-            tab_id: _,
+            tab: _,
             title,
             body,
             replaces,
@@ -522,6 +520,8 @@ mod backend {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    use roost_ui_model::keys::HostId;
 
     use super::*;
     use crate::engine_feed;
@@ -599,18 +599,18 @@ mod tests {
     #[test]
     fn an_empty_body_is_omitted_and_the_title_travels_verbatim() {
         assert_eq!(
-            build_payload(7, "Claude".into(), String::new(), None),
+            build_payload(TabKey::local(7), "Claude".into(), String::new(), None),
             Payload {
-                tab_id: 7,
+                tab: TabKey::local(7),
                 title: "Claude".into(),
                 body: None,
                 replaces: None,
             }
         );
         assert_eq!(
-            build_payload(7, String::new(), "  ".into(), Some(4)),
+            build_payload(TabKey::local(7), String::new(), "  ".into(), Some(4)),
             Payload {
-                tab_id: 7,
+                tab: TabKey::local(7),
                 title: String::new(),
                 body: Some("  ".into()),
                 replaces: Some(4),
@@ -622,16 +622,16 @@ mod tests {
     #[test]
     fn a_show_that_returned_no_id_keeps_the_previous_one() {
         let mut slots = HashMap::new();
-        record_shown(&mut slots, 7, Some(11), None);
-        record_shown(&mut slots, 7, None, None);
+        record_shown(&mut slots, TabKey::local(7), Some(11), None);
+        record_shown(&mut slots, TabKey::local(7), None, None);
         assert_eq!(
-            slots.get(&7).and_then(|slot| slot.server_id),
+            slots.get(&TabKey::local(7)).and_then(|slot| slot.server_id),
             Some(11),
             "a failed show must not orphan the notification still on screen"
         );
-        record_shown(&mut slots, 8, None, None);
+        record_shown(&mut slots, TabKey::local(8), None, None);
         assert!(
-            !slots.contains_key(&8),
+            !slots.contains_key(&TabKey::local(8)),
             "a tab that never showed anything gets no slot"
         );
     }
@@ -647,17 +647,17 @@ mod tests {
         let notifications =
             DesktopNotifications::spawn_on(&tokio::runtime::Handle::current(), show, feed);
 
-        notifications.fire(7, "Claude".into(), "needs input".into());
+        notifications.fire(TabKey::local(7), "Claude".into(), "needs input".into());
         let first = shown.recv().await.expect("the worker showed the first");
         assert_eq!(first.replaces, None, "nothing to replace yet");
         assert_eq!(first.body.as_deref(), Some("needs input"));
 
-        notifications.fire(7, "Claude".into(), "done".into());
+        notifications.fire(TabKey::local(7), "Claude".into(), "done".into());
         let second = shown.recv().await.expect("the worker showed the second");
         assert_eq!(second.replaces, Some(11));
 
         // The second show failed, so the third still targets id 11.
-        notifications.fire(7, "Claude".into(), String::new());
+        notifications.fire(TabKey::local(7), "Claude".into(), String::new());
         let third = shown.recv().await.expect("the worker showed the third");
         assert_eq!(third.replaces, Some(11));
         assert_eq!(third.body, None);
@@ -670,18 +670,18 @@ mod tests {
         let notifications =
             DesktopNotifications::spawn_on(&tokio::runtime::Handle::current(), show, feed);
 
-        notifications.fire(7, "seven".into(), "one".into());
+        notifications.fire(TabKey::local(7), "seven".into(), "one".into());
         assert_eq!(shown.recv().await.expect("first show").replaces, None);
 
-        notifications.fire(8, "eight".into(), "one".into());
+        notifications.fire(TabKey::local(8), "eight".into(), "one".into());
         assert_eq!(
             shown.recv().await.expect("second show").replaces,
             None,
             "a different tab has its own slot"
         );
 
-        notifications.retire(7);
-        notifications.fire(7, "seven".into(), "two".into());
+        notifications.retire(TabKey::local(7));
+        notifications.fire(TabKey::local(7), "seven".into(), "two".into());
         assert_eq!(
             shown.recv().await.expect("third show").replaces,
             None,
@@ -702,9 +702,9 @@ mod tests {
         let notifications =
             DesktopNotifications::spawn_on(&tokio::runtime::Handle::current(), show, feed);
 
-        notifications.fire(7, "Claude".into(), "one".into());
+        notifications.fire(TabKey::local(7), "Claude".into(), "one".into());
         shown.recv().await.expect("first show");
-        notifications.fire(7, "Claude".into(), "two".into());
+        notifications.fire(TabKey::local(7), "Claude".into(), "two".into());
         shown.recv().await.expect("second show");
         first_ended.recv().await.expect("the first listener ended");
         assert!(
@@ -712,7 +712,7 @@ mod tests {
             "the listener for the banner now on screen stays live"
         );
 
-        notifications.fire(7, "Claude".into(), "three".into());
+        notifications.fire(TabKey::local(7), "Claude".into(), "three".into());
         shown.recv().await.expect("third show");
         second_ended
             .recv()
@@ -729,9 +729,9 @@ mod tests {
         let notifications =
             DesktopNotifications::spawn_on(&tokio::runtime::Handle::current(), show, feed);
 
-        notifications.fire(7, "Claude".into(), "one".into());
+        notifications.fire(TabKey::local(7), "Claude".into(), "one".into());
         shown.recv().await.expect("first show");
-        notifications.retire(7);
+        notifications.retire(TabKey::local(7));
         first_ended
             .recv()
             .await
@@ -751,7 +751,7 @@ mod tests {
         let notifications =
             DesktopNotifications::spawn_on(&tokio::runtime::Handle::current(), show, feed);
 
-        notifications.fire(7, "Claude".into(), "needs input".into());
+        notifications.fire(TabKey::local(7), "Claude".into(), "needs input".into());
         shown.recv().await.expect("first show");
         wake.notified().await;
         let mut batch = engine_feed::EngineBatch::default();
@@ -769,7 +769,7 @@ mod tests {
         let (feed, mut feed_rx) = engine_feed::channel();
         let mut batch = engine_feed::EngineBatch::default();
 
-        spawn_listener(&feed, 7, Box::pin(std::future::ready(false)))
+        spawn_listener(&feed, TabKey::local(7), Box::pin(std::future::ready(false)))
             .await
             .expect("the listener ended");
         assert!(
@@ -777,12 +777,69 @@ mod tests {
             "a dismissed banner is not a jump"
         );
 
-        spawn_listener(&feed, 7, Box::pin(std::future::ready(true)))
+        spawn_listener(&feed, TabKey::local(7), Box::pin(std::future::ready(true)))
             .await
             .expect("the listener ended");
         assert!(matches!(
             feed_rx.try_next(&mut batch),
             Some(EngineFeed::NotificationActivated { tab }) if tab == TabKey::local(7)
         ));
+    }
+
+    /// A click is a DELAYED callback — the banner can outlive the
+    /// connection epoch that raised it by minutes. The activation must
+    /// carry the key the fire was raised under, so a dead epoch's click
+    /// cannot be re-read as the live local tab of the same number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_click_carries_the_instance_its_banner_was_raised_for() {
+        let stale = TabKey::new(HostId::new(9), 7);
+        let (feed, mut feed_rx) = engine_feed::channel();
+        let mut batch = engine_feed::EngineBatch::default();
+
+        spawn_listener(&feed, stale, Box::pin(std::future::ready(true)))
+            .await
+            .expect("the listener ended");
+        let activated = feed_rx.try_next(&mut batch);
+        assert!(matches!(
+            activated,
+            Some(EngineFeed::NotificationActivated { tab }) if tab == stale
+        ));
+        assert!(
+            !matches!(
+                activated,
+                Some(EngineFeed::NotificationActivated { tab }) if tab == TabKey::local(7)
+            ),
+            "the local tab 7 is a different tab and must not be named"
+        );
+    }
+
+    /// One banner per tab, and two instances' tab 7 are two tabs: the
+    /// slot map must not let a host's fire replace the local tab's banner
+    /// (or vice versa).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_instances_of_the_same_tab_number_keep_separate_banners() {
+        let stale = TabKey::new(HostId::new(9), 7);
+        let (show, mut shown) = recording_backend(vec![banner(11), banner(21), banner(31)]);
+        let (feed, _feed_rx) = engine_feed::channel();
+        let notifications =
+            DesktopNotifications::spawn_on(&tokio::runtime::Handle::current(), show, feed);
+
+        notifications.fire(TabKey::local(7), "local".into(), "one".into());
+        assert_eq!(shown.recv().await.expect("first show").replaces, None);
+
+        notifications.fire(stale, "host".into(), "one".into());
+        let second = shown.recv().await.expect("second show");
+        assert_eq!(
+            second.replaces, None,
+            "another instance's tab 7 has its own slot"
+        );
+        assert_eq!(second.tab, stale);
+
+        notifications.fire(TabKey::local(7), "local".into(), "two".into());
+        assert_eq!(
+            shown.recv().await.expect("third show").replaces,
+            Some(11),
+            "the local tab replaces its OWN banner, not the host's"
+        );
     }
 }

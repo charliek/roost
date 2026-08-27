@@ -14,6 +14,8 @@
 //! one for the same reason: rediscovering them later would mean
 //! re-cutting a landed abstraction.
 
+use roost_ui_model::keys::HostId;
+
 use super::*;
 
 pub(super) enum TabBackend {
@@ -64,6 +66,25 @@ impl TabBackend {
         })
     }
 
+    /// The instance whose id-space this backend's bare ids belong to.
+    ///
+    /// The backend's own API stays bare i64 — it is engine-facing, and the
+    /// engine is host-unaware — so this is the seam that says what those
+    /// ids mean. HS-2's `Host` variant answers with its connection's
+    /// minted instance instead, and every caller below is then correct
+    /// without moving.
+    pub(super) fn host(&self) -> HostId {
+        match self {
+            Self::InProcess(_) => HostId::LOCAL,
+        }
+    }
+
+    /// Qualify one of this backend's bare ids. The single joint between
+    /// the engine's id-space and the UI's keyed maps.
+    pub(super) fn tab_key(&self, tab_id: i64) -> TabKey {
+        TabKey::new(self.host(), tab_id)
+    }
+
     /// Attach to a tab this backend already has a live session for, and
     /// start the forwarder that puts its output on `feed`.
     ///
@@ -76,7 +97,7 @@ impl TabBackend {
         feed: EngineFeedSender,
     ) -> Result<TabHandle> {
         match self {
-            Self::InProcess(backend) => backend.attach(tab_id, theme_colors, feed),
+            Self::InProcess(backend) => backend.attach(self.tab_key(tab_id), theme_colors, feed),
         }
     }
 
@@ -100,7 +121,7 @@ impl TabBackend {
 impl InProcessBackend {
     fn attach(
         &self,
-        tab_id: i64,
+        key: TabKey,
         theme_colors: OscColorSnapshot,
         feed: EngineFeedSender,
     ) -> Result<TabHandle> {
@@ -112,7 +133,7 @@ impl InProcessBackend {
         // double every reply.
         let session = TabSession::attach_scanned(
             Arc::clone(&self.supervisor),
-            tab_id,
+            key.tab,
             output_tx,
             capture.clone(),
             Some(theme_colors),
@@ -121,7 +142,7 @@ impl InProcessBackend {
         // is what puts PTY output in the same arrival order as everything
         // else the app reacts to, and what arms the feed's wake for it.
         let forwarder =
-            tokio::spawn(engine_feed::pump_tab_output(tab_id, output_rx, feed)).abort_handle();
+            tokio::spawn(engine_feed::pump_tab_output(key, output_rx, feed)).abort_handle();
         Ok(TabHandle {
             kind: TabHandleKind::InProcess(session),
             capture,

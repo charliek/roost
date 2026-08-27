@@ -43,7 +43,7 @@ use roost_ui_model::{
     config::{self, RoostConfig},
     custom_command,
     keybind::{self, Accel, AccelMods, KeybindAction},
-    keys::TabKey,
+    keys::{ProjectKey, TabKey},
     notification_inbox, palette, provider,
     rollup::project_rollup,
     window_title,
@@ -123,11 +123,11 @@ const CONFIRM_PANEL_WIDTH: f32 = 420.0;
 /// the same rule as every other one.
 const RENAME_FIELD_WIDTH: f32 = 140.0;
 
-/// The tab pill the strip reveal scrolls to. Keyed by tab id alone: the
+/// The tab pill the strip reveal scrolls to. Keyed by the tab alone: the
 /// pill for a tab is one container wherever the strip reorders it to, and
-/// a reveal issued for an id that has since closed simply finds nothing.
-fn tab_pill_id(tab_id: i64) -> Id {
-    Id::from(format!("tab-pill:{tab_id}"))
+/// a reveal issued for a tab that has since closed simply finds nothing.
+fn tab_pill_id(tab: TabKey) -> Id {
+    Id::from(format!("tab-pill:{tab}"))
 }
 
 #[derive(Debug, Default)]
@@ -164,19 +164,25 @@ impl StatusBanner {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfirmDeleteProject {
-    project_id: i64,
+    project: ProjectKey,
     name: String,
     tab_count: usize,
 }
 
-fn confirm_delete_target(projects: &[Project], project_id: i64) -> Option<ConfirmDeleteProject> {
+fn confirm_delete_target(
+    projects: &[Project],
+    project: ProjectKey,
+) -> Option<ConfirmDeleteProject> {
+    // The snapshot is the local workspace's, so only a local key can name
+    // a row in it.
+    let project_id = project.local_project()?;
     projects
         .iter()
-        .find(|project| project.id == project_id)
-        .map(|project| ConfirmDeleteProject {
-            project_id: project.id,
-            name: project.name.clone(),
-            tab_count: project.tabs.len(),
+        .find(|candidate| candidate.id == project_id)
+        .map(|candidate| ConfirmDeleteProject {
+            project,
+            name: candidate.name.clone(),
+            tab_count: candidate.tabs.len(),
         })
 }
 
@@ -189,7 +195,7 @@ fn reconcile_confirm_delete(confirm: &mut Option<ConfirmDeleteProject>, projects
         // (App.swift:3145-3182), but its alert is modal so nothing can
         // close a tab underneath it; ours stays open across IPC traffic,
         // and quoting a count the project no longer has would be a lie.
-        *confirm = confirm_delete_target(projects, open.project_id);
+        *confirm = confirm_delete_target(projects, open.project);
     }
 }
 
@@ -312,26 +318,30 @@ pub enum EngineOpResult {
     /// nothing stashed under it.
     TabClosed {
         op: u64,
-        tab_id: i64,
+        tab: TabKey,
         result: Result<CloseTabOutcome, String>,
     },
     ProjectDeleted {
-        project_id: i64,
+        project: ProjectKey,
         result: Result<DeleteProjectOutcome, String>,
     },
     /// One tab opened: the new-tab routes and the launcher's rows. `op`
     /// keys the deferred palette reply exactly as [`Self::TabClosed`]'s
     /// does.
+    ///
+    /// The engine mints the new id in its own id-space; the dispatch
+    /// qualifies it at the backend it dispatched to, which is the only
+    /// thing that knows which one that was.
     TabOpened {
         op: u64,
-        project_id: i64,
-        result: Result<i64, String>,
+        project: ProjectKey,
+        result: Result<TabKey, String>,
     },
     /// A project and its first tab, from the one compound op that
     /// creates both.
     ProjectCreated {
         op: u64,
-        result: Result<(i64, i64), String>,
+        result: Result<(ProjectKey, TabKey), String>,
     },
     /// `op` is the id the editor recorded at dispatch: a completion that
     /// no longer matches belongs to an editor the user has already
@@ -344,6 +354,12 @@ pub enum EngineOpResult {
     /// `op` is the id the drag preview recorded at dispatch, so a
     /// superseded reorder's completion cannot clear a newer drag's
     /// preview.
+    ///
+    /// Bare, deliberately: `ordered_ids` is the order this op HANDED the
+    /// engine, echoed back so the preview can tell a superseded reorder
+    /// from a current one. It is a wire payload round-tripping, not
+    /// routing state — and it is already scoped by `project_id`, which
+    /// only the strip that dispatched it can have produced.
     TabsReordered {
         op: u64,
         project_id: i64,
@@ -391,25 +407,25 @@ fn spawn_engine_op<T: Send + 'static>(
 /// every arm.
 fn engine_op_status(result: EngineOpResult) -> Option<String> {
     match result {
-        EngineOpResult::TabClosed { tab_id, result, .. } => match result {
+        EngineOpResult::TabClosed { tab, result, .. } => match result {
             Ok(CloseTabOutcome::Closed) => None,
             Ok(CloseTabOutcome::AlreadyGone) => {
-                tracing::debug!(tab_id, "close_tab: rendered tab already gone");
+                tracing::debug!(?tab, "close_tab: rendered tab already gone");
                 None
             }
             Err(error) => {
-                tracing::warn!(%error, tab_id, "close_tab failed");
+                tracing::warn!(%error, ?tab, "close_tab failed");
                 Some(error)
             }
         },
-        EngineOpResult::ProjectDeleted { project_id, result } => match result {
+        EngineOpResult::ProjectDeleted { project, result } => match result {
             Ok(DeleteProjectOutcome::Deleted) => None,
             Ok(DeleteProjectOutcome::AlreadyGone) => {
-                tracing::debug!(project_id, "confirmed delete: project already gone");
+                tracing::debug!(?project, "confirmed delete: project already gone");
                 None
             }
             Err(error) => {
-                tracing::warn!(%error, project_id, "delete project failed");
+                tracing::warn!(%error, ?project, "delete project failed");
                 Some(error)
             }
         },
@@ -422,20 +438,20 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         | EngineOpResult::TabsReordered { .. }
         | EngineOpResult::ProjectsReordered { .. } => None,
         EngineOpResult::TabOpened {
-            project_id, result, ..
+            project, result, ..
         } => match result {
-            Ok(tab_id) => {
-                tracing::debug!(project_id, tab_id, "opened tab");
+            Ok(tab) => {
+                tracing::debug!(?project, ?tab, "opened tab");
                 None
             }
             Err(error) => {
-                tracing::warn!(%error, project_id, "open tab failed");
+                tracing::warn!(%error, ?project, "open tab failed");
                 Some(error)
             }
         },
         EngineOpResult::ProjectCreated { result, .. } => match result {
-            Ok((project_id, tab_id)) => {
-                tracing::debug!(project_id, tab_id, "created project");
+            Ok((project, tab)) => {
+                tracing::debug!(?project, ?tab, "created project");
                 None
             }
             Err(error) => {
@@ -577,7 +593,13 @@ fn drop_drag_and_collapse(drag_width: &mut Option<f32>, workspace: &Workspace) {
 /// there?" guard — a route holding only a `&Workspace` (the notification
 /// banner's click, which arrives with no `&mut App` in hand) gets both from
 /// this one call.
-fn focus_tab_in_core(workspace: &Workspace, tab_id: i64) -> Result<(), String> {
+fn focus_tab_in_core(workspace: &Workspace, tab: TabKey) -> Result<(), String> {
+    // The local workspace owns only the local id-space; another
+    // instance's tab is not this workspace's to focus, and applying its
+    // number here would jump to whatever local tab shares it.
+    let tab_id = tab.local_tab().ok_or_else(|| {
+        format!("tab {tab:?} belongs to another instance; the local workspace cannot focus it")
+    })?;
     workspace
         .focus_tab(tab_id)
         .map_err(|error| error.to_string())?;
@@ -682,15 +704,18 @@ enum KeyboardRoute {
     Confirm,
     Editor,
     Palette,
-    Terminal(i64),
+    /// The terminal that owns the keyboard, host-qualified so a
+    /// composition or a keystroke can never be delivered to another
+    /// instance's tab of the same number.
+    Terminal(TabKey),
 }
 
 /// The tab a preedit update belongs to. Only a terminal that owns the
 /// keyboard may hold a composition — every other surface has its own
 /// `TextInput`, which requests its own IME.
-fn ime_preedit_target(route: KeyboardRoute) -> Option<i64> {
+fn ime_preedit_target(route: KeyboardRoute) -> Option<TabKey> {
     match route {
-        KeyboardRoute::Terminal(tab_id) => Some(tab_id),
+        KeyboardRoute::Terminal(tab) => Some(tab),
         KeyboardRoute::None
         | KeyboardRoute::Confirm
         | KeyboardRoute::Editor
@@ -701,7 +726,7 @@ fn ime_preedit_target(route: KeyboardRoute) -> Option<i64> {
 /// The tab a commit belongs to. The tab holding the composition wins over
 /// the current route, so a commit that races a tab switch still lands
 /// where the user was typing.
-fn ime_commit_target(preedit_holder: Option<i64>, route: KeyboardRoute) -> Option<i64> {
+fn ime_commit_target(preedit_holder: Option<TabKey>, route: KeyboardRoute) -> Option<TabKey> {
     preedit_holder.or_else(|| ime_preedit_target(route))
 }
 
@@ -759,12 +784,13 @@ fn set_preedit_in(
     text: String,
     cursor: Option<Range<usize>>,
 ) {
-    let Some(tab_id) = ime_preedit_target(route) else {
+    let Some(key) = ime_preedit_target(route) else {
         return;
     };
-    let Some(tab) = tabs.get_mut(&TabKey::local(tab_id)) else {
+    let Some(tab) = tabs.get_mut(&key) else {
         return;
     };
+    let tab_id = key.tab;
     // Only a fresh composition disarms the latch. An empty preedit is the
     // clear winit sends immediately before every commit, so treating that
     // as a new composition would defeat the discard.
@@ -786,24 +812,27 @@ fn commit_ime_in(
     if discard.claims_commit() {
         return;
     }
+    // The holder's WHOLE key travels to the lookup: reducing it to a
+    // number here and re-qualifying it below would hand the commit to
+    // whichever instance the route happens to name.
     let holder = tabs
         .iter()
         .find(|(_, tab)| tab.preedit.is_some())
-        .map(|(key, _)| key.tab);
-    let Some(tab_id) = ime_commit_target(holder, route) else {
+        .map(|(key, _)| *key);
+    let Some(key) = ime_commit_target(holder, route) else {
         return;
     };
-    let Some(tab) = tabs.get_mut(&TabKey::local(tab_id)) else {
+    let Some(tab) = tabs.get_mut(&key) else {
         return;
     };
     if let Err(error) = tab.commit_ime(text) {
-        tracing::warn!(?error, tab_id, "terminal IME commit failed");
+        tracing::warn!(?error, tab_id = key.tab, "terminal IME commit failed");
     }
 }
 
 /// Whether the terminal for `active_tab` should ask the platform for an
 /// input method: it owns the keyboard and the window has focus.
-fn terminal_ime_active(route: KeyboardRoute, active_tab: i64, window_focused: bool) -> bool {
+fn terminal_ime_active(route: KeyboardRoute, active_tab: TabKey, window_focused: bool) -> bool {
     window_focused && ime_preedit_target(route) == Some(active_tab)
 }
 
@@ -820,7 +849,7 @@ fn resolve_keyboard_route(
     confirm_open: bool,
     editor_open: bool,
     palette_open: bool,
-    active_tab: i64,
+    active_tab: TabKey,
     active_terminal_live: bool,
 ) -> KeyboardRoute {
     if confirm_open {
@@ -871,7 +900,7 @@ pub enum UiTask {
     /// image. The read + PNG encode block, so this runs off the UI
     /// thread and reports back as `Message::PasteImageMaterialized`.
     PasteImageProbe {
-        tab_id: i64,
+        tab: TabKey,
     },
     /// One-shot: wake once the file-drop gesture's debounce window has
     /// elapsed. Scheduled where the deadline is set, never polled.
@@ -1041,7 +1070,7 @@ impl PillLabel {
 /// two same-typed flags.
 #[derive(Debug, Clone, Copy)]
 struct PillKey<'a> {
-    id: i64,
+    tab: TabKey,
     title: &'a str,
     active: bool,
     has_notification: bool,
@@ -1081,17 +1110,17 @@ fn elide_pill_title(key: PillKey<'_>) -> (Cow<'_, str>, f32) {
 
 /// Recompute `labels` for exactly `keys`, skipping every tab whose key is
 /// unchanged and dropping every tab that is no longer in the strip.
-fn refresh_pill_label_map(labels: &mut HashMap<i64, PillLabel>, keys: &[PillKey<'_>]) {
+fn refresh_pill_label_map(labels: &mut HashMap<TabKey, PillLabel>, keys: &[PillKey<'_>]) {
     for &key in keys {
         if labels
-            .get(&key.id)
+            .get(&key.tab)
             .is_some_and(|stored| stored.matches(key))
         {
             continue;
         }
         let (label, width) = elide_pill_title(key);
         labels.insert(
-            key.id,
+            key.tab,
             PillLabel {
                 title: key.title.to_owned(),
                 active: key.active,
@@ -1101,7 +1130,7 @@ fn refresh_pill_label_map(labels: &mut HashMap<i64, PillLabel>, keys: &[PillKey<
             },
         );
     }
-    labels.retain(|id, _| keys.iter().any(|key| key.id == *id));
+    labels.retain(|tab, _| keys.iter().any(|key| key.tab == *tab));
 }
 
 /// The display string a pill shows for `title` — an untitled tab reads
@@ -1121,7 +1150,7 @@ pub struct App {
     client: LocalClient,
     tabs: HashMap<TabKey, TerminalTab>,
     projects: Vec<Project>,
-    sidebar_agents: HashMap<i64, Vec<SidebarDumpAgentRow>>,
+    sidebar_agents: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>>,
     notification_inbox: notification_inbox::NotificationInbox,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
@@ -1160,7 +1189,7 @@ pub struct App {
     /// constants (`pill_title_metrics`). If the budget ever becomes
     /// window-relative, or the chrome font configurable, the key must grow
     /// to match or pills will render at a stale width.
-    pill_labels: HashMap<i64, PillLabel>,
+    pill_labels: HashMap<TabKey, PillLabel>,
     tab_drag_preview: Option<TabDragPreview>,
     tab_strip_generation: u64,
     project_drag_preview: Option<ProjectDragPreview>,
@@ -1195,8 +1224,8 @@ pub struct App {
     /// against the workspace's active tab in `reconcile()`, which is what
     /// makes the reveal fire for every activation route — including raw
     /// IPC, which never touches a UI focus helper.
-    revealed_tab_id: Option<i64>,
-    tab_reveal_request: Option<i64>,
+    revealed_tab: Option<TabKey>,
+    tab_reveal_request: Option<TabKey>,
     exit_state: ExitState,
     /// The gating value last pushed to the native menu bar, so the seam is
     /// touched only when the keyboard route actually moved.
@@ -1380,7 +1409,7 @@ impl App {
             palette_selected_in_view: None,
             palette_visibility_request: PaletteVisibilityRequest::None,
             tab_strip_scroll_id: Id::unique(),
-            revealed_tab_id: None,
+            revealed_tab: None,
             tab_reveal_request: None,
             exit_state: ExitState::default(),
             #[cfg(target_os = "macos")]
@@ -1453,6 +1482,7 @@ impl App {
     /// they are memoized.
     fn refresh_pill_labels(&mut self) {
         let (active_project, active_tab) = self.workspace.active();
+        let host = self.backend.host();
         let keys: Vec<PillKey<'_>> = self
             .projects
             .iter()
@@ -1462,7 +1492,7 @@ impl App {
                     .tabs
                     .iter()
                     .map(|tab| PillKey {
-                        id: tab.id,
+                        tab: TabKey::new(host, tab.id),
                         title: pill_display_title(&tab.title),
                         active: tab.id == active_tab,
                         has_notification: tab.has_notification,
@@ -1722,7 +1752,7 @@ impl App {
             self.modifiers = *modifiers;
             let held = self.link_modifier_held();
             let tab_id = self.workspace.active().1;
-            if let Some(tab) = self.tabs.get_mut(&TabKey::local(tab_id)) {
+            if let Some(tab) = self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
                 if let Err(error) = tab
                     .set_link_modifier_held(held)
                     .and_then(|()| tab.refresh_snapshot())
@@ -1801,10 +1831,11 @@ impl App {
             }
         }
 
-        let KeyboardRoute::Terminal(active_tab) = self.keyboard_route() else {
+        let KeyboardRoute::Terminal(active_key) = self.keyboard_route() else {
             return UiTask::None;
         };
-        let Some(tab) = self.tabs.get_mut(&TabKey::local(active_tab)) else {
+        let active_tab = active_key.tab;
+        let Some(tab) = self.tabs.get_mut(&active_key) else {
             return UiTask::None;
         };
         // A bare page key scrolls this tab's own scrollback whenever the shared
@@ -1841,7 +1872,7 @@ impl App {
     /// Whether the terminal that owns the keyboard is mid-composition.
     fn terminal_composing(&self) -> bool {
         ime_preedit_target(self.keyboard_route())
-            .and_then(|tab_id| self.tabs.get(&TabKey::local(tab_id)))
+            .and_then(|key| self.tabs.get(&key))
             .is_some_and(|tab| tab.preedit.is_some())
     }
 
@@ -2000,29 +2031,30 @@ impl App {
                 if tab_id == 0 {
                     return Ok(UiTask::None);
                 }
-                Ok(self.close_tab_dispatch(tab_id).task)
+                Ok(self.close_tab_dispatch(self.backend.tab_key(tab_id)).task)
             }
             KeybindAction::NewProject => Ok(self.new_project_dispatch().task),
             KeybindAction::RenameProject => {
-                self.begin_rename_target(RenameTarget::Project(self.workspace.active().0))?;
+                self.begin_rename_target(RenameTarget::Project(self.active_project_key()))?;
                 Ok(self.take_rename_focus_task())
             }
             KeybindAction::RenameTab => {
-                self.begin_rename_target(RenameTarget::Tab(self.workspace.active().1))?;
+                let tab = self.active_tab_key();
+                self.begin_rename_target(RenameTarget::Tab(tab))?;
                 Ok(self.take_rename_focus_task())
             }
             KeybindAction::CloseProject => {
                 // The sentinel id 0 is never in the snapshot, so
                 // `confirm_close_project` settles it as a silent no-op.
-                self.confirm_close_project(self.workspace.active().0)?;
+                self.confirm_close_project(self.active_project_key())?;
                 Ok(UiTask::None)
             }
             KeybindAction::JumpToUnread => {
-                let active_project_id = self.workspace.active().0;
-                if let Some(tab_id) =
-                    notification_inbox::next_unread(&self.notification_inbox, active_project_id)
-                {
-                    self.focus_tab_and_clear(tab_id, true)?;
+                if let Some(tab) = notification_inbox::next_unread(
+                    &self.notification_inbox,
+                    self.active_project_key(),
+                ) {
+                    self.focus_tab_and_clear(tab, true)?;
                 }
                 Ok(UiTask::None)
             }
@@ -2078,14 +2110,28 @@ impl App {
         self.rename_editor.is_none() && self.confirm_delete.is_none()
     }
 
+    /// The active project, host-qualified. The workspace's active
+    /// selection is a pinned-bare boundary, so this and
+    /// [`Self::active_tab_key`] are the joints that qualify it at the
+    /// backend that owns it.
+    fn active_project_key(&self) -> ProjectKey {
+        ProjectKey::new(self.backend.host(), self.workspace.active().0)
+    }
+
+    /// [`Self::active_project_key`]'s twin: the one place the workspace's
+    /// bare active tab id becomes a key.
+    fn active_tab_key(&self) -> TabKey {
+        self.backend.tab_key(self.workspace.active().1)
+    }
+
     fn keyboard_route(&self) -> KeyboardRoute {
-        let active_tab = self.workspace.active().1;
+        let active_tab = self.active_tab_key();
         resolve_keyboard_route(
             self.confirm_delete.is_some(),
             self.rename_editor.is_some(),
             self.palette.is_some(),
             active_tab,
-            self.tabs.contains_key(&TabKey::local(active_tab)),
+            self.tabs.contains_key(&active_tab),
         )
     }
 
@@ -2108,7 +2154,7 @@ impl App {
         }
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
-        if let Some(tab) = self.tabs.get(&TabKey::local(self.workspace.active().1)) {
+        if let Some(tab) = self.tabs.get(&self.active_tab_key()) {
             tab.set_window_focus(focused);
         }
     }
@@ -2185,6 +2231,10 @@ impl App {
 
     fn view_body(&self) -> Element<'_, Message> {
         let (active_project, active_tab) = self.workspace.active();
+        // `self.projects` is this backend's snapshot, so every id read out
+        // of it below qualifies at this backend's instance.
+        let host = self.backend.host();
+        let active_key = TabKey::new(host, active_tab);
         let authoritative_project_ids = self.sidebar_project_ids();
         let visual_project_ids = self
             .project_drag_preview
@@ -2210,6 +2260,7 @@ impl App {
                 .iter()
                 .find(|project| project.id == *project_id)
         }) {
+            let project_key = ProjectKey::new(host, project.id);
             let rollup = project_rollup(
                 project
                     .tabs
@@ -2234,7 +2285,7 @@ impl App {
                     .border(iced::border::rounded(2))
             });
             let project_label: Element<'_, Message> = match self.rename_editor.as_ref() {
-                Some(editor) if editor.target == RenameTarget::Project(project.id) => {
+                Some(editor) if editor.target == RenameTarget::Project(project_key) => {
                     text_input("Project name", &editor.draft)
                         .id(self.rename_input_id.clone())
                         .on_input(Message::RenameDraftChanged)
@@ -2312,7 +2363,7 @@ impl App {
             .height(chrome::ROW_HEIGHT);
             let mut project_group = column![project_row].spacing(2);
             if self.config.show_sidebar_agents && !hide_agent_rows {
-                for agent in self.sidebar_agents.get(&project.id).into_iter().flatten() {
+                for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
                     let name = agent.name.clone();
                     let detail = format!("{} · {}", agent.status_text, agent.time_text);
                     let dot_color = agent_color(agent.lifecycle);
@@ -2339,8 +2390,8 @@ impl App {
                                 bottom: 3.0,
                                 left: chrome::AGENT_DOT_INSET,
                             })
-                            .style(chrome::agent_button(agent.is_active))
-                            .on_press(Message::AgentSelected(agent.tab_id)),
+                            .style(chrome::agent_button(agent.tab == active_key))
+                            .on_press(Message::AgentSelected(agent.tab)),
                     );
                 }
             }
@@ -2378,6 +2429,7 @@ impl App {
         // hit-testing and target index walk.
         let project_strip = ReorderStrip::projects(
             sidebar_body,
+            host,
             visual_project_ids,
             self.project_strip_generation,
             self.strip_gestures_enabled(),
@@ -2430,12 +2482,13 @@ impl App {
         // frame on every ordinary click. Same rule the sidebar rows use.
         let mut tab_pills = row![].spacing(6);
         for tab in active_project_tabs {
+            let tab_key = TabKey::new(host, tab.id);
             let title = pill_display_title(&tab.title);
             let active = tab.id == active_tab;
             let editing = self
                 .rename_editor
                 .as_ref()
-                .filter(|editor| editor.target == RenameTarget::Tab(tab.id));
+                .filter(|editor| editor.target == RenameTarget::Tab(tab_key));
             let lifecycle = agent::effective_lifecycle(&tab.agent_state());
             let status_color = tab_status_color(lifecycle);
             let dot = container(
@@ -2449,7 +2502,7 @@ impl App {
                     .border(iced::border::rounded(4))
             });
             let key = PillKey {
-                id: tab.id,
+                tab: tab_key,
                 title,
                 active,
                 has_notification: tab.has_notification,
@@ -2458,7 +2511,7 @@ impl App {
             let (title_font, _) = pill_title_metrics(active, tab.has_notification);
             let cached = self
                 .pill_labels
-                .get(&key.id)
+                .get(&tab_key)
                 .filter(|stored| stored.matches(key));
             let (label, label_width) = if editing.is_some() {
                 (Cow::Borrowed(title), RENAME_FIELD_WIDTH)
@@ -2547,12 +2600,12 @@ impl App {
                         .height(chrome::PILL_HEIGHT)
                         .padding(2)
                         .style(chrome::close_button)
-                        .on_press(Message::CloseTab(tab.id)),
+                        .on_press(Message::CloseTab(tab_key)),
                 );
             }
             tab_pills = tab_pills.push(
                 container(pill)
-                    .id(tab_pill_id(tab.id))
+                    .id(tab_pill_id(tab_key))
                     .width(pill_width)
                     .height(chrome::PILL_HEIGHT)
                     .padding([0.0, chrome::TAB_PILL_PADDING_X])
@@ -2566,6 +2619,7 @@ impl App {
         }
         let tab_strip = ReorderStrip::tabs(
             tab_pills,
+            host,
             active_project,
             visual_tab_ids,
             self.tab_strip_generation,
@@ -2603,7 +2657,7 @@ impl App {
             .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
             .style(chrome::band);
 
-        let terminal: Element<'_, Message> = match self.tabs.get(&TabKey::local(active_tab)) {
+        let terminal: Element<'_, Message> = match self.tabs.get(&active_key) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
                 tab_id: active_tab,
                 snapshot: tab.snapshot.clone(),
@@ -2611,7 +2665,7 @@ impl App {
                 metric_generation: tab.metric_generation,
                 ime_active: terminal_ime_active(
                     self.keyboard_route(),
-                    active_tab,
+                    active_key,
                     self.window_focused,
                 ),
                 focused: terminal_cursor_focused(self.keyboard_route(), self.window_focused),
@@ -2625,7 +2679,7 @@ impl App {
             _ => {
                 let background = self
                     .tabs
-                    .get(&TabKey::local(active_tab))
+                    .get(&active_key)
                     .map(|tab| tab.snapshot.background)
                     .unwrap_or_else(|| Theme::load_bundled(&self.active_theme_name).background);
                 container(Space::new())
@@ -2838,7 +2892,7 @@ impl App {
             .into()
     }
 
-    pub fn select_project(&mut self, project_id: i64) {
+    pub fn select_project(&mut self, project: ProjectKey) {
         // The project strip publishes this on press, immediately before the
         // gesture's start event; cancelling the project drag here would bump
         // the generation the pending start still carries and no drag could
@@ -2846,20 +2900,24 @@ impl App {
         // arms, exactly as the tab strip does in reverse.
         self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
+        let Some(project_id) = project.local_project() else {
+            tracing::debug!(?project, "project selection from another instance");
+            return;
+        };
         if let Some(tab_id) = self.workspace.preferred_tab(project_id) {
-            let _ = self.focus_tab_and_clear(tab_id, false);
+            let _ = self.focus_tab_and_clear(self.backend.tab_key(tab_id), false);
         }
     }
 
-    pub fn select_tab(&mut self, tab_id: i64) {
+    pub fn select_tab(&mut self, tab: TabKey) {
         self.cancel_editor_for_interaction();
-        let _ = self.focus_tab_and_clear(tab_id, false);
+        let _ = self.focus_tab_and_clear(tab, false);
     }
 
-    pub fn select_agent(&mut self, tab_id: i64) {
+    pub fn select_agent(&mut self, tab: TabKey) {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        let _ = self.focus_tab_and_clear(tab_id, true);
+        let _ = self.focus_tab_and_clear(tab, true);
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -2962,13 +3020,15 @@ impl App {
     ) -> EngineDispatch {
         let op = self.take_engine_op_id();
         let client = self.client.clone();
+        let host = self.backend.host();
+        let project = ProjectKey::new(host, project_id);
         EngineDispatch {
             task: self.engine_op(
                 async move { open_tab_flow(&client, project_id, cwd, title, argv).await },
                 move |result| EngineOpResult::TabOpened {
                     op,
-                    project_id,
-                    result,
+                    project,
+                    result: result.map(|tab_id| TabKey::new(host, tab_id)),
                 },
             ),
             op: Some(op),
@@ -2988,17 +3048,23 @@ impl App {
         self.set_sidebar_collapsed(false);
         let op = self.take_engine_op_id();
         let client = self.client.clone();
+        let host = self.backend.host();
         EngineDispatch {
             task: self.engine_op(
                 async move { create_project_flow(&client).await },
-                move |result| EngineOpResult::ProjectCreated { op, result },
+                move |result| EngineOpResult::ProjectCreated {
+                    op,
+                    result: result.map(|(project_id, tab_id)| {
+                        (ProjectKey::new(host, project_id), TabKey::new(host, tab_id))
+                    }),
+                },
             ),
             op: Some(op),
         }
     }
 
-    fn confirm_close_project(&mut self, project_id: i64) -> Result<(), String> {
-        let Some(target) = confirm_delete_target(&self.projects, project_id) else {
+    fn confirm_close_project(&mut self, project: ProjectKey) -> Result<(), String> {
+        let Some(target) = confirm_delete_target(&self.projects, project) else {
             return Ok(());
         };
         self.cancel_drags();
@@ -3042,27 +3108,38 @@ impl App {
         let Some(confirm) = self.confirm_delete.take() else {
             return UiTask::None;
         };
-        let project_id = confirm.project_id;
+        let project = confirm.project;
+        let Some(project_id) = project.local_project() else {
+            tracing::warn!(
+                ?project,
+                "delete confirmed for a project on another instance"
+            );
+            return UiTask::None;
+        };
         let client = self.client.clone();
         self.engine_op(
             async move { delete_project_flow(&client, project_id).await },
-            move |result| EngineOpResult::ProjectDeleted { project_id, result },
+            move |result| EngineOpResult::ProjectDeleted { project, result },
         )
     }
 
-    pub fn close_tab(&mut self, tab_id: i64) -> UiTask {
+    pub fn close_tab(&mut self, tab: TabKey) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        self.close_tab_dispatch(tab_id).task
+        self.close_tab_dispatch(tab).task
     }
 
-    fn close_tab_dispatch(&mut self, tab_id: i64) -> EngineDispatch {
+    fn close_tab_dispatch(&mut self, tab: TabKey) -> EngineDispatch {
+        let Some(tab_id) = tab.local_tab() else {
+            tracing::debug!(?tab, "close requested for a tab on another instance");
+            return EngineDispatch::default();
+        };
         let op = self.take_engine_op_id();
         let client = self.client.clone();
         EngineDispatch {
             task: self.engine_op(
                 async move { close_tab_by_id(&client, tab_id).await },
-                move |result| EngineOpResult::TabClosed { op, tab_id, result },
+                move |result| EngineOpResult::TabClosed { op, tab, result },
             ),
             op: Some(op),
         }
@@ -3089,7 +3166,7 @@ impl App {
         if next == current {
             return Ok(());
         }
-        self.focus_tab_and_clear(tabs[next].id, false)?;
+        self.focus_tab_and_clear(self.backend.tab_key(tabs[next].id), false)?;
         Ok(())
     }
 
@@ -3101,7 +3178,7 @@ impl App {
         let Some(tab_id) = self.workspace.preferred_tab(project_id) else {
             return Ok(());
         };
-        self.focus_tab_and_clear(tab_id, false)
+        self.focus_tab_and_clear(self.backend.tab_key(tab_id), false)
     }
 
     fn switch_tab_by_index(&mut self, index: u8) -> Result<(), String> {
@@ -3110,15 +3187,15 @@ impl App {
         let Some(tab_id) = active_project_tab_at_index(&projects, project_id, index) else {
             return Ok(());
         };
-        self.focus_tab_and_clear(tab_id, false)
+        self.focus_tab_and_clear(self.backend.tab_key(tab_id), false)
     }
 
     /// Every focus change in the UI — strip clicks, sidebar rows, the
     /// cycle/switch keybinds, jump-to-unread, the agent and notification
     /// palettes — funnels through here, so this is the one place that owes
     /// them a reconcile.
-    fn focus_tab_and_clear(&mut self, tab_id: i64, reveal_sidebar: bool) -> Result<(), String> {
-        focus_tab_in_core(&self.workspace, tab_id)?;
+    fn focus_tab_and_clear(&mut self, tab: TabKey, reveal_sidebar: bool) -> Result<(), String> {
+        focus_tab_in_core(&self.workspace, tab)?;
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
         }
@@ -3392,7 +3469,7 @@ mod tests {
 
     fn pill_key(id: i64, title: &str, active: bool) -> PillKey<'_> {
         PillKey {
-            id,
+            tab: TabKey::local(id),
             title,
             active,
             has_notification: false,
@@ -3401,9 +3478,9 @@ mod tests {
 
     /// A sentinel no elision could ever produce, so its survival proves a
     /// skip and its disappearance proves a recompute.
-    fn seed_stale(labels: &mut HashMap<i64, PillLabel>, key: PillKey<'_>) {
+    fn seed_stale(labels: &mut HashMap<TabKey, PillLabel>, key: PillKey<'_>) {
         labels.insert(
-            key.id,
+            key.tab,
             PillLabel {
                 title: key.title.to_owned(),
                 active: key.active,
@@ -3419,7 +3496,7 @@ mod tests {
         assert_eq!(pill_display_title(""), "shell");
         let mut labels = HashMap::new();
         refresh_pill_label_map(&mut labels, &[pill_key(1, pill_display_title(""), true)]);
-        let stored = labels.get(&1).expect("the pill is memoized");
+        let stored = labels.get(&TabKey::local(1)).expect("the pill is memoized");
         assert_eq!(stored.title, "shell");
         assert_eq!(stored.label, "shell", "a short title elides to itself");
         assert!(stored.width > 0.0);
@@ -3432,12 +3509,17 @@ mod tests {
         seed_stale(&mut labels, pill_key(1, "alpha", false));
 
         refresh_pill_label_map(&mut labels, &[pill_key(1, "beta", false)]);
-        assert_eq!(labels[&1].label, "beta", "a new title re-elides");
+        assert_eq!(
+            labels[&TabKey::local(1)].label,
+            "beta",
+            "a new title re-elides"
+        );
 
         seed_stale(&mut labels, pill_key(1, "beta", false));
         refresh_pill_label_map(&mut labels, &[pill_key(1, "beta", true)]);
         assert_eq!(
-            labels[&1].label, "beta",
+            labels[&TabKey::local(1)].label,
+            "beta",
             "activation changes the font weight and the width budget, so it re-elides"
         );
 
@@ -3447,7 +3529,11 @@ mod tests {
             ..pill_key(1, "beta", true)
         };
         refresh_pill_label_map(&mut labels, &[notified]);
-        assert_eq!(labels[&1].label, "beta", "the badge reservation re-elides");
+        assert_eq!(
+            labels[&TabKey::local(1)].label,
+            "beta",
+            "the badge reservation re-elides"
+        );
     }
 
     #[test]
@@ -3456,7 +3542,8 @@ mod tests {
         seed_stale(&mut labels, pill_key(1, "alpha", false));
         refresh_pill_label_map(&mut labels, &[pill_key(1, "alpha", false)]);
         assert_eq!(
-            labels[&1].label, "STALE",
+            labels[&TabKey::local(1)].label,
+            "STALE",
             "an identical key must not re-measure"
         );
     }
@@ -3469,7 +3556,10 @@ mod tests {
             &[pill_key(1, "alpha", true), pill_key(2, "beta", false)],
         );
         refresh_pill_label_map(&mut labels, &[pill_key(2, "beta", false)]);
-        assert_eq!(labels.keys().copied().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            labels.keys().copied().collect::<Vec<_>>(),
+            vec![TabKey::local(2)]
+        );
     }
 
     /// A title far past `TAB_PILL_MAX_WIDTH` must come back marked, and the
@@ -3480,7 +3570,7 @@ mod tests {
         let long = "/Users/charliek/projects/roost/crates/roost-iced/src/app.rs";
         let mut labels = HashMap::new();
         refresh_pill_label_map(&mut labels, &[pill_key(1, long, false)]);
-        let stored = &labels[&1];
+        let stored = &labels[&TabKey::local(1)];
         assert!(stored.label.ends_with(chrome::ELLIPSIS));
         assert!(stored.label.len() < long.len());
         let (_, budget) = pill_title_metrics(false, false);
@@ -3651,20 +3741,20 @@ mod tests {
         for result in [
             EngineOpResult::TabClosed {
                 op: 1,
-                tab_id: 7,
+                tab: TabKey::local(7),
                 result: Ok(CloseTabOutcome::AlreadyGone),
             },
             EngineOpResult::TabClosed {
                 op: 1,
-                tab_id: 7,
+                tab: TabKey::local(7),
                 result: Ok(CloseTabOutcome::Closed),
             },
             EngineOpResult::ProjectDeleted {
-                project_id: 3,
+                project: ProjectKey::local(3),
                 result: Ok(DeleteProjectOutcome::AlreadyGone),
             },
             EngineOpResult::ProjectDeleted {
-                project_id: 3,
+                project: ProjectKey::local(3),
                 result: Ok(DeleteProjectOutcome::Deleted),
             },
         ] {
@@ -3681,14 +3771,14 @@ mod tests {
         assert_eq!(
             engine_op_status(EngineOpResult::TabClosed {
                 op: 1,
-                tab_id: 7,
+                tab: TabKey::local(7),
                 result: Err("close exploded".into()),
             }),
             Some("close exploded".to_string())
         );
         assert_eq!(
             engine_op_status(EngineOpResult::ProjectDeleted {
-                project_id: 3,
+                project: ProjectKey::local(3),
                 result: Err("delete exploded".into()),
             }),
             Some("delete exploded".to_string())
@@ -3708,7 +3798,7 @@ mod tests {
             async { Ok(CloseTabOutcome::Closed) },
             |result| EngineOpResult::TabClosed {
                 op: 1,
-                tab_id: 7,
+                tab: TabKey::local(7),
                 result,
             },
         ));
@@ -3716,25 +3806,25 @@ mod tests {
             completed,
             EngineOpResult::TabClosed {
                 op: 1,
-                tab_id: 7,
+                tab,
                 result: Ok(CloseTabOutcome::Closed)
-            }
+            } if tab == TabKey::local(7)
         ));
 
         let panicked = runtime.block_on(spawn_engine_op(
             runtime.handle().clone(),
             async { panic!("engine op panicked") },
             |result: Result<DeleteProjectOutcome, String>| EngineOpResult::ProjectDeleted {
-                project_id: 3,
+                project: ProjectKey::local(3),
                 result,
             },
         ));
-        let EngineOpResult::ProjectDeleted { project_id, result } = panicked else {
+        let EngineOpResult::ProjectDeleted { project, result } = panicked else {
             panic!("a delete's join failure must stay a delete completion")
         };
-        assert_eq!(project_id, 3);
+        assert_eq!(project, ProjectKey::local(3));
         assert!(result.is_err(), "a lost task is that op's own error");
-        assert!(engine_op_status(EngineOpResult::ProjectDeleted { project_id, result }).is_some());
+        assert!(engine_op_status(EngineOpResult::ProjectDeleted { project, result }).is_some());
     }
 
     #[test]
@@ -3885,15 +3975,15 @@ mod tests {
         assert_eq!(
             engine_op_status(EngineOpResult::TabOpened {
                 op: 1,
-                project_id: 3,
-                result: Ok(9),
+                project: ProjectKey::local(3),
+                result: Ok(TabKey::local(9)),
             }),
             None
         );
         assert_eq!(
             engine_op_status(EngineOpResult::TabOpened {
                 op: 1,
-                project_id: 3,
+                project: ProjectKey::local(3),
                 result: Err("spawn shell failed".into()),
             }),
             Some("spawn shell failed".to_string())
@@ -3901,7 +3991,7 @@ mod tests {
         assert_eq!(
             engine_op_status(EngineOpResult::ProjectCreated {
                 op: 2,
-                result: Ok((3, 9)),
+                result: Ok((ProjectKey::local(3), TabKey::local(9))),
             }),
             None
         );
@@ -3924,7 +4014,7 @@ mod tests {
         assert_eq!(
             EngineOpResult::TabClosed {
                 op: 4,
-                tab_id: 7,
+                tab: TabKey::local(7),
                 result: Ok(CloseTabOutcome::Closed),
             }
             .palette_op(),
@@ -3933,8 +4023,8 @@ mod tests {
         assert_eq!(
             EngineOpResult::TabOpened {
                 op: 5,
-                project_id: 3,
-                result: Ok(9),
+                project: ProjectKey::local(3),
+                result: Ok(TabKey::local(9)),
             }
             .palette_op(),
             Some(5)
@@ -3942,14 +4032,14 @@ mod tests {
         assert_eq!(
             EngineOpResult::ProjectCreated {
                 op: 6,
-                result: Ok((3, 9)),
+                result: Ok((ProjectKey::local(3), TabKey::local(9))),
             }
             .palette_op(),
             Some(6)
         );
         assert_eq!(
             EngineOpResult::ProjectDeleted {
-                project_id: 3,
+                project: ProjectKey::local(3),
                 result: Ok(DeleteProjectOutcome::Deleted),
             }
             .palette_op(),
@@ -3958,7 +4048,7 @@ mod tests {
         assert_eq!(
             EngineOpResult::Renamed {
                 op: 7,
-                target: RenameTarget::Tab(9),
+                target: RenameTarget::Tab(TabKey::local(9)),
                 result: Ok(()),
             }
             .palette_op(),
@@ -4103,36 +4193,39 @@ mod tests {
     #[test]
     fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, false, false, 7, false),
+            resolve_keyboard_route(false, false, false, TabKey::local(7), false),
             KeyboardRoute::None
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, 7, true),
-            KeyboardRoute::Terminal(7)
+            resolve_keyboard_route(false, false, false, TabKey::local(7), true),
+            KeyboardRoute::Terminal(TabKey::local(7))
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, true, 7, true),
+            resolve_keyboard_route(false, false, true, TabKey::local(7), true),
             KeyboardRoute::Palette
         );
         assert_eq!(
-            resolve_keyboard_route(false, true, true, 7, true),
+            resolve_keyboard_route(false, true, true, TabKey::local(7), true),
             KeyboardRoute::Editor
         );
         // An open confirm outranks every other surface, so no keystroke can
         // reach an accelerator or the active PTY while it is up.
         assert_eq!(
-            resolve_keyboard_route(true, true, true, 7, true),
+            resolve_keyboard_route(true, true, true, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
         assert_eq!(
-            resolve_keyboard_route(true, false, false, 7, true),
+            resolve_keyboard_route(true, false, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
     }
 
     #[test]
     fn composition_routes_only_to_a_focused_terminal_that_owns_the_keyboard() {
-        assert_eq!(ime_preedit_target(KeyboardRoute::Terminal(7)), Some(7));
+        assert_eq!(
+            ime_preedit_target(KeyboardRoute::Terminal(TabKey::local(7))),
+            Some(TabKey::local(7))
+        );
         for route in [
             KeyboardRoute::None,
             KeyboardRoute::Confirm,
@@ -4146,10 +4239,26 @@ mod tests {
             );
         }
 
-        assert!(terminal_ime_active(KeyboardRoute::Terminal(7), 7, true));
-        assert!(!terminal_ime_active(KeyboardRoute::Terminal(7), 7, false));
-        assert!(!terminal_ime_active(KeyboardRoute::Terminal(8), 7, true));
-        assert!(!terminal_ime_active(KeyboardRoute::Palette, 7, true));
+        assert!(terminal_ime_active(
+            KeyboardRoute::Terminal(TabKey::local(7)),
+            TabKey::local(7),
+            true
+        ));
+        assert!(!terminal_ime_active(
+            KeyboardRoute::Terminal(TabKey::local(7)),
+            TabKey::local(7),
+            false
+        ));
+        assert!(!terminal_ime_active(
+            KeyboardRoute::Terminal(TabKey::local(8)),
+            TabKey::local(7),
+            true
+        ));
+        assert!(!terminal_ime_active(
+            KeyboardRoute::Palette,
+            TabKey::local(7),
+            true
+        ));
     }
 
     /// The terminal cursor is solid only while it owns the keyboard AND
@@ -4157,8 +4266,14 @@ mod tests {
     /// an unfocused window) draws it hollow uniformly, mac parity.
     #[test]
     fn terminal_cursor_focused_requires_the_terminal_route_and_window_focus() {
-        assert!(terminal_cursor_focused(KeyboardRoute::Terminal(7), true));
-        assert!(!terminal_cursor_focused(KeyboardRoute::Terminal(7), false));
+        assert!(terminal_cursor_focused(
+            KeyboardRoute::Terminal(TabKey::local(7)),
+            true
+        ));
+        assert!(!terminal_cursor_focused(
+            KeyboardRoute::Terminal(TabKey::local(7)),
+            false
+        ));
 
         for route in [
             KeyboardRoute::None,
@@ -4178,11 +4293,20 @@ mod tests {
     #[test]
     fn a_commit_follows_the_composition_not_the_active_route() {
         assert_eq!(
-            ime_commit_target(Some(3), KeyboardRoute::Terminal(9)),
-            Some(3)
+            ime_commit_target(
+                Some(TabKey::local(3)),
+                KeyboardRoute::Terminal(TabKey::local(9))
+            ),
+            Some(TabKey::local(3))
         );
-        assert_eq!(ime_commit_target(Some(3), KeyboardRoute::Palette), Some(3));
-        assert_eq!(ime_commit_target(None, KeyboardRoute::Terminal(9)), Some(9));
+        assert_eq!(
+            ime_commit_target(Some(TabKey::local(3)), KeyboardRoute::Palette),
+            Some(TabKey::local(3))
+        );
+        assert_eq!(
+            ime_commit_target(None, KeyboardRoute::Terminal(TabKey::local(9))),
+            Some(TabKey::local(9))
+        );
         assert_eq!(ime_commit_target(None, KeyboardRoute::Palette), None);
     }
 
@@ -4221,15 +4345,18 @@ mod tests {
         let snapshot = workspace.snapshot();
 
         assert_eq!(
-            confirm_delete_target(&snapshot, project.id),
+            confirm_delete_target(&snapshot, ProjectKey::local(project.id)),
             Some(ConfirmDeleteProject {
-                project_id: project.id,
+                project: ProjectKey::local(project.id),
                 name: "doomed".into(),
                 tab_count: 2,
             })
         );
-        assert_eq!(confirm_delete_target(&snapshot, 0), None);
-        assert_eq!(confirm_delete_target(&snapshot, project.id + 1), None);
+        assert_eq!(confirm_delete_target(&snapshot, ProjectKey::local(0)), None);
+        assert_eq!(
+            confirm_delete_target(&snapshot, ProjectKey::local(project.id + 1)),
+            None
+        );
     }
 
     /// The dialog quotes the Mac's `closeActiveProject` alert verbatim
@@ -4241,7 +4368,8 @@ mod tests {
         let project = workspace.create_project("polish", "/tmp").unwrap();
         workspace.open_tab(project.id, "/tmp", "one").unwrap();
         let snapshot = workspace.snapshot();
-        let confirm = confirm_delete_target(&snapshot, project.id).expect("target");
+        let confirm =
+            confirm_delete_target(&snapshot, ProjectKey::local(project.id)).expect("target");
 
         assert_eq!(format!("Close {}?", confirm.name), "Close polish?");
         assert_eq!(
@@ -4260,7 +4388,7 @@ mod tests {
         let tab = workspace.open_tab(project.id, "/tmp", "one").unwrap();
         workspace.open_tab(project.id, "/tmp", "two").unwrap();
         let snapshot = workspace.snapshot();
-        let mut confirm = confirm_delete_target(&snapshot, project.id);
+        let mut confirm = confirm_delete_target(&snapshot, ProjectKey::local(project.id));
 
         reconcile_confirm_delete(&mut confirm, &snapshot);
         assert!(confirm.is_some(), "a live project keeps its confirm open");
@@ -4589,53 +4717,49 @@ mod tests {
             metrics: original_metrics,
             metric_generation: 4,
         };
-        let mut states = HashMap::from([(7_i64, original), (11_i64, original)]);
+        let seven = TabKey::local(7);
+        let eleven = TabKey::local(11);
+        let mut states = HashMap::from([(seven, original), (eleven, original)]);
         let mut operations = Vec::new();
         let mut persisted = false;
 
-        let result =
-            apply_geometry_batch(
-                &[7, 11],
-                92,
-                29,
-                next_metrics,
-                5,
-                |operation| match operation {
-                    GeometryBatchOperation::Apply {
-                        tab_id,
-                        cols,
-                        rows,
-                        metrics,
-                        metric_generation,
-                    } => {
-                        operations.push(format!("apply:{tab_id}"));
-                        if tab_id == 11 {
-                            return Err("injected tab failure".to_string());
-                        }
-                        let previous = states.insert(
-                            tab_id,
-                            TerminalGeometry {
-                                cols,
-                                rows,
-                                metrics,
-                                metric_generation,
-                            },
-                        );
-                        Ok(Some(GeometryChange {
-                            previous,
-                            current: states[&tab_id],
-                            grid_changed: true,
-                            metrics_changed: true,
-                            deferred_replies: Vec::new(),
-                        }))
+        let result = apply_geometry_batch(&[seven, eleven], 92, 29, next_metrics, 5, |operation| {
+            match operation {
+                GeometryBatchOperation::Apply {
+                    tab,
+                    cols,
+                    rows,
+                    metrics,
+                    metric_generation,
+                } => {
+                    operations.push(format!("apply:{}", tab.tab));
+                    if tab == eleven {
+                        return Err("injected tab failure".to_string());
                     }
-                    GeometryBatchOperation::Rollback { tab_id, previous } => {
-                        operations.push(format!("rollback:{tab_id}"));
-                        states.insert(tab_id, previous);
-                        Ok(None)
-                    }
-                },
-            );
+                    let previous = states.insert(
+                        tab,
+                        TerminalGeometry {
+                            cols,
+                            rows,
+                            metrics,
+                            metric_generation,
+                        },
+                    );
+                    Ok(Some(GeometryChange {
+                        previous,
+                        current: states[&tab],
+                        grid_changed: true,
+                        metrics_changed: true,
+                        deferred_replies: Vec::new(),
+                    }))
+                }
+                GeometryBatchOperation::Rollback { tab, previous } => {
+                    operations.push(format!("rollback:{}", tab.tab));
+                    states.insert(tab, previous);
+                    Ok(None)
+                }
+            }
+        });
         if result.is_ok() {
             persisted = true;
         }
@@ -4643,14 +4767,14 @@ mod tests {
         assert_eq!(
             result.expect_err("second tab must fail"),
             GeometryBatchFailure {
-                tab_id: 11,
+                tab: eleven,
                 apply: "injected tab failure".to_string(),
                 rollback: Vec::new(),
             }
         );
         assert_eq!(operations, ["apply:7", "apply:11", "rollback:7"]);
-        assert_eq!(states[&7], original);
-        assert_eq!(states[&11], original);
+        assert_eq!(states[&seven], original);
+        assert_eq!(states[&eleven], original);
         assert!(
             !persisted,
             "failed live application cannot reach persistence"

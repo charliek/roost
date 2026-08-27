@@ -247,21 +247,20 @@ pub(crate) async fn pump_workspace_events(workspace: Arc<Workspace>, feed: Engin
     bridge.abort();
 }
 
-/// Adapter task: one tab's PTY output → feed, tagged with the tab id.
-/// The engine's id-space is host-unaware, so this pump is where a bare
-/// engine id becomes a [`TabKey`] — at `HostId::LOCAL`, because the
-/// in-process backend is the only thing this pump ever drains.
+/// Adapter task: one tab's PTY output → feed, tagged with the tab it came
+/// from. The engine's id-space is host-unaware, so the backend that
+/// attached this tab is what qualified its bare id into `key`; the pump
+/// simply carries that key onto the feed.
 ///
 /// Spawned at attach and ended by the tab's own channel closing, which
 /// `TabSession`'s pump does after the PTY exits or the supervisor drops
 /// it. A forwarder that dies before delivering `Exit` leaks nothing: the
 /// next reconcile prunes any tab the workspace no longer lists.
 pub(crate) async fn pump_tab_output(
-    tab_id: i64,
+    key: TabKey,
     mut rx: mpsc::UnboundedReceiver<TabOutput>,
     feed: EngineFeedSender,
 ) {
-    let key = TabKey::local(tab_id);
     while let Some(output) = rx.recv().await {
         if !feed.send(EngineFeed::Tab(key, output)) {
             break;
@@ -550,7 +549,7 @@ mod tests {
     async fn a_tab_forwarder_tags_its_output_and_ends_with_its_channel() {
         let (feed_tx, mut rx) = channel();
         let (tab_tx, tab_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(pump_tab_output(7, tab_rx, feed_tx));
+        let forwarder = tokio::spawn(pump_tab_output(TabKey::local(7), tab_rx, feed_tx));
 
         assert!(tab_tx.send(TabOutput::Bytes(b"out".to_vec())).is_ok());
         assert!(tab_tx
@@ -574,14 +573,14 @@ mod tests {
         assert!(batch.should_reconcile(), "the exit closes a tab");
     }
 
-    /// The engine hands the pump a bare id out of its own id-space; the
-    /// pump is where that becomes a host-qualified key, and the instance
-    /// it qualifies at is the in-process one.
+    /// The backend hands the pump the key it qualified the engine's bare
+    /// id at; the pump carries exactly that onto the feed, and for the
+    /// in-process backend it is the local instance.
     #[tokio::test]
     async fn the_pump_qualifies_engine_ids_at_the_local_instance() {
         let (feed_tx, mut rx) = channel();
         let (tab_tx, tab_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(pump_tab_output(7, tab_rx, feed_tx));
+        let forwarder = tokio::spawn(pump_tab_output(TabKey::local(7), tab_rx, feed_tx));
 
         assert!(tab_tx.send(TabOutput::Bytes(b"out".to_vec())).is_ok());
         drop(tab_tx);
@@ -604,7 +603,7 @@ mod tests {
     async fn aborting_a_forwarder_closes_the_channel_it_drained() {
         let (feed_tx, mut rx) = channel();
         let (tab_tx, tab_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(pump_tab_output(7, tab_rx, feed_tx));
+        let forwarder = tokio::spawn(pump_tab_output(TabKey::local(7), tab_rx, feed_tx));
         assert!(tab_tx.send(TabOutput::Bytes(b"live".to_vec())).is_ok());
         tokio::task::yield_now().await;
 
