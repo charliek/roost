@@ -11,14 +11,19 @@ Closes both coverage gaps that #142 and #145 left open:
   `tab.dump_resolved` IPC op walks the SAME `resolve_cell_colors`
   call with the live `theme.bold_color`, so asserting on its
   output pins the call site.
-* **#145** (`OSC 10/11/12` dynamic replies): the existing tests
-  cover `Terminal::live_colors`, `TerminalView.liveColor(forQuery:)`,
-  and `format_color_query_response` in isolation. They don't
-  drive PTY bytes → OscScanner.feed → ColorQuery event → reply
-  written to PTY stdin. A regression in `app.rs`'s drain loop
-  (Linux) or Mac's `appendBytes` event-loop would slip through.
-  `tab.feed_pty_bytes` + `tab.capture_pty_input` (PR B) make the
-  full chain testable.
+* **#145** (`OSC 10/11/12` dynamic replies): the color-query
+  replies come from libghostty's `write_pty` effect, which each UI
+  drains onto the tab's PTY input after `vt_write` (see
+  `docs/reference/terminal-queries.md`). The unit tests cover the
+  pieces; only this suite drives PTY bytes → the UI's drain → reply
+  bytes on PTY stdin, on BOTH UIs. `tab.feed_pty_bytes` +
+  `tab.capture_pty_input` make the full chain testable.
+
+  Every color-query case here also asserts **exactly one** reply.
+  Roost used to synthesize these replies from its own OSC scanner;
+  once the pinned libghostty started answering them, that put two
+  answers on the wire for every query. The counts are the regression
+  guard.
 
 Plus parity coverage for the other OSC-routed behaviors (title /
 cwd / notification) that are currently unit-tested only.
@@ -35,7 +40,7 @@ import time
 import pytest
 
 from client import scaled_timeout
-from util import drain_until_match, wait_tab_attached, wait_tab_quiet
+from util import drain, drain_until_match, wait_tab_attached, wait_tab_quiet
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
@@ -152,18 +157,17 @@ class TestOscPipeline:
     # ----- #145 drain-wiring coverage -----------------------------------
 
     def test_osc11_set_then_query_replies_with_new_bg(self, roost, project):
-        """Pre-fix the OSC drain read the static theme bg, so a
-        mid-session `OSC 11;rgb:00/11/22` set would NOT be reflected
-        in the next `OSC 11;?` query reply. Post-fix (#145) it reads
-        libghostty's live colors. SET in one feed, QUERY in a second
-        — libghostty processes SET via vt_write before the QUERY's
-        scanner.feed runs, so the reply uses the post-set bg."""
+        """A mid-session `OSC 11;rgb:00/11/22` set must be reflected in
+        the next `OSC 11;?` reply: libghostty answers from
+        `override orelse default`, and the set moved the override. SET
+        in one feed, QUERY in a second."""
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]11;rgb:00/11/22\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
         # The 16-bit-per-channel form spells `0000/1111/2222`.
-        captured = drain_until_match(roost, tab, rb"0000/1111/2222")
+        captured = _drain_settled(roost, tab, rb"0000/1111/2222")
+        _expect_one_reply(captured, b"\x1b]11;rgb:", b"0000/1111/2222")
         # The stale theme bg must NOT be in the reply — for roost-dark
         # that's `1e1e/1e1e/1e1e` (no escape characters needed; the
         # color string is sufficient).
@@ -174,7 +178,8 @@ class TestOscPipeline:
         wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]10;rgb:aa/bb/cc\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]10;?\x07")
-        captured = drain_until_match(roost, tab, rb"aaaa/bbbb/cccc")
+        captured = _drain_settled(roost, tab, rb"aaaa/bbbb/cccc")
+        _expect_one_reply(captured, b"\x1b]10;rgb:", b"aaaa/bbbb/cccc")
         # Stale theme fg (roost-dark): `ffff/ffff/ffff`.
         assert b"ffff/ffff/ffff" not in captured, captured
 
@@ -183,7 +188,8 @@ class TestOscPipeline:
         wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]12;rgb:de/ad/be\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]12;?\x07")
-        captured = drain_until_match(roost, tab, rb"dede/adad/bebe")
+        captured = _drain_settled(roost, tab, rb"dede/adad/bebe")
+        _expect_one_reply(captured, b"\x1b]12;rgb:", b"dede/adad/bebe")
         # Stale theme cursor (the default cmux/roost cursor):
         # `9898/9898/9d9d`.
         assert b"9898/9898/9d9d" not in captured, captured
@@ -194,45 +200,41 @@ class TestOscPipeline:
         """opencode/opentui gate ALL terminal color detection on a reply
         to `OSC 4;0;?` (a 300ms-timeout probe). Pre-fix roost ignored
         OSC 4, so the probe timed out and opencode fell back to an
-        unreadable gray theme. Post-fix the drain answers each index from
-        the live palette. We don't pin the exact color (palette[0] is
-        theme-dependent) — only that a well-formed OSC 4 reply for
-        index 0 comes back, which is what unblocks opencode."""
+        unreadable gray theme. We don't pin the exact color (palette[0]
+        is theme-dependent) — only that exactly one well-formed OSC 4
+        reply for index 0 comes back, which is what unblocks opencode."""
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]4;0;?\x07")
-        captured = drain_until_match(
+        captured = _drain_settled(
             roost, tab, rb"\x1b\]4;0;rgb:[0-9a-f]{4}/[0-9a-f]{4}/[0-9a-f]{4}"
         )
-        assert b"\x1b]4;0;rgb:" in captured, captured
+        assert captured.count(b"\x1b]4;0;rgb:") == 1, captured
 
     def test_osc4_set_then_query_replies_with_new_palette(self, roost, project):
-        """OSC 4 analogue of #145: a mid-session `OSC 4;5;rgb:de/ad/be`
-        set must be reflected in the next `OSC 4;5;?` reply, read from
-        libghostty's live palette. SET in one feed, QUERY in a second so
-        libghostty's vt_write applies the set before the query's
-        scanner.feed runs (the same ordering the OSC 11 test relies on)."""
+        """OSC 4 analogue: a mid-session `OSC 4;5;rgb:de/ad/be` set must
+        be reflected in the next `OSC 4;5;?` reply. SET in one feed,
+        QUERY in a second."""
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]4;5;rgb:de/ad/be\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]4;5;?\x07")
-        captured = drain_until_match(roost, tab, rb"\x1b\]4;5;rgb:dede/adad/bebe")
-        assert b"\x1b]4;5;rgb:dede/adad/bebe" in captured, captured
+        captured = _drain_settled(roost, tab, rb"\x1b\]4;5;rgb:dede/adad/bebe")
+        _expect_one_reply(captured, b"\x1b]4;5;rgb:", b"dede/adad/bebe")
 
-    def test_osc11_same_chunk_set_query_replies_pre_chunk_color(self, roost, project):
-        """SET + QUERY in ONE chunk answers from the chunk-start
-        colors — pinned behavior on both UIs, not an accident of
-        one implementation.
+    def test_osc11_same_chunk_set_query_replies_sequentially(self, roost, project):
+        """SET + QUERY in ONE chunk answers with the JUST-SET color, and
+        answers exactly once — pinned behavior on both UIs.
 
-        This used to be a skipped "known #145 limitation" slot,
-        described as the scanner running before `vt_write`. Plan 026's
-        D10 moved iced's scan onto the PTY drain, where the ordering
-        argument no longer applies, and pinned the SAME semantics
-        explicitly: `OscRouter::feed`'s contract (a SET affects a LATER
-        chunk's query; SET+QUERY in one chunk sees the pre-chunk value)
-        is what both UIs implement. Asserting only the negative —
-        the just-set color is NOT echoed — keeps this target-agnostic
-        without hard-coding a theme color.
+        This case has moved twice. It started as a skipped "known #145
+        limitation" slot; plan 026's D10 moved iced's scan onto the PTY
+        drain and pinned *pre-chunk* semantics (the SET was applied to
+        a chunk-start snapshot, so a QUERY beside it saw the old color).
+        The libghostty pin `f2d5758f6` made the terminal answer color
+        queries itself, sequentially and in wire order — so Roost's own
+        reply became a duplicate carrying a different (pre-chunk) color,
+        and was removed. What the terminal reports is the just-set
+        value, once.
         """
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
@@ -240,20 +242,19 @@ class TestOscPipeline:
             tab,
             b"\x1b]11;rgb:00/11/22\x07\x1b]11;?\x07",
         )
-        captured = drain_until_match(roost, tab, rb"\x1b\]11;rgb:")
-        assert b"0000/1111/2222" not in captured, captured
+        captured = _drain_settled(roost, tab, rb"\x1b\]11;rgb:")
+        _expect_one_reply(captured, b"\x1b]11;rgb:", b"0000/1111/2222")
 
     def test_osc11_query_reply_needs_no_dump_or_refresh(self, roost, project):
-        """The D10 property: a color-query reply must not depend on
-        anything the UI does after the bytes land.
+        """A color-query reply must not depend on a UI-side round-trip.
 
         Every other case here polls `tab.capture_pty_input` (via
         `drain_until_match`), which is already refresh-free — this test
         exists to say so out loud, and to fail if a future change makes
-        the reply wait on a dump, a refresh, or any other UI-side
-        round-trip. `prox`/termenv exits within a frame of its probe;
-        anything slower than the drain leaks the answer into the shell
-        prompt.
+        the reply wait on a dump, a refresh, or any other round-trip
+        beyond the `vt_write` + `write_pty` drain the UI already does
+        per chunk. `prox`/termenv exits within a frame of its probe;
+        anything slower leaks the answer into the shell prompt.
         """
         tab = roost.open_tab(project, cwd="/tmp")
         wait_tab_attached(roost, tab)
@@ -337,6 +338,31 @@ class TestOscPipeline:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _drain_settled(roost, tab_id: int, pattern: bytes, settle: float = 0.5) -> bytes:
+    """`drain_until_match`, then keep draining for `settle` seconds.
+
+    A duplicate reply arrives *after* the one the match found — the two
+    answers come from different points in the pipeline — so a bare
+    `drain_until_match` would return before the second one landed and
+    the count assertions would never see it.
+    """
+    captured = drain_until_match(roost, tab_id, pattern)
+    deadline = time.monotonic() + scaled_timeout(settle)
+    while time.monotonic() < deadline:
+        captured += drain(roost, tab_id)
+        time.sleep(0.05)
+    return captured
+
+
+def _expect_one_reply(captured: bytes, prefix: bytes, color: bytes) -> None:
+    """Exactly one reply with `prefix`, and it carries `color`."""
+    assert captured.count(prefix) == 1, (
+        f"expected exactly one {prefix!r} reply, got {captured.count(prefix)}: "
+        f"{captured!r}"
+    )
+    assert prefix + color in captured, captured
 
 
 def _find_bn_cells(roost, tab_id: int, timeout: float = 5.0):

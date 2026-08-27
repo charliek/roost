@@ -1,19 +1,18 @@
 //! The OSC opt-in, exercised through the REAL forwarding task.
 //!
-//! Plan 026 D10: iced answered color queries only after the event loop
-//! drained its multiplexed feed (1-12 ms), so a program that queries and
-//! exits — Go termenv's probe, as `prox` runs it — was gone before the
-//! answer arrived and the reply landed in the shell prompt as
-//! `11;rgb:…` garbage. The fix moves the scan into
-//! [`TabSession`]'s forwarding task, which enqueues the reply onto the
-//! same serial input channel keystrokes use, before the bytes have
-//! reached the UI at all.
+//! The drain used to answer OSC color queries itself. It no longer
+//! does: libghostty answers OSC 4 / 10 / 11 / 12 (and Kitty OSC 21)
+//! through the `write_pty` effect as of the pinned ghostty
+//! `f2d5758f6`, and Roost installs that callback for its device-query
+//! replies — so a drain-side answer put a SECOND reply on the wire for
+//! every query. That is what these tests now guard: the drain scans,
+//! tracks colors and forwards actions, and enqueues NOTHING onto the
+//! PTY input channel.
 //!
-//! That property is exactly what the roosttest feed/capture path cannot
-//! show: `tab.feed_pty_bytes` injects bytes on the UI thread. Here the
-//! bytes enter through a synthetic `PtyOutputEvent` broadcast — the same
-//! receiver the supervisor hands out — and NOTHING drains the UI-side
-//! output channel, so a reply that needed the UI could not appear.
+//! The observation point is the one `tab.capture_pty_input` reads, and
+//! bytes enter through a synthetic `PtyOutputEvent` broadcast — the
+//! same receiver the supervisor hands out. There is no terminal here,
+//! so anything in the capture came from the drain.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,9 +40,9 @@ struct Harness {
 }
 
 /// Attach a session to a synthetic PTY broadcast. No PTY is spawned:
-/// the supervisor's write of an enqueued reply fails and is logged,
-/// which is irrelevant here — the capture buffer records the enqueue,
-/// which is the observation point `tab.capture_pty_input` reads.
+/// nothing here writes to one, and the capture buffer records every
+/// enqueue, which is the observation point `tab.capture_pty_input`
+/// reads.
 fn harness(tab_id: i64, scanned: bool) -> Harness {
     let supervisor = Arc::new(PtySupervisor::new());
     let (pty_tx, pty_rx) = broadcast::channel(64);
@@ -72,26 +71,25 @@ impl Harness {
             .expect("the forwarding task is subscribed");
     }
 
-    /// Poll the capture until it holds `needle`, then return everything
-    /// captured. Nothing in this test drains `output_rx`, so a reply
-    /// that reached the capture did so without any UI involvement.
-    async fn await_capture(&self, needle: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let captured = String::from_utf8_lossy(&self.capture.lock().unwrap()).into_owned();
-            if captured.contains(needle) {
-                return captured;
-            }
+    fn captured(&self) -> Vec<u8> {
+        self.capture.lock().unwrap().clone()
+    }
+
+    /// Give a would-be drain-side enqueue every chance to appear, then
+    /// assert the channel stayed empty. The wait is generous because a
+    /// false green here is the failure mode that matters: the reply
+    /// that regressed CI arrived milliseconds after the chunk.
+    async fn assert_never_enqueues_anything(&self) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            let captured = self.captured();
             assert!(
-                Instant::now() < deadline,
-                "never captured {needle:?} (captured {captured:?})"
+                captured.is_empty(),
+                "the drain must not answer color queries — libghostty does: {:?}",
+                String::from_utf8_lossy(&captured)
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
-
-    fn captured(&self) -> Vec<u8> {
-        self.capture.lock().unwrap().clone()
     }
 
     async fn next_output(&mut self) -> TabOutput {
@@ -102,25 +100,31 @@ impl Harness {
     }
 }
 
-/// (a) The reply is enqueued drain-side. The UI-side output channel is
-/// never drained in this test, so the reply cannot have come from it.
+/// (a) The regression guard for the duplicate reply: a color query
+/// reaching the drain produces no PTY input at all. The query bytes
+/// still travel to the UI, which writes them to the terminal — that is
+/// where the one answer comes from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_color_query_is_answered_from_the_drain_without_the_ui() {
-    let harness = harness(901, true);
-    harness.emit(b"\x1b]11;?\x07");
-    let captured = harness
-        .await_capture("\x1b]11;rgb:1e1e/1e1e/1e1e\x07")
-        .await;
-    assert_eq!(
-        captured, "\x1b]11;rgb:1e1e/1e1e/1e1e\x07",
-        "the reply is the only thing enqueued"
-    );
+async fn a_color_query_is_not_answered_by_the_drain() {
+    let mut harness = harness(901, true);
+    harness.emit(b"\x1b]11;?\x07\x1b]10;?\x07\x1b]12;?\x07\x1b]4;5;?\x07");
+    match harness.next_output().await {
+        TabOutput::Scanned { data, actions } => {
+            assert_eq!(
+                data,
+                b"\x1b]11;?\x07\x1b]10;?\x07\x1b]12;?\x07\x1b]4;5;?\x07"
+            );
+            assert_eq!(actions, Vec::<OscAction>::new());
+        }
+        other => panic!("expected Scanned, got {other:?}"),
+    }
+    harness.assert_never_enqueues_anything().await;
 }
 
-/// The chunk still reaches the UI — bytes verbatim, and WITHOUT the
-/// reply action, which the drain already consumed.
+/// The chunk reaches the UI with the bytes verbatim and the actions the
+/// scan produced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scanned_output_forwards_the_bytes_and_the_non_reply_actions() {
+async fn scanned_output_forwards_the_bytes_and_the_actions() {
     let mut harness = harness(902, true);
     harness.emit(b"\x1b]11;?\x07\x1b]0;title\x07hello");
     match harness.next_output().await {
@@ -132,93 +136,61 @@ async fn scanned_output_forwards_the_bytes_and_the_non_reply_actions() {
                     command: 0,
                     payload: "title".into(),
                 }],
-                "the query reply is gone; the title action is not"
+                "the query produces nothing; the title action survives"
             );
         }
         other => panic!("expected Scanned, got {other:?}"),
     }
 }
 
-/// (b) A SET in an earlier chunk moves the color a later QUERY answers.
+/// A color SET is likewise silent on the input channel — libghostty
+/// applies it from the same bytes, and the drain only moves its own
+/// color state (whose semantics are pinned in
+/// `roost_engine::osc`'s unit tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cross_chunk_set_is_reflected_in_the_next_query() {
-    let harness = harness(903, true);
+async fn a_set_followed_by_a_query_stays_silent_across_chunks() {
+    let mut harness = harness(903, true);
     harness.emit(b"\x1b]11;rgb:00/11/22\x07");
+    harness.next_output().await;
     harness.emit(b"\x1b]11;?\x07");
-    let captured = harness.await_capture("\x1b]11;rgb:").await;
-    assert!(captured.contains("0000/1111/2222"), "{captured:?}");
-    assert!(!captured.contains("1e1e/1e1e/1e1e"), "{captured:?}");
+    harness.next_output().await;
+    harness.assert_never_enqueues_anything().await;
 }
 
-/// (c) A SET and a QUERY in ONE chunk answer from the chunk-start
-/// snapshot — the semantics `OscRouter::feed` has always documented,
-/// preserved exactly by the move to the drain.
+/// A theme change re-seeds the drain-local state while the forwarding
+/// task is live. It shares one lock with the scan, so this pins that
+/// the two interleave without deadlocking or losing a chunk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_same_chunk_set_still_answers_the_pre_chunk_color() {
-    let harness = harness(904, true);
-    harness.emit(b"\x1b]11;rgb:00/11/22\x07\x1b]11;?\x07");
-    let captured = harness.await_capture("\x1b]11;rgb:").await;
-    assert!(captured.contains("1e1e/1e1e/1e1e"), "{captured:?}");
-    assert!(!captured.contains("0000/1111/2222"), "{captured:?}");
-}
-
-/// A theme change re-seeds the drain-local state; the next query
-/// answers the new theme.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reseeding_moves_what_the_drain_answers_with() {
-    let harness = harness(905, true);
+async fn reseeding_does_not_disturb_the_forwarding_task() {
+    let mut harness = harness(905, true);
     harness.session.reseed_osc_colors(OscColorSnapshot::new(
         (0x11, 0x22, 0x33),
         (0x44, 0x55, 0x66),
         (0x77, 0x88, 0x99),
         [(0, 0, 0); 256],
     ));
-    harness.emit(b"\x1b]11;?\x07");
-    let captured = harness.await_capture("\x1b]11;rgb:").await;
-    assert!(captured.contains("4444/5555/6666"), "{captured:?}");
-}
-
-/// The production race behind the explicit-set flag: a theme lands
-/// while the program owns the color. The terminal keeps the program's
-/// value (libghostty's `override orelse default`), so the drain must
-/// answer with it too — otherwise every query for the rest of the
-/// session reports a color the tab is not showing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_theme_change_does_not_clobber_a_color_the_program_set() {
-    let mut harness = harness(908, true);
-    harness.emit(b"\x1b]11;rgb:ab/cd/ef\x07");
-    // Await the forwarded chunk: the SET is in the drain's state by the
-    // time the UI could see the bytes at all.
-    harness.next_output().await;
-
-    harness.session.reseed_osc_colors(OscColorSnapshot::new(
-        (0x11, 0x11, 0x11),
-        (0x22, 0x22, 0x22),
-        (0x33, 0x33, 0x33),
-        [(0, 0, 0); 256],
-    ));
-
-    harness.emit(b"\x1b]11;?\x07\x1b]10;?\x07");
-    let captured = harness.await_capture("\x1b]10;rgb:").await;
-    assert!(
-        captured.contains("abab/cdcd/efef"),
-        "the background the program set must survive the theme: {captured:?}"
-    );
-    assert!(
-        captured.contains("1111/1111/1111"),
-        "the foreground it did NOT set must follow the theme: {captured:?}"
-    );
+    harness.emit(b"\x1b]0;after-reseed\x07");
+    match harness.next_output().await {
+        TabOutput::Scanned { actions, .. } => assert_eq!(
+            actions,
+            vec![OscAction::Workspace {
+                command: 0,
+                payload: "after-reseed".into(),
+            }]
+        ),
+        other => panic!("expected Scanned, got {other:?}"),
+    }
 }
 
 /// `tab.feed_pty_bytes`'s route: injected bytes run the SAME router and
-/// state as the drain, so they share the scanner's streaming position
-/// and the cross-chunk color contract.
+/// state as the drain, so they share the scanner's streaming position —
+/// and, like the drain, enqueue nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_bytes_share_the_drain_router_and_state() {
     let harness = harness(906, true);
     let actions = harness
         .session
-        .scan_osc(b"\x1b]11;rgb:00/11/22\x07\x1b]7;file:///tmp\x07");
+        .scan_osc(b"\x1b]11;rgb:00/11/22\x07\x1b]7;file:///tmp\x07\x1b]11;?\x07");
     assert_eq!(
         actions,
         vec![OscAction::Workspace {
@@ -226,15 +198,30 @@ async fn injected_bytes_share_the_drain_router_and_state() {
             payload: "file:///tmp".into(),
         }]
     );
-    // The SET landed in the state the PTY-side drain answers from.
-    harness.emit(b"\x1b]11;?\x07");
-    let captured = harness.await_capture("\x1b]11;rgb:").await;
-    assert!(captured.contains("0000/1111/2222"), "{captured:?}");
+    harness.assert_never_enqueues_anything().await;
+}
+
+/// A sequence split across two injected chunks still parses as one:
+/// the injector and the drain share the scanner's streaming position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_bytes_resume_a_split_sequence_on_the_drain() {
+    let mut harness = harness(909, true);
+    assert!(harness.session.scan_osc(b"\x1b]7;file:///Us").is_empty());
+    harness.emit(b"ers/me\x07");
+    match harness.next_output().await {
+        TabOutput::Scanned { actions, .. } => assert_eq!(
+            actions,
+            vec![OscAction::Workspace {
+                command: 7,
+                payload: "file:///Users/me".into(),
+            }]
+        ),
+        other => panic!("expected Scanned, got {other:?}"),
+    }
 }
 
 /// (d) The default (the now-removed GTK UI's only mode): raw bytes,
-/// byte-identical, and no drain-side reply — the UI keeps its own
-/// router and answers queries itself.
+/// byte-identical, no scan and nothing enqueued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_default_path_forwards_raw_bytes_and_answers_nothing() {
     let mut harness = harness(907, false);
@@ -248,12 +235,5 @@ async fn the_default_path_forwards_raw_bytes_and_answers_nothing() {
         harness.session.scan_osc(b"\x1b]11;?\x07").is_empty(),
         "no router without the opt-in"
     );
-    // Give a would-be drain-side reply every chance to show up.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let captured = harness.captured();
-    assert!(
-        captured.is_empty(),
-        "the default path must not enqueue anything: {:?}",
-        String::from_utf8_lossy(&captured)
-    );
+    harness.assert_never_enqueues_anything().await;
 }
