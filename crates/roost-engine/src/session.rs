@@ -41,9 +41,7 @@ pub enum TabOutput {
     /// PTY emitted bytes and this session's drain already scanned them
     /// (the `attach_scanned` opt-in). The bytes still route into
     /// `Terminal::vt_write` unchanged; `actions` carries what the scan
-    /// produced MINUS the query replies, which the drain has already
-    /// enqueued onto the PTY input channel. The UI must not run a
-    /// second router over these bytes.
+    /// produced. The UI must not run a second router over these bytes.
     Scanned {
         data: Vec<u8>,
         actions: Vec<OscAction>,
@@ -82,12 +80,11 @@ pub struct TabSession {
     pub tab_id: i64,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<PtyCommand>,
     /// Test-mode tap: when set, every payload enqueued onto the serial
-    /// channel — from `send_input` OR from the drain's own OSC replies
-    /// — is appended here first. `None` in production —
+    /// channel is appended here first. `None` in production —
     /// allocated by `App` when `ROOST_TEST_MODE=1` so the
     /// `tab.capture_pty_input` IPC op can observe keystrokes,
-    /// paste, and synthesised OSC replies that flow out to the
-    /// PTY. The tap is upstream of the command queue, so it
+    /// paste, and the terminal's own query replies that flow out to
+    /// the PTY. The tap is upstream of the command queue, so it
     /// captures the bytes whether or not the supervisor write
     /// later succeeds — exactly what a test wants to assert on.
     input_capture: Option<InputCapture>,
@@ -127,42 +124,24 @@ fn enqueue_input(
 
 /// Take the drain lock, recovering from poisoning: a poisoned mutex
 /// means a prior panic somewhere else in the process, and a tab that
-/// stops answering color queries for the rest of the session is a worse
+/// stops tracking its colors for the rest of the session is a worse
 /// outcome than continuing with the state we have.
 fn lock_osc(osc: &Mutex<OscDrain>) -> std::sync::MutexGuard<'_, OscDrain> {
     osc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Scan one chunk with a tab's drain-side router, then split what it
-/// produced: query replies go straight onto the PTY input channel,
-/// everything else is returned to travel to the UI with the bytes.
+/// Scan one chunk with a tab's drain-side router, moving the tab's
+/// color state and returning the actions that travel to the UI with the
+/// bytes.
 ///
-/// The scan AND its replies happen under one hold of the drain lock.
-/// Releasing it in between would let a second scanner (the PTY drain
-/// and a test-mode `scan_osc` are separate threads) interleave its
-/// enqueue between this scan and this enqueue, putting replies on the
-/// channel in the opposite order to the bytes that asked for them.
-///
-/// Lock order is `OscDrain` → `InputCapture`, and only here: every
-/// other capture holder (`enqueue_input`, and each UI's
-/// `tab.capture_pty_input` reader) takes the capture alone, so no site
-/// can invert it.
-fn scan_and_reply(
-    osc: &Mutex<OscDrain>,
-    cmd_tx: &UnboundedSender<PtyCommand>,
-    capture: Option<&InputCapture>,
-    bytes: &[u8],
-) -> Vec<OscAction> {
+/// The scan holds the drain lock for its whole duration: the PTY drain
+/// and a test-mode `scan_osc` are separate threads feeding one streaming
+/// scanner and one color state, and interleaving them would corrupt
+/// both.
+fn scan(osc: &Mutex<OscDrain>, bytes: &[u8]) -> Vec<OscAction> {
     let mut drain = lock_osc(osc);
     let OscDrain { router, colors } = &mut *drain;
-    let mut forwarded = Vec::new();
-    for action in router.feed_stateful(bytes, colors) {
-        match action {
-            OscAction::PtyInput(reply) => enqueue_input(cmd_tx, capture, reply),
-            other => forwarded.push(other),
-        }
-    }
-    forwarded
+    router.feed_stateful(bytes, colors)
 }
 
 impl TabSession {
@@ -192,16 +171,14 @@ impl TabSession {
     ///
     /// With `osc_seed` set, this session's forwarding task owns the
     /// SOLE `OscRouter` for the tab: it scans each PTY chunk as it
-    /// arrives, enqueues color-query replies onto the same serial input
-    /// channel keystrokes use — before the bytes have even reached the
-    /// UI — and forwards the chunk as [`TabOutput::Scanned`] with the
-    /// remaining actions. That is the whole point of the opt-in: a
-    /// program that queries and exits (Go termenv's 1-frame probe) gets
-    /// its answer off the drain instead of one event-loop turn later,
-    /// which is where the reply used to leak into the shell prompt.
+    /// arrives — moving the tab's color state before the bytes have
+    /// even reached the UI — and forwards the chunk as
+    /// [`TabOutput::Scanned`] with the actions the scan produced. The
+    /// UI must not run a second router over those bytes.
     ///
     /// `osc_seed` is the theme the tab launched with; see
-    /// [`OscColorState`] for why the drain tracks colors itself.
+    /// [`OscColorState`] for what the drain tracks and why it tracks it
+    /// itself rather than reading the terminal.
     pub fn attach_with_receiver_scanned(
         supervisor: Arc<PtySupervisor>,
         tab_id: i64,
@@ -210,8 +187,6 @@ impl TabSession {
         input_capture: Option<InputCapture>,
         osc_seed: Option<OscColorSnapshot>,
     ) -> Self {
-        // The serial channel is created first: the forwarding task
-        // needs its sender to enqueue replies from the drain.
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PtyCommand>();
         let osc = osc_seed.map(|seed| {
             Arc::new(Mutex::new(OscDrain {
@@ -219,19 +194,16 @@ impl TabSession {
                 colors: OscColorState::new(seed),
             }))
         });
-        // Everything the scan needs travels as one option so the
-        // default path takes nothing extra — not even a second sender
-        // on the serial channel, whose lifetime ends the writer task.
-        let scan = osc
-            .clone()
-            .map(|osc| (osc, cmd_tx.clone(), input_capture.clone()));
+        // `None` without the opt-in, so the default path's forwarding
+        // task carries nothing extra.
+        let scanner = osc.clone();
         tokio::spawn(async move {
             loop {
                 match output_rx.recv().await {
                     Ok(PtyOutputEvent::Bytes(data)) => {
-                        let output = match &scan {
-                            Some((osc, cmd_tx, capture)) => {
-                                let actions = scan_and_reply(osc, cmd_tx, capture.as_ref(), &data);
+                        let output = match &scanner {
+                            Some(osc) => {
+                                let actions = scan(osc, &data);
                                 TabOutput::Scanned { data, actions }
                             }
                             None => TabOutput::Bytes(data),
@@ -282,8 +254,7 @@ impl TabSession {
         // supervisor in the exact order they were submitted. The
         // shared channel guarantees keystrokes (and resizes relative
         // to them) never reorder. Ends when the last `cmd_tx` drops
-        // (TabSession dropped) — the forwarding task holds one too, so
-        // a drain-side reply can never race the handle's teardown.
+        // (TabSession dropped).
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -352,11 +323,11 @@ impl TabSession {
     /// — today only `tab.feed_pty_bytes`, the test-mode byte injector.
     ///
     /// It runs the SAME router and the SAME color state the drain does,
-    /// so an injected chunk is indistinguishable from a real one: query
-    /// replies are enqueued here, the caller writes the bytes into its
-    /// terminal and applies the returned actions. Without the OSC
-    /// opt-in there is nothing to scan with and the caller keeps its
-    /// own router — no actions come back.
+    /// so an injected chunk is indistinguishable from a real one: the
+    /// caller writes the bytes into its terminal and applies the
+    /// returned actions. Without the OSC opt-in there is nothing to
+    /// scan with and the caller keeps its own router — no actions come
+    /// back.
     ///
     /// **Callers must not race live PTY output.** Injected bytes and
     /// PTY bytes are two producers into one streaming scanner and one
@@ -374,7 +345,7 @@ impl TabSession {
         let Some(osc) = &self.osc else {
             return Vec::new();
         };
-        scan_and_reply(osc, &self.cmd_tx, self.input_capture.as_ref(), bytes)
+        scan(osc, bytes)
     }
 
     /// Re-seed the drain-local color state after a theme change. A
@@ -390,16 +361,15 @@ impl TabSession {
         //
         // The single consumer is the `cmd_rx` task above: it is the
         // only thing that writes to the tab's master fd, so bytes reach
-        // the PTY in exactly the order they were enqueued. What is NOT
-        // single is the producer side — the UI adapter's main thread
-        // (keystrokes, paste, resize, terminal replies) and, under the
-        // OSC opt-in, this session's own drain task (color-query
-        // replies, which is the point: they leave without waiting for
-        // the UI's event loop). Both funnel through `enqueue_input`.
+        // the PTY in exactly the order they were enqueued. The producer
+        // side is the UI adapter's main thread — keystrokes, paste,
+        // resize, and the terminal's own `write_pty` replies, which the
+        // UI drains after each `vt_write`/`resize`. They all funnel
+        // through `enqueue_input`.
         //
         // The ordering contract that follows from that: enqueue order
         // IS observed order, and user input may interleave with
-        // synthesised replies. `tab.capture_pty_input` observes the
+        // terminal replies. `tab.capture_pty_input` observes the
         // same order — its buffer is written under a lock held across
         // the enqueue — so a test may assert on the presence and
         // relative order of what it caused, never on the absence of an

@@ -1,10 +1,20 @@
 //! Toolkit-neutral OSC routing for one terminal session.
 //!
 //! A UI adapter owns one [`OscRouter`] beside each terminal parser. It feeds
-//! PTY output bytes and an owned snapshot of the terminal's live colors, then
-//! executes the returned [`OscAction`]s after the router call returns. This
-//! keeps streaming parse state and action ordering shared without giving the
-//! engine renderer, clipboard, or toolkit callbacks.
+//! PTY output bytes and executes the returned [`OscAction`]s after the router
+//! call returns. This keeps streaming parse state and action ordering shared
+//! without giving the engine renderer, clipboard, or toolkit callbacks.
+//!
+//! **Color queries are not answered here.** libghostty answers OSC 4,
+//! OSC 10/11/12 and Kitty OSC 21 queries itself through the `write_pty`
+//! effect as of the pinned ghostty `f2d5758f6` (upstream `14c829883`,
+//! "terminal: report OSC color queries in lib-vt"), and Roost installs
+//! that callback for the device-query replies. Synthesizing a second
+//! reply here put two answers on the wire for every query, so the
+//! router now passes color queries through: the terminal owns the
+//! reply, with xterm's sequential semantics (a SET earlier in the same
+//! chunk is visible to a QUERY after it). The scanner still surfaces
+//! the SET/RESET events, which [`OscColorState`] tracks.
 
 pub use roost_osc::ClipboardTarget;
 use roost_osc::{OscEvent, OscScanner};
@@ -12,9 +22,10 @@ use roost_osc::{OscEvent, OscScanner};
 /// Renderer-independent 8-bit RGB color.
 pub type OscRgb = (u8, u8, u8);
 
-/// Colors that are effective immediately before a chunk is applied to the
-/// terminal parser. Keeping this DTO independent of `roost-vt` lets a future
-/// Swift adapter supply colors from its native render state.
+/// One full set of terminal colors — a theme seed for
+/// [`OscColorState`], or the values it currently holds. Keeping this DTO
+/// independent of `roost-vt` lets a future Swift adapter supply colors
+/// from its native render state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OscColorSnapshot {
     pub foreground: OscRgb,
@@ -61,21 +72,18 @@ impl Default for ExplicitColors {
     }
 }
 
-/// Color state owned by a scanner that answers queries *ahead* of the
-/// terminal parser.
+/// The drain's own record of the colors a tab is showing.
 ///
-/// The UI-supplied snapshot [`OscRouter::feed`] takes is read off the
-/// live terminal, which is only correct while the scanner and the
-/// parser see the same bytes at the same time. iced's drain-side router
-/// runs ahead of `vt_write` by design (that is the whole point — the
-/// reply leaves before the UI's event loop turns), so it tracks the
-/// colors itself: seeded from the theme at attach, moved by the OSC
+/// It is NOT a reply source — libghostty answers color queries itself
+/// (see the module docs). It is the drain-side mirror of the terminal's
+/// color state: seeded from the theme at attach, moved by the OSC
 /// SET/RESET events the scanner surfaces, re-seeded when the theme
-/// changes. The terminal converges on the same values because it reads
-/// the same byte stream in the same order.
+/// changes. It stays coherent with the terminal because it reads the
+/// same byte stream in the same order, which is what lets anything on
+/// the drain read a tab's colors without an FFI hop onto the UI thread.
 ///
 /// **Why an explicit-set flag rather than "a theme wins".** libghostty
-/// models each color as `{ override, default }` and answers with
+/// models each color as `{ override, default }` and resolves it as
 /// `override orelse default`; the option a theme push writes is
 /// `default`, and its palette's `changeDefault` preserves every entry a
 /// program set. So an OSC override OUTLIVES a theme change in the
@@ -85,9 +93,6 @@ impl Default for ExplicitColors {
 /// theme lands while SET-carrying chunks are still queued for
 /// `vt_write`: the terminal would end up on the program's color and
 /// this state on the theme's, with nothing to reconcile them.
-///
-/// The one deliberate divergence is the reset path — see
-/// [`OscColorState::apply`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OscColorState {
     current: OscColorSnapshot,
@@ -129,7 +134,7 @@ impl OscColorState {
         self.defaults = seed;
     }
 
-    /// The colors a query answers from.
+    /// The colors this state currently holds.
     pub fn snapshot(&self) -> &OscColorSnapshot {
         &self.current
     }
@@ -137,18 +142,12 @@ impl OscColorState {
     /// Apply one scanner event. Non-color events are ignored.
     ///
     /// A reset drops the value back to the current default AND clears
-    /// the explicit flag, so a later theme owns the channel again. That
-    /// is xterm's semantics and what libghostty's palette does
-    /// (`OSC 104` unsets the entry's mask bit). It diverges from the
-    /// PINNED libghostty for fg/bg/cursor only: that build's
-    /// `DynamicRGB.reset()` assigns `override = default` instead of
-    /// clearing it, so a reset channel there stops following later
-    /// themes (pinned by
-    /// `crates/roost-vt/tests/theme_vs_osc_override_test.rs`, which
-    /// goes red when a SHA bump adopts upstream's fix). Observing the
-    /// difference takes reset → theme change → color query on the same
-    /// channel; we answer with the new theme, the pinned terminal
-    /// renders the old one.
+    /// the explicit flag, so a later theme owns the channel again —
+    /// xterm's semantics, and what the pinned libghostty does for both
+    /// the palette (`OSC 104` unsets the entry's mask bit) and
+    /// fg/bg/cursor (`DynamicRGB.reset()` clears `override`). Pinned
+    /// through the FFI by
+    /// `crates/roost-vt/tests/theme_vs_osc_override_test.rs`.
     fn apply(&mut self, event: &OscEvent) {
         match event {
             OscEvent::ColorSet { number, color } => match number {
@@ -211,26 +210,12 @@ impl OscColorState {
     }
 }
 
-/// Whether an event moves [`OscColorState`] — the cheap test that keeps
-/// the chunk-start snapshot clone off every ordinary chunk.
-fn moves_color_state(event: &OscEvent) -> bool {
-    matches!(
-        event,
-        OscEvent::ColorSet { .. }
-            | OscEvent::ColorReset(_)
-            | OscEvent::PaletteSet(_)
-            | OscEvent::PaletteReset(_)
-    )
-}
-
 /// Explicit effect produced by an OSC sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OscAction {
     /// Apply an authoritative workspace transition through
     /// `LocalClient::apply_osc`.
     Workspace { command: u32, payload: String },
-    /// Write a synthesized terminal query reply to the PTY input channel.
-    PtyInput(Vec<u8>),
     /// UI port: write decoded text to the named native clipboard.
     ClipboardWrite {
         target: ClipboardTarget,
@@ -252,45 +237,26 @@ impl OscRouter {
     }
 
     /// Consume one PTY output chunk and return effects in wire order.
-    ///
-    /// `colors` describes the terminal immediately before `bytes` is applied.
-    /// This intentionally preserves Roost's established behavior: a SET in an
-    /// earlier chunk affects a later QUERY, while SET+QUERY in one chunk sees
-    /// the pre-chunk value.
-    pub fn feed(&mut self, bytes: &[u8], colors: &OscColorSnapshot) -> Vec<OscAction> {
-        map_events(self.scanner.feed(bytes), colors)
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<OscAction> {
+        map_events(self.scanner.feed(bytes))
     }
 
-    /// Consume one PTY output chunk against router-owned color state.
+    /// Consume one PTY output chunk and move `state` with the color
+    /// SETs and RESETs it carries.
     ///
-    /// The same-chunk contract [`OscRouter::feed`] documents is
-    /// preserved exactly, and here it is enforced rather than inherited
-    /// from the caller's read of the terminal: `state` is snapshotted at
-    /// chunk start, every query in the chunk answers from that
-    /// snapshot, and the chunk's SETs land in `state` for the chunks
-    /// that follow.
+    /// The events are applied in wire order, so `state` ends the call
+    /// where the terminal ends its own `vt_write` of the same bytes.
     pub fn feed_stateful(&mut self, bytes: &[u8], state: &mut OscColorState) -> Vec<OscAction> {
         let events = self.scanner.feed(bytes);
-        if events.is_empty() {
-            return Vec::new();
+        for event in &events {
+            state.apply(event);
         }
-        // Only a chunk that actually moves color state pays for the
-        // snapshot clone; the overwhelming majority carry none.
-        let pre_chunk = if events.iter().any(moves_color_state) {
-            let pre_chunk = state.snapshot().clone();
-            for event in &events {
-                state.apply(event);
-            }
-            Some(pre_chunk)
-        } else {
-            None
-        };
-        map_events(events, pre_chunk.as_ref().unwrap_or(state.snapshot()))
+        map_events(events)
     }
 }
 
 /// The pure event → action mapping both feed paths share.
-fn map_events(events: Vec<OscEvent>, colors: &OscColorSnapshot) -> Vec<OscAction> {
+fn map_events(events: Vec<OscEvent>) -> Vec<OscAction> {
     let mut actions = Vec::new();
     for event in events {
         match event {
@@ -314,45 +280,21 @@ fn map_events(events: Vec<OscEvent>, colors: &OscColorSnapshot) -> Vec<OscAction
                 command: 133,
                 payload,
             }),
-            OscEvent::ColorQuery(number) => {
-                let color = match number {
-                    10 => Some(colors.foreground),
-                    11 => Some(colors.background),
-                    12 => Some(colors.cursor),
-                    _ => None,
-                };
-                if let Some(reply) =
-                    color.and_then(|color| roost_osc::format_color_query_response(number, color))
-                {
-                    actions.push(OscAction::PtyInput(reply));
-                }
-            }
-            OscEvent::PaletteQuery(indices) => {
-                let mut reply = Vec::new();
-                for index in indices {
-                    reply.extend_from_slice(&roost_osc::format_palette_query_response(
-                        index,
-                        colors.palette[usize::from(index)],
-                    ));
-                }
-                if !reply.is_empty() {
-                    actions.push(OscAction::PtyInput(reply));
-                }
-            }
             OscEvent::Clipboard { target, text } => {
                 actions.push(OscAction::ClipboardWrite { target, text });
             }
             OscEvent::MouseShape(name) => actions.push(OscAction::PointerShape(name)),
-            // Color SETs and RESETs produce no action: libghostty
-            // applies them to the terminal from the same bytes.
-            // They exist for `OscColorState`, and a router fed
-            // without one (the original, pre-`OscColorState` calling
-            // convention — the now-removed GTK UI's only mode) must
-            // behave exactly as it did before they were surfaced.
+            // Every color event produces no action: libghostty applies
+            // the SETs and RESETs to the terminal from the same bytes,
+            // and answers the QUERIES itself through `write_pty` (see
+            // the module docs). The SET/RESET events exist only for
+            // [`OscColorState`]; the queries pass straight through.
             OscEvent::ColorSet { .. }
             | OscEvent::ColorReset(_)
             | OscEvent::PaletteSet(_)
-            | OscEvent::PaletteReset(_) => {}
+            | OscEvent::PaletteReset(_)
+            | OscEvent::ColorQuery(_)
+            | OscEvent::PaletteQuery(_) => {}
         }
     }
     actions
@@ -387,12 +329,16 @@ mod tests {
         )
     }
 
+    fn entry(state: &OscColorState, index: u8) -> OscRgb {
+        state.snapshot().palette[usize::from(index)]
+    }
+
     #[test]
     fn split_sequences_keep_per_session_scan_state() {
         let mut router = OscRouter::new();
-        assert!(router.feed(b"\x1b]7;file:///Us", &colors()).is_empty());
+        assert!(router.feed(b"\x1b]7;file:///Us").is_empty());
         assert_eq!(
-            router.feed(b"ers/me\x07", &colors()),
+            router.feed(b"ers/me\x07"),
             vec![OscAction::Workspace {
                 command: 7,
                 payload: "file:///Users/me".into(),
@@ -405,7 +351,7 @@ mod tests {
         let mut router = OscRouter::new();
         let bytes = b"\x1b]0;build\x07\x1b]133;C\x07\x1b]22;pointer\x07";
         assert_eq!(
-            router.feed(bytes, &colors()),
+            router.feed(bytes),
             vec![
                 OscAction::Workspace {
                     command: 0,
@@ -420,69 +366,63 @@ mod tests {
         );
     }
 
+    /// The contract this router adopted at the `f2d5758f6` pin: a color
+    /// query is scanned and dropped. libghostty answers it from the
+    /// same bytes through `write_pty`; a second reply from here would
+    /// put two answers on the wire.
     #[test]
-    fn color_and_palette_queries_use_supplied_live_snapshot() {
+    fn color_and_palette_queries_produce_no_action() {
         let mut router = OscRouter::new();
-        let actions = router.feed(b"\x1b]11;?\x07\x1b]4;5;?\x07", &colors());
-        assert_eq!(actions.len(), 2);
-        assert!(matches!(
-            &actions[0],
-            OscAction::PtyInput(bytes) if bytes.windows(14).any(|w| w == b"0000/1111/2222")
-        ));
-        assert!(matches!(
-            &actions[1],
-            OscAction::PtyInput(bytes) if bytes.windows(14).any(|w| w == b"dede/adad/bebe")
-        ));
+        assert_eq!(
+            router.feed(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07\x1b]4;5;?\x07"),
+            Vec::<OscAction>::new()
+        );
     }
 
-    /// The no-`OscColorState` path: a router fed the caller's snapshot
-    /// must produce exactly the actions it produced before SET/RESET
-    /// events existed.
+    /// The stateful path answers nothing either, and a query leaves the
+    /// tracked colors exactly where it found them.
     #[test]
-    fn caller_snapshot_feed_ignores_sets_and_resets() {
+    fn a_query_neither_replies_nor_moves_the_state() {
         let mut router = OscRouter::new();
-        let actions = router.feed(
-            b"\x1b]11;rgb:00/11/22\x07\x1b]4;5;rgb:11/22/33\x07\x1b]111\x07\x1b]104\x07",
-            &colors(),
-        );
+        let mut state = OscColorState::new(colors());
+        let actions = router.feed_stateful(b"\x1b]11;?\x07\x1b]4;5;?\x07", &mut state);
+        assert_eq!(actions, Vec::<OscAction>::new());
+        assert_eq!(state.snapshot(), &colors());
+    }
+
+    /// The stateless path: a router fed without an [`OscColorState`]
+    /// tracks nothing and emits nothing for any color event.
+    #[test]
+    fn stateless_feed_ignores_sets_and_resets() {
+        let mut router = OscRouter::new();
+        let actions = router
+            .feed(b"\x1b]11;rgb:00/11/22\x07\x1b]4;5;rgb:11/22/33\x07\x1b]111\x07\x1b]104\x07");
         assert_eq!(actions, Vec::<OscAction>::new());
     }
 
-    fn reply_color(action: &OscAction) -> String {
-        match action {
-            OscAction::PtyInput(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            other => panic!("expected a PTY reply, got {other:?}"),
-        }
-    }
-
     #[test]
-    fn stateful_feed_answers_a_cross_chunk_set_with_the_new_color() {
+    fn stateful_feed_tracks_a_cross_chunk_set() {
         let mut router = OscRouter::new();
         let mut state = OscColorState::new(colors());
         assert!(router
             .feed_stateful(b"\x1b]11;rgb:aa/aa/aa\x07", &mut state)
             .is_empty());
-        let actions = router.feed_stateful(b"\x1b]11;?\x07", &mut state);
-        assert_eq!(actions.len(), 1);
-        assert!(reply_color(&actions[0]).contains("aaaa/aaaa/aaaa"));
+        assert_eq!(state.snapshot().background, (0xaa, 0xaa, 0xaa));
     }
 
-    /// The pinned same-chunk contract: a SET and a QUERY in one chunk
-    /// answer from the chunk-start snapshot, and the SET applies to
-    /// everything after.
+    /// Sequential semantics, matching xterm and the terminal that now
+    /// answers the query: the SET has already moved the state by the
+    /// time the QUERY beside it in the same chunk is scanned. (Before
+    /// the `f2d5758f6` pin this router answered such a query itself,
+    /// from a chunk-start snapshot — the pre-chunk color. libghostty
+    /// answers with the just-set one, so that snapshot is gone.)
     #[test]
-    fn stateful_feed_answers_a_same_chunk_set_with_the_pre_chunk_color() {
+    fn a_same_chunk_set_lands_before_the_query_beside_it() {
         let mut router = OscRouter::new();
         let mut state = OscColorState::new(colors());
         let actions = router.feed_stateful(b"\x1b]11;rgb:aa/aa/aa\x07\x1b]11;?\x07", &mut state);
-        assert_eq!(actions.len(), 1);
-        let reply = reply_color(&actions[0]);
-        assert!(reply.contains("0000/1111/2222"), "{reply}");
-        assert!(!reply.contains("aaaa/aaaa/aaaa"), "{reply}");
-
-        // …and the chunk after it sees the SET.
-        let actions = router.feed_stateful(b"\x1b]11;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("aaaa/aaaa/aaaa"));
+        assert_eq!(actions, Vec::<OscAction>::new());
+        assert_eq!(state.snapshot().background, (0xaa, 0xaa, 0xaa));
     }
 
     #[test]
@@ -490,13 +430,12 @@ mod tests {
         let mut router = OscRouter::new();
         let mut state = OscColorState::new(colors());
         router.feed_stateful(b"\x1b]4;5;rgb:11/22/33\x07", &mut state);
-        let actions = router.feed_stateful(b"\x1b]4;5;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("1111/2222/3333"));
+        assert_eq!(entry(&state, 5), (0x11, 0x22, 0x33));
 
         router.feed_stateful(b"\x1b]104;5\x07", &mut state);
-        let actions = router.feed_stateful(b"\x1b]4;5;?\x07", &mut state);
-        assert!(
-            reply_color(&actions[0]).contains("dede/adad/bebe"),
+        assert_eq!(
+            entry(&state, 5),
+            (0xde, 0xad, 0xbe),
             "OSC 104 must restore the seeded palette entry"
         );
     }
@@ -510,11 +449,7 @@ mod tests {
             &mut state,
         );
         router.feed_stateful(b"\x1b]110\x07\x1b]111\x07\x1b]112\x07", &mut state);
-        let actions = router.feed_stateful(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07", &mut state);
-        assert_eq!(actions.len(), 3);
-        assert!(reply_color(&actions[0]).contains("aaaa/bbbb/cccc"));
-        assert!(reply_color(&actions[1]).contains("0000/1111/2222"));
-        assert!(reply_color(&actions[2]).contains("9898/9898/9d9d"));
+        assert_eq!(state.snapshot(), &colors());
     }
 
     #[test]
@@ -522,26 +457,17 @@ mod tests {
         let mut router = OscRouter::new();
         let mut state = OscColorState::new(colors());
         router.feed_stateful(b"\x1b]11;not-a-color\x07", &mut state);
-        let actions = router.feed_stateful(b"\x1b]11;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("0000/1111/2222"));
+        assert_eq!(state.snapshot().background, (0x00, 0x11, 0x22));
     }
 
-    /// A theme change replaces the drain-local state outright: the next
-    /// query answers the new theme, and so does a later OSC reset.
+    /// A theme change replaces the drain-local state outright: every
+    /// channel the program has not claimed moves to the new theme, and
+    /// so does a later OSC reset's target.
     #[test]
     fn reseeding_moves_every_channel_the_program_has_not_claimed() {
-        let mut router = OscRouter::new();
         let mut state = OscColorState::new(colors());
         state.reseed(theme_b());
-
-        let actions = router.feed_stateful(
-            b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07\x1b]4;5;?\x07",
-            &mut state,
-        );
-        assert!(reply_color(&actions[0]).contains("1111/1111/1111"));
-        assert!(reply_color(&actions[1]).contains("2222/2222/2222"));
-        assert!(reply_color(&actions[2]).contains("3333/3333/3333"));
-        assert!(reply_color(&actions[3]).contains("0a0a/0b0b/0c0c"));
+        assert_eq!(state.snapshot(), &theme_b());
     }
 
     /// The desync this flag exists for: a theme lands while a SET the
@@ -558,9 +484,9 @@ mod tests {
         let mut state = OscColorState::new(colors());
         router.feed_stateful(b"\x1b]11;rgb:ab/cd/ef\x07", &mut state);
         state.reseed(theme_b());
-        let actions = router.feed_stateful(b"\x1b]11;?\x07", &mut state);
-        assert!(
-            reply_color(&actions[0]).contains("abab/cdcd/efef"),
+        assert_eq!(
+            state.snapshot().background,
+            (0xab, 0xcd, 0xef),
             "the theme must not clobber a color the program set"
         );
 
@@ -569,8 +495,7 @@ mod tests {
         let mut state = OscColorState::new(colors());
         state.reseed(theme_b());
         router.feed_stateful(b"\x1b]11;rgb:ab/cd/ef\x07", &mut state);
-        let actions = router.feed_stateful(b"\x1b]11;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("abab/cdcd/efef"));
+        assert_eq!(state.snapshot().background, (0xab, 0xcd, 0xef));
     }
 
     #[test]
@@ -579,13 +504,12 @@ mod tests {
         let mut state = OscColorState::new(colors());
         router.feed_stateful(b"\x1b]11;rgb:ab/cd/ef\x07\x1b]111\x07", &mut state);
         // Back to the seed it was reset against…
-        let actions = router.feed_stateful(b"\x1b]11;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("0000/1111/2222"));
+        assert_eq!(state.snapshot().background, (0x00, 0x11, 0x22));
         // …and the next theme owns it again.
         state.reseed(theme_b());
-        let actions = router.feed_stateful(b"\x1b]11;?\x07", &mut state);
-        assert!(
-            reply_color(&actions[0]).contains("2222/2222/2222"),
+        assert_eq!(
+            state.snapshot().background,
+            (0x22, 0x22, 0x22),
             "the reset cleared the program's claim, so the reseed applies"
         );
     }
@@ -597,27 +521,26 @@ mod tests {
         router.feed_stateful(b"\x1b]4;5;rgb:ab/cd/ef\x07", &mut state);
         state.reseed(theme_b());
 
-        let actions = router.feed_stateful(b"\x1b]4;5;?\x07\x1b]4;6;?\x07", &mut state);
-        assert!(
-            reply_color(&actions[0]).contains("abab/cdcd/efef"),
+        assert_eq!(
+            entry(&state, 5),
+            (0xab, 0xcd, 0xef),
             "entry 5 was claimed by the program"
         );
-        assert!(
-            reply_color(&actions[1]).contains("0d0d/0e0e/0f0f"),
+        assert_eq!(
+            entry(&state, 6),
+            (0x0d, 0x0e, 0x0f),
             "entry 6 was not, so the new theme owns it"
         );
 
         // OSC 104 releases the claim; the CURRENT theme takes over, and
         // so does the next one.
         router.feed_stateful(b"\x1b]104;5\x07", &mut state);
-        let actions = router.feed_stateful(b"\x1b]4;5;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("0a0a/0b0b/0c0c"));
+        assert_eq!(entry(&state, 5), (0x0a, 0x0b, 0x0c));
 
         let mut third = theme_b();
         third.palette[5] = (0x77, 0x77, 0x77);
         state.reseed(third);
-        let actions = router.feed_stateful(b"\x1b]4;5;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("7777/7777/7777"));
+        assert_eq!(entry(&state, 5), (0x77, 0x77, 0x77));
     }
 
     #[test]
@@ -628,18 +551,14 @@ mod tests {
         router.feed_stateful(b"\x1b]104\x07", &mut state);
         state.reseed(theme_b());
 
-        let actions = router.feed_stateful(b"\x1b]4;5;?\x07\x1b]4;6;?\x07", &mut state);
-        assert!(reply_color(&actions[0]).contains("0a0a/0b0b/0c0c"));
-        assert!(reply_color(&actions[1]).contains("0d0d/0e0e/0f0f"));
+        assert_eq!(entry(&state, 5), (0x0a, 0x0b, 0x0c));
+        assert_eq!(entry(&state, 6), (0x0d, 0x0e, 0x0f));
     }
 
     #[test]
     fn notification_and_clipboard_payloads_are_explicit_actions() {
         let mut router = OscRouter::new();
-        let actions = router.feed(
-            b"\x1b]777;notify;Build;Passed\x07\x1b]52;c;aGVsbG8=\x07",
-            &colors(),
-        );
+        let actions = router.feed(b"\x1b]777;notify;Build;Passed\x07\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(
             actions,
             vec![

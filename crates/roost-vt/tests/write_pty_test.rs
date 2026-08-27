@@ -8,6 +8,15 @@
 //! (`third_party/ghostty/src/src/terminal/c/terminal.zig`, "set write_pty
 //! callback") plus roost's replacement/clear/drop semantics.
 //!
+//! Since the pin moved to ghostty `f2d5758f6` (upstream `14c829883`,
+//! "terminal: report OSC color queries in lib-vt") the same callback
+//! also carries the OSC 4 / 10 / 11 / 12 color-query replies Roost used
+//! to synthesize itself. The `osc_*` cases below pin that: the exact
+//! reply bytes, that they come from the colors Roost pushes through
+//! `OPT_COLOR_*`, and that a SET is visible to a QUERY behind it in the
+//! same write. Roost's own drain must stay silent on all of them —
+//! `crates/roost-engine/tests/osc_drain_reply_test.rs`.
+//!
 //! Gated on the `ffi` feature like the other wrapper tests; run with:
 //!
 //!     cargo test -p roost-vt --features ffi
@@ -15,7 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use roost_vt::{Terminal, TerminalOptions};
+use roost_vt::{ColorRgb, Terminal, TerminalOptions};
 
 fn new_terminal() -> Terminal {
     Terminal::new(TerminalOptions {
@@ -133,6 +142,116 @@ fn mode_2048_resize_emits_in_band_size_report() {
 
     // CSI 48 ; rows ; cols ; height_px ; width_px t
     assert_eq!(report, b"\x1b[48;30;100;480;800t");
+}
+
+/// Push the colors a tab launches with — exactly what
+/// `TerminalTab::apply_theme_candidate` / `Theme.apply` do.
+fn apply_theme(term: &mut Terminal) {
+    term.set_color_foreground(ColorRgb::new(0xff, 0xff, 0xff))
+        .expect("set fg");
+    term.set_color_background(ColorRgb::new(0x1e, 0x1e, 0x1e))
+        .expect("set bg");
+    term.set_color_cursor(ColorRgb::new(0x98, 0x98, 0x9d))
+        .expect("set cursor");
+    let mut palette = [ColorRgb::new(0, 0, 0); 256];
+    palette[5] = ColorRgb::new(0xde, 0xad, 0xbe);
+    term.set_color_palette(&palette).expect("set palette");
+}
+
+#[test]
+fn osc_color_queries_reply_from_the_pushed_theme() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+    apply_theme(&mut term);
+
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]10;?\x07"),
+        b"\x1b]10;rgb:ffff/ffff/ffff\x07"
+    );
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]11;?\x07"),
+        b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"
+    );
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]12;?\x07"),
+        b"\x1b]12;rgb:9898/9898/9d9d\x07"
+    );
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]4;5;?\x07"),
+        b"\x1b]4;5;rgb:dede/adad/bebe\x07"
+    );
+}
+
+/// The reply preserves the terminator the request used, so an
+/// ST-terminated query gets an ST-terminated answer.
+#[test]
+fn an_osc_color_reply_preserves_the_request_terminator() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+    apply_theme(&mut term);
+
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]11;?\x1b\\"),
+        b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\"
+    );
+}
+
+/// Why the `OPT_COLOR_*` push is load-bearing: libghostty answers with
+/// `override orelse default`, and a terminal with neither has nothing
+/// to report, so the query goes unanswered.
+#[test]
+fn an_unseeded_color_query_gets_no_reply() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+
+    assert!(query(&mut term, &buf, b"\x1b]11;?\x07").is_empty());
+}
+
+#[test]
+fn an_osc_color_reply_follows_a_set_from_an_earlier_write() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+    apply_theme(&mut term);
+
+    term.vt_write(b"\x1b]11;rgb:00/11/22\x07");
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]11;?\x07"),
+        b"\x1b]11;rgb:0000/1111/2222\x07"
+    );
+}
+
+/// Sequential semantics: a SET and a QUERY in ONE write answer with
+/// the just-set color, in one reply. Roost's drain used to answer such
+/// a query from a chunk-start snapshot — the pre-chunk color — which
+/// both contradicted xterm and put a second answer on the wire.
+#[test]
+fn a_same_write_set_and_query_reply_sequentially() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+    apply_theme(&mut term);
+
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]11;rgb:00/11/22\x07\x1b]11;?\x07"),
+        b"\x1b]11;rgb:0000/1111/2222\x07"
+    );
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]4;5;rgb:11/22/33\x07\x1b]4;5;?\x07"),
+        b"\x1b]4;5;rgb:1111/2222/3333\x07"
+    );
+}
+
+/// The opencode/opentui gate: `OSC 4;0;?` with a 300 ms timeout is
+/// what all of its color detection hangs on.
+#[test]
+fn the_osc4_probe_opencode_gates_on_is_answered() {
+    let mut term = new_terminal();
+    let buf = install_buffer(&mut term);
+    apply_theme(&mut term);
+
+    assert_eq!(
+        query(&mut term, &buf, b"\x1b]4;0;?\x07"),
+        b"\x1b]4;0;rgb:0000/0000/0000\x07"
+    );
 }
 
 #[test]

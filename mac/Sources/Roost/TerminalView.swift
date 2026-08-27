@@ -609,49 +609,15 @@ final class TerminalView: NSView {
         oscShapeSetInThisChunk = false
         let events = oscScanner.feed(data)
         for event in events {
-            // Synthesise OSC 10/11/12 query replies inline —
-            // libghostty-vt drops the .query arm of its color-op
-            // handler, so without us answering, codex (and reportedly
-            // claude-code) skip their prompt-row bg SGR sequence. We
-            // route the reply through `onKey` because the destination
-            // is exactly the same: bytes injected into the PTY's
-            // stdin alongside user keystrokes via the tab's
-            // keystroke continuation — FIFO with other writes *once
-            // enqueued*, not against PTY output that hasn't been
-            // drained yet. Reads libghostty's *currently effective*
-            // color so a prior `OSC 10/11/12;rgb:…` set is reflected
-            // in the next query reply (vim colorscheme plugins etc.).
-            // Mirrors the OSC color-query handling at
-            // `crates/roost-engine/src/osc.rs` (shared by iced).
-            if case .colorQuery(let n) = event {
-                let color = TerminalView.liveColor(forQuery: n, terminal: terminal, theme: theme)
-                if let color = color,
-                   let reply = TerminalView.formatColorQueryResponse(n: n, color: color)
-                {
-                    onKey?(reply)
-                }
-                continue
-            }
-            // OSC 4 palette query — answer each index from libghostty's
-            // live palette (a prior `OSC 4;Ps;rgb:…` set wins), theme
-            // fallback on FFI miss. Same `onKey` PTY-input route as the
-            // OSC 10/11/12 path above. Unblocks opencode/opentui, which
-            // gate *all* color detection on a reply to `OSC 4;0;?`.
-            if case .paletteQuery(let indices) = event {
-                let palette = TerminalView.livePalette(terminal: terminal, theme: theme)
-                var reply = Data()
-                for idx in indices where Int(idx) < palette.count {
-                    if let bytes = TerminalView.formatPaletteQueryResponse(
-                        index: idx, color: palette[Int(idx)]
-                    ) {
-                        reply.append(bytes)
-                    }
-                }
-                if !reply.isEmpty {
-                    onKey?(reply)
-                }
-                continue
-            }
+            // OSC 4 / 10 / 11 / 12 color queries pass through
+            // untouched. libghostty answers them itself from the same
+            // bytes, through the `write_pty` effect that
+            // `flushPendingPtyReplies` drains at the end of this
+            // method — as of the pinned ghostty `f2d5758f6` (upstream
+            // `14c829883`). Answering here too put a SECOND reply on
+            // the wire for every query.
+            if case .colorQuery = event { continue }
+            if case .paletteQuery = event { continue }
             // OSC 52 program-initiated clipboard write — UI-only
             // action, not workspace state. Honor on the UI side
             // because only the UI has the NSPasteboard handle.
@@ -3169,131 +3135,6 @@ final class TerminalView: NSView {
             return .outline
         default:
             return .block
-        }
-    }
-
-    /// Synthesise the XTerm-form OSC 10/11/12 query response for
-    /// the given query number + theme color. Byte-identical to the
-    /// Rust `format_color_query_response` in
-    /// `crates/roost-osc/src/lib.rs` — both UIs must produce the
-    /// same bytes so codex/claude-code see one terminal answer
-    /// regardless of which UI hosts the tab. `nonisolated` because
-    /// the function is pure (no `self`); see `resolveCellColors`
-    /// above for the same Swift 6 strict-concurrency rationale.
-    ///
-    /// Returns `nil` if `n` isn't one of the recognised color-query
-    /// numbers (10, 11, 12). Returns `nil` when the color can't be
-    /// converted to sRGB components (defensive — every bundled theme
-    /// color does convert).
-    nonisolated static func formatColorQueryResponse(n: UInt8, color: NSColor) -> Data? {
-        guard (10...12).contains(n), let srgb = color.usingColorSpace(.sRGB) else {
-            return nil
-        }
-        let r = UInt8(round(srgb.redComponent * 255))
-        let g = UInt8(round(srgb.greenComponent * 255))
-        let b = UInt8(round(srgb.blueComponent * 255))
-        // 16-bit-per-channel form: each 8-bit channel repeated to
-        // fill 4 hex digits, BEL-terminated. Matches xterm's reply
-        // and what codex/claude expect.
-        let s = String(
-            format: "\u{1B}]%d;rgb:%02x%02x/%02x%02x/%02x%02x\u{07}",
-            Int(n), r, r, g, g, b, b
-        )
-        return Data(s.utf8)
-    }
-
-    /// Read the live effective color libghostty would render with for
-    /// the given OSC color-query number (10=fg, 11=bg, 12=cursor),
-    /// falling back to the theme when libghostty hasn't tracked a
-    /// value yet. Centralised so the OSC reply path on the Mac
-    /// matches the Linux `TerminalView::live_colors` shape — both
-    /// UIs must reply with the same color a `vim`-driven
-    /// `OSC 11;rgb:…` set most recently established.
-    ///
-    /// Returns `nil` if `n` isn't 10/11/12.
-    @MainActor
-    static func liveColor(
-        forQuery n: UInt8,
-        terminal: GhosttyTerminal,
-        theme: Theme
-    ) -> NSColor? {
-        let dataKey: GhosttyTerminalData
-        let themeFallback: NSColor
-        switch n {
-        case 10:
-            dataKey = GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND
-            themeFallback = theme.foreground
-        case 11:
-            dataKey = GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND
-            themeFallback = theme.background
-        case 12:
-            dataKey = GHOSTTY_TERMINAL_DATA_COLOR_CURSOR
-            themeFallback = theme.cursor
-        default:
-            return nil
-        }
-        var rgb = GhosttyColorRgb(r: 0, g: 0, b: 0)
-        let rc = ghostty_terminal_get(terminal, dataKey, &rgb)
-        guard rc.rawValue == 0 else {
-            // GHOSTTY_NO_VALUE (or any other non-zero rc) means
-            // libghostty isn't reporting a default yet — render with
-            // the theme, which is what the renderer paints anyway.
-            return themeFallback
-        }
-        return NSColor(
-            srgbRed: CGFloat(rgb.r) / 255,
-            green: CGFloat(rgb.g) / 255,
-            blue: CGFloat(rgb.b) / 255,
-            alpha: 1
-        )
-    }
-
-    /// Format an OSC 4 palette-query reply:
-    /// `ESC]4;<index>;rgb:RRRR/GGGG/BBBB BEL`. Mirrors
-    /// `formatColorQueryResponse` (16-bit channels, BEL-terminated) for
-    /// the palette path so both UIs answer byte-identically. The index
-    /// echoes the queried palette slot.
-    ///
-    /// Returns `nil` when the color can't convert to sRGB (defensive).
-    nonisolated static func formatPaletteQueryResponse(index: UInt8, color: NSColor) -> Data? {
-        guard let srgb = color.usingColorSpace(.sRGB) else { return nil }
-        let r = UInt8(round(srgb.redComponent * 255))
-        let g = UInt8(round(srgb.greenComponent * 255))
-        let b = UInt8(round(srgb.blueComponent * 255))
-        let s = String(
-            format: "\u{1B}]4;%d;rgb:%02x%02x/%02x%02x/%02x%02x\u{07}",
-            Int(index), r, r, g, g, b, b
-        )
-        return Data(s.utf8)
-    }
-
-    /// Read libghostty's live 256-entry palette — the post-OSC-override
-    /// view an `OSC 4;Ps;?` query should answer — falling back to the
-    /// theme palette when libghostty hasn't tracked one yet. The OSC-4
-    /// analogue of `liveColor`; mirrors the Linux
-    /// `TerminalView::live_palette` shape so both UIs reply with the
-    /// color a prior `OSC 4;Ps;rgb:…` set most recently established.
-    @MainActor
-    static func livePalette(terminal: GhosttyTerminal, theme: Theme) -> [NSColor] {
-        // libghostty's PaletteC is `[256]RGB.C`, layout-compatible with
-        // a contiguous `[GhosttyColorRgb]` of 256; `get` copies into it.
-        var raw = [GhosttyColorRgb](repeating: GhosttyColorRgb(r: 0, g: 0, b: 0), count: 256)
-        let rc = raw.withUnsafeMutableBytes { buf in
-            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE, buf.baseAddress)
-        }
-        guard rc.rawValue == 0 else {
-            // GHOSTTY_NO_VALUE (or any non-zero rc) — libghostty hasn't
-            // tracked a palette yet; render with the theme palette, what
-            // the renderer paints anyway.
-            return theme.palette
-        }
-        return raw.map {
-            NSColor(
-                srgbRed: CGFloat($0.r) / 255,
-                green: CGFloat($0.g) / 255,
-                blue: CGFloat($0.b) / 255,
-                alpha: 1
-            )
         }
     }
 
