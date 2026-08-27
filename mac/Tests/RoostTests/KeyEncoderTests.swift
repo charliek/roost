@@ -62,16 +62,13 @@ private func keyEvent(
 /// Kitty / modifyOtherKeys state per encode.
 @MainActor
 private func withEncoder(_ body: (KeyEncoder) -> Void) {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
     var term: GhosttyTerminal?
-    let rc = ghostty_terminal_new(nil, &term, opts)
+    let rc = ghostty_terminal_new(nil, &term, 80, 24)
     guard rc.rawValue == 0, let term else {
         fatalError("ghostty_terminal_new failed (rc=\(rc.rawValue))")
     }
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
     guard let encoder = KeyEncoder(terminal: term) else {
         fatalError("KeyEncoder init returned nil")
     }
@@ -85,16 +82,13 @@ private func withEncoder(_ body: (KeyEncoder) -> Void) {
 /// when they enable the protocol.
 @MainActor
 private func withKittyEncoder(_ body: (KeyEncoder) -> Void) {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
     var term: GhosttyTerminal?
-    let rc = ghostty_terminal_new(nil, &term, opts)
+    let rc = ghostty_terminal_new(nil, &term, 80, 24)
     guard rc.rawValue == 0, let term else {
         fatalError("ghostty_terminal_new failed (rc=\(rc.rawValue))")
     }
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
     // CSI > 1 u — push Kitty flags (bit 0 = disambiguate).
     let enable: [UInt8] = [0x1B, 0x5B, 0x3E, 0x31, 0x75]
     enable.withUnsafeBufferPointer { ghostty_terminal_vt_write(term, $0.baseAddress, $0.count) }

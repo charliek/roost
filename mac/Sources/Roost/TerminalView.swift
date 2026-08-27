@@ -433,20 +433,39 @@ final class TerminalView: NSView {
         // walking its render state to drive draw(); for now we just
         // hold the handle to validate the lifecycle on the real
         // (non-test) binary.
-        var opts = GhosttyTerminalOptions()
-        opts.cols = cols
-        opts.rows = rows
-        // M6: enable scrollback storage. Without a positive value
-        // libghostty-vt discards lines as they scroll off the screen
-        // — scroll-wheel events would have nothing to scroll into.
-        opts.max_scrollback = Self.defaultScrollback
-
         var handle: GhosttyTerminal?
-        let rc = ghostty_terminal_new(nil, &handle, opts)
+        let rc = ghostty_terminal_new(nil, &handle, cols, rows)
         if rc.rawValue != 0 || handle == nil {
             fatalError("ghostty_terminal_new failed (rc.rawValue=\(rc.rawValue))")
         }
         self.terminal = handle
+
+        // M6: enable scrollback storage. Without a positive value
+        // libghostty-vt discards lines as they scroll off the screen
+        // — scroll-wheel events would have nothing to scroll into.
+        // Applied after construction: the scrollback limit moved out of
+        // the (now removed) options struct onto ghostty_terminal_set.
+        var maxScrollback = Self.defaultScrollback
+        let scrollbackRc = ghostty_terminal_set(
+            handle,
+            GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES,
+            &maxScrollback
+        )
+        if scrollbackRc.rawValue != 0 {
+            fatalError(
+                "ghostty_terminal_set(SCROLLBACK_MAX_LINES) failed (rc.rawValue=\(scrollbackRc.rawValue))"
+            )
+        }
+        // ghostty_terminal_new also installs a default *byte* limit
+        // (10 KB at this pin) that wins over the line limit whenever it
+        // is reached first — which is always, at these magnitudes.
+        // NULL removes it so the line limit above is the one in force.
+        let byteLimitRc = ghostty_terminal_set(handle, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, nil)
+        if byteLimitRc.rawValue != 0 {
+            fatalError(
+                "ghostty_terminal_set(SCROLLBACK_MAX_BYTES, nil) failed (rc.rawValue=\(byteLimitRc.rawValue))"
+            )
+        }
 
         // #247: install libghostty-vt's write_pty effects callback so the
         // device queries the engine answers autonomously (DA1/DA2/DA3,
@@ -2189,10 +2208,9 @@ final class TerminalView: NSView {
     @MainActor
     private func isDecModeEnabled(_ mode: UInt16) -> Bool {
         guard let terminal else { return false }
-        var on = false
-        let m = GhosttyMode(mode & 0x7FFF)
-        let rc = ghostty_terminal_mode_get(terminal, m, &on)
-        return rc.rawValue == 0 && on
+        var cfg = GhosttyTerminalModeConfig(mode: GhosttyMode(mode & 0x7FFF), value: false)
+        let rc = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE, &cfg)
+        return rc.rawValue == 0 && cfg.value
     }
 
     /// True when mode 1003 (any-event motion tracking) is on. Strix

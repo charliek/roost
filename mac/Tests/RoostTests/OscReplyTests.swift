@@ -64,15 +64,11 @@ func reply_channelOrderIsRedGreenBlue() {
 /// the static theme bg and would have returned `1c1c/1c1c/1c1c`.
 @Test @MainActor
 func osc11_dynamicSetIsReflectedByQueryReply() throws {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
-
     var maybeTerm: GhosttyTerminal?
-    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    #expect(ghostty_terminal_new(nil, &maybeTerm, 80, 24).rawValue == 0)
     let term = try #require(maybeTerm, "ghostty_terminal_new returned success but term is nil")
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
 
     // Push a starting theme so the effective-color getters return a
     // value (libghostty's getters return GHOSTTY_NO_VALUE for any
@@ -116,15 +112,11 @@ func osc11_dynamicSetIsReflectedByQueryReply() throws {
 
 @Test @MainActor
 func osc10_dynamicSetIsReflectedByQueryReply() throws {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
-
     var maybeTerm: GhosttyTerminal?
-    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    #expect(ghostty_terminal_new(nil, &maybeTerm, 80, 24).rawValue == 0)
     let term = try #require(maybeTerm)
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
 
     let theme = Theme(
         foreground: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1),
@@ -150,15 +142,11 @@ func osc10_dynamicSetIsReflectedByQueryReply() throws {
 
 @Test @MainActor
 func osc12_dynamicSetIsReflectedByQueryReply() throws {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
-
     var maybeTerm: GhosttyTerminal?
-    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    #expect(ghostty_terminal_new(nil, &maybeTerm, 80, 24).rawValue == 0)
     let term = try #require(maybeTerm)
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
 
     let theme = Theme(
         foreground: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1),
@@ -207,15 +195,11 @@ func osc4_replyEchoesIndex() {
 /// reply, read from libghostty's live palette (not the stale theme).
 @Test @MainActor
 func osc4_dynamicSetIsReflectedByQueryReply() throws {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
-
     var maybeTerm: GhosttyTerminal?
-    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    #expect(ghostty_terminal_new(nil, &maybeTerm, 80, 24).rawValue == 0)
     let term = try #require(maybeTerm)
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
 
     // Seed slot 5 with a known theme color so the "stale" assertion has
     // a value to compare against.

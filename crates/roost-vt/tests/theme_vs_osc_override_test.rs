@@ -126,33 +126,36 @@ fn an_osc_104_reset_clears_the_entry_override() {
     );
 }
 
-/// The one place the pinned libghostty and `OscColorState` disagree, so
-/// the disagreement is measured rather than assumed.
+/// An OSC 110/111/112 reset clears the channel's override outright, so
+/// the channel goes back to following later theme pushes — the same
+/// semantics `OSC 104` already had for a palette entry, and the same
+/// clearing form `OscColorState` implements.
 ///
-/// The pinned build's `DynamicRGB.reset()` assigns `override = default`
-/// instead of clearing `override` (upstream has since changed it to
-/// `null`), so a channel that a program reset with OSC 110/111/112
-/// stops following later theme changes — unlike a palette entry, whose
-/// `OSC 104` reset genuinely unsets its mask bit (see above).
-/// `OscColorState` implements the clearing form for every channel: it
-/// is xterm's semantics and ghostty's own direction, and the divergence
-/// needs the exact sequence reset → theme change → color query to be
-/// observable at all. A SHA bump that fixes `reset()` upstream turns
-/// this test red, which is the signal to delete it.
+/// This used to be the one place libghostty and `OscColorState`
+/// disagreed: at the previous pin `DynamicRGB.reset()` assigned
+/// `override = default` rather than clearing `override`, which froze a
+/// reset channel at whatever default it happened to see. That is fixed
+/// upstream as of the tip this build pins, so the test now pins the
+/// agreement instead of the divergence. It needs the exact sequence
+/// reset → theme change → color query to be observable at all.
 #[test]
-fn a_reset_channel_stops_following_the_theme_in_the_pinned_build() {
+fn a_reset_channel_follows_later_theme_changes() {
     let mut term = term();
     let theme_a = ColorRgb::new(0x1e, 0x1e, 0x1e);
     apply_theme(&mut term, ColorRgb::new(0xff, 0xff, 0xff), theme_a, theme_a);
     term.vt_write(b"\x1b]11;rgb:00/11/22\x07");
     term.vt_write(b"\x1b]111\x07");
+    assert_eq!(
+        term.live_colors().expect("live").background,
+        theme_a,
+        "the reset drops the override and falls back to the current default"
+    );
 
     let theme_b = ColorRgb::new(0x21, 0x21, 0x21);
     apply_theme(&mut term, ColorRgb::new(0xee, 0xee, 0xee), theme_b, theme_b);
     assert_eq!(
         term.live_colors().expect("live").background,
-        theme_a,
-        "pinned `reset()` pins the channel to the default it saw; if this now \
-         reports theme_b, libghostty was fixed and this test should go"
+        theme_b,
+        "a reset channel has no override left, so the next theme owns it again"
     );
 }
