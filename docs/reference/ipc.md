@@ -24,6 +24,12 @@ than one is live, it reports the actual candidates and requires selection.
 (The `linux` profile also resolves on macOS, as `~/Library/Caches/Roost-linux/`,
 but nothing ships or launches it there.)
 
+A fifth socket path, `Session` (`~/Library/Caches/RoostSession/roost.sock`
+on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is
+**reserved** for the future `roost-session` daemon (HS-1). Nothing binds
+it yet, it is not a `roostctl --target` value, and `roostctl` never probes
+it — see [`paths.md`](paths.md#session-profile-reserved).
+
 ## Wire format
 
 * **Framing:** newline-delimited JSON. One JSON object per line.
@@ -42,10 +48,11 @@ but nothing ships or launches it there.)
   `{"id": "<string>", "ok": true, "result": {...}}`.
 * **Response envelope (error):**
   `{"id": "<string>", "ok": false, "error": {"code": "<kebab>", "message": "<string>"}}`.
-* **Event envelope** (server-push, unsolicited, only sent after
-  `events.subscribe`):
+* **Event envelope** (server-push, unsolicited — **not delivered
+  today**; see [`events.subscribe`](#eventssubscribe)):
   `{"event": "<dotted-name>", "data": {...}}` — no `id`, no response
-  expected.
+  expected. This is the shape a future push will use; the catalog in
+  [Events](#events) below documents it in advance.
 * **Bytes payloads** (e.g. `tab.write.data`, and any future binary
   field): **base64-encoded strings** using the standard alphabet,
   no padding stripping. Tested for binary fidelity (`0x00..0xff`
@@ -1009,26 +1016,40 @@ state live on the UI side.
 
 ### `events.subscribe`
 
-Opt-in to the event stream. After the response, the server pushes
-`{"event": ..., "data": ...}` envelopes on the same connection until
-the connection closes.
+**Not implemented.** The op exists on the wire but the server
+rejects every call with `{"ok": false, "error": {"code":
+"not-implemented", "message": "events.subscribe is not yet
+implemented"}}` (`ops::EVENTS_SUBSCRIBE` in
+`crates/roost-engine/src/ipc.rs`) rather than a false ACK — a client
+that treated the reply as "subscribed" would wait forever, since no
+event is ever pushed on the connection today. Callers that want
+current state should poll `tab.list` / `project.list` /
+`tab.dump` instead.
 
-Request: `{"params": {"tab_id_filter": "0"}}`. A non-zero
-`tab_id_filter` restricts the stream to events for that tab.
+Request shape as designed: `{"params": {"tab_id_filter": "0"}}`. A
+non-zero `tab_id_filter` would restrict the stream to events for
+that tab.
 
-**M0 status:** stubbed. The server replies `{"ok": true, "result":
-{}}` and never sends event envelopes on the connection. This is
-intentional — `roostctl` does not need events for any current
-subcommand, and clients that *do* want events will surface as
-follow-ups against a working stub.
-
-Response: `{}`.
+**Forward note (HS-1):** push delivery lands with `roost-session`
+(the host-sessions daemon), delivered as atomic `EventBatch`es —
+`{"revision": <u64>, "events": [<EventEnvelope>, ...]}` — rather than
+one envelope per line. Batching every envelope that shares a
+`revision` lets a client detect loss with a simple gap check ("did I
+skip a revision?") instead of reconstructing individual dropped
+events; on a gap it re-pulls `tab.list` / `project.list`. Both
+`EventBatch` and `EventEnvelope` are already defined in
+`crates/roost-ipc/src/messages.rs` (landed ahead of the push
+implementation) — see [Events](#events) below for the envelope
+catalog they will carry.
 
 ## Events
 
-Server-push only. Each is a line of the form `{"event": "<name>", "data":
-{...}}`. The set below is the exhaustive list; no other event names are
-emitted.
+Server-push only, and **not delivered yet** — see
+[`events.subscribe`](#eventssubscribe). Each event is documented here
+in the envelope shape it will be pushed in once HS-1 implements
+delivery: a line of the form `{"event": "<name>", "data": {...}}`
+inside an `EventBatch`. The set below is the exhaustive list of event
+*types* the workspace already models; no other event names exist.
 
 * `tab.opened` — `{"tab": <Tab>}`.
 * `tab.closed` — `{"tab_id": "<id>"}`.
@@ -1069,7 +1090,9 @@ makes them unnecessary:
 * `ReportOsc`. OSC sequences are parsed in the UI; the UI updates
   its own state directly. There is nobody to round-trip to.
 * `WatchEvents` (legacy event stream RPC) is replaced by the
-  `events.subscribe` op + push envelopes on the same connection.
+  `events.subscribe` op + push envelopes on the same connection —
+  designed, wire-typed (`EventEnvelope` / `EventBatch`), but not
+  implemented yet; see [`events.subscribe`](#eventssubscribe).
 
 Schema-only fields that survive but rename:
 
