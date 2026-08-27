@@ -153,6 +153,13 @@ async fn seqs_stay_ordered_when_the_backstop_races_the_reader() {
     // The subshell exits after its write, releasing the slave fd, so the
     // reader finishes and the channel closes on its own — nothing is
     // left holding the PTY open and no pid has to be killed.
+    //
+    // `trap '' HUP` runs in the PARENT, before the fork: an ignored
+    // disposition is inherited, so the subshell is HUP-immune from its
+    // first instruction. Setting the trap inside the braces raced the
+    // parent's exit — on a slow runner the leader's SIGHUP landed before
+    // the child executed its trap, killing it and collapsing the run to
+    // the EOF shape (seen flaking on ubuntu CI).
     let mut output = sup
         .spawn(
             901,
@@ -160,7 +167,7 @@ async fn seqs_stay_ordered_when_the_backstop_races_the_reader() {
             &[
                 "/bin/sh".into(),
                 "-c".into(),
-                "{ trap '' HUP; sleep 1; printf 'ROOST_SEQ_TRAILING\\n'; } & \
+                "trap '' HUP; { sleep 1; printf 'ROOST_SEQ_TRAILING\\n'; } & \
                  printf 'ROOST_SEQ_FIRST\\n'; exit 0"
                     .into(),
             ],
