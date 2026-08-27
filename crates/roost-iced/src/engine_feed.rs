@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(bytes, b"out");
     }
 
-    /// `TerminalTab`'s `Drop` aborts its forwarder; this is the half of
+    /// `TabHandle`'s `Drop` aborts its forwarder; this is the half of
     /// that cascade the tab cannot express itself. The aborted task takes
     /// the tab's receiver with it, which is how the engine-side bridge
     /// learns — on its very next send — that it has nobody left to feed.
