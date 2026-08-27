@@ -1,10 +1,11 @@
 // BundleProfile.swift — daemon-removal refactor M1.
 //
-// Swift companion to `roost_ipc::paths::BundleProfile` (Rust). Three
+// Swift companion to `roost_ipc::paths::BundleProfile` (Rust). Four
 // variants — `mac` (Swift `Roost.app`), `linux` (the packaged Linux
-// `roost`), and `iced` (the Rust + iced build). Path resolution mirrors
-// the Rust side so `roostctl` written in Rust and the Swift UI agree on
-// where the Unix socket lives.
+// `roost`), `iced` (the Rust + iced build), and `session` (the headless
+// `roost-session` daemon). Path resolution mirrors the Rust side so
+// `roostctl` written in Rust and the Swift UI agree on where the Unix
+// socket lives.
 //
 // The `defaultSocketPath` helper that the rest of the Mac codebase
 // has been calling becomes a thin shim over the Mac profile (the
@@ -17,16 +18,20 @@ import Foundation
 /// `cargo run -p roost-iced` dev session don't fight over the same
 /// socket / state directory. `linux` never launches on macOS; it stays
 /// modeled here so this mirror covers every kind the Rust enum has.
+/// `session` is the headless `roost-session` daemon — not a UI, and no
+/// Mac binary launches it yet.
 enum BundleProfileKind: String, Sendable {
     case mac
     case linux
     case iced
+    case session
 }
 
 struct BundleProfile: Sendable {
     let kind: BundleProfileKind
-    /// `"Roost"`, `"Roost-linux"`, or `"Roost-iced"`. Used as the directory component
-    /// under `~/Library/{Caches,Application Support,Logs}/`.
+    /// `"Roost"`, `"Roost-linux"`, `"Roost-iced"`, or `"RoostSession"`
+    /// (`"RoostSessionDev"` in debug builds). Used as the directory
+    /// component under `~/Library/{Caches,Application Support,Logs}/`.
     let appLabel: String
     /// `CFBundleIdentifier` (Mac) / desktop-entry id (Linux).
     let appID: String
@@ -85,6 +90,8 @@ struct BundleProfile: Sendable {
             case .mac: return ("Roost", "ai.stridelabs.Roost")
             case .linux: return ("Roost-linux", "ai.stridelabs.Roost.linux")
             case .iced: return ("Roost-iced", "ai.stridelabs.Roost.iced")
+            case .session:
+                return (sessionAppLabel(debugBuild: isDebugBuild), "ai.stridelabs.Roost.session")
             }
         }()
 
@@ -121,6 +128,35 @@ struct BundleProfile: Sendable {
             stateDir: applyStateDirOverride(stateDir, env["ROOST_STATE_DIR"]),
             logDir: logDir
         )
+    }
+
+    /// Directory component the `session` profile uses under
+    /// `~/Library/{Caches,Application Support,Logs}/`. Mirrors
+    /// `session_dir_names` in `paths.rs`: a debug session must never
+    /// land in the shipped session's directories. Parameterized rather
+    /// than a bare `#if` at the use site so both cells are testable in
+    /// one build.
+    static func sessionAppLabel(debugBuild: Bool) -> String {
+        debugBuild ? "RoostSessionDev" : "RoostSession"
+    }
+
+    /// Whether this binary was compiled with debug assertions, matching
+    /// what `cfg!(debug_assertions)` yields on the Rust side.
+    static let isDebugBuild: Bool = {
+        #if DEBUG
+            return true
+        #else
+            return false
+        #endif
+    }()
+
+    /// Session profile — the headless `roost-session` daemon. Kept
+    /// resolvable on macOS (nothing launches it there yet) so this
+    /// mirror stays total against the Rust enum.
+    static func session(environment env: [String: String] = ProcessInfo.processInfo.environment)
+        -> BundleProfile
+    {
+        resolve(kind: .session, environment: env)
     }
 
     /// Apply a `ROOST_STATE_DIR` override to `defaultDir`. Strict
@@ -162,7 +198,9 @@ struct BundleProfile: Sendable {
 
     /// Pick a profile, letting `ROOST_BUNDLE_PROFILE=mac|linux|iced` override
     /// the caller's preferred default. Unknown values silently fall
-    /// through to the default — same policy as Rust.
+    /// through to the default — same policy as Rust. `session` is
+    /// deliberately absent there too: it is not a UI, so pointing a UI
+    /// process at the session namespace is always a mistake.
     static func currentForBinary(
         default fallback: BundleProfileKind,
         environment env: [String: String] = ProcessInfo.processInfo.environment

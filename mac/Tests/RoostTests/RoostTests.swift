@@ -107,6 +107,51 @@ func bundleProfileIcedIsDistinctFromMacAndLinux() {
     #expect(iced.stateLockPath != linux.stateLockPath)
 }
 
+/// Lockstep with `paths.rs`'s
+/// `session_paths_live_under_their_own_mac_library_dirs` and
+/// `session_dir_names_split_dev_from_prod`.
+@Test
+func bundleProfileSessionUsesItsOwnLibraryDirs() {
+    let label = BundleProfile.sessionAppLabel(debugBuild: BundleProfile.isDebugBuild)
+    let session = BundleProfile.session(environment: ["HOME": "/Users/tester"])
+    #expect(session.appID == "ai.stridelabs.Roost.session")
+    #expect(session.appLabel == label)
+    #expect(session.socketPath == "/Users/tester/Library/Caches/\(label)/roost.sock")
+    #expect(session.stateDir == "/Users/tester/Library/Application Support/\(label)")
+    #expect(session.logDir == "/Users/tester/Library/Logs/\(label)")
+
+    for ui in [
+        BundleProfile.mac(environment: ["HOME": "/Users/tester"]),
+        BundleProfile.linux(environment: ["HOME": "/Users/tester"]),
+        BundleProfile.iced(environment: ["HOME": "/Users/tester"]),
+    ] {
+        #expect(session.socketPath != ui.socketPath)
+        #expect(session.stateDir != ui.stateDir)
+        #expect(session.logDir != ui.logDir)
+        #expect(session.appID != ui.appID)
+    }
+}
+
+@Test
+func bundleProfileSessionSplitsDevFromProd() {
+    #expect(BundleProfile.sessionAppLabel(debugBuild: false) == "RoostSession")
+    #expect(BundleProfile.sessionAppLabel(debugBuild: true) == "RoostSessionDev")
+}
+
+/// `session` is not a `ROOST_BUNDLE_PROFILE` value on either side — a UI
+/// pointed at the session namespace is always a mistake.
+@Test
+func bundleProfileSessionEnvFallsThroughToDefault() {
+    let p = BundleProfile.currentForBinary(
+        default: .mac,
+        environment: [
+            "HOME": "/Users/tester",
+            "ROOST_BUNDLE_PROFILE": "session",
+        ]
+    )
+    #expect(p.kind == .mac)
+}
+
 @Test
 func bundleProfileEnvOverridesDefault() {
     let p = BundleProfile.currentForBinary(

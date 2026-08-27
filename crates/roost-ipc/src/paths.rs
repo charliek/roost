@@ -42,10 +42,11 @@ use std::path::PathBuf;
 #[cfg(not(target_os = "macos"))]
 use anyhow::Context;
 
-/// UI variants Roost ships or evaluates. On macOS all three coexist
-/// with distinct paths. On Linux the established Mac/Linux profiles keep
-/// sharing the production XDG paths, while the dev Iced profile uses its
-/// own namespace so it can run beside a packaged install.
+/// Profiles Roost ships or evaluates — the three UI variants plus the
+/// headless host-session daemon. On macOS they coexist with distinct
+/// paths. On Linux the established Mac/Linux profiles keep sharing the
+/// production XDG paths, while the dev Iced profile uses its own
+/// namespace so it can run beside a packaged install.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BundleProfileKind {
     /// The Swift `Roost.app`. App id: `ai.stridelabs.Roost`.
@@ -62,6 +63,12 @@ pub enum BundleProfileKind {
     /// Always isolated from the production Mac/Linux namespace,
     /// including on Linux.
     Iced,
+    /// The headless `roost-session` daemon. App id:
+    /// `ai.stridelabs.Roost.session`. Not a UI and never a `roostctl`
+    /// target — HS-1 defines how sessions get addressed. Its directory
+    /// names carry a `-dev`/`Dev` suffix in debug builds so a dev
+    /// session can never collide with a real one.
+    Session,
 }
 
 impl BundleProfileKind {
@@ -70,7 +77,22 @@ impl BundleProfileKind {
             Self::Mac => "mac",
             Self::Linux => "linux",
             Self::Iced => "iced",
+            Self::Session => "session",
         }
+    }
+}
+
+/// The session profile's `(app_label, linux_namespace)` pair.
+///
+/// Parameterized rather than a bare `#[cfg]` at the use site so both
+/// cells are unit-testable in a single build. Debug builds get their own
+/// directories — `roost-session` and a dev session must never share a
+/// socket, a `state.json`, or a log (host-sessions architecture §8).
+fn session_dir_names(debug_build: bool) -> (&'static str, &'static str) {
+    if debug_build {
+        ("RoostSessionDev", "roost-session-dev")
+    } else {
+        ("RoostSession", "roost-session")
     }
 }
 
@@ -85,10 +107,12 @@ pub struct BundleProfile {
     pub kind: BundleProfileKind,
     /// Human-readable label used in path components on macOS, and
     /// reported by `identify` / `roostctl doctor` on every platform.
-    /// `"Roost"` for Mac, `"Roost-linux"` for Linux, and `"Roost-iced"`
-    /// for Iced. Linux itself uses the established `roost/` namespace
-    /// for Mac and Linux and the isolated `roost-iced/` namespace for
-    /// Iced.
+    /// `"Roost"` for Mac, `"Roost-linux"` for Linux, `"Roost-iced"` for
+    /// Iced, and `"RoostSession"` (`"RoostSessionDev"` in debug builds)
+    /// for Session. Linux itself uses the established `roost/` namespace
+    /// for Mac and Linux, the isolated `roost-iced/` namespace for Iced,
+    /// and `roost-session/` (`roost-session-dev/` in debug builds) for
+    /// Session.
     pub app_label: &'static str,
     /// Reverse-DNS application identifier (`CFBundleIdentifier` on
     /// macOS, the desktop-entry id on Linux). Stable per kind except
@@ -117,6 +141,10 @@ impl BundleProfile {
                 },
             ),
             BundleProfileKind::Iced => ("Roost-iced", "ai.stridelabs.Roost.iced"),
+            BundleProfileKind::Session => (
+                session_dir_names(cfg!(debug_assertions)).0,
+                "ai.stridelabs.Roost.session",
+            ),
         };
         let (socket_path, state_dir, log_dir) = resolve_paths(kind, app_label)?;
         // Redirect ONLY the state dir when `ROOST_STATE_DIR` is set, so
@@ -145,6 +173,10 @@ impl BundleProfile {
 
     pub fn iced() -> anyhow::Result<BundleProfile> {
         Self::for_kind(BundleProfileKind::Iced)
+    }
+
+    pub fn session() -> anyhow::Result<BundleProfile> {
+        Self::for_kind(BundleProfileKind::Session)
     }
 
     /// Pick a profile with `ROOST_BUNDLE_PROFILE` overriding the
@@ -218,6 +250,10 @@ impl BundleProfile {
 /// left over from before the profile was renamed to `linux`) silently
 /// changes which namespace the process owns, and that has to be
 /// observable in the log.
+///
+/// `session` is deliberately absent: it is not a UI, so pointing a UI
+/// process at the session namespace is always a mistake. HS-1 defines
+/// how a session gets addressed.
 fn kind_from_profile_env(default: BundleProfileKind, value: Option<&str>) -> BundleProfileKind {
     match value.map(str::trim) {
         Some("mac") => BundleProfileKind::Mac,
@@ -354,6 +390,7 @@ fn resolve_paths_linux(
     let namespace = match kind {
         BundleProfileKind::Mac | BundleProfileKind::Linux => "roost",
         BundleProfileKind::Iced => "roost-iced",
+        BundleProfileKind::Session => session_dir_names(cfg!(debug_assertions)).1,
     };
     let socket = match valid_dir(env.runtime_dir.as_deref()) {
         Some(dir) => dir.join(namespace).join("roost.sock"),
@@ -439,6 +476,38 @@ mod tests {
         // `roostctl doctor` report on Linux too.
         assert_eq!(linux.app_label, "Roost-linux");
         assert_eq!(iced.app_label, "Roost-iced");
+
+        let session = BundleProfile::session().expect("session profile");
+        assert_eq!(session.app_id, "ai.stridelabs.Roost.session");
+        assert_eq!(
+            session.app_label,
+            session_dir_names(cfg!(debug_assertions)).0
+        );
+    }
+
+    #[test]
+    fn session_dir_names_split_dev_from_prod() {
+        assert_eq!(
+            session_dir_names(false),
+            ("RoostSession", "roost-session"),
+            "the shipped session profile owns these exact directory names"
+        );
+        assert_eq!(
+            session_dir_names(true),
+            ("RoostSessionDev", "roost-session-dev"),
+            "a debug session must never land in the shipped session's directories"
+        );
+    }
+
+    #[test]
+    fn session_profile_slug_round_trips_but_is_not_a_profile_env_value() {
+        assert_eq!(BundleProfileKind::Session.as_str(), "session");
+        // A UI pointed at the session namespace is always a mistake, so
+        // the env parser leaves the caller's default in place.
+        assert_eq!(
+            kind_from_profile_env(BundleProfileKind::Iced, Some("session")),
+            BundleProfileKind::Iced
+        );
     }
 
     #[test]
@@ -563,6 +632,42 @@ mod tests {
         assert_ne!(mac.app_id, linux.app_id);
         assert_ne!(mac.app_id, iced.app_id);
         assert_ne!(linux.app_id, iced.app_id);
+
+        let session = BundleProfile::session().expect("session profile");
+        for ui in [&mac, &linux, &iced] {
+            assert_ne!(session.socket_path, ui.socket_path);
+            assert_ne!(session.state_dir, ui.state_dir);
+            assert_ne!(session.log_dir, ui.log_dir);
+            assert_ne!(session.app_id, ui.app_id);
+        }
+    }
+
+    /// The macOS half of the session path contract. Mirrored by
+    /// `RoostTests.swift`'s `bundleProfileSession*` tests.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_paths_live_under_their_own_mac_library_dirs() {
+        let label = session_dir_names(cfg!(debug_assertions)).0;
+        let session = BundleProfile::session().expect("session profile");
+        let Some(home) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| !h.as_os_str().is_empty() && h.is_absolute())
+        else {
+            let tmp = PathBuf::from("/tmp").join(label);
+            assert_eq!(session.socket_path, tmp.join("roost.sock"));
+            assert_eq!(session.state_dir, tmp);
+            assert_eq!(session.log_dir, tmp);
+            return;
+        };
+        assert_eq!(
+            session.socket_path,
+            home.join("Library/Caches").join(label).join("roost.sock")
+        );
+        assert_eq!(
+            session.state_dir,
+            home.join("Library/Application Support").join(label)
+        );
+        assert_eq!(session.log_dir, home.join("Library/Logs").join(label));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -729,6 +834,58 @@ mod tests {
         );
         assert_eq!(state, PathBuf::from("/home/tester/.local/share/roost-iced"));
         assert_eq!(log, PathBuf::from("/home/tester/.local/state/roost-iced"));
+    }
+
+    /// The headless session daemon gets a third namespace, so it never
+    /// shares a socket, `state.json` or log with either UI.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_session_paths_stay_in_their_own_namespace() {
+        let ns = session_dir_names(cfg!(debug_assertions)).1;
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Session, &golden_env(), 1000).expect("resolve");
+        assert_eq!(
+            socket,
+            PathBuf::from(format!("/run/user/1000/{ns}/roost.sock"))
+        );
+        assert_eq!(
+            state,
+            PathBuf::from(format!("/home/tester/.local/share/{ns}"))
+        );
+        assert_eq!(
+            log,
+            PathBuf::from(format!("/home/tester/.local/state/{ns}"))
+        );
+
+        let iced =
+            resolve_paths_linux(BundleProfileKind::Iced, &golden_env(), 1000).expect("resolve");
+        let linux =
+            resolve_paths_linux(BundleProfileKind::Linux, &golden_env(), 1000).expect("resolve");
+        assert_ne!(socket, iced.0);
+        assert_ne!(socket, linux.0);
+    }
+
+    /// With no `XDG_RUNTIME_DIR` the session socket falls back to
+    /// `/tmp/<namespace>-<uid>`, exactly as the UI profiles do.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_session_paths_without_a_runtime_dir() {
+        let ns = session_dir_names(cfg!(debug_assertions)).1;
+        let env = LinuxPathEnv {
+            home: Some("/home/tester".into()),
+            ..LinuxPathEnv::default()
+        };
+        let (socket, state, log) =
+            resolve_paths_linux(BundleProfileKind::Session, &env, 1000).expect("resolve");
+        assert_eq!(socket, PathBuf::from(format!("/tmp/{ns}-1000/roost.sock")));
+        assert_eq!(
+            state,
+            PathBuf::from(format!("/home/tester/.local/share/{ns}"))
+        );
+        assert_eq!(
+            log,
+            PathBuf::from(format!("/home/tester/.local/state/{ns}"))
+        );
     }
 
     /// A missing / unusable `$HOME` is only fatal when it is actually
