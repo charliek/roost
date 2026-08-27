@@ -6,7 +6,7 @@
 //! someone else unlink our socket and bind their own at the same path,
 //! and every client dials the path. So the leaf is ours (`0700`, our
 //! uid), no component of the path is a symlink, and no ancestor is
-//! world-writable without the sticky bit.
+//! group- or world-writable without the sticky bit.
 //!
 //! # Call order
 //!
@@ -31,14 +31,14 @@
 //! * **Bound-inode identity.** Recording `(dev, ino)` at bind and
 //!   unlinking only a socket that still matches at shutdown is HS-1.
 //! * **Ancestor ownership.** Ancestors are screened only for symlinks,
-//!   non-directories, and world-writability-without-sticky — not for
-//!   foreign ownership or group-writability. A runtime dir deliberately
-//!   nested under another principal's directory is outside the threat
-//!   model; the intended paths (`$XDG_RUNTIME_DIR`, `~/Library`, sticky
-//!   `/tmp`) never construct one.
+//!   non-directories, and group/world-writability-without-sticky — not
+//!   for foreign ownership. A runtime dir deliberately nested under
+//!   another principal's directory is outside the threat model; the
+//!   intended paths (`$XDG_RUNTIME_DIR`, `~/Library`, sticky `/tmp`)
+//!   never construct one.
 //! * **Closing the validate→bind window.** Validation and bind happen in
 //!   one process, microseconds apart, in a directory whose ancestors we
-//!   just proved are not world-writable-without-sticky — so the only
+//!   just proved are not group/world-writable-without-sticky — so the only
 //!   party who could swap the leaf in that window is the one who already
 //!   owns it (us, or root). Accepted for HS-0; the flock over the
 //!   probe→bind sequence is the other half of the answer.
@@ -56,8 +56,8 @@ use crate::peer::current_euid;
 ///
 /// Rejects (never repairs): a leaf that is a symlink, a non-directory,
 /// owned by another uid, or carrying any bit outside `0700`; any symlink
-/// component among the ancestors; any ancestor that is world-writable
-/// without the sticky bit.
+/// component among the ancestors; any ancestor that is group- or
+/// world-writable without the sticky bit.
 ///
 /// The symlink rule is strict on purpose — a symlinked component is
 /// indistinguishable from a redirected one — which means callers must
@@ -112,10 +112,11 @@ fn check_ancestor(dir: &Path) -> anyhow::Result<()> {
     // The sticky bit is what makes `/tmp` legal as an ancestor: it is
     // world-writable, but sticky means only the owner of an entry can
     // rename or unlink it, so nobody else can swap our leaf directory
-    // out from under us. World-writable without it is a free rename.
-    if mode & 0o002 != 0 && mode & 0o1000 == 0 {
+    // out from under us. Group- or world-writable without it is a free
+    // rename for anyone in the group / anyone at all.
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         bail!(
-            "runtime-dir ancestor {} is world-writable without the sticky bit (mode {:04o})",
+            "runtime-dir ancestor {} is group- or world-writable without the sticky bit (mode {:04o})",
             dir.display(),
             mode
         );

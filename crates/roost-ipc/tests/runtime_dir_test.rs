@@ -154,6 +154,25 @@ fn a_world_writable_ancestor_without_the_sticky_bit_is_rejected() {
 }
 
 #[test]
+fn a_group_writable_ancestor_without_the_sticky_bit_is_rejected() {
+    let (_guard, root) = root();
+    let shared = root.join("shared");
+    mkdir(&shared, 0o770);
+    assert_eq!(
+        mode_of(&shared),
+        0o770,
+        "test needs a real non-sticky 770 dir"
+    );
+
+    let err = validate_runtime_dir(shared.join("session"))
+        .expect_err("group-writable non-sticky ancestor must be rejected");
+    assert!(
+        err.to_string().contains("sticky"),
+        "error should say why: {err}"
+    );
+}
+
+#[test]
 fn a_relative_path_is_rejected() {
     let err = validate_runtime_dir("relative/session")
         .expect_err("a relative runtime dir cannot be validated");

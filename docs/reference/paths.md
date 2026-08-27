@@ -107,13 +107,14 @@ nothing launches it yet — it is reserved for the future headless
 **not** a legal `ROOST_BUNDLE_PROFILE` value today; `roostctl --target
 session` and `ROOST_BUNDLE_PROFILE=session` are both rejected — see
 the `ROOST_BUNDLE_PROFILE` discussion above. Debug
-builds get their own `-dev`/`Dev`-suffixed directories so a dev
-session can never collide with a real one.
+builds substitute `RoostSessionDev` / `roost-session-dev` for the
+directory name in **all** of the paths below (socket, state, and
+logs), so a dev session can never collide with a real one.
 
 | Platform | Socket | State | Logs |
 |---|---|---|---|
-| macOS | `~/Library/Caches/RoostSession/roost.sock` (`RoostSessionDev` in debug builds) | `~/Library/Application Support/RoostSession/` | `~/Library/Logs/RoostSession/` |
-| Linux | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, falling back to `/tmp/roost-session-<uid>/roost.sock` (`roost-session-dev` in debug builds) | `$XDG_DATA_HOME/roost-session/` | `$XDG_STATE_HOME/roost-session/` |
+| macOS | `~/Library/Caches/RoostSession/roost.sock` | `~/Library/Application Support/RoostSession/` | `~/Library/Logs/RoostSession/` |
+| Linux | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, falling back to `/tmp/roost-session-<uid>/roost.sock` | `$XDG_DATA_HOME/roost-session/` | `$XDG_STATE_HOME/roost-session/` |
 
 ### Two single-instance locks
 

@@ -79,8 +79,8 @@ it — see [`paths.md`](paths.md#session-profile-reserved).
 * **Errors:** stable kebab-case codes. Current set:
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
-  `internal`. Clients should treat unknown codes as fatal for the
-  request and surface `message` to the user.
+  `not-implemented`, `internal`. Clients should treat unknown codes as
+  fatal for the request and surface `message` to the user.
 
 ## Shared types
 
