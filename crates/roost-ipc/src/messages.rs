@@ -1479,6 +1479,40 @@ pub struct SessionIdentify {
     pub started_at: String,
 }
 
+/// `session.identify` params — empty today, a struct (not a bare
+/// `Value`) so the op rejects unknown fields the same way every other
+/// op does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionIdentifyParams {}
+
+/// `session.stop` params — empty: stop takes no options. A future
+/// deadline override lands here rather than in a new op.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStopParams {}
+
+/// `session.stop` result — how every tab that was live when the stop
+/// began was accounted for. The three lists partition that id set, and
+/// each is sorted.
+///
+/// * `reaped` — hung up and reaped without a direct kill.
+/// * `killed` — still live at the soft deadline, so it was SIGKILLed.
+/// * `abandoned` — still unreaped after the post-kill tail; the session
+///   stopped waiting for it.
+///
+/// Tab ids are string-encoded like every other id on this wire, so a
+/// JavaScript client can't round them through a lossy `Number`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStopResult {
+    #[serde(with = "vec_string_int64")]
+    pub reaped: Vec<i64>,
+    #[serde(with = "vec_string_int64")]
+    pub killed: Vec<i64>,
+    #[serde(with = "vec_string_int64")]
+    pub abandoned: Vec<i64>,
+}
+
 /// One atomic push on the events connection.
 ///
 /// A single workspace commit can publish several events under the same
@@ -1523,6 +1557,15 @@ pub mod ops {
     pub const TAB_AGENT_REPORT: &str = "tab.agent_report";
     pub const NOTIFICATION_CREATE: &str = "notification.create";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    /// Host-session handshake: version + identity + what the session can
+    /// encode an attach payload as. Served only by a socket that carries
+    /// session info; a UI socket answers `unknown-op`, which is how a
+    /// client tells the two apart.
+    pub const SESSION_IDENTIFY: &str = "session.identify";
+    /// Stop the host session: refuse further mutations, flush the
+    /// workspace, tear every PTY down, reply with the reap report, and
+    /// only then run the process-level shutdown tail.
+    pub const SESSION_STOP: &str = "session.stop";
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";

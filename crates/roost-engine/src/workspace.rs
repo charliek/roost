@@ -275,12 +275,18 @@ pub enum WorkspaceEvent {
     Resync(Vec<Project>),
 }
 
-/// An ordered workspace event tagged under the authoritative state lock.
-/// Events produced by one command share a revision and retain vector order.
+/// One commit's worth of workspace events, tagged under the
+/// authoritative state lock and delivered as a single message.
+///
+/// The batch — not the individual event — is the unit of delivery, so a
+/// subscriber's gap check ("did I skip a revision?") is sufficient: it
+/// can never observe half of a commit. Every commit publishes exactly
+/// one of these, **including a commit that produced no events**, so the
+/// revision stream has no unexplained holes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionedWorkspaceEvent {
     pub revision: u64,
-    pub event: WorkspaceEvent,
+    pub events: Vec<WorkspaceEvent>,
 }
 
 pub struct Workspace {
@@ -1485,7 +1491,10 @@ impl Workspace {
     /// `Persist::Write` (so the seq reflects commit order), then sends
     /// every event **while still holding the lock** (broadcast order
     /// matches commit order — a fast subscriber can't observe a
-    /// contradicting sequence), and only after dropping the lock does
+    /// contradicting sequence) — per-event on `events`, and as one
+    /// [`VersionedWorkspaceEvent`] batch on `versioned_events`, sent
+    /// even when the batch is empty so the revision stream stays
+    /// gapless — and only after dropping the lock does
     /// it write to disk (no I/O under the lock). `Persist::Skip` is
     /// for state that isn't part of the persisted snapshot (tab
     /// run-state, notification flags) — emit only.
@@ -1501,13 +1510,12 @@ impl Workspace {
             Persist::Skip => None,
             Persist::Write => Some(inner.snapshot_for_persist()),
         };
-        for ev in events {
+        for ev in &events {
             let _ = self.events.send(ev.clone());
-            let _ = self.versioned_events.send(VersionedWorkspaceEvent {
-                revision,
-                event: ev,
-            });
         }
+        let _ = self
+            .versioned_events
+            .send(VersionedWorkspaceEvent { revision, events });
         drop(inner);
         if let Some((snapshot, seq)) = to_write {
             self.persist(seq, &snapshot, false);

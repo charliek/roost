@@ -30,9 +30,11 @@ use crate::Error;
 
 /// A handler dispatches a single request to a typed implementation.
 ///
-/// Returning `Ok(value)` produces a `{"ok": true, "result": value}`
-/// envelope; returning `Err(HandlerError)` produces a
-/// `{"ok": false, "error": {code, message}}` envelope.
+/// Returning `Ok(HandlerOutcome::Reply(value))` produces a
+/// `{"ok": true, "result": value}` envelope; returning
+/// `Err(HandlerError)` produces a `{"ok": false, "error": {code,
+/// message}}` envelope. [`HandlerOutcome::ReplyThen`] writes the same
+/// reply first and then hands the connection to a [`ConnAction`].
 ///
 /// `Send + Sync + 'static` because tokio's accept loop and per-conn
 /// tasks move the handler across threads.
@@ -44,7 +46,114 @@ pub trait Handler: Send + Sync + 'static {
         &'a self,
         op: &'a str,
         params: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, HandlerError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>>;
+}
+
+/// What a [`Handler`] wants done with the connection after this request.
+///
+/// A dispatcher that only ever returns [`HandlerOutcome::Reply`] is
+/// wire-identical to the request/response-only server: the reply frame
+/// is written and the read loop continues.
+#[derive(Debug)]
+pub enum HandlerOutcome {
+    /// Write `{"ok": true, "result": value}` and keep serving requests.
+    Reply(serde_json::Value),
+    /// Write the reply first, *then* run `then`. The ordering is the
+    /// contract: a client that sees the reply frame knows the action has
+    /// not run yet, and a client that never sees it knows nothing was
+    /// started on its behalf.
+    ReplyThen {
+        reply: serde_json::Value,
+        then: ConnAction,
+    },
+}
+
+// Hand-written: neither a push source nor a finalizer has anything
+// meaningful to print, but callers still want an outcome in an
+// assertion message.
+impl std::fmt::Debug for ConnAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnAction::StartPush(_) => f.write_str("StartPush"),
+            ConnAction::FinalizeStop(_) => f.write_str("FinalizeStop"),
+        }
+    }
+}
+
+/// A change of mode for the connection, taken after the reply is on the
+/// wire.
+pub enum ConnAction {
+    /// Hand the connection's owned write half to a push loop fed by
+    /// `source`. The read half demotes to discard-and-detect-EOF: frames
+    /// are still read (and thrown away) so a peer that goes away is
+    /// noticed promptly.
+    StartPush(PushSource),
+    /// Close the connection and run `finalizer` on a detached task.
+    /// Used by `session.stop`, whose shutdown tail must not begin until
+    /// the stop reply has been flushed to the caller.
+    ///
+    /// Two guarantees, both load-bearing for a daemon whose stop already
+    /// happened by the time the finalizer is handed over:
+    ///
+    /// * It runs even if the reply could not be written (the peer hung
+    ///   up mid-shutdown), so a lost reply can never strand the process.
+    /// * It is detached, so [`IpcServer::run_until`]'s cancellation —
+    ///   which the finalizer itself typically triggers — cannot abort it
+    ///   part-way through.
+    FinalizeStop(StopFinalizer),
+}
+
+/// Ready-to-write push messages for [`ConnAction::StartPush`].
+///
+/// Deliberately a plain bounded-channel receiver rather than a
+/// `Stream`: this crate has no `futures`/`tokio-stream` dependency, and
+/// the producer side is always somebody else's task (the event bridge
+/// adapts a workspace broadcast receiver into the sender), so a channel
+/// is both the simplest shape and the one that keeps the backpressure
+/// policy on the producer's side of the seam.
+pub struct PushSource {
+    rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
+}
+
+impl PushSource {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<serde_json::Value>) -> Self {
+        Self { rx }
+    }
+
+    /// The next message to write, or `None` once every sender is gone
+    /// (which ends the push loop and closes the connection).
+    ///
+    /// Cancel-safe: `mpsc::Receiver::recv` is, so this may be used in a
+    /// `select!` without losing a message.
+    pub async fn next(&mut self) -> Option<serde_json::Value> {
+        self.rx.recv().await
+    }
+}
+
+/// The tail a [`ConnAction::FinalizeStop`] runs once the reply is out.
+///
+/// Boxed rather than generic so the outcome type stays object-safe and
+/// this crate stays ignorant of what "stop" means to its embedder.
+///
+/// It runs on a detached task and survives connection cancellation, so
+/// it is free to be the thing that resolves [`IpcServer::run_until`]'s
+/// shutdown future.
+pub struct StopFinalizer(Box<dyn FnOnce() -> BoxFuture + Send>);
+
+type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+impl StopFinalizer {
+    pub fn new<F, Fut>(f: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Self(Box::new(move || Box::pin(f())))
+    }
+
+    pub async fn run(self) {
+        (self.0)().await;
+    }
 }
 
 /// Error returned by a [`Handler`] implementation.
@@ -186,8 +295,48 @@ impl<H: Handler> IpcServer<H> {
     /// application's lifecycle drive shutdown by dropping the server
     /// handle.
     pub async fn run(self) -> anyhow::Result<()> {
+        self.run_until(std::future::pending::<()>()).await
+    }
+
+    /// Like [`Self::run`], but stops accepting and cancels every live
+    /// connection task as soon as `shutdown` resolves.
+    ///
+    /// Cancelling the live tasks is the half that matters: a session
+    /// that has already torn its PTYs down must not leave a peer parked
+    /// on a half-open socket waiting for a reply that will never come.
+    ///
+    /// A [`ConnAction::FinalizeStop`] tail is exempt — it runs detached,
+    /// so a finalizer that resolves `shutdown` still completes after the
+    /// connection it came from is cancelled.
+    pub async fn run_until(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        // `false` -> serving, `true` -> cancelled. A watch (rather than
+        // a token type from another crate) keeps this dependency-free
+        // and lets every live task observe the flip.
+        //
+        // The sender is shared with each connection task so it outlives
+        // this loop: a dropped sender also wakes `changed()`, which would
+        // turn a fatal accept error into a mass cancellation. That error
+        // is deliberately *not* a cancellation — it ends the accept loop
+        // only, leaving served connections to finish exactly as they did
+        // before `run_until` existed.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        let mut shutdown = Box::pin(shutdown);
         loop {
-            let (conn, _) = self.listener.accept().await?;
+            let accepted = tokio::select! {
+                accepted = self.listener.accept() => accepted,
+                () = &mut shutdown => {
+                    let _ = cancel_tx.send(true);
+                    break Ok(());
+                }
+            };
+            let (conn, _) = match accepted {
+                Ok(conn) => conn,
+                Err(e) => break Err(anyhow::Error::from(e)),
+            };
             // `None` means enforcement is off, so the connection is
             // served. Dropping `conn` here closes it; the peer sees EOF.
             if self
@@ -197,9 +346,22 @@ impl<H: Handler> IpcServer<H> {
                 continue;
             }
             let handler = self.handler.clone();
+            let mut cancel = cancel_rx.clone();
+            let keep_sender_alive = cancel_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_connection(conn, handler).await {
-                    debug!(error = %e, "ipc connection ended");
+                let _keep_sender_alive = keep_sender_alive;
+                tokio::select! {
+                    served = serve_connection(conn, handler) => {
+                        if let Err(e) = served {
+                            debug!(error = %e, "ipc connection ended");
+                        }
+                    }
+                    // `changed()` errors only if the sender is gone,
+                    // which also means the server is finished — either
+                    // way the connection is done.
+                    _ = cancel.changed() => {
+                        debug!("ipc connection cancelled by server shutdown");
+                    }
                 }
             });
         }
@@ -275,12 +437,15 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
         let id = request.id;
         let op = request.op.clone();
         let result = handler.handle(&op, request.params).await;
-        let response = match result {
-            Ok(value) => Response::ok(id, value),
-            Err(err) => Response::err(id, err.code, err.message),
+        let (response, action) = match result {
+            Ok(HandlerOutcome::Reply(value)) => (Response::ok(id, value), None),
+            Ok(HandlerOutcome::ReplyThen { reply, then }) => (Response::ok(id, reply), Some(then)),
+            Err(err) => (Response::err(id, err.code, err.message), None),
         };
+        // `None` when not even the fallback envelope could be encoded:
+        // there is nothing to put on the wire for this id.
         let body = match serde_json::to_vec(&response) {
-            Ok(b) => b,
+            Ok(b) => Some(b),
             Err(e) => {
                 // Surface the failure to the client rather than
                 // dropping the request on the floor — the original
@@ -295,17 +460,108 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
                     format!("response serialization failed: {e}"),
                 );
                 match serde_json::to_vec(&fallback) {
-                    Ok(b) => b,
+                    Ok(b) => Some(b),
                     Err(e2) => {
                         warn!(error = %e2, id, "fallback response also failed to serialize; closing connection");
-                        return Ok(());
+                        None
                     }
                 }
             }
         };
-        write_frame(&mut w, &body).await?;
+        let encoded = body.is_some();
+        let wrote_reply = match body {
+            Some(body) => write_frame(&mut w, &body).await,
+            None => Ok(()),
+        };
+
+        // Strictly after the reply attempt — the reply-before-action
+        // ordering is what `ReplyThen` promises. The two actions differ
+        // in what a *failed* reply means for them.
+        match action {
+            Some(ConnAction::FinalizeStop(finalizer)) => {
+                // Runs whatever became of the reply. By the time a
+                // handler hands this back, the stop it describes has
+                // already happened — latched, flushed, reaped — so a peer
+                // that hung up during it (a Ctrl-C'd `roostctl session
+                // stop`, whose write then fails EPIPE) must not be able
+                // to strand the process with its latch set and its socket
+                // still on disk.
+                if let Err(e) = &wrote_reply {
+                    warn!(error = %e, id, op = %op, "reply failed to reach the client; finalizing anyway");
+                } else if !encoded {
+                    warn!(id, op = %op, "no reply could be encoded; finalizing anyway");
+                }
+                // Detached on purpose: the finalizer is what typically
+                // resolves `run_until`'s shutdown, and that cancels this
+                // connection task. Running it here would let the
+                // cancellation abort it mid-flight, leaving the socket
+                // unlinked. The reply is already out, so nothing is
+                // ordered behind this task.
+                tokio::spawn(finalizer.run());
+                return Ok(());
+            }
+            Some(ConnAction::StartPush(source)) => {
+                // The mirror image: only a client that actually received
+                // its subscribe ack may be put into push mode. One that
+                // did not would sit on a stream it never learned it was
+                // on, so close instead.
+                wrote_reply?;
+                if !encoded {
+                    return Ok(());
+                }
+                return serve_push(reader, w, source).await;
+            }
+            None => {
+                wrote_reply?;
+                if !encoded {
+                    return Ok(());
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Push mode: the connection stops answering requests and becomes a
+/// one-way stream of `source`'s messages.
+///
+/// Teardown is symmetric. The reader task only detects EOF (frames are
+/// read and discarded so a peer that keeps writing can't wedge the
+/// socket buffer), and whichever side finishes first ends the other:
+/// reader EOF drops out of the `select!` and the writer is cancelled
+/// with it; a write failure, or an exhausted source, aborts the reader.
+async fn serve_push(
+    mut reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    mut w: tokio::net::unix::OwnedWriteHalf,
+    mut source: PushSource,
+) -> Result<(), Error> {
+    let mut eof = tokio::spawn(async move { while let Ok(Some(_)) = reader.read_line().await {} });
+    let result = loop {
+        tokio::select! {
+            _ = &mut eof => break Ok(()),
+            item = source.next() => match item {
+                None => break Ok(()),
+                Some(value) => {
+                    let body = match serde_json::to_vec(&value) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            // Dropping one unrepresentable push message
+                            // would silently punch a hole in the stream
+                            // the client is gap-checking, so end the
+                            // connection instead and let it re-subscribe.
+                            warn!(error = %e, "push message failed to serialize; closing connection");
+                            break Err(Error::from(e));
+                        }
+                    };
+                    if let Err(e) = write_frame(&mut w, &body).await {
+                        break Err(e);
+                    }
+                }
+            },
+        }
+    };
+    eof.abort();
+    result
 }
 
 /// Unlink `path` if it is a socket. Re-checks the file type rather

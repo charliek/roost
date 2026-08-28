@@ -68,6 +68,24 @@ final class IPCSessionTypesTests: XCTestCase {
         XCTAssertEqual(identify.payloadKinds, [IPCAttachPayloadKind.vt])
     }
 
+    // `session.stop`'s reap report is server-only — the Mac never
+    // produces one, so it gets no Swift twin (same treatment as
+    // `app.render_stats` and friends). What it does get is field-level
+    // coverage of the shared vector, because the id encoding is the part
+    // that silently breaks across languages: every tab id is a string,
+    // including the ones past 2^53 that a `Double` would round.
+    func testSessionStopVectorKeepsStringEncodedIDs() throws {
+        let raw = try Data(contentsOf: vectorURL("session.stop.response.json"))
+        let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
+        XCTAssertTrue(response.ok)
+        let result = try XCTUnwrap(try XCTUnwrap(response.result).value as? [String: Any])
+        XCTAssertEqual(Set(result.keys), ["reaped", "killed", "abandoned"])
+        XCTAssertEqual(result["reaped"] as? [String], ["3", "5"])
+        XCTAssertEqual(result["killed"] as? [String], ["8"])
+        XCTAssertEqual(result["abandoned"] as? [String], ["9007199254740993"])
+        XCTAssertEqual(Int64("9007199254740993"), 9_007_199_254_740_993)
+    }
+
     func testEventBatchVectorDecodesAndKeepsOrder() throws {
         let raw = try Data(contentsOf: vectorURL("events.batch.json"))
         let batch = try JSONDecoder().decode(IPCEventBatch.self, from: raw)

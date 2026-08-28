@@ -51,7 +51,9 @@ mod server;
 pub use client::{ClientError, IpcClient};
 pub use peer::{current_euid, peer_uid};
 pub use runtime_dir::validate_runtime_dir;
-pub use server::{Handler, HandlerError, IpcServer};
+pub use server::{
+    ConnAction, Handler, HandlerError, HandlerOutcome, IpcServer, PushSource, StopFinalizer,
+};
 
 /// The wire-format protocol version. M0 ships `1`.
 pub const PROTOCOL_VERSION: u32 = 1;

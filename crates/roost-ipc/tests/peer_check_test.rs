@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use roost_ipc::framing::{write_frame, FrameReader};
-use roost_ipc::{current_euid, peer_uid, Handler, HandlerError, IpcServer};
+use roost_ipc::{current_euid, peer_uid, Handler, HandlerError, HandlerOutcome, IpcServer};
 use tempfile::tempdir;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -20,8 +20,8 @@ impl Handler for OkHandler {
         &'a self,
         _op: &'a str,
         _params: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, HandlerError>> + Send + 'a>> {
-        Box::pin(async { Ok(serde_json::json!({"served": true})) })
+    ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {
+        Box::pin(async { Ok(HandlerOutcome::Reply(serde_json::json!({"served": true}))) })
     }
 }
 

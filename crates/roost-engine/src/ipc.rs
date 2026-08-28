@@ -15,9 +15,13 @@
 //! installs a receiver on its own main-loop mechanism and listens
 //! there (Iced drains its subscription on its own event loop).
 
+use std::future::Future;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
@@ -26,23 +30,24 @@ use roost_ipc::messages::{
     AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
-    AppUpdateStatusParams, AppUpdateStatusResult, ClipboardDumpParams, ClipboardDumpResult,
-    ClipboardWriteParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
-    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
-    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams,
-    SelectionDumpParams, SelectionDumpResult, SelectionSetParams, SidebarDumpParams,
-    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
+    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
     TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
     TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams,
+    WindowResizeParams, SESSION_PROTOCOL_VERSION,
 };
-use roost_ipc::{Handler, HandlerError};
+use roost_ipc::{ConnAction, Handler, HandlerError, HandlerOutcome, StopFinalizer};
 
 /// Text snapshot of a tab's terminal viewport, produced on the UI
 /// adapter's main thread for the `tab.dump` op. Neutral (lib-side) types so this crate
@@ -410,6 +415,123 @@ pub enum ClipboardOp {
 
 use crate::{AttentionSource, PtyError, PtySupervisor, Workspace, WorkspaceError};
 
+/// How long `session.stop` lets a hung-up child live before it escalates
+/// to SIGKILL. Long enough for a shell to run its exit traps and for an
+/// agent to finish a write, short enough that a stuck child can't hold a
+/// remote client's `roostctl session stop` open indefinitely.
+pub const SESSION_STOP_SOFT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Identity a host session answers `session.identify` with, plus the
+/// session-local defaults that differ from a UI socket's.
+///
+/// Constructed by the daemon and installed with
+/// [`IpcHandler::with_session`]. A handler without one is a UI socket:
+/// `session.*` falls through to `unknown-op` and every default keeps the
+/// value it has always had.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub session_id: String,
+    /// RFC3339, carried as a string on the wire.
+    pub started_at: String,
+    pub app_version: String,
+    /// What this session can encode a tab's attach payload as. Empty
+    /// until HS-1b implements the attach data plane — an honest "attach
+    /// unavailable" rather than a promise the session cannot keep.
+    pub payload_kinds: Vec<AttachPayloadKind>,
+    /// Pinned libghostty build identity, which must match exactly for
+    /// [`AttachPayloadKind::GHOSTTY_SNAPSHOT`] to be negotiable. Empty
+    /// in this slice for the same reason as `payload_kinds`.
+    pub libghostty_build: String,
+    /// `(cols, rows)` a `tab.open` that omits both falls back to. A
+    /// headless session has no window to measure, so the daemon states
+    /// the size rather than inheriting a UI's 80×24.
+    pub default_tab_size: (u16, u16),
+}
+
+/// The process-level shutdown tail a `session.stop` runs *after* its
+/// reply is on the wire — stop accepting, unlink the socket, exit.
+///
+/// Supplied by the daemon; boxed so this crate never learns what the
+/// process does about it, and `Fn` rather than `FnOnce` because the
+/// handler holds it behind a shared reference (the stop latch, not the
+/// type, is what makes it run at most once).
+#[derive(Clone)]
+pub struct StopHandle(Arc<dyn Fn() -> StopFuture + Send + Sync>);
+
+type StopFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+impl StopHandle {
+    pub fn new<F, Fut>(f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Self(Arc::new(move || Box::pin(f())))
+    }
+
+    async fn run(&self) {
+        (self.0)().await;
+    }
+}
+
+impl std::fmt::Debug for StopHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StopHandle")
+    }
+}
+
+/// Session-socket state: the identity, the stop tail, and the two
+/// primitives that make `session.stop` a clean cut.
+struct SessionState {
+    info: SessionInfo,
+    stop: StopHandle,
+    /// Latched once, never cleared. Set *before* the barrier is taken,
+    /// so a mutating op that has not yet acquired the barrier is
+    /// guaranteed to see it.
+    stopping: AtomicBool,
+    /// Mutating dispatches hold this for read; `session.stop` takes it
+    /// for write after latching. That makes stop wait for exactly the
+    /// mutations already in flight — a `tab.open` that got past the
+    /// latch completes, and its tab joins the reap set — while every
+    /// later one is rejected.
+    barrier: tokio::sync::RwLock<()>,
+}
+
+/// Ops that change workspace or PTY state, and so must not run once a
+/// session has latched Stopping.
+///
+/// Reads (`identify`, `tab.list`, `tab.dump*`, `session.identify`) stay
+/// answerable throughout, so a client can still find out what happened.
+/// The UI-only ops (`palette.*`, `window.*`, `app.*`, clipboard,
+/// selection, and the test-mode feed ops) are not listed: they route
+/// through `ui_call`, and a session socket has no UI attached, so they
+/// already fail with `internal: no UI attached`.
+fn is_mutating_op(op: &str) -> bool {
+    matches!(
+        op,
+        ops::TAB_OPEN
+            | ops::TAB_CLOSE
+            | ops::TAB_WRITE
+            | ops::TAB_RESIZE
+            | ops::TAB_FOCUS
+            | ops::TAB_SET_TITLE
+            | ops::TAB_SET_STATE
+            | ops::TAB_CLEAR_NOTIFICATION
+            | ops::TAB_SET_HOOK_ACTIVE
+            | ops::TAB_AGENT_REPORT
+            | ops::TAB_REORDER
+            | ops::PROJECT_CREATE
+            | ops::PROJECT_RENAME
+            | ops::PROJECT_DELETE
+            | ops::PROJECT_REORDER
+            | ops::NOTIFICATION_CREATE
+    )
+}
+
+fn shutting_down() -> HandlerError {
+    HandlerError::new("shutting-down", "session is shutting down")
+}
+
 /// Glue between the JSON IPC server and the in-process workspace +
 /// PTY supervisor.
 pub struct IpcHandler {
@@ -426,6 +548,9 @@ pub struct IpcHandler {
     /// main thread to service. `None` in headless contexts (tests), so
     /// those ops no-op (activate) or error `internal` (screenshot/dump).
     ui_tx: Option<tokio::sync::mpsc::UnboundedSender<UiRequest>>,
+    /// Set by the host-session daemon. `None` on every UI socket, which
+    /// is what makes `session.*` an `unknown-op` there.
+    session: Option<Arc<SessionState>>,
 }
 
 impl IpcHandler {
@@ -443,6 +568,7 @@ impl IpcHandler {
             app_label: app_label.into(),
             app_id: app_id.into(),
             ui_tx: None,
+            session: None,
         }
     }
 
@@ -452,6 +578,24 @@ impl IpcHandler {
     /// adapter's main thread.
     pub fn with_ui(mut self, tx: tokio::sync::mpsc::UnboundedSender<UiRequest>) -> Self {
         self.ui_tx = Some(tx);
+        self
+    }
+
+    /// Promote this handler to a host-session socket: `session.identify`
+    /// and `session.stop` start answering, `tab.open`'s size fallback
+    /// comes from `session.default_tab_size`, and every mutating op
+    /// becomes gated on the stop latch.
+    ///
+    /// A handler built without this is a UI socket and is wire-identical
+    /// to what it has always been.
+    #[must_use]
+    pub fn with_session(mut self, session: SessionInfo, stop: StopHandle) -> Self {
+        self.session = Some(Arc::new(SessionState {
+            info: session,
+            stop,
+            stopping: AtomicBool::new(false),
+            barrier: tokio::sync::RwLock::new(()),
+        }));
         self
     }
 
@@ -483,11 +627,93 @@ impl Handler for IpcHandler {
         &'a self,
         op: &'a str,
         params: serde_json::Value,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, HandlerError>> + Send + 'a>,
-    > {
-        Box::pin(async move { dispatch(self, op, params).await })
+    ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {
+        Box::pin(async move { dispatch_outcome(self, op, params).await })
     }
+}
+
+/// The session layer wrapped around the op dispatcher: `session.*`, the
+/// stop latch, and the mutation barrier. Without a [`SessionState`] this
+/// is a straight pass-through, so a UI socket's wire behavior is exactly
+/// what it was before host sessions existed.
+async fn dispatch_outcome(
+    h: &IpcHandler,
+    op: &str,
+    params: serde_json::Value,
+) -> Result<HandlerOutcome, HandlerError> {
+    let Some(session) = h.session.as_ref() else {
+        return dispatch(h, op, params).await.map(HandlerOutcome::Reply);
+    };
+
+    match op {
+        ops::SESSION_IDENTIFY => {
+            let _p: SessionIdentifyParams = decode(params)?;
+            let result = SessionIdentify {
+                app_version: session.info.app_version.clone(),
+                session_protocol: SESSION_PROTOCOL_VERSION,
+                payload_kinds: session.info.payload_kinds.clone(),
+                libghostty_build: session.info.libghostty_build.clone(),
+                session_id: session.info.session_id.clone(),
+                started_at: session.info.started_at.clone(),
+            };
+            return encode(&result).map(HandlerOutcome::Reply);
+        }
+        ops::SESSION_STOP => {
+            let _p: SessionStopParams = decode(params)?;
+            return session_stop(h, session).await;
+        }
+        _ => {}
+    }
+
+    if !is_mutating_op(op) {
+        return dispatch(h, op, params).await.map(HandlerOutcome::Reply);
+    }
+
+    if session.stopping.load(Ordering::Acquire) {
+        return Err(shutting_down());
+    }
+    let _admitted = session.barrier.read().await;
+    // Re-check under the barrier. The latch is set before `session.stop`
+    // asks for the write guard, so an op that read `false` above but only
+    // acquired the read guard after stop released it would otherwise
+    // mutate a session that has already flushed and reaped.
+    if session.stopping.load(Ordering::Acquire) {
+        return Err(shutting_down());
+    }
+    dispatch(h, op, params).await.map(HandlerOutcome::Reply)
+}
+
+/// `session.stop`: latch, barrier, flush, reap, reply, *then* finalize.
+///
+/// The reply is the reap report and it goes out before the process-level
+/// tail runs — that ordering is why the finalizer travels back as a
+/// [`ConnAction::FinalizeStop`] instead of being awaited here.
+async fn session_stop(
+    h: &IpcHandler,
+    session: &Arc<SessionState>,
+) -> Result<HandlerOutcome, HandlerError> {
+    // Idempotent-reject: the first caller owns the shutdown, a second
+    // gets the same answer any other post-latch op gets.
+    if session.stopping.swap(true, Ordering::AcqRel) {
+        return Err(shutting_down());
+    }
+
+    // Waits out exactly the mutations that got past the latch.
+    let _drained = session.barrier.write().await;
+
+    h.workspace.flush();
+    let report = h.supervisor.shutdown_all(SESSION_STOP_SOFT_DEADLINE).await;
+    let reply = encode(&SessionStopResult {
+        reaped: report.reaped,
+        killed: report.killed,
+        abandoned: report.abandoned,
+    })?;
+
+    let stop = session.stop.clone();
+    Ok(HandlerOutcome::ReplyThen {
+        reply,
+        then: ConnAction::FinalizeStop(StopFinalizer::new(move || async move { stop.run().await })),
+    })
 }
 
 async fn dispatch(
@@ -527,14 +753,18 @@ async fn dispatch(
             // provide one. Reject out-of-range cols/rows with
             // `invalid-param` instead of silently truncating —
             // CR-flagged on PR #78.
+            let (default_cols, default_rows) = h
+                .session
+                .as_ref()
+                .map_or((80u16, 24u16), |s| s.info.default_tab_size);
             let cols = if p.cols == 0 {
-                80u16
+                default_cols
             } else {
                 u16::try_from(p.cols)
                     .map_err(|_| HandlerError::invalid_param("cols out of u16 range"))?
             };
             let rows = if p.rows == 0 {
-                24u16
+                default_rows
             } else {
                 u16::try_from(p.rows)
                     .map_err(|_| HandlerError::invalid_param("rows out of u16 range"))?

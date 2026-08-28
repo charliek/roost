@@ -1042,6 +1042,67 @@ events; on a gap it re-pulls `tab.list` / `project.list`. Both
 implementation) — see [Events](#events) below for the envelope
 catalog they will carry.
 
+## Session ops
+
+Served **only by a host session** (`roost-session`), never by a UI
+socket. A UI socket answers `unknown-op` for both, which is how a client
+tells the two kinds of socket apart.
+
+### `session.identify`
+
+Params: `{}`. Response:
+
+```json
+{
+  "app_version": "0.0.18",
+  "session_protocol": 1,
+  "payload_kinds": [],
+  "libghostty_build": "",
+  "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+  "started_at": "2026-08-27T14:03:11Z"
+}
+```
+
+The handshake a client runs before anything binary exists, so every
+incompatibility is caught on stable JSON. `session_protocol` is
+`SESSION_PROTOCOL_VERSION` — deliberately separate from the
+request/response `protocol_version` in [`identify`](#identify), because
+the two version different things and move independently.
+
+`payload_kinds` is empty and `libghostty_build` is `""` in the current
+implementation: attach is not available yet, and an honest empty list is
+what lets a client fall back rather than negotiate a payload the session
+cannot produce. HS-1b populates both. `payload_kinds` is an open list of
+strings, not a closed enum — a client must preserve values it does not
+recognize.
+
+### `session.stop`
+
+Params: `{}`. Response: the reap report,
+
+```json
+{"reaped": ["3", "5"], "killed": ["8"], "abandoned": ["9"]}
+```
+
+Stops the session. In order: the session latches *stopping* (every
+mutating op from that point answers `{"code": "shutting-down"}`, reads
+keep answering, and a second `session.stop` gets `shutting-down` too);
+it waits out the mutating requests already in flight, so a `tab.open`
+that got past the latch completes and its tab is included below; it
+flushes the workspace layout; then it hangs every PTY up, escalating to
+`SIGKILL` after a soft deadline.
+
+The three id lists partition the tabs that were live when the stop
+began — each id appears in exactly one, and each is sorted. `reaped`
+died on the hangup; `killed` was still live at the deadline and was
+SIGKILLed; `abandoned` was still unreaped after the post-kill tail and
+the session stopped waiting for it. Ids are string-encoded like every
+other id on this wire.
+
+The reply is written **before** the process-level shutdown tail runs, so
+a client always gets its report even though the session is on its way
+out.
+
 ## Events
 
 Server-push only, and **not delivered yet** — see
