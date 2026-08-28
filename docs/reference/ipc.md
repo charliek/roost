@@ -48,11 +48,11 @@ it — see [`paths.md`](paths.md#session-profile-reserved).
   `{"id": "<string>", "ok": true, "result": {...}}`.
 * **Response envelope (error):**
   `{"id": "<string>", "ok": false, "error": {"code": "<kebab>", "message": "<string>"}}`.
-* **Event envelope** (server-push, unsolicited — **not delivered
-  today**; see [`events.subscribe`](#eventssubscribe)):
+* **Event envelope** (server-push, unsolicited):
   `{"event": "<dotted-name>", "data": {...}}` — no `id`, no response
-  expected. This is the shape a future push will use; the catalog in
-  [Events](#events) below documents it in advance.
+  expected. Pushed inside an `EventBatch` on a connection that ran
+  [`events.subscribe`](#eventssubscribe), which host-session sockets
+  serve and UI sockets do not. Catalog: [Events](#events) below.
 * **Bytes payloads** (e.g. `tab.write.data`, and any future binary
   field): **base64-encoded strings** using the standard alphabet,
   no padding stripping. Tested for binary fidelity (`0x00..0xff`
@@ -248,6 +248,15 @@ Snapshot of the workspace. Same shape as the legacy
 `ListTabsResponse`.
 
 Response: `{"projects": [<Project>, ...]}`.
+
+On a **host-session socket** the response also carries
+`"revision": <u64>` — the commit the snapshot was taken at, read under
+the same lock as the projects. It is the fence a client pairs with
+[`events.subscribe`](#eventssubscribe): discard every `EventBatch`
+whose `revision` is `<=` this one, apply the rest, and the first batch
+it keeps is exactly `revision + 1`. A UI socket omits the key entirely
+(not `null`) — it serves no event stream, so there would be nothing to
+fence against.
 
 ### `tab.write`
 
@@ -1016,31 +1025,58 @@ state live on the UI side.
 
 ### `events.subscribe`
 
-**Not implemented.** The op exists on the wire but the server
-rejects every call with `{"ok": false, "error": {"code":
-"not-implemented", "message": "events.subscribe is not yet
-implemented"}}` (`ops::EVENTS_SUBSCRIBE` in
-`crates/roost-engine/src/ipc.rs`) rather than a false ACK — a client
-that treated the reply as "subscribed" would wait forever, since no
-event is ever pushed on the connection today. Callers that want
-current state should poll `tab.list` / `project.list` /
-`tab.dump` instead.
+Turn this connection into a one-way event stream. **Served by a
+host-session socket only.**
 
-Request shape as designed: `{"params": {"tab_id_filter": "0"}}`. A
-non-zero `tab_id_filter` would restrict the stream to events for
-that tab.
+Request: `{"params": {"tab_id_filter": "0"}}`. Response (the last
+request/response frame on the connection):
 
-**Forward note (HS-1):** push delivery lands with `roost-session`
-(the host-sessions daemon), delivered as atomic `EventBatch`es —
-`{"revision": <u64>, "events": [<EventEnvelope>, ...]}` — rather than
-one envelope per line. Batching every envelope that shares a
-`revision` lets a client detect loss with a simple gap check ("did I
-skip a revision?") instead of reconstructing individual dropped
-events; on a gap it re-pulls `tab.list` / `project.list`. Both
-`EventBatch` and `EventEnvelope` are already defined in
-`crates/roost-ipc/src/messages.rs` (landed ahead of the push
-implementation) — see [Events](#events) below for the envelope
-catalog they will carry.
+```json
+{"revision": 42}
+```
+
+Everything after that ack is an `EventBatch` — one per workspace
+commit, `{"revision": <u64>, "events": [<EventEnvelope>, ...]}`, one
+per newline-delimited frame. The catalog of envelopes is
+[Events](#events) below.
+
+Three properties make this lossless without a replay buffer:
+
+* **The ack is a fence.** `revision` is the commit the subscription
+  starts from, and the first batch is exactly `revision + 1`. Pair it
+  with [`tab.list`](#tablist)'s own `revision`: snapshot, discard every
+  batch `<=` it, apply the rest.
+* **No gaps.** Every commit is a batch, including a commit that
+  produced no events — that arrives as `{"revision": N, "events": []}`.
+  A skipped number therefore always means loss, never a quiet commit.
+* **The server closes rather than thins.** If a subscriber stops
+  reading, falls behind the workspace broadcast, or the connection
+  stalls, the server closes the connection instead of dropping events
+  out of the stream. A close is the resync signal: reconnect,
+  re-subscribe, re-pull `tab.list`, and fence again.
+
+After the flip the connection answers nothing. Frames a client writes
+on it are read and discarded (so the server still notices a peer that
+goes away), never dispatched and never replied to. That read is also
+why a client must keep its write half **open**: half-closing it is how
+a peer says it is gone, and the server ends the stream. `session.stop`
+closes every subscriber before it drains its in-flight work, so a
+client watching a session sees the stream end as the session goes down.
+
+A non-zero `tab_id_filter` is rejected with `invalid-param` rather than
+ignored — HS-2 scope. Silently serving an unfiltered stream to a client
+that asked for one tab would make it mis-attribute every other tab's
+events.
+
+**Provisional.** HS-1b puts the stream behind a lease, which is a
+breaking change to this op. Today Roost's own tests are its only
+consumer.
+
+On a **UI socket** the op is still unimplemented: it answers
+`{"ok": false, "error": {"code": "not-implemented", "message":
+"events.subscribe is not yet implemented"}}` rather than a false ACK,
+because a UI process pushes nothing. Callers there poll `tab.list` /
+`tab.dump` instead. A UI-side stream lands with its first consumer.
 
 ## Session ops
 
@@ -1105,12 +1141,14 @@ out.
 
 ## Events
 
-Server-push only, and **not delivered yet** — see
-[`events.subscribe`](#eventssubscribe). Each event is documented here
-in the envelope shape it will be pushed in once HS-1 implements
-delivery: a line of the form `{"event": "<name>", "data": {...}}`
-inside an `EventBatch`. The set below is the exhaustive list of event
-*types* the workspace already models; no other event names exist.
+Server-push only, delivered on a host-session socket after
+[`events.subscribe`](#eventssubscribe). Each envelope is a
+`{"event": "<name>", "data": {...}}` object inside an `EventBatch`;
+several envelopes can share one batch, which is what makes a commit
+atomic on the wire. The set below is exhaustive — the serializer
+(`crates/roost-engine/src/event_push.rs`) is a total match over the
+workspace's event enum, so a new event cannot ship without a name
+here.
 
 * `tab.opened` — `{"tab": <Tab>}`.
 * `tab.closed` — `{"tab_id": "<id>"}`.
@@ -1130,6 +1168,8 @@ inside an `EventBatch`. The set below is the exhaustive list of event
 * `project.renamed`   — `{"project_id": "<id>", "name": "<string>"}`.
 * `project.deleted`   — `{"project_id": "<id>"}`.
 * `active.changed`    — `{"project_id": "<id>", "tab_id": "<id>"}` (either may be `"0"`).
+* `tabs.reordered`    — `{"project_id": "<id>", "tab_ids": ["<id>", ...]}`. The full post-reorder display order for that project, not a diff.
+* `projects.reordered` — `{"project_ids": ["<id>", ...]}`. The full post-reorder sidebar order.
 * `hook_active.changed` — `{"tab_id": "<id>", "active": <bool>}`.
 * `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>"}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere.
 * `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
@@ -1151,9 +1191,9 @@ makes them unnecessary:
 * `ReportOsc`. OSC sequences are parsed in the UI; the UI updates
   its own state directly. There is nobody to round-trip to.
 * `WatchEvents` (legacy event stream RPC) is replaced by the
-  `events.subscribe` op + push envelopes on the same connection —
-  designed, wire-typed (`EventEnvelope` / `EventBatch`), but not
-  implemented yet; see [`events.subscribe`](#eventssubscribe).
+  `events.subscribe` op + push envelopes on the same connection; see
+  [`events.subscribe`](#eventssubscribe). Served by a host session
+  today, still `not-implemented` on a UI socket.
 
 Schema-only fields that survive but rename:
 

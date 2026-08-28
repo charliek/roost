@@ -11,8 +11,9 @@
 //!   instead of the legacy `roost_proto::v1::*` types.
 //! * **Events**: a typed `WorkspaceEvent` enum is emitted on a
 //!   `tokio::sync::broadcast` channel. The IPC server's
-//!   `events.subscribe` op (stubbed in M0; wired later) will convert
-//!   these into `roost_ipc::messages::EventEnvelope`.
+//!   `events.subscribe` op converts these into
+//!   `roost_ipc::messages::EventEnvelope`s (see `crate::event_push`),
+//!   on a host-session socket.
 //! * **Session layout**: the workspace persists each project's tab
 //!   layout (title + cwd + position) plus the active selection, so a
 //!   relaunch re-opens the prior tabs as fresh shells in their saved
@@ -40,7 +41,7 @@ use crate::persistence::{persist_state, read_state, HostSnapshot, ProjectSnapsho
 /// How many events the broadcast channel buffers per subscriber.
 /// Subscribers that fall behind get a `Lagged` and resync via
 /// `tab.list`.
-const EVENT_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Narrowest the sidebar may be dragged, in logical points.
 pub const SIDEBAR_MIN_WIDTH: f64 = 160.0;
@@ -186,8 +187,10 @@ pub struct RestoreTab {
     pub user_titled: bool,
 }
 
-/// Workspace event channel. Server-push subscribers in `ipc.rs`
-/// convert these to wire-format `EventEnvelope`s.
+/// Workspace event channel. The server-push relay
+/// (`crate::event_push`) converts these to wire-format
+/// `EventEnvelope`s; its serializer is a total match over this enum, so
+/// a new variant added here is a compile error until it has a wire name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WorkspaceEvent {
@@ -584,6 +587,15 @@ impl Workspace {
     pub fn snapshot(&self) -> Vec<Project> {
         let inner = self.inner.lock().unwrap();
         self.snapshot_locked(&inner)
+    }
+
+    /// The revision of the most recent commit.
+    ///
+    /// For a caller that only needs the fence, not the state — the event
+    /// push reads it right after subscribing, where snapshotting every
+    /// project would be pure waste.
+    pub fn revision(&self) -> u64 {
+        self.inner.lock().unwrap().revision
     }
 
     /// Full ordered snapshot and revision captured under one lock.

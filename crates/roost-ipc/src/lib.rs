@@ -53,6 +53,7 @@ pub use peer::{current_euid, peer_uid};
 pub use runtime_dir::validate_runtime_dir;
 pub use server::{
     ConnAction, Handler, HandlerError, HandlerOutcome, IpcServer, PushSource, StopFinalizer,
+    DEFAULT_PUSH_WRITE_DEADLINE,
 };
 
 /// The wire-format protocol version. M0 ships `1`.

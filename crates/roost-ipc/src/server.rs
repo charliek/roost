@@ -103,6 +103,12 @@ pub enum ConnAction {
     FinalizeStop(StopFinalizer),
 }
 
+/// Budget one push frame gets to reach a peer before the connection is
+/// considered stalled. Generous — a healthy client drains a few hundred
+/// bytes in microseconds, so reaching this means the peer has stopped
+/// reading, not that it is busy.
+pub const DEFAULT_PUSH_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Ready-to-write push messages for [`ConnAction::StartPush`].
 ///
 /// Deliberately a plain bounded-channel receiver rather than a
@@ -113,11 +119,31 @@ pub enum ConnAction {
 /// policy on the producer's side of the seam.
 pub struct PushSource {
     rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    write_deadline: std::time::Duration,
 }
 
 impl PushSource {
     pub fn new(rx: tokio::sync::mpsc::Receiver<serde_json::Value>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            write_deadline: DEFAULT_PUSH_WRITE_DEADLINE,
+        }
+    }
+
+    /// How long one frame may sit unwritten before the connection is
+    /// torn down.
+    ///
+    /// A peer that has stopped reading blocks the write once the socket
+    /// buffer fills, and an unbounded write there parks the connection
+    /// task — holding the socket and everything queued behind it —
+    /// indefinitely. Producers that already have a stall policy
+    /// (`roost-engine`'s event relay) pass theirs so the two bounds
+    /// cannot disagree; everyone else gets
+    /// [`DEFAULT_PUSH_WRITE_DEADLINE`].
+    #[must_use]
+    pub fn with_write_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.write_deadline = deadline;
+        self
     }
 
     /// The next message to write, or `None` once every sender is gone
@@ -529,12 +555,14 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
 /// read and discarded so a peer that keeps writing can't wedge the
 /// socket buffer), and whichever side finishes first ends the other:
 /// reader EOF drops out of the `select!` and the writer is cancelled
-/// with it; a write failure, or an exhausted source, aborts the reader.
+/// with it; a write failure, a stalled write, or an exhausted source
+/// aborts the reader.
 async fn serve_push(
     mut reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
     mut w: tokio::net::unix::OwnedWriteHalf,
     mut source: PushSource,
 ) -> Result<(), Error> {
+    let write_deadline = source.write_deadline;
     let mut eof = tokio::spawn(async move { while let Ok(Some(_)) = reader.read_line().await {} });
     let result = loop {
         tokio::select! {
@@ -553,8 +581,25 @@ async fn serve_push(
                             break Err(Error::from(e));
                         }
                     };
-                    if let Err(e) = write_frame(&mut w, &body).await {
-                        break Err(e);
+                    // A peer that stopped reading blocks this write once
+                    // the socket buffer fills. Waiting on it forever
+                    // holds the connection — and everything queued
+                    // behind it — for as long as the peer feels like it,
+                    // so a stalled write ends the connection the same
+                    // way a failed one does.
+                    match tokio::time::timeout(write_deadline, write_frame(&mut w, &body)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => break Err(e),
+                        Err(_) => {
+                            warn!(
+                                deadline_ms = write_deadline.as_millis(),
+                                "push write stalled past its deadline; closing the connection"
+                            );
+                            break Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "push write stalled past its deadline",
+                            )));
+                        }
                     }
                 }
             },

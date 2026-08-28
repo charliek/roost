@@ -9,6 +9,7 @@
 
 pub mod application;
 pub mod crash;
+pub mod event_push;
 pub mod events;
 // Experimental Swift-facing boundary (`Engine`/`EngineCommand`/owned
 // snapshots). No production consumer yet — both Rust UIs use the concrete

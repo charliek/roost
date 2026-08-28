@@ -1257,6 +1257,14 @@ private struct IPCTabCloseParams: Codable {
 
 private struct IPCTabListResult: Codable {
     let projects: [IPCProject]
+    /// The commit revision the snapshot was taken at — the fence a
+    /// client pairs with an event stream (discard every batch at or
+    /// below it). Only a host session serves that stream, so the Mac
+    /// leaves this `nil` and the key stays off the wire entirely;
+    /// `encodeIfPresent` on an optional is what keeps the response
+    /// byte-identical to what it has always been. The twin exists so
+    /// the shared golden vectors decode on both sides.
+    var revision: UInt64?
 }
 
 private struct IPCTabWriteParams: Codable {

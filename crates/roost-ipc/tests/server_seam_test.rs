@@ -259,6 +259,71 @@ async fn start_push_streams_after_the_reply_and_tears_down_on_peer_eof() {
     );
 }
 
+/// A peer that stops reading blocks the push write as soon as the
+/// socket buffer fills. Without a bound on that write the connection
+/// task parks there for as long as the peer feels like it, holding the
+/// socket and every queued frame behind it; with one, the stall ends the
+/// connection like any other write failure.
+///
+/// Deterministic by size, not by timing: a megabyte cannot fit in an
+/// unread socket buffer on any platform this ships on, so the very first
+/// frame is the one that stalls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_write_that_stalls_past_its_deadline_closes_the_connection() {
+    const DEADLINE: Duration = Duration::from_millis(200);
+    let (tx, rx) = mpsc::channel(4);
+    let dir = tempdir().unwrap();
+    let socket = dir.path().join("roost.sock");
+    let server = IpcServer::bind(
+        &socket,
+        ScriptedHandler(Script::Push(Mutex::new(Some(
+            PushSource::new(rx).with_write_deadline(DEADLINE),
+        )))),
+    )
+    .await
+    .expect("bind");
+    let path = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // `w` stays alive for the whole test: a half-closed peer is
+    // indistinguishable from one that hung up, and would end the stream
+    // for the wrong reason.
+    let (mut reader, mut w) = dial(&path).await;
+    request(&mut w, 3, "events.subscribe").await;
+    let reply = read_frame(&mut reader).await;
+    assert_eq!(reply["result"]["subscribed"], serde_json::json!(true));
+
+    // From here the client reads nothing. Each message is far larger
+    // than any socket buffer, so the writer blocks on the first one.
+    let fat = serde_json::json!({ "revision": 1, "pad": "x".repeat(1024 * 1024) });
+    let ended = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if tx.send(fat.clone()).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "a stalled write must end the push loop, not park on it forever"
+    );
+
+    // And the client sees it: whatever made it into the buffer, then EOF.
+    let closed = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match reader.read_line().await {
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return,
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the peer must see the connection close");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_until_stops_accepting_and_cancels_live_connections() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
