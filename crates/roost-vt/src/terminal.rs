@@ -103,6 +103,20 @@ pub enum ActiveScreen {
     Alternate,
 }
 
+#[cfg(feature = "ffi")]
+impl ActiveScreen {
+    /// Map a `GhosttyTerminalScreen`. Anything other than the alternate
+    /// screen — including a variant a future Ghostty adds — collapses to
+    /// primary, which is the safer fallback for every caller.
+    pub(crate) fn from_sys(raw: sys::GhosttyTerminalScreen) -> Self {
+        if raw == sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_ALTERNATE {
+            Self::Alternate
+        } else {
+            Self::Primary
+        }
+    }
+}
+
 /// Which coordinate space a [`Point`] is interpreted in. Mirrors
 /// `GhosttyPointTag` 1:1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +354,29 @@ impl Terminal {
         // libghostty's own default rather than the caller's choice.
         terminal.set_continuation_max_bytes(options.continuation_max_bytes)?;
         Ok(terminal)
+    }
+
+    /// Adopt a terminal handle produced by
+    /// `ghostty_snapshot_decoder_ready` (`snapshot.h:423-460`), which
+    /// hands back a **caller-owned** terminal that the decoder then
+    /// borrows while it restores history.
+    ///
+    /// # Safety
+    ///
+    /// * `handle` must be non-null and must come from a `GHOSTTY_SUCCESS`
+    ///   return of `ghostty_snapshot_decoder_ready`.
+    /// * Ownership transfers here and must be unique: nothing else may
+    ///   free the handle, and no second `Terminal` may wrap it.
+    /// * The decoder that produced the handle borrows it until FINISH or
+    ///   until it is freed, so that decoder must be freed **before** this
+    ///   `Terminal` is dropped. [`crate::SnapshotDecoder`]'s `Drop` and
+    ///   its `finish`/`abandon` paths are what guarantee that ordering.
+    pub(crate) unsafe fn from_decoded(handle: sys::GhosttyTerminal) -> Self {
+        Self {
+            handle,
+            write_pty_buffer: None,
+            _not_sync: PhantomData,
+        }
     }
 
     /// Set the byte cap on retained VT continuation bytes; `0` disables
@@ -661,13 +698,7 @@ impl Terminal {
         if Error::from_result(rc).is_err() {
             return ActiveScreen::Primary;
         }
-        // Anything other than the alternate screen collapses to primary;
-        // safer fallback for the scroll handler.
-        if out == sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_ALTERNATE {
-            ActiveScreen::Alternate
-        } else {
-            ActiveScreen::Primary
-        }
+        ActiveScreen::from_sys(out)
     }
 
     /// True if the app has enabled any mouse-tracking mode (X10 /
