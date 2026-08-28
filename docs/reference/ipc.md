@@ -25,10 +25,16 @@ than one is live, it reports the actual candidates and requires selection.
 but nothing ships or launches it there.)
 
 A fifth socket path, `Session` (`~/Library/Caches/RoostSession/roost.sock`
-on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is
-**reserved** for the future `roost-session` daemon (HS-1). Nothing binds
-it yet, it is not a `roostctl --target` value, and `roostctl` never probes
-it — see [`paths.md`](paths.md#session-profile-reserved).
+on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is served
+by the headless `roost-session` daemon (HS-1a, plan 035) — see
+[Session sockets](#session-sockets) and [`paths.md`](paths.md#session-profile).
+It is **not** a `roostctl --target` value and `roostctl` never auto-probes
+it: `roostctl session start|stop|status` address the session profile's
+socket directly (a pre-connect carve-out, since `start` must work when
+nothing is listening yet), and any other op reaches a session only
+through an explicit `--socket`. A UI socket answers `unknown-op` for
+every `session.*` op and `not-implemented` for `events.subscribe`,
+byte-identical to before `roost-session` existed.
 
 ## Wire format
 
@@ -79,8 +85,12 @@ it — see [`paths.md`](paths.md#session-profile-reserved).
 * **Errors:** stable kebab-case codes. Current set:
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
-  `not-implemented`, `internal`. Clients should treat unknown codes as
-  fatal for the request and surface `message` to the user.
+  `not-implemented`, `internal`, `shutting-down`. Clients should treat
+  unknown codes as fatal for the request and surface `message` to the
+  user. `shutting-down` is **session-socket only**: once
+  [`session.stop`](#sessionstop) latches, every mutating op answers it
+  (reads still answer normally), and a second `session.stop` on the
+  same session gets it too instead of a fresh reap report.
 
 ## Shared types
 
@@ -1083,6 +1093,78 @@ because a UI process pushes nothing. Callers there poll `tab.list` /
 Served **only by a host session** (`roost-session`), never by a UI
 socket. A UI socket answers `unknown-op` for both, which is how a client
 tells the two kinds of socket apart.
+
+### Session sockets
+
+`roost-session` is a headless daemon: it owns a workspace + PTY
+supervisor exactly like a UI does, but with no window and no renderer
+attached. It resolves the `Session` bundle profile
+([`paths.md`](paths.md#session-profile)) — same `~/Library/Caches/
+RoostSession/roost.sock` (macOS) / `$XDG_RUNTIME_DIR/roost-session/
+roost.sock` (Linux) socket path `identify.socket_path` names above,
+`RoostSessionDev` / `roost-session-dev` in debug builds. Startup installs
+`umask 0077` before creating anything, so the state dir, log dir, and
+socket directory it creates itself land at `0700` and `state.json` at
+`0600`; the socket file gets the same `0600` `IpcServer::bind` chmods
+every profile's socket to. On top of that file-mode posture, a session
+socket is the one IPC server in this codebase that also checks the
+**peer's UID** at accept time (`IpcServer::require_same_uid`) and drops
+any connection from a different user — a UI socket does not enforce
+this, relying on the `0700`/`0600` directory posture alone. Before the
+locks, `validate_runtime_dir` rejects (rather than repairs) a socket
+directory some other mode or owner already created, so a session never
+silently inherits a loosened directory. On shutdown the session unlinks
+its socket only if the path still resolves to the `(dev, ino)` it bound
+— a guard against removing a different, later session's live socket at
+the same path.
+
+`roostctl session start|stop|status` address this socket directly; they
+are a pre-connect carve-out (`session start` has to work when nothing is
+listening at all) and are deliberately **not** reachable through
+`--target` / `ROOST_BUNDLE_PROFILE` / auto-detect. Any other op reaches a
+session only via an explicit `--socket <path>`. See [`cli.md`](cli.md)
+for the verb-level contract (exit codes, `ROOST_SESSION_BIN`).
+
+A session's default tab size is `120x40` (`DEFAULT_TAB_COLS` /
+`DEFAULT_TAB_ROWS`) for both restored and freshly-opened tabs, since
+there is no window to measure a size from — a UI socket keeps its usual
+`80x24` default. On start, a session **hydrates** its saved
+`state.json` layout headlessly: it re-opens each tab's saved `{title,
+cwd}` as a fresh shell (same "layout, not live state" contract as a UI —
+[DL-7](../development/vision.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24))
+and attaches a per-tab OSC drain to each one so title/cwd/notification
+facts keep flowing with no terminal or renderer present. `SIGTERM` and
+`SIGINT` converge on the same shutdown path as an IPC-driven
+`session.stop`: the signal handler dials the session's own socket and
+drives the identical latch → drain → flush → reap sequence described
+below. Only if that self-dial fails outright (broken socket) or exceeds
+its budget does the daemon fall back to a direct finalization — flush,
+socket/lock cleanup, exit — without the mutation barrier or a reap
+report; the children then die with the process.
+
+**Three deviations from
+[`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md)
+are provisional, not final**, and tracked to close in HS-1b
+([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)):
+
+1. **`events.subscribe` ships leaseless.** §4.1/§9 of the architecture
+   doc gate the events connection behind a `session.connect` lease;
+   HS-1a serves it unconditionally to any client that asks. HS-1b's
+   lease will be a **breaking wire change** for anything written against
+   HS-1a's `events.subscribe`.
+2. **`session.stop` notifies push clients by closing the connection**,
+   not the architecture doc's §8 labeled shutdown envelope (`events`
+   connections get a labeled envelope; data connections close with a
+   labeled `ERROR`). HS-1a's plain close *is* the resync signal a
+   subscriber acts on — see [`events.subscribe`](#eventssubscribe) — but
+   it carries no reason code.
+3. **Terminal-generated queries go unanswered headless.** A program that
+   asks the terminal who it is (DA/DA2), where the cursor is (DSR), or
+   what a palette entry is set to gets no reply on any tab, because
+   answering one requires a libghostty terminal and a headless session
+   has none yet (`crates/roost-session/src/drain.rs`) — HS-1b's per-tab
+   server-side terminal is what fixes it. A program that blocks on such
+   a reply hangs; one that times out degrades.
 
 ### `session.identify`
 

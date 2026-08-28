@@ -336,6 +336,21 @@ worktree on a topic branch regardless.
 
 ### HS-1 — Headless `roost-session`, driven by `roostctl` (no UI)
 
+**HS-1 executed as two plans, not one.** HS-1a (plan 035, shipped) is the
+lifecycle + control plane slice: the new crate + binary, daemonize +
+readiness + locks + stale-socket handling, awaited shutdown, headless
+hydration + per-tab OSC drains, `session.identify`/`session.stop`,
+`events.subscribe` implemented **provisionally** (no lease yet — see
+[`ipc.md`](https://github.com/charliek/roost/blob/main/docs/reference/ipc.md#session-sockets)
+for the full deviation list), `roostctl session start|stop|status`, the
+Linux `.deb` shipping `/usr/bin/roost-session`, and a dedicated
+`e2e-session` pytest lane + required CI job. HS-1b (next plan) is the
+data plane: server-side Terminals (`server-vt`, D5), the attach stream
+(D2/D3), connect leases (D8) — which turns HS-1a's leaseless
+`events.subscribe` into a breaking change — and session-side
+`tab.dump`/`dump_resolved`. The bullets below describe HS-1 as
+originally scoped; the split above is what actually shipped.
+
 - New crate + binary: engine bootstrapped headless (the
   `ipc_dispatch.rs` pattern), session socket profile, daemonize +
   readiness + locks + stale-socket handling, awaited shutdown (D6,

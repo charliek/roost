@@ -141,8 +141,8 @@ Uses a fixed `session_id` (`t1`) across every step — see the CLI cheatsheet ab
 
 ### T6 — UI log inspection
 
-There is no shared daemon. Watch the running UI's log while driving the
-above tests:
+Each UI keeps its own log; there is no daemon shared across them. Watch
+the running UI's log while driving the above tests:
 
 ```bash
 # macOS (Swift Roost.app)

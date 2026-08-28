@@ -112,7 +112,7 @@ The iced side's equivalent subtlety is the drain: the feed is batched (capped pe
 
 ## Boundaries
 
-- Each UI process owns its workspace, PTY supervisor, and IPC server. There is no separate daemon. State is in memory + the bundle-profile `state.json` file.
+- Each UI process owns its workspace, PTY supervisor, and IPC server. There is no separate daemon by default — the one opt-in exception is `roost-session` (`crates/roost-session/`), a headless daemon for host-sessions, started with `roostctl session start` (see [`ipc.md`](ipc.md#session-sockets)). State is in memory + the bundle-profile `state.json` file.
 - `libghostty-vt` lives inside each UI for VT parsing + rendering.
 - OSC scanning lives in the UI (`OscScanner.swift` on macOS, the `roost-osc` crate + `roost-engine`'s `OscRouter` in the Rust UI) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace via `LocalClient.applyOSC`.
 - Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) all come from libghostty, through the `write_pty` effects callback each UI installs and drains onto the tab's PTY input. Roost's OSC scanner sees those queries but answers none of them — it did synthesize the OSC color replies until the pinned SHA started answering them, at which point synthesizing too meant double-answering. See [Terminal query replies](terminal-queries.md).

@@ -2,14 +2,14 @@
 
 Roost resolves all of its filesystem state once at startup. Other components read the paths from this resolution; nothing should derive its own.
 
-There are three UI bundle profiles — `Mac`, `Linux`, and `Iced` (slugs `mac`, `linux`, `iced`) — and each running UI resolves exactly one of them. There is no shared daemon; the profile a UI resolves determines the socket `roostctl` dials. A fourth profile, `Session`, exists in the same enum for the future `roost-session` daemon (HS-1) but is reserved: nothing launches it yet, and it is not a legal `roostctl` target or `ROOST_BUNDLE_PROFILE` value today (see [Session profile (reserved)](#session-profile-reserved) below). The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. On macOS the two implementations are tested in lockstep.
+There are three UI bundle profiles — `Mac`, `Linux`, and `Iced` (slugs `mac`, `linux`, `iced`) — and each running UI resolves exactly one of them; each owns its own workspace + PTY supervisor in-process, so there is no daemon a UI depends on. A fourth profile, `Session`, is resolved by the headless `roost-session` daemon (HS-1a, plan 035) — a workspace + PTY supervisor with no UI attached, opt-in via `roostctl session start` (see [Session profile](#session-profile) below). It is not a legal `roostctl --target` value or `ROOST_BUNDLE_PROFILE` value; `roostctl session start|stop|status` address its socket directly instead. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. On macOS the two implementations are tested in lockstep.
 
 | Profile | Who resolves it | `app_label` | `app_id` |
 |---|---|---|---|
 | `Mac`   | the Swift `Roost.app` | `Roost` | `ai.stridelabs.Roost` |
 | `Linux` | the packaged Linux UI (`/usr/bin/roost`) | `Roost-linux` | `ai.stridelabs.Roost` on Linux; `ai.stridelabs.Roost.linux` on macOS |
 | `Iced`  | a dev build of `roost-iced`, and the experimental macOS `Roost-Iced.app` | `Roost-iced` | `ai.stridelabs.Roost.iced` |
-| `Session` (reserved) | nobody yet — HS-1's `roost-session` daemon | `RoostSession` (`RoostSessionDev` in debug builds) | `ai.stridelabs.Roost.session` |
+| `Session` | the headless `roost-session` daemon (`/usr/bin/roost-session` on the Linux `.deb`) | `RoostSession` (`RoostSessionDev` in debug builds) | `ai.stridelabs.Roost.session` |
 
 `app_label` is fixed per profile on every platform — it is the string `identify` and `roostctl doctor` report, and on macOS it is also the directory component of the profile's paths. `app_id` is the only field that resolves per platform: on Linux the `Linux` profile shares `ai.stridelabs.Roost` with the `Mac` profile, which can never run there and already shares that platform's path namespace; on macOS every profile stays independently resolvable (so their paths and identities can never collide), even though nothing ships or launches the `Linux` one there.
 
@@ -24,11 +24,11 @@ The profile defaults to:
 | `roost-iced` (dev build, any platform; macOS `Roost-Iced.app`) | `Iced` | `ROOST_BUNDLE_PROFILE=mac` / `=linux` to dial another profile's namespace |
 | `roostctl` (binary from the `roost-cli` crate) | auto-detect | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,linux,iced}` |
 
-The two sides treat an **unrecognized** `ROOST_BUNDLE_PROFILE` value differently, on purpose. A UI logs a warning and falls back to its compiled-in default rather than refusing to launch; `roostctl` hard-errors with `unknown ROOST_BUNDLE_PROFILE value … (expected mac, linux, or iced)`. A stale `ROOST_BUNDLE_PROFILE=gtk` left over from an older install therefore starts the UI on its normal profile (with a warning in the log) but stops the CLI outright. `session` gets the same `roostctl` rejection today even though it names a real profile kind internally — see [Session profile (reserved)](#session-profile-reserved) — because HS-1 hasn't defined how a session gets addressed yet.
+The two sides treat an **unrecognized** `ROOST_BUNDLE_PROFILE` value differently, on purpose. A UI logs a warning and falls back to its compiled-in default rather than refusing to launch; `roostctl` hard-errors with `unknown ROOST_BUNDLE_PROFILE value … (expected mac, linux, or iced)`. A stale `ROOST_BUNDLE_PROFILE=gtk` left over from an older install therefore starts the UI on its normal profile (with a warning in the log) but stops the CLI outright. `session` gets the same `roostctl` rejection — it names a real profile kind internally, but a session is deliberately not one of `--target`'s / `ROOST_BUNDLE_PROFILE`'s legal values, by design (see [Session profile](#session-profile)), not because it is unimplemented.
 
 ## File locations
 
-The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-linux`, `Roost-iced`, or (reserved) `RoostSession`/`RoostSessionDev`.
+The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-linux`, `Roost-iced`, or `RoostSession`/`RoostSessionDev` for a headless session.
 
 Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` and its `state.lock` live) — the socket, the socket lock, and the log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. Note the consequence: two UIs with different `ROOST_STATE_DIR` values no longer collide on state, so a collision that used to be loud is now silent isolation; the socket lock is what still catches a genuine second instance on one socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
 
@@ -99,22 +99,39 @@ keep launching.
 
 The directories are created at first launch with mode `0700`.
 
-### Session profile (reserved)
+### Session profile
 
-`Session` resolves paths the same way the three UI profiles do, but
-nothing launches it yet — it is reserved for the future headless
-`roost-session` daemon (HS-1). It is **not** a `roostctl` target and
-**not** a legal `ROOST_BUNDLE_PROFILE` value today; `roostctl --target
-session` and `ROOST_BUNDLE_PROFILE=session` are both rejected — see
-the `ROOST_BUNDLE_PROFILE` discussion above. Debug
-builds substitute `RoostSessionDev` / `roost-session-dev` for the
-directory name in **all** of the paths below (socket, state, and
-logs), so a dev session can never collide with a real one.
+`Session` resolves paths the same way the three UI profiles do, and is
+now live: the headless `roost-session` daemon (HS-1a, plan 035) resolves
+it — the Linux `.deb` ships it as `/usr/bin/roost-session`, opt-in via
+`roostctl session start`. It is still **not** a `roostctl --target` value
+and **not** a legal `ROOST_BUNDLE_PROFILE` value — `roostctl --target
+session` is rejected, and `ROOST_BUNDLE_PROFILE=session` is rejected by
+ordinary target resolution (the dedicated `session` verbs never consult
+either knob — they resolve this profile directly), by design
+(see `session.rs`'s module doc: a session is not a UI, and `start` has to
+work when nothing is listening at all, so `roostctl session
+start|stop|status` address this profile's socket directly instead as a
+pre-connect carve-out). Any other op reaches a session only through an
+explicit `roostctl --socket <path>`. Debug builds substitute
+`RoostSessionDev` / `roost-session-dev` for the directory name in **all**
+of the paths below (socket, state, and logs), so a dev session can never
+collide with a real one.
 
 | Platform | Socket | State | Logs |
 |---|---|---|---|
 | macOS | `~/Library/Caches/RoostSession/roost.sock` | `~/Library/Application Support/RoostSession/` | `~/Library/Logs/RoostSession/` |
 | Linux | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, falling back to `/tmp/roost-session-<uid>/roost.sock` | `$XDG_DATA_HOME/roost-session/` | `$XDG_STATE_HOME/roost-session/` |
+
+Before creating any of the above, the daemon installs `umask 0077`, so
+the state dir, log dir, and socket directory it creates land at `0700`
+and `state.json` at `0600` (the socket file itself gets `0600` the same
+way every profile's socket does — see [`ipc.md`](ipc.md#session-sockets)).
+A session socket additionally checks the connecting peer's UID at accept
+time and drops any connection from a different user, which no UI socket
+does. `validate_runtime_dir` rejects rather than repairs a socket
+directory some other mode or owner already created, so a session's
+lock-acquisition step never silently inherits a loosened directory.
 
 ### Two single-instance locks
 
