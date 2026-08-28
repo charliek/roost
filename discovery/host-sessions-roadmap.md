@@ -63,12 +63,16 @@ what changed or got confirmed by reading the actual code):
 **Ghostty tip** (943 commits past our pin):
 
 - The snapshot API is the designed attach primitive: encode a
-  terminal to a CRC + BLAKE3-authenticated stream laid out
-  active-screen → CONTINUATION → `READY` → history pages
+  terminal to a stream of independently CRC32C-checksummed records
+  laid out active-screen → CONTINUATION → `READY` → history pages
   newest-to-oldest → `FINISH`. The decoder hands back a renderable,
   typeable terminal at READY; history applies incrementally while
   live bytes flow. Bytes after FINISH are deliberately left for the
-  embedding transport, and `SOURCE_OFFSET` marks the boundary.
+  embedding transport, and `SOURCE_OFFSET` marks the boundary. The
+  CRC32C is integrity only — the format carries no authentication at
+  this pin, so the transport (localhost socket perms, SSH at HS-3)
+  remains the only thing standing between a session and a forged
+  stream.
 - **Format v1 has no binary-compatibility promise** — the decoder
   rejects any other version. Client and server must run the same
   libghostty build. Localhost: free (same package). SSH: the

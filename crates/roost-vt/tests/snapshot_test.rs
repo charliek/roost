@@ -848,6 +848,189 @@ fn zero_history_finishes_on_the_first_step() {
 }
 
 // ============================================================================
+// 6. Fragmentation
+// ============================================================================
+
+/// Written to the decoded terminal the moment READY lands, and to the
+/// comparison terminal after the decode — test 2's interleave, but with
+/// the stream arriving in fragments.
+const FRAGMENT_LIVE: &[u8] = b"\r\ntyped while the stream was still arriving\r\n";
+
+/// Deep enough that history arrives as several pages (1200 fits in one),
+/// still under the scrollback cap so the live input written at READY
+/// cannot prune rows out from under the equality assertion.
+const FRAGMENT_LINES: u32 = 1900;
+
+/// What a fragmented decode observed on its way through, so the shape of
+/// the progressive path can be asserted rather than assumed.
+struct Fragmented {
+    decoded: DecodedTerminal,
+    /// How many bytes had been fed when READY landed.
+    ready_after_bytes: usize,
+    pages: usize,
+    /// `try_next` calls that reported the next record was not buffered
+    /// yet — the state a real transport pump spends most of its time in.
+    need_more_bytes: usize,
+}
+
+/// Feed `bytes` in the chunks `cuts` describes (each entry is a chunk's
+/// end offset), driving `try_ready`/`try_next` opportunistically after
+/// every feed — exactly the shape HS-1's pump has.
+///
+/// Every `try_*` is unwrapped on purpose: the wrapper only calls into
+/// libghostty once the record it will read is fully buffered, so a
+/// spurious EOF from a decoder that read further ahead than the scanner
+/// guaranteed would surface here as a hard error (architecture risk in
+/// plan 034 §8). This driver is that risk's probe.
+fn decode_in_chunks(bytes: &[u8], cuts: &[usize]) -> Fragmented {
+    let mut decode = decoder();
+    let mut fed = 0usize;
+    let mut ready_after_bytes = None;
+    let mut pages = 0usize;
+    let mut need_more_bytes = 0usize;
+    let mut finished = false;
+
+    for &cut in cuts {
+        if finished {
+            break;
+        }
+        assert!(
+            cut >= fed && cut <= bytes.len(),
+            "cut {cut} out of order or past the stream"
+        );
+        decode.feed(&bytes[fed..cut]).expect("feed a chunk");
+        fed = cut;
+        if ready_after_bytes.is_none() {
+            if decode.try_ready().expect("try_ready") == ReadyState::Ready {
+                ready_after_bytes = Some(fed);
+                decode.vt_write(FRAGMENT_LIVE).expect("vt_write at READY");
+            }
+            continue;
+        }
+        match decode.try_next().expect("try_next") {
+            HistoryStep::NeedMoreBytes => need_more_bytes += 1,
+            HistoryStep::Page { .. } => pages += 1,
+            HistoryStep::Finished => finished = true,
+        }
+    }
+
+    assert!(
+        finished || fed == bytes.len(),
+        "the cut list must cover the whole stream"
+    );
+    while !finished {
+        match decode.try_next().expect("try_next after the last chunk") {
+            HistoryStep::NeedMoreBytes => panic!("the whole stream is fed; nothing can be missing"),
+            HistoryStep::Page { .. } => pages += 1,
+            HistoryStep::Finished => finished = true,
+        }
+    }
+
+    Fragmented {
+        decoded: decode.finish().expect("finish"),
+        ready_after_bytes: ready_after_bytes.expect("READY must land"),
+        pages,
+        need_more_bytes,
+    }
+}
+
+/// Compare a fragmented decode against a source terminal fed the same
+/// live bytes — test 2's equality, reused verbatim.
+fn assert_matches_source(fragmented: &mut Fragmented, source: &mut Terminal, encoded_len: usize) {
+    source.vt_write(FRAGMENT_LIVE);
+    assert_eq!(
+        dump(&fragmented.decoded.terminal),
+        dump(source),
+        "active grid after a fragmented decode"
+    );
+    assert_eq!(
+        fragmented.decoded.terminal.scrollbar().expect("scrollbar"),
+        source.scrollbar().expect("scrollbar"),
+        "scrollback totals after a fragmented decode"
+    );
+    assert_eq!(
+        dump_scrollback_top(&mut fragmented.decoded.terminal),
+        dump_scrollback_top(source),
+        "history landed under the live input"
+    );
+    assert_eq!(
+        fragmented.decoded.source_offset, encoded_len,
+        "source offset at FINISH"
+    );
+}
+
+/// One byte at a time: every split point in the stream is exercised at
+/// once, so the envelope and every record header are crossed mid-field.
+#[test]
+fn a_one_byte_at_a_time_stream_decodes_identically() {
+    let mut source = fixture(FRAGMENT_LINES, false);
+    let bytes = source.snapshot().expect("snapshot");
+
+    let cuts: Vec<usize> = (1..=bytes.len()).collect();
+    let mut fragmented = decode_in_chunks(&bytes, &cuts);
+
+    assert!(
+        fragmented.ready_after_bytes < bytes.len(),
+        "READY must land mid-stream, not once every byte is in: {} of {}",
+        fragmented.ready_after_bytes,
+        bytes.len()
+    );
+    assert_eq!(
+        fragmented.ready_after_bytes,
+        first_record(&bytes, TAG_READY).end,
+        "READY must land on the very byte that completes the READY record — \
+         not a byte early, and not once history has arrived"
+    );
+    assert!(
+        fragmented.pages > 1,
+        "the fixture must arrive as several history pages, got {}",
+        fragmented.pages
+    );
+    assert!(
+        fragmented.need_more_bytes > 0,
+        "a byte-drip must spend most calls waiting for the next record"
+    );
+
+    assert_matches_source(&mut fragmented, &mut source, bytes.len());
+}
+
+/// The coarse counterpart: cuts landing *exactly* on the envelope
+/// boundary and on each field boundary of the first history page's
+/// header. Boundary-exact feeds are the case a byte-drip cannot single
+/// out — a scanner that mistook "header buffered" for "record buffered"
+/// would fail precisely here.
+#[test]
+fn boundary_exact_chunks_decode_identically() {
+    let mut source = fixture(FRAGMENT_LINES, false);
+    let bytes = source.snapshot().expect("snapshot");
+    let page = first_history_page(&bytes);
+
+    let mut cuts = vec![
+        ENVELOPE_LEN,
+        page.start,
+        page.start + 2,     // after the tag
+        page.start + 6,     // after payload_len
+        page.payload_start, // after the crc: the whole header, no payload
+        page.payload_start + 1,
+        page.end,
+        bytes.len(),
+    ];
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut fragmented = decode_in_chunks(&bytes, &cuts);
+    assert_eq!(
+        fragmented.ready_after_bytes, page.start,
+        "READY lands on the chunk that completes the prefix before the first history page"
+    );
+    assert!(
+        fragmented.need_more_bytes > 0,
+        "the chunks that carry only part of a record header must report NeedMoreBytes"
+    );
+    assert_matches_source(&mut fragmented, &mut source, bytes.len());
+}
+
+// ============================================================================
 // 7. Corruption / truncation
 // ============================================================================
 
@@ -1034,6 +1217,149 @@ fn a_resize_between_pages_still_reaches_finish() {
 }
 
 // ============================================================================
+// 10. Caps
+// ============================================================================
+
+/// Overwrite a record's declared `payload_len` in place. Mutating a real
+/// encode is the only honest way to build an oversized-record stream —
+/// a hand-rolled one would prove the test's framing, not the wrapper's.
+fn set_payload_len(bytes: &mut [u8], record: Record, len: u32) {
+    bytes[record.start + 2..record.start + 6].copy_from_slice(&len.to_le_bytes());
+}
+
+fn largest_record_payload(bytes: &[u8]) -> usize {
+    records(bytes)
+        .iter()
+        .map(|record| record.end - record.payload_start)
+        .max()
+        .expect("the stream carries records")
+}
+
+/// A header declaring more than `max_record_bytes` is refused as soon as
+/// the *header* is buffered — the payload is never waited for, so the
+/// cap actually bounds what a hostile stream can make roost hold.
+#[test]
+fn an_oversized_record_header_is_refused_before_any_ffi() {
+    let mut bytes = fixture_bytes(HEADROOM_LINES);
+    let page = first_history_page(&bytes);
+    let opts = SnapshotDecodeOptions::default();
+    let over = u32::try_from(opts.max_record_bytes + 1).expect("the cap is well under u32::MAX");
+    set_payload_len(&mut bytes, page, over);
+
+    let mut decode = SnapshotDecoder::new(opts);
+    match decode.feed(&bytes) {
+        Err(Error::LimitExceeded) => {}
+        other => panic!("expected LimitExceeded for an oversized record, got {other:?}"),
+    }
+    // Sticky, not poisoning: the offending header is still in the buffer,
+    // so every call that rescans reports the same cap error — never
+    // `Lifecycle`, which is what a poisoned decoder answers. No decoder
+    // was ever constructed, so libghostty never saw a byte.
+    assert!(
+        matches!(decode.try_ready(), Err(Error::LimitExceeded)),
+        "the cap error must repeat rather than poison"
+    );
+    assert!(matches!(
+        decode.feed(b"more bytes"),
+        Err(Error::LimitExceeded)
+    ));
+    assert!(matches!(decode.try_ready(), Err(Error::LimitExceeded)));
+    assert!(
+        decode.terminal().is_none(),
+        "the decode never started, so there is no terminal"
+    );
+    assert!(
+        decode.history_rows_primary().is_none(),
+        "…and no READY-window data either"
+    );
+}
+
+/// The same gate on an untouched stream: a cap one byte below the
+/// largest genuine record rejects, and the exact size is accepted. Pins
+/// the rejection to the cap rather than to anything about the mutation
+/// above.
+#[test]
+fn the_record_cap_boundary_is_the_largest_genuine_record() {
+    let bytes = fixture_bytes(HEADROOM_LINES);
+    let largest = largest_record_payload(&bytes);
+
+    let opts = SnapshotDecodeOptions {
+        max_record_bytes: largest - 1,
+        ..Default::default()
+    };
+    match SnapshotDecoder::decode_bytes(bytes.clone(), opts) {
+        Err(Error::LimitExceeded) => {}
+        other => panic!("expected LimitExceeded one byte below the largest record, got {other:?}"),
+    }
+
+    let opts = SnapshotDecodeOptions {
+        max_record_bytes: largest,
+        ..Default::default()
+    };
+    SnapshotDecoder::decode_bytes(bytes, opts).expect("the exact size is within the cap");
+}
+
+/// The total cap is checked *before* the append, so a rejected feed
+/// leaves the buffer exactly as it was.
+#[test]
+fn the_total_cap_rejects_before_the_buffer_grows() {
+    let bytes = fixture_bytes(HEADROOM_LINES);
+
+    let opts = SnapshotDecodeOptions {
+        max_total_bytes: bytes.len() - 1,
+        ..Default::default()
+    };
+    let mut decode = SnapshotDecoder::new(opts);
+    match decode.feed(&bytes) {
+        Err(Error::LimitExceeded) => {}
+        other => panic!("expected LimitExceeded over the total cap, got {other:?}"),
+    }
+    // A whole snapshot was refused, so nothing of it landed: had the
+    // append run first, the prefix through READY would be buffered here.
+    assert_eq!(
+        decode.try_ready().expect("try_ready"),
+        ReadyState::NeedMoreBytes,
+        "the refused feed must leave the decoder empty"
+    );
+
+    // Split feed: the cap counts cumulatively, and refusing the second
+    // chunk does not disturb the first.
+    let ready_end = first_record(&bytes, TAG_READY).end;
+    let opts = SnapshotDecodeOptions {
+        max_total_bytes: ready_end,
+        ..Default::default()
+    };
+    let mut decode = SnapshotDecoder::new(opts);
+    decode
+        .feed(&bytes[..ready_end])
+        .expect("the prefix fits the cap exactly");
+    assert_eq!(decode.try_ready().expect("try_ready"), ReadyState::Ready);
+    match decode.feed(&bytes[ready_end..]) {
+        Err(Error::LimitExceeded) => {}
+        other => panic!("expected LimitExceeded for the history chunk, got {other:?}"),
+    }
+    assert_eq!(
+        decode.try_next().expect("try_next"),
+        HistoryStep::NeedMoreBytes,
+        "the refused history bytes never entered the buffer, and the decoder is not poisoned"
+    );
+    assert!(matches!(
+        decode.feed(&bytes[ready_end..]),
+        Err(Error::LimitExceeded)
+    ));
+
+    // The buffered convenience path reports the same cap error.
+    let opts = SnapshotDecodeOptions {
+        max_total_bytes: bytes.len() - 1,
+        ..Default::default()
+    };
+    match SnapshotDecoder::decode_bytes(bytes, opts) {
+        Err(Error::LimitExceeded) => {}
+        other => panic!("expected LimitExceeded from decode_bytes, got {other:?}"),
+    }
+}
+
+// ============================================================================
 // 11. Misuse / lifecycle
 // ============================================================================
 
@@ -1182,4 +1508,52 @@ fn history_far_past_ten_kilobytes_restores_fully() {
         dump_scrollback_top(&mut source),
         "the oldest restored rows must match the source"
     );
+}
+
+// ============================================================================
+// Perf capture (recorded, never asserted)
+// ============================================================================
+
+fn ms(elapsed: std::time::Duration) -> f64 {
+    elapsed.as_secs_f64() * 1000.0
+}
+
+/// HS-1's §12 budget inputs for the 2000-row 80-column fixture. Ignored
+/// by default because it is a measurement, not a check — timings vary by
+/// machine and asserting on them would make the gate flaky.
+///
+/// Run it explicitly, in release:
+/// `cargo test -p roost-vt --features ffi --release -- --ignored perf --nocapture`
+#[test]
+#[ignore = "perf capture: run explicitly with --ignored perf --nocapture"]
+fn perf_snapshot_encode_and_decode() {
+    let source = fixture(MULTI_PAGE_LINES, false);
+
+    let started = std::time::Instant::now();
+    let bytes = source.snapshot().expect("snapshot");
+    let encode = started.elapsed();
+
+    // Time to READY starts with the READY prefix already in hand — the
+    // HS-1 question is "prefix received -> renderable terminal", so the
+    // span covers only feeding that prefix and try_ready, not buffering
+    // or scanning the post-READY history.
+    let ready_end = first_record(&bytes, TAG_READY).end;
+    let mut decode = SnapshotDecoder::new(SnapshotDecodeOptions::default());
+    let started = std::time::Instant::now();
+    decode.feed(&bytes[..ready_end]).expect("feed the prefix");
+    assert_eq!(decode.try_ready().expect("try_ready"), ReadyState::Ready);
+    let time_to_ready = started.elapsed();
+    drop(decode);
+
+    let full_input = bytes.clone();
+    let started = std::time::Instant::now();
+    let decoded = SnapshotDecoder::decode_bytes(full_input, SnapshotDecodeOptions::default())
+        .expect("decode_bytes");
+    let full_decode = started.elapsed();
+    drop(decoded);
+
+    println!("encode_bytes={}", bytes.len());
+    println!("encode_ms={:.3}", ms(encode));
+    println!("time_to_ready_ms={:.3}", ms(time_to_ready));
+    println!("full_decode_ms={:.3}", ms(full_decode));
 }
