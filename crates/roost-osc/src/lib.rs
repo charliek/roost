@@ -15,8 +15,8 @@
 //! data for OSC 7 / 9 / 10-12 / 4 / 133 / 52 / 22 — seven of the eight
 //! [`OscEvent`] variants. The policy below (percent-decode +
 //! `file://` extraction, ConEmu OSC 9 sub-command filtering, OSC 52
-//! base64 decode with refuse-on-truncation, `MAX_BODY`, reply
-//! synthesis) has no C-API counterpart and would survive regardless.
+//! base64 decode with refuse-on-truncation, `MAX_BODY`) has no C-API
+//! counterpart and would survive regardless.
 //!
 //! Re-evaluate only if libghostty-vt grows `GHOSTTY_OSC_DATA_*`
 //! accessors beyond window title — which would ride in with a Ghostty
@@ -44,19 +44,17 @@
 //!     OSC 99 silently; Phase 6b can extend the proto + scanner if
 //!     dogfooding shows it's needed.
 //!
-//!   * OSC 10/11/12 color queries: emitted as `ColorQuery` events.
-//!     The UI layer synthesises replies via
-//!     [`format_color_query_response`] and writes them back through
-//!     the PTY's input channel. Wiring lives on each UI side
-//!     (`crates/roost-iced/src/app.rs` drain task,
-//!     `mac/Sources/Roost/TerminalView.swift::appendBytes`); the
-//!     scanner stays dependency-free and just surfaces the event so
-//!     callers control what color to answer with. The matching SET and
-//!     RESET forms (10/11/12, 4, 110/111/112, 104) are surfaced too —
-//!     not because the scanner applies them, but so a consumer that
-//!     answers queries *ahead* of libghostty (iced's drain-side
-//!     router, `roost-engine::osc::OscColorState`) can track the same
-//!     colors the terminal will end up with.
+//!   * OSC 4 / 10 / 11 / 12 color query REPLIES. The scanner surfaces
+//!     the queries as `ColorQuery` / `PaletteQuery` events, but Roost
+//!     no longer answers them: libghostty replies to OSC 4, OSC
+//!     10/11/12 and Kitty OSC 21 itself through the `write_pty`
+//!     effect as of the pinned ghostty `f2d5758f6` (upstream
+//!     `14c829883`), and both UIs install that callback. A second
+//!     synthesised reply would put two answers on the wire. The
+//!     matching SET and RESET forms (10/11/12, 4, 110/111/112, 104)
+//!     are surfaced so a consumer can track the same colors the
+//!     terminal ends up with (`roost-engine::osc::OscColorState`),
+//!     not because the scanner applies them.
 
 use std::str;
 
@@ -93,16 +91,17 @@ pub enum OscEvent {
 
     /// OSC 10 / 11 / 12 with body `"?"` — query for the current
     /// foreground (10), background (11), or cursor (12) color.
-    /// The scanner doesn't synthesise the response; the daemon
-    /// caller decides whether to route back to the UI or drop.
+    /// Surfaced for observation only: the terminal answers these
+    /// itself (see the module docs), so a consumer that replies here
+    /// double-answers.
     ColorQuery(u8),
 
     /// OSC 10 / 11 / 12 with a color spec body — set the foreground
     /// (10), background (11), or cursor (12) color. libghostty applies
-    /// these to the terminal itself; they are surfaced so a scanner
-    /// that answers queries *ahead* of the terminal (the drain-side
-    /// router) can keep its own color state coherent. Malformed specs
-    /// are dropped, never surfaced as a set.
+    /// these to the terminal itself; they are surfaced so a consumer
+    /// that mirrors the terminal's colors (the drain-side router) can
+    /// keep its own state coherent. Malformed specs are dropped, never
+    /// surfaced as a set.
     ColorSet { number: u8, color: (u8, u8, u8) },
 
     /// OSC 110 / 111 / 112 — reset the foreground / background /
@@ -112,14 +111,13 @@ pub enum OscEvent {
 
     /// OSC 4 palette query — `4;Ps;?`, optionally repeated
     /// (`4;0;?;1;?;…`). Carries the queried palette indices (`Ps`,
-    /// 0..=255). Like [`OscEvent::ColorQuery`], the scanner doesn't
-    /// synthesise the reply — the UI answers each index from the live
-    /// palette (with a theme fallback).
+    /// 0..=255). Like [`OscEvent::ColorQuery`], observation only — the
+    /// terminal answers each index itself.
     PaletteQuery(Vec<u8>),
 
     /// OSC 4 palette set — `4;Ps;<spec>` pairs, in body order.
     /// libghostty applies these; the drain-side router mirrors them so
-    /// its palette answers match. A body may carry both sets and
+    /// its palette stays coherent. A body may carry both sets and
     /// queries (`4;0;rgb:…;1;?`), in which case the set event is
     /// emitted first.
     PaletteSet(Vec<(u8, (u8, u8, u8))>),
@@ -554,41 +552,6 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Synthesise the standard XTerm-form OSC 10/11/12 query *response*
-/// for query number `n` (one of 10/11/12) and the matching theme
-/// color. Output is `\x1b]N;rgb:RRRR/GGGG/BBBB\x07` — 16-bit-per-
-/// channel form (each 8-bit channel repeated to fill 4 hex digits),
-/// BEL-terminated. This is the exact byte sequence codex,
-/// claude-code, and other agents that probe for theme colors expect
-/// back from an OSC 10/11/12 query.
-///
-/// Returns `None` if `n` isn't a recognised query number. The caller
-/// picks which of foreground (10), background (11), or cursor (12)
-/// the `color` argument refers to — keeps this helper dependency-free
-/// (no `Theme` import, no `ColorRgb` newtype) so it can sit in
-/// `roost-osc` next to the scanner.
-///
-/// Why this lives here: codex (and reportedly claude-code) only emit
-/// their highlighted prompt-row backgrounds *after* the terminal
-/// answers an OSC 11 query. libghostty-vt's color-query handler is
-/// a no-op, so without this synthesised reply the prompt rows
-/// render invisibly against the canvas. Both UIs feed their
-/// scanners' `ColorQuery(n)` events through this formatter and
-/// write the bytes back to the PTY.
-pub fn format_color_query_response(n: u8, color: (u8, u8, u8)) -> Option<Vec<u8>> {
-    if !matches!(n, 10..=12) {
-        return None;
-    }
-    let (r, g, b) = color;
-    Some(
-        format!(
-            "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
-            n, r, r, g, g, b, b
-        )
-        .into_bytes(),
-    )
-}
-
 /// Parse an OSC 4 body into its set pairs and its queried indices.
 ///
 /// Body is `Ps;Pc[;Ps;Pc…]`: each `Ps` is a palette index (0..=255)
@@ -622,9 +585,7 @@ fn parse_osc4(body: &str) -> (Vec<(u8, (u8, u8, u8))>, Vec<u8>) {
 /// 1-4 hex digits per channel (`rgb:a/b/c`, `rgb:de/ad/be`,
 /// `rgb:dede/adad/bebe`) and the `#`-prefixed form with 3, 6, 9, or 12
 /// hex digits total. Wider channels are truncated to their high byte,
-/// narrower ones are replicated — the same scaling
-/// [`format_color_query_response`] inverts when it doubles each byte.
-/// Everything else (`rgbi:` floats, X11 color names, garbage) returns
+/// narrower ones are replicated. Everything else (`rgbi:` floats, X11 color names, garbage) returns
 /// `None`; a consumer tracking color state must leave it unchanged
 /// rather than guess.
 fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
@@ -671,21 +632,6 @@ fn scale_hex_channel(digits: &str) -> Option<u8> {
         3 => (value >> 4) as u8,
         _ => (value >> 8) as u8,
     })
-}
-
-/// Format an OSC 4 palette-query reply:
-/// `ESC]4;<index>;rgb:RRRR/GGGG/BBBB BEL`.
-///
-/// Mirrors [`format_color_query_response`]'s 16-bit-per-channel,
-/// BEL-terminated XTerm form (each 8-bit channel doubled). The index
-/// echoes the queried palette slot (0..=255).
-pub fn format_palette_query_response(index: u8, color: (u8, u8, u8)) -> Vec<u8> {
-    let (r, g, b) = color;
-    format!(
-        "\x1b]4;{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
-        index, r, r, g, g, b, b
-    )
-    .into_bytes()
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -1053,44 +999,6 @@ mod tests {
         );
     }
 
-    // -- format_color_query_response: byte-exact response shape for
-    //    OSC 10/11/12 color queries.
-
-    #[test]
-    fn format_color_query_response_osc10_fg() {
-        let bytes = format_color_query_response(10, (0xFF, 0xFF, 0xFF)).expect("Some");
-        assert_eq!(bytes, b"\x1b]10;rgb:ffff/ffff/ffff\x07");
-    }
-
-    #[test]
-    fn format_color_query_response_osc11_bg() {
-        let bytes = format_color_query_response(11, (0x1E, 0x1E, 0x1E)).expect("Some");
-        assert_eq!(bytes, b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07");
-    }
-
-    #[test]
-    fn format_color_query_response_osc12_cursor() {
-        let bytes = format_color_query_response(12, (0x98, 0x98, 0x9D)).expect("Some");
-        assert_eq!(bytes, b"\x1b]12;rgb:9898/9898/9d9d\x07");
-    }
-
-    #[test]
-    fn format_color_query_response_rejects_unknown_n() {
-        // 13 isn't a recognised XTerm color-query code — caller
-        // should treat None as "skip" rather than fall through.
-        assert!(format_color_query_response(13, (0, 0, 0)).is_none());
-        assert!(format_color_query_response(0, (0, 0, 0)).is_none());
-    }
-
-    #[test]
-    fn format_color_query_response_mixed_channels() {
-        // Pin the channel order (red, green, blue) so a future
-        // refactor of the format string can't accidentally swap them
-        // — would otherwise be silently invisible in the BEL bytes.
-        let bytes = format_color_query_response(11, (0x12, 0x34, 0x56)).expect("Some");
-        assert_eq!(bytes, b"\x1b]11;rgb:1212/3434/5656\x07");
-    }
-
     // OSC 4 (palette color queries)
 
     #[test]
@@ -1190,21 +1098,6 @@ mod tests {
         // `4;0` with no `?`/color is incomplete — nothing surfaced.
         let events = feed_all(b"\x1b]4;0\x07");
         assert!(events.is_empty());
-    }
-
-    // -- format_palette_query_response: byte-exact, mirrors
-    //    format_color_query_response's 16-bit channels + BEL.
-
-    #[test]
-    fn format_palette_query_response_byte_exact() {
-        let bytes = format_palette_query_response(0, (0x12, 0x34, 0x56));
-        assert_eq!(bytes, b"\x1b]4;0;rgb:1212/3434/5656\x07");
-    }
-
-    #[test]
-    fn format_palette_query_response_index_echoed() {
-        let bytes = format_palette_query_response(231, (0xFF, 0x00, 0x80));
-        assert_eq!(bytes, b"\x1b]4;231;rgb:ffff/0000/8080\x07");
     }
 
     // Multiple sequences

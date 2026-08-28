@@ -27,8 +27,10 @@ const _: () = assert!(
     std::mem::align_of::<crate::ColorRgb>() == std::mem::align_of::<sys::GhosttyColorRgb>(),
 );
 
-/// Construction parameters for a new terminal. Matches
-/// `GhosttyTerminalOptions` 1:1.
+/// Construction parameters for a new terminal. `cols`/`rows` go to
+/// `ghostty_terminal_new`; `max_scrollback` is a separate
+/// `ghostty_terminal_set` the constructor applies right after (upstream
+/// retired the options struct that used to carry all three).
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalOptions {
     pub cols: u16,
@@ -246,28 +248,55 @@ unsafe extern "C" fn write_pty_trampoline(
 unsafe impl Send for Terminal {}
 
 impl Terminal {
-    /// Allocate a fresh terminal. Mirrors
-    /// `ghostty_terminal_new(NULL, &out, options)` and panics-free: any
-    /// non-success result is returned as an `Error`.
+    /// Allocate a fresh terminal. Mirrors `ghostty_terminal_new(NULL,
+    /// &out, cols, rows)` and panics-free: any non-success result is
+    /// returned as an `Error`.
     pub fn new(options: TerminalOptions) -> Result<Self> {
-        let opts = sys::GhosttyTerminalOptions {
-            cols: options.cols,
-            rows: options.rows,
-            max_scrollback: options.max_scrollback,
-        };
         let mut handle: sys::GhosttyTerminal = ptr::null_mut();
-        // SAFETY: passing a null allocator (libghostty's default), an
-        // out-pointer we own, and a stack-allocated options struct.
-        let rc = unsafe { sys::ghostty_terminal_new(ptr::null_mut(), &mut handle, opts) };
+        // SAFETY: passing a null allocator (libghostty's default) and an
+        // out-pointer we own.
+        let rc = unsafe {
+            sys::ghostty_terminal_new(ptr::null_mut(), &mut handle, options.cols, options.rows)
+        };
         Error::from_result(rc)?;
         if handle.is_null() {
             return Err(Error::NullHandle);
         }
-        Ok(Self {
+        // Construct the RAII owner *before* configuring scrollback so a
+        // failed `set` frees the terminal instead of leaking it.
+        let terminal = Self {
             handle,
             write_pty_buffer: None,
             _not_sync: PhantomData,
-        })
+        };
+        // Always applied, including `0` (= scrollback disabled):
+        // otherwise the terminal keeps libghostty's own default limit,
+        // not the one the caller asked for.
+        // SAFETY: handle non-null; `options.max_scrollback` is a live
+        // local of the `size_t` type this option documents.
+        let rc = unsafe {
+            sys::ghostty_terminal_set(
+                terminal.handle,
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES,
+                (&raw const options.max_scrollback).cast(),
+            )
+        };
+        Error::from_result(rc)?;
+        // `ghostty_terminal_new` also installs a default *byte* limit
+        // (10 KB at this pin) that wins over the line limit whenever it
+        // is reached first — which is always, at these magnitudes. Clear
+        // it (NULL removes the byte limit) so `max_scrollback` lines is
+        // the one limit in force.
+        // SAFETY: handle non-null; NULL is the documented "remove" value.
+        let rc = unsafe {
+            sys::ghostty_terminal_set(
+                terminal.handle,
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+                ptr::null(),
+            )
+        };
+        Error::from_result(rc)?;
+        Ok(terminal)
     }
 
     /// Raw FFI handle. Pass-through for crates that need to call a
@@ -480,12 +509,25 @@ impl Terminal {
     /// Returns `false` if the mode is not currently set or if the mode
     /// number is unknown to libghostty.
     pub fn mode_get(&self, mode: u16) -> bool {
-        let mut out: bool = false;
-        // SAFETY: handle non-null; out is a real local.
-        let rc = unsafe { sys::ghostty_terminal_mode_get(self.handle, mode as _, &mut out) };
+        // `mode` is packed DEC-private (ANSI bit clear) exactly as the
+        // removed `ghostty_terminal_mode_get` took it; the caller-facing
+        // `u16` mode numbering is unchanged.
+        let mut cfg = sys::GhosttyTerminalModeConfig {
+            mode: mode as _,
+            value: false,
+        };
+        // SAFETY: handle non-null; cfg is a real local of the type
+        // GHOSTTY_TERMINAL_DATA_MODE documents as its in/out parameter.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MODE,
+                (&mut cfg) as *mut sys::GhosttyTerminalModeConfig as *mut _,
+            )
+        };
         // Treat any non-success as "false" — the Mac UI does the same.
         Error::from_result(rc).ok();
-        out
+        cfg.value
     }
 
     /// Encode the canonical xterm focus report when DEC mode 1004 is active.
@@ -522,21 +564,22 @@ impl Terminal {
     /// htop, etc.). The Linux/Mac UIs use this to decide between local
     /// scrollback and arrow-key translation for the wheel.
     pub fn active_screen(&self) -> ActiveScreen {
-        let mut out: u32 = 0;
+        let mut out: sys::GhosttyTerminalScreen =
+            sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY;
         // SAFETY: handle non-null; out is a real local.
         let rc = unsafe {
             sys::ghostty_terminal_get(
                 self.handle,
                 sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
-                (&mut out) as *mut u32 as *mut _,
+                (&mut out) as *mut sys::GhosttyTerminalScreen as *mut _,
             )
         };
         if Error::from_result(rc).is_err() {
             return ActiveScreen::Primary;
         }
-        // libghostty exposes 0=primary, 1=alt. Anything else collapses
-        // to primary; safer fallback for the scroll handler.
-        if out == 1 {
+        // Anything other than the alternate screen collapses to primary;
+        // safer fallback for the scroll handler.
+        if out == sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_ALTERNATE {
             ActiveScreen::Alternate
         } else {
             ActiveScreen::Primary

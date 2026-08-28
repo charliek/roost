@@ -1,7 +1,9 @@
 use iced::keyboard::{self, key::Named, Key};
 use roost_ui_model::keybind::{Accel, AccelMods};
 use roost_vt::ffi as ghostty;
-use roost_vt::{key_action, mods, KeyEncoder, KeyEvent, PageDirection, Terminal};
+use roost_vt::{
+    key_action, mods, Key as GhosttyKey, KeyEncoder, KeyEvent, PageDirection, Terminal,
+};
 
 /// Translate an Iced key press into the toolkit-neutral accelerator grammar.
 /// Physical Latin lookup keeps configured letter bindings usable under a
@@ -439,7 +441,7 @@ pub(crate) fn ghostty_modifiers(value: keyboard::Modifiers) -> u16 {
     result
 }
 
-fn ghostty_key(key: &Key<&str>) -> Option<u32> {
+fn ghostty_key(key: &Key<&str>) -> Option<GhosttyKey> {
     use ghostty::*;
     Some(match key {
         Key::Named(Named::Enter) => GhosttyKey_GHOSTTY_KEY_ENTER,
@@ -474,11 +476,11 @@ fn ghostty_key(key: &Key<&str>) -> Option<u32> {
     })
 }
 
-fn character_key(value: &str) -> Option<u32> {
+fn character_key(value: &str) -> Option<GhosttyKey> {
     Some(character_key_char(value.chars().next()?))
 }
 
-fn character_key_char(value: char) -> u32 {
+fn character_key_char(value: char) -> GhosttyKey {
     use ghostty::*;
     match value.to_ascii_lowercase() {
         'a' => GhosttyKey_GHOSTTY_KEY_A,

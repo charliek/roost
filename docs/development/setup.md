@@ -11,7 +11,7 @@ Both link the same vendored `libghostty-vt` static archive built from `third_par
 
 | Tool | Use |
 |---|---|
-| `mise` | Provisions Rust 1.97.1 + Zig 0.15.x at the pinned versions |
+| `mise` | Provisions Rust 1.97.1 + Zig 0.16.x at the pinned versions |
 | Xcode Command Line Tools | Builds the Mac UI (SwiftPM) |
 | `libclang-dev` + `pkg-config` | Build-time deps of `roost-vt`'s FFI bindings (Linux) |
 | `uv` | Builds the documentation site and runs the E2E harness |
@@ -141,7 +141,7 @@ The voice for new docs: professional + direct (no marketing), tables for option 
 4. Re-run `make test`.
 5. Commit with the SHA + date in the message.
 
-If the bump also moves past Zig 0.15.x, drop the `maybe_arm64_sdk_shim` helper in `third_party/ghostty/build.sh` — it exists only because Zig 0.15.x links host artifacts as `arm64-macos`, which Apple's macOS 26+ SDK no longer exposes.
+Zig 0.15.x linked host artifacts as `arm64-macos`, which Apple's macOS 26+ SDK no longer exposed; `third_party/ghostty/build.sh` carried a `maybe_arm64_sdk_shim` helper to work around it. Zig 0.16.0 (the pinned toolchain as of the 2026-08-26 ghostty main-tip bump) resolves the system SDK correctly on its own, so the shim was deleted. If a future bump regresses this, restore the `sdk_has_plain_arm64`/`maybe_arm64_sdk_shim` block from git history (see `b6c46f7`).
 
 ## Code conventions
 

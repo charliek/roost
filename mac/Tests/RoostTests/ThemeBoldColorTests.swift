@@ -44,15 +44,11 @@ func theme_without_bold_color_has_none() {
 /// Rust `bold_default_fg_through_libghostty_uses_theme_bold_color`.
 @Test @MainActor
 func boldDefaultFgThroughLibghosttyUsesThemeBoldColor() throws {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
-
     var maybeTerm: GhosttyTerminal?
-    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    #expect(ghostty_terminal_new(nil, &maybeTerm, 80, 24).rawValue == 0)
     let term = try #require(maybeTerm, "ghostty_terminal_new returned success but term is nil")
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
 
     // CSI 1 m = bold on; X.
     let bytes: [UInt8] = Array("\u{1b}[1mX".utf8)

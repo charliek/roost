@@ -74,6 +74,15 @@ pub enum Error {
     OutOfSpace,
     #[error("libghostty-vt: no value")]
     NoValue,
+    #[error("libghostty-vt: I/O error")]
+    IoError,
+    #[error("libghostty-vt: limit exceeded")]
+    LimitExceeded,
+    /// A safety check refused the operation and did nothing — e.g. a
+    /// paste that could inject commands. Retry with the operation's
+    /// allow flag only after confirming with the user.
+    #[error("libghostty-vt: rejected by a safety check")]
+    Rejected,
     #[error("libghostty-vt returned non-UTF-8 text")]
     InvalidUtf8,
     #[error("libghostty-vt returned error code {0}")]
@@ -92,6 +101,9 @@ impl Error {
             -2 => Err(Error::InvalidValue),
             -3 => Err(Error::OutOfSpace),
             -4 => Err(Error::NoValue),
+            -5 => Err(Error::IoError),
+            -6 => Err(Error::LimitExceeded),
+            -7 => Err(Error::Rejected),
             other => Err(Error::Other(other)),
         }
     }
@@ -212,5 +224,52 @@ mod tests {
         }
         vt_smoke().expect("first vt_smoke");
         vt_smoke().expect("second vt_smoke");
+    }
+
+    /// Cross-check the literals `from_result` matches on against the
+    /// header constants bindgen generated for them. bindgen emits the
+    /// codes as plain constants rather than an exhaustive Rust enum, so
+    /// nothing makes a renumbered or mistyped literal fail to compile —
+    /// this table fails instead. A code upstream *adds* still lands in
+    /// `Other`, the deliberate fallback the last assertion pins.
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn from_result_maps_every_defined_code() {
+        use sys::{
+            GhosttyResult_GHOSTTY_INVALID_VALUE as INVALID_VALUE,
+            GhosttyResult_GHOSTTY_IO_ERROR as IO_ERROR,
+            GhosttyResult_GHOSTTY_LIMIT_EXCEEDED as LIMIT_EXCEEDED,
+            GhosttyResult_GHOSTTY_NO_VALUE as NO_VALUE,
+            GhosttyResult_GHOSTTY_OUT_OF_MEMORY as OUT_OF_MEMORY,
+            GhosttyResult_GHOSTTY_OUT_OF_SPACE as OUT_OF_SPACE,
+            GhosttyResult_GHOSTTY_REJECTED as REJECTED,
+        };
+
+        assert_eq!(GHOSTTY_SUCCESS, sys::GhosttyResult_GHOSTTY_SUCCESS);
+        assert!(Error::from_result(GHOSTTY_SUCCESS).is_ok());
+        let cases: &[(i32, Error)] = &[
+            (OUT_OF_MEMORY, Error::OutOfMemory),
+            (INVALID_VALUE, Error::InvalidValue),
+            (OUT_OF_SPACE, Error::OutOfSpace),
+            (NO_VALUE, Error::NoValue),
+            (IO_ERROR, Error::IoError),
+            (LIMIT_EXCEEDED, Error::LimitExceeded),
+            (REJECTED, Error::Rejected),
+        ];
+        for (code, expected) in cases {
+            let actual = Error::from_result(*code).expect_err("negative codes are errors");
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(expected),
+                "rc {code} should map to {expected:?}"
+            );
+        }
+
+        // An unknown code keeps its integer rather than being coerced
+        // into a neighbouring variant.
+        match Error::from_result(-99) {
+            Err(Error::Other(-99)) => {}
+            other => panic!("unknown rc should fall through to Other(-99), got {other:?}"),
+        }
     }
 }

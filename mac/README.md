@@ -19,7 +19,7 @@ The Mac UI links libghostty-vt from the vendored Ghostty build at
 running `swift build`:
 
 ```bash
-mise install                        # gets zig 0.15.2 if not already installed
+mise install                        # gets zig 0.16.0 if not already installed
 ./third_party/ghostty/build.sh      # clones Ghostty at the pinned SHA, builds the static lib
 ```
 

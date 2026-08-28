@@ -382,7 +382,7 @@ final class RenderState {
         }
         var colors = GhosttyRenderStateColors()
         colors.size = MemoryLayout<GhosttyRenderStateColors>.size
-        let rc = ghostty_render_state_colors_get(rs, &colors)
+        let rc = ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors)
         if rc.rawValue != 0 {
             return (.white, .black)
         }

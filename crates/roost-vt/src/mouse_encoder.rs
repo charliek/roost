@@ -26,9 +26,10 @@ pub type MouseButton = sys::GhosttyMouseButton;
 #[allow(dead_code)]
 pub mod mouse_action {
     use super::sys;
-    pub const PRESS: u32 = sys::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS;
-    pub const RELEASE: u32 = sys::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_RELEASE;
-    pub const MOTION: u32 = sys::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_MOTION;
+    use super::MouseAction;
+    pub const PRESS: MouseAction = sys::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS;
+    pub const RELEASE: MouseAction = sys::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_RELEASE;
+    pub const MOTION: MouseAction = sys::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_MOTION;
 }
 
 /// Button constants for [`MouseButton`]. Wheel up = button 4, wheel
@@ -36,13 +37,14 @@ pub mod mouse_action {
 #[allow(dead_code)]
 pub mod mouse_button {
     use super::sys;
-    pub const LEFT: u32 = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_LEFT;
-    pub const MIDDLE: u32 = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_MIDDLE;
-    pub const RIGHT: u32 = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_RIGHT;
+    use super::MouseButton;
+    pub const LEFT: MouseButton = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_LEFT;
+    pub const MIDDLE: MouseButton = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_MIDDLE;
+    pub const RIGHT: MouseButton = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_RIGHT;
     /// Wheel up.
-    pub const FOUR: u32 = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_FOUR;
+    pub const FOUR: MouseButton = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_FOUR;
     /// Wheel down.
-    pub const FIVE: u32 = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_FIVE;
+    pub const FIVE: MouseButton = sys::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_FIVE;
 }
 
 pub struct MouseEvent {

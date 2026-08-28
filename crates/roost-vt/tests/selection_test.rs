@@ -239,10 +239,14 @@ fn scrollback_copy_keeps_interior_blank_rows() {
 /// Honest limit: screen coordinates are relative to the top of the page
 /// list, so an evicted row shifts every stored endpoint by one. libghostty
 /// has tracked pins that would follow the content, but
-/// `ghostty_terminal_grid_ref` hands back untracked pins and no tracking
-/// symbol is exported. This fix cures clipping, not drift — the assertion
-/// below pins the drift so a future libghostty bump that fixes it is
-/// noticed.
+/// `ghostty_terminal_grid_ref` hands back untracked ones. The bumped pin
+/// does export the tracking API (`ghostty_terminal_grid_ref_track`);
+/// adopting it is #334, and this assertion pins today's drift until then.
+///
+/// The row count is load-bearing: libghostty prunes at *page*
+/// granularity, so a `max_scrollback` of 0 evicts nothing at all until a
+/// whole page of history has filled — at 20 columns that is a few
+/// thousand rows, not the dozens an intuitive setup would write.
 #[test]
 fn evicted_history_drifts_rather_than_failing() {
     let (mut terminal, mut render_state) = sized_terminal(0);
@@ -254,10 +258,21 @@ fn evicted_history_drifts_rather_than_failing() {
         Some("MARKER".into())
     );
 
-    write_lines(&mut terminal, 50);
-    assert_eq!(
-        text(&selection, &terminal, &mut render_state),
-        Some("line46".into())
+    write_lines(&mut terminal, 5000);
+    // Eviction prunes whole pages, and rows-per-page depends on the
+    // compile target's page size (16 KiB arm64-macos, 4 KiB Linux), so
+    // the exact row the selection drifts onto is not portable. Pin the
+    // drift property instead: the selection now names some other intact
+    // line, never the content it was anchored to.
+    let drifted = text(&selection, &terminal, &mut render_state)
+        .expect("drifted selection still resolves to a row");
+    assert_ne!(
+        drifted, "MARKER",
+        "selection followed content; expected drift"
+    );
+    assert!(
+        drifted.starts_with("line") && drifted[4..].parse::<u32>().is_ok(),
+        "drifted selection landed on garbage: {drifted:?}"
     );
 }
 

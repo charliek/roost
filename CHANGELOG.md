@@ -33,6 +33,14 @@ release workflow asserts they agree).
 - **`identify` and `roostctl doctor` report `app_label: Roost-linux`** for the
   packaged Linux profile, where they used to report `Roost-gtk`. The label is
   cosmetic — no path or app id is derived from it on Linux.
+- **libghostty-vt bumped to ghostty main tip (#333)** — pin `c74f6d56`
+  (2026-04-25) → `f2d5758f6` (2026-08-26), zig 0.15.2 → 0.16.0. Scrollback now
+  genuinely honors the configured line limit: the old pin treated the
+  configured value as a byte cap internally, silently capping history at a few
+  hundred rows regardless of the configured count (a 2000-line setting never
+  actually delivered 2000 rows); it does now. Three
+  new libghostty error codes (`IO_ERROR`, `LIMIT_EXCEEDED`, `REJECTED`) are
+  mapped into `roost-vt`'s `Error` enum.
 
 ## v0.0.18 — 2026-08-25
 

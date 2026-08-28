@@ -1506,11 +1506,6 @@ impl App {
                 OscAction::Workspace { command, payload } => {
                     self.client.apply_osc(tab_id, command, &payload);
                 }
-                OscAction::PtyInput(bytes) => {
-                    if let Some(tab) = self.tabs.get(&tab_id) {
-                        tab.session.send_input(bytes);
-                    }
-                }
                 OscAction::ClipboardWrite { target, text } => {
                     if !enqueue_osc_clipboard_write(
                         &mut self.clipboard,

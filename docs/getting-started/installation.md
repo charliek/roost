@@ -98,7 +98,7 @@ self-contained for `claude install`.
 | Tool | Purpose | Pinned version |
 |---|---|---|
 | Rust | CLI + the iced UI | 1.97.1 (via `mise`) |
-| Zig | Builds `libghostty-vt` from the vendored Ghostty source | 0.15.x (via `mise`) |
+| Zig | Builds `libghostty-vt` from the vendored Ghostty source | 0.16.x (via `mise`) |
 | Xcode Command Line Tools | Builds the Mac UI | macOS only |
 | `libclang-dev` + `pkg-config` | Build-time deps of the Rust UI's FFI bindings | Linux only |
 | `mise` | Manages the pinned Rust + Zig versions | any |

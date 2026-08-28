@@ -41,9 +41,10 @@ pub mod mods {
 #[allow(dead_code)]
 pub mod key_action {
     use super::sys;
-    pub const RELEASE: u32 = sys::GhosttyKeyAction_GHOSTTY_KEY_ACTION_RELEASE;
-    pub const PRESS: u32 = sys::GhosttyKeyAction_GHOSTTY_KEY_ACTION_PRESS;
-    pub const REPEAT: u32 = sys::GhosttyKeyAction_GHOSTTY_KEY_ACTION_REPEAT;
+    use super::KeyAction;
+    pub const RELEASE: KeyAction = sys::GhosttyKeyAction_GHOSTTY_KEY_ACTION_RELEASE;
+    pub const PRESS: KeyAction = sys::GhosttyKeyAction_GHOSTTY_KEY_ACTION_PRESS;
+    pub const REPEAT: KeyAction = sys::GhosttyKeyAction_GHOSTTY_KEY_ACTION_REPEAT;
 }
 
 pub struct KeyEvent {

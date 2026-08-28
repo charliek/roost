@@ -45,7 +45,7 @@ pub enum CursorVisualStyle {
 }
 
 impl CursorVisualStyle {
-    fn from_u32(v: u32) -> Self {
+    fn from_raw(v: sys::GhosttyRenderStateCursorVisualStyle) -> Self {
         use sys::{
             GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR as BAR,
             GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK as BLOCK,
@@ -280,8 +280,16 @@ impl RenderState {
             cursor_has_value: false,
             palette: [sys::GhosttyColorRgb::default(); 256],
         };
-        // SAFETY: handle non-null; raw is a real local.
-        let rc = unsafe { sys::ghostty_render_state_colors_get(self.handle, &mut raw) };
+        // SAFETY: handle non-null; raw is a real local whose `.size` is
+        // initialized above — the sized-struct ABI contract that
+        // `GHOSTTY_INIT_SIZED(GhosttyRenderStateColors)` encodes in C.
+        let rc = unsafe {
+            sys::ghostty_render_state_get(
+                self.handle,
+                sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_COLORS,
+                (&mut raw) as *mut sys::GhosttyRenderStateColors as *mut _,
+            )
+        };
         Error::from_result(rc)?;
         Ok(Colors {
             foreground: raw.foreground.into(),
@@ -323,9 +331,10 @@ impl RenderState {
             .read_bool(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING)
             .unwrap_or(false);
         let style = self
-            .read_u32(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE)
+            .read_enum(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE)
             .unwrap_or(
-                sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK,
+                sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK
+                    as _,
             );
 
         let cursor_has_color = self
@@ -343,7 +352,7 @@ impl RenderState {
             wide_tail,
             visible,
             blinking,
-            visual_style: CursorVisualStyle::from_u32(style),
+            visual_style: CursorVisualStyle::from_raw(style as _),
             color,
         })
     }
@@ -402,8 +411,8 @@ impl RenderState {
 
     /// Global dirty state. Pure read — clears nothing.
     pub fn dirty(&self) -> Result<Dirty> {
-        let raw = self.read_u32(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_DIRTY)?;
-        Ok(Dirty::from_raw(raw))
+        let raw = self.read_enum(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_DIRTY)?;
+        Ok(Dirty::from_raw(raw as _))
     }
 
     /// Raise the global dirty state to `Full`, forcing the next
@@ -728,6 +737,28 @@ impl RenderState {
         Ok(out)
     }
 
+    /// Read a data key whose documented output type is one of
+    /// libghostty's `GHOSTTY_ENUM_TYPED` enums. The ABI is a 4-byte
+    /// write either way, but the Rust-side alias signedness is
+    /// platform-dependent: Apple clang honors the header's
+    /// `c_fixed_enum` `: int` (bindgen emits `c_int`) while Linux clang
+    /// in default C mode expands the macro empty (bindgen infers
+    /// `c_uint` for non-negative enums). Read as `c_int` and let call
+    /// sites `as _` into the alias type, never assume one signedness.
+    fn read_enum(&self, data: sys::GhosttyRenderStateData) -> Result<std::os::raw::c_int> {
+        let mut out: std::os::raw::c_int = 0;
+        // SAFETY: handle non-null; out is local.
+        let rc = unsafe {
+            sys::ghostty_render_state_get(
+                self.handle,
+                data,
+                (&mut out) as *mut std::os::raw::c_int as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        Ok(out)
+    }
+
     fn read_bool(&self, data: sys::GhosttyRenderStateData) -> Result<bool> {
         let mut out: bool = false;
         // SAFETY: handle non-null; out is local.
@@ -969,14 +1000,14 @@ mod tests {
     /// a bar in both Rust UIs and DECSCUSR 1/2 vs 5/6 were swapped.
     #[test]
     fn cursor_visual_style_matches_header_codes() {
-        assert_eq!(CursorVisualStyle::from_u32(0), CursorVisualStyle::Bar);
-        assert_eq!(CursorVisualStyle::from_u32(1), CursorVisualStyle::Block);
-        assert_eq!(CursorVisualStyle::from_u32(2), CursorVisualStyle::Underline);
+        assert_eq!(CursorVisualStyle::from_raw(0), CursorVisualStyle::Bar);
+        assert_eq!(CursorVisualStyle::from_raw(1), CursorVisualStyle::Block);
+        assert_eq!(CursorVisualStyle::from_raw(2), CursorVisualStyle::Underline);
         assert_eq!(
-            CursorVisualStyle::from_u32(3),
+            CursorVisualStyle::from_raw(3),
             CursorVisualStyle::BlockHollow
         );
-        assert_eq!(CursorVisualStyle::from_u32(99), CursorVisualStyle::Block);
+        assert_eq!(CursorVisualStyle::from_raw(99), CursorVisualStyle::Block);
 
         assert_eq!(
             sys::GhosttyRenderStateCursorVisualStyle_GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR,

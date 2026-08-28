@@ -16,7 +16,7 @@
 
 use roost_vt::{key_action, mods, KeyEncoder, KeyEvent, Terminal, TerminalOptions};
 
-const KEY_A: u32 = roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_A;
+const KEY_A: roost_vt::Key = roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_A;
 
 /// Build a terminal, push the Kitty "disambiguate escape codes" flag
 /// (`CSI > 1 u`), and hand back a terminal + encoder synced to it. The

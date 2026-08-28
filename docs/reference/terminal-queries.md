@@ -6,70 +6,84 @@ synchronized output on?". The terminal answers in-band by writing bytes
 back onto the PTY's input. Many TUIs gate features (or whole render
 paths) on these replies, so Roost has to answer the ones that matter.
 
-Roost answers queries through **two distinct channels**, split by *who
-owns the answer*. The split is deliberate and load-bearing — get it
-wrong and you either double-answer or leave a query unanswered.
+**libghostty-vt answers every query Roost answers.** Both the OSC color
+queries and the CSI/DCS device queries come back through one channel —
+libghostty's `write_pty` effects callback, which Roost installs on both
+UIs and drains onto the tab's PTY-input channel. Roost synthesizes
+nothing.
 
-## Why two channels
+## Who owns the answer
 
-`libghostty-vt` parses the byte stream for screen state, but it does
-**not** answer every query itself:
+That was not always true, and the history is worth keeping because the
+failure mode is loud:
 
-- **OSC color queries** (`OSC 4` palette, `OSC 10/11/12` fg/bg/cursor) —
-  libghostty-vt **no-ops the `.query` arm** of its color handler in every
-  version (`src/terminal/stream_terminal.zig`, the `.query => {}` arm).
-  It can't, really: the *embedder* (Roost) owns the palette and theme, so
-  only Roost knows the right RGB to report. These replies are
-  **embedder-synthesized**.
+- **OSC color queries** (`OSC 4` palette, `OSC 10/11/12` fg/bg/cursor,
+  and Kitty's `OSC 21`) — libghostty-vt used to **no-op the `.query`
+  arm** of its color handler (`src/terminal/stream_terminal.zig`), so
+  Roost scanned for those queries itself and wrote its own replies.
+  Upstream `14c829883` ("terminal: report OSC color queries in lib-vt",
+  in Roost as of the pinned SHA `f2d5758f6`) makes libghostty answer
+  them from its own color state whenever `write_pty` is installed —
+  which Roost does, for the device replies below. Roost's synthesis
+  became a **second** answer to every query, so it was removed.
 - **CSI/DCS device queries** (DA1/DA2/DA3, DSR 5n/6n, XTVERSION, DECRQM,
   the Kitty keyboard query, mode-2048 resize reports) — libghostty-vt
-  **does** answer these autonomously, via the `write_pty` effects
-  callback. The answers are pure VT bookkeeping (cursor position, mode
-  state, a static attribute string) that the engine already tracks. These
-  replies are **libghostty-answered**. (A second class — ENQ, XTWINOPS
-  14/16/18t size reports, DSR `?996` — needs *additional* provider
-  callbacks that `write_pty` alone does not enable; see Channel 2's
-  "provider-gated set". Those remain unanswered, deferred to #209.)
+  has always answered these autonomously through the same callback. (A
+  third class — ENQ, XTWINOPS 14/16/18t size reports, DSR `?996` — needs
+  *additional* provider callbacks that `write_pty` alone does not
+  enable; see the "provider-gated set" below. Those remain unanswered,
+  deferred to #209.)
 
-The two sets are disjoint, so the channels never overlap or double-reply.
+> **The pin is load-bearing for OSC colors.** Before `f2d5758f6` these
+> queries went unanswered without embedder synthesis; after it, embedder
+> synthesis double-answers. A Ghostty SHA bump that moved backwards past
+> that commit would silence them.
 
-> **No Ghostty bump is needed for either.** OSC colors are embedder-owned
-> in all Ghostty versions (a bump can't make libghostty answer them), and
-> the `write_pty` device-reply set is already complete at the pinned SHA.
+## Where the colors come from
 
-## Channel 1 — embedder-synthesized OSC color replies
+libghostty resolves a color query as `override orelse default`:
+`override` is whatever an `OSC 4;Ps;rgb:…` / `OSC 11;rgb:…` *set* from
+the program established, and `default` is the theme Roost pushed through
+`ghostty_terminal_set(GHOSTTY_TERMINAL_OPT_COLOR_*)` at tab creation and
+on every theme switch (`TerminalTab::apply_theme_candidate` on iced,
+`Theme.apply` on macOS). **That push is what makes the queries
+answerable at all** — a terminal with neither an override nor a default
+has nothing to report and stays silent (pinned by
+`an_unseeded_color_query_gets_no_reply` in
+`crates/roost-vt/tests/write_pty_test.rs`).
 
-Roost runs its own OSC scanner over the PTY output, *in parallel* with
-feeding the same bytes to libghostty (`roost-osc` crate on Linux,
-`OscScanner.swift` on macOS). The scanner surfaces query events; the UI
-answers them and writes the reply onto the same per-tab PTY-input channel
-as keystrokes (`TabSession::send_input` in the Rust UI, `onKey` on
-macOS), so the reply is FIFO-ordered with other input once enqueued.
-
-| Query | Scanner event | Reply formatter | Live data source |
-|---|---|---|---|
-| `OSC 10/11/12 ;?` | `ColorQuery(n)` | `format_color_query_response` | `Terminal::live_colors` (theme fallback) |
-| `OSC 4 ;Ps;?` | `PaletteQuery([Ps])` | `format_palette_query_response` | `Terminal::live_palette` (theme fallback) |
-
-The data source reads libghostty's **live** colors/palette
-(`ghostty_terminal_get`), so a mid-session `OSC 4;Ps;rgb:…` /
-`OSC 11;rgb:…` *set* (which libghostty applies and the scanner ignores)
-is reflected in the next query reply. If the FFI read fails, Roost falls
-back to the static theme color/palette.
+Replies use the fixed 16-bit-per-channel xterm form
+(`ESC]11;rgb:1e1e/1e1e/1e1e BEL`), preserve the terminator the request
+used (BEL or ST), and fall back from cursor to foreground when no cursor
+color is set. Semantics are **sequential**: requests are processed in
+wire order, so a SET earlier in the same write is visible to a QUERY
+behind it. (Roost's old drain-side replies answered such a query from a
+chunk-start snapshot — the *pre-chunk* color. That divergence is gone
+with the synthesis.)
 
 **Why OSC 4 matters:** opencode's TUI (`@opentui/core`) gates *all* of
 its terminal color detection behind a single probe — `OSC 4;0;?` with a
 300 ms timeout. If that goes unanswered it returns an all-`null` palette
-and opencode renders an unreadable gray fallback theme. Answering OSC 4
-is what unblocks it (and any other opentui-based TUI).
+and opencode renders an unreadable gray fallback theme.
 
-Code: `crates/roost-osc/src/lib.rs` (scanner + formatters),
-`crates/roost-engine/src/osc.rs` (the `OscRouter` arm that answers
-`ColorQuery` / `PaletteQuery` straight off the per-tab drain and enqueues
-the reply on `TabSession::send_input`),
-`mac/Sources/Roost/TerminalView.swift` (`appendBytes` reply arm).
+**What Roost's own OSC scanner still does.** Roost keeps scanning PTY
+output in parallel with libghostty (`roost-osc` on Linux,
+`OscScanner.swift` on macOS) — it is how title / cwd / notification /
+clipboard / pointer-shape OSCs reach the workspace, since libghostty's
+C API surfaces no payload for them. The scanner surfaces color queries
+too, but every consumer now drops them; `roost-engine`'s `OscColorState`
+tracks only the SET/RESET forms, as the drain's own record of a tab's
+colors.
 
-## Channel 2 — libghostty-answered device queries (`write_pty`) — *live*
+Code: `crates/roost-osc/src/lib.rs` (scanner),
+`crates/roost-engine/src/osc.rs` (`OscRouter` — color events produce no
+action), `mac/Sources/Roost/TerminalView.swift` (`appendBytes` passes
+color queries through). Reply bytes are pinned at the FFI in
+`crates/roost-vt/tests/write_pty_test.rs`, end-to-end on macOS in
+`mac/Tests/RoostTests/TerminalViewOscDrainTests.swift`, and on both UIs
+by `tools/roosttest/test_osc_pipeline.py`.
+
+## The `write_pty` channel — *live*
 
 > **Status: live (#247).** Roost installs libghostty-vt's `write_pty`
 > effects callback on both UIs, so the engine-autonomous device replies
@@ -79,15 +93,18 @@ the reply on `TabSession::send_input`),
 > query and then never pushed Kitty flags (so Shift+Enter arrived as a
 > bare `\r`).
 
-libghostty-vt's C terminal layer answers a set of CSI/DCS device queries
-itself, handing the response bytes to the `write_pty` effects callback.
-Roost wires that callback and forwards the bytes onto the same per-tab
-PTY-input channel as keystrokes.
+libghostty-vt's C terminal layer answers these queries itself, handing
+the response bytes to the `write_pty` effects callback. Roost wires that
+callback and forwards the bytes onto the same per-tab PTY-input channel
+as keystrokes.
 
 ### Answered — engine-autonomous set (enabled by `write_pty` alone)
 
 | Query | Sequence | Reply (engine default at the pinned SHA) |
 |---|---|---|
+| OSC color query | `ESC]10;?` / `ESC]11;?` / `ESC]12;?` | `ESC]11;rgb:1e1e/1e1e/1e1e BEL` (request's terminator preserved) |
+| OSC palette query | `ESC]4;Ps;?` | `ESC]4;0;rgb:RRRR/GGGG/BBBB BEL` |
+| Kitty color query | `ESC]21;foreground=?` | terminal-backed keys reported; unset dynamic colors report empty |
 | DA1 / DA2 / DA3 | `ESC[c` / `ESC[>c` / `ESC[=c` | e.g. DA1 → `ESC[?62;22c` (VT220 + ANSI color) |
 | DSR status | `ESC[5n` | `ESC[0n` ("OK") |
 | DSR cursor position (CPR) | `ESC[6n` | `ESC[<row>;<col>R` |
@@ -148,17 +165,16 @@ color-scheme, …) later can't just set its own userdata — it must be
 multiplexed through one shared context struct. That refactor is deferred
 until a second callback actually exists (#209 remainder).
 
-**Cross-channel ordering nuance.** Within a *single mixed chunk*, Channel
-1 (OSC) replies are synthesized *before* `vt_write` while Channel 2
-(device) replies drain *after* it, so replies from one chunk are not
-ordered by byte position across the two channels. This is harmless — the
-query sets are disjoint and each channel is internally ordered.
+**Ordering.** Every reply — OSC color and CSI/DCS device alike — is
+emitted from inside `vt_write` (or `resize`) in wire order and drained
+after the producing call returns, so one chunk's replies leave in the
+order its queries arrived. Roost adds nothing ahead of them.
 
 ### DEC 2031 — proactive color-scheme change notification
 
 Mode 2031 (`CSI ? 2031 h`) is an app *opt-in* to be told when the
 terminal's color scheme flips between light and dark at runtime. Unlike
-the Channel 2 queries above, nothing on the PTY output triggers it — it's
+the queries above, nothing on the PTY output triggers it — it's
 **proactive**: when the user switches Roost's theme mid-session, Roost
 writes a DSR onto the PTY input of every tab whose terminal has mode 2031
 enabled:
@@ -181,9 +197,9 @@ macOS),
 routed through the **same per-tab PTY-input sink as keystrokes** (`onKey`
 / `input_callback` → `send_input`) so it stays FIFO-ordered with input
 and is visible to `tab.capture_pty_input`. Gating: only when the tab's
-terminal reports mode 2031 set (`ghostty_terminal_mode_get`), and only on
-an actual theme switch — merely *enabling* the mode emits nothing (an app
-that wants the current state queries `?996`).
+terminal reports mode 2031 set (`ghostty_terminal_get(DATA_MODE)`), and
+only on an actual theme switch — merely *enabling* the mode emits nothing
+(an app that wants the current state queries `?996`).
 
 **Still deferred (#209):** the DSR `?996` *query* (`ESC[?996n`, "what
 scheme are you now?") stays unanswered — it needs the `color_scheme`

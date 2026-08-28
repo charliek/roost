@@ -201,26 +201,34 @@ to drive the shell into emitting the sequence. They require
 ```python
 def test_osc11_set_then_query_replies_with_new_bg(roost, project):
     tab = roost.open_tab(project, cwd="/tmp")
-    # SET in one chunk, QUERY in the next: a SET affects a LATER chunk's
-    # query, while SET+QUERY in ONE chunk answers the pre-chunk color.
+    wait_tab_quiet(roost, tab)  # a late shell byte would join the capture
+    # SET then QUERY. libghostty answers the query from
+    # `override orelse default`, in wire order — so a SET is visible to
+    # any QUERY behind it, in a later chunk OR the same one.
     roost.tab_feed_pty_bytes(tab, b"\x1b]11;rgb:00/11/22\x07")
     roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
     reply = roost.tab_capture_pty_input(tab, drain=True)
     assert b"0000/1111/2222" in reply
+    assert reply.count(b"\x1b]11;rgb:") == 1   # exactly one answer
 ```
+
+**Count the replies.** Color-query replies come from libghostty's
+`write_pty` effect (`docs/reference/terminal-queries.md`); Roost used to
+synthesize its own alongside them, which double-answered every query.
+Any new color-query case asserts the reply COUNT, not just its presence
+— and drains for a beat past the first match, since a duplicate arrives
+after it (`_drain_settled` in `test_osc_pipeline.py`).
 
 **What `tab.feed_pty_bytes` exercises on iced.** Since plan 026's D10,
 iced's OSC scan lives in the PTY drain (`TabSession`'s forwarding task
-owns the tab's only `OscRouter` and answers color queries there, ahead
-of the UI's event loop — that latency is what leaked replies into the
-shell prompt). `tab.feed_pty_bytes` injects on the UI thread, so it
-cannot go through the drain; it routes through
+owns the tab's only `OscRouter`). `tab.feed_pty_bytes` injects on the UI
+thread, so it cannot go through the drain; it routes through
 `TerminalTab::scan_and_write_vt`, which hands the bytes to the SAME
 router and the SAME color state via `TabSession::scan_osc` before
 writing them to the terminal. So these tests still walk the production
-scan, the production color state and the production input channel — but
-they cannot prove the reply left *without* the UI. That property has its
-own test at the engine level:
+scan, the production color state and the production input channel. The
+complementary property — that the drain itself enqueues NOTHING for a
+color query — has its own test at the engine level:
 `crates/roost-engine/tests/osc_drain_reply_test.rs`. Mac keeps its own
 UI-side router, and `feed_pty_bytes` is its production path by
 construction.

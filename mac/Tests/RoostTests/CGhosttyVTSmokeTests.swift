@@ -17,13 +17,8 @@ import Testing
 
 @Test
 func libghosttyVtRoundTrip() {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
-
     var term: GhosttyTerminal?
-    let rc = ghostty_terminal_new(nil, &term, opts)
+    let rc = ghostty_terminal_new(nil, &term, 80, 24)
     // libghostty-vt returns GhosttyResult (typedef enum). Swift's C
     // importer wraps it as a struct, so we compare on the underlying
     // integer (`rawValue`) rather than against an Int32 literal.
@@ -54,17 +49,13 @@ func libghosttyVtRoundTrip() {
 /// fail loudly if a future Ghostty bump made palette set write-once.
 @Test @MainActor
 func themeAppliesAfterVtWrite() throws {
-    var opts = GhosttyTerminalOptions()
-    opts.cols = 80
-    opts.rows = 24
-    opts.max_scrollback = 0
-
     var maybeTerm: GhosttyTerminal?
-    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    #expect(ghostty_terminal_new(nil, &maybeTerm, 80, 24).rawValue == 0)
     // Fail loudly rather than silently passing if the out-handle is nil
     // despite a success rc.
     let term = try #require(maybeTerm, "ghostty_terminal_new returned success but term is nil")
     defer { ghostty_terminal_free(term) }
+    setScrollbackLines(term, 0)
 
     // Simulate a live session: SGR red text + a newline, so the
     // terminal has parsed VT data and advanced its screen state
