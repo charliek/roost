@@ -1060,9 +1060,18 @@ jobs:
             || { echo "FAIL: $dmg does not contain Roost-Iced.app at its root"; exit 1; }
           [ ! -e "$mnt/Roost.app" ] \
             || { echo "FAIL: $dmg contains Roost.app — the iced DMG would drag-install over the Swift app"; exit 1; }
-          hdiutil detach "$mnt" >/dev/null
+          # Spotlight/quarantine briefly holds a fresh mount on CI runners,
+          # so a bare detach intermittently fails "Resource busy" (exit 16)
+          # AFTER every assertion has passed. Retry, then force — cleanup
+          # must not fail a smoke whose assertions succeeded.
+          for attempt in 1 2 3 4 5; do
+            hdiutil detach "$mnt" >/dev/null 2>&1 && break
+            [ "$attempt" = 5 ] && { hdiutil detach "$mnt" -force >/dev/null 2>&1 || true; break; }
+            echo "    detach busy (attempt ${attempt}); retrying in 2s…"
+            sleep 2
+          done
           trap - EXIT
-          rmdir "$mnt"
+          rmdir "$mnt" 2>/dev/null || true
           echo "OK: iced DMG mounts with Roost-Iced.app (and no Roost.app) at its root"
 
       # The other half: sign_update -> update-appcast.py, the exact chain
