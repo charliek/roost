@@ -112,11 +112,18 @@ of what was selected.
 
 A selection that extends beyond the visible viewport copies **in full**,
 including rows scrolled off-screen ([#249](https://github.com/charliek/roost/issues/249)).
-The one thing copy still cannot survive is a row being **evicted** from
-scrollback entirely: selection endpoints are stored as screen
-coordinates, which shift by one for every row the buffer drops off the
-top, so a selection left anchored while a saturated scrollback keeps
-scrolling will drift onto different rows.
+Endpoints are tracked pins into the terminal's own storage
+([#334](https://github.com/charliek/roost/issues/334)), so a selection
+follows its **content**: it stays on the same characters as history
+scrolls past, as the buffer drops rows off the top, and across a window
+resize that reflows the line. A row that is **evicted** from scrollback
+entirely takes the selection with it — copy then returns nothing, rather
+than quietly handing back whichever row moved into that slot.
+
+A selection also belongs to the screen it was made on. Start an
+alt-screen program (vim, less, htop) and a selection made in the normal
+scrollback stops being drawn and copies nothing; it reappears when the
+program exits.
 
 ## `clipboard-write`
 

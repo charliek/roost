@@ -732,7 +732,7 @@ impl TerminalTab {
             }
             PointerAction::Motion => match self.local_pointer_gesture {
                 Some(LocalPointerGesture::Selection) => {
-                    self.selection.update(&self.terminal, cell.0, cell.1);
+                    self.selection.update(&self.terminal, cell.0, cell.1)?;
                     Ok(NativePointerOutcome::default())
                 }
                 Some(LocalPointerGesture::MultiClick | LocalPointerGesture::Url) => {
@@ -746,7 +746,7 @@ impl TerminalTab {
             },
             PointerAction::Release => match self.local_pointer_gesture.take() {
                 Some(LocalPointerGesture::Selection) => {
-                    self.selection.update(&self.terminal, cell.0, cell.1);
+                    self.selection.update(&self.terminal, cell.0, cell.1)?;
                     Ok(NativePointerOutcome {
                         selection_completed: true,
                         ..NativePointerOutcome::default()
@@ -797,7 +797,7 @@ impl TerminalTab {
         if button == Some(PointerButton::Left) {
             self.local_pointer_gesture = self
                 .selection
-                .begin(&self.terminal, cell.0, cell.1)
+                .begin(&self.terminal, cell.0, cell.1)?
                 .then_some(LocalPointerGesture::Selection);
             return Ok(NativePointerOutcome::default());
         }
@@ -934,7 +934,7 @@ impl TerminalTab {
         };
         if !self
             .selection
-            .set(&self.terminal, (span.col0, row), (span.col1, row))
+            .set(&self.terminal, (span.col0, row), (span.col1, row))?
         {
             return Ok(None);
         }

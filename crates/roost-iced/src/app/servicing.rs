@@ -1400,7 +1400,11 @@ impl App {
                     .get_mut(&tab_id)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
-                        if !tab.selection.set(&tab.terminal, anchor, cursor) {
+                        let anchored = tab
+                            .selection
+                            .set(&tab.terminal, anchor, cursor)
+                            .map_err(|error| error.to_string())?;
+                        if !anchored {
                             return Err(format!(
                                 "selection coordinates are outside tab {tab_id}'s viewport"
                             ));

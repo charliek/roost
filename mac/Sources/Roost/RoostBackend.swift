@@ -73,7 +73,8 @@ protocol UiBridge: AnyObject {
     // Selection drive surface (`selection.*` ops). Each takes a tab id;
     // returning `false` / `nil` signals "no live tab" so the IPC
     // handler maps to `not-found`. Coords are viewport (col, row); the
-    // TerminalView converts to scrollback-stable screen-y internally.
+    // TerminalView pins each endpoint with a tracked grid ref
+    // internally.
     func setTabSelection(
         tabID: Int64,
         anchorCol: Int,

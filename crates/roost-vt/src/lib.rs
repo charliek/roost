@@ -132,6 +132,8 @@ mod scroll;
 mod selection;
 #[cfg(feature = "ffi")]
 mod terminal;
+#[cfg(feature = "ffi")]
+mod tracked_ref;
 
 #[cfg(feature = "ffi")]
 pub use formatter::UNWRAP_SOFT_WRAPPED_LINES;
@@ -153,6 +155,8 @@ pub use selection::{RowTextProjection, SelectionSnapshot, SelectionSpan, Termina
 pub use terminal::{
     ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Scrollbar, Terminal, TerminalOptions,
 };
+#[cfg(feature = "ffi")]
+pub use tracked_ref::TrackedRef;
 
 // ============================================================================
 // FFI smoke

@@ -151,18 +151,33 @@ final class TerminalView: NSView {
     /// rectangle, normalized at draw + extract time so the user can
     /// drag in any direction.
     ///
-    /// Rows are stored in libghostty's `PointTag::Screen` coordinate
-    /// space — the unified screen-including-scrollback index that
-    /// stays stable as the user scrolls. The viewport row equivalent
-    /// is computed each frame in [`draw`] via
-    /// `ghostty_terminal_grid_ref` so the highlight scrolls with the
-    /// content (matching Ghostty / cmux behavior). Cols are
-    /// column-index integers that don't change with vertical scroll.
-    private struct CellSelection {
-        var anchorCol: Int
-        var anchorScreenY: UInt32
-        var cursorCol: Int
-        var cursorScreenY: UInt32
+    /// Endpoints are libghostty **tracked grid refs**: owned pins the
+    /// engine rewrites as the page list scrolls, prunes, and reflows,
+    /// so a selection follows its *content* on both axes. A stored
+    /// screen-y (what this used to be) names a position instead, and
+    /// the first scrollback eviction or resize points it at whatever
+    /// content moved into that slot. Swift mirror of
+    /// `roost_vt::TrackedRef` + `TerminalSelection`; the two must stay
+    /// behaviorally identical.
+    ///
+    /// A ref that has lost its cell — the row was pruned, or the
+    /// terminal was reset — resolves to nothing, and the selection then
+    /// paints nothing and copies nothing rather than drifting.
+    ///
+    /// A class, not a struct, so `deinit` frees both refs exactly once;
+    /// assigning over `selection` or clearing it releases them.
+    private final class CellSelection {
+        /// Terminal that created the refs. libghostty does not check
+        /// that a `_set` targets the right terminal, so we do.
+        let terminal: GhosttyTerminal
+        let anchor: GhosttyTrackedGridRef
+        let cursor: GhosttyTrackedGridRef
+        /// Screen (primary / alternate) the refs are attached to. They
+        /// keep resolving against it even while the other screen is
+        /// displayed, and libghostty's formatter requires endpoints on
+        /// the *active* screen — so every read is gated on this still
+        /// matching.
+        let screen: GhosttyTerminalScreen
         /// True when the selection was set as a deliberate commit
         /// (multi-click n_press dispatch, `setSelection` from IPC)
         /// rather than as a single-cell `mouseDown` anchor that the
@@ -171,7 +186,39 @@ final class TerminalView: NSView {
         /// single-cell span — geometrically equal to a
         /// click-without-drag, but the user expects to see + copy
         /// it. `committed` is the bit that distinguishes the two.
-        var committed: Bool = false
+        let committed: Bool
+
+        init(
+            terminal: GhosttyTerminal,
+            anchor: GhosttyTrackedGridRef,
+            cursor: GhosttyTrackedGridRef,
+            screen: GhosttyTerminalScreen,
+            committed: Bool
+        ) {
+            self.terminal = terminal
+            self.anchor = anchor
+            self.cursor = cursor
+            self.screen = screen
+            self.committed = committed
+        }
+
+        deinit {
+            // Freeing after the owning terminal is gone is explicitly
+            // allowed by libghostty, so no drop ordering is required.
+            ghostty_tracked_grid_ref_free(anchor)
+            ghostty_tracked_grid_ref_free(cursor)
+        }
+    }
+
+    /// A selection's endpoints resolved into screen coordinates. Every
+    /// geometry rule works from this, unchanged from when the endpoints
+    /// were stored as screen scalars.
+    private struct SelectionEndpoints {
+        let anchorCol: Int
+        let anchorScreenY: UInt32
+        let cursorCol: Int
+        let cursorScreenY: UInt32
+        let committed: Bool
 
         /// True if the anchor and cursor land on the same cell —
         /// shouldn't render selection chrome for a single-cell
@@ -1122,6 +1169,21 @@ final class TerminalView: NSView {
         textForViewportRow(row)
     }
 
+    /// Test-only read of libghostty's scrollable-row total. The
+    /// selection-eviction tests use it to prove history really was
+    /// pruned, so a green run cannot mean "the terminal kept
+    /// everything and the scenario never happened". Pure read.
+    @MainActor
+    func totalScrollableRowsForTest() -> UInt64 {
+        guard let terminal else { return 0 }
+        var out = GhosttyTerminalScrollbar()
+        guard
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &out)
+                == GHOSTTY_SUCCESS
+        else { return 0 }
+        return out.total
+    }
+
     /// Build the visible text of one viewport row by walking the
     /// render state. Each cell contributes exactly **one Unicode
     /// scalar** so the click column (which the renderer reports in
@@ -1226,42 +1288,182 @@ final class TerminalView: NSView {
     private func selectionMouseDown(_ event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
-        guard let screenY = screenY(forViewportRow: cell.row) else {
-            // libghostty rejected the viewport→screen conversion (very
-            // narrow window: tab tearing down, no terminal handle yet).
-            // Clear any stale selection so the user isn't left with a
-            // highlight pointing at the wrong row.
-            if selection != nil {
-                selection = nil
-                needsDisplay = true
-            }
-            return
-        }
-        selection = CellSelection(
+        _ = anchorSelection(
             anchorCol: cell.col,
-            anchorScreenY: screenY,
+            anchorRow: cell.row,
             cursorCol: cell.col,
-            cursorScreenY: screenY
+            cursorRow: cell.row,
+            committed: false
         )
-        needsDisplay = true
     }
 
     private func selectionMouseDragged(_ event: NSEvent) {
-        guard var sel = selection else { return }
+        guard let sel = selection else { return }
+        guard let terminal, sel.terminal == terminal else {
+            // No terminal handle any more (the tab is tearing down).
+            // Drop the selection rather than keep a stale one.
+            selection = nil
+            needsDisplay = true
+            return
+        }
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
-        guard let screenY = screenY(forViewportRow: cell.row) else {
-            // Mid-drag conversion failure (rare — usually means the
+        // A drag that started on the other screen must not pull one
+        // endpoint across page lists; leave it alone until its screen
+        // is active again.
+        guard sel.screen == activeScreen(terminal) else { return }
+        let point = viewportPoint(col: cell.col, row: cell.row)
+        guard ghostty_tracked_grid_ref_set(sel.cursor, terminal, point) == GHOSTTY_SUCCESS else {
+            // Mid-drag failure (rare — an out-of-range row, or the
             // terminal handle just went away). Drop the selection
             // rather than continue updating a stale anchor.
             selection = nil
             needsDisplay = true
             return
         }
-        sel.cursorCol = cell.col
-        sel.cursorScreenY = screenY
-        selection = sel
         needsDisplay = true
+    }
+
+    /// Replace the selection with tracked refs pinning `anchor` and
+    /// `cursor`. Returns `false` (and clears any stale selection) when
+    /// either viewport cell names nothing — an out-of-range row, or no
+    /// terminal handle yet.
+    @MainActor
+    private func anchorSelection(
+        anchorCol: Int,
+        anchorRow: Int,
+        cursorCol: Int,
+        cursorRow: Int,
+        committed: Bool
+    ) -> Bool {
+        guard let terminal,
+              let anchor = trackedRef(terminal, col: anchorCol, row: anchorRow)
+        else {
+            clearSelection()
+            return false
+        }
+        guard let cursor = trackedRef(terminal, col: cursorCol, row: cursorRow) else {
+            ghostty_tracked_grid_ref_free(anchor)
+            clearSelection()
+            return false
+        }
+        selection = CellSelection(
+            terminal: terminal,
+            anchor: anchor,
+            cursor: cursor,
+            screen: activeScreen(terminal),
+            committed: committed
+        )
+        needsDisplay = true
+        return true
+    }
+
+    /// A viewport point for `(col, row)`, with the column pulled into
+    /// the grid. A column equal to `cols` has no cell to track and
+    /// libghostty would reject the endpoint outright, but `setSelection`
+    /// takes IPC-supplied coordinates without validating them — the old
+    /// screen-coordinate path clamped at copy time instead.
+    @MainActor
+    private func viewportPoint(col: Int, row: Int) -> GhosttyPoint {
+        var point = GhosttyPoint()
+        point.tag = GHOSTTY_POINT_TAG_VIEWPORT
+        point.value.coordinate.x = UInt16(clamping: min(max(col, 0), max(Int(cols) - 1, 0)))
+        point.value.coordinate.y = UInt32(clamping: max(row, 0))
+        return point
+    }
+
+    /// Track a viewport cell. `nil` when libghostty rejects the point.
+    @MainActor
+    private func trackedRef(
+        _ terminal: GhosttyTerminal,
+        col: Int,
+        row: Int
+    ) -> GhosttyTrackedGridRef? {
+        guard row >= 0, row < Int(rows) else { return nil }
+        var ref: GhosttyTrackedGridRef?
+        guard
+            ghostty_terminal_grid_ref_track(terminal, viewportPoint(col: col, row: row), &ref)
+                == GHOSTTY_SUCCESS,
+            let ref
+        else { return nil }
+        return ref
+    }
+
+    /// Which screen the terminal is currently showing. Mirrors
+    /// `Terminal::active_screen` in `roost-vt`: anything other than the
+    /// alternate screen collapses to primary.
+    @MainActor
+    private func activeScreen(_ terminal: GhosttyTerminal) -> GhosttyTerminalScreen {
+        var out = GHOSTTY_TERMINAL_SCREEN_PRIMARY
+        guard
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &out)
+                == GHOSTTY_SUCCESS
+        else { return GHOSTTY_TERMINAL_SCREEN_PRIMARY }
+        return out == GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+            ? GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+            : GHOSTTY_TERMINAL_SCREEN_PRIMARY
+    }
+
+    /// Whether the refs still belong to the current terminal *and* the
+    /// screen they were taken on is the one on display. libghostty
+    /// resolves a ref against its own screen regardless of what is
+    /// displayed, so every read below is gated on this.
+    @MainActor
+    private func isResolvable(_ sel: CellSelection) -> Bool {
+        guard let terminal, sel.terminal == terminal else { return false }
+        return sel.screen == activeScreen(terminal)
+    }
+
+    /// Resolve a selection's endpoints into screen coordinates, or
+    /// `nil` when it currently names nothing: the terminal is gone or
+    /// is not the one that owns the refs, the owning screen is not
+    /// active, or the tracked content has been discarded.
+    @MainActor
+    private func resolvedEndpoints(_ sel: CellSelection) -> SelectionEndpoints? {
+        guard isResolvable(sel),
+              let anchor = trackedPoint(sel.anchor, tag: GHOSTTY_POINT_TAG_SCREEN),
+              let cursor = trackedPoint(sel.cursor, tag: GHOSTTY_POINT_TAG_SCREEN)
+        else { return nil }
+        return SelectionEndpoints(
+            anchorCol: Int(anchor.x),
+            anchorScreenY: anchor.y,
+            cursorCol: Int(cursor.x),
+            cursorScreenY: cursor.y,
+            committed: sel.committed
+        )
+    }
+
+    /// [`resolvedEndpoints`], filtered down to selections that should be
+    /// painted and copied.
+    @MainActor
+    private func visibleEndpoints(_ sel: CellSelection) -> SelectionEndpoints? {
+        guard let endpoints = resolvedEndpoints(sel), endpoints.isVisible else { return nil }
+        return endpoints
+    }
+
+    /// Resolve one tracked ref into `tag`'s coordinate space. `nil`
+    /// covers both "the content is gone" (`GHOSTTY_NO_VALUE`) and "it
+    /// has no representation in this space" — asking for `VIEWPORT`
+    /// while the row is scrolled out of view is the latter.
+    @MainActor
+    private func trackedPoint(
+        _ ref: GhosttyTrackedGridRef,
+        tag: GhosttyPointTag
+    ) -> GhosttyPointCoordinate? {
+        var out = GhosttyPointCoordinate()
+        guard ghostty_tracked_grid_ref_point(ref, tag, &out) == GHOSTTY_SUCCESS else { return nil }
+        return out
+    }
+
+    /// Whether a tracked endpoint currently sits inside the visible
+    /// viewport. Answered from the ref itself, so a pruned endpoint
+    /// reads as not visible rather than as some other row.
+    @MainActor
+    private func endpointVisible(_ sel: CellSelection, _ ref: GhosttyTrackedGridRef) -> Bool {
+        guard isResolvable(sel),
+              let point = trackedPoint(ref, tag: GHOSTTY_POINT_TAG_VIEWPORT)
+        else { return false }
+        return point.y < UInt32(rows)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1393,33 +1595,6 @@ final class TerminalView: NSView {
         return true
     }
 
-    /// Convert a viewport row (0-indexed from top of visible area) to
-    /// its `PointTag::Screen` y coordinate. Returns nil if the row is
-    /// out of range or libghostty rejects the conversion. Used by
-    /// `mouseDown` / `mouseDragged` to anchor selection in
-    /// scrollback-stable coordinates.
-    @MainActor
-    private func screenY(forViewportRow row: Int) -> UInt32? {
-        guard let terminal else { return nil }
-        guard row >= 0, row < Int(rows) else { return nil }
-        var pt = GhosttyPoint()
-        pt.tag = GHOSTTY_POINT_TAG_VIEWPORT
-        pt.value.coordinate.x = 0
-        pt.value.coordinate.y = UInt32(row)
-        var gref = GhosttyGridRef()
-        gref.size = MemoryLayout<GhosttyGridRef>.size
-        guard ghostty_terminal_grid_ref(terminal, pt, &gref) == GHOSTTY_SUCCESS else {
-            return nil
-        }
-        var out = GhosttyPointCoordinate()
-        guard
-            ghostty_terminal_point_from_grid_ref(
-                terminal, &gref, GHOSTTY_POINT_TAG_SCREEN, &out
-            ) == GHOSTTY_SUCCESS
-        else { return nil }
-        return out.y
-    }
-
     /// Convert a `PointTag::Screen` y coordinate back to its current
     /// viewport row. Returns nil if the row is currently outside the
     /// visible viewport (scrolled into history above or below), in
@@ -1488,7 +1663,10 @@ final class TerminalView: NSView {
         // highlight. Committed single-cell selections (Codex PR #177)
         // and real multi-cell selections persist until the next
         // mouseDown or `clearSelection()`.
-        if let sel = selection, !sel.isVisible {
+        // A selection that currently resolves to nothing (its screen is
+        // inactive, its rows were pruned) is left alone rather than
+        // cleared — it may become meaningful again.
+        if let sel = selection, let endpoints = resolvedEndpoints(sel), !endpoints.isVisible {
             selection = nil
             needsDisplay = true
             return
@@ -1602,8 +1780,8 @@ final class TerminalView: NSView {
     /// `selection.set` IPC op). Mirrors `mouseDown` + `mouseDragged`
     /// but with row/col passed in instead of computed from
     /// `NSEvent.locationInWindow`. Returns `false` and clears the
-    /// selection if either point can't convert to a stable screen-y
-    /// (out-of-range row, terminal not ready).
+    /// selection if either point can't be tracked (out-of-range row,
+    /// terminal not ready).
     @MainActor
     @discardableResult
     func setSelection(
@@ -1612,28 +1790,17 @@ final class TerminalView: NSView {
         cursorCol: Int,
         cursorRow: Int
     ) -> Bool {
-        guard let anchorY = screenY(forViewportRow: anchorRow),
-              let cursorY = screenY(forViewportRow: cursorRow)
-        else {
-            if selection != nil {
-                selection = nil
-                needsDisplay = true
-            }
-            return false
-        }
         // IPC-driven selections (`selection.set`, the click-count
         // dispatch from `handleClickCount`, the test-mode
         // `tab.expand_selection_at`) are deliberate commits — a
         // single-cell span must still paint + copy. Codex PR #177.
-        selection = CellSelection(
+        anchorSelection(
             anchorCol: anchorCol,
-            anchorScreenY: anchorY,
+            anchorRow: anchorRow,
             cursorCol: cursorCol,
-            cursorScreenY: cursorY,
+            cursorRow: cursorRow,
             committed: true
         )
-        needsDisplay = true
-        return true
     }
 
     /// Snapshot the current selection for the `selection.dump` IPC op.
@@ -1644,8 +1811,8 @@ final class TerminalView: NSView {
     func dumpSelection() -> SelectionDump? {
         guard let sel = selection else { return nil }
         let text = selectedPlainText()
-        let anchorVisible = viewportRow(forScreenY: sel.anchorScreenY) != nil
-        let cursorVisible = viewportRow(forScreenY: sel.cursorScreenY) != nil
+        let anchorVisible = endpointVisible(sel, sel.anchor)
+        let cursorVisible = endpointVisible(sel, sel.cursor)
         return SelectionDump(
             text: text,
             anchorVisible: anchorVisible,
@@ -1813,8 +1980,10 @@ final class TerminalView: NSView {
     /// `TerminalSelection::selected_text` in `roost-vt`.
     @MainActor
     private func selectedPlainText() -> String? {
-        guard let sel = selection, let terminal else { return nil }
-        let n = sel.normalized()
+        guard let sel = selection, let terminal, let endpoints = visibleEndpoints(sel) else {
+            return nil
+        }
+        let n = endpoints.normalized()
         let totalRowSpan = Int(n.endY &- n.startY)
         guard totalRowSpan > 0 else { return nil }
 
@@ -1829,19 +1998,16 @@ final class TerminalView: NSView {
             return text
         }
 
-        // Raw anchor/cursor cells: the formatter's range is inclusive on
-        // both ends, unlike `normalized()`'s half-open one, and it
-        // orders reversed endpoints itself. Columns are clamped because
-        // a column equal to `cols` has no cell to pin and libghostty
-        // would reject the whole selection — `setSelection` accepts
-        // IPC-supplied coordinates without validating the column.
-        let lastCol = max(Int(cols) - 1, 0)
+        // The tracked endpoints go straight to the formatter, which
+        // snapshots them itself: its range is inclusive on both ends,
+        // unlike `normalized()`'s half-open one, and it orders reversed
+        // endpoints via `Selection.order`. No column clamp is needed —
+        // a tracked ref only exists for a cell that was in range when it
+        // was created.
         let text = SelectionFormatter.text(
             terminal: terminal,
-            startCol: min(max(sel.anchorCol, 0), lastCol),
-            startScreenY: sel.anchorScreenY,
-            endCol: min(max(sel.cursorCol, 0), lastCol),
-            endScreenY: sel.cursorScreenY
+            start: sel.anchor,
+            end: sel.cursor
         )
         guard let text, !text.isEmpty else { return nil }
         return text
@@ -2855,13 +3021,15 @@ final class TerminalView: NSView {
         // Selection overlay (Phase 6a M5). Drawn last so it sits on
         // top of the glyph pass — translucent accent fill, no border.
         //
-        // Selection rows are stored in screen-y (scrollback-stable)
-        // space; resolve each to a viewport row before drawing so the
-        // highlight scrolls with the content. Rows currently outside
-        // the visible viewport are skipped — the rectangle "exits"
-        // off the top / bottom of the view as the user scrolls.
-        if let sel = selection, sel.isVisible {
-            let n = sel.normalized()
+        // Endpoints are tracked refs; resolving them gives screen rows,
+        // which are then mapped to viewport rows so the highlight
+        // scrolls with the content. Rows currently outside the visible
+        // viewport are skipped — the rectangle "exits" off the top /
+        // bottom of the view as the user scrolls. A selection that
+        // resolves to nothing (rows pruned, or its screen is not the
+        // active one) paints nothing at all.
+        if let sel = selection, let endpoints = visibleEndpoints(sel) {
+            let n = endpoints.normalized()
             let overlay = theme.selectionBackground.withAlphaComponent(0.6)
             overlay.setFill()
             let totalRowSpan = Int(n.endY - n.startY)

@@ -14,7 +14,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 
 use crate::sys;
-use crate::{Error, Result};
+use crate::{Error, Result, TrackedRef};
 
 // Compile-time guards on the `ColorRgb` <-> `GhosttyColorRgb` cast in
 // `set_color_palette`. If a bindgen regen ever changes the size or
@@ -93,12 +93,13 @@ pub enum PointTag {
     /// changes as the user scrolls.
     Viewport,
     /// Full screen including scrollback. 0 = top of scrollback, so a
-    /// screen row is stable only while nothing has been evicted from the
-    /// top: once `max_scrollback` saturates, every evicted row shifts all
-    /// stored screen coordinates down by one relative to the content they
-    /// named. Still the best space available for long-lived selection
-    /// endpoints — libghostty's tracked pins would fix the drift, but the
-    /// C API does not export them.
+    /// screen coordinate names a *position*, not a piece of content:
+    /// once `max_scrollback` saturates, every evicted row shifts all
+    /// stored screen coordinates down by one relative to the content
+    /// they named. Fine for a coordinate translated and used inside one
+    /// synchronous call; not a place to store a long-lived endpoint.
+    /// For that use [`Terminal::track`], whose refs libghostty rewrites
+    /// so they keep naming the same content on both axes.
     Screen,
     /// Scrollback history only — the area above the active region.
     /// 0 = top of scrollback.
@@ -107,7 +108,7 @@ pub enum PointTag {
 
 #[cfg(feature = "ffi")]
 impl PointTag {
-    fn to_sys(self) -> sys::GhosttyPointTag {
+    pub(crate) fn to_sys(self) -> sys::GhosttyPointTag {
         match self {
             PointTag::Active => sys::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
             PointTag::Viewport => sys::GhosttyPointTag_GHOSTTY_POINT_TAG_VIEWPORT,
@@ -158,6 +159,21 @@ impl Point {
     }
 }
 
+#[cfg(feature = "ffi")]
+impl Point {
+    pub(crate) fn to_sys(self) -> sys::GhosttyPoint {
+        sys::GhosttyPoint {
+            tag: self.tag.to_sys(),
+            value: sys::GhosttyPointValue {
+                coordinate: sys::GhosttyPointCoordinate {
+                    x: self.x,
+                    y: self.y,
+                },
+            },
+        }
+    }
+}
+
 /// Opaque reference to a position in the terminal's internal page
 /// structure, obtained via [`Terminal::grid_ref`].
 ///
@@ -171,17 +187,19 @@ impl Point {
 /// is changed."
 ///
 /// For long-lived position tracking (e.g. selection state), do not
-/// store `GridRef` directly. Convert to a [`Point`] with
-/// [`PointTag::Screen`] via [`Terminal::convert_point`] and store
-/// that — see [`PointTag::Screen`] for how far that stability actually
-/// goes (it ends when scrollback saturates and rows start being
-/// evicted).
+/// store `GridRef` directly — use [`Terminal::track`], whose
+/// [`crate::TrackedRef`] libghostty rewrites as the page list scrolls,
+/// prunes, and reflows.
 #[cfg(feature = "ffi")]
 #[derive(Debug, Clone, Copy)]
 pub struct GridRef(sys::GhosttyGridRef);
 
 #[cfg(feature = "ffi")]
 impl GridRef {
+    pub(crate) fn from_sys(raw: sys::GhosttyGridRef) -> Self {
+        Self(raw)
+    }
+
     /// Raw pin, for in-crate wrappers that hand it straight back to
     /// libghostty (see `formatter::selection_text`). Same transience
     /// contract as the type itself.
@@ -744,15 +762,7 @@ impl Terminal {
     /// terminal call. Prefer [`Self::convert_point`] for selection
     /// logic that needs a stable handle.
     pub fn grid_ref(&self, point: Point) -> Option<GridRef> {
-        let c_point = sys::GhosttyPoint {
-            tag: point.tag.to_sys(),
-            value: sys::GhosttyPointValue {
-                coordinate: sys::GhosttyPointCoordinate {
-                    x: point.x,
-                    y: point.y,
-                },
-            },
-        };
+        let c_point = point.to_sys();
         let mut out = sys::GhosttyGridRef {
             size: std::mem::size_of::<sys::GhosttyGridRef>(),
             node: std::ptr::null_mut(),
@@ -767,6 +777,35 @@ impl Terminal {
             return None;
         }
         Some(GridRef(out))
+    }
+
+    /// Capture an owned [`TrackedRef`] for `point` — a pin libghostty
+    /// keeps up to date as the page list scrolls, prunes, and reflows.
+    /// This is what selection endpoints are stored as; a raw
+    /// [`GridRef`] or a [`PointTag::Screen`] coordinate both go stale.
+    ///
+    /// Returns [`Error::InvalidValue`] when `point` names no cell (an
+    /// out-of-range row or column) and [`Error::OutOfMemory`] when the
+    /// allocation fails.
+    pub fn track(&self, point: Point) -> Result<TrackedRef> {
+        TrackedRef::new(self, point)
+    }
+
+    /// Grid width in cells, as libghostty currently has it. `None` if
+    /// the read fails — callers treat that as "don't clamp".
+    pub(crate) fn cols(&self) -> Option<u16> {
+        let mut out: u16 = 0;
+        // SAFETY: handle non-null; `out` is a `uint16_t` local, the type
+        // GHOSTTY_TERMINAL_DATA_COLS documents as its out parameter.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLS,
+                (&mut out) as *mut u16 as *mut _,
+            )
+        };
+        Error::from_result(rc).ok()?;
+        Some(out)
     }
 
     /// Resolve a [`GridRef`] back to a [`Point`] in the requested
