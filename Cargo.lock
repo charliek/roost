@@ -2776,6 +2776,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "roost-session"
+version = "0.0.18"
+dependencies = [
+ "anyhow",
+ "clap",
+ "getrandom 0.4.2",
+ "libc",
+ "roost-engine",
+ "roost-ipc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "roost-ui-model"
 version = "0.0.18"
 dependencies = [
