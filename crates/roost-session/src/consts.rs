@@ -7,15 +7,14 @@
 
 use std::time::Duration;
 
-/// Consumed-once hint naming the directory the user ran `roostctl
-/// session start` from.
+/// What this crate shares with whoever launches it: two constants and
+/// the timeout-scale reader.
 ///
-/// The daemon `chdir("/")`s before it does anything else, so the launch
-/// cwd cannot be recovered later — and it is what seeds the first
-/// project on a fresh state file. It travels as an env var because the
-/// fork happens before any IPC exists, and it is removed from the
-/// environment the instant it is read so no PTY can inherit it.
-pub const LAUNCH_CWD_ENV: &str = "ROOST_SESSION_LAUNCH_CWD";
+/// They are defined in `roost-ipc` because `roostctl` sets/reads them
+/// too, and a shell-integration binary must not depend on the engine to
+/// learn them. Re-exported here so this module stays the one place to
+/// look for a named constant.
+pub use roost_ipc::session_launch::{timeout_scale, LAUNCH_CWD_ENV, MAX_VERDICT_BYTES};
 
 /// `umask` the daemon installs before it creates anything. Everything
 /// downstream — state dir, log dir, `state.json`, crash reports, the
@@ -26,20 +25,6 @@ pub const PROCESS_UMASK: libc::mode_t = 0o077;
 /// The socket dir is `validate_runtime_dir`'s business and it enforces
 /// the same value.
 pub const OWNER_ONLY_DIR_MODE: u32 = 0o700;
-
-/// Multiplier applied to the budgets that wait on somebody else's work.
-///
-/// The same `ROOST_TEST_TIMEOUT_SCALE` the Python harness reads, honoured
-/// here so a loaded CI runner widens the daemon's own waits rather than
-/// only the driver's. Nonsense values (unparseable, zero, negative) fall
-/// back to 1.0: a bad env var must not be able to disarm a timeout.
-pub fn timeout_scale() -> f64 {
-    std::env::var("ROOST_TEST_TIMEOUT_SCALE")
-        .ok()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .filter(|factor| factor.is_finite() && *factor > 0.0)
-        .unwrap_or(1.0)
-}
 
 /// Base budget for [`parent_ready_timeout`].
 const PARENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -59,11 +44,6 @@ const PARENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn parent_ready_timeout() -> Duration {
     PARENT_READY_TIMEOUT.mul_f64(timeout_scale())
 }
-
-/// Cap on the readiness frame the parent will buffer. A verdict line is
-/// tens of bytes; anything past this is a child writing garbage down the
-/// pipe, and the parent stops rather than growing without bound.
-pub const MAX_VERDICT_BYTES: usize = 8 * 1024;
 
 /// `(cols, rows)` every tab this session opens defaults to.
 ///

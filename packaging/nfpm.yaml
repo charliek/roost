@@ -95,6 +95,10 @@ contents:
     dst: /usr/bin/roost
   - src: ./dist/roostctl
     dst: /usr/bin/roostctl
+  # roost-session lands beside roostctl on purpose: `roostctl session
+  # start` looks for a sibling before it looks at $PATH.
+  - src: ./dist/roost-session
+    dst: /usr/bin/roost-session
   - src: ./packaging/roost.desktop
     dst: /usr/share/applications/ai.stridelabs.Roost.desktop
   # roost-gtk-alias.desktop: NoDisplay compat shim so v0.0.17-era launcher

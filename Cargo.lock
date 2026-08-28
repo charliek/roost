@@ -2696,6 +2696,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "libc",
  "roost-agent",
  "roost-ipc",
  "serde",

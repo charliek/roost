@@ -140,6 +140,7 @@ dpkg-deb -x "${deb}" "${payload}"
 expect_exec=(
   usr/bin/roost
   usr/bin/roostctl
+  usr/bin/roost-session
 )
 expect_file=(
   usr/share/applications/ai.stridelabs.Roost.desktop

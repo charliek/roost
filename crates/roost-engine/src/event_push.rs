@@ -47,20 +47,6 @@ pub const DEFAULT_PUSH_CAPACITY: usize = crate::workspace::EVENT_CHANNEL_CAPACIT
 /// Base budget for [`PushLimits::stall`].
 const DEFAULT_PUSH_STALL: Duration = Duration::from_secs(30);
 
-/// Multiplier applied to the push stall budget.
-///
-/// The same `ROOST_TEST_TIMEOUT_SCALE` the Python harness and
-/// `roost-session` read, honoured here so a loaded CI runner widens the
-/// budget rather than dropping subscribers under its own load. Nonsense
-/// values fall back to 1.0 — a bad env var must not disarm a timeout.
-fn timeout_scale() -> f64 {
-    std::env::var("ROOST_TEST_TIMEOUT_SCALE")
-        .ok()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .filter(|factor| factor.is_finite() && *factor > 0.0)
-        .unwrap_or(1.0)
-}
-
 /// The two bounds on one subscriber's delivery.
 ///
 /// Injectable so a test can force the overflow branch deterministically
@@ -85,7 +71,7 @@ impl Default for PushLimits {
     fn default() -> Self {
         Self {
             capacity: DEFAULT_PUSH_CAPACITY,
-            stall: DEFAULT_PUSH_STALL.mul_f64(timeout_scale()),
+            stall: DEFAULT_PUSH_STALL.mul_f64(roost_ipc::session_launch::timeout_scale()),
         }
     }
 }
