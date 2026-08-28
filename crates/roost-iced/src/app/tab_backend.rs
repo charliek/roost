@@ -49,8 +49,9 @@ pub(super) enum ReplyPolicy {
 /// Who scans a tab's byte stream for OSC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OscScanMode {
-    /// This tab's own drain scans, answers color queries off its state,
-    /// and hands the remaining actions up with the bytes.
+    /// This tab's own drain scans, tracks color state, and hands the
+    /// non-reply actions up with the bytes (query replies are
+    /// libghostty's job since the plan-032 pin).
     Scanned,
     // HS-2: the host server scans and reports effects as events, so the
     // client must not run a second router over the same bytes.
@@ -128,9 +129,8 @@ impl InProcessBackend {
         let capture = self.test_mode.then(|| Arc::new(Mutex::new(Vec::new())));
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
         // The OSC opt-in: this session's forwarding task owns the sole
-        // router for the tab and answers color queries straight off the
-        // drain. The UI keeps no router of its own — a second one would
-        // double every reply.
+        // router for the tab. The UI keeps no router of its own — a
+        // second one would double every scanned action.
         let session = TabSession::attach_scanned(
             Arc::clone(&self.supervisor),
             key.tab,
@@ -249,17 +249,6 @@ mod tests {
 
     const TEST_SOCKET: &str = "/tmp/roost-iced-tab-backend-test.sock";
 
-    /// What the drain answers an `OSC 11` background query with — the
-    /// wire form `roost_osc` writes, so a test can name the exact bytes
-    /// a reseed is supposed to move.
-    fn background_reply(theme: &Theme) -> String {
-        let bg = theme.background;
-        format!(
-            "\x1b]11;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
-            bg.r, bg.r, bg.g, bg.g, bg.b, bg.b
-        )
-    }
-
     /// A backend with one live PTY running `argv`, plus a handle attached
     /// to it, the feed its forwarder writes to, and the supervisor the
     /// caller closes the tab with.
@@ -314,15 +303,6 @@ mod tests {
             .lock()
             .expect("capture lock")
             .clone()
-    }
-
-    fn clear_captured(handle: &TabHandle) {
-        handle
-            .capture()
-            .expect("test-mode input capture")
-            .lock()
-            .expect("capture lock")
-            .clear();
     }
 
     /// The policy surface the seam exists to carry: the in-process
@@ -408,37 +388,48 @@ mod tests {
         supervisor.close(8_604);
     }
 
-    /// `scan_osc` runs the drain's router — the injected query is
-    /// answered onto the input side — and `reseed_theme` is what moves
-    /// the state those answers come from.
+    /// `scan_osc` runs the drain's real router: a color query is silent
+    /// (libghostty owns query replies since the plan-032 pin — the
+    /// drain enqueues nothing, mirroring
+    /// `osc_drain_reply_test::a_color_query_is_not_answered_by_the_drain`)
+    /// while non-reply actions survive, and `reseed_theme` reaches the
+    /// same shared state without disturbing the scan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scan_osc_answers_from_the_color_state_reseed_theme_moves() {
-        let seeded = Theme::roost_dark_fallback();
+    async fn scan_osc_runs_the_router_and_reseed_theme_does_not_disturb_it() {
         let (_backend, handle, _feed, supervisor) = cat(8_605);
-        let actions = handle.scan_osc(b"\x1b]11;?\x07");
-        assert!(
-            actions.is_empty(),
-            "a color query produces a reply, not an action: {actions:?}"
-        );
+        let actions = handle.scan_osc(b"\x1b]11;?\x07\x1b]0;title\x07");
         assert_eq!(
-            String::from_utf8_lossy(&captured(&handle)),
-            background_reply(&seeded),
-            "the query was answered from the seeded color state"
+            actions,
+            vec![OscAction::Workspace {
+                command: 0,
+                payload: "title".into(),
+            }],
+            "the query produces nothing; the title action survives"
+        );
+        assert!(
+            captured(&handle).is_empty(),
+            "the drain must not answer a color query — libghostty does"
         );
 
-        clear_captured(&handle);
-        let mut recolored = seeded.clone();
+        let mut recolored = Theme::roost_dark_fallback();
         recolored.background = roost_vt::ColorRgb {
             r: 0xfa,
             g: 0xce,
             b: 0x0d,
         };
         handle.reseed_theme(super::terminal_tab::theme_osc_colors(&recolored));
-        handle.scan_osc(b"\x1b]11;?\x07");
+        let actions = handle.scan_osc(b"\x1b]11;?\x07\x1b]0;after-reseed\x07");
         assert_eq!(
-            String::from_utf8_lossy(&captured(&handle)),
-            background_reply(&recolored),
-            "reseed_theme never reached the drain's color state"
+            actions,
+            vec![OscAction::Workspace {
+                command: 0,
+                payload: "after-reseed".into(),
+            }],
+            "reseed_theme shares the scan's lock without wedging it"
+        );
+        assert!(
+            captured(&handle).is_empty(),
+            "reseed must not resurrect drain-side query replies"
         );
         drop(handle);
         supervisor.close(8_605);
