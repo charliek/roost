@@ -23,6 +23,7 @@ fn hyperlink_at_reads_osc8_span() {
         cols: 40,
         rows: 5,
         max_scrollback: 100,
+        ..Default::default()
     })
     .expect("Terminal::new");
     // OSC 8 wraps the span "link" with explicit URI.
@@ -57,6 +58,7 @@ fn hyperlink_at_returns_none_for_plain_text() {
         cols: 40,
         rows: 5,
         max_scrollback: 100,
+        ..Default::default()
     })
     .expect("Terminal::new");
     term.vt_write(b"https://example.com");
@@ -77,6 +79,7 @@ fn hyperlink_at_rejects_out_of_range_cells() {
         cols: 10,
         rows: 3,
         max_scrollback: 0,
+        ..Default::default()
     })
     .expect("Terminal::new");
     term.vt_write(b"\x1b]8;;https://x.test\x1b\\hi\x1b]8;;\x1b\\");

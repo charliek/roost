@@ -28,9 +28,10 @@ const _: () = assert!(
 );
 
 /// Construction parameters for a new terminal. `cols`/`rows` go to
-/// `ghostty_terminal_new`; `max_scrollback` is a separate
-/// `ghostty_terminal_set` the constructor applies right after (upstream
-/// retired the options struct that used to carry all three).
+/// `ghostty_terminal_new`; `max_scrollback` and `continuation_max_bytes`
+/// are separate `ghostty_terminal_set` calls the constructor applies
+/// right after (upstream retired the options struct that used to carry
+/// the sizing and scrollback fields together).
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalOptions {
     pub cols: u16,
@@ -38,6 +39,26 @@ pub struct TerminalOptions {
     /// Number of rows of off-screen scrollback to retain. Both UIs
     /// use 2000.
     pub max_scrollback: usize,
+    /// Byte cap on the replay-safe VT continuation libghostty retains
+    /// for an escape sequence or UTF-8 codepoint left unfinished by the
+    /// most recent write. `0` disables tracking (the libghostty
+    /// default). Only a terminal that had tracking enabled *before* the
+    /// input that left it unfinished can be snapshotted from a
+    /// non-ground state, so this is a construction-time knob; see
+    /// [`Terminal::set_continuation_max_bytes`] for the post-hoc setter
+    /// and its caveats.
+    pub continuation_max_bytes: usize,
+}
+
+impl Default for TerminalOptions {
+    fn default() -> Self {
+        Self {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+            continuation_max_bytes: 0,
+        }
+    }
 }
 
 /// Tag for `Terminal::scroll_viewport`. Mirrors the C-side
@@ -80,6 +101,20 @@ impl Scrollbar {
 pub enum ActiveScreen {
     Primary,
     Alternate,
+}
+
+#[cfg(feature = "ffi")]
+impl ActiveScreen {
+    /// Map a `GhosttyTerminalScreen`. Anything other than the alternate
+    /// screen — including a variant a future Ghostty adds — collapses to
+    /// primary, which is the safer fallback for every caller.
+    pub(crate) fn from_sys(raw: sys::GhosttyTerminalScreen) -> Self {
+        if raw == sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_ALTERNATE {
+            Self::Alternate
+        } else {
+            Self::Primary
+        }
+    }
 }
 
 /// Which coordinate space a [`Point`] is interpreted in. Mirrors
@@ -282,7 +317,7 @@ impl Terminal {
         }
         // Construct the RAII owner *before* configuring scrollback so a
         // failed `set` frees the terminal instead of leaking it.
-        let terminal = Self {
+        let mut terminal = Self {
             handle,
             write_pty_buffer: None,
             _not_sync: PhantomData,
@@ -314,7 +349,75 @@ impl Terminal {
             )
         };
         Error::from_result(rc)?;
+        // Always applied, including `0`, for the same reason as the
+        // scrollback limit above: leaving the `set` out would take
+        // libghostty's own default rather than the caller's choice.
+        terminal.set_continuation_max_bytes(options.continuation_max_bytes)?;
         Ok(terminal)
+    }
+
+    /// Adopt a terminal handle produced by
+    /// `ghostty_snapshot_decoder_ready` (`snapshot.h:423-460`), which
+    /// hands back a **caller-owned** terminal that the decoder then
+    /// borrows while it restores history.
+    ///
+    /// # Safety
+    ///
+    /// * `handle` must be non-null and must come from a `GHOSTTY_SUCCESS`
+    ///   return of `ghostty_snapshot_decoder_ready`.
+    /// * Ownership transfers here and must be unique: nothing else may
+    ///   free the handle, and no second `Terminal` may wrap it.
+    /// * The decoder that produced the handle borrows it until FINISH or
+    ///   until it is freed, so that decoder must be freed **before** this
+    ///   `Terminal` is dropped. [`crate::SnapshotDecoder`]'s `Drop` and
+    ///   its `finish`/`abandon` paths are what guarantee that ordering.
+    pub(crate) unsafe fn from_decoded(handle: sys::GhosttyTerminal) -> Self {
+        Self {
+            handle,
+            write_pty_buffer: None,
+            _not_sync: PhantomData,
+        }
+    }
+
+    /// Set the byte cap on retained VT continuation bytes; `0` disables
+    /// tracking. HS-1's decode path needs this to zero tracking after a
+    /// continuation export (`snapshot.h`'s cleanup rule for
+    /// `RETAIN_CONTINUATION`).
+    ///
+    /// Raising tracking while the parser is already unfinished — or
+    /// lowering the cap below an already-retained continuation — makes
+    /// the *current* continuation unavailable, because the earlier bytes
+    /// were never recorded. Tracking recovers on the next write that
+    /// reaches ground. Prefer [`TerminalOptions::continuation_max_bytes`]
+    /// when the terminal is yours to construct.
+    pub fn set_continuation_max_bytes(&mut self, max_bytes: usize) -> Result<()> {
+        // SAFETY: handle non-null; `max_bytes` is a live local of the
+        // `size_t` type this option documents.
+        let rc = unsafe {
+            sys::ghostty_terminal_set(
+                self.handle,
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
+                (&raw const max_bytes).cast(),
+            )
+        };
+        Error::from_result(rc)
+    }
+
+    /// Read back the configured continuation byte cap. `0` means
+    /// tracking is disabled.
+    pub fn continuation_max_bytes(&self) -> Result<usize> {
+        let mut out: usize = 0;
+        // SAFETY: handle non-null; `out` is a real local of the `size_t`
+        // type this data key documents.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CONTINUATION_MAX_BYTES,
+                (&mut out) as *mut usize as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        Ok(out)
     }
 
     /// Raw FFI handle. Pass-through for crates that need to call a
@@ -595,13 +698,7 @@ impl Terminal {
         if Error::from_result(rc).is_err() {
             return ActiveScreen::Primary;
         }
-        // Anything other than the alternate screen collapses to primary;
-        // safer fallback for the scroll handler.
-        if out == sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_ALTERNATE {
-            ActiveScreen::Alternate
-        } else {
-            ActiveScreen::Primary
-        }
+        ActiveScreen::from_sys(out)
     }
 
     /// True if the app has enabled any mouse-tracking mode (X10 /

@@ -15,6 +15,7 @@ fn sized_terminal(max_scrollback: usize) -> (Terminal, RenderState) {
             cols: COLS,
             rows: ROWS,
             max_scrollback,
+            ..Default::default()
         })
         .expect("terminal"),
         RenderState::new().expect("render state"),
@@ -298,6 +299,7 @@ fn eviction_terminal() -> (Terminal, RenderState) {
             cols: EVICT_COLS,
             rows: ROWS,
             max_scrollback: EVICT_SCROLLBACK,
+            ..Default::default()
         })
         .expect("terminal"),
         RenderState::new().expect("render state"),

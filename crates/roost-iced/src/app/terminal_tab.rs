@@ -312,6 +312,7 @@ impl TerminalTab {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             max_scrollback: 2_000,
+            continuation_max_bytes: 0,
         })?;
         terminal.set_color_foreground(theme.foreground)?;
         terminal.set_color_background(theme.background)?;

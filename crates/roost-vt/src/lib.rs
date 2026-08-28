@@ -85,6 +85,12 @@ pub enum Error {
     Rejected,
     #[error("libghostty-vt returned non-UTF-8 text")]
     InvalidUtf8,
+    /// A wrapper-level API was called out of order — e.g.
+    /// `SnapshotDecoder::finish` before the stream reached FINISH.
+    /// Purely wrapper-side: no FFI call was made, so nothing was
+    /// consumed and nothing was poisoned.
+    #[error("wrapper misuse: {0}")]
+    Lifecycle(&'static str),
     #[error("libghostty-vt returned error code {0}")]
     Other(i32),
 }
@@ -131,6 +137,8 @@ mod scroll;
 #[cfg(feature = "ffi")]
 mod selection;
 #[cfg(feature = "ffi")]
+mod snapshot;
+#[cfg(feature = "ffi")]
 mod terminal;
 #[cfg(feature = "ffi")]
 mod tracked_ref;
@@ -151,6 +159,10 @@ pub use render_state::{
 pub use scroll::{PageDirection, PageRoute, ScrollDirection, ScrollRoute, TerminalScroll};
 #[cfg(feature = "ffi")]
 pub use selection::{RowTextProjection, SelectionSnapshot, SelectionSpan, TerminalSelection};
+#[cfg(feature = "ffi")]
+pub use snapshot::{
+    DecodedTerminal, HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder,
+};
 #[cfg(feature = "ffi")]
 pub use terminal::{
     ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Scrollbar, Terminal, TerminalOptions,
@@ -180,6 +192,7 @@ pub fn vt_smoke() -> Result<()> {
         cols: 80,
         rows: 24,
         max_scrollback: 0,
+        ..Default::default()
     })?;
     term.vt_write(b"hello\r\n");
     let mut rs = RenderState::new()?;

@@ -11,6 +11,18 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Terminal snapshot encode + decode in `roost-vt`** — `Terminal::snapshot()`
+  serializes a live terminal to libghostty's snapshot byte stream, and
+  `SnapshotDecoder` restores one: buffered in a single call, or progressively,
+  handing back a renderable, typeable terminal as soon as the stream's READY
+  marker arrives and prepending scrollback pages as more bytes land. The
+  wrapper owns its buffering and enforces its own size caps, so incomplete
+  or over-limit input is refused before it reaches libghostty (corrupt
+  payloads remain libghostty's per-record CRC check to reject). Groundwork
+  for host sessions (#363); nothing in either UI consumes it yet.
+
 ### Removed
 
 - **The GTK UI is gone** — `crates/roost-linux` (gtk4-rs + libadwaita) has been

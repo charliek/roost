@@ -14,6 +14,7 @@ fn fresh(cols: u16, rows: u16) -> (Terminal, RenderState) {
         cols,
         rows,
         max_scrollback: 500,
+        ..Default::default()
     })
     .expect("Terminal::new");
     (t, RenderState::new().expect("RenderState::new"))

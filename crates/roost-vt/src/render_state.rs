@@ -900,6 +900,7 @@ mod tests {
             cols: 80,
             rows: 24,
             max_scrollback: 100,
+            ..Default::default()
         })
         .expect("Terminal::new");
         // ASCII "hello" — exactly 5 visible cells at columns 0..5 on row 0.
@@ -953,6 +954,7 @@ mod tests {
             cols: 80,
             rows: 24,
             max_scrollback: 100,
+            ..Default::default()
         })
         .expect("Terminal::new");
         // CSI 7m = inverse on, CSI 1m = bold on (combined), reset, then Y.
@@ -1043,6 +1045,7 @@ mod tests {
             cols: 20,
             rows: 5,
             max_scrollback: 10,
+            ..Default::default()
         })
         .expect("Terminal::new");
         let mut render_state = RenderState::new().expect("RenderState::new");

@@ -60,7 +60,7 @@ frames.
 | `roost-engine` | Seq numbers on `PtyOutputEvent` (HS-0). New feature `server-vt`: per-tab authoritative Terminal + the tab pipeline below (HS-1). Daemonization helper. No default-build dependency on the ghostty archive. |
 | `roost-ipc` | `Session` bundle-profile kind (socket/state/log paths). Same-UID peer check (`SO_PEERCRED`/`getpeereid`) enabled for the session profile. Attach handshake + protocol-version types. Real `events.subscribe` (connection flips to push mode). Binary data-plane framing module. |
 | `roost-session` (new crate, bin) | `main`: daemonize → locks → engine headless bootstrap (the `tests/ipc_dispatch.rs` pattern) → serve. Owns nothing the engine doesn't already own; it is packaging + lifecycle + the `server-vt` wiring. |
-| `roost-vt` | Snapshot wrapper over `ghostty_snapshot_encode_alloc` / the incremental decoder (post-plan-032). Client-side record-boundary buffering (§5). Reply-drain policy hook (§6). |
+| `roost-vt` | Snapshot wrapper **(shipped: plan 034, PR #371)** — `Terminal::snapshot()` over `ghostty_snapshot_encode` (Vec-writer trampoline; `_encode_alloc` considered and rejected) + the streaming `SnapshotDecoder` with client-side record-boundary buffering (§5). Reply-drain policy hook (§6) still to come. |
 | `roost-iced` | `TabBackend` seam (HS-0). `HostConn` client, new `EngineFeed` pump for host events, Hosts sidebar section, connect/disconnect/stop flows (HS-2). |
 | `roost-cli` | Target rules for two sockets; `roostctl session …` verbs (start/stop/status) as thin ops. |
 
@@ -337,6 +337,15 @@ install — expected behavior, stated in the connect UI.
 
 ## 5. Client-side decode (roost-vt wrapper)
 
+**Shipped:** the wrapper this section specifies now exists as
+`crates/roost-vt/src/snapshot.rs` (plan 034, PR #371) — envelope +
+record-header framing for boundaries only, `decoder_ready`/
+`decoder_next` gated on a fully buffered record, and wrapper-enforced
+hard caps on *size* only (total bytes, single-record bytes,
+continuation bytes); decode *time* is not capped by the wrapper and
+stays the consumer's watchdog, as below. What follows is the
+specification the wrapper was built to.
+
 The Ghostty decoder's `GhosttyReader` is synchronous and
 blocking-only (zero-byte read = EOF, never "would block"), the
 decoder may retain borrowed input until FINISH, and the client
@@ -350,10 +359,11 @@ under the decoder's feet):
   (`tag u16 | len u32 | crc u32 | payload` — documented layout)
   purely to find boundaries; semantic validation stays with the
   decoder, but the wrapper enforces its own hard caps — total
-  snapshot bytes, single-record size, continuation bytes, decode
-  time — because the 1 MiB transport frame limit does not bound an
-  accumulated record. EOF before FINISH is desync even if no ERROR
-  frame arrived.
+  snapshot bytes, single-record size, continuation bytes — because
+  the 1 MiB transport frame limit does not bound an accumulated
+  record. (Decode *time* is the consumer's watchdog — the wrapper
+  caps size only, matching the shipped code.) EOF before FINISH is
+  desync even if no ERROR frame arrived.
 - `decoder_ready()` is called only once the buffer contains the
   complete prefix through the READY record; `decoder_next()` only
   when the next full record is buffered. Reads always complete from
@@ -591,7 +601,10 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 
 - **Rust unit tier** (repo convention, `_test.rs` under `tests/`):
   the §5 record-boundary buffering (split headers, partial records,
-  truncated CRC); fence assignment on the tab task (including the
+  truncated CRC) — shipped as plan 034's
+  `crates/roost-vt/tests/snapshot_test.rs` battery (fragmentation
+  down to 1-byte feeds, corruption/truncation, caps, continuation
+  round-trips); fence assignment on the tab task (including the
   HS-0→HS-1 seq relocation — a test pins fence semantics across the
   move); the resize-withhold state machine; **exactly-once replies**
   (DA/DSR/color query answered once by the server, client reply

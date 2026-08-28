@@ -17,6 +17,7 @@ fn term() -> Terminal {
         cols: 80,
         rows: 24,
         max_scrollback: 0,
+        ..Default::default()
     })
     .expect("Terminal::new")
 }

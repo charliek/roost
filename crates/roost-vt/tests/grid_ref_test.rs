@@ -23,6 +23,7 @@ fn small_terminal() -> Terminal {
         cols: 20,
         rows: 5,
         max_scrollback: 10,
+        ..Default::default()
     })
     .expect("terminal")
 }
