@@ -1,4 +1,4 @@
-//! Selection text extraction via `ghostty_formatter_*`.
+//! Selection text extraction via `ghostty_terminal_selection_format_alloc`.
 //!
 //! The formatter is the only libghostty API that can read cells outside
 //! the viewport, so it — not the render state — is what makes a
@@ -10,18 +10,18 @@
 //! and libghostty resolves a selection's endpoints with an unchecked
 //! `pointFromPin(...).?` (`Selection.order`). The archive is built
 //! `-Doptimize=ReleaseFast`, where that null unwrap is undefined
-//! behavior rather than a panic. Any mutating terminal call — `vt_write`,
-//! `resize`, `reset`, an alt-screen switch — landing between the pin and
-//! the format is enough to trigger it.
+//! behavior rather than a panic. Upstream codifies this as an unchecked
+//! precondition rather than validating it, so any mutating terminal call
+//! — `vt_write`, `resize`, `reset`, an alt-screen switch — landing
+//! between the pin and the format is enough to trigger it.
 //!
 //! [`selection_text`] therefore pins, formats, and frees inside a single
-//! synchronous call holding `&Terminal`. No `GridRef` and no formatter
-//! handle escapes it, which makes the hazardous interleaving
-//! unrepresentable instead of merely documented. Selection endpoints
-//! live outside as [`crate::TrackedRef`]s, which libghostty keeps
-//! current; snapshotting them into raw pins happens *here*, immediately
-//! before the `GhosttySelection` is built, and the pins die with the
-//! call.
+//! synchronous call holding `&Terminal`. No `GridRef` escapes it, which
+//! makes the hazardous interleaving unrepresentable instead of merely
+//! documented. Selection endpoints live outside as [`crate::TrackedRef`]s,
+//! which libghostty keeps current; snapshotting them into raw pins
+//! happens *here*, immediately before the `GhosttySelection` is built,
+//! and the pins die with the call.
 
 use std::ptr;
 
@@ -44,19 +44,8 @@ use crate::{Error, Result, Terminal, TrackedRef};
 /// the Mac and Linux UIs copy differently.
 pub const UNWRAP_SOFT_WRAPPED_LINES: bool = true;
 
-/// RAII owner of a `GhosttyFormatter` handle. Private so a formatter can
-/// never be stored across a terminal mutation (see the module docs).
-struct Formatter(sys::GhosttyFormatter);
-
-impl Drop for Formatter {
-    fn drop(&mut self) {
-        // SAFETY: handle came from a successful
-        // `ghostty_formatter_terminal_new` and is freed exactly once.
-        unsafe { sys::ghostty_formatter_free(self.0) };
-    }
-}
-
-/// RAII owner of the buffer `ghostty_formatter_format_alloc` returns.
+/// RAII owner of the buffer
+/// `ghostty_terminal_selection_format_alloc` returns.
 struct FormatterBuf {
     ptr: *mut u8,
     len: usize,
@@ -64,8 +53,9 @@ struct FormatterBuf {
 
 impl Drop for FormatterBuf {
     fn drop(&mut self) {
-        // SAFETY: allocated by `format_alloc` with the default allocator,
-        // so it is freed with the same (null) allocator and its exact len.
+        // SAFETY: allocated by `selection_format_alloc` with the default
+        // allocator, so it is freed with the same (null) allocator and
+        // its exact len, as that call's contract requires.
         unsafe { sys::ghostty_free(ptr::null(), self.ptr, self.len) };
     }
 }
@@ -90,8 +80,8 @@ pub(crate) fn selection_text(
     end: &TrackedRef,
 ) -> Result<Option<String>> {
     // Snapshot here, not in the caller: the pins are only valid until
-    // the terminal's next update, and nothing between this line and
-    // `ghostty_formatter_free` touches the terminal.
+    // the terminal's next update, and nothing between this line and the
+    // one `selection_format_alloc` call touches the terminal.
     let (Some(start_ref), Some(end_ref)) = (start.snapshot(terminal)?, end.snapshot(terminal)?)
     else {
         return Ok(None);
@@ -103,8 +93,8 @@ pub(crate) fn selection_text(
         end: end_ref.as_sys(),
         rectangle: false,
     };
-    let options = sys::GhosttyFormatterTerminalOptions {
-        size: std::mem::size_of::<sys::GhosttyFormatterTerminalOptions>(),
+    let options = sys::GhosttyTerminalSelectionFormatOptions {
+        size: std::mem::size_of::<sys::GhosttyTerminalSelectionFormatOptions>(),
         emit: sys::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN,
         unwrap: UNWRAP_SOFT_WRAPPED_LINES,
         // Roost does want trailing spaces gone, but not libghostty's
@@ -116,36 +106,25 @@ pub(crate) fn selection_text(
         // way. `false` also happens to be bindgen's zeroed default;
         // it is set explicitly because libghostty's own default is `true`.
         trim: false,
-        // Ignored for PLAIN, but every `size` still has to be right.
-        extra: sys::GhosttyFormatterTerminalExtra {
-            size: std::mem::size_of::<sys::GhosttyFormatterTerminalExtra>(),
-            screen: sys::GhosttyFormatterScreenExtra {
-                size: std::mem::size_of::<sys::GhosttyFormatterScreenExtra>(),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+        // Non-null, so the terminal's own active selection is not
+        // consulted and `GHOSTTY_NO_VALUE` cannot come back for a missing
+        // one.
         selection: &selection,
     };
 
-    let mut handle: sys::GhosttyFormatter = ptr::null_mut();
-    // SAFETY: default allocator, an out-pointer we own, a live terminal
-    // handle, and an options struct that outlives the call (libghostty
-    // copies the selection into the formatter).
-    let rc = unsafe {
-        sys::ghostty_formatter_terminal_new(ptr::null(), &mut handle, terminal.handle(), options)
-    };
-    Error::from_result(rc)?;
-    if handle.is_null() {
-        return Err(Error::NullHandle);
-    }
-    let formatter = Formatter(handle);
-
     let mut out_ptr: *mut u8 = ptr::null_mut();
     let mut out_len: usize = 0;
-    // SAFETY: formatter handle is live; both out params are stack locals.
+    // SAFETY: a live terminal handle, the default allocator (null — the
+    // same one `FormatterBuf` frees with), an options struct whose
+    // `selection` pointer outlives the call, and two stack out-params.
     let rc = unsafe {
-        sys::ghostty_formatter_format_alloc(formatter.0, ptr::null(), &mut out_ptr, &mut out_len)
+        sys::ghostty_terminal_selection_format_alloc(
+            terminal.handle(),
+            ptr::null(),
+            options,
+            &mut out_ptr,
+            &mut out_len,
+        )
     };
     Error::from_result(rc)?;
     if out_ptr.is_null() {

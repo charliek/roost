@@ -685,19 +685,20 @@ fn assert_copies_as(input: &str, expected: &str) {
 /// The formatter structs are sized structs: libghostty reads the `size`
 /// field we set but never validates it, so a layout change in a Ghostty
 /// bump would be misread silently. Pin the sizes instead.
+///
+/// Only the structs `formatter.rs` actually fills in are pinned — the
+/// one-shot `ghostty_terminal_selection_format_alloc` adoption retired
+/// `GhosttyFormatterTerminal{Options,Extra}` and
+/// `GhosttyFormatterScreenExtra` from Roost's call path, so pinning them
+/// would fail on upstream churn Roost is no longer exposed to.
 #[test]
 fn formatter_struct_layouts_are_pinned() {
     use std::mem::size_of;
 
     assert_eq!(size_of::<roost_vt::ffi::GhosttyGridRef>(), 24);
     assert_eq!(size_of::<roost_vt::ffi::GhosttySelection>(), 64);
-    assert_eq!(size_of::<roost_vt::ffi::GhosttyFormatterScreenExtra>(), 16);
     assert_eq!(
-        size_of::<roost_vt::ffi::GhosttyFormatterTerminalExtra>(),
-        32
-    );
-    assert_eq!(
-        size_of::<roost_vt::ffi::GhosttyFormatterTerminalOptions>(),
-        56
+        size_of::<roost_vt::ffi::GhosttyTerminalSelectionFormatOptions>(),
+        24
     );
 }

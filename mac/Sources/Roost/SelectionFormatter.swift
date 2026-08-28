@@ -1,4 +1,4 @@
-// Selection text extraction via `ghostty_formatter_*`.
+// Selection text extraction via `ghostty_terminal_selection_format_alloc`.
 //
 // The formatter is the only libghostty API that can read cells outside
 // the viewport, so it — not the render state — is what makes a
@@ -12,17 +12,18 @@
 // and libghostty resolves a selection's endpoints with an unchecked
 // `pointFromPin(...).?` (`Selection.order`). The archive is built
 // `-Doptimize=ReleaseFast`, where that null unwrap is undefined
-// behavior rather than a panic. Any mutating terminal call —
-// `vt_write`, `resize`, `reset`, an alt-screen switch — landing between
-// the pin and the format is enough to trigger it.
+// behavior rather than a panic. Upstream codifies this as an unchecked
+// precondition rather than validating it, so any mutating terminal call
+// — `vt_write`, `resize`, `reset`, an alt-screen switch — landing
+// between the pin and the format is enough to trigger it.
 //
 // `SelectionFormatter.text` therefore pins, formats, and frees inside a
-// single synchronous call. No grid ref and no formatter handle escapes
-// it, which makes the hazardous interleaving unrepresentable instead of
-// merely documented. Selection endpoints live outside as libghostty
-// *tracked* refs, which the engine keeps current; snapshotting them into
-// raw pins happens here, immediately before the `GhosttySelection` is
-// built, and the pins die with the call.
+// single synchronous call. No grid ref escapes it, which makes the
+// hazardous interleaving unrepresentable instead of merely documented.
+// Selection endpoints live outside as libghostty *tracked* refs, which
+// the engine keeps current; snapshotting them into raw pins happens
+// here, immediately before the `GhosttySelection` is built, and the pins
+// die with the call.
 
 import CGhosttyVT
 import Foundation
@@ -73,12 +74,12 @@ enum SelectionFormatter {
         selection.end = endRef
         selection.rectangle = false
 
-        // libghostty copies the selection into the formatter, so the
-        // pointer only has to outlive `ghostty_formatter_terminal_new`
-        // — but it is kept valid for the whole body anyway.
+        // The selection pointer only has to outlive the one
+        // `ghostty_terminal_selection_format_alloc` call, but it is kept
+        // valid for the whole body anyway.
         return withUnsafePointer(to: &selection) { selectionPtr -> String? in
-            var options = GhosttyFormatterTerminalOptions()
-            options.size = MemoryLayout<GhosttyFormatterTerminalOptions>.size
+            var options = GhosttyTerminalSelectionFormatOptions()
+            options.size = MemoryLayout<GhosttyTerminalSelectionFormatOptions>.size
             options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN
             options.unwrap = unwrapSoftWrappedLines
             // Roost does want trailing spaces gone, but not
@@ -89,25 +90,20 @@ enum SelectionFormatter {
             // `trimTrailingSpaces` instead, which is otherwise
             // equivalent — textless cells are dropped either way.
             options.trim = false
-            // `extra` is ignored for PLAIN, but libghostty does not
-            // validate a `size` field, so every one of them still has
-            // to be right or a future layout drift is misread silently.
-            options.extra.size = MemoryLayout<GhosttyFormatterTerminalExtra>.size
-            options.extra.screen.size = MemoryLayout<GhosttyFormatterScreenExtra>.size
+            // Non-null, so the terminal's own active selection is not
+            // consulted and `GHOSTTY_NO_VALUE` cannot come back for a
+            // missing one.
             options.selection = selectionPtr
-
-            var handle: GhosttyFormatter?
-            guard ghostty_formatter_terminal_new(nil, &handle, terminal, options)
-                == GHOSTTY_SUCCESS, let formatter = handle
-            else { return nil }
-            defer { ghostty_formatter_free(formatter) }
 
             var outPtr: UnsafeMutablePointer<UInt8>?
             var outLen = 0
-            guard ghostty_formatter_format_alloc(formatter, nil, &outPtr, &outLen)
-                == GHOSTTY_SUCCESS
+            guard ghostty_terminal_selection_format_alloc(
+                terminal, nil, options, &outPtr, &outLen
+            ) == GHOSTTY_SUCCESS
             else { return nil }
             guard let outPtr else { return "" }
+            // Freed with the same (null) default allocator and the exact
+            // length the call reported, as its contract requires.
             defer { ghostty_free(nil, outPtr, outLen) }
 
             let bytes = UnsafeBufferPointer(start: outPtr, count: outLen)
