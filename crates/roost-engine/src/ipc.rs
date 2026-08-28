@@ -1313,6 +1313,7 @@ fn pty_err(e: PtyError) -> HandlerError {
             HandlerError::not_found(e.to_string())
         }
         PtyError::DuplicateTab(_) => HandlerError::invalid_param(e.to_string()),
+        PtyError::ShuttingDown(_) => HandlerError::new("shutting-down", e.to_string()),
     }
 }
 

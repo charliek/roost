@@ -54,6 +54,43 @@ fn an_existing_0700_leaf_validates_and_is_idempotent() {
     assert_eq!(mode_of(&leaf), 0o700);
 }
 
+/// Two simultaneous first starts both validate before either holds the
+/// socket lock — validation precedes the lock by design — so exactly one
+/// of them wins the `mkdir` and the loser must validate the leaf the
+/// winner just made, not fail the start.
+#[test]
+fn racing_creators_all_validate_the_same_leaf() {
+    let (_guard, root) = root();
+    let racers = 8;
+    // Rounds, because whether the losers land in the `mkdir` race or
+    // merely find the directory already there is up to the scheduler.
+    for round in 0..20 {
+        let leaf = root.join(format!("session-{round}"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(racers));
+        let handles: Vec<_> = (0..racers)
+            .map(|_| {
+                let leaf = leaf.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    validate_runtime_dir(&leaf)
+                })
+            })
+            .collect();
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle.join().expect("racer thread").unwrap_or_else(|err| {
+                panic!("round {round} racer {i} lost the create race and failed: {err}")
+            });
+        }
+
+        assert_eq!(mode_of(&leaf), 0o700);
+        assert_eq!(
+            fs::symlink_metadata(&leaf).expect("stat").uid(),
+            current_euid()
+        );
+    }
+}
+
 #[test]
 fn a_group_or_world_readable_leaf_is_rejected() {
     let (_guard, root) = root();

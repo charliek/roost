@@ -20,12 +20,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Depth of a tab's output fan-out. A consumer that falls this far
 /// behind gets `RecvError::Lagged` and the skipped bytes are gone for
@@ -50,6 +50,17 @@ const KILL_GRACE: Duration = Duration::from_millis(200);
 /// reaped — always wins; short enough that a tab whose reader never
 /// EOFs still reports its exit promptly.
 const EXIT_PUBLISH_GRACE: Duration = Duration::from_millis(250);
+/// How often [`PtySupervisor::shutdown_all`] re-reads the session map
+/// while waiting for children to be reaped. The lifecycle channel wakes
+/// the wait sooner in the common case; this bounds how long a lagged or
+/// missed event can delay it.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How long [`PtySupervisor::shutdown_all`] waits for a straggler to
+/// leave the session map after escalating it to SIGKILL. A SIGKILL'd
+/// child is reaped as soon as the kernel and the per-spawn wait task can
+/// run; anything still there afterwards is reported as abandoned rather
+/// than waited on indefinitely.
+const SHUTDOWN_KILL_TAIL: Duration = Duration::from_millis(500);
 
 /// What a subscriber gets back from `PtySupervisor::subscribe`.
 ///
@@ -139,6 +150,58 @@ pub enum SupervisorEvent {
     TabExited { tab_id: i64, status: i32 },
 }
 
+/// What [`PtySupervisor::shutdown_all`] did with every tab that was live
+/// when it started.
+///
+/// The three vectors partition that id set — each id appears in exactly
+/// one of them, and each is sorted:
+///
+/// * `reaped` — the child was reaped without shutdown having to signal
+///   it past the hangup: SIGHUP, or the per-tab SIGKILL watchdog, was
+///   enough. A straggler that dies between the deadline and the
+///   escalation belongs here too — the SIGKILL was never sent.
+/// * `killed` — still live at the deadline, so `shutdown_all` sent it a
+///   direct SIGKILL that landed, and it was reaped after that.
+/// * `abandoned` — still in the session map after the post-SIGKILL tail.
+///   Its child may yet be reaped by its wait task; shutdown stopped
+///   waiting.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShutdownReport {
+    pub reaped: Vec<i64>,
+    pub killed: Vec<i64>,
+    pub abandoned: Vec<i64>,
+}
+
+/// One tab's teardown handles, snapshotted out of the session map so
+/// `shutdown_all` can hang every tab up without holding its lock.
+struct Victim {
+    tab_id: i64,
+    /// A fresh `Mutex` around the session's cloned killer, so the
+    /// snapshot feeds the unchanged `terminate_child` — which takes the
+    /// session's own — rather than growing a second teardown path.
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    pid: Option<u32>,
+    reaped: Arc<AtomicBool>,
+}
+
+impl Victim {
+    /// Copy a live session's teardown handles without disturbing the
+    /// entry. Leaving the entry in place is the point: while shutdown is
+    /// running, "still in the map" is what it means by "not yet reaped".
+    fn snapshot(tab_id: i64, session: &Session) -> Self {
+        Self {
+            tab_id,
+            killer: Mutex::new(session.killer.lock().unwrap().clone_killer()),
+            pid: session.pid,
+            reaped: session.reaped.clone(),
+        }
+    }
+
+    fn terminate(self) {
+        terminate_child(&self.killer, self.pid, self.reaped, self.tab_id);
+    }
+}
+
 /// A command on a tab's single writer channel. Input and resize share
 /// one FIFO so they reach the PTY in submission order end-to-end —
 /// the writer loop applies them in the exact order they were sent (#80).
@@ -155,6 +218,25 @@ pub struct PtySupervisor {
     /// racing the first one. Cleaned up on every `spawn()` exit
     /// path via `SlotGuard`.
     pending: Mutex<HashSet<i64>>,
+    /// Latched by [`PtySupervisor::shutdown_all`] and never cleared. Two
+    /// things read it: `spawn` refuses outright, and `close` stops
+    /// removing session entries (removal is shutdown's reaped oracle;
+    /// see [`PtySupervisor::close`]). Written under the `sessions` +
+    /// `pending` locks, so a `spawn` either reserved its slot before the
+    /// latch (and shutdown waits for it) or sees the latch and rejects.
+    shutting_down: AtomicBool,
+    /// Latched under the `sessions` lock in the same critical section
+    /// that snapshots the victims. A `spawn` that reserved its slot
+    /// before the latch but promotes after the snapshot would install a
+    /// session nobody is left to tear down, so promotion rechecks this
+    /// and kills its own child instead.
+    sweep_started: AtomicBool,
+    /// Serializes [`PtySupervisor::shutdown_all`]. Two concurrent
+    /// teardowns would escalate from independent, stale snapshots — the
+    /// second signalling pids the first already saw reaped. The loser
+    /// waits and then runs against what the winner left, which is
+    /// normally nothing.
+    shutdown_gate: tokio::sync::Mutex<()>,
     /// One broadcast channel for supervisor-level events. The
     /// `Workspace` subscribes once at startup.
     lifecycle: broadcast::Sender<SupervisorEvent>,
@@ -202,6 +284,9 @@ impl PtySupervisor {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending: Mutex::new(HashSet::new()),
+            shutting_down: AtomicBool::new(false),
+            sweep_started: AtomicBool::new(false),
+            shutdown_gate: tokio::sync::Mutex::new(()),
             lifecycle,
         }
     }
@@ -321,6 +406,12 @@ impl PtySupervisor {
         {
             let sessions = self.sessions.lock().unwrap();
             let mut pending = self.pending.lock().unwrap();
+            // Same critical section `shutdown_all` latches the flag in,
+            // so there is no window where a spawn passes the check and
+            // then reserves a slot the shutdown sweep has already read.
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(PtyError::ShuttingDown(tab_id).into());
+            }
             if sessions.contains_key(&tab_id) || pending.contains(&tab_id) {
                 return Err(PtyError::DuplicateTab(tab_id).into());
             }
@@ -479,14 +570,23 @@ impl PtySupervisor {
         // Detect that here and hand the session back instead of
         // installing it; the caller-visible teardown happens after the
         // reap task is started, so the child is still reaped.
-        let cancelled = {
+        //
+        // `shutdown_all` is the second way this promotion can be too
+        // late. Its bounded wait for `pending` to drain can expire while
+        // this spawn is still building, and once it has snapshotted the
+        // victims nothing will ever walk this tab: installing here would
+        // orphan a live child. So the same "hand it back and kill it"
+        // path covers both, with the error naming which one it was.
+        let unwanted: Option<(Session, PtyError)> = {
             let mut sessions = self.sessions.lock().unwrap();
             let mut pending = self.pending.lock().unwrap();
-            if pending.remove(&tab_id) {
+            if !pending.remove(&tab_id) {
+                Some((session, PtyError::Cancelled(tab_id)))
+            } else if self.sweep_started.load(Ordering::SeqCst) {
+                Some((session, PtyError::ShuttingDown(tab_id)))
+            } else {
                 sessions.insert(tab_id, session);
                 None
-            } else {
-                Some(session)
             }
         };
         // Either branch consumed the pending entry (ours, or the one
@@ -560,16 +660,16 @@ impl PtySupervisor {
             }
         });
 
-        if let Some(session) = cancelled {
-            // Cancelled by close(). Kill the child rather than
-            // returning a usable receiver: `terminate_child` sends
-            // SIGHUP (SIGKILL on the watchdog), and the reap task
-            // started above reaps whatever the signal lands on.
-            // Dropping `session` drops the input/resize channels, so
-            // the writer task exits too.
+        if let Some((session, err)) = unwanted {
+            // Cancelled by close(), or too late for shutdown's sweep.
+            // Kill the child rather than returning a usable receiver:
+            // `terminate_child` sends SIGHUP (SIGKILL on the watchdog),
+            // and the reap task started above reaps whatever the signal
+            // lands on. Dropping `session` drops the input/resize
+            // channels, so the writer task exits too.
             terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
             drop(session);
-            return Err(PtyError::Cancelled(tab_id).into());
+            return Err(err.into());
         }
 
         Ok(early_rx)
@@ -621,13 +721,30 @@ impl PtySupervisor {
         // pending at promotion time; if the slot is gone it kills
         // the freshly-spawned child rather than installing it.
         // CR-flagged on PR #78 (`0555dd42` → `653e080`).
-        let (session, was_pending) = {
+        //
+        // The one exception is a shutdown in progress. `shutdown_all`
+        // reads "entry gone from the map" as "child reaped", so removing
+        // a still-running child's entry here would have it counted as
+        // reaped. While the latch is set, close() sends the same hangup
+        // but leaves the entry for the waiter to remove — which is what
+        // shutdown's own sweep does.
+        let (session, victim, was_pending) = {
             let mut sessions = self.sessions.lock().unwrap();
             let mut pending = self.pending.lock().unwrap();
-            (sessions.remove(&tab_id), pending.remove(&tab_id))
+            let was_pending = pending.remove(&tab_id);
+            if self.shutting_down.load(Ordering::SeqCst) {
+                let victim = sessions
+                    .get(&tab_id)
+                    .map(|session| Victim::snapshot(tab_id, session));
+                (None, victim, was_pending)
+            } else {
+                (sessions.remove(&tab_id), None, was_pending)
+            }
         };
         if let Some(session) = session {
             terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
+        } else if let Some(victim) = victim {
+            victim.terminate();
         } else if was_pending {
             debug!(tab_id, "close() cancelled in-flight spawn");
         }
@@ -635,6 +752,198 @@ impl PtySupervisor {
 
     pub fn has(&self, tab_id: i64) -> bool {
         self.sessions.lock().unwrap().contains_key(&tab_id)
+    }
+
+    /// Tear every live PTY down and report what happened to each.
+    ///
+    /// Permanently latches the supervisor closed to new spawns, waits
+    /// out any spawn already in flight (so its child is supervised
+    /// rather than orphaned), then hangs every live tab up through the
+    /// same `terminate_child` path `close()` uses — SIGHUP plus the
+    /// per-tab [`KILL_GRACE`] SIGKILL watchdog, unchanged.
+    ///
+    /// Completion is keyed on the **session map**, not on lifecycle
+    /// events: the per-spawn wait task removes a tab's entry when
+    /// `child.wait()` returns, so an id leaving the map is proof its
+    /// child was reaped. `SupervisorEvent`s only wake the wait early.
+    /// That split is what makes the report correct past the lifecycle
+    /// channel's capacity — more simultaneous exits than that makes
+    /// subscribers lag, and a lost wake can only cost latency (bounded
+    /// by [`SHUTDOWN_POLL_INTERVAL`]), never accuracy.
+    ///
+    /// Unlike `close()`, the session is left in the map for its wait
+    /// task to remove; removing it here would erase the very signal the
+    /// wait is keyed on. `close()` follows the same rule once the latch
+    /// is set, and a `spawn` that promotes after the victim snapshot
+    /// kills its own child rather than installing an unswept session.
+    ///
+    /// `deadline` is the soft budget for that cooperative phase. Tabs
+    /// still present when it expires get a direct SIGKILL and one
+    /// further [`SHUTDOWN_KILL_TAIL`] to leave the map. Nothing here
+    /// ever calls `waitpid`: the per-spawn wait task is the only reaper,
+    /// and racing it would consume the status it is blocked on.
+    ///
+    /// Concurrent calls are serialized rather than run in parallel: a
+    /// second teardown escalating from its own stale snapshot could
+    /// signal a pid the first already watched get reaped. The second
+    /// caller waits for the first and then reports on what is left,
+    /// normally nothing.
+    pub async fn shutdown_all(&self, deadline: Duration) -> ShutdownReport {
+        let _gate = self.shutdown_gate.lock().await;
+        let start = Instant::now();
+        {
+            let _sessions = self.sessions.lock().unwrap();
+            let _pending = self.pending.lock().unwrap();
+            self.shutting_down.store(true, Ordering::SeqCst);
+        }
+
+        // Spawns that reserved their slot before the latch still have to
+        // finish: they either install a session (which the sweep below
+        // then hangs up) or fail and drop the reservation. Bounded by
+        // the same deadline so a wedged spawn cannot stall teardown —
+        // one that promotes after the snapshot below tears itself down.
+        loop {
+            let settled = self.pending.lock().unwrap().is_empty();
+            if settled || start.elapsed() >= deadline {
+                break;
+            }
+            tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+        }
+
+        let mut lifecycle = self.lifecycle.subscribe();
+        // Latch `sweep_started` and read the map in one critical
+        // section: a spawn promoting between the two would install a
+        // session this sweep never saw and no one would tear it down.
+        // The signalling itself happens with the lock released —
+        // `terminate_child` makes syscalls and spawns a watchdog thread
+        // per tab, and the wait tasks it is about to wake need this same
+        // lock to remove their sessions.
+        let victims: Vec<Victim> = {
+            let sessions = self.sessions.lock().unwrap();
+            self.sweep_started.store(true, Ordering::SeqCst);
+            sessions
+                .iter()
+                .map(|(tab_id, session)| Victim::snapshot(*tab_id, session))
+                .collect()
+        };
+        let mut targets: Vec<i64> = victims.iter().map(|v| v.tab_id).collect();
+        targets.sort_unstable();
+        let pids: HashMap<i64, u32> = victims
+            .iter()
+            .filter_map(|v| v.pid.map(|pid| (v.tab_id, pid)))
+            .collect();
+        for victim in victims {
+            victim.terminate();
+        }
+
+        let mut remaining = targets.clone();
+        self.await_removals(&mut remaining, &mut lifecycle, start + deadline)
+            .await;
+        let stragglers = remaining.clone();
+        let mut signalled: Vec<i64> = Vec::new();
+        if !stragglers.is_empty() {
+            for tab_id in &stragglers {
+                let Some(&pid) = pids.get(tab_id) else {
+                    continue;
+                };
+                // Re-read the map immediately before signalling: an
+                // entry that has since gone means the waiter reaped that
+                // child, and its pid may already have been recycled onto
+                // an unrelated process. This narrows the window to the
+                // same inherent signal-after-reap race the per-tab
+                // watchdog in `terminate_child` already carries.
+                if !self.sessions.lock().unwrap().contains_key(tab_id) {
+                    continue;
+                }
+                // SAFETY: a signal to a pid we spawned, checked live a
+                // moment ago. An exited-but-unreaped zombie takes it as
+                // a no-op; the wait task still reaps it.
+                let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                if rc == 0 {
+                    signalled.push(*tab_id);
+                } else {
+                    // ESRCH is the child winning the race; anything else
+                    // is a real failure. Either way we did not kill it,
+                    // so it is not reported as `killed`.
+                    debug!(
+                        tab_id,
+                        err = ?std::io::Error::last_os_error(),
+                        "pty shutdown SIGKILL did not land"
+                    );
+                }
+            }
+            self.await_removals(
+                &mut remaining,
+                &mut lifecycle,
+                Instant::now() + SHUTDOWN_KILL_TAIL,
+            )
+            .await;
+        }
+
+        let abandoned = remaining;
+        let killed: Vec<i64> = signalled
+            .into_iter()
+            .filter(|id| !abandoned.contains(id))
+            .collect();
+        let report = ShutdownReport {
+            reaped: targets
+                .into_iter()
+                .filter(|id| !killed.contains(id) && !abandoned.contains(id))
+                .collect(),
+            killed,
+            abandoned,
+        };
+        if !report.abandoned.is_empty() {
+            warn!(
+                abandoned = ?report.abandoned,
+                "pty shutdown gave up on children that outlived SIGKILL"
+            );
+        }
+        info!(
+            reaped = report.reaped.len(),
+            killed = report.killed.len(),
+            abandoned = report.abandoned.len(),
+            elapsed = ?start.elapsed(),
+            "pty shutdown complete"
+        );
+        report
+    }
+
+    /// Drop ids from `remaining` as their sessions leave the map, until
+    /// none are left or `deadline` passes. Lifecycle events are only a
+    /// wake source — the map is the oracle — so a `Lagged` receiver
+    /// costs at most one poll interval.
+    async fn await_removals(
+        &self,
+        remaining: &mut Vec<i64>,
+        lifecycle: &mut broadcast::Receiver<SupervisorEvent>,
+        deadline: Instant,
+    ) {
+        loop {
+            {
+                let sessions = self.sessions.lock().unwrap();
+                remaining.retain(|tab_id| sessions.contains_key(tab_id));
+            }
+            if remaining.is_empty() {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let step = SHUTDOWN_POLL_INTERVAL.min(deadline - now);
+            tokio::select! {
+                () = tokio::time::sleep(step) => {}
+                result = lifecycle.recv() => {
+                    // A closed channel would otherwise spin this loop;
+                    // it cannot happen while we hold the sender, but the
+                    // wait must not depend on that.
+                    if matches!(result, Err(broadcast::error::RecvError::Closed)) {
+                        tokio::time::sleep(step).await;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1021,6 +1330,8 @@ pub enum PtyError {
     DuplicateTab(i64),
     #[error("spawn for tab {0} cancelled by close()")]
     Cancelled(i64),
+    #[error("supervisor is shutting down; refused to spawn tab {0}")]
+    ShuttingDown(i64),
 }
 
 #[cfg(test)]

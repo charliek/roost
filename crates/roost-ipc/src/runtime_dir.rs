@@ -59,6 +59,10 @@ use crate::peer::current_euid;
 /// component among the ancestors; any ancestor that is group- or
 /// world-writable without the sticky bit.
 ///
+/// Losing the create race is not a failure: a peer that materializes the
+/// leaf first leaves an ordinary existing directory, which is re-stat'd
+/// and validated like any other.
+///
 /// The symlink rule is strict on purpose — a symlinked component is
 /// indistinguishable from a redirected one — which means callers must
 /// pass a path that is already real. On macOS `$TMPDIR` sits under
@@ -124,22 +128,36 @@ fn check_ancestor(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `mkdir` masks the mode with the umask, which can only clear bits —
+/// never widen — so the directory is never more permissive than 0700 for
+/// even an instant. The chmod that follows only restores owner bits a
+/// hostile umask stripped.
+fn create_leaf(path: &Path) -> std::io::Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
 fn check_leaf(path: &Path) -> anyhow::Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // `mkdir` masks the mode with the umask, which can only
-            // clear bits — never widen — so the directory is never more
-            // permissive than 0700 for even an instant. The chmod that
-            // follows only restores owner bits a hostile umask stripped.
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(path)
-                .with_context(|| format!("create runtime dir {}", path.display()))?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod 0700 {}", path.display()))?;
-            return Ok(());
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match create_leaf(path) {
+            Ok(()) => return Ok(()),
+            // Someone created the leaf between our stat and our mkdir.
+            // Two simultaneous first starts reach here by design —
+            // validation precedes the lock that would serialize them —
+            // and "is this directory acceptable?" is the same question
+            // for a leaf a peer just made as for one that was already
+            // there. So re-stat and answer it, rather than failing a
+            // start over a lost race.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::symlink_metadata(path).with_context(|| {
+                    format!("stat concurrently created runtime dir {}", path.display())
+                })?
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("create runtime dir {}", path.display()))
+            }
+        },
         Err(err) => {
             return Err(err).with_context(|| format!("stat runtime dir {}", path.display()))
         }

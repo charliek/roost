@@ -117,6 +117,7 @@ impl EngineError {
             Self::Pty(PtyError::NotFound(_)) | Self::Pty(PtyError::Closed(_)) => "tab_not_found",
             Self::Pty(PtyError::Cancelled(_)) => "cancelled",
             Self::Pty(PtyError::DuplicateTab(_)) => "duplicate_tab",
+            Self::Pty(PtyError::ShuttingDown(_)) => "shutting_down",
             Self::Operation(_) => "operation_failed",
             Self::InvalidArgument(_) => "invalid_argument",
         }
