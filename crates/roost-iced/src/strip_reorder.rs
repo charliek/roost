@@ -11,6 +11,7 @@ use iced::advanced::renderer;
 use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{mouse, Clipboard, Layout, Shell, Widget};
 use iced::{window, Element, Event, Length, Point, Rectangle, Size, Vector};
+use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 use roost_ui_model::reorder::{moved_ids, ReorderError};
 
 use crate::Message;
@@ -233,14 +234,20 @@ pub(crate) struct ReorderStrip<'a> {
     ids: Vec<i64>,
     context_generation: u64,
     enabled: bool,
-    on_select: fn(i64) -> Message,
-    on_rename: fn(i64) -> Message,
+    /// The strip's own model is the snapshot's BARE ids (positions,
+    /// hit-testing, member equality) while the messages it publishes are
+    /// host-qualified, so the constructors below take the instance those
+    /// ids belong to — the one joint between the two.
+    host: HostId,
+    on_select: fn(HostId, i64) -> Message,
+    on_rename: fn(HostId, i64) -> Message,
     on_event: fn(StripEvent) -> Message,
 }
 
 impl<'a> ReorderStrip<'a> {
     pub(crate) fn tabs(
         content: impl Into<Element<'a, Message>>,
+        host: HostId,
         project_id: i64,
         ids: Vec<i64>,
         context_generation: u64,
@@ -253,8 +260,9 @@ impl<'a> ReorderStrip<'a> {
             ids,
             context_generation,
             enabled,
-            on_select: Message::TabSelected,
-            on_rename: Message::BeginRenameTab,
+            host,
+            on_select: |host, id| Message::TabSelected(TabKey::new(host, id)),
+            on_rename: |host, id| Message::BeginRenameTab(TabKey::new(host, id)),
             on_event: Message::TabStrip,
         }
     }
@@ -263,6 +271,7 @@ impl<'a> ReorderStrip<'a> {
     /// no scope to key gestures to; `0` is the constant it compares against.
     pub(crate) fn projects(
         content: impl Into<Element<'a, Message>>,
+        host: HostId,
         ids: Vec<i64>,
         context_generation: u64,
         enabled: bool,
@@ -274,8 +283,9 @@ impl<'a> ReorderStrip<'a> {
             ids,
             context_generation,
             enabled,
-            on_select: Message::ProjectSelected,
-            on_rename: Message::BeginRenameProject,
+            host,
+            on_select: |host, id| Message::ProjectSelected(ProjectKey::new(host, id)),
+            on_rename: |host, id| Message::BeginRenameProject(ProjectKey::new(host, id)),
             on_event: Message::ProjectStrip,
         }
     }
@@ -673,7 +683,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                     child_bounds = ?layout.children().map(|child| child.bounds()).collect::<Vec<_>>(),
                     "Iced reorder strip armed pointer press"
                 );
-                shell.publish((self.on_select)(source_id));
+                shell.publish((self.on_select)(self.host, source_id));
                 match state.arm_press(
                     position,
                     Instant::now(),
@@ -686,7 +696,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                         shell.publish((self.on_event)(event));
                     }
                     PressSettlement::DoubleClick => {
-                        shell.publish((self.on_rename)(source_id));
+                        shell.publish((self.on_rename)(self.host, source_id));
                     }
                 }
                 shell.capture_event();

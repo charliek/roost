@@ -22,6 +22,7 @@ use iced::Subscription;
 use roost_engine::ipc::UiRequest;
 use roost_engine::session::TabOutput;
 use roost_engine::{Workspace, WorkspaceEvent};
+use roost_ui_model::keys::TabKey;
 use tokio::sync::{mpsc, Notify};
 
 use crate::app::{AgentMetricsResult, ProviderRunResult};
@@ -36,8 +37,10 @@ const ENGINE_FEED_BATCH_CAP: usize = 256;
 pub(crate) enum EngineFeed {
     Workspace(WorkspaceEvent),
     /// One tab's PTY output, tagged with the tab it came from — the tag
-    /// is what lets every tab share this channel.
-    Tab(i64, TabOutput),
+    /// is what lets every tab share this channel. Host-qualified, so a
+    /// backend's items can never land on another backend's tab that
+    /// happens to carry the same numeric id.
+    Tab(TabKey, TabOutput),
     UiRequest(UiRequest),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
@@ -52,7 +55,7 @@ pub(crate) enum EngineFeed {
     /// the feed like every other engine → UI item so the jump it triggers is
     /// ordered against the events that may have closed the tab meanwhile.
     NotificationActivated {
-        tab_id: i64,
+        tab: TabKey,
     },
 }
 
@@ -244,18 +247,22 @@ pub(crate) async fn pump_workspace_events(workspace: Arc<Workspace>, feed: Engin
     bridge.abort();
 }
 
-/// Adapter task: one tab's PTY output → feed, tagged with the tab id.
+/// Adapter task: one tab's PTY output → feed, tagged with the tab it came
+/// from. The engine's id-space is host-unaware, so the backend that
+/// attached this tab is what qualified its bare id into `key`; the pump
+/// simply carries that key onto the feed.
+///
 /// Spawned at attach and ended by the tab's own channel closing, which
 /// `TabSession`'s pump does after the PTY exits or the supervisor drops
 /// it. A forwarder that dies before delivering `Exit` leaks nothing: the
 /// next reconcile prunes any tab the workspace no longer lists.
 pub(crate) async fn pump_tab_output(
-    tab_id: i64,
+    key: TabKey,
     mut rx: mpsc::UnboundedReceiver<TabOutput>,
     feed: EngineFeedSender,
 ) {
     while let Some(output) = rx.recv().await {
-        if !feed.send(EngineFeed::Tab(tab_id, output)) {
+        if !feed.send(EngineFeed::Tab(key, output)) {
             break;
         }
     }
@@ -402,7 +409,10 @@ mod tests {
     async fn a_batch_of_nothing_but_tab_bytes_skips_the_reconcile() {
         let (tx, mut rx) = channel();
         for _ in 0..3 {
-            assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+            assert!(tx.send(EngineFeed::Tab(
+                TabKey::local(7),
+                TabOutput::Bytes(b"out".to_vec())
+            )));
         }
 
         let (items, batch) = drain(&mut rx);
@@ -428,7 +438,10 @@ mod tests {
             tab_id: 7
         })));
         assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
-        assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+        assert!(tx.send(EngineFeed::Tab(
+            TabKey::local(7),
+            TabOutput::Bytes(b"out".to_vec())
+        )));
 
         let mut batch = EngineBatch::default();
         let mut mid_drain_reconciles = 0;
@@ -478,7 +491,10 @@ mod tests {
         assert!(batch.workspace_dirty() && batch.should_reconcile());
         batch.mark_reconciled();
 
-        assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+        assert!(tx.send(EngineFeed::Tab(
+            TabKey::local(7),
+            TabOutput::Bytes(b"out".to_vec())
+        )));
         assert!(rx.try_next(&mut batch).is_some());
         assert!(
             !batch.should_reconcile() && !batch.workspace_dirty(),
@@ -500,18 +516,26 @@ mod tests {
         for tail in [
             EngineFeed::UiRequest(UiRequest::Activate),
             EngineFeed::Tab(
-                7,
+                TabKey::local(7),
                 TabOutput::Exit {
                     status: 0,
                     reason: "shell exited".into(),
                 },
             ),
-            EngineFeed::Tab(7, TabOutput::Error("broadcast lagged".into())),
+            EngineFeed::Tab(
+                TabKey::local(7),
+                TabOutput::Error("broadcast lagged".into()),
+            ),
             EngineFeed::Workspace(WorkspaceEvent::TabClosed { tab_id: 7 }),
-            EngineFeed::NotificationActivated { tab_id: 7 },
+            EngineFeed::NotificationActivated {
+                tab: TabKey::local(7),
+            },
         ] {
             let (tx, mut rx) = channel();
-            assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+            assert!(tx.send(EngineFeed::Tab(
+                TabKey::local(7),
+                TabOutput::Bytes(b"out".to_vec())
+            )));
             assert!(tx.send(tail));
 
             let (items, batch) = drain(&mut rx);
@@ -525,7 +549,7 @@ mod tests {
     async fn a_tab_forwarder_tags_its_output_and_ends_with_its_channel() {
         let (feed_tx, mut rx) = channel();
         let (tab_tx, tab_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(pump_tab_output(7, tab_rx, feed_tx));
+        let forwarder = tokio::spawn(pump_tab_output(TabKey::local(7), tab_rx, feed_tx));
 
         assert!(tab_tx.send(TabOutput::Bytes(b"out".to_vec())).is_ok());
         assert!(tab_tx
@@ -538,15 +562,40 @@ mod tests {
         forwarder.await.expect("the forwarder ends, not panics");
 
         let (items, batch) = drain(&mut rx);
-        assert!(matches!(items[0], EngineFeed::Tab(7, TabOutput::Bytes(_))));
+        assert!(matches!(
+            items[0],
+            EngineFeed::Tab(key, TabOutput::Bytes(_)) if key == TabKey::local(7)
+        ));
         assert!(matches!(
             items[1],
-            EngineFeed::Tab(7, TabOutput::Exit { .. })
+            EngineFeed::Tab(key, TabOutput::Exit { .. }) if key == TabKey::local(7)
         ));
         assert!(batch.should_reconcile(), "the exit closes a tab");
     }
 
-    /// `TerminalTab`'s `Drop` aborts its forwarder; this is the half of
+    /// The backend hands the pump the key it qualified the engine's bare
+    /// id at; the pump carries exactly that onto the feed, and for the
+    /// in-process backend it is the local instance.
+    #[tokio::test]
+    async fn the_pump_qualifies_engine_ids_at_the_local_instance() {
+        let (feed_tx, mut rx) = channel();
+        let (tab_tx, tab_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(pump_tab_output(TabKey::local(7), tab_rx, feed_tx));
+
+        assert!(tab_tx.send(TabOutput::Bytes(b"out".to_vec())).is_ok());
+        drop(tab_tx);
+        forwarder.await.expect("the forwarder ends, not panics");
+
+        let (items, _) = drain(&mut rx);
+        let EngineFeed::Tab(key, TabOutput::Bytes(bytes)) = &items[0] else {
+            panic!("the pump tags its output");
+        };
+        assert_eq!(*key, TabKey::local(7));
+        assert!(key.is_local());
+        assert_eq!(bytes, b"out");
+    }
+
+    /// `TabHandle`'s `Drop` aborts its forwarder; this is the half of
     /// that cascade the tab cannot express itself. The aborted task takes
     /// the tab's receiver with it, which is how the engine-side bridge
     /// learns — on its very next send — that it has nobody left to feed.
@@ -554,7 +603,7 @@ mod tests {
     async fn aborting_a_forwarder_closes_the_channel_it_drained() {
         let (feed_tx, mut rx) = channel();
         let (tab_tx, tab_rx) = mpsc::unbounded_channel();
-        let forwarder = tokio::spawn(pump_tab_output(7, tab_rx, feed_tx));
+        let forwarder = tokio::spawn(pump_tab_output(TabKey::local(7), tab_rx, feed_tx));
         assert!(tab_tx.send(TabOutput::Bytes(b"live".to_vec())).is_ok());
         tokio::task::yield_now().await;
 

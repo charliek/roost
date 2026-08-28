@@ -234,29 +234,31 @@ pub(super) fn apply_with_rollback<T, E>(
 
 #[derive(Debug, PartialEq, Eq)]
 struct ThemeBatchFailure {
-    tab_id: i64,
+    tab: TabKey,
     apply: String,
-    rollback: Vec<(i64, String)>,
+    rollback: Vec<(TabKey, String)>,
 }
 
+/// Same rule as [`apply_geometry_batch`]: the walk is keyed end to end,
+/// so a rollback lands on exactly the tab whose apply succeeded.
 fn apply_theme_batch(
-    targets: &[(i64, Theme)],
+    targets: &[(TabKey, Theme)],
     next: &Theme,
-    mut apply: impl FnMut(i64, &Theme) -> std::result::Result<(), String>,
+    mut apply: impl FnMut(TabKey, &Theme) -> std::result::Result<(), String>,
 ) -> std::result::Result<(), ThemeBatchFailure> {
-    for (applied, (tab_id, _)) in targets.iter().enumerate() {
-        if let Err(error) = apply(*tab_id, next) {
+    for (applied, (key, _)) in targets.iter().enumerate() {
+        if let Err(error) = apply(*key, next) {
             let rollback = targets[..applied]
                 .iter()
                 .rev()
-                .filter_map(|(rollback_id, previous)| {
-                    apply(*rollback_id, previous)
+                .filter_map(|(rollback_key, previous)| {
+                    apply(*rollback_key, previous)
                         .err()
-                        .map(|error| (*rollback_id, error))
+                        .map(|error| (*rollback_key, error))
                 })
                 .collect();
             return Err(ThemeBatchFailure {
-                tab_id: *tab_id,
+                tab: *key,
                 apply: error,
                 rollback,
             });
@@ -602,33 +604,35 @@ impl App {
     ) -> Result<(), String> {
         let metric_generation = self.metric_generation.wrapping_add(1).max(1);
         let (cols, rows) = terminal_grid(self.window_size, self.effective_sidebar_width(), metrics);
-        let mut tab_ids = self.tabs.keys().copied().collect::<Vec<_>>();
-        tab_ids.sort_unstable();
+        let mut keys = self.tabs.keys().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
         let batched = apply_geometry_batch(
-            &tab_ids,
+            &keys,
             cols,
             rows,
             metrics,
             metric_generation,
             |batch_operation| match batch_operation {
                 GeometryBatchOperation::Apply {
-                    tab_id,
+                    tab,
                     cols,
                     rows,
                     metrics,
                     metric_generation,
                 } => self
                     .tabs
-                    .get_mut(&tab_id)
+                    .get_mut(&tab)
                     .ok_or_else(|| {
-                        format!("tab {tab_id} disappeared during {operation} application")
+                        format!("tab {} disappeared during {operation} application", tab.tab)
                     })?
                     .apply_geometry(cols, rows, metrics, metric_generation)
                     .map_err(|error| error.to_string()),
-                GeometryBatchOperation::Rollback { tab_id, previous } => self
+                GeometryBatchOperation::Rollback { tab, previous } => self
                     .tabs
-                    .get_mut(&tab_id)
-                    .ok_or_else(|| format!("tab {tab_id} disappeared during {operation} rollback"))?
+                    .get_mut(&tab)
+                    .ok_or_else(|| {
+                        format!("tab {} disappeared during {operation} rollback", tab.tab)
+                    })?
                     .rollback_geometry(previous)
                     .map(|()| None)
                     .map_err(|error| error.to_string()),
@@ -639,42 +643,44 @@ impl App {
             Err(failure) => {
                 let mut message = format!(
                     "apply {operation} to tab {}: {}",
-                    failure.tab_id, failure.apply
+                    failure.tab.tab, failure.apply
                 );
-                for (tab_id, error) in failure.rollback {
-                    message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+                for (key, error) in failure.rollback {
+                    message.push_str(&format!("; rollback tab {}: {error}", key.tab));
                 }
                 // A rolled-back tab was resized twice and reflow is lossy,
                 // so its snapshot describes neither geometry.
-                self.refresh_regridded(&tab_ids, operation);
+                self.refresh_regridded(&keys, operation);
                 return Err(message);
             }
         };
 
         let mut pointer_releases = Vec::new();
-        for (tab_id, change) in &applied {
+        for (key, change) in &applied {
             if !change.metrics_changed {
                 continue;
             }
-            let release = match self.tabs.get_mut(tab_id) {
+            let tab_id = key.tab;
+            let release = match self.tabs.get_mut(key) {
                 Some(tab) => tab.prepare_pointer_cancel(),
                 None => Err(anyhow::anyhow!(
                     "tab {tab_id} disappeared while staging pointer release"
                 )),
             };
             match release {
-                Ok(release) => pointer_releases.push((*tab_id, release)),
+                Ok(release) => pointer_releases.push((*key, release)),
                 Err(error) => {
                     let mut message = format!(
                         "stage pointer release for tab {tab_id} before {operation} commit: {error}"
                     );
-                    for (rollback_id, applied_change) in applied.iter().rev() {
+                    for (rollback_key, applied_change) in applied.iter().rev() {
                         let Some(previous) = applied_change.previous else {
                             continue;
                         };
+                        let rollback_id = rollback_key.tab;
                         if let Err(rollback_error) = self
                             .tabs
-                            .get_mut(rollback_id)
+                            .get_mut(rollback_key)
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "tab {rollback_id} disappeared during {operation} rollback"
@@ -687,7 +693,7 @@ impl App {
                             ));
                         }
                     }
-                    self.refresh_regridded(&tab_ids, operation);
+                    self.refresh_regridded(&keys, operation);
                     return Err(message);
                 }
             }
@@ -696,15 +702,15 @@ impl App {
         self.typography = candidate;
         self.terminal_metrics = metrics;
         self.metric_generation = metric_generation;
-        for (tab_id, release) in pointer_releases {
-            if let Some(tab) = self.tabs.get_mut(&tab_id) {
+        for (key, release) in pointer_releases {
+            if let Some(tab) = self.tabs.get_mut(&key) {
                 tab.commit_pointer_cancel(release);
             }
         }
-        for (tab_id, change) in applied {
-            if let Some(tab) = self.tabs.get_mut(&tab_id) {
+        for (key, change) in applied {
+            if let Some(tab) = self.tabs.get_mut(&key) {
                 tab.commit_geometry(change);
-                refresh_or_warn(tab_id, tab, operation);
+                refresh_or_warn(key.tab, tab, operation);
             }
         }
         Ok(())
@@ -715,10 +721,10 @@ impl App {
     /// geometry moved is not drawable until its snapshot is rebuilt. The
     /// failure paths cannot say which tabs moved — a rollback is itself a
     /// re-grid — so they refresh every tab they touched.
-    fn refresh_regridded(&mut self, tab_ids: &[i64], operation: &str) {
-        for tab_id in tab_ids {
-            if let Some(tab) = self.tabs.get_mut(tab_id) {
-                refresh_or_warn(*tab_id, tab, operation);
+    fn refresh_regridded(&mut self, keys: &[TabKey], operation: &str) {
+        for key in keys {
+            if let Some(tab) = self.tabs.get_mut(key) {
+                refresh_or_warn(key.tab, tab, operation);
             }
         }
     }
@@ -810,9 +816,11 @@ impl App {
                 &self.keybindings,
             ),
             "launcher" => launcher_palette_frame(&self.config),
-            "agents" => {
-                agent_palette::agent_frame(&self.workspace.snapshot(), agent_palette::now_unix())
-            }
+            "agents" => agent_palette::agent_frame(
+                &self.workspace.snapshot(),
+                self.backend.host(),
+                agent_palette::now_unix(),
+            ),
             "notifications" => notification_inbox::frame(&self.notification_inbox),
             "custom" => provider_palette_frame(&self.config.providers),
             _ => return Err(format!("unknown palette kind {kind:?}")),
@@ -1233,6 +1241,7 @@ impl App {
                     if let Some(state) = &mut self.palette {
                         state.push(agent_palette::agent_frame(
                             &self.workspace.snapshot(),
+                            self.backend.host(),
                             agent_palette::now_unix(),
                         ));
                     }
@@ -1244,9 +1253,14 @@ impl App {
                     }
                 }
                 palette::PaletteCommands::CLEAR_NOTIFICATIONS_ID => {
-                    let tab_ids = self.notification_inbox.tab_ids();
                     let mut first_error = None;
-                    for tab_id in tab_ids {
+                    for tab in self.notification_inbox.tab_keys() {
+                        // Only the local workspace's own rows are its to
+                        // clear; a connected host's are cleared through
+                        // that host's client.
+                        let Some(tab_id) = tab.local_tab() else {
+                            continue;
+                        };
                         if let Err(error) = self.workspace.set_tab_has_notification(tab_id, false) {
                             first_error.get_or_insert_with(|| error.to_string());
                         }
@@ -1270,14 +1284,14 @@ impl App {
                     dispatch = self.new_project_dispatch();
                 }
                 "close_project" => {
-                    let project_id = self.workspace.active().0;
+                    let project = self.active_project_key();
                     self.clear_palette_state();
-                    self.confirm_close_project(project_id)?;
+                    self.confirm_close_project(project)?;
                 }
                 "close_tab" => {
-                    let tab_id = self.workspace.active().1;
+                    let tab = self.active_tab_key();
                     self.clear_palette_state();
-                    dispatch = self.close_tab_dispatch(tab_id);
+                    dispatch = self.close_tab_dispatch(tab);
                 }
                 "cycle_tab_next" => {
                     self.cycle_tab(1)?;
@@ -1308,25 +1322,24 @@ impl App {
                     self.apply_font_size_transition(FontSizeTransition::Reset)?;
                 }
                 "jump_to_unread" => {
-                    let active_project_id = self.workspace.active().0;
                     let target = notification_inbox::next_unread(
                         &self.notification_inbox,
-                        active_project_id,
+                        self.active_project_key(),
                     );
-                    if let Some(tab_id) = target {
-                        self.focus_tab_and_clear(tab_id, true)?;
+                    if let Some(tab) = target {
+                        self.focus_tab_and_clear(tab, true)?;
                     }
                     self.clear_palette_state();
                 }
                 "rename_project" => {
-                    let project_id = self.workspace.active().0;
+                    let project = self.active_project_key();
                     self.clear_palette_state();
-                    self.begin_rename_target(RenameTarget::Project(project_id))?;
+                    self.begin_rename_target(RenameTarget::Project(project))?;
                 }
                 "rename_tab" => {
-                    let tab_id = self.workspace.active().1;
+                    let tab = self.active_tab_key();
                     self.clear_palette_state();
-                    self.begin_rename_target(RenameTarget::Tab(tab_id))?;
+                    self.begin_rename_target(RenameTarget::Tab(tab))?;
                 }
                 "custom_commands" => {
                     if let Some(state) = &mut self.palette {
@@ -1371,15 +1384,15 @@ impl App {
                 }
             }
             agent_palette::FRAME_ID => {
-                let tab_id = agent_palette::agent_tab_id(&item.id)
+                let tab = agent_palette::agent_tab_key(&item.id)
                     .ok_or_else(|| format!("agent row {:?} cannot be activated", item.id))?;
-                self.focus_tab_and_clear(tab_id, true)?;
+                self.focus_tab_and_clear(tab, true)?;
                 self.clear_palette_state();
             }
             "notifications" => {
-                let tab_id = notification_inbox::tab_id(&item.id)
+                let tab = notification_inbox::tab_key(&item.id)
                     .ok_or_else(|| format!("notification row {:?} cannot be activated", item.id))?;
-                self.focus_tab_and_clear(tab_id, true)?;
+                self.focus_tab_and_clear(tab, true)?;
                 self.clear_palette_state();
             }
             "custom" => {
@@ -1439,19 +1452,19 @@ impl App {
         let mut targets = self
             .tabs
             .iter()
-            .map(|(tab_id, tab)| (*tab_id, tab.theme.clone()))
+            .map(|(key, tab)| (*key, tab.theme.clone()))
             .collect::<Vec<_>>();
-        targets.sort_by_key(|(tab_id, _)| *tab_id);
-        if let Err(failure) = apply_theme_batch(&targets, &theme, |tab_id, candidate| {
+        targets.sort_by_key(|(key, _)| *key);
+        if let Err(failure) = apply_theme_batch(&targets, &theme, |key, candidate| {
             self.tabs
-                .get_mut(&tab_id)
-                .ok_or_else(|| format!("tab {tab_id} disappeared during theme application"))?
+                .get_mut(&key)
+                .ok_or_else(|| format!("tab {} disappeared during theme application", key.tab))?
                 .set_theme(candidate)
                 .map_err(|error| error.to_string())
         }) {
-            let mut message = format!("apply theme to tab {}: {}", failure.tab_id, failure.apply);
-            for (tab_id, error) in failure.rollback {
-                message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+            let mut message = format!("apply theme to tab {}: {}", failure.tab.tab, failure.apply);
+            for (key, error) in failure.rollback {
+                message.push_str(&format!("; rollback tab {}: {error}", key.tab));
             }
             return Err(message);
         }
@@ -1596,8 +1609,9 @@ impl App {
         // the adapter's next general reconcile. The engine snapshot is the
         // authoritative resync source for this live frame.
         let projects = self.workspace.snapshot();
-        let cwds = agent_palette::agent_tab_cwds(&projects);
-        let mut items = agent_palette::agent_items(&projects, agent_palette::now_unix());
+        let host = self.backend.host();
+        let cwds = agent_palette::agent_tab_cwds(&projects, host);
+        let mut items = agent_palette::agent_items(&projects, host, agent_palette::now_unix());
         self.apply_metrics_cache(&cwds, &mut items);
         if let Some(state) = &mut self.palette {
             state.update_items(agent_palette::FRAME_ID, items);
@@ -2383,26 +2397,29 @@ mod tests {
         let first = Theme::load_bundled("roost-dark");
         let second = Theme::load_bundled("Oxocarbon");
         let next = Theme::load_bundled("Atom");
-        let targets = vec![(7, first.clone()), (11, second)];
+        let targets = vec![
+            (TabKey::local(7), first.clone()),
+            (TabKey::local(11), second),
+        ];
         let mut applied = Vec::new();
-        let failure = apply_theme_batch(&targets, &next, |tab_id, theme| {
-            applied.push((tab_id, theme.background));
-            if tab_id == 11 && theme.background == next.background {
+        let failure = apply_theme_batch(&targets, &next, |key, theme| {
+            applied.push((key, theme.background));
+            if key == TabKey::local(11) && theme.background == next.background {
                 Err("injected tab failure".to_string())
             } else {
                 Ok(())
             }
         })
         .expect_err("second tab must fail");
-        assert_eq!(failure.tab_id, 11);
+        assert_eq!(failure.tab, TabKey::local(11));
         assert_eq!(failure.apply, "injected tab failure");
         assert!(failure.rollback.is_empty());
         assert_eq!(
             applied,
             [
-                (7, next.background),
-                (11, next.background),
-                (7, first.background),
+                (TabKey::local(7), next.background),
+                (TabKey::local(11), next.background),
+                (TabKey::local(7), first.background),
             ]
         );
     }

@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use roost_ipc::agent::{self, AgentLifecycle, Ownership, SOURCE_LEGACY, SOURCE_MANUAL};
 use roost_ipc::messages::{Project, Tab};
 
+use crate::keys::{HostId, TabKey};
 use crate::notification_inbox;
 use crate::palette::{AgentRowData, PaletteFrame, PaletteItem};
 
@@ -57,13 +58,17 @@ pub fn now_unix() -> i64 {
 }
 
 /// The root/sub frame for the agents palette.
-pub fn agent_frame(projects: &[Project], now: i64) -> PaletteFrame {
-    PaletteFrame::new(FRAME_ID, PLACEHOLDER, agent_items(projects, now))
+///
+/// `host` is the instance whose id-space `projects` was drawn from — the
+/// snapshot is a wire value, so it carries bare ids and the caller is the
+/// only thing that knows which backend produced them.
+pub fn agent_frame(projects: &[Project], host: HostId, now: i64) -> PaletteFrame {
+    PaletteFrame::new(FRAME_ID, PLACEHOLDER, agent_items(projects, host, now))
 }
 
 /// Rows for every agent-owned tab in the snapshot, in `rank` order.
 /// Empty populations yield the single non-actionable sentinel row.
-pub fn agent_items(projects: &[Project], now: i64) -> Vec<PaletteItem> {
+pub fn agent_items(projects: &[Project], host: HostId, now: i64) -> Vec<PaletteItem> {
     let mut rows: Vec<Row> = Vec::new();
     for project in projects {
         for tab in &project.tabs {
@@ -74,6 +79,7 @@ pub fn agent_items(projects: &[Project], now: i64) -> Vec<PaletteItem> {
             rows.push(row_for(
                 project,
                 tab,
+                TabKey::new(host, tab.id),
                 owner,
                 agent::effective_lifecycle(&axes),
                 now,
@@ -103,12 +109,12 @@ pub fn agent_items(projects: &[Project], now: i64) -> Vec<PaletteItem> {
 /// probe and the fill both key off the tab's cwd — so the population
 /// filter is shared with [`agent_items`] rather than re-spelled in
 /// `app.rs`, where it could drift.
-pub fn agent_tab_cwds(projects: &[Project]) -> HashMap<i64, String> {
+pub fn agent_tab_cwds(projects: &[Project], host: HostId) -> HashMap<TabKey, String> {
     let mut cwds = HashMap::new();
     for project in projects {
         for tab in &project.tabs {
             if agent_owner(&tab.agent_state()).is_some() {
-                cwds.insert(tab.id, tab.cwd.clone());
+                cwds.insert(TabKey::new(host, tab.id), tab.cwd.clone());
             }
         }
     }
@@ -121,7 +127,7 @@ pub fn agent_tab_cwds(projects: &[Project]) -> HashMap<i64, String> {
 /// visually, so the row never needs to say which one it's in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarAgentRow {
-    pub tab_id: i64,
+    pub tab: TabKey,
     pub name: String,
     pub lifecycle: AgentLifecycle,
     pub status_text: String,
@@ -133,7 +139,7 @@ pub struct SidebarAgentRow {
 /// drops out of the key relative to [`agent_items`]'s — every row here
 /// already shares one project, so ordering across projects is the
 /// caller's problem (it owns the project list order already).
-pub fn sidebar_agents(project: &Project, now: i64) -> Vec<SidebarAgentRow> {
+pub fn sidebar_agents(project: &Project, host: HostId, now: i64) -> Vec<SidebarAgentRow> {
     struct Keyed {
         rank: u8,
         last_event_at: i64,
@@ -154,7 +160,7 @@ pub fn sidebar_agents(project: &Project, now: i64) -> Vec<SidebarAgentRow> {
             tab_position: tab.position,
             tab_id: tab.id,
             row: SidebarAgentRow {
-                tab_id: tab.id,
+                tab: TabKey::new(host, tab.id),
                 name: row_name(tab, owner),
                 lifecycle: effective,
                 status_text: status_text(effective, tab.agent_lifecycle, &owner.detail),
@@ -183,10 +189,10 @@ fn agent_owner(axes: &agent::AgentTabState) -> Option<&Ownership> {
     (!NON_AGENT_SOURCES.contains(&owner.source.as_str())).then_some(owner)
 }
 
-/// The tab id an agent row activates, or `None` for the empty sentinel
+/// The tab an agent row activates, or `None` for the empty sentinel
 /// (and any other row id).
-pub fn agent_tab_id(row_id: &str) -> Option<i64> {
-    row_id.strip_prefix(ROW_ID_PREFIX)?.parse().ok()
+pub fn agent_tab_key(row_id: &str) -> Option<TabKey> {
+    TabKey::from_wire(row_id.strip_prefix(ROW_ID_PREFIX)?)
 }
 
 /// CSS class carrying a lifecycle's colour (dot background + status
@@ -331,6 +337,7 @@ struct Row {
 fn row_for(
     project: &Project,
     tab: &Tab,
+    key: TabKey,
     owner: &Ownership,
     effective: AgentLifecycle,
     now: i64,
@@ -338,7 +345,7 @@ fn row_for(
     let project_name = normalize_line(&project.name);
     let name = row_name(tab, owner);
     let item = PaletteItem::new(
-        format!("{ROW_ID_PREFIX}{}", tab.id),
+        format!("{ROW_ID_PREFIX}{key}"),
         compose_title(&project_name, &name),
     )
     .with_agent(AgentRowData {
@@ -745,7 +752,7 @@ mod tests {
                 owned(tab(5, "codex"), "codex", AgentLifecycle::Waiting, NOW),
             ],
         )];
-        let ids: Vec<String> = agent_items(&projects, NOW)
+        let ids: Vec<String> = agent_items(&projects, HostId::LOCAL, NOW)
             .into_iter()
             .map(|i| i.id)
             .collect();
@@ -768,15 +775,46 @@ mod tests {
                 owned(tab(3, "manual"), "manual", AgentLifecycle::Working, NOW),
             ],
         )];
-        let cwds = agent_tab_cwds(&projects);
+        let cwds = agent_tab_cwds(&projects, HostId::LOCAL);
         assert_eq!(cwds.len(), 1);
-        assert_eq!(cwds.get(&2).map(String::as_str), Some("/w/roost"));
+        assert_eq!(
+            cwds.get(&TabKey::local(2)).map(String::as_str),
+            Some("/w/roost")
+        );
 
-        let ids: Vec<Option<i64>> = agent_items(&projects, NOW)
+        let ids: Vec<Option<TabKey>> = agent_items(&projects, HostId::LOCAL, NOW)
             .iter()
-            .map(|i| agent_tab_id(&i.id))
+            .map(|i| agent_tab_key(&i.id))
             .collect();
-        assert_eq!(ids, vec![Some(2)]);
+        assert_eq!(ids, vec![Some(TabKey::local(2))]);
+    }
+
+    /// The same snapshot read as two instances: rows, row ids and cwds
+    /// must land in two id-spaces, so a connected host's tab 2 can never
+    /// be probed, filled or activated as the local tab 2.
+    #[test]
+    fn two_instances_of_the_same_snapshot_produce_two_id_spaces() {
+        let mut agent_tab = owned(tab(2, "claude"), "claude", AgentLifecycle::Working, NOW);
+        agent_tab.cwd = "/w/roost".to_string();
+        let projects = vec![project(1, "roost", vec![agent_tab])];
+        let host = HostId::new(4);
+
+        let local = agent_items(&projects, HostId::LOCAL, NOW);
+        let remote = agent_items(&projects, host, NOW);
+        assert_eq!(local[0].id, "agent:2");
+        assert_eq!(remote[0].id, "agent:h4.2");
+        assert_eq!(agent_tab_key(&remote[0].id), Some(TabKey::new(host, 2)));
+
+        let cwds = agent_tab_cwds(&projects, host);
+        assert!(cwds.contains_key(&TabKey::new(host, 2)));
+        assert!(
+            !cwds.contains_key(&TabKey::local(2)),
+            "the local tab 2 is a different tab and gets no entry"
+        );
+        assert_eq!(
+            sidebar_agents(&projects[0], host, NOW)[0].tab,
+            TabKey::new(host, 2)
+        );
     }
 
     #[test]
@@ -785,7 +823,7 @@ mod tests {
             owned(tab(1, "ghost"), "claude", AgentLifecycle::Working, NOW),
             |owner| owner.source = String::new(),
         );
-        let items = agent_items(&[project(1, "roost", vec![t])], NOW);
+        let items = agent_items(&[project(1, "roost", vec![t])], HostId::LOCAL, NOW);
         assert_eq!(items[0].id, EMPTY_ROW_ID);
     }
 
@@ -798,7 +836,11 @@ mod tests {
         fresh.shell_state = ShellState::AtPrompt;
         let mut busy = owned(tab(2, "claude"), "claude", AgentLifecycle::Inactive, NOW);
         busy.shell_state = ShellState::ForegroundProcess;
-        let items = agent_items(&[project(1, "roost", vec![fresh, busy])], NOW);
+        let items = agent_items(
+            &[project(1, "roost", vec![fresh, busy])],
+            HostId::LOCAL,
+            NOW,
+        );
         assert_eq!(items.len(), 2);
         // Shell-derived: the busy one ranks above the idle one.
         assert_eq!(items[0].id, "agent:2");
@@ -808,22 +850,31 @@ mod tests {
 
     #[test]
     fn empty_population_yields_one_non_actionable_row() {
-        let items = agent_items(&[project(1, "roost", vec![tab(1, "shell")])], NOW);
+        let items = agent_items(
+            &[project(1, "roost", vec![tab(1, "shell")])],
+            HostId::LOCAL,
+            NOW,
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, EMPTY_ROW_ID);
         assert_eq!(items[0].title, EMPTY_ROW_TITLE);
         assert!(!items[0].actionable);
         assert!(items[0].agent.is_none());
         // The sentinel must not parse as a jump target.
-        assert_eq!(agent_tab_id(EMPTY_ROW_ID), None);
+        assert_eq!(agent_tab_key(EMPTY_ROW_ID), None);
     }
 
     #[test]
     fn row_id_round_trips_to_a_tab_id() {
-        assert_eq!(agent_tab_id("agent:42"), Some(42));
-        assert_eq!(agent_tab_id("agent:"), None);
-        assert_eq!(agent_tab_id("agent:x"), None);
-        assert_eq!(agent_tab_id("notif:7"), None);
+        assert_eq!(agent_tab_key("agent:42"), Some(TabKey::local(42)));
+        assert_eq!(agent_tab_key("agent:"), None);
+        assert_eq!(agent_tab_key("agent:x"), None);
+        assert_eq!(agent_tab_key("notif:7"), None);
+        assert_eq!(
+            agent_tab_key("agent:h2.42"),
+            Some(TabKey::new(HostId::new(2), 42)),
+            "a connected instance's row is its own target, not the local tab 42"
+        );
     }
 
     // ----- name + title ---------------------------------------------
@@ -843,6 +894,7 @@ mod tests {
 
         let items = agent_items(
             &[project(1, "roost", vec![with_meta, with_title, untitled])],
+            HostId::LOCAL,
             NOW,
         );
         let by_id = |id: &str| {
@@ -869,7 +921,7 @@ mod tests {
                     .insert(SESSION_TITLE_KEY.to_string(), "  \n ".to_string());
             },
         );
-        let items = agent_items(&[project(1, "roost", vec![t])], NOW);
+        let items = agent_items(&[project(1, "roost", vec![t])], HostId::LOCAL, NOW);
         assert_eq!(agent_of(&items[0]).name, "zsh");
     }
 
@@ -884,7 +936,7 @@ mod tests {
                 );
             },
         );
-        let items = agent_items(&[project(1, "roost\nnope", vec![t])], NOW);
+        let items = agent_items(&[project(1, "roost\nnope", vec![t])], HostId::LOCAL, NOW);
         let row = agent_of(&items[0]);
         assert_eq!(row.name, "line oneline two x");
         assert_eq!(row.project, "roostnope");
@@ -918,7 +970,7 @@ mod tests {
                 NOW,
             ),
         ];
-        let ids: Vec<String> = agent_items(&[project(1, "roost", tabs)], NOW)
+        let ids: Vec<String> = agent_items(&[project(1, "roost", tabs)], HostId::LOCAL, NOW)
             .into_iter()
             .map(|i| i.id)
             .collect();
@@ -951,7 +1003,7 @@ mod tests {
             "roost",
             vec![later_tab, same_position_high_id, same_position_low_id],
         );
-        let ids: Vec<String> = agent_items(&[second, first], NOW)
+        let ids: Vec<String> = agent_items(&[second, first], HostId::LOCAL, NOW)
             .into_iter()
             .map(|i| i.id)
             .collect();
@@ -975,9 +1027,9 @@ mod tests {
                 owned(tab(5, "codex"), "codex", AgentLifecycle::Waiting, NOW),
             ],
         );
-        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+        let ids: Vec<i64> = sidebar_agents(&p, HostId::LOCAL, NOW)
             .into_iter()
-            .map(|r| r.tab_id)
+            .map(|r| r.tab.tab)
             .collect();
         assert_eq!(ids, vec![5, 2]);
     }
@@ -998,9 +1050,9 @@ mod tests {
         older.position = 0;
 
         let p = project(1, "p", vec![older, newer]);
-        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+        let ids: Vec<i64> = sidebar_agents(&p, HostId::LOCAL, NOW)
             .into_iter()
-            .map(|r| r.tab_id)
+            .map(|r| r.tab.tab)
             .collect();
         assert_eq!(ids, vec![9, 2]);
     }
@@ -1032,9 +1084,9 @@ mod tests {
                 waiting_old,
             ],
         );
-        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+        let ids: Vec<i64> = sidebar_agents(&p, HostId::LOCAL, NOW)
             .into_iter()
-            .map(|r| r.tab_id)
+            .map(|r| r.tab.tab)
             .collect();
         // rank: Failed > Waiting > Working; then within Working, position
         // 0 before position 5, then id 3 before id 30.
@@ -1090,9 +1142,10 @@ mod tests {
 
         let rows = sidebar_agents(
             &project(1, "roost", vec![with_meta, with_title, untitled]),
+            HostId::LOCAL,
             NOW,
         );
-        let by_id = |id: i64| rows.iter().find(|r| r.tab_id == id).expect("row present");
+        let by_id = |id: i64| rows.iter().find(|r| r.tab.tab == id).expect("row present");
         assert_eq!(by_id(1).name, "slauth-refactor");
         assert_eq!(by_id(2).name, "zsh");
         assert_eq!(by_id(3).name, "Tab 3");
@@ -1105,7 +1158,7 @@ mod tests {
             owned(tab(1, "zsh\nx"), "claude", AgentLifecycle::Failed, NOW),
             |owner| owner.detail = long_detail.clone(),
         );
-        let rows = sidebar_agents(&project(1, "roost", vec![t]), NOW);
+        let rows = sidebar_agents(&project(1, "roost", vec![t]), HostId::LOCAL, NOW);
         assert_eq!(rows[0].name, "zshx");
         let detail = rows[0]
             .status_text
@@ -1117,9 +1170,16 @@ mod tests {
 
     #[test]
     fn sidebar_agents_on_an_empty_project_is_empty() {
-        assert_eq!(sidebar_agents(&project(1, "roost", vec![]), NOW), vec![]);
         assert_eq!(
-            sidebar_agents(&project(1, "roost", vec![tab(1, "shell")]), NOW),
+            sidebar_agents(&project(1, "roost", vec![]), HostId::LOCAL, NOW),
+            vec![]
+        );
+        assert_eq!(
+            sidebar_agents(
+                &project(1, "roost", vec![tab(1, "shell")]),
+                HostId::LOCAL,
+                NOW
+            ),
             vec![]
         );
     }

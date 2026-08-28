@@ -4,8 +4,27 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenameTarget {
-    Project(i64),
-    Tab(i64),
+    Project(ProjectKey),
+    Tab(TabKey),
+}
+
+impl RenameTarget {
+    /// The engine id this target renames, or `None` when it names an
+    /// entity on another instance — the local client cannot rename it,
+    /// and its number would rename whatever local entity shares it.
+    fn local_id(self) -> Option<i64> {
+        match self {
+            Self::Project(project) => project.local_project(),
+            Self::Tab(tab) => tab.local_tab(),
+        }
+    }
+
+    /// [`Self::local_id`] for the two callers that owe the caller a
+    /// reason rather than a silent `None`.
+    fn local_id_or_error(self) -> Result<i64, String> {
+        self.local_id()
+            .ok_or_else(|| format!("rename target {self:?} belongs to another instance"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,23 +76,24 @@ pub(super) struct RenameEditor {
 }
 
 fn rename_target_label(projects: &[Project], target: RenameTarget) -> Option<&str> {
+    // The snapshot is one instance's, so only that instance's keys can
+    // name a row in it.
+    let id = target.local_id()?;
     match target {
-        RenameTarget::Project(project_id) => projects
+        RenameTarget::Project(_) => projects
             .iter()
-            .find(|project| project.id == project_id)
+            .find(|project| project.id == id)
             .map(|project| project.name.as_str()),
-        RenameTarget::Tab(tab_id) => projects
+        RenameTarget::Tab(_) => projects
             .iter()
             .flat_map(|project| &project.tabs)
-            .find(|tab| tab.id == tab_id)
+            .find(|tab| tab.id == id)
             .map(|tab| tab.title.as_str()),
     }
 }
 
 fn begin_rename_editor(projects: &[Project], target: RenameTarget) -> Result<RenameEditor, String> {
-    let id = match target {
-        RenameTarget::Project(id) | RenameTarget::Tab(id) => id,
-    };
+    let id = target.local_id_or_error()?;
     if id == 0 {
         return Err("no active project or tab to rename".into());
     }
@@ -92,14 +112,17 @@ fn rename_editor_is_renderable(
     active_project: i64,
     sidebar_collapsed: bool,
 ) -> bool {
+    let Some(id) = editor.target.local_id() else {
+        return false;
+    };
     match editor.target {
-        RenameTarget::Project(project_id) => {
-            !sidebar_collapsed && projects.iter().any(|project| project.id == project_id)
+        RenameTarget::Project(_) => {
+            !sidebar_collapsed && projects.iter().any(|project| project.id == id)
         }
-        RenameTarget::Tab(tab_id) => projects
+        RenameTarget::Tab(_) => projects
             .iter()
             .find(|project| project.id == active_project)
-            .is_some_and(|project| project.tabs.iter().any(|tab| tab.id == tab_id)),
+            .is_some_and(|project| project.tabs.iter().any(|tab| tab.id == id)),
     }
 }
 
@@ -239,15 +262,15 @@ impl App {
         Ok(())
     }
 
-    pub fn begin_rename_project(&mut self, project_id: i64) -> UiTask {
-        if let Err(error) = self.begin_rename_target(RenameTarget::Project(project_id)) {
+    pub fn begin_rename_project(&mut self, project: ProjectKey) -> UiTask {
+        if let Err(error) = self.begin_rename_target(RenameTarget::Project(project)) {
             self.set_status(error);
         }
         self.take_rename_focus_task()
     }
 
-    pub fn begin_rename_tab(&mut self, tab_id: i64) -> UiTask {
-        if let Err(error) = self.begin_rename_target(RenameTarget::Tab(tab_id)) {
+    pub fn begin_rename_tab(&mut self, tab: TabKey) -> UiTask {
+        if let Err(error) = self.begin_rename_target(RenameTarget::Tab(tab)) {
             self.set_status(error);
         }
         self.take_rename_focus_task()
@@ -284,11 +307,10 @@ impl App {
                 let client = self.client.clone();
                 self.engine_op(
                     async move {
+                        let id = target.local_id_or_error()?;
                         match target {
-                            RenameTarget::Project(project_id) => {
-                                client.rename_project(project_id, &label).await
-                            }
-                            RenameTarget::Tab(tab_id) => client.set_tab_title(tab_id, &label).await,
+                            RenameTarget::Project(_) => client.rename_project(id, &label).await,
+                            RenameTarget::Tab(_) => client.set_tab_title(id, &label).await,
                         }
                         .map_err(|error| error.to_string())
                     },
@@ -1350,7 +1372,7 @@ impl App {
             self.cancel_editor_for_interaction();
         }
         let link_modifier_held = self.link_modifier_held();
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, self.backend.tab_key(tab_id)) else {
             tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
             return UiTask::None;
         };
@@ -1393,8 +1415,9 @@ impl App {
         );
         #[cfg(target_os = "linux")]
         if outcome.paste_selection {
+            let key = self.backend.tab_key(tab_id);
             self.clipboard
-                .enqueue_paste_read(ClipboardOp::Selection, tab_id);
+                .enqueue_paste_read(ClipboardOp::Selection, key);
         }
         let clipboard = self.clipboard.start_next();
         match outcome.open_url {
@@ -1410,7 +1433,7 @@ impl App {
             col,
             row,
         } = event;
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, self.backend.tab_key(tab_id)) else {
             tracing::debug!(tab_id, "ignored terminal wheel event for a closed tab");
             return UiTask::None;
         };
@@ -1429,7 +1452,7 @@ impl App {
     }
 
     pub fn pointer_leave(&mut self, tab_id: i64) {
-        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+        if let Some(tab) = self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
             tab.pointer_leave();
             if let Err(error) = tab.refresh_snapshot() {
                 tracing::warn!(?error, tab_id, "terminal hover refresh failed after leave");
@@ -1459,7 +1482,10 @@ const FILE_DROP_DEBOUNCE: Duration = Duration::from_millis(50);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PendingFileDrop {
-    tab_id: i64,
+    /// The stable origin, host-qualified. The gesture is debounced, so
+    /// this is a delayed target like the clipboard read's: a bare number
+    /// resolved at delivery time could name a different instance's tab.
+    tab: TabKey,
     paths: Vec<PathBuf>,
     deadline: Instant,
 }
@@ -1479,7 +1505,7 @@ impl FileDropQueue {
     /// palette, or an editor between per-path events.
     pub(super) fn push_at(
         &mut self,
-        new_origin: Option<i64>,
+        new_origin: Option<TabKey>,
         path: PathBuf,
         now: Instant,
     ) -> (Option<PendingFileDrop>, bool) {
@@ -1495,11 +1521,11 @@ impl FileDropQueue {
                 (ready, true)
             }
             None => {
-                let Some(tab_id) = new_origin else {
+                let Some(tab) = new_origin else {
                     return (ready, false);
                 };
                 self.pending = Some(PendingFileDrop {
-                    tab_id,
+                    tab,
                     paths: vec![path],
                     deadline: now + FILE_DROP_DEBOUNCE,
                 });
@@ -1549,7 +1575,7 @@ pub(super) fn native_file_drop_origin(
     app_window: Option<window::Id>,
     event_window: window::Id,
     route: KeyboardRoute,
-) -> Option<i64> {
+) -> Option<TabKey> {
     (app_window == Some(event_window))
         .then_some(route)
         .and_then(|route| match route {
@@ -1569,8 +1595,13 @@ enum ClipboardReadDestination {
     Ipc(ClipboardReply),
     /// `target` rides along because the image fallback is system-clipboard
     /// only — see [`paste_read_followup`].
+    ///
+    /// `tab` is host-qualified because the read is a DELAYED callback: the
+    /// clipboard round-trip (and the image probe behind it) can outlive a
+    /// connection epoch, and a bare number would then paste into whatever
+    /// tab holds it by the time the text arrives.
     Paste {
-        tab_id: i64,
+        tab: TabKey,
         target: ClipboardOp,
     },
 }
@@ -1581,7 +1612,7 @@ enum ClipboardReadCompletion {
         value: Option<String>,
     },
     Paste {
-        tab_id: i64,
+        tab: TabKey,
         target: ClipboardOp,
         value: Option<String>,
     },
@@ -1658,12 +1689,10 @@ impl ClipboardQueue {
         request_id
     }
 
-    fn enqueue_paste_read(&mut self, target: ClipboardOp, tab_id: i64) -> u64 {
+    fn enqueue_paste_read(&mut self, target: ClipboardOp, tab: TabKey) -> u64 {
         let request_id = self.allocate_request_id();
-        self.pending_reads.insert(
-            request_id,
-            ClipboardReadDestination::Paste { tab_id, target },
-        );
+        self.pending_reads
+            .insert(request_id, ClipboardReadDestination::Paste { tab, target });
         self.queued
             .push_back(ClipboardEffect::Read { request_id, target });
         request_id
@@ -1702,11 +1731,9 @@ impl ClipboardQueue {
         self.active_request_id = None;
         Some(match destination {
             ClipboardReadDestination::Ipc(reply) => ClipboardReadCompletion::Ipc { reply, value },
-            ClipboardReadDestination::Paste { tab_id, target } => ClipboardReadCompletion::Paste {
-                tab_id,
-                target,
-                value,
-            },
+            ClipboardReadDestination::Paste { tab, target } => {
+                ClipboardReadCompletion::Paste { tab, target, value }
+            }
         })
     }
 
@@ -1775,13 +1802,13 @@ fn enqueue_selection_copy(
 fn paste_read_followup(
     clipboard: &mut ClipboardQueue,
     target: ClipboardOp,
-    tab_id: i64,
+    tab: TabKey,
     text: Option<&str>,
 ) -> UiTask {
     let probe = match target {
         ClipboardOp::Selection => UiTask::None,
         ClipboardOp::System if text.is_some_and(|text| !text.is_empty()) => UiTask::None,
-        ClipboardOp::System => UiTask::PasteImageProbe { tab_id },
+        ClipboardOp::System => UiTask::PasteImageProbe { tab },
     };
     clipboard.start_next().then(probe)
 }
@@ -1790,13 +1817,15 @@ fn paste_read_followup(
 /// — never the active tab, which may have changed while the clipboard
 /// read blocked. `None` means the probe found no image and already
 /// logged why.
-fn deliver_paste_image(tabs: &HashMap<i64, TerminalTab>, tab_id: i64, path: Option<&str>) {
+fn deliver_paste_image(tabs: &HashMap<TabKey, TerminalTab>, key: TabKey, path: Option<&str>) {
     let Some(path) = path else {
         return;
     };
-    match tabs.get(&tab_id) {
+    match tabs.get(&key) {
         Some(tab) => tab.paste(Some(path)),
-        None => tracing::debug!(tab_id, "discarded clipboard image paste for a closed tab"),
+        // A stale instance's key matches nothing live, so the probe's
+        // image lands nowhere rather than in the local tab of that number.
+        None => tracing::debug!(?key, "discarded clipboard image paste for a closed tab"),
     }
 }
 
@@ -1809,23 +1838,26 @@ pub(super) fn paste_bytes(terminal: &Terminal, text: Option<&str>) -> Vec<u8> {
 
 impl App {
     pub(super) fn deliver_file_drop(&mut self, batch: PendingFileDrop) {
-        let tab_id = batch.tab_id;
-        let origin_live = self.workspace.tab(tab_id).is_ok() && self.tabs.contains_key(&tab_id);
+        let key = batch.tab;
+        let origin_live = key
+            .local_tab()
+            .is_some_and(|tab_id| self.workspace.tab(tab_id).is_ok())
+            && self.tabs.contains_key(&key);
         let disposition = dispatch_file_drop_batch(batch, origin_live, |text| {
             // The stable origin was stamped by the first window event. It
             // cannot change when another tab gains focus during debounce.
             self.tabs
-                .get(&tab_id)
+                .get(&key)
                 .expect("live file-drop origin must have a terminal adapter")
                 .paste(Some(text));
         });
         match disposition {
             FileDropDisposition::Pasted => {}
             FileDropDisposition::Invalid => {
-                tracing::debug!(tab_id, "ignored file drop with no safe local paths")
+                tracing::debug!(?key, "ignored file drop with no safe local paths")
             }
             FileDropDisposition::ClosedOrigin => {
-                tracing::debug!(tab_id, "discarded file drop for a closed tab")
+                tracing::debug!(?key, "discarded file drop for a closed tab")
             }
         }
     }
@@ -1840,17 +1872,13 @@ impl App {
                 let _ = reply.send(Ok(value));
                 self.clipboard.start_next()
             }
-            ClipboardReadCompletion::Paste {
-                tab_id,
-                target,
-                value,
-            } => {
-                let Some(tab) = self.tabs.get(&tab_id) else {
-                    tracing::debug!(tab_id, request_id, "discarded paste for a closed tab");
+            ClipboardReadCompletion::Paste { tab, target, value } => {
+                let Some(terminal) = self.tabs.get(&tab) else {
+                    tracing::debug!(?tab, request_id, "discarded paste for a closed tab");
                     return self.clipboard.start_next();
                 };
-                tab.paste(value.as_deref());
-                paste_read_followup(&mut self.clipboard, target, tab_id, value.as_deref())
+                terminal.paste(value.as_deref());
+                paste_read_followup(&mut self.clipboard, target, tab, value.as_deref())
             }
         }
     }
@@ -1858,8 +1886,8 @@ impl App {
     /// A clipboard image probe reported back. Two pastes racing produce
     /// two temp files and two pastes — tolerated: each one is what the
     /// user asked for, and the file the loser wrote is still theirs.
-    pub fn paste_image_materialized(&self, tab_id: i64, path: Option<&str>) {
-        deliver_paste_image(&self.tabs, tab_id, path);
+    pub fn paste_image_materialized(&self, tab: TabKey, path: Option<&str>) {
+        deliver_paste_image(&self.tabs, tab, path);
     }
 
     pub fn clipboard_write_completed(&mut self, request_id: u64) -> UiTask {
@@ -1872,7 +1900,7 @@ impl App {
 
     pub(super) fn copy_active_selection(&mut self) -> UiTask {
         let tab_id = self.workspace.active().1;
-        let text = match self.tabs.get_mut(&tab_id) {
+        let text = match self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
             Some(tab) => match tab.selected_text() {
                 Ok(text) => text,
                 Err(error) => {
@@ -1887,11 +1915,11 @@ impl App {
     }
 
     pub(super) fn paste_into_active(&mut self, target: ClipboardOp) -> UiTask {
-        let tab_id = self.workspace.active().1;
-        if !self.tabs.contains_key(&tab_id) {
+        let tab = self.active_tab_key();
+        if !self.tabs.contains_key(&tab) {
             return UiTask::None;
         }
-        self.clipboard.enqueue_paste_read(target, tab_id);
+        self.clipboard.enqueue_paste_read(target, tab);
         self.clipboard.start_next()
     }
 }
@@ -1947,6 +1975,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use roost_ui_model::keys::HostId;
+
     use super::*;
 
     fn deliver_ipc(completion: ClipboardReadCompletion) {
@@ -1999,12 +2029,12 @@ mod tests {
         let start = Instant::now();
         let mut queue = FileDropQueue::default();
         assert_eq!(
-            queue.push_at(Some(7), PathBuf::from("/tmp/first"), start),
+            queue.push_at(Some(TabKey::local(7)), PathBuf::from("/tmp/first"), start),
             (None, true)
         );
         assert_eq!(
             queue.push_at(
-                Some(7),
+                Some(TabKey::local(7)),
                 PathBuf::from("/tmp/second"),
                 start + Duration::from_millis(40)
             ),
@@ -2016,7 +2046,7 @@ mod tests {
         let batch = queue
             .take_ready_at(start + Duration::from_millis(90))
             .expect("extended deadline is inclusive");
-        assert_eq!(batch.tab_id, 7);
+        assert_eq!(batch.tab, TabKey::local(7));
         assert_eq!(
             batch.paths,
             [PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
@@ -2033,7 +2063,7 @@ mod tests {
         let start = Instant::now();
         let mut queue = FileDropQueue::default();
         assert_eq!(
-            queue.push_at(Some(7), PathBuf::from("/tmp/first"), start),
+            queue.push_at(Some(TabKey::local(7)), PathBuf::from("/tmp/first"), start),
             (None, true)
         );
         let first_shot = queue.pending_deadline().expect("the first path is pending");
@@ -2041,7 +2071,7 @@ mod tests {
 
         assert_eq!(
             queue.push_at(
-                Some(7),
+                Some(TabKey::local(7)),
                 PathBuf::from("/tmp/second"),
                 start + Duration::from_millis(30),
             ),
@@ -2088,22 +2118,22 @@ mod tests {
             "an unowned event cannot start a batch"
         );
         assert_eq!(
-            queue.push_at(Some(7), PathBuf::from("/tmp/first"), start),
+            queue.push_at(Some(TabKey::local(7)), PathBuf::from("/tmp/first"), start),
             (None, true)
         );
         let (expired, accepted) = queue.push_at(
-            Some(7),
+            Some(TabKey::local(7)),
             PathBuf::from("/tmp/second"),
             start + FILE_DROP_DEBOUNCE,
         );
         let expired = expired.expect("deadline boundary flushes before accepting a path");
         assert!(accepted);
-        assert_eq!(expired.tab_id, 7);
+        assert_eq!(expired.tab, TabKey::local(7));
         assert_eq!(expired.paths, [PathBuf::from("/tmp/first")]);
 
         assert_eq!(
             queue.push_at(
-                Some(9),
+                Some(TabKey::local(9)),
                 PathBuf::from("/tmp/third"),
                 start + FILE_DROP_DEBOUNCE + Duration::from_millis(1),
             ),
@@ -2122,7 +2152,7 @@ mod tests {
         let current = queue
             .take_ready_at(start + 2 * FILE_DROP_DEBOUNCE + Duration::from_millis(2))
             .expect("second gesture remains independently flushable at its extended deadline");
-        assert_eq!(current.tab_id, 7);
+        assert_eq!(current.tab, TabKey::local(7));
         assert_eq!(
             current.paths,
             [
@@ -2138,15 +2168,23 @@ mod tests {
         let owned = window::Id::unique();
         let other = window::Id::unique();
         assert_eq!(
-            native_file_drop_origin(Some(owned), owned, KeyboardRoute::Terminal(42)),
-            Some(42)
+            native_file_drop_origin(
+                Some(owned),
+                owned,
+                KeyboardRoute::Terminal(TabKey::local(42))
+            ),
+            Some(TabKey::local(42))
         );
         assert_eq!(
-            native_file_drop_origin(Some(owned), other, KeyboardRoute::Terminal(42)),
+            native_file_drop_origin(
+                Some(owned),
+                other,
+                KeyboardRoute::Terminal(TabKey::local(42))
+            ),
             None
         );
         assert_eq!(
-            native_file_drop_origin(None, owned, KeyboardRoute::Terminal(42)),
+            native_file_drop_origin(None, owned, KeyboardRoute::Terminal(TabKey::local(42))),
             None
         );
         for route in [
@@ -2162,7 +2200,7 @@ mod tests {
     fn file_drop_batch_is_one_plain_or_bracketed_paste_and_never_retargets() {
         let start = Instant::now();
         let batch = || PendingFileDrop {
-            tab_id: 41,
+            tab: TabKey::local(41),
             paths: vec![
                 PathBuf::from("/tmp/My File.png"),
                 PathBuf::from("/tmp/My File.png"),
@@ -2211,9 +2249,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn file_drop_batch_reaches_terminal_session_capture_exactly_once() {
         let (mut tab, supervisor) = attached_test_terminal(9_043);
-        let capture = tab.input_capture.as_ref().unwrap();
+        let capture = tab.session.capture().unwrap();
         let batch = || PendingFileDrop {
-            tab_id: 9_043,
+            tab: TabKey::local(9_043),
             paths: vec![
                 PathBuf::from("/tmp/My File.png"),
                 PathBuf::from("/tmp/second.png"),
@@ -2247,7 +2285,7 @@ mod tests {
     fn file_drop_invalid_first_path_keeps_origin_but_emits_no_empty_write() {
         let start = Instant::now();
         let invalid = PendingFileDrop {
-            tab_id: 77,
+            tab: TabKey::local(77),
             paths: vec![PathBuf::from("/tmp/unsafe\npath")],
             deadline: start,
         };
@@ -2258,12 +2296,16 @@ mod tests {
 
         let mut queue = FileDropQueue::default();
         assert_eq!(
-            queue.push_at(Some(77), PathBuf::from("/tmp/unsafe\npath"), start),
+            queue.push_at(
+                Some(TabKey::local(77)),
+                PathBuf::from("/tmp/unsafe\npath"),
+                start
+            ),
             (None, true)
         );
         assert_eq!(
             queue.push_at(
-                Some(77),
+                Some(TabKey::local(77)),
                 PathBuf::from("/tmp/safe path"),
                 start + Duration::from_millis(1),
             ),
@@ -2272,7 +2314,7 @@ mod tests {
         let batch = queue
             .take_ready_at(start + Duration::from_millis(51))
             .unwrap();
-        assert_eq!(batch.tab_id, 77);
+        assert_eq!(batch.tab, TabKey::local(77));
         let mut resolved = None;
         assert_eq!(
             dispatch_file_drop_batch(batch, true, |text| resolved = Some(text.to_string())),
@@ -2977,7 +3019,11 @@ mod tests {
     #[test]
     fn rename_editor_uses_typed_stable_targets_and_visibility() {
         let (projects, first_project, first_tab, second_tab) = rename_fixture();
-        let project = begin_rename_editor(&projects, RenameTarget::Project(first_project)).unwrap();
+        let project = begin_rename_editor(
+            &projects,
+            RenameTarget::Project(ProjectKey::local(first_project)),
+        )
+        .unwrap();
         assert_eq!(project.opened_label, "First");
         assert!(rename_editor_is_renderable(
             &project,
@@ -2992,7 +3038,8 @@ mod tests {
             true
         ));
 
-        let tab = begin_rename_editor(&projects, RenameTarget::Tab(first_tab)).unwrap();
+        let tab =
+            begin_rename_editor(&projects, RenameTarget::Tab(TabKey::local(first_tab))).unwrap();
         assert!(rename_editor_is_renderable(
             &tab,
             &projects,
@@ -3005,9 +3052,15 @@ mod tests {
             projects.last().unwrap().id,
             false
         ));
-        assert!(begin_rename_editor(&projects, RenameTarget::Tab(second_tab)).is_ok());
-        assert!(begin_rename_editor(&projects, RenameTarget::Project(0)).is_err());
-        assert!(begin_rename_editor(&projects, RenameTarget::Tab(i64::MAX)).is_err());
+        assert!(
+            begin_rename_editor(&projects, RenameTarget::Tab(TabKey::local(second_tab))).is_ok()
+        );
+        assert!(
+            begin_rename_editor(&projects, RenameTarget::Project(ProjectKey::local(0))).is_err()
+        );
+        assert!(
+            begin_rename_editor(&projects, RenameTarget::Tab(TabKey::local(i64::MAX))).is_err()
+        );
     }
 
     #[test]
@@ -3078,13 +3131,14 @@ mod tests {
     /// return to the completion.
     #[test]
     fn a_failed_rename_keeps_the_editor_open_with_its_draft() {
-        let mut editor = rename_editor_for(RenameTarget::Project(7), "recover me");
+        let mut editor =
+            rename_editor_for(RenameTarget::Project(ProjectKey::local(7)), "recover me");
         let mut pending = None;
         let mut in_flight = None;
         assert_eq!(
             plan_rename_submission_once(&mut editor, &mut pending, in_flight, 1),
             RenameSubmission::Dispatch {
-                target: RenameTarget::Project(7),
+                target: RenameTarget::Project(ProjectKey::local(7)),
                 label: "recover me".into(),
                 op: 1,
             }
@@ -3117,7 +3171,7 @@ mod tests {
         assert_eq!(
             plan_rename_submission_once(&mut editor, &mut pending, in_flight, 2),
             RenameSubmission::Dispatch {
-                target: RenameTarget::Project(7),
+                target: RenameTarget::Project(ProjectKey::local(7)),
                 label: "recover me".into(),
                 op: 2,
             }
@@ -3130,7 +3184,7 @@ mod tests {
     /// an engine already renaming.
     #[test]
     fn a_rename_in_flight_refuses_a_second_submit() {
-        let mut editor = rename_editor_for(RenameTarget::Tab(9), "new title");
+        let mut editor = rename_editor_for(RenameTarget::Tab(TabKey::local(9)), "new title");
         let mut pending = None;
         assert!(matches!(
             plan_rename_submission_once(&mut editor, &mut pending, None, 1),
@@ -3148,7 +3202,7 @@ mod tests {
 
     #[test]
     fn held_palette_enter_cannot_submit_the_editor_it_opens() {
-        let mut editor = rename_editor_for(RenameTarget::Tab(9), "title");
+        let mut editor = rename_editor_for(RenameTarget::Tab(TabKey::local(9)), "title");
         let mut pending = None;
         arm_rename_completion_for_open_editor(&mut pending, editor.is_some());
         assert_eq!(
@@ -3161,7 +3215,7 @@ mod tests {
         assert_eq!(
             plan_rename_submission_once(&mut editor, &mut pending, None, 2),
             RenameSubmission::Dispatch {
-                target: RenameTarget::Tab(9),
+                target: RenameTarget::Tab(TabKey::local(9)),
                 label: "title".into(),
                 op: 2,
             }
@@ -3170,11 +3224,11 @@ mod tests {
 
     #[test]
     fn rename_submit_trims_dispatches_exact_target_and_closes_on_success() {
-        let mut editor = rename_editor_for(RenameTarget::Tab(42), "  new  title  ");
+        let mut editor = rename_editor_for(RenameTarget::Tab(TabKey::local(42)), "  new  title  ");
         assert_eq!(
             plan_rename_submission(&mut editor, 1),
             RenameSubmission::Dispatch {
-                target: RenameTarget::Tab(42),
+                target: RenameTarget::Tab(TabKey::local(42)),
                 label: "new  title".into(),
                 op: 1,
             }
@@ -3195,7 +3249,7 @@ mod tests {
 
     #[test]
     fn empty_rename_never_dispatches() {
-        let mut empty = rename_editor_for(RenameTarget::Project(7), " \t ");
+        let mut empty = rename_editor_for(RenameTarget::Project(ProjectKey::local(7)), " \t ");
         assert_eq!(
             plan_rename_submission(&mut empty, 1),
             RenameSubmission::Settled
@@ -3215,7 +3269,7 @@ mod tests {
     /// editor nor raise its error over it.
     #[test]
     fn a_rename_completion_for_a_dismissed_editor_touches_the_reopened_one() {
-        let mut editor = rename_editor_for(RenameTarget::Project(7), "first");
+        let mut editor = rename_editor_for(RenameTarget::Project(ProjectKey::local(7)), "first");
         let mut pending = None;
         let mut in_flight = None;
         assert!(matches!(
@@ -3232,7 +3286,7 @@ mod tests {
             RenameSubmission::InFlight
         );
         in_flight = None;
-        editor = rename_editor_for(RenameTarget::Tab(9), "second");
+        editor = rename_editor_for(RenameTarget::Tab(TabKey::local(9)), "second");
         pending = None;
 
         let reopened = editor.clone();
@@ -3269,7 +3323,11 @@ mod tests {
     #[test]
     fn concurrent_snapshot_rename_never_overwrites_the_draft() {
         let (mut projects, project_id, _, _) = rename_fixture();
-        let mut editor = begin_rename_editor(&projects, RenameTarget::Project(project_id)).unwrap();
+        let mut editor = begin_rename_editor(
+            &projects,
+            RenameTarget::Project(ProjectKey::local(project_id)),
+        )
+        .unwrap();
         editor.draft = "my draft".into();
         projects
             .iter_mut()
@@ -3518,8 +3576,8 @@ mod tests {
     #[test]
     fn paste_reads_keep_the_initiating_tab_and_reject_stale_results() {
         let mut queue = ClipboardQueue::default();
-        let first_id = queue.enqueue_paste_read(ClipboardOp::System, 41);
-        let second_id = queue.enqueue_paste_read(ClipboardOp::Selection, 42);
+        let first_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(41));
+        let second_id = queue.enqueue_paste_read(ClipboardOp::Selection, TabKey::local(42));
         assert!(matches!(
             queue.start_next(),
             UiTask::ClipboardRead { request_id, target: ClipboardOp::System }
@@ -3534,10 +3592,10 @@ mod tests {
         assert!(matches!(
             completion,
             ClipboardReadCompletion::Paste {
-                tab_id: 41,
+                tab,
                 target: ClipboardOp::System,
                 value: Some(ref value),
-            } if value == "first"
+            } if tab == TabKey::local(41) && value == "first"
         ));
         assert!(matches!(
             queue.start_next(),
@@ -3649,7 +3707,7 @@ mod tests {
         assert_eq!(bindings.get(&accelerator), Some(&KeybindAction::Paste));
 
         let mut queue = ClipboardQueue::default();
-        let request_id = queue.enqueue_paste_read(ClipboardOp::System, 73);
+        let request_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(73));
         assert!(matches!(
             queue.start_next(),
             UiTask::ClipboardRead { request_id: scheduled, .. } if scheduled == request_id
@@ -3657,10 +3715,10 @@ mod tests {
         let completion = queue
             .complete_read(request_id, Some("mac paste".into()))
             .expect("native read completion");
-        let ClipboardReadCompletion::Paste { tab_id, value, .. } = completion else {
+        let ClipboardReadCompletion::Paste { tab, value, .. } = completion else {
             panic!("expected initiating-tab paste completion")
         };
-        assert_eq!(tab_id, 73);
+        assert_eq!(tab, TabKey::local(73));
         let terminal = Terminal::new(TerminalOptions {
             cols: 80,
             rows: 24,
@@ -3674,20 +3732,25 @@ mod tests {
     fn only_an_empty_system_paste_probes_for_a_clipboard_image() {
         let mut queue = ClipboardQueue::default();
         assert!(matches!(
-            paste_read_followup(&mut queue, ClipboardOp::System, 7, None),
-            UiTask::PasteImageProbe { tab_id: 7 }
+            paste_read_followup(&mut queue, ClipboardOp::System, TabKey::local(7), None),
+            UiTask::PasteImageProbe { tab } if tab == TabKey::local(7)
         ));
         assert!(matches!(
-            paste_read_followup(&mut queue, ClipboardOp::System, 7, Some("")),
-            UiTask::PasteImageProbe { tab_id: 7 }
+            paste_read_followup(&mut queue, ClipboardOp::System, TabKey::local(7), Some("")),
+            UiTask::PasteImageProbe { tab } if tab == TabKey::local(7)
         ));
         assert!(matches!(
-            paste_read_followup(&mut queue, ClipboardOp::System, 7, Some("text")),
+            paste_read_followup(
+                &mut queue,
+                ClipboardOp::System,
+                TabKey::local(7),
+                Some("text")
+            ),
             UiTask::None
         ));
         // Matches the (now-removed) GTK UI: a PRIMARY paste has no image branch at all.
         assert!(matches!(
-            paste_read_followup(&mut queue, ClipboardOp::Selection, 7, None),
+            paste_read_followup(&mut queue, ClipboardOp::Selection, TabKey::local(7), None),
             UiTask::None
         ));
 
@@ -3695,7 +3758,7 @@ mod tests {
         // blocking probe.
         let queued = queue.enqueue_write(ClipboardOp::System, "queued".into());
         let UiTask::Then(first, second) =
-            paste_read_followup(&mut queue, ClipboardOp::System, 7, None)
+            paste_read_followup(&mut queue, ClipboardOp::System, TabKey::local(7), None)
         else {
             panic!("the clipboard queue must resume alongside the probe")
         };
@@ -3703,18 +3766,22 @@ mod tests {
             *first,
             UiTask::ClipboardWrite { request_id, .. } if request_id == queued
         ));
-        assert!(matches!(*second, UiTask::PasteImageProbe { tab_id: 7 }));
+        assert!(matches!(*second, UiTask::PasteImageProbe { tab } if tab == TabKey::local(7)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_materialized_image_path_reaches_only_the_tab_that_pasted() {
         let (tab, supervisor) = attached_test_terminal(9_101);
-        let capture = tab.input_capture.clone().expect("test-mode input capture");
-        let mut tabs = HashMap::from([(9_101_i64, tab)]);
+        let capture = tab
+            .session
+            .capture()
+            .cloned()
+            .expect("test-mode input capture");
+        let mut tabs = HashMap::from([(TabKey::local(9_101), tab)]);
 
         deliver_paste_image(
             &tabs,
-            9_101,
+            TabKey::local(9_101),
             Some("/tmp/roost-image-1-0123456789abcdef.png"),
         );
         assert_eq!(
@@ -3723,10 +3790,12 @@ mod tests {
         );
 
         capture.lock().unwrap().clear();
-        tabs.get_mut(&9_101).unwrap().write_vt(b"\x1b[?2004h");
+        tabs.get_mut(&TabKey::local(9_101))
+            .unwrap()
+            .write_vt(b"\x1b[?2004h");
         deliver_paste_image(
             &tabs,
-            9_101,
+            TabKey::local(9_101),
             Some("/tmp/roost-image-2-fedcba9876543210.png"),
         );
         assert_eq!(
@@ -3735,14 +3804,65 @@ mod tests {
         );
 
         capture.lock().unwrap().clear();
-        deliver_paste_image(&tabs, 9_101, None);
+        deliver_paste_image(&tabs, TabKey::local(9_101), None);
         deliver_paste_image(
             &tabs,
-            9_102,
+            TabKey::local(9_102),
             Some("/tmp/roost-image-3-00112233445566ff.png"),
         );
         assert!(capture.lock().unwrap().is_empty());
         supervisor.close(9_101);
+    }
+
+    /// A paste is a delayed callback: the clipboard read (and the image
+    /// probe behind it) can outlive the connection epoch that started it.
+    /// The whole chain — the queued destination, the completion, the probe
+    /// task and the image delivery — must carry the ORIGINATING instance,
+    /// so a paste started on a dead epoch lands nowhere rather than in the
+    /// live local tab of the same number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paste_from_a_stale_instance_never_reaches_the_local_tab_of_that_id() {
+        let stale = TabKey::new(HostId::new(9), 9_201);
+        let (tab, supervisor) = attached_test_terminal(9_201);
+        let capture = tab
+            .session
+            .capture()
+            .cloned()
+            .expect("test-mode input capture");
+        let tabs = HashMap::from([(TabKey::local(9_201), tab)]);
+
+        let mut queue = ClipboardQueue::default();
+        let request_id = queue.enqueue_paste_read(ClipboardOp::System, stale);
+        assert!(matches!(queue.start_next(), UiTask::ClipboardRead { .. }));
+        let completion = queue
+            .complete_read(request_id, None)
+            .expect("active paste completion");
+        let ClipboardReadCompletion::Paste { tab, value, target } = completion else {
+            panic!("expected an initiating-tab paste completion")
+        };
+        assert_eq!(
+            tab, stale,
+            "the completion carries the epoch the paste started on"
+        );
+        assert_ne!(tab, TabKey::local(9_201));
+
+        // The empty system read hands the probe the same key.
+        assert!(matches!(
+            paste_read_followup(&mut queue, target, tab, value.as_deref()),
+            UiTask::PasteImageProbe { tab } if tab == stale
+        ));
+
+        // …and the materialized image finds nothing to paste into.
+        deliver_paste_image(
+            &tabs,
+            stale,
+            Some("/tmp/roost-image-9-0011223344556677.png"),
+        );
+        assert!(
+            capture.lock().unwrap().is_empty(),
+            "a stale epoch's paste must not reach the live tab of that number"
+        );
+        supervisor.close(9_201);
     }
 
     #[test]
@@ -3830,7 +3950,7 @@ mod tests {
         assert_eq!(tab.tracking_pointer, None);
         assert_eq!(tab.local_pointer_gesture, None);
 
-        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        let captured = captured_input(&tab);
         assert!(captured.windows(3).any(|bytes| bytes == b"\x1b[<"));
         supervisor.close(91);
     }
@@ -3842,7 +3962,7 @@ mod tests {
         // IPC op bypasses.
         let (mut tab, supervisor) = attached_test_terminal(403);
         tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
 
         native_pointer(
             &mut tab,
@@ -3874,12 +3994,12 @@ mod tests {
             false,
         );
 
-        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        let captured = captured_input(&tab);
         assert_eq!(captured, b"\x1b[<0;3;3M\x1b[<0;3;3m".to_vec());
 
         // A real crossing still reports, and returning to the press cell
         // reports again — this is a cell gate, not a time throttle.
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         native_pointer(
             &mut tab,
             PointerAction::Press,
@@ -3902,7 +4022,7 @@ mod tests {
             false,
         );
 
-        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        let captured = captured_input(&tab);
         assert_eq!(
             captured,
             b"\x1b[<0;3;3M\x1b[<32;5;3M\x1b[<32;3;3M\x1b[<0;3;3m".to_vec()
@@ -3914,7 +4034,7 @@ mod tests {
     async fn geometry_transaction_defers_in_band_reports_until_commit() {
         let (mut tab, supervisor) = attached_test_terminal(92);
         tab.write_vt(b"\x1b[?2048h");
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
 
         let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
         let change = tab
@@ -3922,26 +4042,16 @@ mod tests {
             .expect("stage candidate geometry")
             .expect("candidate changes geometry");
         assert!(
-            tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            captured_input(&tab).is_empty(),
             "libghostty size reports must remain internal until batch commit"
         );
         tab.commit_geometry(change);
         assert!(
-            !tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            !captured_input(&tab).is_empty(),
             "successful commit delivers the staged in-band report"
         );
 
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         let smaller = TerminalMetrics::measure(13.0).expect("smaller metrics");
         let change = tab
             .apply_geometry(100, 32, smaller, 3)
@@ -3950,12 +4060,7 @@ mod tests {
         tab.rollback_geometry(change.previous.expect("installed prior geometry"))
             .expect("rollback candidate geometry");
         assert!(
-            tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            captured_input(&tab).is_empty(),
             "candidate and rollback reports must not escape a failed transaction"
         );
         supervisor.close(92);
@@ -3975,7 +4080,7 @@ mod tests {
             true,
             false,
         );
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
 
         let grid_change = tab
             .apply_geometry(99, 31, original, 1)
@@ -3994,7 +4099,7 @@ mod tests {
         );
         assert_eq!(tab.tracking_pointer, None);
         assert_eq!(
-            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
+            captured_input(&tab).last(),
             Some(&b'm'),
             "the native release reaches the tracked application after grid-only resize"
         );
@@ -4008,33 +4113,21 @@ mod tests {
             true,
             false,
         );
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
         let metric_change = tab
             .apply_geometry(92, 28, larger, 2)
             .expect("apply metric change")
             .expect("metrics changed");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
-        assert!(tab
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(captured_input(&tab).is_empty());
         let release = tab.prepare_pointer_cancel().expect("stage tracked release");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
-        assert!(tab
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(captured_input(&tab).is_empty());
         tab.commit_pointer_cancel(release);
         assert_eq!(tab.tracking_pointer, None);
         assert_eq!(
-            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
+            captured_input(&tab).last(),
             Some(&b'm'),
             "committed metric replacement sends its staged release"
         );
@@ -4049,7 +4142,7 @@ mod tests {
             true,
             false,
         );
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        clear_captured_input(&tab);
         let rollback = tab
             .apply_geometry(99, 31, original, 3)
             .expect("stage failed metric candidate")
@@ -4058,12 +4151,7 @@ mod tests {
             .expect("roll back failed metric candidate");
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
         assert!(
-            tab.input_capture
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_empty(),
+            captured_input(&tab).is_empty(),
             "failed metric transition must not release or clear mouse ownership"
         );
         native_pointer(
@@ -4076,10 +4164,7 @@ mod tests {
             false,
         );
         assert_eq!(tab.tracking_pointer, None);
-        assert_eq!(
-            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
-            Some(&b'm')
-        );
+        assert_eq!(captured_input(&tab).last(), Some(&b'm'));
         supervisor.close(93);
     }
 
@@ -4101,44 +4186,20 @@ mod tests {
 
         let (mut tracked, tracked_supervisor) = attached_test_terminal(192);
         tracked.write_vt(b"\x1b[?1000h\x1b[?1006h");
-        tracked
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clear();
+        clear_captured_input(&tracked);
         tracked.handle_wheel(2.0, 3, 1, 0).expect("tracked wheel");
-        let captured = tracked
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clone();
+        let captured = captured_input(&tracked);
         assert_eq!(captured.iter().filter(|byte| **byte == b'M').count(), 2);
         assert!(captured.windows(5).any(|bytes| bytes == b"\x1b[<64"));
         tracked_supervisor.close(192);
 
         let (mut alternate, alternate_supervisor) = attached_test_terminal(193);
         alternate.write_vt(b"\x1b[?1049h");
-        alternate
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clear();
+        clear_captured_input(&alternate);
         alternate
             .handle_wheel(2.0, 3, 1, 0)
             .expect("alternate-screen wheel");
-        let captured = alternate
-            .input_capture
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clone();
+        let captured = captured_input(&alternate);
         assert_eq!(captured, b"\x1b[A\x1b[A");
         alternate_supervisor.close(193);
     }
@@ -4173,11 +4234,11 @@ mod tests {
     }
 
     fn captured_input(tab: &TerminalTab) -> Vec<u8> {
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clone()
+        tab.session.capture().unwrap().lock().unwrap().clone()
     }
 
     fn clear_captured_input(tab: &TerminalTab) {
-        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        tab.session.capture().unwrap().lock().unwrap().clear();
     }
 
     fn viewport_offset(tab: &TerminalTab) -> u64 {
@@ -4775,10 +4836,10 @@ mod tests {
     fn composing_pair(
         first: i64,
         second: i64,
-    ) -> (HashMap<i64, TerminalTab>, Vec<Arc<PtySupervisor>>) {
+    ) -> (HashMap<TabKey, TerminalTab>, Vec<Arc<PtySupervisor>>) {
         let (one, one_supervisor) = attached_test_terminal(first);
         let (two, two_supervisor) = attached_test_terminal(second);
-        let tabs = HashMap::from_iter([(first, one), (second, two)]);
+        let tabs = HashMap::from_iter([(TabKey::local(first), one), (TabKey::local(second), two)]);
         for tab in tabs.values() {
             clear_captured_input(tab);
         }
@@ -4793,14 +4854,19 @@ mod tests {
         set_preedit_in(
             &mut tabs,
             &mut discard,
-            KeyboardRoute::Terminal(403),
+            KeyboardRoute::Terminal(TabKey::local(403)),
             "你".into(),
             Some(0..3),
         );
         // The active tab already moved; the composition still owns the commit.
-        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(404), "你");
-        assert_eq!(captured_input(&tabs[&403]), "你".as_bytes());
-        assert!(captured_input(&tabs[&404]).is_empty());
+        commit_ime_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(TabKey::local(404)),
+            "你",
+        );
+        assert_eq!(captured_input(&tabs[&TabKey::local(403)]), "你".as_bytes());
+        assert!(captured_input(&tabs[&TabKey::local(404)]).is_empty());
         supervisors[0].close(403);
         supervisors[1].close(404);
     }
@@ -4817,20 +4883,25 @@ mod tests {
         set_preedit_in(
             &mut tabs,
             &mut discard,
-            KeyboardRoute::Terminal(405),
+            KeyboardRoute::Terminal(TabKey::local(405)),
             "你".into(),
             Some(0..3),
         );
         // What a tab switch does: reconcile cancels every composition the
         // newly active tab does not own.
-        cancel_preedits(&mut tabs, &mut discard, Some(406));
-        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(406), "你");
+        cancel_preedits(&mut tabs, &mut discard, Some(TabKey::local(406)));
+        commit_ime_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(TabKey::local(406)),
+            "你",
+        );
         assert!(
-            captured_input(&tabs[&405]).is_empty(),
+            captured_input(&tabs[&TabKey::local(405)]).is_empty(),
             "the cancelled composition must not type into the tab it left"
         );
         assert!(
-            captured_input(&tabs[&406]).is_empty(),
+            captured_input(&tabs[&TabKey::local(406)]).is_empty(),
             "nor into the tab that now owns the route"
         );
 
@@ -4839,14 +4910,19 @@ mod tests {
             set_preedit_in(
                 &mut tabs,
                 &mut discard,
-                KeyboardRoute::Terminal(406),
+                KeyboardRoute::Terminal(TabKey::local(406)),
                 text,
                 None,
             );
         }
-        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(406), "好");
-        assert_eq!(captured_input(&tabs[&406]), "好".as_bytes());
-        assert!(captured_input(&tabs[&405]).is_empty());
+        commit_ime_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(TabKey::local(406)),
+            "好",
+        );
+        assert_eq!(captured_input(&tabs[&TabKey::local(406)]), "好".as_bytes());
+        assert!(captured_input(&tabs[&TabKey::local(405)]).is_empty());
         supervisors[0].close(405);
         supervisors[1].close(406);
     }
@@ -4857,25 +4933,35 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_commit_with_no_composition_behind_it_still_reaches_the_route() {
         let (tab, supervisor) = attached_test_terminal(407);
-        let mut tabs = HashMap::from_iter([(407, tab)]);
-        clear_captured_input(&tabs[&407]);
+        let mut tabs = HashMap::from_iter([(TabKey::local(407), tab)]);
+        clear_captured_input(&tabs[&TabKey::local(407)]);
         let mut discard = ImeDiscard::default();
 
-        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(407), "👍");
-        assert_eq!(captured_input(&tabs[&407]), "👍".as_bytes());
-        clear_captured_input(&tabs[&407]);
+        commit_ime_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(TabKey::local(407)),
+            "👍",
+        );
+        assert_eq!(captured_input(&tabs[&TabKey::local(407)]), "👍".as_bytes());
+        clear_captured_input(&tabs[&TabKey::local(407)]);
 
         set_preedit_in(
             &mut tabs,
             &mut discard,
-            KeyboardRoute::Terminal(407),
+            KeyboardRoute::Terminal(TabKey::local(407)),
             String::new(),
             None,
         );
         cancel_preedits(&mut tabs, &mut discard, None);
-        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(407), "é");
+        commit_ime_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(TabKey::local(407)),
+            "é",
+        );
         assert_eq!(
-            captured_input(&tabs[&407]),
+            captured_input(&tabs[&TabKey::local(407)]),
             "é".as_bytes(),
             "cancelling an already-empty composition arms nothing"
         );

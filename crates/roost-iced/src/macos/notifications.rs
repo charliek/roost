@@ -40,6 +40,7 @@ use objc2_user_notifications::{
     UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
 use roost_ipc::messages::AppNotificationStatusResult;
+use roost_ui_model::keys::TabKey;
 use tokio::sync::oneshot;
 
 use crate::notifications::{Payload, Shown};
@@ -288,13 +289,13 @@ pub(crate) async fn show(payload: Payload) -> Result<Shown, String> {
     ) {
         tracing::debug!(
             title = %payload.title,
-            tab_id = payload.tab_id,
+            tab_id = payload.tab.tab,
             "notifications: backend not enabled; nothing shown"
         );
         return Ok(Shown::nothing());
     }
 
-    let identifier = identifier_for(payload.tab_id);
+    let identifier = identifier_for(payload.tab);
     let activation = with_pending(|pending| {
         // Reclaims both the entry a worker-side SHOW_TIMEOUT abandoned
         // and the one a `Retire` left behind: either way the listener
@@ -317,7 +318,7 @@ pub(crate) async fn show(payload: Payload) -> Result<Shown, String> {
         // The worker only ever hands this back as `replaces`; the
         // identifier is what actually makes the next banner replace this
         // one, so a truncating cast costs nothing.
-        server_id: Some(payload.tab_id as u32),
+        server_id: Some(payload.tab.tab as u32),
         // A closed channel is a dismissed banner, never a panic: a
         // replacing show drops the displaced sender while its listener is
         // still awaiting, and a panic there would kill that task.
@@ -377,8 +378,14 @@ fn show_allowed(enabled: bool, authorized: bool) -> bool {
 }
 
 /// Stable for the life of the tab: that is the whole replace mechanism.
-fn identifier_for(tab_id: i64) -> String {
-    format!("roost-tab-{tab_id}")
+///
+/// The identifier space is the whole process's, so it is keyed on the
+/// host-qualified tab rather than the bare id — two instances' tab 7 are
+/// two tabs and must not share (and silently replace) one banner. A local
+/// tab still renders `roost-tab-7`, so nothing an existing banner is
+/// registered under moves.
+fn identifier_for(tab: TabKey) -> String {
+    format!("roost-tab-{tab}")
 }
 
 fn display_title(title: &str) -> &str {
@@ -427,13 +434,26 @@ fn with_pending<T>(f: impl FnOnce(&mut PendingMap) -> T) -> T {
 
 #[cfg(test)]
 mod tests {
+    use roost_ui_model::keys::HostId;
+
     use super::*;
 
     #[test]
     fn a_tabs_identifier_is_stable_so_the_next_banner_replaces_the_last() {
-        assert_eq!(identifier_for(7), "roost-tab-7");
-        assert_eq!(identifier_for(7), identifier_for(7));
-        assert_ne!(identifier_for(7), identifier_for(8));
+        assert_eq!(identifier_for(TabKey::local(7)), "roost-tab-7");
+        assert_eq!(
+            identifier_for(TabKey::local(7)),
+            identifier_for(TabKey::local(7))
+        );
+        assert_ne!(
+            identifier_for(TabKey::local(7)),
+            identifier_for(TabKey::local(8))
+        );
+        assert_ne!(
+            identifier_for(TabKey::local(7)),
+            identifier_for(TabKey::new(HostId::new(1), 7)),
+            "two instances' tab 7 are two banners, not one that replaces the other"
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use roost_ui_model::keys::HostId;
+
 use super::*;
 
 pub(crate) struct AgentMetricsResult {
@@ -51,14 +53,14 @@ struct PendingAttach {
 /// attaches first on a shared tick is repeatable.
 #[derive(Debug, Default)]
 pub(super) struct PendingAttachments {
-    tabs: BTreeMap<i64, PendingAttach>,
+    tabs: BTreeMap<TabKey, PendingAttach>,
 }
 
 impl PendingAttachments {
     /// Record one failed attach. The first failure starts the budget; the
     /// verdict says whether a retry is still owed.
-    pub(super) fn record_failure(&mut self, tab_id: i64, now: Instant) -> AttachRetryVerdict {
-        let entry = self.tabs.entry(tab_id).or_insert(PendingAttach {
+    pub(super) fn record_failure(&mut self, key: TabKey, now: Instant) -> AttachRetryVerdict {
+        let entry = self.tabs.entry(key).or_insert(PendingAttach {
             attempts: 0,
             first_seen: now,
             exhausted: false,
@@ -79,15 +81,22 @@ impl PendingAttachments {
     /// Stop tracking a tab entirely — it attached. This is also how an
     /// exhausted mark is lifted: a tab that finally gets a session is a
     /// tab with a fresh budget.
-    pub(super) fn clear(&mut self, tab_id: i64) {
-        self.tabs.remove(&tab_id);
+    pub(super) fn clear(&mut self, key: TabKey) {
+        self.tabs.remove(&key);
     }
 
-    /// Forget every tab the workspace no longer lists — a spawn that
-    /// failed and rolled back, or a tab closed while it waited. Exhausted
-    /// entries go too: the mark belongs to a tab, not to an id.
-    pub(super) fn retain_live(&mut self, live_ids: &HashSet<i64>) {
-        self.tabs.retain(|tab_id, _| live_ids.contains(tab_id));
+    /// Forget every tab of `host` that its workspace no longer lists — a
+    /// spawn that failed and rolled back, or a tab closed while it
+    /// waited. Exhausted entries go too: the mark belongs to a tab, not
+    /// to an id.
+    ///
+    /// Scoped to one instance because `live` is one instance's snapshot:
+    /// another host's pending attaches are that host's reconcile to
+    /// prune, and dropping them here would be inferring their absence
+    /// from a listing they were never in.
+    pub(super) fn retain_live(&mut self, host: HostId, live: &HashSet<TabKey>) {
+        self.tabs
+            .retain(|key, _| key.host != host || live.contains(key));
     }
 
     /// Whether any tab is still owed a retry — the attach-retry
@@ -97,18 +106,18 @@ impl PendingAttachments {
         self.tabs.values().any(|entry| !entry.exhausted)
     }
 
-    /// The ids still owed a retry, owned so the walk in
+    /// The tabs still owed a retry, owned so the walk in
     /// `retry_pending_attachments` can mutate the set as it attaches.
-    pub(super) fn retry_ids(&self) -> Vec<i64> {
+    pub(super) fn retry_keys(&self) -> Vec<TabKey> {
         self.tabs
             .iter()
             .filter(|(_, entry)| !entry.exhausted)
-            .map(|(tab_id, _)| *tab_id)
+            .map(|(key, _)| *key)
             .collect()
     }
 
     #[cfg(test)]
-    fn tracked_ids(&self) -> Vec<i64> {
+    fn tracked_keys(&self) -> Vec<TabKey> {
         self.tabs.keys().copied().collect()
     }
 }
@@ -121,19 +130,20 @@ pub(super) struct TabOutputBatch {
     /// Tabs whose terminal state moved this batch — the only ones whose
     /// snapshot needs rebuilding. Every other tab renders the snapshot it
     /// already has.
-    pub(super) touched: HashSet<i64>,
-    pub(super) osc_actions: Vec<(i64, Vec<OscAction>)>,
-    pub(super) exited: Vec<i64>,
+    pub(super) touched: HashSet<TabKey>,
+    pub(super) osc_actions: Vec<(TabKey, Vec<OscAction>)>,
+    pub(super) exited: Vec<TabKey>,
     pub(super) error: Option<String>,
 }
 
 pub(super) fn collect_tab_output(
-    tabs: &mut HashMap<i64, TerminalTab>,
+    tabs: &mut HashMap<TabKey, TerminalTab>,
     collected: &mut TabOutputBatch,
-    tab_id: i64,
+    key: TabKey,
     output: TabOutput,
 ) {
-    let Some(tab) = tabs.get_mut(&tab_id) else {
+    let tab_id = key.tab;
+    let Some(tab) = tabs.get_mut(&key) else {
         // A forwarder outlives its tab by however long its last items sit
         // on the feed: the tab was already dropped by the reconcile that
         // saw the workspace stop listing it.
@@ -149,20 +159,20 @@ pub(super) fn collect_tab_output(
         // it as a chunk with no actions rather than asserting.
         TabOutput::Bytes(bytes) => {
             tab.write_vt(&bytes);
-            collected.touched.insert(tab_id);
+            collected.touched.insert(key);
         }
         TabOutput::Scanned { data, actions } => {
             tab.write_vt(&data);
             // Most chunks of a flood carry no OSC at all; an empty entry
             // would still cost a push and an `apply_osc_actions` hop.
             if !actions.is_empty() {
-                collected.osc_actions.push((tab_id, actions));
+                collected.osc_actions.push((key, actions));
             }
-            collected.touched.insert(tab_id);
+            collected.touched.insert(key);
         }
         TabOutput::Exit { status, reason } => {
             tracing::info!(tab_id, status, %reason, "PTY exited");
-            collected.exited.push(tab_id);
+            collected.exited.push(key);
         }
         TabOutput::Error(error) => {
             // Broadcast lag cannot be reconstructed. Surface it and keep
@@ -187,10 +197,15 @@ pub(super) fn collect_tab_output(
 fn notification_activation(
     workspace: &Workspace,
     window_id: Option<window::Id>,
-    tab_id: i64,
+    key: TabKey,
 ) -> Option<UiTask> {
-    if let Err(error) = focus_tab_in_core(workspace, tab_id) {
-        tracing::debug!(tab_id, %error, "notification click named a tab that is gone");
+    // The local workspace owns only the local id-space: a banner minted
+    // by a connection epoch that has since died carries that instance, and
+    // focusing its numeric id here would jump to whatever local tab
+    // happens to share the number. `focus_tab_in_core` refuses it, which
+    // is the same guard every other engine sink now applies.
+    if let Err(error) = focus_tab_in_core(workspace, key) {
+        tracing::debug!(?key, %error, "notification click named a tab that is gone");
         return None;
     }
     Some(window_id.map_or(UiTask::None, UiTask::Focus))
@@ -355,30 +370,37 @@ impl App {
         self.refresh_notification_palette();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
-        let live_ids: HashSet<i64> = self
+        // The workspace is one backend's id-space, so its ids qualify at
+        // that backend's instance — and the prune below is scoped to it
+        // for the same reason: a connected host's tabs are pruned by that
+        // host's own reconcile, and a snapshot this workspace never
+        // listed them in says nothing about them.
+        let host = self.backend.host();
+        let live: HashSet<TabKey> = self
             .projects
             .iter()
-            .flat_map(|project| project.tabs.iter().map(|tab| tab.id))
+            .flat_map(|project| project.tabs.iter().map(|tab| TabKey::new(host, tab.id)))
             .collect();
-        self.tabs.retain(|tab_id, _| live_ids.contains(tab_id));
-        self.pending_attachments.retain_live(&live_ids);
-        let active_tab_id = self.workspace.active().1;
-        self.request_tab_reveal(active_tab_id);
-        for (tab_id, tab) in &mut self.tabs {
-            if *tab_id != active_tab_id && tab.reset_pointer_state() {
-                refresh_or_warn(*tab_id, tab, "pointer reset after active tab changed");
+        self.tabs
+            .retain(|key, _| key.host != host || live.contains(key));
+        self.pending_attachments.retain_live(host, &live);
+        let active_key = self.active_tab_key();
+        self.request_tab_reveal(active_key);
+        for (key, tab) in &mut self.tabs {
+            if *key != active_key && tab.reset_pointer_state() {
+                refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
             }
         }
         // Every focus change funnels through `focus_tab_and_clear`, which
         // reconciles — so this is the one place a tab switch cancels a
         // composition the user left behind.
-        cancel_preedits(&mut self.tabs, &mut self.ime_discard, Some(active_tab_id));
+        cancel_preedits(&mut self.tabs, &mut self.ime_discard, Some(active_key));
         let now = Instant::now();
-        for tab_id in &live_ids {
-            if self.tabs.contains_key(tab_id) {
+        for key in &live {
+            if self.tabs.contains_key(key) {
                 continue;
             }
-            self.attach_tab_tracked(*tab_id, now);
+            self.attach_tab_tracked(*key, now);
         }
     }
 
@@ -405,33 +427,41 @@ impl App {
     /// over IPC mutates the workspace in its handler and reaches the UI
     /// only as a broadcast, so a UI-side funnel would miss exactly the
     /// path the missing reveal was reported on.
-    fn request_tab_reveal(&mut self, active_tab_id: i64) {
-        if self.revealed_tab_id == Some(active_tab_id) {
+    fn request_tab_reveal(&mut self, active_tab: TabKey) {
+        if self.revealed_tab == Some(active_tab) {
             return;
         }
-        self.revealed_tab_id = Some(active_tab_id);
-        self.tab_reveal_request = Some(active_tab_id);
+        self.revealed_tab = Some(active_tab);
+        self.tab_reveal_request = Some(active_tab);
     }
 
     /// One attach attempt for a tab the workspace lists but the UI has no
     /// terminal for. Returns whether the tab is attached now — reconcile
     /// and the retry driver share this so a retry cannot drift from the
     /// attempt that preceded it.
-    fn attach_tab(&mut self, tab_id: i64) -> bool {
+    fn attach_tab(&mut self, key: TabKey) -> bool {
+        // The backend is asked for one of its OWN tabs. A key minted
+        // against another instance names nothing this backend has, and
+        // handing its number over would attach whichever local session
+        // shares the number.
+        if key.host != self.backend.host() {
+            tracing::debug!(?key, "attach requested for a tab on another instance");
+            return false;
+        }
+        let tab_id = key.tab;
         // Loading the theme and building the terminal costs a 256-entry
-        // palette, a scrollback and the encoders — all discarded when
-        // `TabSession::attach` consults this very map and finds nothing.
-        // The retry driver runs 40 times a second, so ask first.
-        if !self.supervisor.has(tab_id) {
+        // palette, a scrollback and the encoders — all discarded when the
+        // backend's attach finds no session for the id. The retry driver
+        // runs 40 times a second, so ask first.
+        if !self.backend.is_live(tab_id) {
             tracing::debug!(tab_id, "PTY not ready for UI attach");
             return false;
         }
         let attached = {
             let _guard = self.runtime.enter();
             TerminalTab::attach(
-                Arc::clone(&self.supervisor),
+                &self.backend,
                 tab_id,
-                self.test_mode,
                 Theme::load_bundled(&self.active_theme_name),
                 self.config.word_break_chars.clone(),
                 self.feed_tx.clone(),
@@ -456,7 +486,7 @@ impl App {
                 // something refreshes it; nothing else will until the PTY
                 // emits its first bytes.
                 refresh_or_warn(tab_id, &mut tab, "newly attached tab");
-                self.tabs.insert(tab_id, tab);
+                self.tabs.insert(key, tab);
                 true
             }
             Ok(None) => {
@@ -484,16 +514,16 @@ impl App {
     /// next reconcile attaches it and the exhausted mark goes with it.
     /// What exhaustion ends is the 25 ms timer and the warning, not the
     /// tab's chance to attach.
-    fn attach_tab_tracked(&mut self, tab_id: i64, now: Instant) {
-        if self.attach_tab(tab_id) {
-            self.pending_attachments.clear(tab_id);
+    fn attach_tab_tracked(&mut self, key: TabKey, now: Instant) {
+        if self.attach_tab(key) {
+            self.pending_attachments.clear(key);
             return;
         }
         if let AttachRetryVerdict::Exhausted { attempts, waited } =
-            self.pending_attachments.record_failure(tab_id, now)
+            self.pending_attachments.record_failure(key, now)
         {
             tracing::warn!(
-                tab_id,
+                tab_id = key.tab,
                 attempts,
                 waited_ms = waited.as_millis(),
                 "tab never attached a terminal: no live PTY within the attach retry budget"
@@ -506,22 +536,28 @@ impl App {
     /// still owed a retry, so an idle app never runs it.
     pub fn retry_pending_attachments(&mut self) {
         let now = Instant::now();
-        for tab_id in self.pending_attachments.retry_ids() {
-            if self.tabs.contains_key(&tab_id) {
-                self.pending_attachments.clear(tab_id);
+        for key in self.pending_attachments.retry_keys() {
+            if self.tabs.contains_key(&key) {
+                self.pending_attachments.clear(key);
                 continue;
             }
             // Ask the workspace, not the last snapshot: a spawn that
             // failed rolls the tab back without the UI having reconciled.
-            if self.workspace.tab(tab_id).is_err() {
+            // The probe is a LOCAL liveness oracle, so it only disproves
+            // local keys — a non-local pending entry is its own host's to
+            // prune (reconcile is host-scoped the same way).
+            if key
+                .local_tab()
+                .is_some_and(|tab_id| self.workspace.tab(tab_id).is_err())
+            {
                 tracing::debug!(
-                    tab_id,
+                    tab_id = key.tab,
                     "dropped a pending attach the workspace no longer lists"
                 );
-                self.pending_attachments.clear(tab_id);
+                self.pending_attachments.clear(key);
                 continue;
             }
-            self.attach_tab_tracked(tab_id, now);
+            self.attach_tab_tracked(key, now);
         }
     }
 
@@ -539,8 +575,8 @@ impl App {
         while let Some(item) = self.feed_rx.try_next(&mut batch) {
             match item {
                 EngineFeed::Workspace(event) => self.apply_workspace_event(event),
-                EngineFeed::Tab(tab_id, output) => {
-                    collect_tab_output(&mut self.tabs, &mut pty, tab_id, output);
+                EngineFeed::Tab(key, output) => {
+                    collect_tab_output(&mut self.tabs, &mut pty, key, output);
                 }
                 EngineFeed::UiRequest(request) => {
                     // IPC reads (`tab.dump`, `palette.state`,
@@ -579,9 +615,9 @@ impl App {
                 }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
-                EngineFeed::NotificationActivated { tab_id } => {
+                EngineFeed::NotificationActivated { tab } => {
                     if let Some(raise) =
-                        notification_activation(&self.workspace, self.window_id, tab_id)
+                        notification_activation(&self.workspace, self.window_id, tab)
                     {
                         // The rest of a notification jump, exactly as the
                         // palette's rows do it: reveal the sidebar so the
@@ -610,20 +646,31 @@ impl App {
         // so a vanished tab is a no-op rather than a panic. The
         // touched-tab refresh below and the exit list further down are
         // guarded the same way.
-        for (tab_id, actions) in pty.osc_actions {
-            task = task.then(self.apply_osc_actions(tab_id, actions));
+        for (key, actions) in pty.osc_actions {
+            task = task.then(self.apply_osc_actions(key, actions));
         }
-        for tab_id in &pty.touched {
-            if let Some(tab) = self.tabs.get_mut(tab_id) {
-                refresh_or_warn(*tab_id, tab, "PTY output");
+        for key in &pty.touched {
+            if let Some(tab) = self.tabs.get_mut(key) {
+                refresh_or_warn(key.tab, tab, "PTY output");
             }
         }
         if batch.should_reconcile() {
             self.reconcile();
         }
-        for tab_id in pty.exited {
-            let _ = self.workspace.close_tab(tab_id);
-            self.tabs.remove(&tab_id);
+        for key in pty.exited {
+            // The exit closes the tab in the backend that owns it. The
+            // local workspace owns only the local id-space, so a key from
+            // any other instance must not reach `close_tab` — its number
+            // would close whichever local tab happens to share it. HS-2
+            // routes those to their own host's client; until then the
+            // drop below is the whole of it.
+            match key.local_tab() {
+                Some(tab_id) => {
+                    let _ = self.workspace.close_tab(tab_id);
+                }
+                None => tracing::debug!(?key, "PTY exit for a tab on another instance"),
+            }
+            self.tabs.remove(&key);
         }
         // Idle ticks would otherwise bury every informative record under
         // ~60 empty ones a second.
@@ -646,16 +693,18 @@ impl App {
                 title,
                 body,
             } => {
-                if let Some((project_id, row_title)) = self.notification_title(tab_id) {
+                // The workspace broadcast is one backend's id-space.
+                let tab = self.backend.tab_key(tab_id);
+                if let Some((project, row_title)) = self.notification_title(tab) {
                     self.notification_inbox
                         .upsert(notification_inbox::NotificationRecord::new(
-                            tab_id,
-                            project_id,
+                            tab,
+                            project,
                             row_title,
                             body.clone(),
                         ));
                 }
-                self.desktop_notifications.fire(tab_id, title, body);
+                self.desktop_notifications.fire(tab, title, body);
             }
             WorkspaceEvent::TabNotification {
                 tab_id,
@@ -666,22 +715,24 @@ impl App {
                 // now-removed GTK UI used too) makes a later re-notify
                 // replace it — forgetting the id here would stack a
                 // duplicate beside it instead.
-                self.notification_inbox.remove(tab_id);
+                self.notification_inbox.remove(self.backend.tab_key(tab_id));
             }
             WorkspaceEvent::TabClosed { tab_id } => {
-                self.notification_inbox.remove(tab_id);
-                self.desktop_notifications.retire(tab_id);
+                let tab = self.backend.tab_key(tab_id);
+                self.notification_inbox.remove(tab);
+                self.desktop_notifications.retire(tab);
             }
             WorkspaceEvent::ProjectDeleted { project_id } => {
-                let stale: Vec<i64> = self
+                let project = ProjectKey::new(self.backend.host(), project_id);
+                let stale: Vec<TabKey> = self
                     .notification_inbox
                     .snapshot()
                     .iter()
-                    .filter(|record| record.project_id == project_id)
-                    .map(|record| record.tab_id)
+                    .filter(|record| record.project == project)
+                    .map(|record| record.tab)
                     .collect();
-                for tab_id in stale {
-                    self.notification_inbox.remove(tab_id);
+                for tab in stale {
+                    self.notification_inbox.remove(tab);
                 }
             }
             // The bridge turns a lagged broadcast into a full-snapshot
@@ -694,8 +745,12 @@ impl App {
         }
     }
 
-    fn notification_title(&self, tab_id: i64) -> Option<(i64, String)> {
+    fn notification_title(&self, key: TabKey) -> Option<(ProjectKey, String)> {
+        let tab_id = key.local_tab()?;
+        let host = self.backend.host();
         self.workspace.snapshot().into_iter().find_map(|project| {
+            let project_key = ProjectKey::new(host, project.id);
+            let project_name = project.name;
             project.tabs.into_iter().find_map(|tab| {
                 (tab.id == tab_id).then(|| {
                     let tab_title = if !tab.title.is_empty() {
@@ -706,8 +761,8 @@ impl App {
                         "Tab".to_string()
                     };
                     (
-                        project.id,
-                        notification_inbox::compose_title(&project.name, &tab_title),
+                        project_key,
+                        notification_inbox::compose_title(&project_name, &tab_title),
                     )
                 })
             })
@@ -715,7 +770,8 @@ impl App {
     }
 
     fn reconcile_notification_inbox(&mut self) {
-        let pending_rows: Vec<(i64, i64, String)> = self
+        let host = self.backend.host();
+        let pending_rows: Vec<(TabKey, ProjectKey, String)> = self
             .projects
             .iter()
             .flat_map(|project| {
@@ -732,25 +788,28 @@ impl App {
                             "Tab".to_string()
                         };
                         (
-                            tab.id,
-                            project.id,
+                            TabKey::new(host, tab.id),
+                            ProjectKey::new(host, project.id),
                             notification_inbox::compose_title(&project.name, &tab_title),
                         )
                     })
             })
             .collect();
-        let pending_ids: HashSet<i64> = pending_rows.iter().map(|row| row.0).collect();
-        let stale: Vec<i64> = self
+        let pending: HashSet<TabKey> = pending_rows.iter().map(|row| row.0).collect();
+        // Scoped to this backend's instance for `retain_live`'s reason: a
+        // connected host's rows are absent from this snapshot because it
+        // is not their snapshot, not because they were cleared.
+        let stale: Vec<TabKey> = self
             .notification_inbox
-            .tab_ids()
+            .tab_keys()
             .into_iter()
-            .filter(|tab_id| !pending_ids.contains(tab_id))
+            .filter(|tab| tab.host == host && !pending.contains(tab))
             .collect();
-        for tab_id in stale {
-            self.notification_inbox.remove(tab_id);
+        for tab in stale {
+            self.notification_inbox.remove(tab);
         }
 
-        let existing: HashSet<i64> = self.notification_inbox.tab_ids().into_iter().collect();
+        let existing: HashSet<TabKey> = self.notification_inbox.tab_keys().into_iter().collect();
         let slots = notification_inbox::CAP.saturating_sub(self.notification_inbox.count());
         let mut additions = Vec::with_capacity(slots);
         for row in pending_rows
@@ -762,10 +821,10 @@ impl App {
         }
         // Insert in reverse snapshot order so the first deterministic
         // project/tab fallback remains at the front after repeated prepends.
-        while let Some((tab_id, project_id, title)) = additions.pop() {
+        while let Some((tab, project, title)) = additions.pop() {
             self.notification_inbox
                 .upsert(notification_inbox::NotificationRecord::new(
-                    tab_id, project_id, title, "",
+                    tab, project, title, "",
                 ));
         }
     }
@@ -914,17 +973,20 @@ impl App {
             if self.window_id.is_none() {
                 return;
             }
-            let (active_project_id, active_tab_id) = self.workspace.active();
+            let host = self.backend.host();
+            let active_project = self.active_project_key();
+            let active_tab = self.active_tab_key();
             if self
                 .menu_window_rows
-                .matches(&self.projects, active_project_id, active_tab_id)
+                .matches(&self.projects, host, active_project, active_tab)
             {
                 return;
             }
             let rows = crate::macos::menu::WindowRows::derive(
                 &self.projects,
-                active_project_id,
-                active_tab_id,
+                host,
+                active_project,
+                active_tab,
             );
             let Some(mtm) = seam_on_main("window-menu rebuild") else {
                 return;
@@ -966,29 +1028,23 @@ impl App {
     }
 
     fn refresh_sidebar_agents(&mut self) {
-        let active_tab = self.workspace.active().1;
+        let host = self.backend.host();
         let now = agent_palette::now_unix();
         self.sidebar_agents = self
             .projects
             .iter()
             .map(|project| {
-                let rows = agent_palette::sidebar_agents(project, now)
-                    .into_iter()
-                    .map(|row| SidebarDumpAgentRow {
-                        tab_id: row.tab_id,
-                        name: row.name,
-                        lifecycle: row.lifecycle,
-                        status_text: row.status_text,
-                        time_text: row.time_text,
-                        is_active: row.tab_id == active_tab,
-                    })
-                    .collect();
-                (project.id, rows)
+                (
+                    ProjectKey::new(host, project.id),
+                    agent_palette::sidebar_agents(project, host, now),
+                )
             })
             .collect();
     }
 
     fn sidebar_dump(&self) -> SidebarDumpResult {
+        let host = self.backend.host();
+        let active_tab = self.active_tab_key();
         let projects = self
             .workspace
             .snapshot()
@@ -997,9 +1053,20 @@ impl App {
                 project_id: project.id,
                 agents: self
                     .sidebar_agents
-                    .get(&project.id)
-                    .cloned()
-                    .unwrap_or_default(),
+                    .get(&ProjectKey::new(host, project.id))
+                    .into_iter()
+                    .flatten()
+                    // The dump is a wire result, so the keys narrow back
+                    // to the bare ids a client speaks.
+                    .map(|row| SidebarDumpAgentRow {
+                        tab_id: row.tab.tab,
+                        name: row.name.clone(),
+                        lifecycle: row.lifecycle,
+                        status_text: row.status_text.clone(),
+                        time_text: row.time_text.clone(),
+                        is_active: row.tab == active_tab,
+                    })
+                    .collect(),
             })
             .collect();
         SidebarDumpResult {
@@ -1010,14 +1077,14 @@ impl App {
 
     pub(super) fn apply_metrics_cache(
         &self,
-        cwds: &HashMap<i64, String>,
+        cwds: &HashMap<TabKey, String>,
         items: &mut [palette::PaletteItem],
     ) {
         for item in items {
-            let Some(tab_id) = agent_palette::agent_tab_id(&item.id) else {
+            let Some(tab) = agent_palette::agent_tab_key(&item.id) else {
                 continue;
             };
-            let (Some(agent), Some(cwd)) = (item.agent.as_mut(), cwds.get(&tab_id)) else {
+            let (Some(agent), Some(cwd)) = (item.agent.as_mut(), cwds.get(&tab)) else {
                 continue;
             };
             agent.metrics_text = self
@@ -1027,7 +1094,7 @@ impl App {
         }
     }
 
-    pub(super) fn spawn_agent_metrics(&mut self, cwds: &HashMap<i64, String>) {
+    pub(super) fn spawn_agent_metrics(&mut self, cwds: &HashMap<TabKey, String>) {
         self.metrics_cache.begin_session(self.palette_session);
         let claimed = self.metrics_cache.claim_unprobed(cwds.values().cloned());
         if claimed.is_empty() {
@@ -1088,6 +1155,10 @@ impl App {
         }
     }
 
+    /// The IPC wire is host-unaware by pin, so every `tab_id` below is
+    /// one of the local backend's bare ids — `backend.tab_key` is the
+    /// joint that qualifies them, exactly as the workspace's active
+    /// selection is qualified.
     fn apply_ui_request(&mut self, request: UiRequest) -> UiTask {
         let mut task = UiTask::None;
         match request {
@@ -1099,7 +1170,7 @@ impl App {
             UiRequest::Dump { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&tab_id)
+                    .get(&self.backend.tab_key(tab_id))
                     .map(TerminalTab::dump)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -1109,6 +1180,7 @@ impl App {
                 data,
                 reply,
             } => {
+                let key = self.backend.tab_key(tab_id);
                 // Same ordering as the feed batch's tail: an OSC action can
                 // mutate the tab (pointer shape), so it lands before the
                 // refresh that publishes it, never after. That second
@@ -1117,12 +1189,12 @@ impl App {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
                 } else if let Some(actions) = self
                     .tabs
-                    .get_mut(&tab_id)
+                    .get_mut(&key)
                     .map(|tab| tab.scan_and_write_vt(&data))
                 {
-                    task = task.then(self.apply_osc_actions(tab_id, actions));
+                    task = task.then(self.apply_osc_actions(key, actions));
                     self.tabs
-                        .get_mut(&tab_id)
+                        .get_mut(&key)
                         .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                         .and_then(|tab| tab.refresh_snapshot().map_err(|error| error.to_string()))
                 } else {
@@ -1137,8 +1209,8 @@ impl App {
             } => {
                 let result = self
                     .tabs
-                    .get(&tab_id)
-                    .and_then(|tab| tab.input_capture.as_ref())
+                    .get(&self.backend.tab_key(tab_id))
+                    .and_then(|tab| tab.session.capture())
                     .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
                     .and_then(|capture| {
                         capture
@@ -1165,7 +1237,12 @@ impl App {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
                 } else {
                     match self.keyboard_route() {
-                        KeyboardRoute::Terminal(active_tab) if active_tab == tab_id => {
+                        // `tab_id` arrives off the wire, which is bare by
+                        // pin; the route it is checked against carries the
+                        // key, so both halves have to agree.
+                        KeyboardRoute::Terminal(active)
+                            if active == self.backend.tab_key(tab_id) =>
+                        {
                             match action.as_str() {
                                 "preedit" => {
                                     self.ime_preedit(text, cursor);
@@ -1182,9 +1259,10 @@ impl App {
                                 other => Err(format!("unknown tab.feed_ime action: {other}")),
                             }
                         }
-                        KeyboardRoute::Terminal(active_tab) => Err(format!(
+                        KeyboardRoute::Terminal(active) => Err(format!(
                             "tab {tab_id} is not the active terminal \
-                                 (keyboard route owns tab {active_tab})"
+                                 (keyboard route owns tab {})",
+                            active.tab
                         )),
                         KeyboardRoute::None
                         | KeyboardRoute::Confirm
@@ -1200,7 +1278,7 @@ impl App {
             UiRequest::TabDumpResolved { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&tab_id)
+                    .get(&self.backend.tab_key(tab_id))
                     .map(TerminalTab::resolved_cells)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -1293,7 +1371,7 @@ impl App {
             UiRequest::AppCursorShape { reply } => {
                 let shape = self
                     .tabs
-                    .get(&self.workspace.active().1)
+                    .get(&self.active_tab_key())
                     .map_or("default", TerminalTab::effective_pointer_shape);
                 let _ = reply.send(Ok(shape.into()));
             }
@@ -1397,7 +1475,7 @@ impl App {
             } => {
                 let result = self
                     .tabs
-                    .get_mut(&tab_id)
+                    .get_mut(&self.backend.tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         let anchored = tab
@@ -1416,7 +1494,7 @@ impl App {
             UiRequest::SelectionClear { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get_mut(&tab_id)
+                    .get_mut(&self.backend.tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         tab.selection.clear();
@@ -1427,7 +1505,7 @@ impl App {
             UiRequest::SelectionDump { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get_mut(&tab_id)
+                    .get_mut(&self.backend.tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| tab.selection_dump().map_err(|error| error.to_string()));
                 let _ = reply.send(result);
@@ -1451,7 +1529,7 @@ impl App {
                     Err("tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch".into())
                 } else {
                     self.tabs
-                        .get_mut(&tab_id)
+                        .get_mut(&self.backend.tab_key(tab_id))
                         .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                         .and_then(|tab| {
                             let expanded = tab.expand_selection_at(col, row, click_count);
@@ -1492,7 +1570,7 @@ impl App {
                         .map_err(|_| format!("modifier mask {mods} exceeds u16"))
                         .and_then(|mods| {
                             self.tabs
-                                .get_mut(&tab_id)
+                                .get_mut(&self.backend.tab_key(tab_id))
                                 .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?
                                 .dispatch_pointer(kind, button, cell_x, cell_y, mods)
                                 .map_err(|error| error.to_string())
@@ -1504,12 +1582,22 @@ impl App {
         task
     }
 
-    pub(super) fn apply_osc_actions(&mut self, tab_id: i64, actions: Vec<OscAction>) -> UiTask {
+    pub(super) fn apply_osc_actions(&mut self, key: TabKey, actions: Vec<OscAction>) -> UiTask {
+        let tab_id = key.tab;
         for action in actions {
             match action {
-                OscAction::Workspace { command, payload } => {
-                    self.client.apply_osc(tab_id, command, &payload);
-                }
+                // The only arm that leaves the UI: `LocalClient` drives the
+                // local workspace, so a non-local tab's OSC would apply a
+                // title/cwd/agent claim to whatever local tab shares its
+                // number. HS-2 sends it to that host's client instead.
+                OscAction::Workspace { command, payload } => match key.local_tab() {
+                    Some(local_tab) => self.client.apply_osc(local_tab, command, &payload),
+                    None => tracing::debug!(
+                        ?key,
+                        %command,
+                        "workspace OSC from another instance is not the local client's to apply"
+                    ),
+                },
                 OscAction::ClipboardWrite { target, text } => {
                     if !enqueue_osc_clipboard_write(
                         &mut self.clipboard,
@@ -1525,7 +1613,7 @@ impl App {
                     }
                 }
                 OscAction::PointerShape(name) => {
-                    if let Some(tab) = self.tabs.get_mut(&tab_id) {
+                    if let Some(tab) = self.tabs.get_mut(&key) {
                         tab.pointer_shape = canonical_pointer_shape(&name).into();
                     }
                 }
@@ -1537,14 +1625,16 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use roost_ui_model::keys::HostId;
+
     use super::*;
 
     /// These tests hand `collect_tab_output` the items a forwarder would
     /// have delivered, so the feed receiver is surplus.
-    fn attached(tab_id: i64) -> (HashMap<i64, TerminalTab>, Arc<PtySupervisor>) {
+    fn attached(tab_id: i64) -> (HashMap<TabKey, TerminalTab>, Arc<PtySupervisor>) {
         let (feed_tx, _) = engine_feed::channel();
         let (tab, supervisor) = attach_test_terminal(tab_id, feed_tx);
-        (HashMap::from([(tab_id, tab)]), supervisor)
+        (HashMap::from([(TabKey::local(tab_id), tab)]), supervisor)
     }
 
     /// The race the retry exists for, against a real supervisor: the
@@ -1555,11 +1645,11 @@ mod tests {
     async fn a_tab_whose_pty_is_not_spawned_yet_attaches_on_a_retry() {
         let supervisor = Arc::new(PtySupervisor::new());
         let (feed_tx, _feed_rx) = engine_feed::channel();
+        let backend = TabBackend::in_process(Arc::clone(&supervisor), true);
         let attach = |feed: EngineFeedSender| {
             TerminalTab::attach(
-                Arc::clone(&supervisor),
+                &backend,
                 75,
-                true,
                 Theme::roost_dark_fallback(),
                 roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
                 feed,
@@ -1573,11 +1663,11 @@ mod tests {
             "no session has been promoted yet"
         );
         assert_eq!(
-            pending.record_failure(75, started),
+            pending.record_failure(TabKey::local(75), started),
             AttachRetryVerdict::Retry
         );
         assert!(pending.has_retryable(), "the retry subscription is armed");
-        assert_eq!(pending.retry_ids(), vec![75]);
+        assert_eq!(pending.retry_keys(), vec![TabKey::local(75)]);
 
         supervisor
             .spawn(
@@ -1591,12 +1681,12 @@ mod tests {
             .expect("spawn the PTY the retry is waiting for");
 
         let tab = attach(feed_tx).expect("the retry attaches once the session exists");
-        pending.clear(75);
+        pending.clear(TabKey::local(75));
         assert!(
             !pending.has_retryable(),
             "success disarms the retry subscription"
         );
-        assert!(pending.tracked_ids().is_empty());
+        assert!(pending.tracked_keys().is_empty());
 
         drop(tab);
         supervisor.close(75);
@@ -1617,10 +1707,14 @@ mod tests {
 
         for attempt in 0..=ATTACH_RETRY_LIMIT {
             assert!(!supervisor.has(76), "the guard reconcile attempts first");
-            pending.record_failure(76, started + ATTACH_RETRY_INTERVAL * attempt);
+            pending.record_failure(TabKey::local(76), started + ATTACH_RETRY_INTERVAL * attempt);
         }
         assert!(!pending.has_retryable(), "the budget is spent");
-        assert_eq!(pending.tracked_ids(), vec![76], "but the tab is remembered");
+        assert_eq!(
+            pending.tracked_keys(),
+            vec![TabKey::local(76)],
+            "but the tab is remembered"
+        );
 
         supervisor
             .spawn(
@@ -1635,17 +1729,16 @@ mod tests {
 
         assert!(supervisor.has(76));
         let tab = TerminalTab::attach(
-            Arc::clone(&supervisor),
+            &TabBackend::in_process(Arc::clone(&supervisor), true),
             76,
-            true,
             Theme::roost_dark_fallback(),
             roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
             feed_tx,
         )
         .expect("an exhausted mark never blocks the attach itself");
-        pending.clear(76);
+        pending.clear(TabKey::local(76));
         assert!(
-            pending.tracked_ids().is_empty(),
+            pending.tracked_keys().is_empty(),
             "attaching lifts the exhausted mark"
         );
 
@@ -1661,14 +1754,14 @@ mod tests {
         let started = Instant::now();
         for attempt in 0..ATTACH_RETRY_LIMIT {
             assert_eq!(
-                pending.record_failure(9, started + ATTACH_RETRY_INTERVAL * attempt),
+                pending.record_failure(TabKey::local(9), started + ATTACH_RETRY_INTERVAL * attempt),
                 AttachRetryVerdict::Retry,
                 "attempt {attempt} is inside the budget"
             );
         }
         let last = started + ATTACH_RETRY_INTERVAL * ATTACH_RETRY_LIMIT;
         assert_eq!(
-            pending.record_failure(9, last),
+            pending.record_failure(TabKey::local(9), last),
             AttachRetryVerdict::Exhausted {
                 attempts: ATTACH_RETRY_LIMIT + 1,
                 waited: ATTACH_RETRY_WINDOW,
@@ -1680,8 +1773,8 @@ mod tests {
             "an exhausted tab stops arming the retry subscription"
         );
         assert_eq!(
-            pending.tracked_ids(),
-            vec![9],
+            pending.tracked_keys(),
+            vec![TabKey::local(9)],
             "and stays tracked, so nothing can restart its budget"
         );
     }
@@ -1697,7 +1790,7 @@ mod tests {
         let mut exhaustions = 0;
         for attempt in 0..=ATTACH_RETRY_LIMIT {
             if matches!(
-                pending.record_failure(9, started + ATTACH_RETRY_INTERVAL * attempt),
+                pending.record_failure(TabKey::local(9), started + ATTACH_RETRY_INTERVAL * attempt),
                 AttachRetryVerdict::Exhausted { .. }
             ) {
                 exhaustions += 1;
@@ -1708,21 +1801,21 @@ mod tests {
         let later = started + ATTACH_RETRY_WINDOW * 10;
         for step in 0..100 {
             assert_eq!(
-                pending.record_failure(9, later + ATTACH_RETRY_INTERVAL * step),
+                pending.record_failure(TabKey::local(9), later + ATTACH_RETRY_INTERVAL * step),
                 AttachRetryVerdict::GaveUp,
                 "a later reconcile neither restarts the budget nor re-warns"
             );
         }
         assert!(!pending.has_retryable(), "and never re-arms the timer");
-        assert_eq!(pending.tracked_ids(), vec![9]);
+        assert_eq!(pending.tracked_keys(), vec![TabKey::local(9)]);
 
-        pending.retain_live(&HashSet::new());
+        pending.retain_live(HostId::LOCAL, &HashSet::new());
         assert!(
-            pending.tracked_ids().is_empty(),
+            pending.tracked_keys().is_empty(),
             "a closed tab is pruned exhausted mark and all"
         );
         assert_eq!(
-            pending.record_failure(9, later),
+            pending.record_failure(TabKey::local(9), later),
             AttachRetryVerdict::Retry,
             "and an id the workspace lists again is a new tab with a new budget"
         );
@@ -1737,7 +1830,7 @@ mod tests {
         let now = Instant::now();
         for _ in 0..4 * ATTACH_RETRY_LIMIT {
             assert_eq!(
-                pending.record_failure(9, now),
+                pending.record_failure(TabKey::local(9), now),
                 AttachRetryVerdict::Retry,
                 "attempts alone cannot end the wall-clock window"
             );
@@ -1747,7 +1840,7 @@ mod tests {
             "the tab is still waiting for its PTY"
         );
         assert!(matches!(
-            pending.record_failure(9, now + ATTACH_RETRY_WINDOW),
+            pending.record_failure(TabKey::local(9), now + ATTACH_RETRY_WINDOW),
             AttachRetryVerdict::Exhausted { .. }
         ));
     }
@@ -1758,22 +1851,28 @@ mod tests {
         let now = Instant::now();
         for tab_id in [7, 3, 5] {
             assert_eq!(
-                pending.record_failure(tab_id, now),
+                pending.record_failure(TabKey::local(tab_id), now),
                 AttachRetryVerdict::Retry
             );
         }
-        assert_eq!(pending.retry_ids(), vec![3, 5, 7]);
-
-        pending.retain_live(&HashSet::from([3, 7]));
         assert_eq!(
-            pending.retry_ids(),
-            vec![3, 7],
+            pending.retry_keys(),
+            vec![TabKey::local(3), TabKey::local(5), TabKey::local(7)]
+        );
+
+        pending.retain_live(
+            HostId::LOCAL,
+            &HashSet::from([TabKey::local(3), TabKey::local(7)]),
+        );
+        assert_eq!(
+            pending.retry_keys(),
+            vec![TabKey::local(3), TabKey::local(7)],
             "a tab the workspace dropped is never retried"
         );
-        pending.clear(3);
-        pending.clear(7);
-        assert!(pending.tracked_ids().is_empty());
-        pending.retain_live(&HashSet::from([1]));
+        pending.clear(TabKey::local(3));
+        pending.clear(TabKey::local(7));
+        assert!(pending.tracked_keys().is_empty());
+        pending.retain_live(HostId::LOCAL, &HashSet::from([TabKey::local(1)]));
         assert!(
             !pending.has_retryable(),
             "a live tab with no failed attach is not pending"
@@ -1788,18 +1887,20 @@ mod tests {
         collect_tab_output(
             &mut tabs,
             &mut collected,
-            70,
+            TabKey::local(70),
             TabOutput::Bytes(b"\x1b[2J\x1b[Hhello".to_vec()),
         );
 
-        assert_eq!(collected.touched, HashSet::from([70]));
+        assert_eq!(collected.touched, HashSet::from([TabKey::local(70)]));
         assert!(
             collected.osc_actions.is_empty(),
             "plain output carries no OSC, so the tail has nothing to apply"
         );
         assert!(collected.exited.is_empty());
         assert!(collected.error.is_none());
-        let tab = tabs.get_mut(&70).expect("the tab is still attached");
+        let tab = tabs
+            .get_mut(&TabKey::local(70))
+            .expect("the tab is still attached");
         tab.refresh_snapshot().expect("refresh the touched tab");
         assert_eq!(tab.snapshot.grid[0].text, "hello");
         supervisor.close(70);
@@ -1816,19 +1917,24 @@ mod tests {
         collect_tab_output(
             &mut tabs,
             &mut collected,
-            75,
+            TabKey::local(75),
             TabOutput::Scanned {
                 data: b"\x1b[2J\x1b[Hhello".to_vec(),
                 actions: vec![OscAction::PointerShape("pointer".into())],
             },
         );
 
-        assert_eq!(collected.touched, HashSet::from([75]));
+        assert_eq!(collected.touched, HashSet::from([TabKey::local(75)]));
         assert_eq!(
             collected.osc_actions,
-            vec![(75, vec![OscAction::PointerShape("pointer".into())])]
+            vec![(
+                TabKey::local(75),
+                vec![OscAction::PointerShape("pointer".into())]
+            )]
         );
-        let tab = tabs.get_mut(&75).expect("the tab is still attached");
+        let tab = tabs
+            .get_mut(&TabKey::local(75))
+            .expect("the tab is still attached");
         tab.refresh_snapshot().expect("refresh the touched tab");
         assert_eq!(tab.snapshot.grid[0].text, "hello");
         supervisor.close(75);
@@ -1847,7 +1953,7 @@ mod tests {
             },
             TabOutput::Error("broadcast lagged".into()),
         ] {
-            collect_tab_output(&mut tabs, &mut collected, 999, output);
+            collect_tab_output(&mut tabs, &mut collected, TabKey::local(999), output);
         }
 
         assert!(collected.touched.is_empty());
@@ -1855,6 +1961,143 @@ mod tests {
         assert!(collected.exited.is_empty());
         assert!(collected.error.is_none());
         supervisor.close(71);
+    }
+
+    /// The collision the host-qualified keys exist for: a dead connection
+    /// epoch's items carry its instance, and the local tab that happens to
+    /// share their numeric id must not receive them — not the bytes, not
+    /// the exit that would close it, not the error that would surface as a
+    /// status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_from_a_stale_instance_never_reaches_the_local_tab_of_that_id() {
+        let (mut tabs, supervisor) = attached(77);
+        let stale = TabKey::new(HostId::new(9), 77);
+        assert_ne!(stale, TabKey::local(77));
+        let mut collected = TabOutputBatch::default();
+
+        for output in [
+            TabOutput::Bytes(b"\x1b[2J\x1b[Hstale".to_vec()),
+            TabOutput::Scanned {
+                data: b"stale".to_vec(),
+                actions: vec![OscAction::PointerShape("pointer".into())],
+            },
+            TabOutput::Exit {
+                status: 0,
+                reason: "shell exited".into(),
+            },
+            TabOutput::Error("broadcast lagged".into()),
+        ] {
+            collect_tab_output(&mut tabs, &mut collected, stale, output);
+        }
+
+        assert!(collected.touched.is_empty());
+        assert!(collected.osc_actions.is_empty());
+        assert!(collected.exited.is_empty());
+        assert!(collected.error.is_none());
+        let tab = tabs
+            .get_mut(&TabKey::local(77))
+            .expect("the live tab is untouched");
+        tab.refresh_snapshot().expect("refresh the live tab");
+        assert_eq!(
+            tab.snapshot.grid[0].text.trim(),
+            "",
+            "no stale byte was written through to the live terminal"
+        );
+        supervisor.close(77);
+    }
+
+    /// The same collision walked through the REAL drain, not the helper:
+    /// items are sent on a live feed, taken with `try_next`, dispatched by
+    /// the arms `service_engine` uses, and finished by its batch tail —
+    /// the tail being where `TabOutput::Exit` reaches `workspace.close_tab`
+    /// and a banner click reaches `focus_tab_in_core`. Those two are the
+    /// engine sinks, so this is the test that pins them: a dead epoch's
+    /// items must close nothing, focus nothing and write nothing.
+    ///
+    /// `App` has no test constructor (bootstrap needs a profile, the
+    /// instance lock and the Iced runtime), so the drain is reproduced
+    /// here against a real `Workspace` and a real attached tab.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_instances_items_survive_the_whole_drain_without_touching_the_local_tab() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").expect("project");
+        let live = workspace.open_tab(project.id, "/tmp", "live").expect("tab");
+        let other = workspace
+            .open_tab(project.id, "/tmp", "other")
+            .expect("tab");
+        workspace.focus_tab(other.id).expect("focus elsewhere");
+        workspace
+            .set_tab_has_notification(live.id, true)
+            .expect("mark pending");
+
+        let (feed_tx, _keep) = engine_feed::channel();
+        let (mut terminal, supervisor) = attach_test_terminal(live.id, feed_tx);
+        terminal.refresh_snapshot().expect("initial snapshot");
+        let mut tabs = HashMap::from([(TabKey::local(live.id), terminal)]);
+
+        // The dead epoch reuses the live tab's number — the whole point.
+        let stale = TabKey::new(HostId::new(9), live.id);
+        let (tx, mut rx) = engine_feed::channel();
+        assert!(tx.send(EngineFeed::Tab(
+            stale,
+            TabOutput::Bytes(b"\x1b[2J\x1b[Hstale".to_vec())
+        )));
+        assert!(tx.send(EngineFeed::Tab(
+            stale,
+            TabOutput::Exit {
+                status: 0,
+                reason: "shell exited".into(),
+            }
+        )));
+        assert!(tx.send(EngineFeed::NotificationActivated { tab: stale }));
+
+        // `service_engine`'s drain loop and batch tail, verbatim in shape.
+        let mut batch = EngineBatch::default();
+        let mut pty = TabOutputBatch::default();
+        let mut raised = 0;
+        while let Some(item) = rx.try_next(&mut batch) {
+            match item {
+                EngineFeed::Tab(key, output) => {
+                    collect_tab_output(&mut tabs, &mut pty, key, output);
+                }
+                EngineFeed::NotificationActivated { tab } => {
+                    if notification_activation(&workspace, Some(window::Id::unique()), tab)
+                        .is_some()
+                    {
+                        raised += 1;
+                    }
+                }
+                _ => panic!("only the two host-keyed arms were sent"),
+            }
+        }
+        for key in pty.exited {
+            if let Some(tab_id) = key.local_tab() {
+                let _ = workspace.close_tab(tab_id);
+            }
+            tabs.remove(&key);
+        }
+
+        assert_eq!(raised, 0, "a dead epoch's banner click earns no raise");
+        assert!(pty.error.is_none());
+        assert!(
+            workspace.tab(live.id).is_ok(),
+            "the exit must not have closed the local tab of that number"
+        );
+        assert_eq!(
+            workspace.active().1,
+            other.id,
+            "and the click must not have moved the focus"
+        );
+        let terminal = tabs
+            .get_mut(&TabKey::local(live.id))
+            .expect("the local tab is still attached");
+        terminal.refresh_snapshot().expect("refresh the live tab");
+        assert_eq!(
+            terminal.snapshot.grid[0].text.trim(),
+            "",
+            "and no stale byte was written through to it"
+        );
+        supervisor.close(live.id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1865,7 +2108,7 @@ mod tests {
         collect_tab_output(
             &mut tabs,
             &mut collected,
-            72,
+            TabKey::local(72),
             TabOutput::Exit {
                 status: 0,
                 reason: "shell exited".into(),
@@ -1874,11 +2117,11 @@ mod tests {
         collect_tab_output(
             &mut tabs,
             &mut collected,
-            72,
+            TabKey::local(72),
             TabOutput::Error("broadcast lagged: dropped 3 message(s)".into()),
         );
 
-        assert_eq!(collected.exited, vec![72]);
+        assert_eq!(collected.exited, vec![TabKey::local(72)]);
         assert_eq!(
             collected.error.as_deref(),
             Some("tab 72: broadcast lagged: dropped 3 message(s)")
@@ -1913,35 +2156,6 @@ mod tests {
         supervisor.close(73);
     }
 
-    /// Accumulate one tab's PTY bytes off `rx` until `needle` shows up or
-    /// the window elapses. Returns what was seen either way, so the same
-    /// helper serves the positive and the negative assertion.
-    async fn feed_text_until(
-        rx: &mut EngineFeedReceiver,
-        tab_id: i64,
-        needle: &str,
-        window: Duration,
-    ) -> String {
-        let deadline = Instant::now() + window;
-        let mut seen = String::new();
-        while Instant::now() < deadline && !seen.contains(needle) {
-            let mut batch = EngineBatch::default();
-            while let Some(item) = rx.try_next(&mut batch) {
-                if let EngineFeed::Tab(
-                    id,
-                    TabOutput::Bytes(bytes) | TabOutput::Scanned { data: bytes, .. },
-                ) = item
-                {
-                    if id == tab_id {
-                        seen.push_str(&String::from_utf8_lossy(&bytes));
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        seen
-    }
-
     /// `reconcile`'s failed-geometry arm builds a tab and then discards it,
     /// and a later attach takes the same PTY over. The discarded tab's
     /// forwarder must not outlive it: the second `TabSession::attach`
@@ -1955,9 +2169,8 @@ mod tests {
 
         let (live_feed, mut live_rx) = engine_feed::channel();
         let tab = TerminalTab::attach(
-            Arc::clone(&supervisor),
+            &TabBackend::in_process(Arc::clone(&supervisor), true),
             74,
-            true,
             Theme::roost_dark_fallback(),
             roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
             live_feed,
@@ -1965,8 +2178,13 @@ mod tests {
         .expect("re-attach the PTY the discarded tab left running");
         tab.session.send_input(b"forwarder-marker\n".to_vec());
 
-        let live =
-            feed_text_until(&mut live_rx, 74, "forwarder-marker", Duration::from_secs(5)).await;
+        let live = feed_text_until(
+            &mut live_rx,
+            TabKey::local(74),
+            "forwarder-marker",
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(
             live.contains("forwarder-marker"),
             "the re-attached tab is the live stream: {live:?}"
@@ -1977,7 +2195,7 @@ mod tests {
         // synchronisation.
         let stale = feed_text_until(
             &mut discarded_rx,
-            74,
+            TabKey::local(74),
             "forwarder-marker",
             Duration::from_millis(250),
         )
@@ -2014,7 +2232,7 @@ mod tests {
         };
 
         let window = window::Id::unique();
-        let raise = notification_activation(&workspace, Some(window), clicked.id)
+        let raise = notification_activation(&workspace, Some(window), TabKey::local(clicked.id))
             .expect("the tab the banner named is still there");
         assert!(matches!(raise, UiTask::Focus(id) if id == window));
         assert_eq!(workspace.active().1, clicked.id);
@@ -2027,17 +2245,47 @@ mod tests {
         // No window id yet (or a headless run): the focus still landed in
         // the core, and only the raise is skipped.
         assert!(matches!(
-            notification_activation(&workspace, None, other.id),
+            notification_activation(&workspace, None, TabKey::local(other.id)),
             Some(UiTask::None)
         ));
         assert_eq!(workspace.active().1, other.id);
 
         workspace.close_tab(clicked.id).expect("close the tab");
         assert!(
-            notification_activation(&workspace, Some(window), clicked.id).is_none(),
+            notification_activation(&workspace, Some(window), TabKey::local(clicked.id)).is_none(),
             "a banner outliving its tab is a no-op"
         );
         assert_eq!(workspace.active().1, other.id, "and moves nothing");
+    }
+
+    /// The same click from a dead connection epoch: its instance no longer
+    /// matches anything, and the local tab that shares its numeric id must
+    /// not be jumped to.
+    #[test]
+    fn a_banner_from_a_stale_instance_never_jumps_the_local_tab_of_that_id() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").expect("project");
+        let one = workspace.open_tab(project.id, "/tmp", "one").expect("tab");
+        let two = workspace.open_tab(project.id, "/tmp", "two").expect("tab");
+        workspace
+            .set_tab_has_notification(one.id, true)
+            .expect("mark pending");
+        workspace.focus_tab(two.id).expect("focus elsewhere");
+
+        assert!(
+            notification_activation(
+                &workspace,
+                Some(window::Id::unique()),
+                TabKey::new(HostId::new(9), one.id),
+            )
+            .is_none(),
+            "another instance's banner earns no raise"
+        );
+        assert_eq!(
+            workspace.active().1,
+            two.id,
+            "and never moves the local focus"
+        );
     }
 
     /// Pins the per-tab counters `refresh_snapshot` maintains. These are
