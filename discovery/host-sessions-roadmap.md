@@ -31,10 +31,10 @@ toolchain move — putting the snapshot API in reach.
    session backend is a later, explicit product decision (HS-5), not
    a side effect.
 3. **Snapshot-first payload.** The attach payload is
-   `ghostty-snapshot`, available after plan 032 lands. The wire stays
-   kind-tagged (`vt` | `ghostty-snapshot`) so a formatter fallback
-   remains possible, but we do not build the formatter path unless
-   plan 032 stalls badly.
+   `ghostty-snapshot` (plan 032 landed the API; plan 034 / PR #371
+   shipped the `roost-vt` wrapper). The wire stays kind-tagged
+   (`vt` | `ghostty-snapshot`) so a formatter fallback remains
+   possible, but the formatter path is not built.
 4. **Localhost auto-reconnects after first opt-in; SSH stays
    explicit.** Once a user has connected `localhost`, relaunching the
    UI reattaches automatically — persist feels native. SSH hosts
@@ -345,10 +345,12 @@ worktree on a topic branch regardless.
   + replay ring (architecture §3).
 - The attach stream itself: bidirectional data-plane connection,
   snapshot payload, READY, seq-tagged tee, input/resize frames,
-  resume-from-seq, connect leases (D2/D3/D8) — **and the client-side
-  `roost-vt` snapshot-decode wrapper** (its correctness is part of
-  the protocol, not UI plumbing; a Rust integration client proves
-  decode fidelity here, before iced touches it).
+  resume-from-seq, connect leases (D2/D3/D8). The client-side
+  `roost-vt` snapshot wrapper **already shipped ahead of HS-1**
+  (plan 034, PR #371: encode + streaming `SnapshotDecoder` with a
+  36-test contract battery), so HS-1 consumes it rather than builds
+  it; the Rust integration client proving decode fidelity over the
+  real attach stream remains HS-1 work.
 - `events.subscribe` implemented (revision batches + resync
   contract test, architecture §4.2) — HS-2's sidebar depends on it.
 - Explicit stop op. `roostctl` targeting rules for the second
@@ -360,9 +362,10 @@ worktree on a topic branch regardless.
   for the contract-test list, CI path-filter wiring, and the perf
   budget.
 
-**Depends on:** plan 032 PR A merged (snapshot API). If 032 stalls,
-the fallback is the ~60-line formatter wrapper under the same
-kind-tagged wire — a swap, not a redesign.
+**Depends on:** plan 032 PR A merged (snapshot API) — satisfied, and
+the `roost-vt` wrapper shipped (plan 034, PR #371). The kind-tagged
+wire keeps the ~60-line formatter fallback possible as a swap, not a
+redesign, should a pin bump ever break the format.
 
 **Acceptance:** start session → open tabs via `roostctl` → agents
 keep running with no UI anywhere → `tab.dump` shows live state →
@@ -437,8 +440,10 @@ default-backend change, not a rewrite.
 
 - **Plan 032** owns the pin bump and files the snapshot-adoption
   issue (its D8) that HS-1 picks up. HS work references plan 032,
-  not "E8". HS-1's snapshot wrapper in `roost-vt` starts only after
-  032's PR A merges to keep `roost-vt` churn serialized.
+  not "E8". The snapshot wrapper in `roost-vt` waited for 032's PR A
+  to keep `roost-vt` churn serialized and **has since shipped**
+  (plan 034, PR #371 — the attach half of #363; the persistence
+  half stays open).
 - All HS implementation happens on topic branches in **worktrees**;
   no HS PR edits `vision.md` except the HS-1 plan's DL revision
   commit.
