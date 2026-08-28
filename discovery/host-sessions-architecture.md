@@ -338,12 +338,13 @@ install — expected behavior, stated in the connect UI.
 ## 5. Client-side decode (roost-vt wrapper)
 
 **Shipped:** the wrapper this section specifies now exists as
-`crates/roost-vt/src/snapshot.rs` (plan 034, PR pending) — envelope +
+`crates/roost-vt/src/snapshot.rs` (plan 034, PR #371) — envelope +
 record-header framing for boundaries only, `decoder_ready`/
 `decoder_next` gated on a fully buffered record, and wrapper-enforced
-hard caps on total bytes, single-record size, and continuation bytes.
-Decode *time* stays the consumer's watchdog, as below. What follows
-is the specification the wrapper was built to.
+hard caps on *size* only (total bytes, single-record bytes,
+continuation bytes); decode *time* is not capped by the wrapper and
+stays the consumer's watchdog, as below. What follows is the
+specification the wrapper was built to.
 
 The Ghostty decoder's `GhosttyReader` is synchronous and
 blocking-only (zero-byte read = EOF, never "would block"), the

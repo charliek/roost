@@ -1441,11 +1441,13 @@ fn dropping_at_every_state_is_safe() {
     let (decoded, _) = decode_streaming(&bytes);
     drop(decoded);
 
-    // Poisoned.
+    // Poisoned. Bounded so a corruption that stopped erroring fails
+    // the test instead of spinning on the idempotent `Finished`.
     let page = first_history_page(&bytes);
     bytes[page.payload_start + 7] ^= 0xff;
     let mut decode = ready_decoder(&bytes);
-    while decode.try_next().is_ok() {}
+    let poisoned = (0..16).any(|_| decode.try_next().is_err());
+    assert!(poisoned, "the flipped payload byte must poison the decode");
     drop(decode);
 }
 
