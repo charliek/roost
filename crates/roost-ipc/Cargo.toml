@@ -28,8 +28,11 @@ thiserror   = { workspace = true }
 # Logging.
 tracing     = { workspace = true }
 
+# Peer credentials (SO_PEERCRED / getpeereid), the runtime-dir mode
+# checks, the `/tmp` namespace uid in `paths`, plus `EAGAIN` in the
+# socket-liveness errno tests.
+libc        = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.10"
-# Only for spelling `EAGAIN` in the socket-liveness errno tests.
-libc = "0.2"

@@ -24,6 +24,10 @@
 //!   request/response cycle, one method per op.
 //! * [`server`] — `IpcServer` + `Handler` trait. The UI implements
 //!   `Handler`; the server crate drives the accept loop.
+//! * [`peer`] — peer-credential lookup ([`peer_uid`]) behind the
+//!   server's opt-in same-UID enforcement.
+//! * [`runtime_dir`] — create-or-validate the directory a socket is
+//!   bound in ([`validate_runtime_dir`]).
 //! * [`target`] — CLI-side target selection for `roostctl`.
 //!
 //! The Swift companion lives in `mac/Sources/Roost/IPCServer.swift`
@@ -40,9 +44,13 @@ pub mod socket_state;
 pub mod target;
 
 mod client;
+mod peer;
+mod runtime_dir;
 mod server;
 
 pub use client::{ClientError, IpcClient};
+pub use peer::{current_euid, peer_uid};
+pub use runtime_dir::validate_runtime_dir;
 pub use server::{Handler, HandlerError, IpcServer};
 
 /// The wire-format protocol version. M0 ships `1`.

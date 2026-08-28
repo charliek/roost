@@ -40,8 +40,8 @@ async fn collect_until_exit(
 
     while Instant::now() < deadline && exit_status.is_none() {
         match output.try_recv() {
-            Ok(PtyOutputEvent::Bytes(bytes)) => collected.extend_from_slice(&bytes),
-            Ok(PtyOutputEvent::Exit(status)) => exit_status = Some(status),
+            Ok(PtyOutputEvent::Bytes { data, .. }) => collected.extend_from_slice(&data),
+            Ok(PtyOutputEvent::Exit { code, .. }) => exit_status = Some(code),
             Err(TryRecvError::Closed) => break,
             Err(TryRecvError::Empty) => sleep(Duration::from_millis(50)).await,
             // Dropped messages mean a truncated capture; fail loudly rather
@@ -210,7 +210,7 @@ async fn write_after_exit_returns_not_found() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match output.try_recv() {
-            Ok(PtyOutputEvent::Exit(_)) => break,
+            Ok(PtyOutputEvent::Exit { .. }) => break,
             Ok(_) => {}
             Err(TryRecvError::Closed) => break, // senders gone → child exited
             Err(TryRecvError::Empty) => {

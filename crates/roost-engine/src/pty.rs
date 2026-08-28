@@ -52,21 +52,84 @@ const KILL_GRACE: Duration = Duration::from_millis(200);
 const EXIT_PUBLISH_GRACE: Duration = Duration::from_millis(250);
 
 /// What a subscriber gets back from `PtySupervisor::subscribe`.
+///
+/// Every event carries `seq`, its ordinal within the spawn that
+/// produced it: 1 for the first event, +1 for each event after,
+/// `Exit` included (its own ordinal, not a copy of the last `Bytes`).
+/// A respawned tab is a new session with a fresh counter. Seqs are
+/// assigned in send order (see [`OutputPublisher`]), so a subscriber
+/// can detect a gap left by a `Lagged` and, later, resume a host
+/// session from the last seq it saw.
 #[derive(Debug, Clone)]
 pub enum PtyOutputEvent {
-    /// PTY emitted `bytes`. Bytes are owned to make `broadcast`
+    /// PTY emitted `data`. Bytes are owned to make `broadcast`
     /// cheap (each subscriber Clones the `Arc<Vec<u8>>`-equivalent
     /// internal repr; here we use plain `Vec<u8>` since
     /// per-frame chunks are small and the broadcast clone is cheap
     /// enough at the workloads roost runs).
-    Bytes(Vec<u8>),
+    Bytes { seq: u64, data: Vec<u8> },
     /// PTY child exited with this status. Published by the reader task
     /// after the last `Bytes` it read, so a consumer that stops here
     /// has the tab's complete output (#255). The one exception is the
     /// bounded fallback described on `PtySupervisor::spawn`: a reader
     /// that never reaches EOF gets `Exit` published out from under it
-    /// on a deadline.
-    Exit(i32),
+    /// on a deadline, and `Bytes` with higher seqs can still follow.
+    Exit { seq: u64, code: i32 },
+}
+
+impl PtyOutputEvent {
+    /// This event's ordinal within its spawn, whichever variant it is.
+    /// A consumer watching for a `Lagged` gap cares about the number,
+    /// not the variant, so it should not have to match on one.
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Bytes { seq, .. } | Self::Exit { seq, .. } => *seq,
+        }
+    }
+}
+
+/// A tab's output channel plus its sequence counter.
+///
+/// The counter bump and the `send` have to happen together under one
+/// lock: with a bare atomic, a producer that reserved seq N could stall
+/// before sending while the other producer broadcast N+1, so
+/// subscribers would see seqs out of order. Two producers race here on
+/// the deadline path — the reader loop and the reap task's backstop —
+/// which is exactly when that matters. `broadcast::Sender::send` is
+/// synchronous and never blocks on subscribers, so the critical section
+/// is a few nanoseconds and holds no `.await`.
+struct OutputPublisher {
+    tx: broadcast::Sender<PtyOutputEvent>,
+    next_seq: Mutex<u64>,
+}
+
+impl OutputPublisher {
+    fn new() -> Self {
+        let (tx, _drop_rx) = broadcast::channel::<PtyOutputEvent>(PTY_OUTPUT_BROADCAST_CAPACITY);
+        Self {
+            tx,
+            next_seq: Mutex::new(1),
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<PtyOutputEvent> {
+        self.tx.subscribe()
+    }
+
+    fn send_bytes(&self, data: Vec<u8>) {
+        self.publish(|seq| PtyOutputEvent::Bytes { seq, data });
+    }
+
+    fn send_exit(&self, code: i32) {
+        self.publish(|seq| PtyOutputEvent::Exit { seq, code });
+    }
+
+    fn publish(&self, event: impl FnOnce(u64) -> PtyOutputEvent) {
+        let mut next = self.next_seq.lock().unwrap();
+        let seq = *next;
+        *next += 1;
+        let _ = self.tx.send(event(seq));
+    }
 }
 
 /// Supervisor-level lifecycle events, fan-out to higher-level
@@ -101,7 +164,7 @@ struct Session {
     /// Unified input+resize command channel — one FIFO, so commands
     /// reach the PTY in submission order through the writer loop.
     cmd_tx: mpsc::Sender<WriterCmd>,
-    output_tx: broadcast::Sender<PtyOutputEvent>,
+    output: Arc<OutputPublisher>,
     /// Sendable kill handle obtained from
     /// `portable_pty::Child::clone_killer` before the child was
     /// moved into the wait task. `close()` invokes this to actively
@@ -157,7 +220,7 @@ impl PtySupervisor {
             .lock()
             .unwrap()
             .get(&tab_id)
-            .map(|s| s.output_tx.subscribe())
+            .map(|s| s.output.subscribe())
     }
 
     /// The receiver `spawn` subscribed before the reader task started,
@@ -320,15 +383,14 @@ impl PtySupervisor {
         // Drop the slave end now that the shell has it.
         drop(pair.slave);
 
-        let (output_tx, _drop_rx) =
-            broadcast::channel::<PtyOutputEvent>(PTY_OUTPUT_BROADCAST_CAPACITY);
+        let output = Arc::new(OutputPublisher::new());
         // Subscribe BEFORE we spawn the reader task. Returning this
         // to the caller guarantees no Bytes/Exit event between
         // spawn and caller-subscribe can be lost.
-        let early_rx = output_tx.subscribe();
+        let early_rx = output.subscribe();
         // Second pre-reader subscription, stashed in the Session for
         // the UI's first attach (see `Session::initial_rx`).
-        let initial_rx = output_tx.subscribe();
+        let initial_rx = output.subscribe();
         // One command channel for input + resize so they apply to the
         // PTY in submission order (#80).
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(PTY_INPUT_CHANNEL_CAPACITY);
@@ -348,11 +410,11 @@ impl PtySupervisor {
         // Reader: blocking read off the master fd, push to broadcast,
         // then publish the exit.
         tokio::task::spawn_blocking({
-            let output_tx = output_tx.clone();
+            let output = output.clone();
             let exit_published = exit_published.clone();
             move || {
                 let _reader_alive = reader_alive_tx;
-                pty_reader_loop(reader_handle, &output_tx, tab_id);
+                pty_reader_loop(reader_handle, &output, tab_id);
                 // EOF: everything the PTY produced is on the channel,
                 // so `Exit` published from here can only follow it.
                 // The status normally lands within microseconds (the
@@ -361,7 +423,7 @@ impl PtySupervisor {
                 // once it does, still after this EOF.
                 match status_rx.recv_timeout(EXIT_PUBLISH_GRACE) {
                     Ok(status) => {
-                        publish_exit_once(&output_tx, &exit_published, status);
+                        publish_exit_once(&output, &exit_published, status);
                     }
                     Err(_) => debug!(
                         tab_id,
@@ -395,7 +457,7 @@ impl PtySupervisor {
             debug!(tab_id, "pty input loop ended");
         });
 
-        let output_tx_exit = output_tx.clone();
+        let output_for_exit = output.clone();
         let lifecycle_tx = self.lifecycle.clone();
         let sessions_for_reap = self.sessions.clone();
         let reaped_for_wait = reaped.clone();
@@ -403,7 +465,7 @@ impl PtySupervisor {
 
         let session = Session {
             cmd_tx,
-            output_tx,
+            output,
             killer: Mutex::new(killer),
             pid,
             reaped,
@@ -490,7 +552,7 @@ impl PtySupervisor {
             // or on the deadline, when publishing here is the only
             // way the tab ever reports its exit.
             let _ = reader_alive_rx.recv_timeout(EXIT_PUBLISH_GRACE);
-            if publish_exit_once(&output_tx_exit, &exit_published_for_wait, status) {
+            if publish_exit_once(&output_for_exit, &exit_published_for_wait, status) {
                 debug!(
                     tab_id,
                     "pty reader had not finished; published Exit on the deadline path"
@@ -916,26 +978,18 @@ fn build_command(
 /// call this; the compare-exchange decides which one gets to send, so
 /// a consumer never sees two exits for one child. Returns whether this
 /// call was the one that published.
-fn publish_exit_once(
-    output_tx: &broadcast::Sender<PtyOutputEvent>,
-    published: &AtomicBool,
-    status: i32,
-) -> bool {
+fn publish_exit_once(output: &OutputPublisher, published: &AtomicBool, status: i32) -> bool {
     if published
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return false;
     }
-    let _ = output_tx.send(PtyOutputEvent::Exit(status));
+    output.send_exit(status);
     true
 }
 
-fn pty_reader_loop(
-    mut reader: Box<dyn Read + Send>,
-    output_tx: &broadcast::Sender<PtyOutputEvent>,
-    tab_id: i64,
-) {
+fn pty_reader_loop(mut reader: Box<dyn Read + Send>, output: &OutputPublisher, tab_id: i64) {
     let mut buf = vec![0u8; PTY_OUTPUT_CHUNK_SIZE];
     loop {
         match reader.read(&mut buf) {
@@ -944,7 +998,7 @@ fn pty_reader_loop(
                 return;
             }
             Ok(n) => {
-                let _ = output_tx.send(PtyOutputEvent::Bytes(buf[..n].to_vec()));
+                output.send_bytes(buf[..n].to_vec());
             }
             Err(err) => {
                 if matches!(err.kind(), std::io::ErrorKind::Interrupted) {
@@ -972,6 +1026,43 @@ pub enum PtyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_publishers_deliver_seqs_in_send_order() {
+        // Hammers the assign+send critical section from many threads.
+        // With the Mutex the receiver must see exactly 1..=N in order;
+        // an implementation that reserved seqs with a bare fetch-add
+        // and sent outside the lock could interleave reserve and send,
+        // which this catches with high probability — and the correct
+        // implementation can never fail it. Total sends stay within
+        // the broadcast capacity so the undrained receiver cannot lag.
+        let publisher = Arc::new(OutputPublisher::new());
+        let mut rx = publisher.subscribe();
+        let threads = 16;
+        let sends_per_thread = PTY_OUTPUT_BROADCAST_CAPACITY / threads;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let publisher = Arc::clone(&publisher);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..sends_per_thread {
+                        publisher.send_bytes(vec![0]);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        for expected in 1..=(threads * sends_per_thread) as u64 {
+            match rx.try_recv() {
+                Ok(event) => assert_eq!(event.seq(), expected),
+                Err(err) => panic!("receiver stopped at seq {expected}: {err:?}"),
+            }
+        }
+    }
 
     #[test]
     fn empty_argv_becomes_default_shell() {

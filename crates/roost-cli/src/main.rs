@@ -1529,6 +1529,22 @@ mod tests {
         ));
     }
 
+    /// HS-0 fence: `BundleProfileKind::Session` exists, but `roostctl`
+    /// cannot be pointed at a session. HS-1 defines session targeting;
+    /// until then `--target session` must be rejected outright.
+    #[test]
+    fn session_is_not_a_target_flag_value() {
+        use clap::ValueEnum;
+        assert!(TargetArg::from_str("session", true).is_err());
+        assert_eq!(
+            TargetArg::value_variants()
+                .iter()
+                .filter_map(|v| v.to_possible_value().map(|p| p.get_name().to_string()))
+                .collect::<Vec<_>>(),
+            vec!["mac", "linux", "iced"]
+        );
+    }
+
     #[test]
     fn claude_settings_document_matches_the_shipped_file() {
         // Frozen literal, not a re-derivation: an already-installed

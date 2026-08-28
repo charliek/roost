@@ -1006,6 +1006,7 @@ fn compose_window_title(fallback: &str, project: Option<(&str, &str)>, home: &st
 fn title_fallback(kind: BundleProfileKind) -> &'static str {
     match kind {
         BundleProfileKind::Iced => "Roost-Iced",
+        BundleProfileKind::Session => "Roost-Session",
         BundleProfileKind::Mac | BundleProfileKind::Linux => window_title::DEFAULT_WINDOW_TITLE,
     }
 }
@@ -3336,6 +3337,11 @@ mod tests {
             title_fallback(BundleProfileKind::Linux),
             "Roost",
             "the packaged Linux build resolves Linux and keeps the production name"
+        );
+        assert_eq!(
+            title_fallback(BundleProfileKind::Session),
+            "Roost-Session",
+            "no window ever runs the headless session profile, but the fallback stays total"
         );
     }
 

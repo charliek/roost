@@ -128,6 +128,12 @@ final class Workspace {
     /// the live `tabs` map — the live tabs are the fresh shells the
     /// UI re-opens from these descriptors.
     private var restoreLayout: RestoreLayout?
+    /// Saved hosts decoded from `state.json`, carried verbatim back
+    /// into every rewrite. The workspace neither reads nor mutates
+    /// them — HS-2 owns the mutation API — but they must be held here,
+    /// because a snapshot rebuilt without them silently erases the
+    /// user's hosts on the first ordinary write-through.
+    private var hosts: [SnapshotFile.HostSnapshot] = []
     /// Whether the UI window currently has focus — half of the
     /// notification-suppression predicate (plan §3.5), reported by the
     /// UI via `setWindowFocused`. Never persisted: focus is a property
@@ -164,6 +170,7 @@ final class Workspace {
         self.statePath = statePath
         if let snapshot = Self.readSnapshot(at: statePath) {
             self.nextID = max(1, snapshot.nextID)
+            self.hosts = snapshot.hosts
             // A pre-fix file can hold colliding project positions, and
             // unlike tabs (re-opened through `openTab`, so freshly
             // allocated) projects load their position verbatim — the
@@ -1012,7 +1019,8 @@ final class Workspace {
                     )
                 },
             activeProjectID: activeProjectID,
-            activeTabPosition: activeTabPosition
+            activeTabPosition: activeTabPosition,
+            hosts: hosts
         )
         do {
             try Self.write(snapshot: snapshot, to: statePath, sync: sync)
@@ -1103,17 +1111,26 @@ final class Workspace {
         /// ids aren't stable across a fresh-shell restore, so the
         /// selection is restored by position.
         let activeTabPosition: Int32
+        /// Saved host sessions, in the order the UI lists them. This
+        /// is **client-side** state: the laptop remembers which hosts
+        /// it can dial, while a host's own project/tab layout lives in
+        /// that host's `state.json` (host-sessions roadmap D8).
+        /// Defaulted on decode so a file from a build predating host
+        /// sessions (or from the other UI) still loads.
+        let hosts: [HostSnapshot]
 
         init(
             nextID: Int64,
             projects: [ProjectSnapshot],
             activeProjectID: Int64 = 0,
-            activeTabPosition: Int32 = 0
+            activeTabPosition: Int32 = 0,
+            hosts: [HostSnapshot] = []
         ) {
             self.nextID = nextID
             self.projects = projects
             self.activeProjectID = activeProjectID
             self.activeTabPosition = activeTabPosition
+            self.hosts = hosts
         }
 
         struct ProjectSnapshot: Codable, Equatable, Sendable {
@@ -1201,21 +1218,58 @@ final class Workspace {
             }
         }
 
+        /// A saved host session: the identity the client dials, plus
+        /// enough to render the row. `target` is `localhost` or an SSH
+        /// destination; `lastConnected` is absent until the first
+        /// successful connect. Mirrors the Rust `HostSnapshot`.
+        struct HostSnapshot: Codable, Equatable, Sendable {
+            let id: String
+            let label: String
+            let target: String
+            let lastConnected: String?
+
+            init(id: String, label: String, target: String, lastConnected: String? = nil) {
+                self.id = id
+                self.label = label
+                self.target = target
+                self.lastConnected = lastConnected
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case id, label, target
+                case lastConnected = "last_connected"
+            }
+
+            // Custom decode so a missing or null `last_connected`
+            // decodes as nil rather than throwing — matches Rust's
+            // `#[serde(default)]` on the `Option`.
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                id = try c.decode(String.self, forKey: .id)
+                label = try c.decode(String.self, forKey: .label)
+                target = try c.decode(String.self, forKey: .target)
+                lastConnected = try c.decodeIfPresent(String.self, forKey: .lastConnected)
+            }
+        }
+
         enum CodingKeys: String, CodingKey {
             case nextID = "next_id"
             case projects
             case activeProjectID = "active_project_id"
             case activeTabPosition = "active_tab_position"
+            case hosts
         }
 
-        // Custom decode so missing `tabs` / `active_*` keys default
-        // instead of throwing (cross-version + legacy compatibility).
+        // Custom decode so missing `tabs` / `active_*` / `hosts` keys
+        // default instead of throwing (cross-version + legacy
+        // compatibility).
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             nextID = try c.decode(Int64.self, forKey: .nextID)
             projects = try c.decodeIfPresent([ProjectSnapshot].self, forKey: .projects) ?? []
             activeProjectID = try c.decodeIfPresent(Int64.self, forKey: .activeProjectID) ?? 0
             activeTabPosition = try c.decodeIfPresent(Int32.self, forKey: .activeTabPosition) ?? 0
+            hosts = try c.decodeIfPresent([HostSnapshot].self, forKey: .hosts) ?? []
         }
     }
 

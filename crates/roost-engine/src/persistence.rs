@@ -10,7 +10,8 @@
 //! in their saved directories; this reverses the original
 //! "no session restore" goal (vision.md DL-7). The `tabs` array and
 //! the `active_*` selection fields are `#[serde(default)]` so a file
-//! written by an older build (or the other UI) still loads.
+//! written by an older build (or the other UI) still loads — as is the
+//! `hosts` list, the client's saved host sessions.
 //!
 //! Atomic write protocol: write to `state.json.tmp`, rename over
 //! `state.json`. Killing the process mid-write either leaves the
@@ -69,6 +70,14 @@ pub struct SnapshotFile {
     /// [`SIDEBAR_MAX_WIDTH`]: crate::SIDEBAR_MAX_WIDTH
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f64,
+    /// Saved host sessions, in the order the UI lists them. This is
+    /// **client-side** state: the laptop remembers which hosts it can
+    /// dial, while a host's own project/tab layout lives in that
+    /// host's `state.json` (host-sessions roadmap D8). Defaulted so a
+    /// file from a build predating host sessions (or from the other
+    /// UI) still loads.
+    #[serde(default)]
+    pub hosts: Vec<HostSnapshot>,
 }
 
 fn default_sidebar_width() -> f64 {
@@ -87,8 +96,21 @@ impl Default for SnapshotFile {
             active_tab_position: 0,
             sidebar_collapsed: false,
             sidebar_width: default_sidebar_width(),
+            hosts: Vec::new(),
         }
     }
+}
+
+/// A saved host session: the identity the client dials, plus enough
+/// to render the row. `target` is `localhost` or an SSH destination;
+/// `last_connected` is absent until the first successful connect.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSnapshot {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub last_connected: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +280,20 @@ mod tests {
             active_tab_position: 1,
             sidebar_collapsed: true,
             sidebar_width: 300.0,
+            hosts: vec![
+                HostSnapshot {
+                    id: "h1".into(),
+                    label: "laptop".into(),
+                    target: "localhost".into(),
+                    last_connected: Some("2026-08-27T00:00:00Z".into()),
+                },
+                HostSnapshot {
+                    id: "h2".into(),
+                    label: "shed".into(),
+                    target: "test1@localhost".into(),
+                    last_connected: None,
+                },
+            ],
             projects: vec![ProjectSnapshot {
                 id: 1,
                 name: "Roost".into(),
@@ -309,6 +345,31 @@ mod tests {
         );
         assert_eq!(back.projects.len(), 1);
         assert!(back.projects[0].tabs.is_empty());
+        assert!(back.hosts.is_empty(), "absent hosts key defaults to none");
+    }
+
+    #[test]
+    fn host_without_last_connected_loads_as_none() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        std::fs::write(
+            &p,
+            br#"{
+                "next_id": 5,
+                "projects": [],
+                "hosts": [
+                    { "id": "h1", "label": "shed", "target": "test1@localhost" },
+                    { "id": "h2", "label": "box", "target": "localhost",
+                      "last_connected": null }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let back = read_state(&p).unwrap().expect("present");
+        assert_eq!(back.hosts.len(), 2);
+        assert_eq!(back.hosts[0].label, "shed");
+        assert_eq!(back.hosts[0].last_connected, None);
+        assert_eq!(back.hosts[1].last_connected, None);
     }
 
     #[test]

@@ -521,6 +521,31 @@ mod tests {
         assert_eq!(res.socket_path, linux.socket_path);
     }
 
+    /// HS-0 fence: the session profile exists in `paths.rs` but is not a
+    /// `roostctl` target. Naming it must be an error like any other
+    /// unknown profile, and auto-detect must never probe its socket —
+    /// HS-1 is what defines how a session gets addressed.
+    #[test]
+    fn session_is_not_a_roostctl_target() {
+        assert_eq!(
+            classify(None, None, None, Some("session")),
+            Step::UnknownProfile("session".into())
+        );
+
+        let session = BundleProfile::session().expect("session profile");
+        let candidates = auto_detect_candidates().expect("candidates");
+        for (kind, path) in &candidates {
+            assert!(
+                matches!(
+                    kind,
+                    BundleProfileKind::Mac | BundleProfileKind::Linux | BundleProfileKind::Iced
+                ),
+                "auto-detect must only probe UI profiles, got {kind:?}"
+            );
+            assert_ne!(*path, session.socket_path);
+        }
+    }
+
     #[test]
     fn chooser_names_every_live_candidate_in_stable_order() {
         let candidates = vec![
