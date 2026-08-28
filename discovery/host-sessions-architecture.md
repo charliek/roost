@@ -1,10 +1,19 @@
 # Host sessions — architecture
 
-Status: **design** — companion to
+Status: **design, with the HS-1a slice shipped** (plan 035, PR #372) —
+`roost-session`'s lifecycle and control plane are live per §8/§4.1
+below; the data plane (§3, §4.3, §5's wrapper wiring, §6, per-tab
+server Terminals) is still design, tracked into HS-1b. This file is
+the technical design the HS milestone plans implement, and stays
+normative for HS-1b/HS-2/HS-3; status annotations below mark what
+HS-1a already shipped. Companion docs:
 [`host-sessions-roadmap.md`](host-sessions-roadmap.md) (milestones,
-pinned direction) and [`host-sessions.md`](host-sessions.md)
-(rationale). This file is the technical design the HS milestone plans
-implement. It assumes the separately planned Ghostty pin bump
+pinned direction, the HS-1a/HS-1b split) and
+[`host-sessions.md`](host-sessions.md) (rationale). For the shipped
+wire's authoritative description (including its deviations from this
+design), see
+[`docs/reference/ipc.md`](../docs/reference/ipc.md#session-sockets).
+It assumes the separately planned Ghostty pin bump
 ("plan 032": libghostty-vt to main tip with the Zig 0.15→0.16
 toolchain move, which is what makes the snapshot C API available)
 lands first for anything snapshot-related; that effort tracks in
@@ -37,11 +46,11 @@ client-side Terminal.
  │    state.json, agent axes                          [exists]
  ├─ per-tab server Terminal (roost-vt, feature `server-vt`)  [new]
  ├─ roost-ipc server on the session socket profile    [exists + new]
- │    ├─ control connections (request→response JSON)
- │    ├─ events connection   (push JSON envelopes)    [new]
+ │    ├─ control connections (request→response JSON) [exists]
+ │    ├─ events connection   (push JSON envelopes)    [exists, provisional/leaseless]
  │    └─ data connections    (binary attach streams)  [new]
  └─ lifecycle: setsid daemon, flock single-instance, stale-socket
-      probe, explicit stop                            [new]
+      probe, explicit stop                            [exists]
 ```
 
 One session per host (for now). The client holds, per connected
@@ -140,6 +149,9 @@ existing `roost-ipc` framing and op set. New/changed ops:
   session_id, started_at }`. The client calls this **first** on any
   new host connection; every incompatibility is detected here, on
   stable JSON, before any binary frame exists (Herdr's lesson).
+  **Shipped in HS-1a**, with `payload_kinds: []` and
+  `libghostty_build: ""` until HS-1b populates them (attach doesn't
+  exist yet to name a kind for).
 - `session.connect` `{ takeover: true }` → registers the client and
   returns a **lease**: a cryptographically random token that is the
   interactive-authority boundary (a self-declared client id is
@@ -156,9 +168,14 @@ existing `roost-ipc` framing and op set. New/changed ops:
   revision. Required ordering on a new connection set:
   `session.identify` → `session.connect` → `events.subscribe` /
   `tab.attach`; out-of-order ops get a clean error naming the
-  missing step.
+  missing step. **Not yet enforced**: `session.connect` and its lease
+  don't exist yet, so HS-1a's `events.subscribe` is leaseless and
+  provisional (any client that asks gets pushed events); ordering
+  enforcement arrives with HS-1b's lease — see
+  [ipc.md's deviation list](../docs/reference/ipc.md#session-sockets).
 - `session.stop` → graceful shutdown (§8). Distinct from disconnect,
-  which is just closing connections.
+  which is just closing connections. **Shipped in HS-1a**, reap
+  report included.
 - `tab.attach` `{ tab_id, kinds: [...], cols, rows, cell_px }` →
   validates, returns `{ attach_token, kind }`. The token is
   single-use, short-lived (~60 s TTL), and associated with the
@@ -211,13 +228,26 @@ is safe precisely because reconnect + revision resync recovers.
 One engine reality shapes the envelope: a single workspace commit
 can publish several events under the **same** revision, so bare
 per-envelope revisions cannot detect loss mid-batch. The wire
-therefore carries atomic `{ revision, events: [...] }` batches (or
-an index/count per envelope — decided in the HS-1 plan), and the
-events connection uses the same subscribe-first / snapshot-at-R /
-discard-≤R fence discipline as the terminal stream. This is a
-correctness dependency of HS-2's sidebar, not a nice-to-have.
-**Implemented in HS-1** (with its resync contract test), consumed
-by HS-2.
+therefore carries atomic `{ revision, events: [...] }` batches, one
+per commit including empty ones, and the events connection uses the
+same subscribe-first / snapshot-at-R / discard-≤R fence discipline as
+the terminal stream. This is a correctness dependency of HS-2's
+sidebar, not a nice-to-have.
+
+**Shipped in HS-1a**, resolving the open "batches or index/count"
+question above in favor of atomic batches — see
+[ipc.md's `events.subscribe`](../docs/reference/ipc.md#eventssubscribe)
+for the wire shape as built: the subscribe ack returns `{revision}`
+as the fence, the first batch is exactly `revision + 1`, every commit
+(including a quiet one) produces a batch so a skipped number always
+means loss, and a bounded per-client queue plus close-don't-thin
+backpressure is implemented as specified. One deviation from this
+section as originally written: the connection is **leaseless** —
+HS-1b's `session.connect` lease is what this doc's §4.1 gates
+`events.subscribe` behind, and until then any client that asks gets
+served (documented as a breaking-change-pending in
+[ipc.md](../docs/reference/ipc.md#session-sockets)). Consumed by
+HS-2.
 
 ### 4.3 Data plane (binary attach stream)
 
@@ -436,7 +466,10 @@ The full authority split, per kind of state:
 
 - Detach does not resize; PTYs keep the last attached size (no
   SIGWINCH into TUI agents). Tabs created while detached use a
-  configured default (120×40).
+  configured default (120×40). **Shipped in HS-1a** — the 120×40
+  default is live for tabs a session creates (restored or freshly
+  opened via `roostctl`); the "configured" half (a config key to
+  change it) is still deferred, D7's default is hardcoded today.
 - PTY env is today's (`TERM=xterm-256color` forced, `COLORTERM`,
   `ROOST_TAB_ID`), with `ROOST_SOCKET` = the session socket — Claude
   hooks and `roostctl` inside session tabs work unmodified.
@@ -444,6 +477,12 @@ The full authority split, per kind of state:
   (takeover means exactly one).
 
 ## 8. Lifecycle, locks, security
+
+**Implemented by HS-1a** — start/fork/setsid, the flock + stale-socket
++ `(dev, ino)` + directory-hygiene posture, the readiness pipe,
+same-UID peer check, and stop's order/probe/never-self-exits/
+stopping-client poll semantics below all shipped as written. The one
+deviation is the client-notification step of Stop, noted inline.
 
 - **Start:** `roost-session start` (or spawn-if-missing from the
   client): single fork + `setsid`, parent exits; launch cwd passed
@@ -479,7 +518,11 @@ The full authority split, per kind of state:
   a concurrent spawner that loses the flock just reconnects to the
   winner.
 - **Stop:** `session.stop` → refuse new tabs/attaches → notify
-  clients (events envelope; data conns close with a labeled ERROR)
+  clients (events envelope; data conns close with a labeled ERROR —
+  **deviation: HS-1a notifies push clients by plain connection close,
+  with no reason code; the labeled envelope/ERROR arrives with the
+  data plane in HS-1b, per
+  [ipc.md](../docs/reference/ipc.md#session-sockets)**)
   → flush `state.json` (existing `Workspace::flush`) → **awaited**
   `shutdown_all(deadline)` reap of every child (SIGHUP, waitpid
   loop, SIGKILL escalation — the current `terminate_child` is a
@@ -599,6 +642,24 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 
 ## 12. Testing architecture
 
+HS-1a shipped the control-plane subset of this section: the Rust
+contract tests in `crates/roost-session/tests/`
+(`session_lifecycle_test.rs` for start/stop/reap ordering,
+`session_events_test.rs` for subscribe over the real serve path,
+`socket_guard_test.rs` for the `(dev, ino)` stale-socket guard,
+`session_hydration_test.rs` and `session_osc_drain_test.rs` for
+headless hydration + drain, `session_fast_exit_test.rs` for
+pre-attach exits still closing their rows), the batch/fence/stop
+contract tests in `crates/roost-engine/tests/`
+(`workspace_batch_test.rs`, `events_push_test.rs`,
+`session_ops_test.rs`, `pty_shutdown_test.rs`) plus the
+`session_daemon`-marked pytest module
+(`tools/roosttest/test_session.py`) and its required `session-e2e` CI
+job. The attach/data-plane/perf items in the lists below (fence on
+the tab task, resume-from-seq, snapshot byte fidelity, exactly-once
+replies, the input-latency-under-`tab.dump` budget) remain HS-1b work
+— annotated where they occur.
+
 - **Rust unit tier** (repo convention, `_test.rs` under `tests/`):
   the §5 record-boundary buffering (split headers, partial records,
   truncated CRC) — shipped as plan 034's
@@ -606,16 +667,24 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
   down to 1-byte feeds, corruption/truncation, caps, continuation
   round-trips); fence assignment on the tab task (including the
   HS-0→HS-1 seq relocation — a test pins fence semantics across the
-  move); the resize-withhold state machine; **exactly-once replies**
+  move — **HS-1b, tab task doesn't exist yet**); the resize-withhold
+  state machine (**HS-1b**); **exactly-once replies**
   (DA/DSR/color query answered once by the server, client reply
   buffer verifiably discarded — the two-VT design reintroduces the
   doubled-reply bug class `osc_drain_reply_test.rs` exists for, so
-  it gets the same treatment); `Error::from_result` coverage for
-  any new codes.
+  it gets the same treatment — **HS-1b, no server VT yet to answer
+  from**); `Error::from_result` coverage for any new codes.
 - **HS-1 (no UI):** a roosttest module speaks both planes from
   Python — control ops via the existing IPC client, the data plane
-  via a small binary-frame reader. Contract tests: fence correctness
-  (no lost/duplicated bytes around `seq`), READY-before-history
+  via a small binary-frame reader. **HS-1a shipped the control-plane
+  half** as `tools/roosttest/test_session.py` (the `session_daemon`
+  marker, required `session-e2e` CI job): start/stop/status,
+  identify, the events atomic-batch fence and resync, stale-socket
+  recovery, hydration, and OSC drain are covered there and in the
+  Rust tests listed above. Everything below that names `seq`, attach,
+  takeover, or the data connection is **HS-1b** (takeover needs
+  `session.connect`'s lease, which doesn't exist yet). Contract tests: fence
+  correctness (no lost/duplicated bytes around `seq`), READY-before-history
   ordering, PTY-frame priority, resume-from-seq (ring hit and ring
   miss), a fast-producer/slow-consumer soak proving no attach
   thrash, takeover (including stale-control-op rejection),
@@ -662,9 +731,10 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 
 ## 13. Open questions (carried, not blocking)
 
-- Exact event-envelope revision/resync wire shape (spec'd in the
-  HS-1 plan; the interim ipc.md drift fix in HS-0 documents
-  `events.subscribe` as not-implemented until then).
+- ~~Exact event-envelope revision/resync wire shape~~ **Resolved,
+  shipped in HS-1a**: atomic `{revision, events: [...]}` batches, one
+  per commit including empty ones — see
+  [ipc.md's `events.subscribe`](../docs/reference/ipc.md#eventssubscribe).
 - Whether `session.connect` carries the client theme seed or a
   separate op does (§6).
 - Data-plane priority implementation detail (two queues vs one with
