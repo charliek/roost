@@ -476,9 +476,14 @@ fn buffered_round_trip_reproduces_the_terminal() {
     );
     let copy = scrollback_copy(&mut restored);
     assert_eq!(copy, scrollback_copy(&mut source), "scrollback span copy");
+    // Which numbered line sits at the top of scrollback depends on the
+    // page-granular prune boundary, which varies with the OS page size
+    // (16K macOS vs 4K Linux) — so pin the fixture's per-line marker
+    // text, not an absolute line number.
     assert!(
-        copy.is_some_and(|text| text.contains("line 0")),
-        "the copied span must actually contain restored history"
+        copy.as_deref()
+            .is_some_and(|text| text.contains("the quick brown fox")),
+        "the copied span must actually contain restored history, got {copy:?}"
     );
     assert_eq!(
         decoded.source_offset,
