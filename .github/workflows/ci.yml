@@ -1654,8 +1654,15 @@ jobs:
         # --roost-fresh: own a hermetic instance with an isolated, throwaway
         # ROOST_STATE_DIR (replaces the old ROOST_TEST_RESET_STATE clean-slate
         # hack — the harness no longer deletes the real state.json).
+        #
+        # `-m 'not session_daemon'` deselects the headless host-session lane,
+        # which has its own `session-e2e` job. This whole-directory run builds
+        # no `roost-session`, so collecting it here would make the first
+        # session case `cargo build` mid-test on a shared macOS runner. Mirror
+        # of the Makefile's SESSION_E2E_DESELECT — see the comment there.
         run: >
-          uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh -v
+          uv run --group test pytest tools/roosttest -m 'not session_daemon'
+          --roost-target mac --roost-fresh -v
           --junitxml=test-results/e2e-mac.xml
 
       # On failure, salvage what makes a red blocking check debuggable: the
@@ -1682,10 +1689,54 @@ jobs:
             test-results/
           if-no-files-found: ignore
 
+  # Functional E2E against the headless host-session daemon: the pytest lane
+  # spawns real `roost-session` processes on throwaway profiles and drives
+  # them over the same IPC op set `roostctl` speaks (tools/roosttest/
+  # test_session.py). Required (in ci-success).
+  #
+  # Deliberately lean compared with the UI lanes: no display, no apt
+  # packages (portable-pty needs none), and no libghostty-vt step —
+  # `roost-session` depends on roost-engine, not roost-vt, so
+  # `cargo tree -p roost-session | grep roost-vt` is empty and a ghostty
+  # build here would be pure cost.
+  session-e2e:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-session-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-session-${{ runner.os }}-
+
+      - name: Run host-session E2E
+        env:
+          RUST_LOG: warn
+          # Same knob the daemon and `roostctl session` read, so the
+          # runner's slowness widens both sides of every handshake.
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+        run: make e2e-session
+
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, iced-build-e2e, iced-release, e2e-mac]
+    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, iced-build-e2e, iced-release, e2e-mac, session-e2e]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1718,7 +1769,9 @@ jobs:
           # e2e-gtk, e2e-gtk-wayland) were deleted with crates/roost-linux.
           # e2e-iced-wayland-drag is deliberately NOT in `needs` — it is a
           # non-blocking signal lane (see its job comment).
-          required_jobs=9
+          # 9 -> 10 in plan 035: `session-e2e` gates the headless
+          # host-session daemon lane.
+          required_jobs=10
           count="$(echo "${NEEDS}" | jq -r 'length')"
           if [ "${count}" -lt "${required_jobs}" ]; then
             echo "::error::ci-success is gating ${count} jobs but expects at least ${required_jobs} — a job was removed from its needs list. If that was deliberate, lower required_jobs in the same commit."

@@ -49,8 +49,30 @@ def target(pytestconfig) -> str:
     )
 
 
+_needs_ui = pytest.StashKey[bool]()
+
+
+def pytest_collection_modifyitems(config, items):
+    """Record whether this invocation needs a UI at all.
+
+    The headless host-session lane (`test_session.py`, marked
+    `session_daemon`) spawns its own `roost-session` daemons against
+    throwaway profiles and never dials a UI socket. Launching a UI for it
+    would be pure cost — and destructive under `--roost-fresh`, which
+    force-quits the developer's running instance. So the autouse fixture
+    below stands down when *every* collected test is a session-daemon
+    test; a mixed run still gets its UI.
+    """
+    config.stash[_needs_ui] = any(
+        item.get_closest_marker("session_daemon") is None for item in items
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _ui_session(target, fresh):
+def _ui_session(pytestconfig, target, fresh):
+    if not pytestconfig.stash.get(_needs_ui, True):
+        yield
+        return
     # `start_session` returns True when the harness owns the instance
     # (launched it with a throwaway state dir); only then do we quit it +
     # clean up at teardown. A reused dev UI is left running and untouched.
