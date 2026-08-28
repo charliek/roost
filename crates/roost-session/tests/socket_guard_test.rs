@@ -29,10 +29,13 @@ fn a_successor_at_the_same_path_is_left_alone() {
     std::fs::write(&path, b"ours").unwrap();
     let recorded = SocketIdentity::of(&path).unwrap();
 
-    // Replace it the way a restart would: the old entry goes, a new one
-    // takes the name.
-    std::fs::remove_file(&path).unwrap();
-    std::fs::write(&path, b"theirs").unwrap();
+    // Replace it via create-then-rename: the replacement exists beside
+    // the original before taking its name, so the two can never share
+    // an inode. (A plain remove+create let ext4 hand the freed inode
+    // straight back, tripping the precondition below on CI.)
+    let staged = dir.path().join("roost.sock.next");
+    std::fs::write(&staged, b"theirs").unwrap();
+    std::fs::rename(&staged, &path).unwrap();
     assert_ne!(
         SocketIdentity::of(&path).unwrap(),
         recorded,
