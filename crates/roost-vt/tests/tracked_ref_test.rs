@@ -18,6 +18,7 @@ fn terminal() -> Terminal {
         cols: COLS,
         rows: ROWS,
         max_scrollback: 2000,
+        ..Default::default()
     })
     .expect("terminal")
 }

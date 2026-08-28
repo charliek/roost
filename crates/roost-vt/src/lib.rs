@@ -131,6 +131,8 @@ mod scroll;
 #[cfg(feature = "ffi")]
 mod selection;
 #[cfg(feature = "ffi")]
+mod snapshot;
+#[cfg(feature = "ffi")]
 mod terminal;
 #[cfg(feature = "ffi")]
 mod tracked_ref;
@@ -180,6 +182,7 @@ pub fn vt_smoke() -> Result<()> {
         cols: 80,
         rows: 24,
         max_scrollback: 0,
+        ..Default::default()
     })?;
     term.vt_write(b"hello\r\n");
     let mut rs = RenderState::new()?;

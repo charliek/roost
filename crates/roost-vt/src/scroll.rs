@@ -188,6 +188,7 @@ mod tests {
             cols: 8,
             rows: 2,
             max_scrollback: 20,
+            ..Default::default()
         })
         .expect("terminal")
     }
@@ -204,6 +205,7 @@ mod tests {
             cols: 8,
             rows: 4,
             max_scrollback: 64,
+            ..Default::default()
         })
         .expect("terminal");
         for index in 0..16 {

@@ -26,6 +26,7 @@ fn kitty_terminal_and_encoder() -> (Terminal, KeyEncoder) {
         cols: 80,
         rows: 24,
         max_scrollback: 0,
+        ..Default::default()
     })
     .expect("terminal");
     // CSI > 1 u — push Kitty flags (bit 0 = disambiguate). This is the
@@ -110,6 +111,7 @@ fn ctrl_a_legacy_returns_soh() {
         cols: 80,
         rows: 24,
         max_scrollback: 0,
+        ..Default::default()
     })
     .expect("terminal");
     enc.sync_from_terminal(&term);

@@ -21,6 +21,7 @@ fn sgr_terminal_and_encoder() -> (Terminal, MouseEncoder) {
         cols: 80,
         rows: 24,
         max_scrollback: 0,
+        ..Default::default()
     })
     .expect("terminal");
     // DECSET 1000 (normal button tracking) + 1006 (SGR extended coords).
@@ -104,6 +105,7 @@ fn wheel_with_tracking_off_is_dropped() {
         cols: 80,
         rows: 24,
         max_scrollback: 0,
+        ..Default::default()
     })
     .expect("terminal");
     let mut enc = MouseEncoder::new().expect("encoder");
