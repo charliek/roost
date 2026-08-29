@@ -5,6 +5,7 @@
 //! GTK migration mechanical. New adapters should prefer this façade: every
 //! value crossing it is owned, serializable, and independent of a UI toolkit.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -117,6 +118,7 @@ impl EngineError {
             Self::Pty(PtyError::NotFound(_)) | Self::Pty(PtyError::Closed(_)) => "tab_not_found",
             Self::Pty(PtyError::Cancelled(_)) => "cancelled",
             Self::Pty(PtyError::DuplicateTab(_)) => "duplicate_tab",
+            Self::Pty(PtyError::ShuttingDown(_)) => "shutting_down",
             Self::Operation(_) => "operation_failed",
             Self::InvalidArgument(_) => "invalid_argument",
         }
@@ -186,6 +188,8 @@ impl Engine {
             initial: true,
             last_revision: 0,
             discard_through: None,
+            pending: VecDeque::new(),
+            pending_revision: 0,
         }
     }
 
@@ -318,6 +322,11 @@ pub struct EngineEventStream {
     /// Startup/resync snapshots can be newer than already-buffered events.
     /// Discard those stale deltas before resuming incremental delivery.
     discard_through: Option<u64>,
+    /// The tail of the commit batch currently being handed out. The
+    /// workspace delivers a commit atomically; this stream's contract is
+    /// still one `Delta` per event, so the batch is drained here.
+    pending: VecDeque<WorkspaceEvent>,
+    pending_revision: u64,
 }
 
 impl EngineEventStream {
@@ -328,9 +337,17 @@ impl EngineEventStream {
             let snapshot = self.engine.snapshot();
             self.last_revision = snapshot.revision;
             self.discard_through = Some(snapshot.revision);
+            self.pending.clear();
             return Some(EngineEvent::Resync(snapshot));
         }
         loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Some(EngineEvent::Delta {
+                    schema_version: EngineSnapshot::SCHEMA_VERSION,
+                    revision: self.pending_revision,
+                    event,
+                });
+            }
             match self.receiver.recv().await {
                 Ok(item) => {
                     if self
@@ -350,16 +367,16 @@ impl EngineEventStream {
                         return Some(EngineEvent::Resync(snapshot));
                     }
                     self.last_revision = item.revision;
-                    return Some(EngineEvent::Delta {
-                        schema_version: EngineSnapshot::SCHEMA_VERSION,
-                        revision: item.revision,
-                        event: item.event,
-                    });
+                    // An event-free commit still advances the revision;
+                    // it just has no delta to hand out.
+                    self.pending_revision = item.revision;
+                    self.pending.extend(item.events);
                 }
                 Err(RecvError::Lagged(_)) => {
                     let snapshot = self.engine.snapshot();
                     self.last_revision = snapshot.revision;
                     self.discard_through = Some(snapshot.revision);
+                    self.pending.clear();
                     return Some(EngineEvent::Resync(snapshot));
                 }
                 Err(RecvError::Closed) => return None,
@@ -493,25 +510,24 @@ mod tests {
         let mut events = workspace.subscribe_versioned();
 
         workspace.delete_project(project.id).unwrap();
-        let mut batch = Vec::new();
-        for _ in 0..4 {
-            batch.push(events.recv().await.unwrap());
-        }
-        assert!(batch.iter().all(|item| item.revision == 4));
+        let message = events.recv().await.unwrap();
+        assert_eq!(message.revision, 4);
+        let batch = message.events;
+        assert_eq!(batch.len(), 4);
         assert!(matches!(
-            batch[0].event,
+            batch[0],
             WorkspaceEvent::TabClosed { tab_id } if tab_id == first.id
         ));
         assert!(matches!(
-            batch[1].event,
+            batch[1],
             WorkspaceEvent::TabClosed { tab_id } if tab_id == second.id
         ));
         assert!(matches!(
-            batch[2].event,
+            batch[2],
             WorkspaceEvent::ProjectDeleted { project_id } if project_id == project.id
         ));
         assert!(matches!(
-            batch[3].event,
+            batch[3],
             WorkspaceEvent::ActiveChanged {
                 project_id: 0,
                 tab_id: 0

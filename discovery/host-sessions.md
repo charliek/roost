@@ -19,6 +19,11 @@ direction + milestones) and
 (technical design). Where they differ from this note, they win. The
 Ghostty pin bump this note calls "E8" is now plan 032.
 
+2026-08-28 update: the session server this note proposed now exists —
+HS-1a (plan 035) shipped `roost-session` (lifecycle + control plane +
+provisional events push, deb-packaged, CI-gated); the roadmap's HS-1
+section records the HS-1a/HS-1b split.
+
 ---
 
 ## Product

@@ -1,0 +1,42 @@
+[package]
+name          = "roost-session"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+publish       = { workspace = true }
+description   = "Headless Roost host session: workspace + PTY supervisor + session IPC socket, no UI"
+
+[[bin]]
+name = "roost-session"
+path = "src/main.rs"
+
+[dependencies]
+roost-engine = { path = "../roost-engine" }
+roost-ipc    = { path = "../roost-ipc" }
+
+tokio   = { workspace = true }
+anyhow  = { workspace = true }
+clap    = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# fork / setsid / umask / pipe / poll / dup2 — the daemonize sequence
+# has no safe-Rust equivalent, and the same crate already backs
+# `roost-ipc`'s peer credentials and `roost-engine`'s reaper.
+libc = "0.2"
+
+# 128 bits for the session id. Already in the workspace graph (tempfile,
+# jobserver); the smallest thing that answers "give me entropy" without
+# pulling a generator framework in behind it.
+getrandom = "0.4"
+
+[dev-dependencies]
+tempfile   = "3"
+# Only the ops with no typed params struct on the wire need a hand-built
+# `{}`; the crate itself dials `session.stop` with `SessionStopParams`.
+serde_json = "1"
+
+[lints]
+workspace = true

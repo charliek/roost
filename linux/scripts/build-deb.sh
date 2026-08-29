@@ -56,13 +56,14 @@ export ROOST_VERSION="${VERSION}"
 echo "==> Building libghostty-vt (cached)"
 "${REPO_ROOT}/third_party/ghostty/build.sh"
 
-echo "==> cargo build --release (roost-iced + roostctl, linux-package feature)"
-cargo build --release -p roost-iced -p roost-cli --features roost-iced/linux-package
+echo "==> cargo build --release (roost-iced + roostctl + roost-session, linux-package feature)"
+cargo build --release -p roost-iced -p roost-cli -p roost-session --features roost-iced/linux-package
 
 CARGO_TARGET="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 ROOST_BIN="${CARGO_TARGET}/release/roost-iced"
 ROOSTCTL_BIN="${CARGO_TARGET}/release/roostctl"
-for b in "${ROOST_BIN}" "${ROOSTCTL_BIN}"; do
+SESSION_BIN="${CARGO_TARGET}/release/roost-session"
+for b in "${ROOST_BIN}" "${ROOSTCTL_BIN}" "${SESSION_BIN}"; do
   if [ ! -x "${b}" ]; then
     echo "error: expected binary not found: ${b}" >&2
     exit 1
@@ -80,6 +81,7 @@ rm -rf "${REPO_ROOT}/dist"
 mkdir -p "${REPO_ROOT}/dist"
 install -m 0755 "${ROOST_BIN}"    "${REPO_ROOT}/dist/roost"
 install -m 0755 "${ROOSTCTL_BIN}" "${REPO_ROOT}/dist/roostctl"
+install -m 0755 "${SESSION_BIN}"  "${REPO_ROOT}/dist/roost-session"
 
 echo "==> nfpm pkg (version=${ROOST_VERSION}, arch=${ROOST_ARCH})"
 # Clear prior .debs the way dist/ is cleared above. Repeated local builds at

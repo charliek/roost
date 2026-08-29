@@ -434,7 +434,14 @@ jobs:
           # exercised identically (test-only ops unlocked). --roost-fresh
           # owns a hermetic instance with an isolated, throwaway state dir.
           ROOST_TEST_MODE: "1"
-        run: uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh -v
+        # `-m 'not session_daemon'`: this step validates the Mac BUNDLE, and
+        # the headless host-session lane drives no bundle at all — it would
+        # only make the first session case `cargo build roost-session`
+        # mid-release. Its own `session-e2e` job gates it. Mirror of the
+        # Makefile's SESSION_E2E_DESELECT — see the comment there.
+        run: >
+          uv run --group test pytest tools/roosttest -m 'not session_daemon'
+          --roost-target mac --roost-fresh -v
 
       - name: Make DMG
         env:

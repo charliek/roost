@@ -7,12 +7,12 @@
 //! variant can land later if a use case shows up.
 //!
 //! Each request gets a monotonically-increasing id. Responses are
-//! matched by id; unsolicited event envelopes mid-stream (the server
-//! may emit them once `events.subscribe` is implemented — today it
-//! returns `not-implemented`, so none are sent) are silently dropped
-//! by this client. Future event-aware clients can extend [`IpcClient`]
-//! with a frame-level read helper rather than going through
-//! [`IpcClient::call_raw`].
+//! matched by id; unsolicited event envelopes mid-stream are silently
+//! dropped by this client. It never sends `events.subscribe`, so none
+//! arrive in practice — a connection only carries them after that op
+//! flips it to push mode. Future event-aware clients can extend
+//! [`IpcClient`] with a frame-level read helper rather than going
+//! through [`IpcClient::call_raw`].
 
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};

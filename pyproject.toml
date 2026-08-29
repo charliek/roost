@@ -28,3 +28,9 @@ stridelabs-docs-theme = { git = "https://github.com/charliek/stridelabs-docs-the
 [tool.pytest.ini_options]
 testpaths = ["tools/roosttest"]
 addopts = "-ra"
+markers = [
+    # Drives a `roost-session` daemon it spawns itself, against a throwaway
+    # profile — never a UI. conftest's autouse UI fixture stands down when
+    # every collected test carries this marker (see `make e2e-session`).
+    "session_daemon: headless roost-session E2E; needs no UI",
+]

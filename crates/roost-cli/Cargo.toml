@@ -32,5 +32,9 @@ serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 base64     = "0.22"
 
+# `access(2)`, for "can *this* user execute that file?" when locating the
+# roost-session binary. A permission-bit read cannot answer that.
+libc       = "0.2"
+
 [lints]
 workspace = true

@@ -25,10 +25,16 @@ than one is live, it reports the actual candidates and requires selection.
 but nothing ships or launches it there.)
 
 A fifth socket path, `Session` (`~/Library/Caches/RoostSession/roost.sock`
-on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is
-**reserved** for the future `roost-session` daemon (HS-1). Nothing binds
-it yet, it is not a `roostctl --target` value, and `roostctl` never probes
-it — see [`paths.md`](paths.md#session-profile-reserved).
+on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is served
+by the headless `roost-session` daemon (HS-1a, plan 035) — see
+[Session sockets](#session-sockets) and [`paths.md`](paths.md#session-profile).
+It is **not** a `roostctl --target` value and `roostctl` never auto-probes
+it: `roostctl session start|stop|status` address the session profile's
+socket directly (a pre-connect carve-out, since `start` must work when
+nothing is listening yet), and any other op reaches a session only
+through an explicit `--socket`. A UI socket answers `unknown-op` for
+every `session.*` op and `not-implemented` for `events.subscribe`,
+byte-identical to before `roost-session` existed.
 
 ## Wire format
 
@@ -48,11 +54,11 @@ it — see [`paths.md`](paths.md#session-profile-reserved).
   `{"id": "<string>", "ok": true, "result": {...}}`.
 * **Response envelope (error):**
   `{"id": "<string>", "ok": false, "error": {"code": "<kebab>", "message": "<string>"}}`.
-* **Event envelope** (server-push, unsolicited — **not delivered
-  today**; see [`events.subscribe`](#eventssubscribe)):
+* **Event envelope** (server-push, unsolicited):
   `{"event": "<dotted-name>", "data": {...}}` — no `id`, no response
-  expected. This is the shape a future push will use; the catalog in
-  [Events](#events) below documents it in advance.
+  expected. Pushed inside an `EventBatch` on a connection that ran
+  [`events.subscribe`](#eventssubscribe), which host-session sockets
+  serve and UI sockets do not. Catalog: [Events](#events) below.
 * **Bytes payloads** (e.g. `tab.write.data`, and any future binary
   field): **base64-encoded strings** using the standard alphabet,
   no padding stripping. Tested for binary fidelity (`0x00..0xff`
@@ -79,8 +85,12 @@ it — see [`paths.md`](paths.md#session-profile-reserved).
 * **Errors:** stable kebab-case codes. Current set:
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
-  `not-implemented`, `internal`. Clients should treat unknown codes as
-  fatal for the request and surface `message` to the user.
+  `not-implemented`, `internal`, `shutting-down`. Clients should treat
+  unknown codes as fatal for the request and surface `message` to the
+  user. `shutting-down` is **session-socket only**: once
+  [`session.stop`](#sessionstop) latches, every mutating op answers it
+  (reads still answer normally), and a second `session.stop` on the
+  same session gets it too instead of a fresh reap report.
 
 ## Shared types
 
@@ -248,6 +258,15 @@ Snapshot of the workspace. Same shape as the legacy
 `ListTabsResponse`.
 
 Response: `{"projects": [<Project>, ...]}`.
+
+On a **host-session socket** the response also carries
+`"revision": <u64>` — the commit the snapshot was taken at, read under
+the same lock as the projects. It is the fence a client pairs with
+[`events.subscribe`](#eventssubscribe): discard every `EventBatch`
+whose `revision` is `<=` this one, apply the rest, and the first batch
+it keeps is exactly `revision + 1`. A UI socket omits the key entirely
+(not `null`) — it serves no event stream, so there would be nothing to
+fence against.
 
 ### `tab.write`
 
@@ -1016,40 +1035,202 @@ state live on the UI side.
 
 ### `events.subscribe`
 
-**Not implemented.** The op exists on the wire but the server
-rejects every call with `{"ok": false, "error": {"code":
-"not-implemented", "message": "events.subscribe is not yet
-implemented"}}` (`ops::EVENTS_SUBSCRIBE` in
-`crates/roost-engine/src/ipc.rs`) rather than a false ACK — a client
-that treated the reply as "subscribed" would wait forever, since no
-event is ever pushed on the connection today. Callers that want
-current state should poll `tab.list` / `project.list` /
-`tab.dump` instead.
+Turn this connection into a one-way event stream. **Served by a
+host-session socket only.**
 
-Request shape as designed: `{"params": {"tab_id_filter": "0"}}`. A
-non-zero `tab_id_filter` would restrict the stream to events for
-that tab.
+Request: `{"params": {"tab_id_filter": "0"}}`. Response (the last
+request/response frame on the connection):
 
-**Forward note (HS-1):** push delivery lands with `roost-session`
-(the host-sessions daemon), delivered as atomic `EventBatch`es —
-`{"revision": <u64>, "events": [<EventEnvelope>, ...]}` — rather than
-one envelope per line. Batching every envelope that shares a
-`revision` lets a client detect loss with a simple gap check ("did I
-skip a revision?") instead of reconstructing individual dropped
-events; on a gap it re-pulls `tab.list` / `project.list`. Both
-`EventBatch` and `EventEnvelope` are already defined in
-`crates/roost-ipc/src/messages.rs` (landed ahead of the push
-implementation) — see [Events](#events) below for the envelope
-catalog they will carry.
+```json
+{"id": "7", "ok": true, "result": {"revision": 42}}
+```
+
+Everything after that ack is an `EventBatch` — one per workspace
+commit, `{"revision": <u64>, "events": [<EventEnvelope>, ...]}`, one
+per newline-delimited frame. The catalog of envelopes is
+[Events](#events) below.
+
+Three properties make this lossless without a replay buffer:
+
+* **The ack is a fence.** `revision` is the commit the subscription
+  starts from, and the first batch is exactly `revision + 1`. Pair it
+  with [`tab.list`](#tablist)'s own `revision`: snapshot, discard every
+  batch `<=` it, apply the rest.
+* **No gaps.** Every commit is a batch, including a commit that
+  produced no events — that arrives as `{"revision": N, "events": []}`.
+  A skipped number therefore always means loss, never a quiet commit.
+* **The server closes rather than thins.** If a subscriber stops
+  reading, falls behind the workspace broadcast, or the connection
+  stalls, the server closes the connection instead of dropping events
+  out of the stream. A close is the resync signal: reconnect,
+  re-subscribe, re-pull `tab.list`, and fence again.
+
+After the flip the connection answers nothing. Frames a client writes
+on it are read and discarded (so the server still notices a peer that
+goes away), never dispatched and never replied to. That read is also
+why a client must keep its write half **open**: half-closing it is how
+a peer says it is gone, and the server ends the stream. `session.stop`
+closes every subscriber before it drains its in-flight work, so a
+client watching a session sees the stream end as the session goes down.
+
+A non-zero `tab_id_filter` is rejected with `invalid-param` rather than
+ignored — HS-2 scope. Silently serving an unfiltered stream to a client
+that asked for one tab would make it mis-attribute every other tab's
+events.
+
+**Provisional.** HS-1b puts the stream behind a lease, which is a
+breaking change to this op. Today Roost's own tests are its only
+consumer.
+
+On a **UI socket** the op is still unimplemented: it answers
+`{"ok": false, "error": {"code": "not-implemented", "message":
+"events.subscribe is not yet implemented"}}` rather than a false ACK,
+because a UI process pushes nothing. Callers there poll `tab.list` /
+`tab.dump` instead. A UI-side stream lands with its first consumer.
+
+## Session ops
+
+Served **only by a host session** (`roost-session`), never by a UI
+socket. A UI socket answers `unknown-op` for both, which is how a client
+tells the two kinds of socket apart.
+
+### Session sockets
+
+`roost-session` is a headless daemon: it owns a workspace + PTY
+supervisor exactly like a UI does, but with no window and no renderer
+attached. It resolves the `Session` bundle profile
+([`paths.md`](paths.md#session-profile)) — same `~/Library/Caches/
+RoostSession/roost.sock` (macOS) / `$XDG_RUNTIME_DIR/roost-session/
+roost.sock` (Linux) socket path `identify.socket_path` names above,
+`RoostSessionDev` / `roost-session-dev` in debug builds. Startup installs
+`umask 0077` before creating anything, so the state dir, log dir, and
+socket directory it creates itself land at `0700` and `state.json` at
+`0600`; the socket file gets the same `0600` `IpcServer::bind` chmods
+every profile's socket to. On top of that file-mode posture, a session
+socket is the one IPC server in this codebase that also checks the
+**peer's UID** at accept time (`IpcServer::require_same_uid`) and drops
+any connection from a different user — a UI socket does not enforce
+this, relying on the `0700`/`0600` directory posture alone. Before the
+locks, `validate_runtime_dir` rejects (rather than repairs) a socket
+directory some other mode or owner already created, so a session never
+silently inherits a loosened directory. On shutdown the session unlinks
+its socket only if the path still resolves to the `(dev, ino)` it bound
+— a guard against removing a different, later session's live socket at
+the same path.
+
+`roostctl session start|stop|status` address this socket directly; they
+are a pre-connect carve-out (`session start` has to work when nothing is
+listening at all) and are deliberately **not** reachable through
+`--target` / `ROOST_BUNDLE_PROFILE` / auto-detect. Any other op reaches a
+session only via an explicit `--socket <path>`. See [`cli.md`](cli.md)
+for the verb-level contract (exit codes, `ROOST_SESSION_BIN`).
+
+A session's default tab size is `120x40` (`DEFAULT_TAB_COLS` /
+`DEFAULT_TAB_ROWS`) for both restored and freshly-opened tabs, since
+there is no window to measure a size from — a UI socket keeps its usual
+`80x24` default. On start, a session **hydrates** its saved
+`state.json` layout headlessly: it re-opens each tab's saved `{title,
+cwd}` as a fresh shell (same "layout, not live state" contract as a UI —
+[DL-7](../development/vision.md#dl-7-tabs-persist-as-layout-not-live-state-revised-2026-05-24))
+and attaches a per-tab OSC drain to each one so title/cwd/notification
+facts keep flowing with no terminal or renderer present. `SIGTERM` and
+`SIGINT` converge on the same shutdown path as an IPC-driven
+`session.stop`: the signal handler dials the session's own socket and
+drives the identical latch → drain → flush → reap sequence described
+below. Only if that self-dial fails outright (broken socket) or exceeds
+its budget does the daemon fall back to a direct finalization — flush,
+socket/lock cleanup, exit — without the mutation barrier or a reap
+report; the children then die with the process.
+
+**Three deviations from
+[`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md)
+are provisional, not final**, and tracked to close in HS-1b
+([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)):
+
+1. **`events.subscribe` ships leaseless.** §4.1/§9 of the architecture
+   doc gate the events connection behind a `session.connect` lease;
+   HS-1a serves it unconditionally to any client that asks. HS-1b's
+   lease will be a **breaking wire change** for anything written against
+   HS-1a's `events.subscribe`.
+2. **`session.stop` notifies push clients by closing the connection**,
+   not the architecture doc's §8 labeled shutdown envelope (`events`
+   connections get a labeled envelope; data connections close with a
+   labeled `ERROR`). HS-1a's plain close *is* the resync signal a
+   subscriber acts on — see [`events.subscribe`](#eventssubscribe) — but
+   it carries no reason code.
+3. **Terminal-generated queries go unanswered headless.** A program that
+   asks the terminal who it is (DA/DA2), where the cursor is (DSR), or
+   what a palette entry is set to gets no reply on any tab, because
+   answering one requires a libghostty terminal and a headless session
+   has none yet (`crates/roost-session/src/drain.rs`) — HS-1b's per-tab
+   server-side terminal is what fixes it. A program that blocks on such
+   a reply hangs; one that times out degrades.
+
+### `session.identify`
+
+Params: `{}`. Response:
+
+```json
+{
+  "app_version": "0.0.18",
+  "session_protocol": 1,
+  "payload_kinds": [],
+  "libghostty_build": "",
+  "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+  "started_at": "2026-08-27T14:03:11Z"
+}
+```
+
+The handshake a client runs before anything binary exists, so every
+incompatibility is caught on stable JSON. `session_protocol` is
+`SESSION_PROTOCOL_VERSION` — deliberately separate from the
+request/response `protocol_version` in [`identify`](#identify), because
+the two version different things and move independently.
+
+`payload_kinds` is empty and `libghostty_build` is `""` in the current
+implementation: attach is not available yet, and an honest empty list is
+what lets a client fall back rather than negotiate a payload the session
+cannot produce. HS-1b populates both. `payload_kinds` is an open list of
+strings, not a closed enum — a client must preserve values it does not
+recognize.
+
+### `session.stop`
+
+Params: `{}`. Response: the reap report,
+
+```json
+{"reaped": ["3", "5"], "killed": ["8"], "abandoned": ["9"]}
+```
+
+Stops the session. In order: the session latches *stopping* (every
+mutating op from that point answers `{"code": "shutting-down"}`, reads
+keep answering, and a second `session.stop` gets `shutting-down` too);
+it waits out the mutating requests already in flight, so a `tab.open`
+that got past the latch completes and its tab is included below; it
+flushes the workspace layout; then it hangs every PTY up, escalating to
+`SIGKILL` after a soft deadline.
+
+The three id lists partition the tabs that were live when the stop
+began — each id appears in exactly one, and each is sorted. `reaped`
+died on the hangup; `killed` was still live at the deadline and was
+SIGKILLed; `abandoned` was still unreaped after the post-kill tail and
+the session stopped waiting for it. Ids are string-encoded like every
+other id on this wire.
+
+The reply is written **before** the process-level shutdown tail runs, so
+a client always gets its report even though the session is on its way
+out.
 
 ## Events
 
-Server-push only, and **not delivered yet** — see
-[`events.subscribe`](#eventssubscribe). Each event is documented here
-in the envelope shape it will be pushed in once HS-1 implements
-delivery: a line of the form `{"event": "<name>", "data": {...}}`
-inside an `EventBatch`. The set below is the exhaustive list of event
-*types* the workspace already models; no other event names exist.
+Server-push only, delivered on a host-session socket after
+[`events.subscribe`](#eventssubscribe). Each envelope is a
+`{"event": "<name>", "data": {...}}` object inside an `EventBatch`;
+several envelopes can share one batch, which is what makes a commit
+atomic on the wire. The set below is exhaustive — the serializer
+(`crates/roost-engine/src/event_push.rs`) is a total match over the
+workspace's event enum, so a new event cannot ship without a name
+here.
 
 * `tab.opened` — `{"tab": <Tab>}`.
 * `tab.closed` — `{"tab_id": "<id>"}`.
@@ -1069,6 +1250,8 @@ inside an `EventBatch`. The set below is the exhaustive list of event
 * `project.renamed`   — `{"project_id": "<id>", "name": "<string>"}`.
 * `project.deleted`   — `{"project_id": "<id>"}`.
 * `active.changed`    — `{"project_id": "<id>", "tab_id": "<id>"}` (either may be `"0"`).
+* `tabs.reordered`    — `{"project_id": "<id>", "tab_ids": ["<id>", ...]}`. The full post-reorder display order for that project, not a diff.
+* `projects.reordered` — `{"project_ids": ["<id>", ...]}`. The full post-reorder sidebar order.
 * `hook_active.changed` — `{"tab_id": "<id>", "active": <bool>}`.
 * `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>"}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere.
 * `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
@@ -1090,9 +1273,9 @@ makes them unnecessary:
 * `ReportOsc`. OSC sequences are parsed in the UI; the UI updates
   its own state directly. There is nobody to round-trip to.
 * `WatchEvents` (legacy event stream RPC) is replaced by the
-  `events.subscribe` op + push envelopes on the same connection —
-  designed, wire-typed (`EventEnvelope` / `EventBatch`), but not
-  implemented yet; see [`events.subscribe`](#eventssubscribe).
+  `events.subscribe` op + push envelopes on the same connection; see
+  [`events.subscribe`](#eventssubscribe). Served by a host session
+  today, still `not-implemented` on a UI socket.
 
 Schema-only fields that survive but rename:
 

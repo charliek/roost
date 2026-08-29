@@ -16,7 +16,8 @@ The same iced binary additionally ships an **experimental macOS build**,
 installs beside `Roost.app` and is not a third implementation, just the
 Linux UI on a different host. `libghostty-vt` is vendored once and
 linked into both for in-process VT parsing and rendering. There is no
-daemon.
+daemon by default — the one opt-in exception is `roost-session`, a
+headless daemon for host-sessions ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)).
 
 ## The command core (north star)
 
@@ -102,6 +103,14 @@ cross-process serialization, the gRPC bindings (`tonic`, `prost`,
 `grpc-swift`), SQLite, and the entire `proto/` directory — ~4,400 LOC of
 plumbing.
 
+**The one exception is opt-in.** `roost-session`
+([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28))
+is a headless daemon for host-sessions — a workspace that outlives any
+UI attached to it, e.g. left running on a remote host — not a
+replacement for the one-user-one-UI-process deployment this paragraph
+describes. A user opts in with `roostctl session start`; nothing changes
+for anyone who doesn't.
+
 **JSON IPC, not gRPC.** With control-plane traffic only (no streaming
 PTY bytes), the wire surface is small enough that a hand-rolled
 newline-delimited JSON framing protocol over a Unix socket is simpler
@@ -181,8 +190,13 @@ chunk, then everything else is in-process memory.
 - **No multi-window.** One window per Roost instance, projects in the
   sidebar, tabs in the projects.
 - **No split-pane.** One terminal per tab.
-- **No remote / network IPC.** Unix domain socket only. The JSON wire
-  format is local IPC, not a public API.
+- **No remote / network IPC.** Unix domain socket only — including the
+  session socket `roost-session`
+  ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28))
+  serves, which is still a local UDS with a same-UID peer check, not a
+  network listener. The JSON wire format is local IPC, not a public API.
+  A planned bridge for reaching a session on a remote host (HS-3) tunnels
+  over SSH stdio rather than networking the protocol itself.
 - **No rendered output over the wire.** PTY bytes only ever live
   in-process.
 - **No shared UI code between Mac and Linux beyond the JSON wire
@@ -462,6 +476,40 @@ AppKit gives the Swift sidebar and menus VoiceOver support for free; an
 iced canvas gives essentially none. Named here so it stays a conscious
 trade rather than a late surprise.
 
+### DL-17: an opt-in headless roost-session daemon for host-sessions (2026-08-28)
+
+Plan 035 (HS-1a) added `crates/roost-session`, a headless daemon built on
+`roost-engine` that owns a workspace + PTY supervisor with no UI
+attached — the first exception to
+[DL-3](#dl-3-unix-domain-socket-not-tcp)'s "local desktop app" framing
+and [DL-4](#dl-4-each-ui-owns-its-own-workspace-revised-2026-05-23)'s
+"each UI owns its own workspace," and to the "no daemon" language in
+[Why this shape](#why-this-shape) and the non-goals above. It exists for
+[host-sessions](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md):
+a workspace that outlives any UI connecting to it, e.g. left running on
+a remote Linux host. It does not change the default deployment — a UI
+still owns its PTY supervisor in-process unless a user opts in with
+`roostctl session start`.
+
+DL-3 and DL-4 otherwise still hold: the session socket is a Unix domain
+socket with a same-UID peer check and `0700`/`0600` posture, not TCP,
+and session ops are gated to that one socket — UI sockets report
+`session.*` as `unknown-op` and `events.subscribe` as `not-implemented`,
+byte-identical to before this landed. See
+[ipc.md](../reference/ipc.md#session-sockets) for the wire contract.
+
+**Three deviations from the architecture doc are provisional, not
+final**, and tracked to close in HS-1b
+([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)):
+`events.subscribe` ships leaseless, ahead of the `session.connect` lease
+[the architecture doc](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md)
+specifies — HS-1b's lease will be a breaking wire change for any client
+written against HS-1a; `session.stop` notifies push clients by closing
+the connection rather than the architecture doc's labeled envelope; and
+headless tabs have no server VT, so terminal-generated queries (DA/DSR/
+color) go unanswered until HS-1b adds one. Full deviation list in
+[ipc.md](../reference/ipc.md).
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section
@@ -497,16 +545,22 @@ gated rather than answered early. The unproven Swift-facing facade
 held at "don't invest, don't delete" until the direction resolves.
 
 **What either branch unlocks** is the `discovery/` backlog as the
-candidate roadmap. The first spike candidate is **remote host support
-without needing tmux or herdr**
-([`discovery/host-sessions.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md)):
-an opt-in session server built from `roost-engine`, with the UI as one
-of its clients — which revises the "no daemon" non-goal for that feature
-without reversing the default. Its companion is **agent watching**
+candidate roadmap. The first spike, **remote host support without
+needing tmux or herdr**
+([`discovery/host-sessions.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md)),
+is landing, not just a candidate: `roost-session`
+([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)),
+an opt-in session daemon built from `roost-engine` with the UI as one of
+its clients, shipped its lifecycle + control plane as HS-1a; the data
+plane (attach, leases, headless `tab.dump`, snapshot payload) is HS-1b,
+tracked in
+[`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md).
+It revises the "no daemon" non-goal for that feature without reversing
+the default. Its companion, **agent watching**
 ([`discovery/agent-watching.md`](https://github.com/charliek/roost/blob/main/discovery/agent-watching.md)),
 adding screen/process observation as a fallback writer into the four
-agent axes rather than a replacement for hooks. Both are discovery
-notes; neither is scheduled, and neither waits on the other.
+agent axes rather than a replacement for hooks, remains an unscheduled
+discovery note; the two don't wait on each other.
 
 ## Migration history
 

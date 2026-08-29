@@ -24,6 +24,7 @@
 //!   roostctl render-stats [--reset]
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
+//!   roostctl session {start,stop,status}
 //!
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
@@ -32,9 +33,13 @@
 //!   ROOST_BUNDLE_PROFILE    (same effect as --target)
 //!   auto-detect             (probes all distinct paths; fails on ambiguity)
 //!
-//! See `crates/roost-ipc/src/target.rs` for resolution logic.
+//! See `crates/roost-ipc/src/target.rs` for resolution logic. The
+//! headless session is **not** a target on that ladder: `session …`
+//! addresses its socket directly (see [`session`]), and a generic op
+//! reaches a session only through an explicit `--socket`.
 
 mod doctor;
+mod session;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -199,6 +204,16 @@ enum Cmd {
     /// Claude Code subcommands (install hook settings file).
     #[command(subcommand)]
     Claude(ClaudeCmd),
+    /// Headless host-session subcommands: start, stop, and inspect the
+    /// `roost-session` daemon.
+    ///
+    /// A session is not a UI: it has its own socket, and it is
+    /// deliberately unreachable through `--target` /
+    /// `ROOST_BUNDLE_PROFILE` / auto-detect. These verbs address the
+    /// session profile's socket directly; other ops reach a session only
+    /// via an explicit `--socket`.
+    #[command(subcommand)]
+    Session(session::SessionCmd),
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
@@ -496,6 +511,14 @@ async fn main() -> Result<()> {
     // subcommand.
     if let Cmd::Claude(ClaudeCmd::Install { force }) = args.command {
         return claude_install(force);
+    }
+
+    // `session` addresses the session profile's own socket, which no
+    // target selector resolves (and must not — see `roost_ipc::target`'s
+    // HS-0 fences). `start` also has to work with nothing listening at
+    // all, so like doctor it runs before the connect prologue.
+    if let Cmd::Session(cmd) = &args.command {
+        std::process::exit(session::run(cmd).await);
     }
 
     // doctor exists to report "no UI is running", so it must not go
@@ -997,7 +1020,9 @@ async fn main() -> Result<()> {
             // Dismissed → print nothing; exit 0 either way.
         }
         // Already handled above before client connect.
-        Cmd::ClaudeHook { .. } | Cmd::Claude(_) | Cmd::Doctor { .. } => unreachable!(),
+        Cmd::ClaudeHook { .. } | Cmd::Claude(_) | Cmd::Doctor { .. } | Cmd::Session(_) => {
+            unreachable!()
+        }
     }
 
     Ok(())

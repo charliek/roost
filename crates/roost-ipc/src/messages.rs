@@ -182,14 +182,15 @@ impl Response {
 // Event envelope (server push)
 // ============================================================================
 
-/// Server-push event. **Not delivered today**: the only way to start
-/// a push stream is `events.subscribe`, and the server answers that op
-/// with `not-implemented` rather than a false ACK (see the
-/// `ops::EVENTS_SUBSCRIBE` arm in `roost-engine/src/ipc.rs`), so no
-/// event is ever written on a connection. The type exists because it
-/// is the shape both UIs and `roostctl` will decode once HS-1
-/// implements the push, delivering these envelopes inside an
-/// [`EventBatch`].
+/// Server-push event, delivered inside an [`EventBatch`].
+///
+/// Delivered on **host-session sockets only**: `events.subscribe`
+/// starts the stream there, while a UI socket still answers the op
+/// `not-implemented` rather than a false ACK (see the
+/// `ops::EVENTS_SUBSCRIBE` arm in `roost-engine/src/ipc.rs`). The
+/// serializer that mints these from the workspace's own event enum
+/// lives in `roost-engine/src/event_push.rs`; the exhaustive name
+/// catalog is the `EVENT_*` constants in [`ops`].
 ///
 /// Permissive by default (no `deny_unknown_fields`) so future
 /// server-side additions to the event envelope itself don't break
@@ -266,6 +267,16 @@ pub struct TabCloseParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabListResult {
     pub projects: Vec<Project>,
+    /// The commit revision this snapshot was taken at — the fence a
+    /// client pairs with an [`EventBatch`] stream: discard every batch
+    /// whose `revision` is `<=` this, apply the rest.
+    ///
+    /// Present **only on a host-session socket**, where the snapshot and
+    /// the revision are read under one lock. A UI socket omits the key
+    /// entirely; it serves no event stream, so a fence would be a number
+    /// with nothing to fence against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1100,15 +1111,34 @@ pub struct NotificationCreateParams {
 }
 
 // ============================================================================
-// Events subscribe (stubbed M0..M2)
+// Events subscribe
 // ============================================================================
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsSubscribeParams {
     /// Restrict to a single tab. `"0"` (or absent) means all events.
+    ///
+    /// Not implemented: a non-zero value is rejected rather than
+    /// silently ignored — a filter the server does not apply is a
+    /// contract lie, and a client that believes it is filtered would
+    /// mis-attribute every other tab's events. HS-2 scope.
     #[serde(with = "string_int64", default)]
     pub tab_id_filter: i64,
+}
+
+/// `events.subscribe` ack — the last request/response frame on the
+/// connection, which becomes a one-way [`EventBatch`] stream after it.
+///
+/// `revision` is the commit the subscription starts from: the client
+/// already has everything up to and including it (whatever it last
+/// pulled at this revision or later), and the first batch it receives is
+/// `revision + 1`. Plain `u64`, matching [`EventBatch::revision`] —
+/// revisions are in-process counters, not ids, so the string-int64
+/// convention does not apply.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsSubscribeResult {
+    pub revision: u64,
 }
 
 /// `app.activate` carries no params. Declared (empty + strict) so the
@@ -1367,6 +1397,23 @@ pub struct ActiveChangedEvent {
     pub tab_id: i64,
 }
 
+/// `tabs.reordered` — the full post-reorder display order for one
+/// project, not a diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabsReorderedEvent {
+    #[serde(with = "string_int64")]
+    pub project_id: i64,
+    #[serde(with = "vec_string_int64")]
+    pub tab_ids: Vec<i64>,
+}
+
+/// `projects.reordered` — the full post-reorder sidebar order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectsReorderedEvent {
+    #[serde(with = "vec_string_int64")]
+    pub project_ids: Vec<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookActiveChangedEvent {
     #[serde(with = "string_int64")]
@@ -1479,14 +1526,51 @@ pub struct SessionIdentify {
     pub started_at: String,
 }
 
+/// `session.identify` params — empty today, a struct (not a bare
+/// `Value`) so the op rejects unknown fields the same way every other
+/// op does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionIdentifyParams {}
+
+/// `session.stop` params — empty: stop takes no options. A future
+/// deadline override lands here rather than in a new op.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStopParams {}
+
+/// `session.stop` result — how every tab that was live when the stop
+/// began was accounted for. The three lists partition that id set, and
+/// each is sorted.
+///
+/// * `reaped` — hung up and reaped without a direct kill.
+/// * `killed` — still live at the soft deadline, so it was SIGKILLed.
+/// * `abandoned` — still unreaped after the post-kill tail; the session
+///   stopped waiting for it.
+///
+/// Tab ids are string-encoded like every other id on this wire, so a
+/// JavaScript client can't round them through a lossy `Number`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStopResult {
+    #[serde(with = "vec_string_int64")]
+    pub reaped: Vec<i64>,
+    #[serde(with = "vec_string_int64")]
+    pub killed: Vec<i64>,
+    #[serde(with = "vec_string_int64")]
+    pub abandoned: Vec<i64>,
+}
+
 /// One atomic push on the events connection.
 ///
 /// A single workspace commit can publish several events under the same
 /// `revision`, so a per-envelope revision cannot detect loss mid-commit.
 /// Batching the envelopes that share a revision makes the client's gap
 /// check ("did I skip a revision?") sufficient: a client that sees a
-/// jump re-pulls `tab.list` / `project.list` rather than trying to
-/// reconstruct what it missed.
+/// jump re-pulls `tab.list` rather than trying to reconstruct what it
+/// missed.
+///
+/// A commit that produced no events is pushed as an **empty** batch
+/// rather than skipped, so a gap on the wire always means loss.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EventBatch {
     pub revision: u64,
@@ -1523,6 +1607,15 @@ pub mod ops {
     pub const TAB_AGENT_REPORT: &str = "tab.agent_report";
     pub const NOTIFICATION_CREATE: &str = "notification.create";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    /// Host-session handshake: version + identity + what the session can
+    /// encode an attach payload as. Served only by a socket that carries
+    /// session info; a UI socket answers `unknown-op`, which is how a
+    /// client tells the two apart.
+    pub const SESSION_IDENTIFY: &str = "session.identify";
+    /// Stop the host session: refuse further mutations, flush the
+    /// workspace, tear every PTY down, reply with the reap report, and
+    /// only then run the process-level shutdown tail.
+    pub const SESSION_STOP: &str = "session.stop";
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";
@@ -1677,6 +1770,11 @@ pub mod ops {
     pub const EVENT_HOOK_ACTIVE_CHANGED: &str = "hook_active.changed";
     pub const EVENT_NOTIFICATION_FIRED: &str = "notification.fired";
     pub const EVENT_AGENT_REPORT_CHANGED: &str = "agent_report.changed";
+    /// Plural subjects: the event names the *set* that was reordered,
+    /// not a member of it. `tabs.reordered` carries the project whose
+    /// tabs moved plus the full post-reorder order.
+    pub const EVENT_TABS_REORDERED: &str = "tabs.reordered";
+    pub const EVENT_PROJECTS_REORDERED: &str = "projects.reordered";
 }
 
 // ============================================================================

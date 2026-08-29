@@ -68,6 +68,71 @@ final class IPCSessionTypesTests: XCTestCase {
         XCTAssertEqual(identify.payloadKinds, [IPCAttachPayloadKind.vt])
     }
 
+    // `session.stop`'s reap report is server-only — the Mac never
+    // produces one, so it gets no Swift twin (same treatment as
+    // `app.render_stats` and friends). What it does get is field-level
+    // coverage of the shared vector, because the id encoding is the part
+    // that silently breaks across languages: every tab id is a string,
+    // including the ones past 2^53 that a `Double` would round.
+    func testSessionStopVectorKeepsStringEncodedIDs() throws {
+        let raw = try Data(contentsOf: vectorURL("session.stop.response.json"))
+        let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
+        XCTAssertTrue(response.ok)
+        let result = try XCTUnwrap(try XCTUnwrap(response.result).value as? [String: Any])
+        XCTAssertEqual(Set(result.keys), ["reaped", "killed", "abandoned"])
+        XCTAssertEqual(result["reaped"] as? [String], ["3", "5"])
+        XCTAssertEqual(result["killed"] as? [String], ["8"])
+        XCTAssertEqual(result["abandoned"] as? [String], ["9007199254740993"])
+        XCTAssertEqual(Int64("9007199254740993"), 9_007_199_254_740_993)
+    }
+
+    // The revision fence (plan 035 C4). Like the reap report, these are
+    // server-only results the Mac never produces — a host session does —
+    // so they get field-level coverage of the shared vectors rather than
+    // Swift twins. What matters across languages here is that `revision`
+    // is a JSON *number* (revisions are counters, not ids, so the
+    // string-int64 convention does not apply to them) and that a UI
+    // socket's `tab.list` omits the key rather than sending null.
+    func testEventsSubscribeAckCarriesANumericRevision() throws {
+        let raw = try Data(contentsOf: vectorURL("events.subscribe.response.json"))
+        let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
+        XCTAssertTrue(response.ok)
+        let result = try XCTUnwrap(try XCTUnwrap(response.result).value as? [String: Any])
+        XCTAssertEqual(Set(result.keys), ["revision"])
+        XCTAssertEqual(result["revision"] as? Int64, 42)
+        XCTAssertNil(result["revision"] as? String, "revision is a number, not an id string")
+    }
+
+    func testTabListFenceIsPresentOnlyOnTheSessionVector() throws {
+        let session = try Data(contentsOf: vectorURL("tab.list.session.response.json"))
+        let fenced = try JSONDecoder().decode(IPCResponse.self, from: session)
+        let fencedResult = try XCTUnwrap(try XCTUnwrap(fenced.result).value as? [String: Any])
+        XCTAssertEqual(Set(fencedResult.keys), ["projects", "revision"])
+        XCTAssertEqual(fencedResult["revision"] as? Int64, 42)
+
+        let ui = try Data(contentsOf: vectorURL("tab.list.response.json"))
+        let plain = try JSONDecoder().decode(IPCResponse.self, from: ui)
+        let plainResult = try XCTUnwrap(try XCTUnwrap(plain.result).value as? [String: Any])
+        XCTAssertEqual(
+            Set(plainResult.keys), ["projects"],
+            "a UI socket's tab.list must not carry the fence at all")
+    }
+
+    func testReorderEventVectorsKeepStringEncodedIDLists() throws {
+        let tabs = try Data(contentsOf: vectorURL("tabs.reordered.event.json"))
+        let tabsEvent = try JSONDecoder().decode(IPCEventEnvelope.self, from: tabs)
+        XCTAssertEqual(tabsEvent.event, "tabs.reordered")
+        let tabsData = try XCTUnwrap(tabsEvent.data.value as? [String: Any])
+        XCTAssertEqual(tabsData["project_id"] as? String, "1")
+        XCTAssertEqual(tabsData["tab_ids"] as? [String], ["7", "5", "9007199254740993"])
+
+        let projects = try Data(contentsOf: vectorURL("projects.reordered.event.json"))
+        let projectsEvent = try JSONDecoder().decode(IPCEventEnvelope.self, from: projects)
+        XCTAssertEqual(projectsEvent.event, "projects.reordered")
+        let projectsData = try XCTUnwrap(projectsEvent.data.value as? [String: Any])
+        XCTAssertEqual(projectsData["project_ids"] as? [String], ["2", "1"])
+    }
+
     func testEventBatchVectorDecodesAndKeepsOrder() throws {
         let raw = try Data(contentsOf: vectorURL("events.batch.json"))
         let batch = try JSONDecoder().decode(IPCEventBatch.self, from: raw)

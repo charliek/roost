@@ -38,9 +38,9 @@ measures *cost* on a sibling axis rather than correctness.
   (`palette.*`, `tab.copy`/`tab.paste`, `screenshot`) so a test can
   trigger it without synthetic input.
 - **No test ever calls `sleep`.** Wait on a condition: `roostctl wait`
-  (`--state`, `--text`, `--gone`) or the harness's
-  `wait_*` helpers. `events.subscribe` is still stubbed
-  `not-implemented` on both UIs, so `wait` is poll-backed today — the
+  (`--state`, `--text`, `--gone`) or the harness's `wait_*` helpers.
+  `events.subscribe` is still `not-implemented` on both UI sockets
+  (only a host session pushes), so `wait` is poll-backed today — the
   *interface* is what tests depend on, so swapping in wire events later
   changes no test.
 - **Content as text, pixels only when targeted.** Assert with

@@ -2,7 +2,7 @@
 
 Roost has two active development surfaces:
 
-1. The Rust workspace at `crates/` — `roost-ipc`, `roost-engine`, `roost-ui-model`, `roost-vt`, `roost-osc`, `roost-url`, `roost-agent`, `roost-cli`, and `roost-iced` (the Linux UI).
+1. The Rust workspace at `crates/` — `roost-ipc`, `roost-engine`, `roost-ui-model`, `roost-vt`, `roost-osc`, `roost-url`, `roost-agent`, `roost-cli`, `roost-iced` (the Linux UI), and `roost-session` (the opt-in headless host-session daemon).
 2. The Swift package at `mac/` — the macOS UI, `Roost.app`.
 
 Both link the same vendored `libghostty-vt` static archive built from `third_party/ghostty/`.
@@ -44,6 +44,7 @@ invoking Zig again.
 | Build the Mac UI | `make build-mac` (`cd mac && swift build`) |
 | Run the Linux UI | `make run-iced` — runs the dev `Iced` profile, so it never touches a packaged install's state |
 | Run the Mac UI | `make run-mac` (bundles, then `open mac/build/Roost.app`) |
+| Start/stop the headless session daemon | `cargo build -p roost-session -p roost-cli && ROOST_SESSION_BIN=target/debug/roost-session target/debug/roostctl session start` (`session stop` to tear down) |
 | Bundle the experimental macOS iced app | `make bundle-iced` → `mac/build/Roost-Iced.app` |
 | Smoke-test the CLI | `cargo run -p roost-cli -- identify` |
 | Rust unit tests | `cargo test --workspace` (`make test-rust` adds the cfg-gated `roost-vt` ffi tests) |
@@ -71,12 +72,17 @@ compiled-in default.
 | `mac` | `Roost.app` (Swift) | `~/Library/Caches/Roost/roost.sock` |
 | `linux` | the packaged `.deb` (`/usr/bin/roost`) | `$XDG_RUNTIME_DIR/roost/roost.sock` |
 | `iced` | every dev iced build, and `Roost-Iced.app` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock`, or `~/Library/Caches/Roost-iced/roost.sock` on macOS |
+| `session` | the headless `roost-session` daemon (opt-in, `roostctl session start`) | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, or `~/Library/Caches/RoostSession/roost.sock` on macOS — debug builds use `roost-session-dev` / `RoostSessionDev` |
 
 Without `XDG_RUNTIME_DIR`, Linux falls back to `/tmp/roost-<uid>` and
-`/tmp/roost-iced-<uid>` respectively. Select a live UI with
-`roostctl --target mac|linux|iced`. The full table — state, locks, logs, and
-the macOS dev paths for the `linux` profile — is in
-[Paths & Environment](../reference/paths.md).
+`/tmp/roost-iced-<uid>` respectively (and `/tmp/roost-session-<uid>` for
+a session; a debug-build session uses `/tmp/roost-session-dev-<uid>`). Select a live UI with `roostctl --target mac|linux|iced` —
+`session` is deliberately not a `--target` value; drive it with
+`roostctl session start|stop|status`, and reach a running session with
+any other op only via an explicit `roostctl --socket <path>` (see
+[`cli.md`](../reference/cli.md#session-subcommands)). The full table —
+state, locks, logs, and the macOS dev paths for the `linux` profile — is
+in [Paths & Environment](../reference/paths.md).
 
 Each UI writes a log file **and** tees to stdout. The iced UI logs to
 `$XDG_STATE_HOME/roost/roost.log` when it resolves the `linux` profile and
@@ -96,7 +102,8 @@ Rust tests live next to the code they exercise. Major coverage:
 | `roost-engine` | Workspace, PTY supervision, persistence, events, OSC routing, IPC dispatch, instance lock |
 | `roost-ui-model` | Config, theme, keybind, palette, provider, and agent projection models |
 | `roost-iced` | iced presentation, native ports, input, and the terminal rendering adapter — what the Linux package ships |
-| `roost-cli` | Escape decoder, shell quoter, target arg mapping, doctor checks + doc anchors |
+| `roost-cli` | Escape decoder, shell quoter, target arg mapping, doctor checks + doc anchors, `session` verb decisions (verdict classification, stop-completion) |
+| `roost-session` | Daemonize handshake, readiness verdicts, headless hydration, per-tab OSC drains, socket-guard identity-checked unlink (unlink-if-ours), lifecycle + fast-exit races |
 
 Mac tests are under `mac/Tests/RoostTests/`; they cover the workspace state machine, PTY supervisor lifecycle, IPC server framing, single-instance flock, renderer, OSC scanner, key encoder, drag/drop math, and tab pill state machine. They run in headless `swift test` (no NSWindow required for any covered surface).
 

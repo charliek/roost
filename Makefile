@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_sparkle.py`'s two classes split by lane: the bare-binary class
@@ -101,6 +101,27 @@ ICED_MENU_QUIT_E2E_TESTS := tools/roosttest/test_menu_quit.py
 # rasterization — the last two because the one release-only bug this stack
 # has produced was issue #299's swash shaping hang.
 ICED_RELEASE_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_z_typography.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_view_perf.py
+# The headless host-session lane. Deliberately NOT in ICED_E2E_TESTS: it
+# drives no UI at all — it spawns `roost-session` daemons against
+# throwaway profiles — so it needs neither a display nor the shared
+# UI-session fixture, and it gets its own target + CI job.
+SESSION_E2E_TESTS := tools/roosttest/test_session.py
+# Every whole-directory pytest run must deselect the session lane: those
+# runs drive a UI, nothing in them builds `roost-session`, and the first
+# session case would therefore `cargo build` mid-test on a shared runner.
+#
+# Expressed as the MARKER, not a path list, so the exclusion has one
+# source of truth — the same `session_daemon` marker `conftest.py` keys
+# its "does this invocation need a UI" decision off. A second session
+# module needs no edit here or in the workflows.
+#
+# MIRRORS (keep the expression identical, move together):
+#   * .github/workflows/ci.yml       — the `e2e-mac` job's pytest step
+#   * .github/workflows/release.yml  — "E2E against the release bundle"
+# Neither can reference a Makefile variable, so they restate the flag —
+# the same hand-mirrored-constant arrangement `smoke-deb`'s `expect_exec`
+# list lives with.
+SESSION_E2E_DESELECT := -m 'not session_daemon'
 # The Sparkle lane's bundle inputs. The feed URL is a deliberate dead
 # placeholder: the seam's test-mode delegate override replaces it with
 # the live loopback port at check time, and a plist URL that could never
@@ -156,7 +177,16 @@ e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not h
 	uv run --group test pytest $(ICED_CLIPBOARD_TESTS) --roost-target iced
 
 e2e-mac:  ## E2E against the Mac app
-	uv run --group test pytest tools/roosttest --roost-target mac
+	uv run --group test pytest tools/roosttest $(SESSION_E2E_DESELECT) --roost-target mac
+
+# No ghostty step and no display: `roost-session` does not depend on
+# roost-vt (`cargo tree -p roost-session | grep roost-vt` is empty), and
+# the lane spawns daemons rather than windows. Both binaries are built
+# first because the harness would otherwise `cargo build` mid-test and
+# charge the first case for it.
+e2e-session:  ## Headless host-session E2E (spawns roost-session daemons; no UI)
+	cargo build -p roost-session -p roost-cli
+	uv run --group test pytest $(SESSION_E2E_TESTS)
 
 e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
 	@tests='$(ICED_E2E_TESTS)'; \
@@ -173,7 +203,7 @@ e2e-iced-release-ci:  ## Release-profile Iced E2E gate: curated subset against a
 	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_RELEASE_E2E_TESTS) --roost-target iced --roost-fresh
 
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
-	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh
+	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest $(SESSION_E2E_DESELECT) --roost-target mac --roost-fresh
 
 e2e-iced-bundle:  ## macOS-only: assemble Roost-Iced.app + run the curated bundle smoke against it (ROOST_ICED_APP)
 	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-bundle is macOS-only: it launches Roost-Iced.app via LaunchServices (open)"; exit 1; }

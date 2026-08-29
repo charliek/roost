@@ -14,7 +14,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use roost_ipc::messages::{
-    AttachPayloadKind, EventBatch, EventEnvelope, SessionIdentify, SESSION_PROTOCOL_VERSION,
+    AttachPayloadKind, EventBatch, EventEnvelope, SessionIdentify, SessionIdentifyParams,
+    SessionStopParams, SessionStopResult, SESSION_PROTOCOL_VERSION,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -220,6 +221,55 @@ fn session_identify_vector_decodes_into_its_typed_result() {
         serde_json::from_value(resp.result.expect("result body")).expect("decode session identify");
     assert_eq!(result, sample_identify());
     assert_eq!(result.session_protocol, SESSION_PROTOCOL_VERSION);
+}
+
+fn sample_stop_report() -> SessionStopResult {
+    SessionStopResult {
+        reaped: vec![3, 5],
+        killed: vec![8],
+        // Past 2^53: the reason every id is string-encoded.
+        abandoned: vec![9_007_199_254_740_993],
+    }
+}
+
+#[test]
+fn session_stop_result_matches_its_golden_json() {
+    const GOLDEN: &str = concat!(
+        r#"{"reaped":["3","5"],"killed":["8"],"#,
+        r#""abandoned":["9007199254740993"]}"#,
+    );
+
+    let value = sample_stop_report();
+    round_trip(&value);
+    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
+    let decoded: SessionStopResult = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(decoded, value);
+}
+
+/// Both session ops take no params today. They are still typed structs
+/// so an unknown field is a decode error rather than a silently ignored
+/// option — the same contract every other op's params have.
+#[test]
+fn session_params_are_empty_and_reject_unknown_fields() {
+    assert_eq!(
+        serde_json::to_string(&SessionIdentifyParams {}).unwrap(),
+        "{}"
+    );
+    assert_eq!(serde_json::to_string(&SessionStopParams {}).unwrap(), "{}");
+    serde_json::from_str::<SessionIdentifyParams>("{}").unwrap();
+    serde_json::from_str::<SessionStopParams>("{}").unwrap();
+    assert!(serde_json::from_str::<SessionStopParams>(r#"{"force":true}"#).is_err());
+}
+
+#[test]
+fn session_stop_vector_decodes_into_its_typed_result() {
+    let raw = read_vector("session.stop.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: SessionStopResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode stop report");
+    assert_eq!(result, sample_stop_report());
 }
 
 #[test]

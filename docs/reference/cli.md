@@ -1,7 +1,10 @@
 # `roostctl`
 
 Shell-integration CLI for the running Roost UI. Talks JSON over
-a Unix-domain socket directly to the UI process — no daemon.
+a Unix-domain socket directly to the UI process — no daemon by
+default. The one exception is opt-in: `roostctl session` starts,
+stops, and inspects a headless `roost-session` daemon (see
+[`session` subcommands](#session-subcommands) below).
 Intended to be invoked from inside a Roost tab (typically by
 Claude Code hooks) but works from any shell that can reach the
 socket. See [`docs/reference/ipc.md`](ipc.md) for the wire
@@ -29,8 +32,13 @@ roostctl [--socket <PATH>] <COMMAND>
 | `claude install` | Generate Claude Code hook settings + print the alias snippet |
 | `claude-hook` | Internal: invoked by Claude on each hook event |
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, Claude hooks) |
+| `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
 
-`--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket.
+`--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
+session is not a UI: `session start|stop|status` address the session profile's own socket
+directly and ignore `--target` / `--socket` / `ROOST_BUNDLE_PROFILE` entirely — any other op
+reaches a running session only via an explicit `--socket <path>` (see
+[`session` subcommands](#session-subcommands)).
 
 ### Where `roostctl` lives
 
@@ -240,6 +248,57 @@ roostctl claude install --force   # overwrite an existing file
 
 Internal: invoked by Claude Code via the generated settings file. Reads the hook payload from stdin, looks up `$ROOST_TAB_ID`, and translates lifecycle events into IPC calls. Always exits 0 with `{}` on stdout (Claude treats nonzero hooks as failures). Silently no-ops when run outside a Roost tab.
 
+## `session` subcommands
+
+Start, stop, and inspect the headless `roost-session` daemon (HS-1a,
+plan 035) — a workspace + PTY supervisor with no UI attached, for
+host-sessions (a workspace left running on a machine with nobody
+watching, e.g. a remote host). See [`ipc.md`](ipc.md#session-sockets)
+for the socket posture (same-UID check, `0700`/`0600`) and the session
+ops these verbs drive.
+
+```bash
+roostctl session start
+roostctl session status
+roostctl session stop
+```
+
+These three verbs are a deliberate carve-out: a session is not a UI, so
+they never go through `--target` / `ROOST_BUNDLE_PROFILE` / auto-detect
+— they resolve the `Session` bundle profile's socket directly, and
+`start` has to work when nothing is listening at all. Any other op
+(`tab.list`, `tab.open`, …) reaches a running session only through an
+explicit `roostctl --socket <path> <op>` pointed at that same socket.
+
+`session start` spawns `roost-session start`, which daemonizes and
+seeds its first project from the calling shell's cwd on a fresh state
+file. It then polls `session.identify` on the socket before returning,
+so exit 0 means **a session answered**, not merely that a process was
+launched — both a fresh start and confirming an already-running session
+print their identity and exit 0; either verdict that never gets
+confirmed exits 1. The daemon binary is located next to `roostctl`
+first, then on `PATH`; `ROOST_SESSION_BIN` overrides the search
+outright (used by tests and a from-source `cargo run`).
+
+`session stop` calls [`session.stop`](ipc.md#sessionstop) and prints
+the reap report, then polls until the socket is actually gone before
+exiting — stopping something that is not already running is a success
+(`systemctl stop` style), so `session stop` always exits 0 short of a
+genuine fault reaching the socket.
+
+`session status` prints the session's identity and tab count. It is
+the one verb with a distinct
+not-running exit code: **3** when no session is listening, matching
+`systemctl status`'s convention so a script can branch on the code
+alone without parsing output; a socket that exists but will not answer
+is a real fault and exits 1, not 3.
+
+| Verb | Exit 0 | Exit 1 | Exit 3 |
+|---|---|---|---|
+| `session start` | a session confirmed serving (fresh or already-running) | spawn failed, or no session answered `session.identify` within the confirm window | — |
+| `session stop` | stopped, or already not running | a socket exists but never answered, or the reap timed out | — |
+| `session status` | a session answered; identity printed | a socket exists but would not answer | no session is running |
+
 ## `doctor`
 
 A **read-only** diagnostic for the Roost integration — it reports and
@@ -387,6 +446,7 @@ flag.
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
 | `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl`. Best-effort — may be absent if the UI can't resolve its bundled/sibling CLI, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
 | `ROOST_DEBUG` | If set, `claude-hook` writes failure messages to stderr |
+| `ROOST_SESSION_BIN` | Overrides where `session start` looks for the `roost-session` binary (default: next to `roostctl`, then `PATH`) |
 
 `ROOST_SOCKET` / `ROOST_TAB_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back.
 
@@ -406,3 +466,8 @@ Roost UI is running" is itself a failed check (`ui.socket` / `ui.target`),
 so `roostctl doctor` exits 1 whenever nothing is listening — that's by
 design, not a bug: the whole point of the `ui` section is to fail when
 there's nothing there.
+
+`session status` is the one command with its own not-running exit code,
+**3**, distinct from this table — see the [`session`
+subcommands](#session-subcommands) table above. `session start` and
+`session stop` use the plain 0/1 split.

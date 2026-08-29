@@ -29,6 +29,8 @@
 //! * [`runtime_dir`] — create-or-validate the directory a socket is
 //!   bound in ([`validate_runtime_dir`]).
 //! * [`target`] — CLI-side target selection for `roostctl`.
+//! * [`session_launch`] — the launch-cwd hint and the readiness verdict
+//!   line `roostctl session start` and `roost-session` exchange.
 //!
 //! The Swift companion lives in `mac/Sources/Roost/IPCServer.swift`
 //! (post-M4). Golden cross-language vectors live under
@@ -40,6 +42,7 @@ pub mod agent;
 pub mod framing;
 pub mod messages;
 pub mod paths;
+pub mod session_launch;
 pub mod socket_state;
 pub mod target;
 
@@ -51,7 +54,10 @@ mod server;
 pub use client::{ClientError, IpcClient};
 pub use peer::{current_euid, peer_uid};
 pub use runtime_dir::validate_runtime_dir;
-pub use server::{Handler, HandlerError, IpcServer};
+pub use server::{
+    ConnAction, Handler, HandlerError, HandlerOutcome, IpcServer, PushSource, StopFinalizer,
+    DEFAULT_PUSH_WRITE_DEADLINE,
+};
 
 /// The wire-format protocol version. M0 ships `1`.
 pub const PROTOCOL_VERSION: u32 = 1;

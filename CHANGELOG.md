@@ -13,6 +13,32 @@ release workflow asserts they agree).
 
 ### Added
 
+- **`roost-session`, an opt-in headless host-session daemon (HS-1a, #363)** —
+  a new `crates/roost-session` binary that owns a workspace + PTY supervisor
+  with no UI attached, for a session left running with nobody watching (e.g.
+  a remote host). Start/stop/inspect it with `roostctl session
+  start|stop|status`; the Linux `.deb` now ships `/usr/bin/roost-session`
+  alongside `roostctl`. It daemonizes with a readiness handshake (`start`
+  only exits 0 once a session actually answers), installs `umask 0077` so
+  everything it creates lands owner-only, enforces a same-UID peer check on
+  its socket (no UI socket does), and hydrates its saved tab layout headlessly
+  (fresh shells, per-tab OSC drains — titles/cwd/notifications keep working
+  with no terminal or renderer present). `SIGTERM`/`SIGINT` converge on the
+  same graceful-shutdown path as `session.stop` (self-dialing the socket;
+  a broken socket falls back to flush-and-exit without the reap report): every in-flight mutating op
+  is let finish, the layout is flushed, then every PTY is hung up (escalating
+  to `SIGKILL`), and the reply carries a reap report
+  (`{reaped, killed, abandoned}`). The wire adds `session.identify`,
+  `session.stop`, and `events.subscribe` on this socket only — UI sockets
+  answer `unknown-op` / `not-implemented` for these, unchanged. **Breaking
+  change warning:** `events.subscribe` ships without the lease
+  `session.connect` will require once HS-1b lands attach — anything written
+  against this leaseless form will need to change then. A new `roostctl
+  --socket` reaches a running session for any other op; a dedicated
+  `make e2e-session` pytest lane (`tools/roosttest/test_session.py`) is now a
+  required CI gate. See [`docs/reference/ipc.md`](docs/reference/ipc.md#session-sockets)
+  for the full contract and its documented deviations from the architecture
+  doc.
 - **Terminal snapshot encode + decode in `roost-vt`** — `Terminal::snapshot()`
   serializes a live terminal to libghostty's snapshot byte stream, and
   `SnapshotDecoder` restores one: buffered in a single call, or progressively,

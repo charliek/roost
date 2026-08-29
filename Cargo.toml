@@ -14,6 +14,8 @@
 #   * roost-ui-model — toolkit-neutral config, theme, palette, keybind,
 #                      provider, agent projection, and selection models.
 #   * roost-iced — the Linux UI, packaged as `/usr/bin/roost`.
+#   * roost-session — the headless host-session daemon; binary is
+#                     `roost-session`. Same engine as a UI, no toolkit.
 #   * roost-cli   — shell-integration CLI; binary is `roostctl`.
 #
 # The pre-M7 daemon-era crates (roost-core, roost-proto, roost-common,
@@ -32,6 +34,7 @@ members = [
     "crates/roost-ui-model",
     "crates/roost-cli",
     "crates/roost-iced",
+    "crates/roost-session",
 ]
 
 [workspace.package]

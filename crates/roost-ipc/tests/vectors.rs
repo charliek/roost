@@ -283,3 +283,79 @@ fn event_vectors_have_required_envelope_shape() {
         );
     }
 }
+
+/// The `events.subscribe` ack and the two `tab.list` shapes it fences.
+///
+/// Three things generic round-tripping cannot see: `revision` is a JSON
+/// *number* on both (revisions are counters, not ids, so the
+/// string-int64 convention deliberately does not apply); the UI-socket
+/// vector has no `revision` key at all rather than a `null`; and the
+/// session-socket vector decodes into the same `TabListResult` an older
+/// client would use.
+#[test]
+fn the_revision_fence_vectors_decode_into_their_typed_results() {
+    use roost_ipc::messages::{EventsSubscribeResult, Response, TabListResult};
+
+    let mut path = vectors_dir();
+    path.push("events.subscribe.response.json");
+    let raw = fs::read_to_string(&path).expect("read events.subscribe vector");
+    let resp: Response = serde_json::from_str(&raw).expect("decode response envelope");
+    let body = resp.result.expect("result body");
+    assert!(body["revision"].is_u64(), "revision must be a JSON number");
+    let ack: EventsSubscribeResult = serde_json::from_value(body).expect("decode ack");
+    assert_eq!(ack.revision, 42);
+
+    let mut path = vectors_dir();
+    path.push("tab.list.session.response.json");
+    let raw = fs::read_to_string(&path).expect("read session tab.list vector");
+    let resp: Response = serde_json::from_str(&raw).expect("decode response envelope");
+    let fenced: TabListResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode result");
+    assert_eq!(fenced.revision, Some(42));
+    assert_eq!(fenced.projects.len(), 1);
+
+    let mut path = vectors_dir();
+    path.push("tab.list.response.json");
+    let raw = fs::read_to_string(&path).expect("read UI tab.list vector");
+    let resp: Response = serde_json::from_str(&raw).expect("decode response envelope");
+    let body = resp.result.expect("result body");
+    assert!(
+        !body
+            .as_object()
+            .expect("result object")
+            .contains_key("revision"),
+        "a UI socket's tab.list must not carry the key at all"
+    );
+    let plain: TabListResult = serde_json::from_value(body).expect("decode result");
+    assert_eq!(plain.revision, None);
+    // Re-encoding an unfenced result must not invent the key back.
+    let re = serde_json::to_value(&plain).expect("re-encode");
+    assert!(!re.as_object().unwrap().contains_key("revision"));
+}
+
+/// The two reorder events joined the wire catalog with the push
+/// implementation (plan 035 C4). Their ids are string-encoded *inside a
+/// list*, which is the encoding a JSON client is most likely to get
+/// wrong — a bare `Number` there rounds any id past 2^53.
+#[test]
+fn the_reorder_event_vectors_keep_string_encoded_id_lists() {
+    use roost_ipc::messages::{ops, EventEnvelope};
+
+    let mut path = vectors_dir();
+    path.push("tabs.reordered.event.json");
+    let raw = fs::read_to_string(&path).expect("read tabs.reordered vector");
+    let ev: EventEnvelope = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(ev.event, ops::EVENT_TABS_REORDERED);
+    assert_eq!(ev.data["project_id"], "1");
+    assert_eq!(
+        ev.data["tab_ids"],
+        serde_json::json!(["7", "5", "9007199254740993"])
+    );
+
+    let mut path = vectors_dir();
+    path.push("projects.reordered.event.json");
+    let raw = fs::read_to_string(&path).expect("read projects.reordered vector");
+    let ev: EventEnvelope = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(ev.event, ops::EVENT_PROJECTS_REORDERED);
+    assert_eq!(ev.data["project_ids"], serde_json::json!(["2", "1"]));
+}

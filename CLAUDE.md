@@ -6,7 +6,10 @@ Roost is a cross-platform (Mac + Linux) desktop terminal multiplexer
 built around libghostty-vt. It ships **two platform products** — Swift
 + AppKit on macOS and Rust + iced on Linux — that each embed the
 workspace + PTY supervisor in-process and serve a JSON IPC socket for
-external tooling (`roostctl`, Claude hooks). No daemon.
+external tooling (`roostctl`, Claude hooks). No daemon by default — the
+one opt-in exception is `roost-session` (`crates/roost-session/`), a
+headless daemon for host-sessions, started with `roostctl session
+start`.
 
 * Mac UI: Swift + AppKit, `mac/` (bundle id `ai.stridelabs.Roost`).
 * Linux UI (shipped): Rust + iced, `crates/roost-iced/` (packaged as `/usr/bin/roost`).

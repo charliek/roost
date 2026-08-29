@@ -9,6 +9,7 @@
 
 pub mod application;
 pub mod crash;
+pub mod event_push;
 pub mod events;
 // Experimental Swift-facing boundary (`Engine`/`EngineCommand`/owned
 // snapshots). No production consumer yet — both Rust UIs use the concrete
@@ -34,7 +35,7 @@ pub use facade::{
     CommandResult, Engine, EngineCommand, EngineError, EngineEvent, EngineEventStream,
     EngineSnapshot,
 };
-pub use pty::{PtyError, PtyOutputEvent, PtySupervisor, SupervisorEvent};
+pub use pty::{PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, SupervisorEvent};
 pub use workspace::{
     AttentionSource, RestoreLayout, RestoreProject, RestoreTab, VersionedWorkspaceEvent, Workspace,
     WorkspaceError, WorkspaceEvent, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,

@@ -2696,6 +2696,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "libc",
  "roost-agent",
  "roost-ipc",
  "serde",
@@ -2773,6 +2774,23 @@ name = "roost-osc"
 version = "0.0.18"
 dependencies = [
  "base64",
+]
+
+[[package]]
+name = "roost-session"
+version = "0.0.18"
+dependencies = [
+ "anyhow",
+ "clap",
+ "getrandom 0.4.2",
+ "libc",
+ "roost-engine",
+ "roost-ipc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
