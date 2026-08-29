@@ -37,10 +37,10 @@ use roost_ipc::messages::{
     PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
-    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
-    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
+    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
@@ -48,7 +48,10 @@ use roost_ipc::messages::{
     TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, SESSION_PROTOCOL_VERSION,
 };
-use roost_ipc::{ConnAction, ConnCtx, Handler, HandlerError, HandlerOutcome, StopFinalizer};
+use roost_ipc::{
+    CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
+    StopFinalizer,
+};
 
 /// Text snapshot of a tab's terminal viewport, produced on the UI
 /// adapter's main thread for the `tab.dump` op. Neutral (lib-side) types so this crate
@@ -506,6 +509,128 @@ struct SessionState {
     /// raced the sweep is refused rather than registered into a list
     /// nobody will ever read again.
     pushes: std::sync::Mutex<Option<Vec<tokio::task::AbortHandle>>>,
+    /// Who currently holds interactive authority, and which connections
+    /// they hold it on. The single linearization point for the whole
+    /// admission story: connect, takeover, and every lease-gated op
+    /// resolve against this one lock, so two clients racing a takeover
+    /// produce one winner rather than two live leases.
+    clients: std::sync::Mutex<ClientRegistry>,
+}
+
+/// The lease registry. Bounded by construction: one live lease, one
+/// tombstone, and one entry per live connection under the lease.
+#[derive(Default)]
+struct ClientRegistry {
+    current: Option<Lease>,
+    /// The most recently invalidated lease token, kept only so its
+    /// holder gets `taken-over` instead of `connect-required` — a
+    /// materially different instruction (stop retrying vs. reconnect).
+    /// Exactly one: an older tombstone is a client that has already been
+    /// told twice over.
+    tombstone: Option<String>,
+}
+
+struct Lease {
+    token: String,
+    conns: Vec<(u64, ConnCloser)>,
+}
+
+/// What a presented lease turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseStatus {
+    /// The live lease. The presenting connection is now registered under
+    /// it.
+    Current,
+    /// The tombstone: this client held the lease and lost it.
+    TakenOver,
+    /// Absent, empty, or a token this session never issued.
+    Unknown,
+}
+
+impl ClientRegistry {
+    /// Mint a lease for `ctx`, or refuse.
+    ///
+    /// `takeover` is what makes this destructive: the previous lease is
+    /// invalidated and every connection it was held on is closed —
+    /// except the requester's, which is the one being answered on.
+    fn connect(&mut self, takeover: bool, ctx: &ConnCtx) -> Result<String, HandlerError> {
+        if self.current.is_some() && !takeover {
+            // Refused even when the caller already holds the lease on
+            // this very connection: a client that lost track of its own
+            // lease is exactly the one that must re-establish it
+            // deliberately.
+            return Err(HandlerError::new(
+                "already-connected",
+                "another client holds the session lease; retry with takeover: true",
+            ));
+        }
+        if let Some(previous) = self.current.take() {
+            for (conn_id, closer) in previous.conns {
+                if conn_id != ctx.conn_id {
+                    closer.close(CloseReason::TakenOver);
+                }
+            }
+            self.tombstone = Some(previous.token);
+        }
+        let token = random_hex_128();
+        self.current = Some(Lease {
+            token: token.clone(),
+            conns: vec![(ctx.conn_id, ctx.closer.clone())],
+        });
+        Ok(token)
+    }
+
+    /// Resolve a presented lease, registering the presenting connection
+    /// when it is the live one.
+    fn present(&mut self, lease: &str, ctx: &ConnCtx) -> LeaseStatus {
+        if let Some(current) = self.current.as_mut() {
+            if !lease.is_empty() && current.token == lease {
+                // Pruned here because this is the only walk: a client
+                // that reconnects repeatedly on the same lease would
+                // otherwise accumulate an entry per dead connection.
+                current.conns.retain(|(_, closer)| !closer.is_closed());
+                if !current.conns.iter().any(|(id, _)| *id == ctx.conn_id) {
+                    current.conns.push((ctx.conn_id, ctx.closer.clone()));
+                }
+                return LeaseStatus::Current;
+            }
+        }
+        if !lease.is_empty() && self.tombstone.as_deref() == Some(lease) {
+            return LeaseStatus::TakenOver;
+        }
+        LeaseStatus::Unknown
+    }
+
+    /// Close every registered connection, and stop tracking them. The
+    /// lease itself stays: nothing after a stop is admissible anyway, and
+    /// keeping it means a late op is refused as `shutting-down` rather
+    /// than as a lease problem it cannot fix.
+    fn close_all(&mut self, reason: CloseReason) {
+        if let Some(current) = self.current.as_mut() {
+            for (_, closer) in current.conns.drain(..) {
+                closer.close(reason);
+            }
+        }
+    }
+}
+
+/// 128 bits of OS entropy as 32 lowercase hex characters — the shape
+/// every bearer credential on a session socket takes.
+///
+/// Unlike the session id this one *is* a credential, so the width is the
+/// point: the socket's uid check bounds who can guess at it at all, and
+/// 128 bits ends the question.
+fn random_hex_128() -> String {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    // A failure here means the OS could not produce entropy, which is
+    // not a condition a process handing out credentials can paper over.
+    getrandom::fill(&mut bytes).expect("the OS random source must be available");
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 impl SessionState {
@@ -530,6 +655,47 @@ impl SessionState {
             handle.abort();
         }
     }
+
+    /// Mint or take over the interactive lease for `ctx`'s connection.
+    fn connect(&self, takeover: bool, ctx: &ConnCtx) -> Result<String, HandlerError> {
+        let mut guard = lock(&self.clients);
+        // Re-checked UNDER the registry lock: the stop latches first and
+        // sweeps this registry second, so a connect that was admitted
+        // past the latch but reaches the registry after the sweep must
+        // be refused here — a lease minted post-sweep would be authority
+        // no closer can ever revoke.
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(shutting_down());
+        }
+        guard.connect(takeover, ctx)
+    }
+
+    /// The gate every lease-carrying op runs first. Registers `ctx` under
+    /// the lease on success; the error never echoes the presented token.
+    fn require_lease(&self, lease: &str, ctx: &ConnCtx) -> Result<(), HandlerError> {
+        let mut guard = lock(&self.clients);
+        // Same post-sweep refusal as `connect` — registration IS the
+        // resource, so the decision has to share the sweep's lock.
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(shutting_down());
+        }
+        match guard.present(lease, ctx) {
+            LeaseStatus::Current => Ok(()),
+            LeaseStatus::TakenOver => Err(HandlerError::new(
+                "taken-over",
+                "this lease was taken over by another client",
+            )),
+            LeaseStatus::Unknown => Err(HandlerError::new(
+                "connect-required",
+                "run session.connect first: this op requires a session lease",
+            )),
+        }
+    }
+
+    /// Tell every connection the lease holder owns why it is going away.
+    fn close_clients(&self, reason: CloseReason) {
+        lock(&self.clients).close_all(reason);
+    }
 }
 
 /// Lock recovering from poisoning: a panicked holder must not be able to
@@ -540,8 +706,13 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Ops that change workspace or PTY state, and so must not run once a
-/// session has latched Stopping.
+/// Ops that change workspace or PTY state — or hand out the authority to
+/// change it — and so must not run once a session has latched Stopping.
+///
+/// `session.connect` and `tab.attach` are in the set for the second
+/// reason: neither touches the workspace, but a lease or an attach token
+/// minted after the latch is authority over a session that has already
+/// flushed and reaped.
 ///
 /// Reads (`identify`, `tab.list`, `tab.dump*`, `session.identify`) stay
 /// answerable throughout, so a client can still find out what happened.
@@ -568,6 +739,8 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::PROJECT_DELETE
             | ops::PROJECT_REORDER
             | ops::NOTIFICATION_CREATE
+            | ops::SESSION_CONNECT
+            | ops::TAB_ATTACH
     )
 }
 
@@ -644,6 +817,7 @@ impl IpcHandler {
             stopping: AtomicBool::new(false),
             barrier: tokio::sync::RwLock::new(()),
             pushes: std::sync::Mutex::new(Some(Vec::new())),
+            clients: std::sync::Mutex::new(ClientRegistry::default()),
         }));
         self
     }
@@ -685,11 +859,11 @@ impl IpcHandler {
 impl Handler for IpcHandler {
     fn handle<'a>(
         &'a self,
-        _ctx: &'a ConnCtx,
+        ctx: &'a ConnCtx,
         op: &'a str,
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {
-        Box::pin(async move { dispatch_outcome(self, op, params).await })
+        Box::pin(async move { dispatch_outcome(self, ctx, op, params).await })
     }
 }
 
@@ -699,6 +873,7 @@ impl Handler for IpcHandler {
 /// what it was before host sessions existed.
 async fn dispatch_outcome(
     h: &IpcHandler,
+    ctx: &ConnCtx,
     op: &str,
     params: serde_json::Value,
 ) -> Result<HandlerOutcome, HandlerError> {
@@ -725,7 +900,7 @@ async fn dispatch_outcome(
         }
         ops::EVENTS_SUBSCRIBE => {
             let p: EventsSubscribeParams = decode(params)?;
-            return events_subscribe(h, session, &p);
+            return events_subscribe(h, session, ctx, &p);
         }
         _ => {}
     }
@@ -745,14 +920,31 @@ async fn dispatch_outcome(
     if session.stopping.load(Ordering::Acquire) {
         return Err(shutting_down());
     }
+
+    // Served here rather than in `dispatch`, which has no connection
+    // identity — and a lease that nothing can be registered against is
+    // not a lease.
+    if op == ops::SESSION_CONNECT {
+        let p: SessionConnectParams = decode(params)?;
+        let lease = session.connect(p.takeover, ctx)?;
+        // `snapshot_with_revision` rather than `revision`: one lock
+        // acquisition means the number a client fences its first
+        // `tab.list` against is a state-consistent read, not one that
+        // could have moved between two.
+        let (revision, _projects) = h.workspace.snapshot_with_revision();
+        return encode(&SessionConnectResult { lease, revision }).map(HandlerOutcome::Reply);
+    }
+
     dispatch(h, op, params).await.map(HandlerOutcome::Reply)
 }
 
 /// `events.subscribe` on a session socket: ack with the fence, then push.
 ///
-/// Provisional (plan 035 D4). HS-1b makes the stream lease-gated, which
-/// is a breaking change to this op; today only Roost's own tests consume
-/// it, which is what makes shipping the unleased form acceptable.
+/// Lease-gated (D4): the event stream is interactive authority, so a
+/// caller presents the lease `session.connect` handed it and the
+/// connection joins the registry under that lease — which is what lets a
+/// later takeover close this stream rather than leaving two clients both
+/// believing they drive the session.
 ///
 /// Not a mutating op — it changes no workspace state — but it does
 /// establish a resource, so it is refused once the session has latched:
@@ -762,6 +954,7 @@ async fn dispatch_outcome(
 fn events_subscribe(
     h: &IpcHandler,
     session: &Arc<SessionState>,
+    ctx: &ConnCtx,
     params: &EventsSubscribeParams,
 ) -> Result<HandlerOutcome, HandlerError> {
     if params.tab_id_filter != 0 {
@@ -771,9 +964,9 @@ fn events_subscribe(
             params.tab_id_filter
         )));
     }
-    if session.stopping.load(Ordering::Acquire) {
-        return Err(shutting_down());
-    }
+    // `require_lease` also refuses under the stop latch, sharing the
+    // registry sweep's lock — the check-then-register pair is atomic.
+    session.require_lease(&params.lease, ctx)?;
     let (revision, source, handle) = event_push::spawn(&h.workspace, h.push_limits);
     if !session.register_push(handle.clone()) {
         // Lost the race with the stop's sweep. Abort what we just
@@ -804,9 +997,17 @@ async fn session_stop(
 
     // After the latch, before the barrier. A push connection answers no
     // requests, so it is not something the barrier can wait out — it has
-    // to be cut. The plain close is the client's notification: the same
-    // signal it already handles as "resync", and the only one available
-    // on a connection that stopped being request/response.
+    // to be cut.
+    //
+    // Order matters and is the whole of deviation #2's fix: the closers
+    // fire FIRST, so every push connection observes a reason and writes
+    // the terminal `session.stopping` envelope before it goes. Aborting
+    // the relays first would drop their senders, `serve_push`'s source
+    // would end, and the peer would get a bare EOF it cannot tell from a
+    // crash. The abort still follows, as the guarantee that a relay with
+    // no registered connection — or one whose peer stopped reading — ends
+    // regardless.
+    session.close_clients(CloseReason::ShuttingDown);
     session.abort_pushes();
 
     // Waits out exactly the mutations that got past the latch.
@@ -1710,6 +1911,7 @@ mod tests {
             stopping: AtomicBool::new(false),
             barrier: tokio::sync::RwLock::new(()),
             pushes: std::sync::Mutex::new(Some(Vec::new())),
+            clients: std::sync::Mutex::new(ClientRegistry::default()),
         }
     }
 

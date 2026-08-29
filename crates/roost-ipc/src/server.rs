@@ -196,6 +196,16 @@ impl ConnCloser {
     pub fn reason(&self) -> Option<CloseReason> {
         *self.tx.borrow()
     }
+
+    /// Whether the connection this closer belongs to is already gone.
+    ///
+    /// The watch's receivers live exactly as long as the connection task
+    /// does, so no receivers means nothing is left to close. A registry
+    /// prunes on this rather than growing an entry per client that ever
+    /// dialed.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
 /// The receiving half of a [`ConnCloser`], held by whatever owns the
@@ -922,11 +932,17 @@ async fn serve_push(
             break Ok(());
         }
         tokio::select! {
-            _ = &mut eof => break Ok(()),
+            // Biased, closer first, for the same reason the sticky check
+            // above exists: a server that closes a connection also aborts
+            // whatever feeds it, so the closer and an exhausted source go
+            // ready in the same pass. Unbiased, the peer would lose its
+            // label on a coin flip.
+            biased;
             reason = close_watch.closed() => {
                 write_stopping_envelope(&mut w, reason).await;
                 break Ok(());
             }
+            _ = &mut eof => break Ok(()),
             item = source.next() => match item {
                 None => break Ok(()),
                 Some(value) => {

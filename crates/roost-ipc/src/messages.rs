@@ -1138,6 +1138,17 @@ pub struct NotificationCreateParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsSubscribeParams {
+    /// The lease [`ops::SESSION_CONNECT`] handed out. Required on a
+    /// session socket: the event stream is interactive authority, and a
+    /// client that never connected has none.
+    ///
+    /// Defaulted rather than required by serde so the *decode* still
+    /// succeeds for a client written against the leaseless HS-1a form —
+    /// which then gets `connect-required` naming the step it skipped,
+    /// instead of an envelope-shaped `invalid-param` that names nothing.
+    /// A credential: never logged, never echoed in an error.
+    #[serde(default)]
+    pub lease: String,
     /// Restrict to a single tab. `"0"` (or absent) means all events.
     ///
     /// Not implemented: a non-zero value is rejected rather than

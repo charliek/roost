@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use roost_engine::single_instance::{self, InstanceLocks};
 use roost_ipc::messages::{
-    ops, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams, SessionStopParams,
-    SessionStopResult, Tab, TabListResult, TabOpenParams, TabOpenResult, TabResizeParams,
-    TabSetTitleParams,
+    ops, IdentifyParams, IdentifyResult, SessionConnectParams, SessionConnectResult,
+    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult, Tab,
+    TabListResult, TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams,
 };
 use roost_ipc::IpcClient;
 use roost_session::{Readiness, SessionConfig};
@@ -167,6 +167,19 @@ pub async fn session_identify(client: &mut IpcClient) -> SessionIdentify {
         .call(ops::SESSION_IDENTIFY, SessionIdentifyParams {})
         .await
         .expect("session.identify")
+}
+
+/// Take the session's interactive lease. Every lease-gated op needs one,
+/// and a test that only wants the lease does not care who held it, so
+/// this always takes over.
+pub async fn session_connect(client: &mut IpcClient) -> SessionConnectResult {
+    client
+        .call(
+            ops::SESSION_CONNECT,
+            SessionConnectParams { takeover: true },
+        )
+        .await
+        .expect("session.connect")
 }
 
 pub async fn session_stop(client: &mut IpcClient) -> SessionStopResult {

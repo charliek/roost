@@ -643,22 +643,41 @@ def test_a_tab_open_racing_stop_leaves_no_orphan(env):
 def test_events_push_reaches_a_python_subscriber(env):
     started(env)
 
-    with EventStream(env.socket) as stream, env.client() as client:
-        fence = stream.subscribe()
-        # The snapshot's revision is the same fence the ack names, which
-        # is what makes "discard everything <= this" a usable rule.
-        snapshot = client.call("tab.list")
-        assert snapshot["revision"] >= fence
+    with env.client() as client:
+        # The stream is lease-gated: a client that never connected is
+        # told which step it skipped rather than handed a stream.
+        with EventStream(env.socket) as leaseless:
+            with pytest.raises(RoostError) as refused:
+                leaseless.subscribe()
+            assert refused.value.code == "connect-required"
+            assert "session.connect" in refused.value.message
 
-        project = int(snapshot["projects"][0]["id"])
-        tab = client.open_tab(project, cwd=str(env.launch_cwd), title="pushed")
+        lease = client.call("session.connect", {"takeover": False})["lease"]
+        # Bind the length before asserting so a failure dump prints the
+        # number, never the bearer token itself.
+        lease_len = len(lease)
+        assert lease_len == 32
 
-        batches, envelope = stream.recv_until("tab.opened", timeout=20.0)
-        # No holes: every commit pushes a batch, empty ones included.
-        stream.expect_contiguous(batches, fence)
-        assert int(envelope["data"]["tab"]["id"]) == tab
+        with EventStream(env.socket, lease=lease) as stream:
+            fence = stream.subscribe()
+            # The snapshot's revision is the same fence the ack names,
+            # which is what makes "discard everything <= this" a usable
+            # rule.
+            snapshot = client.call("tab.list")
+            assert snapshot["revision"] >= fence
 
-    env.stop_over_the_wire()
+            project = int(snapshot["projects"][0]["id"])
+            tab = client.open_tab(project, cwd=str(env.launch_cwd), title="pushed")
+
+            batches, envelope = stream.recv_until("tab.opened", timeout=20.0)
+            # No holes: every commit pushes a batch, empty ones included.
+            stream.expect_contiguous(batches, fence)
+            assert int(envelope["data"]["tab"]["id"]) == tab
+
+            # And the stop is announced, not just enacted: the last frame
+            # before the close names the reason.
+            env.stop_over_the_wire()
+            assert stream.recv_stopping(timeout=30.0) == "stop"
 
 
 # ---------------------------------------------------------------------------

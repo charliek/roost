@@ -17,13 +17,16 @@ facade = []
 # workspace build unifies features, so a UI binary can link it. What
 # turns the pipeline on is the runtime opt-in
 # `PtySupervisor::enable_server_vt`, which only `roost-session` calls.
-server-vt = ["dep:roost-vt", "dep:getrandom", "roost-vt/ffi"]
+server-vt = ["dep:roost-vt", "roost-vt/ffi"]
 
 [dependencies]
 roost-ipc = { path = "../roost-ipc" }
 roost-osc = { path = "../roost-osc" }
 roost-vt = { path = "../roost-vt", optional = true }
-getrandom = { workspace = true, optional = true }
+# Not optional: `session.connect`'s lease is minted here, and a lease is
+# not a server-vt concern — a session hands one out whether or not it
+# serves attach data.
+getrandom = { workspace = true }
 
 portable-pty = { workspace = true }
 libc = "0.2"
