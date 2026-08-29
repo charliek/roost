@@ -104,6 +104,12 @@ impl Layout {
             app_label: APP_LABEL.into(),
             app_id: APP_ID.into(),
             launch_cwd: launch_cwd.to_path_buf(),
+            // Always on here: `tab.feed_pty_bytes` and
+            // `tab.capture_pty_input` are how a test puts known bytes
+            // through a real tab without scripting a shell, and the
+            // sessions these tests start are torn down within seconds,
+            // so the capture buffer's growth is bounded by the test.
+            test_mode: true,
         }
     }
 

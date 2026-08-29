@@ -60,6 +60,22 @@ pub struct SessionConfig {
     /// Directory the user launched from, captured before the daemon
     /// `chdir`'d to `/`. Seeds the first project on an empty state file.
     pub launch_cwd: PathBuf,
+    /// Whether this session serves the test-mode op set
+    /// (`tab.feed_pty_bytes`, `tab.capture_pty_input`) and keeps the
+    /// input-capture buffer.
+    ///
+    /// **This is the in-process test-harness knob, and nothing else.**
+    /// The shipped binary never sets it directly: `start` builds its
+    /// config through [`SessionConfig::from_profile`], which derives
+    /// this from `ROOST_TEST_MODE` exactly as `serve` used to read it,
+    /// so a daemon's behaviour is still decided by that one environment
+    /// variable.
+    ///
+    /// A field rather than a read inside `serve` because the in-process
+    /// integration tests run several sessions in one process, and a
+    /// process-global env var is neither settable safely from a
+    /// `#[tokio::test]` nor scopable to one of them.
+    pub test_mode: bool,
 }
 
 impl SessionConfig {
@@ -71,6 +87,7 @@ impl SessionConfig {
             app_label: profile.app_label.to_string(),
             app_id: profile.app_id.to_string(),
             launch_cwd,
+            test_mode: std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -96,7 +113,7 @@ pub async fn serve(
     // workspace is handed in as the seam the tab tasks apply OSC
     // transitions and row-closes through (the supervisor itself stays
     // workspace-agnostic).
-    let test_mode = std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1");
+    let test_mode = config.test_mode;
     supervisor
         .enable_server_vt(
             ServerVtConfig::new(Arc::clone(&workspace) as Arc<dyn ServerVtWorkspace>)
