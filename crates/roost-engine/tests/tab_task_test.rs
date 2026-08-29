@@ -612,14 +612,30 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
         "the tab task must keep processing output through a reply flood"
     );
 
-    // …and the tee kept flowing through it, contiguously.
+    // …and the tee kept flowing through it, contiguously. The replies
+    // this test floods out get ECHOED by the PTY line discipline
+    // (`sleep` never reads, echo is on), and how much of that echo makes
+    // it back through the reader depends on the platform's PTY buffer —
+    // on a roomy kernel it is enough to lap this plain subscriber. Lag
+    // is legal for a subscriber by contract (the authoritative terminal
+    // is fed synchronously, not via this broadcast), so the drain
+    // tolerates it and pins contiguity from the first event it kept.
     let mut seen = Vec::new();
-    while let Ok(Ok(event)) = timeout(Duration::from_millis(50), output.recv()).await {
-        seen.push(event);
+    loop {
+        match timeout(Duration::from_millis(50), output.recv()).await {
+            Ok(Ok(event)) => seen.push(event),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => break,
+        }
     }
     assert!(!seen.is_empty(), "the flood's chunks were teed");
+    let first = seen[0].seq();
     for (index, event) in seen.iter().enumerate() {
-        assert_eq!(event.seq(), index as u64 + 1, "gap at teed event {index}");
+        assert_eq!(
+            event.seq(),
+            first + index as u64,
+            "gap at teed event {index}"
+        );
     }
 
     drop(commands);
