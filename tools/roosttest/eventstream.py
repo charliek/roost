@@ -186,7 +186,7 @@ class EventStream:
             if got != want:
                 raise AssertionError(
                     f"event stream skipped a revision: expected {want}, got {got} "
-                    f"(batches={[b['revision'] for b in batches]})"
+                    f"(batches={[b.get('revision', b.get('event')) for b in batches]})"
                 )
             want += 1
 

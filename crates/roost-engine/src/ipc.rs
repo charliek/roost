@@ -1493,11 +1493,18 @@ async fn tab_attach(
 
     // A list mixing kinds this build has never heard of with one it
     // serves is fine — the client states a preference order and the
-    // first servable entry wins.
+    // first servable entry wins. "Servable" is what `session.identify`
+    // ADVERTISED (`payload_kinds`), intersected with what this build
+    // can actually encode — the advertisement is the contract a client
+    // negotiated against, so a kind absent from it must not be accepted
+    // even when the code could produce it.
     let kind = p
         .kinds
         .iter()
-        .find(|kind| kind.as_str() == AttachPayloadKind::GHOSTTY_SNAPSHOT)
+        .find(|kind| {
+            kind.as_str() == AttachPayloadKind::GHOSTTY_SNAPSHOT
+                && session.info.payload_kinds.contains(kind)
+        })
         .cloned()
         .ok_or_else(|| {
             HandlerError::new(

@@ -257,7 +257,7 @@ fmt:  ## Format Rust (cargo fmt --all)
 fmt-check:  ## Check formatting (what CI's rust-lint runs)
 	cargo fmt --all -- --check
 
-clippy:  ## Lint Rust at CI parity (warnings are errors)
+clippy: $(GHOSTTY_LIB)  ## Lint Rust at CI parity (warnings are errors)
 	# `-D warnings` matches the `rust-lint` CI job. Without it `make check`
 	# passed while CI failed, which is worse than no local gate at all.
 	cargo clippy --workspace --all-targets -- -D warnings

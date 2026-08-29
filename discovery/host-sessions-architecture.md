@@ -163,9 +163,13 @@ consumers.
 Newline-delimited JSON request→response on the session socket, the
 existing `roost-ipc` framing and op set. New/changed ops:
 
-- `session.identify` → `{ app_version, protocol_version,
+- `session.identify` → `{ app_version, session_protocol,
   payload_kinds: ["ghostty-snapshot"], libghostty_build,
-  session_id, started_at }`. The client calls this **first** on any
+  session_id, started_at }` (this doc's generic "protocol_version"
+  concept ships on the wire as `session_protocol` — deliberately a
+  separate constant from the request/response `protocol_version`;
+  ipc.md is normative on field names). The client calls this
+  **first** on any
   new host connection; every incompatibility is detected here, on
   stable JSON, before any binary frame exists (Herdr's lesson).
   **Shipped in HS-1a**; **HS-1b populated both fields** —
