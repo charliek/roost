@@ -33,22 +33,22 @@ use roost_ipc::messages::{
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
+    HostAddParams, HostAddResult, HostListParams, HostListResult, HostRemoveParams, IdentifyParams,
+    IdentifyResult, NotificationCreateParams, PaletteActivateParams, PaletteDismissParams,
+    PaletteOpenParams, PalettePresentParams, PalettePresentResult, PaletteQueryParams,
+    PaletteStateParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
+    ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams,
+    ScreenshotResult, SelectionClearParams, SelectionDumpParams, SelectionDumpResult,
+    SelectionSetParams, SessionConnectParams, SessionConnectResult, SessionIdentify,
+    SessionIdentifyParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
+    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{
@@ -421,6 +421,7 @@ pub enum ClipboardOp {
 }
 
 use crate::event_push::{self, PushLimits};
+use crate::persistence::HostSnapshot;
 use crate::{AttentionSource, PtyError, PtySupervisor, Workspace, WorkspaceError};
 
 /// How long `session.stop` lets a hung-up child live before it escalates
@@ -836,16 +837,7 @@ impl ClientRegistry {
 /// point: the socket's uid check bounds who can guess at it at all, and
 /// 128 bits ends the question.
 fn random_hex_128() -> String {
-    use std::fmt::Write as _;
-    let mut bytes = [0u8; 16];
-    // A failure here means the OS could not produce entropy, which is
-    // not a condition a process handing out credentials can paper over.
-    getrandom::fill(&mut bytes).expect("the OS random source must be available");
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    crate::workspace::random_hex(16)
 }
 
 impl SessionState {
@@ -1012,6 +1004,8 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::SESSION_CONNECT
             | ops::TAB_ATTACH
             | ops::TAB_FEED_PTY_BYTES
+            | ops::HOST_ADD
+            | ops::HOST_REMOVE
     )
 }
 
@@ -1420,6 +1414,12 @@ async fn dispatch_outcome(
         ops::EVENTS_SUBSCRIBE => {
             let p: EventsSubscribeParams = decode(params)?;
             return events_subscribe(h, session, ctx, &p);
+        }
+        // The host registry is client-side state (D8): a UI socket's op
+        // family. Letting it fall through would grow a shadow registry in
+        // the daemon's own state.json that nothing ever reads.
+        ops::HOST_ADD | ops::HOST_REMOVE | ops::HOST_LIST => {
+            return Err(HandlerError::unknown_op(op));
         }
         _ => {}
     }
@@ -2422,7 +2422,38 @@ async fn dispatch(
                 "events.subscribe is not yet implemented",
             ))
         }
+        ops::HOST_ADD => {
+            let p: HostAddParams = decode(params)?;
+            let host = h.workspace.add_host(&p.label, &p.target).map_err(ws_err)?;
+            encode(&HostAddResult { host: host.into() })
+        }
+        ops::HOST_REMOVE => {
+            let p: HostRemoveParams = decode(params)?;
+            h.workspace.remove_host(&p.id).map_err(ws_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::HOST_LIST => {
+            let _p: HostListParams = decode(params)?;
+            let hosts = h.workspace.hosts().into_iter().map(Host::from).collect();
+            encode(&HostListResult { hosts })
+        }
         other => Err(HandlerError::unknown_op(other)),
+    }
+}
+
+/// `persistence::HostSnapshot` (storage) → `messages::Host` (wire).
+/// `Host` is foreign to this crate, but the orphan rule still allows the
+/// impl here because `HostSnapshot` — the trait's type parameter — is
+/// local; `roost-engine`, the only crate that sees both types, is where
+/// the mapping belongs either way.
+impl From<HostSnapshot> for Host {
+    fn from(host: HostSnapshot) -> Self {
+        Host {
+            id: host.id,
+            label: host.label,
+            target: host.target,
+            last_connected: host.last_connected,
+        }
     }
 }
 
@@ -2527,6 +2558,10 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
         WorkspaceError::Io(_) | WorkspaceError::Json(_) => {
             HandlerError::new("internal", e.to_string())
         }
+        WorkspaceError::HostNotFound(_) => HandlerError::not_found(e.to_string()),
+        WorkspaceError::HostLabelEmpty
+        | WorkspaceError::HostLabelReserved
+        | WorkspaceError::HostLabelTaken(_) => HandlerError::invalid_param(e.to_string()),
     }
 }
 

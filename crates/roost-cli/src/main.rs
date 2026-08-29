@@ -25,6 +25,7 @@
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
 //!   roostctl session {start,stop,status}
+//!   roostctl host {add,list,remove} — add: --label, --target, [--verify]
 //!
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
@@ -39,6 +40,7 @@
 //! reaches a session only through an explicit `--socket`.
 
 mod doctor;
+mod host;
 mod session;
 
 use std::io::{IsTerminal, Read, Write};
@@ -214,6 +216,12 @@ enum Cmd {
     /// via an explicit `--socket`.
     #[command(subcommand)]
     Session(session::SessionCmd),
+    /// Client-side saved-host registry subcommands: add, list, remove
+    /// (host-sessions HS-2). Unlike `session`, these address the
+    /// ordinary UI socket target — a saved host is UI state, not the
+    /// session daemon's own workspace.
+    #[command(subcommand)]
+    Host(host::HostCmd),
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
@@ -1018,6 +1026,9 @@ async fn main() -> Result<()> {
                 println!("{id}");
             }
             // Dismissed → print nothing; exit 0 either way.
+        }
+        Cmd::Host(cmd) => {
+            std::process::exit(host::run(&cmd, &mut client).await);
         }
         // Already handled above before client connect.
         Cmd::ClaudeHook { .. } | Cmd::Claude(_) | Cmd::Doctor { .. } | Cmd::Session(_) => {

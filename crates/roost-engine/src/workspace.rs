@@ -341,6 +341,14 @@ pub enum WorkspaceError {
     Io(#[from] std::io::Error),
     #[error("serde_json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("host {0} not found")]
+    HostNotFound(String),
+    #[error("host label must not be empty")]
+    HostLabelEmpty,
+    #[error("host label \"local\" is reserved")]
+    HostLabelReserved,
+    #[error("a host named {0:?} already exists")]
+    HostLabelTaken(String),
 }
 
 /// Repair persisted project positions that collide, in place.
@@ -404,6 +412,27 @@ fn normalize_project_positions(projects: &mut [ProjectSnapshot]) {
         p.position = position;
         previous = Some(position);
     }
+}
+
+/// A saved host's label, checked before it is added: non-empty, unique
+/// among the existing saved hosts case-insensitively, and not `local` —
+/// that word is the sidebar's reserved header for the in-process
+/// workspace, so a saved host claiming it would be indistinguishable
+/// from the local section (host-sessions plan §3.1).
+fn validate_host_label(existing: &[HostSnapshot], label: &str) -> Result<(), WorkspaceError> {
+    if label.is_empty() {
+        return Err(WorkspaceError::HostLabelEmpty);
+    }
+    // Unicode folding, not `eq_ignore_ascii_case`: "Éclair" and "éclair"
+    // must collide, or the sidebar shows two visually identical headers.
+    let folded = label.to_lowercase();
+    if folded == "local" {
+        return Err(WorkspaceError::HostLabelReserved);
+    }
+    if existing.iter().any(|h| h.label.to_lowercase() == folded) {
+        return Err(WorkspaceError::HostLabelTaken(label.to_string()));
+    }
+    Ok(())
 }
 
 impl Workspace {
@@ -572,6 +601,66 @@ impl Workspace {
     /// [`raise_attention`]: Workspace::raise_attention
     pub fn set_window_focused(&self, focused: bool) {
         self.inner.lock().unwrap().window_focused = focused;
+    }
+
+    /// The client's saved host sessions, in the order the sidebar lists
+    /// them. Purely a registry read — connecting to one is HS-2's
+    /// `HostConn`, not this crate.
+    pub fn hosts(&self) -> Vec<HostSnapshot> {
+        self.inner.lock().unwrap().hosts.clone()
+    }
+
+    /// Save a new host, minting its stable id. Rejects the label per
+    /// [`validate_host_label`]; `target` is carried opaquely (a socket
+    /// path or, later, an SSH destination — HS-3) and is not validated
+    /// here, since only actually dialing it (`roostctl host add
+    /// --verify`, or the UI's "Add & Connect") can tell whether it is
+    /// reachable.
+    pub fn add_host(&self, label: &str, target: &str) -> Result<HostSnapshot, WorkspaceError> {
+        // Trimmed before validation AND storage, so "  " cannot pass the
+        // non-empty check and " local " cannot dodge the reserved one.
+        let label = label.trim();
+        let mut inner = self.inner.lock().unwrap();
+        validate_host_label(&inner.hosts, label)?;
+        let host = HostSnapshot {
+            id: mint_host_id(&inner.hosts),
+            label: label.to_string(),
+            target: target.to_string(),
+            last_connected: None,
+        };
+        inner.hosts.push(host.clone());
+        self.commit(inner, Vec::new(), Persist::Write);
+        Ok(host)
+    }
+
+    /// Forget a saved host by its stable id. Does not touch a live
+    /// connection — HostConn owns disconnecting before a remove reaches
+    /// here (the UI only offers Remove while disconnected, §3.1).
+    pub fn remove_host(&self, id: &str) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.hosts.len();
+        inner.hosts.retain(|h| h.id != id);
+        if inner.hosts.len() == before {
+            return Err(WorkspaceError::HostNotFound(id.to_string()));
+        }
+        self.commit(inner, Vec::new(), Persist::Write);
+        Ok(())
+    }
+
+    /// Stamp a saved host's `last_connected` with the current time
+    /// (RFC3339 UTC), for a successful connect. Owned by whoever mints
+    /// the connection (HostConn, or `roostctl host add --verify`) —
+    /// this accessor only persists the stamp.
+    pub fn touch_host_connected(&self, id: &str) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let host = inner
+            .hosts
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or_else(|| WorkspaceError::HostNotFound(id.to_string()))?;
+        host.last_connected = Some(rfc3339_now());
+        self.commit(inner, Vec::new(), Persist::Write);
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WorkspaceEvent> {
@@ -1749,6 +1838,78 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A saved host's stable id: 64 bits of OS entropy as 16 lowercase hex
+/// characters. Not a credential (unlike a session lease) — it only has
+/// to not collide with another saved host — so half the width
+/// `roost-session`'s bearer tokens use is plenty. Far past birthday risk
+/// for a hand-curated list, but a collision would be silent and
+/// permanent — two entries answering one id — so the loop buys
+/// certainty for one extra comparison per add.
+fn mint_host_id(existing: &[HostSnapshot]) -> String {
+    loop {
+        let id = random_hex(8);
+        if !existing.iter().any(|h| h.id == id) {
+            return id;
+        }
+    }
+}
+
+/// `n` random bytes from the OS entropy source, rendered as lowercase
+/// hex. Shared by [`random_host_id`] and `ipc::random_hex_128` — only
+/// the byte width and the security expectations riding on it differ
+/// per call site.
+pub(crate) fn random_hex(n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut bytes = vec![0u8; n];
+    getrandom::fill(&mut bytes).expect("the OS random source must be available");
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// `SystemTime::now()` as `YYYY-MM-DDTHH:MM:SSZ`. Hand-rolled rather
+/// than pulling in a date-time crate for one timestamp — mirrors
+/// `roost_session::identity::rfc3339_utc` exactly, which this crate
+/// cannot depend on (`roost-session` depends on `roost-engine`, not the
+/// other way).
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let time_of_day = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days-since-epoch to `(year, month, day)` — Howard Hinnant's
+/// `civil_from_days`, the standard closed-form for this (avoids a
+/// leap-year loop). Duplicated from `roost_session::identity` for the
+/// same dependency-direction reason as [`rfc3339_now`].
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn derive_title(cwd: &str) -> String {

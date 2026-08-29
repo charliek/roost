@@ -287,6 +287,120 @@ async fn app_dock_badge_rejects_unknown_params() {
     }
 }
 
+/// `host.add` / `host.list` / `host.remove` over the wire: the full
+/// round trip a real `roostctl host` or the Hosts sidebar drives,
+/// proving the dispatch arms (not just the `Workspace` accessors
+/// `state_persist.rs` exercises directly).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_add_list_remove_round_trip_over_the_wire() {
+    use roost_ipc::messages::{HostAddParams, HostAddResult, HostListResult, HostRemoveParams};
+
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+
+    let added: HostAddResult = client
+        .call(
+            ops::HOST_ADD,
+            HostAddParams {
+                label: "pop-os".into(),
+                target: "test1@localhost".into(),
+            },
+        )
+        .await
+        .expect("host.add");
+    assert_eq!(added.host.label, "pop-os");
+    assert_eq!(added.host.target, "test1@localhost");
+    assert_eq!(added.host.last_connected, None);
+    assert!(!added.host.id.is_empty());
+
+    let listed: HostListResult = client
+        .call(ops::HOST_LIST, serde_json::json!({}))
+        .await
+        .expect("host.list");
+    assert_eq!(listed.hosts.len(), 1);
+    assert_eq!(listed.hosts[0].id, added.host.id);
+
+    client
+        .call::<_, serde_json::Value>(
+            ops::HOST_REMOVE,
+            HostRemoveParams {
+                id: added.host.id.clone(),
+            },
+        )
+        .await
+        .expect("host.remove");
+
+    let after: HostListResult = client
+        .call(ops::HOST_LIST, serde_json::json!({}))
+        .await
+        .expect("host.list after remove");
+    assert!(after.hosts.is_empty());
+}
+
+/// Label validation surfaces as `invalid-param` at the wire, and a
+/// removal of an id that was never added surfaces as `not-found` —
+/// both mapped by `ws_err` in `ipc.rs`, not left as `internal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_add_rejects_reserved_label_and_remove_reports_not_found() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+
+    let err = client
+        .call_raw(
+            ops::HOST_ADD,
+            serde_json::json!({"label": "local", "target": "localhost"}),
+        )
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "invalid-param"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+
+    let err = client
+        .call_raw(ops::HOST_REMOVE, serde_json::json!({"id": "never-added"}))
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "not-found"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
 /// Connect to a freshly-bound server with bounded retries instead of
 /// a flat sleep. CI runners under load can take more than 50ms to
 /// schedule the accept loop; a bounded retry is robust without

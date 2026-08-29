@@ -133,6 +133,32 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
     assert_eq!(open_tab_reporting_size(&f, None).await, (80, 24));
 }
 
+/// The mirror of the UI-socket rule: the host registry is client-side
+/// state (D8), so a session daemon must not serve `host.*` — a fall-
+/// through would grow a shadow registry in the daemon's own state.json.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_socket_does_not_know_the_host_ops() {
+    let f = fixture(true);
+
+    for (op, params) in [
+        (
+            ops::HOST_ADD,
+            serde_json::json!({"label": "shed", "target": "localhost"}),
+        ),
+        (ops::HOST_REMOVE, serde_json::json!({"id": "abc"})),
+        (ops::HOST_LIST, serde_json::json!({})),
+    ] {
+        let err = call(&f.handler, op, params)
+            .await
+            .expect_err("a session socket must not serve host ops");
+        assert_eq!(err.code, "unknown-op", "{op}");
+    }
+    assert!(
+        f.workspace.hosts().is_empty(),
+        "no shadow registry entry may have been created"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_identify_reports_the_installed_identity() {
     let f = fixture(true);

@@ -1836,6 +1836,50 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
 }
 
 // ============================================================================
+// Host registry (client-side saved hosts, host-sessions HS-2)
+// ============================================================================
+
+/// A saved host, as the UI socket's `host.*` ops carry it. Mirrors
+/// `roost-engine`'s `persistence::HostSnapshot` field-for-field; kept as
+/// a separate type because this crate does not depend on `roost-engine`
+/// (the wire is the shared vocabulary, not the storage struct).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Host {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub last_connected: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAddParams {
+    pub label: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAddResult {
+    pub host: Host,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRemoveParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostListParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostListResult {
+    pub hosts: Vec<Host>,
+}
+
+// ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
 
@@ -2044,6 +2088,13 @@ pub mod ops {
     /// tabs moved plus the full post-reorder order.
     pub const EVENT_TABS_REORDERED: &str = "tabs.reordered";
     pub const EVENT_PROJECTS_REORDERED: &str = "projects.reordered";
+
+    /// Client-side saved-host registry (host-sessions HS-2, plan 037
+    /// C1). Registry only — no connect/disconnect here (`host.connect`
+    /// / `host.disconnect` land with `HostConn` in a later commit).
+    pub const HOST_ADD: &str = "host.add";
+    pub const HOST_REMOVE: &str = "host.remove";
+    pub const HOST_LIST: &str = "host.list";
 }
 
 // ============================================================================

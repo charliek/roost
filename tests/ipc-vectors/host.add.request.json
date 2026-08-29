@@ -1,0 +1,8 @@
+{
+  "id": "30",
+  "op": "host.add",
+  "params": {
+    "label": "pop-os",
+    "target": "/home/charlie/.local/state/roost/roost-session.sock"
+  }
+}

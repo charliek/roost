@@ -752,7 +752,7 @@ fn print_identity(identity: &SessionIdentify, socket: &Path) {
 // Thin IPC
 // ============================================================================
 
-async fn connect(socket: &Path) -> Result<IpcClient> {
+pub(crate) async fn connect(socket: &Path) -> Result<IpcClient> {
     tokio::time::timeout(scaled(IPC_TIMEOUT), IpcClient::connect(socket))
         .await
         .map_err(|_| anyhow!("connecting to {} timed out", socket.display()))?
@@ -775,7 +775,7 @@ async fn identify(socket: &Path) -> Result<SessionIdentify> {
     identify_on(&mut client).await
 }
 
-async fn identify_on(client: &mut IpcClient) -> Result<SessionIdentify> {
+pub(crate) async fn identify_on(client: &mut IpcClient) -> Result<SessionIdentify> {
     call(client, ops::SESSION_IDENTIFY, SessionIdentifyParams {}).await
 }
 

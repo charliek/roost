@@ -4,7 +4,7 @@
 //! fresh shells), not as live tabs in the workspace.
 
 use roost_engine::persistence::read_state;
-use roost_engine::Workspace;
+use roost_engine::{Workspace, WorkspaceError};
 use tempfile::tempdir;
 
 #[test]
@@ -104,6 +104,160 @@ fn saved_hosts_survive_an_ordinary_rewrite() {
 
     let ws2 = Workspace::open(state_path);
     ws2.create_project("Third", "/tmp").unwrap();
+}
+
+/// `add_host` mints a fresh id, persists through a reopen, and
+/// `remove_host` forgets it the same way — the accessor round-trip the
+/// opaque-carry tests above don't cover (those load hosts from a
+/// hand-written fixture; these exercise the mutation API itself).
+#[test]
+fn add_host_persists_and_remove_host_forgets_it_across_reopen() {
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+
+    let host_id = {
+        let ws = Workspace::open(state_path.clone());
+        let host = ws.add_host("pop-os", "test1@localhost").unwrap();
+        assert_eq!(host.label, "pop-os");
+        assert_eq!(host.target, "test1@localhost");
+        assert_eq!(host.last_connected, None);
+        assert!(!host.id.is_empty());
+        assert_eq!(ws.hosts(), vec![host.clone()]);
+        host.id
+    };
+
+    let ws2 = Workspace::open(state_path.clone());
+    let hosts = ws2.hosts();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].id, host_id);
+    assert_eq!(hosts[0].label, "pop-os");
+    drop(ws2);
+
+    let ws3 = Workspace::open(state_path.clone());
+    ws3.remove_host(&host_id).unwrap();
+    assert!(ws3.hosts().is_empty());
+    drop(ws3);
+
+    let ws4 = Workspace::open(state_path);
+    assert!(
+        ws4.hosts().is_empty(),
+        "the removal must have persisted, not just applied in memory"
+    );
+}
+
+/// Removing an id that isn't there is a `HostNotFound`, not a silent
+/// no-op — a client (or `roostctl host remove`) needs to know its id
+/// was already gone.
+#[test]
+fn remove_host_reports_not_found() {
+    let dir = tempdir().unwrap();
+    let ws = Workspace::open(dir.path().join("state.json"));
+    let err = ws.remove_host("does-not-exist").unwrap_err();
+    assert!(matches!(err, WorkspaceError::HostNotFound(id) if id == "does-not-exist"));
+}
+
+/// `touch_host_connected` stamps `last_connected` and the stamp
+/// survives a reopen — the field a fresh `add_host` deliberately leaves
+/// `None` until a real connect happens.
+#[test]
+fn touch_host_connected_stamps_last_connected_and_it_persists() {
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+
+    let host_id = {
+        let ws = Workspace::open(state_path.clone());
+        let host = ws.add_host("shed", "localhost").unwrap();
+        assert_eq!(host.last_connected, None);
+        ws.touch_host_connected(&host.id).unwrap();
+        let hosts = ws.hosts();
+        assert_eq!(hosts.len(), 1);
+        assert!(
+            hosts[0].last_connected.is_some(),
+            "touch must set last_connected"
+        );
+        host.id
+    };
+
+    let ws2 = Workspace::open(state_path);
+    let hosts = ws2.hosts();
+    assert_eq!(hosts[0].id, host_id);
+    assert!(
+        hosts[0].last_connected.is_some(),
+        "the stamp must survive a reopen"
+    );
+}
+
+#[test]
+fn touch_host_connected_reports_not_found() {
+    let dir = tempdir().unwrap();
+    let ws = Workspace::open(dir.path().join("state.json"));
+    let err = ws.touch_host_connected("ghost").unwrap_err();
+    assert!(matches!(err, WorkspaceError::HostNotFound(id) if id == "ghost"));
+}
+
+/// Label validation (host-sessions plan §3.1): non-empty, unique
+/// case-insensitively among existing saved hosts, and not `local` (any
+/// case) — the sidebar's reserved header for the in-process workspace.
+#[test]
+fn add_host_rejects_an_empty_label() {
+    let ws = Workspace::new();
+    let err = ws.add_host("", "localhost").unwrap_err();
+    assert!(matches!(err, WorkspaceError::HostLabelEmpty));
+}
+
+#[test]
+fn add_host_rejects_the_reserved_local_label_any_case() {
+    let ws = Workspace::new();
+    for label in ["local", "Local", "LOCAL", "LoCaL"] {
+        let err = ws.add_host(label, "localhost").unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::HostLabelReserved),
+            "label {label:?} must be rejected as reserved"
+        );
+    }
+}
+
+#[test]
+fn add_host_rejects_a_duplicate_label_case_insensitively() {
+    let ws = Workspace::new();
+    ws.add_host("pop-os", "test1@localhost").unwrap();
+    let err = ws.add_host("Pop-OS", "somewhere-else").unwrap_err();
+    assert!(matches!(err, WorkspaceError::HostLabelTaken(label) if label == "Pop-OS"));
+    // The first host survives untouched — a rejected add must not have
+    // mutated the registry.
+    assert_eq!(ws.hosts().len(), 1);
+}
+
+/// Trimming happens before every check AND before storage, so
+/// whitespace can neither smuggle an empty-looking label past the
+/// non-empty check nor dodge the reserved / uniqueness comparisons.
+#[test]
+fn add_host_trims_labels_before_validating_and_storing() {
+    let ws = Workspace::new();
+    assert!(matches!(
+        ws.add_host("   ", "localhost").unwrap_err(),
+        WorkspaceError::HostLabelEmpty
+    ));
+    assert!(matches!(
+        ws.add_host(" local ", "localhost").unwrap_err(),
+        WorkspaceError::HostLabelReserved
+    ));
+    ws.add_host("  pop-os  ", "test1@localhost").unwrap();
+    assert_eq!(ws.hosts()[0].label, "pop-os", "stored trimmed");
+    assert!(matches!(
+        ws.add_host("pop-os", "elsewhere").unwrap_err(),
+        WorkspaceError::HostLabelTaken(_)
+    ));
+}
+
+/// Case-insensitive means Unicode folding, not ASCII: "Éclair" and
+/// "éclair" render identically in a sidebar header and must collide.
+#[test]
+fn add_host_rejects_a_duplicate_label_across_unicode_case() {
+    let ws = Workspace::new();
+    ws.add_host("Éclair", "localhost").unwrap();
+    let err = ws.add_host("éclair", "elsewhere").unwrap_err();
+    assert!(matches!(err, WorkspaceError::HostLabelTaken(label) if label == "éclair"));
 }
 
 #[test]
