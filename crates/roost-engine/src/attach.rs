@@ -568,8 +568,17 @@ impl Pump {
             //    because the snapshot's byte floor is measured per pass:
             //    an endless producer would otherwise never let the pass
             //    end. Whatever is left is taken next pass.
+            // Until the READY prefix is fully out, tee records are
+            // absorbed but HELD (§4.3 step 3: "queues the rest") — a
+            // client has no terminal to apply a PTY frame to before
+            // READY, and making it buffer them would move this queue to
+            // every client. The hold window is tiny (the prefix is the
+            // active screen, sent at full speed) and stays bounded by
+            // the queue cap below; the burst floor is irrelevant while
+            // holding because no interleaving decision exists yet.
+            let holding = sent < self.ready_end;
             let mut drained_any = false;
-            while tee.streaming() && tee.payload_bytes < PTY_BURST_BYTES {
+            while tee.streaming() && (holding || tee.payload_bytes < PTY_BURST_BYTES) {
                 match self.tee.try_recv() {
                     Ok(event) => {
                         drained_any = true;
@@ -599,11 +608,12 @@ impl Pump {
                 }
             }
 
-            // 3. Flush what the tee gave us. PTY leads: a keystroke's
-            //    echo must not wait behind a scrollback page. This
-            //    pass's payload is what step 5 weighs against the burst
-            //    floor, so at most one burst of PTY precedes each SNAP.
-            if !tee.batch.is_empty() {
+            // 3. Flush what the tee gave us — once READY is out. PTY
+            //    leads from then on: a keystroke's echo must not wait
+            //    behind a scrollback page. This pass's payload is what
+            //    step 5 weighs against the burst floor, so at most one
+            //    burst of PTY precedes each SNAP.
+            if !tee.batch.is_empty() && !holding {
                 pty_since_snap += tee.payload_bytes;
                 if sent < self.snapshot.len() {
                     pty_before_snap += tee.payload_bytes;

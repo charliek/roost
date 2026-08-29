@@ -105,7 +105,7 @@ ICED_RELEASE_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_ice
 # drives no UI at all — it spawns `roost-session` daemons against
 # throwaway profiles — so it needs neither a display nor the shared
 # UI-session fixture, and it gets its own target + CI job.
-SESSION_E2E_TESTS := tools/roosttest/test_session.py
+SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py
 # Every whole-directory pytest run must deselect the session lane: those
 # runs drive a UI, nothing in them builds `roost-session`, and the first
 # session case would therefore `cargo build` mid-test on a shared runner.
