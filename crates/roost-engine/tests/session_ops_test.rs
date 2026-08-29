@@ -12,7 +12,7 @@ use std::time::Duration;
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
 use roost_engine::{PtyOutputEvent, PtySupervisor, Workspace};
 use roost_ipc::messages::{ops, SessionIdentify, SessionStopResult, TabOpenResult};
-use roost_ipc::{ConnAction, Handler, HandlerError, HandlerOutcome};
+use roost_ipc::{ConnAction, ConnCtx, Handler, HandlerError, HandlerOutcome};
 use tempfile::TempDir;
 
 const SESSION_ID: &str = "01K3S8TQ4F0Q9YB2K6WZ5D7XN";
@@ -77,7 +77,11 @@ async fn call(
     op: &str,
     params: serde_json::Value,
 ) -> Result<HandlerOutcome, HandlerError> {
-    handler.handle(op, params).await
+    // A fresh context per call: these ops carry no connection identity
+    // today, and a per-call one is the honest stand-in for the
+    // one-connection-per-`roostctl`-invocation shape.
+    let (ctx, _close) = ConnCtx::new(1);
+    handler.handle(&ctx, op, params).await
 }
 
 fn reply(outcome: HandlerOutcome) -> serde_json::Value {

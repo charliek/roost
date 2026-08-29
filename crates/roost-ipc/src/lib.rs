@@ -15,6 +15,8 @@
 //!   Shared with the Swift port via `tests/agent-state-fixtures/`.
 //! * [`framing`] — newline-delimited JSON read/write over a
 //!   `tokio::net::UnixStream`. Enforces the 16 MiB line limit.
+//! * [`dataframe`] — the binary framing a host-session attach
+//!   connection switches to after its JSON handshake.
 //! * [`paths`] — `BundleProfile` path resolution. The Mac UI's Swift
 //!   side has a byte-for-byte equivalent.
 //! * [`socket_state`] — the one shared answer to "is a listener alive
@@ -39,6 +41,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod agent;
+pub mod dataframe;
 pub mod framing;
 pub mod messages;
 pub mod paths;
@@ -55,7 +58,8 @@ pub use client::{ClientError, IpcClient};
 pub use peer::{current_euid, peer_uid};
 pub use runtime_dir::validate_runtime_dir;
 pub use server::{
-    ConnAction, Handler, HandlerError, HandlerOutcome, IpcServer, PushSource, StopFinalizer,
+    CloseReason, ConnAction, ConnCloseWatch, ConnCloser, ConnCtx, DataConn, Handler, HandlerError,
+    HandlerOutcome, IpcServer, PushSource, StopFinalizer, CLOSE_LABEL_DEADLINE,
     DEFAULT_PUSH_WRITE_DEADLINE,
 };
 
@@ -85,6 +89,13 @@ pub enum Error {
     InvalidId(String),
     #[error("payload contains a literal newline (use a non-newline encoding)")]
     EmbeddedNewline,
+    #[error(
+        "data frame larger than {} bytes",
+        crate::dataframe::MAX_DATA_FRAME_BYTES
+    )]
+    DataFrameTooLarge,
+    #[error("data connection did not open with the expected preamble")]
+    BadPreamble,
 }
 
 impl Error {
@@ -111,6 +122,11 @@ impl Error {
             Error::UnknownOp(_) => "unknown-op",
             Error::InvalidId(_) => "invalid-param",
             Error::EmbeddedNewline => "internal",
+            Error::DataFrameTooLarge => "frame-too-large",
+            // A bad preamble means the peer is not speaking this
+            // protocol at all — the same class of failure as an
+            // unparseable line.
+            Error::BadPreamble => "parse-error",
         }
     }
 }

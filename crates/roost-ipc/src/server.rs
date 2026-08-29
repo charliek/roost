@@ -23,8 +23,12 @@ use anyhow::Context;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, warn};
 
+use crate::dataframe::DataFrameReader;
 use crate::framing::{write_frame, FrameReader};
-use crate::messages::{RawRequest, Response};
+use crate::messages::{
+    AttachHandshake, AttachHandshakeReply, EventEnvelope, RawRequest, Response,
+    SessionStoppingEvent, SESSION_STOPPING_EVENT,
+};
 use crate::socket_state::{self, SocketState};
 use crate::Error;
 
@@ -42,11 +46,213 @@ pub trait Handler: Send + Sync + 'static {
     /// Handle one decoded request. `op` is the dotted-lowercase op
     /// name; `params` is the raw JSON object (handler decodes per-op
     /// into the typed struct).
+    ///
+    /// `ctx` identifies the connection this request arrived on and
+    /// carries the handle that closes it. A handler that ignores `ctx`
+    /// is wire-identical to one written before it existed.
     fn handle<'a>(
         &'a self,
+        ctx: &'a ConnCtx,
         op: &'a str,
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>>;
+
+    /// Serve a connection whose first line was an attach handshake
+    /// rather than a request envelope — the connection has already
+    /// stopped being a request/response socket by the time this is
+    /// called, so the handler owns both halves and every byte from here
+    /// on, including the handshake reply line.
+    ///
+    /// The default answers the one honest thing a socket with no data
+    /// plane can say and closes. Only a host session overrides it; the
+    /// UI sockets keep this.
+    fn handle_data<'a>(
+        &'a self,
+        ctx: &'a ConnCtx,
+        handshake: AttachHandshake,
+        conn: DataConn,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        let _ = (ctx, handshake);
+        Box::pin(async move {
+            let (_reader, mut writer, _close) = conn.into_parts();
+            let written = write_handshake_rejection(
+                &mut writer,
+                "not-supported",
+                "this socket does not serve attach data connections",
+            )
+            .await;
+            if let Err(e) = written {
+                debug!(error = %e, "attach rejection could not be written");
+            }
+        })
+    }
+}
+
+/// Why the server is closing a connection out from under its own read
+/// loop.
+///
+/// The reason exists so the peer learns *why*: a client that was taken
+/// over should not retry the way one whose session is shutting down
+/// should.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// Another client took the session's interactive lease.
+    TakenOver,
+    /// A newer data connection replaced this one for the same tab.
+    Superseded,
+    /// The session is stopping.
+    ShuttingDown,
+}
+
+impl CloseReason {
+    /// The `reason` a push connection's [`SESSION_STOPPING_EVENT`]
+    /// envelope carries. The published vocabulary is exactly
+    /// `"stop"` | `"taken-over"`; `Superseded` is a data-plane-only
+    /// reason that never reaches a push connection, and if it somehow
+    /// does, "stop" is the truthful half of it (the stream is over)
+    /// rather than a word no client knows.
+    pub fn stopping_reason(self) -> &'static str {
+        match self {
+            CloseReason::TakenOver => "taken-over",
+            CloseReason::Superseded | CloseReason::ShuttingDown => "stop",
+        }
+    }
+
+    /// The stable code a data connection's `ERROR` frame carries.
+    ///
+    /// No caller in this crate: the frame is written by whatever
+    /// overrides [`Handler::handle_data`] (the engine, at HS-1b), and
+    /// the vocabulary lives here so both ends read it from one place.
+    pub fn error_code(self) -> &'static str {
+        match self {
+            CloseReason::TakenOver => "taken-over",
+            CloseReason::Superseded => "superseded",
+            CloseReason::ShuttingDown => "shutting-down",
+        }
+    }
+}
+
+/// How long a connection being closed by the server may spend telling
+/// its peer why.
+///
+/// Short on purpose: the label is a courtesy, the close is not. A peer
+/// that has stopped reading makes the labeled write physically
+/// impossible once the socket buffer fills, and EOF is then the signal.
+pub const CLOSE_LABEL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Identity of the connection a request arrived on, handed to every
+/// [`Handler::handle`] call.
+///
+/// A session's lease registry keys on `conn_id` and stores `closer`, so
+/// a takeover can close every connection the previous lease holder
+/// owned — including ones parked in push or data mode, which no longer
+/// read requests and so can never be told anything by replying.
+pub struct ConnCtx {
+    pub conn_id: u64,
+    pub closer: ConnCloser,
+}
+
+impl ConnCtx {
+    /// Mint a context plus the watch its connection selects on. The
+    /// accept loop calls this once per connection; a test that drives a
+    /// [`Handler`] directly calls it to get a context to hand in.
+    pub fn new(conn_id: u64) -> (Self, ConnCloseWatch) {
+        let (closer, watch) = ConnCloser::new();
+        (Self { conn_id, closer }, watch)
+    }
+}
+
+/// A one-shot, cloneable "close this connection, and here is why".
+///
+/// Cloneable because a registry keeps one per connection while the
+/// connection task keeps its own; one-shot because the first reason
+/// wins — a connection being torn down for a takeover that then gets
+/// caught by a shutdown should still report the takeover.
+#[derive(Clone)]
+pub struct ConnCloser {
+    tx: Arc<tokio::sync::watch::Sender<Option<CloseReason>>>,
+}
+
+impl ConnCloser {
+    fn new() -> (Self, ConnCloseWatch) {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        (Self { tx: Arc::new(tx) }, ConnCloseWatch { rx })
+    }
+
+    /// Fire the closer. Returns whether this call is the one that set
+    /// the reason; a second call is a no-op.
+    pub fn close(&self, reason: CloseReason) -> bool {
+        self.tx.send_if_modified(|slot| {
+            if slot.is_some() {
+                false
+            } else {
+                *slot = Some(reason);
+                true
+            }
+        })
+    }
+
+    /// The reason this closer fired, if it has.
+    pub fn reason(&self) -> Option<CloseReason> {
+        *self.tx.borrow()
+    }
+}
+
+/// The receiving half of a [`ConnCloser`], held by whatever owns the
+/// connection's write side.
+#[derive(Clone)]
+pub struct ConnCloseWatch {
+    rx: tokio::sync::watch::Receiver<Option<CloseReason>>,
+}
+
+impl ConnCloseWatch {
+    /// Resolve once the closer fires. Cancel-safe, and sticky: after
+    /// firing it resolves immediately, every time.
+    ///
+    /// If every closer handle is dropped without firing, this never
+    /// resolves — by then the only thing that can still end the
+    /// connection is its own read loop, which is exactly what the
+    /// caller is selecting this against.
+    pub async fn closed(&mut self) -> CloseReason {
+        loop {
+            if let Some(reason) = *self.rx.borrow_and_update() {
+                return reason;
+            }
+            if self.rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// The reason, without waiting.
+    pub fn reason(&self) -> Option<CloseReason> {
+        *self.rx.borrow()
+    }
+}
+
+/// Both halves of a connection that turned out to be a data connection,
+/// handed to [`Handler::handle_data`].
+///
+/// The reader is already the binary framer, seeded with whatever the
+/// line reader had buffered past the handshake line: the handshake and
+/// the first binary bytes routinely share a `read`, and dropping that
+/// residue would lose the head of the stream.
+pub struct DataConn {
+    reader: DataFrameReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+    close: ConnCloseWatch,
+}
+
+impl DataConn {
+    pub fn into_parts(
+        self,
+    ) -> (
+        DataFrameReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+        ConnCloseWatch,
+    ) {
+        (self.reader, self.writer, self.close)
+    }
 }
 
 /// What a [`Handler`] wants done with the connection after this request.
@@ -374,10 +580,11 @@ impl<H: Handler> IpcServer<H> {
             let handler = self.handler.clone();
             let mut cancel = cancel_rx.clone();
             let keep_sender_alive = cancel_tx.clone();
+            let conn_id = next_conn_id();
             tokio::spawn(async move {
                 let _keep_sender_alive = keep_sender_alive;
                 tokio::select! {
-                    served = serve_connection(conn, handler) => {
+                    served = serve_connection(conn, handler, conn_id) => {
                         if let Err(e) = served {
                             debug!(error = %e, "ipc connection ended");
                         }
@@ -423,11 +630,76 @@ fn peer_is_allowed(conn: &UnixStream, expected_uid: u32) -> bool {
     }
 }
 
-async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Result<(), Error> {
+/// Process-unique connection ids. Starts at 1 so `0` stays available
+/// as "no connection" in a registry.
+fn next_conn_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Does this line open a data connection?
+///
+/// The test is deliberately narrow: a JSON **object** carrying `attach`
+/// and **not** carrying `op`. Anything else — an op-carrying envelope
+/// (even one that also has `attach`), a non-object, malformed JSON —
+/// stays on the request path and behaves exactly as it did before the
+/// data plane existed.
+fn is_data_handshake(line: &[u8]) -> bool {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(line)
+    else {
+        return false;
+    };
+    map.contains_key("attach") && !map.contains_key("op")
+}
+
+async fn serve_connection<H: Handler>(
+    stream: UnixStream,
+    handler: Arc<H>,
+    conn_id: u64,
+) -> Result<(), Error> {
     let (r, mut w) = stream.into_split();
     let mut reader = FrameReader::new(r);
+    let (ctx, mut close_watch) = ConnCtx::new(conn_id);
+    // The sniff is a property of the connection's *first* line only, so
+    // a request stream can never be diverted mid-flight by a payload
+    // that happens to look like a handshake.
+    let mut first_line = true;
 
-    while let Some(line) = reader.read_line().await? {
+    loop {
+        // Checked before the read, not only inside the `select!`: with
+        // `biased` a peer that always has another request buffered
+        // would otherwise keep the read arm ready forever and never let
+        // the closer be polled.
+        if let Some(reason) = close_watch.reason() {
+            debug!(
+                conn_id,
+                ?reason,
+                "closing ipc connection at the server's request"
+            );
+            return Ok(());
+        }
+        let line = tokio::select! {
+            // The read loop is the common case; check it first so a
+            // closer that fires while a request is already in hand does
+            // not race the reply out of existence.
+            biased;
+            line = reader.read_line() => match line? {
+                Some(line) => line,
+                None => return Ok(()),
+            },
+            // A plain request connection has nothing to label: there is
+            // no stream the peer is waiting on, only a reply it did not
+            // ask for. Close.
+            reason = close_watch.closed() => {
+                debug!(conn_id, ?reason, "closing ipc connection at the server's request");
+                return Ok(());
+            }
+        };
+
+        if std::mem::take(&mut first_line) && is_data_handshake(&line) {
+            return serve_data(&ctx, handler.as_ref(), reader, w, close_watch, &line).await;
+        }
+
         let request: RawRequest = match serde_json::from_slice(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -462,7 +734,7 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
 
         let id = request.id;
         let op = request.op.clone();
-        let result = handler.handle(&op, request.params).await;
+        let result = handler.handle(&ctx, &op, request.params).await;
         let (response, action) = match result {
             Ok(HandlerOutcome::Reply(value)) => (Response::ok(id, value), None),
             Ok(HandlerOutcome::ReplyThen { reply, then }) => (Response::ok(id, reply), Some(then)),
@@ -535,13 +807,84 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
                 if !encoded {
                     return Ok(());
                 }
-                return serve_push(reader, w, source).await;
+                return serve_push(reader, w, source, close_watch).await;
             }
             None => {
                 wrote_reply?;
                 if !encoded {
                     return Ok(());
                 }
+            }
+        }
+    }
+}
+
+/// A connection whose first line was an attach handshake. From here on
+/// the handler owns the wire — including the reply line, because only
+/// it knows whether the handshake is admissible.
+///
+/// A handshake that does not decode never reaches the handler: a
+/// malformed first line is answered with the same `{"ok": false,
+/// error}` shape a rejected handshake gets and the connection closes.
+/// The alternative — routing an undecodable handshake in as an error
+/// path — buys the handler nothing it can act on.
+/// The one line a refused data connection gets: an
+/// [`AttachHandshakeReply::Rejected`], which is the same shape an
+/// accepted handshake's reply has with `ok: false`. Both refusal sites
+/// — the undecodable line here and the default [`Handler::handle_data`]
+/// — go through this so neither hand-rolls the wire shape.
+async fn write_handshake_rejection(
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    code: &str,
+    message: impl Into<String>,
+) -> Result<(), Error> {
+    let body = serde_json::to_vec(&AttachHandshakeReply::rejected(code, message))?;
+    write_frame(w, &body).await
+}
+
+async fn serve_data<H: Handler>(
+    ctx: &ConnCtx,
+    handler: &H,
+    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    mut w: tokio::net::unix::OwnedWriteHalf,
+    mut close_watch: ConnCloseWatch,
+    line: &[u8],
+) -> Result<(), Error> {
+    let handshake: AttachHandshake = match serde_json::from_slice(line) {
+        Ok(h) => h,
+        Err(e) => {
+            write_handshake_rejection(
+                &mut w,
+                "parse-error",
+                format!("attach handshake decode failed: {e}"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (read_half, residue) = reader.into_parts();
+    let conn = DataConn {
+        reader: DataFrameReader::new(read_half, residue),
+        writer: w,
+        close: close_watch.clone(),
+    };
+
+    // The handler holds the same close watch and owns the labeled
+    // `ERROR` frame, so it gets the deadline to write one — but not
+    // longer than that. The abort is this loop's guarantee, not the
+    // handler's.
+    let mut served = handler.handle_data(ctx, handshake, conn);
+    tokio::select! {
+        biased;
+        () = &mut served => {}
+        reason = close_watch.closed() => {
+            if tokio::time::timeout(CLOSE_LABEL_DEADLINE, served).await.is_err() {
+                warn!(
+                    conn_id = ctx.conn_id,
+                    reason = ?reason,
+                    "data connection did not finish within the close deadline; dropping it"
+                );
             }
         }
     }
@@ -557,16 +900,33 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
 /// reader EOF drops out of the `select!` and the writer is cancelled
 /// with it; a write failure, a stalled write, or an exhausted source
 /// aborts the reader.
+///
+/// The third way it ends is the server closing it (a takeover, a stop):
+/// the peer gets one final labeled control envelope, best-effort under
+/// [`CLOSE_LABEL_DEADLINE`], and then the connection goes away.
 async fn serve_push(
     mut reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
     mut w: tokio::net::unix::OwnedWriteHalf,
     mut source: PushSource,
+    mut close_watch: ConnCloseWatch,
 ) -> Result<(), Error> {
     let write_deadline = source.write_deadline;
     let mut eof = tokio::spawn(async move { while let Ok(Some(_)) = reader.read_line().await {} });
     let result = loop {
+        // Sticky check before the select: the closer must win over any
+        // other arm that happens to be ready in the same pass (a queued
+        // event, a simultaneous EOF), or a taken-over client could keep
+        // receiving batches — or lose its label — on a coin flip.
+        if let Some(reason) = close_watch.reason() {
+            write_stopping_envelope(&mut w, reason).await;
+            break Ok(());
+        }
         tokio::select! {
             _ = &mut eof => break Ok(()),
+            reason = close_watch.closed() => {
+                write_stopping_envelope(&mut w, reason).await;
+                break Ok(());
+            }
             item = source.next() => match item {
                 None => break Ok(()),
                 Some(value) => {
@@ -586,11 +946,46 @@ async fn serve_push(
                     // holds the connection — and everything queued
                     // behind it — for as long as the peer feels like it,
                     // so a stalled write ends the connection the same
-                    // way a failed one does.
-                    match tokio::time::timeout(write_deadline, write_frame(&mut w, &body)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => break Err(e),
-                        Err(_) => {
+                    // way a failed one does. A closer firing MID-write
+                    // shrinks the remaining budget to the label deadline:
+                    // if the frame completes in that window the label
+                    // goes out on a frame boundary; if not, the peer
+                    // gets EOF — the accepted fallback — rather than a
+                    // label spliced into a half-written frame.
+                    let (wrote, close_reason) = {
+                        let write = write_frame(&mut w, &body);
+                        tokio::pin!(write);
+                        let stall = tokio::time::sleep(write_deadline);
+                        tokio::pin!(stall);
+                        let mut close_reason: Option<CloseReason> = None;
+                        loop {
+                            tokio::select! {
+                                res = &mut write => break (Some(res), close_reason),
+                                () = &mut stall => break (None, close_reason),
+                                reason = close_watch.closed(), if close_reason.is_none() => {
+                                    close_reason = Some(reason);
+                                    stall
+                                        .as_mut()
+                                        .reset(tokio::time::Instant::now() + CLOSE_LABEL_DEADLINE);
+                                }
+                            }
+                        }
+                    };
+                    match (wrote, close_reason) {
+                        (Some(Ok(())), Some(reason)) => {
+                            write_stopping_envelope(&mut w, reason).await;
+                            break Ok(());
+                        }
+                        (Some(Ok(())), None) => {}
+                        (Some(Err(e)), _) => break Err(e),
+                        (None, Some(reason)) => {
+                            debug!(
+                                ?reason,
+                                "push write did not finish within the close deadline; closing unlabeled"
+                            );
+                            break Ok(());
+                        }
+                        (None, None) => {
                             warn!(
                                 deadline_ms = write_deadline.as_millis(),
                                 "push write stalled past its deadline; closing the connection"
@@ -607,6 +1002,37 @@ async fn serve_push(
     };
     eof.abort();
     result
+}
+
+/// The one frame a push connection sends that is not an `EventBatch`:
+/// the terminal control envelope naming why the stream is ending.
+///
+/// Best-effort by contract. A peer that stopped reading has already
+/// made this write impossible once the socket buffer filled, and EOF is
+/// then the only signal it gets — so a failure here is logged, never
+/// propagated.
+async fn write_stopping_envelope(w: &mut tokio::net::unix::OwnedWriteHalf, reason: CloseReason) {
+    let encoded = serde_json::to_value(SessionStoppingEvent {
+        reason: reason.stopping_reason().to_string(),
+    })
+    .and_then(|data| {
+        serde_json::to_vec(&EventEnvelope {
+            event: SESSION_STOPPING_EVENT.to_string(),
+            data,
+        })
+    });
+    let body = match encoded {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "stopping envelope failed to serialize");
+            return;
+        }
+    };
+    match tokio::time::timeout(CLOSE_LABEL_DEADLINE, write_frame(w, &body)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => debug!(error = %e, "stopping envelope could not be written; closing anyway"),
+        Err(_) => debug!("stopping envelope stalled past its deadline; closing anyway"),
+    }
 }
 
 /// Unlink `path` if it is a socket. Re-checks the file type rather

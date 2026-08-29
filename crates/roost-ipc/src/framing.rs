@@ -94,6 +94,19 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 }
 
+impl<R> FrameReader<R> {
+    /// Give up line framing: hand back the underlying reader plus the
+    /// bytes already pulled off it that no line consumed yet.
+    ///
+    /// The residue is the load-bearing half. A data connection's
+    /// handshake line and the binary bytes that follow it routinely
+    /// arrive in one `read`, so a caller that took only the reader
+    /// would silently drop the head of the binary stream.
+    pub fn into_parts(self) -> (R, Vec<u8>) {
+        (self.inner, self.pending)
+    }
+}
+
 /// Write a single frame: the `bytes` followed by `\n`. The payload
 /// must not exceed [`crate::MAX_FRAME_BYTES`]. Encoders should produce
 /// a single newline at the end; nothing in this function strips
@@ -210,6 +223,19 @@ mod tests {
             Err(Error::FrameTooLarge) => {}
             other => panic!("expected FrameTooLarge, got {other:?}"),
         }
+    }
+
+    /// The attach handover: one line is consumed, everything the reader
+    /// had already buffered past it comes back as residue.
+    #[tokio::test]
+    async fn into_parts_returns_the_unconsumed_residue() {
+        let buf = b"{\"attach\":\"t\"}\nROOSTDP2\x01\x02".as_slice();
+        let mut r = FrameReader::new(buf);
+        let line = r.read_line().await.unwrap().unwrap();
+        assert_eq!(line, b"{\"attach\":\"t\"}");
+        let (rest, residue) = r.into_parts();
+        assert_eq!(residue, b"ROOSTDP2\x01\x02");
+        assert!(rest.is_empty(), "the slice reader was drained in one read");
     }
 
     #[tokio::test]

@@ -204,6 +204,27 @@ pub struct EventEnvelope {
     pub data: serde_json::Value,
 }
 
+/// The one envelope a subscriber sees that is **not** carried inside an
+/// [`EventBatch`]: the terminal control frame a host session writes
+/// immediately before it closes a push connection.
+///
+/// It is not in the `EVENT_*` catalogue in [`ops`] on purpose — those
+/// name workspace facts that ride a batch under a revision, and this
+/// one names a transport decision. It carries no revision and is exempt
+/// from the client's gap check; it is always the last frame on the
+/// connection.
+pub const SESSION_STOPPING_EVENT: &str = "session.stopping";
+
+/// `data` of the [`SESSION_STOPPING_EVENT`] envelope.
+///
+/// `"stop"` — the session is shutting down; `"taken-over"` — another
+/// client took the lease. Either way the connection is over; the
+/// difference is whether reconnecting is worth trying.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStoppingEvent {
+    pub reason: String,
+}
+
 // ============================================================================
 // Identify
 // ============================================================================
@@ -1454,17 +1475,31 @@ pub struct AgentReportChangedEvent {
 }
 
 // ============================================================================
-// Host sessions (plan 033 §D4) — wire types only, no op serves them yet
+// Host sessions (plan 033 §D4, plan 036 §D4/D6/D11)
+//
+// The server speaks part of this today: the attach handshake and the
+// stopping envelope. The lease + attach *ops* land in HS-1b, and their
+// param/result types live here ahead of them on purpose — the golden
+// vectors and the Swift mirror pin the wire before an implementation
+// exists to drift from it.
 // ============================================================================
 
 /// Version of the host-session protocol: the `session.*` handshake, the
-/// attach handshake, and the binary data-plane framing that HS-1 adds.
+/// attach handshake, and the binary data-plane framing.
 ///
 /// Deliberately separate from [`crate::PROTOCOL_VERSION`], which
 /// versions the request/response wire format every client already
 /// speaks. A host-session change must not force every `roostctl` build
 /// to be re-gated, and vice versa.
-pub const SESSION_PROTOCOL_VERSION: u32 = 1;
+///
+/// `2` (plan 036, HS-1b) is a **breaking** bump from HS-1a's `1`:
+/// `events.subscribe` and `tab.attach` now require the lease minted by
+/// [`ops::SESSION_CONNECT`], so a client written against `1` — which
+/// subscribed with no lease at all — is rejected with
+/// `connect-required`. The attach handshake carries this same number in
+/// its `protocol_version` field and a mismatch is refused before the
+/// token is even looked at.
+pub const SESSION_PROTOCOL_VERSION: u32 = 2;
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -1578,6 +1613,217 @@ pub struct EventBatch {
     pub events: Vec<EventEnvelope>,
 }
 
+/// [`ops::SESSION_CONNECT`] params. `takeover: false` (the default)
+/// fails with `already-connected` when a lease is live — *including*
+/// when the caller is the current holder, because a client that lost
+/// track of its own lease is exactly the one that must re-establish it
+/// deliberately.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConnectParams {
+    #[serde(default)]
+    pub takeover: bool,
+}
+
+/// [`ops::SESSION_CONNECT`] result: the bearer lease every lease-gated
+/// op must present, plus the workspace revision it was minted at so a
+/// client can fence its first `tab.list` against the event stream
+/// without a second round trip.
+///
+/// The lease is a credential: never log it, never print it in a test
+/// failure dump.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionConnectResult {
+    pub lease: String,
+    pub revision: u64,
+}
+
+/// [`ops::TAB_ATTACH`] params — the control-plane half of an attach.
+///
+/// `kinds` is the client's preference order; the server serves the
+/// first one it supports. `libghostty_build` must match the session's
+/// own build string exactly for [`AttachPayloadKind::GHOSTTY_SNAPSHOT`]
+/// — two libghostty builds that disagree cannot exchange a snapshot.
+/// The cell-pixel geometry is optional (a headless client has no cell
+/// metrics to report); `cols`/`rows` are not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabAttachParams {
+    pub lease: String,
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    pub kinds: Vec<AttachPayloadKind>,
+    pub cols: u16,
+    pub rows: u16,
+    #[serde(default)]
+    pub cell_w_px: u16,
+    #[serde(default)]
+    pub cell_h_px: u16,
+    pub libghostty_build: String,
+}
+
+/// [`ops::TAB_ATTACH`] result — a single-use ticket for one data
+/// connection, plus the identity that scopes every seq on it.
+///
+/// `server_epoch` is random per session process and `tab_generation`
+/// counts tab pipelines within it; a client that resumes must hand both
+/// back, which is what makes a stale stream from a restarted server
+/// unresumable by construction rather than by luck.
+///
+/// `attach_token` is a credential — same no-logging rule as the lease.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabAttachResult {
+    pub attach_token: String,
+    pub kind: AttachPayloadKind,
+    pub server_epoch: u64,
+    pub tab_generation: u64,
+}
+
+/// The first line of a data connection: not a request envelope, which
+/// is exactly how the server tells the two apart (an object with
+/// `attach` and no `op`).
+///
+/// Permissive on decode — a newer client may carry fields this build
+/// has never heard of, and refusing the whole handshake over one would
+/// turn an additive change into a hard incompatibility. The resume
+/// triple is all-or-nothing in practice: `resume_from_seq` without a
+/// matching `server_epoch` + `tab_generation` falls back to snapshot
+/// mode rather than erroring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachHandshake {
+    pub attach: String,
+    pub protocol_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_generation: Option<u64>,
+}
+
+/// How the server chose to serve an accepted handshake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachMode {
+    /// Full snapshot stream, then live frames. The fallback for every
+    /// resume that cannot be honored.
+    #[default]
+    Snapshot,
+    /// Replay from the tab's ring, then live frames — no snapshot.
+    Resume,
+}
+
+/// The accepted arm of an [`AttachHandshakeReply`].
+///
+/// `seq` is the fence: the client has everything up to and including
+/// it, and the next `PTY` frame carries `seq + 1`. Snapshot mode fences
+/// at the snapshot's own encode point; resume mode fences at
+/// `resume_from_seq - 1`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachAccepted {
+    pub kind: AttachPayloadKind,
+    pub mode: AttachMode,
+    pub seq: u64,
+    pub server_epoch: u64,
+    pub tab_generation: u64,
+}
+
+/// The one JSON line a data connection gets back before the wire turns
+/// binary — or the only line it gets, if the handshake is refused.
+///
+/// The `ok` flag is the discriminant, mirroring [`Response`]'s shape so
+/// a client reads both the same way. `u64`s ride as bare JSON numbers
+/// (the [`EventBatch::revision`] precedent): these are counters, not
+/// ids, and the string-int64 convention does not apply to them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawAttachHandshakeReply", into = "RawAttachHandshakeReply")]
+pub enum AttachHandshakeReply {
+    Accepted(AttachAccepted),
+    /// Written, then the connection closes. Codes: `invalid-token`,
+    /// `protocol-mismatch`, `taken-over`, `snapshot-failed`,
+    /// `shutting-down`.
+    Rejected(ResponseError),
+}
+
+impl AttachHandshakeReply {
+    pub fn rejected(code: impl Into<String>, message: impl Into<String>) -> Self {
+        AttachHandshakeReply::Rejected(ResponseError {
+            code: code.into(),
+            message: message.into(),
+        })
+    }
+}
+
+/// Flat mirror of [`AttachHandshakeReply`] — serde has no bool-tagged
+/// enum representation, and a hand-written `Deserialize` would be a lot
+/// of code to say "look at `ok`".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RawAttachHandshakeReply {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<AttachPayloadKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<AttachMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tab_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<ResponseError>,
+}
+
+impl TryFrom<RawAttachHandshakeReply> for AttachHandshakeReply {
+    type Error = String;
+
+    fn try_from(raw: RawAttachHandshakeReply) -> Result<Self, String> {
+        if raw.ok {
+            Ok(AttachHandshakeReply::Accepted(AttachAccepted {
+                kind: raw
+                    .kind
+                    .ok_or("accepted handshake reply is missing `kind`")?,
+                mode: raw
+                    .mode
+                    .ok_or("accepted handshake reply is missing `mode`")?,
+                seq: raw.seq.ok_or("accepted handshake reply is missing `seq`")?,
+                server_epoch: raw
+                    .server_epoch
+                    .ok_or("accepted handshake reply is missing `server_epoch`")?,
+                tab_generation: raw
+                    .tab_generation
+                    .ok_or("accepted handshake reply is missing `tab_generation`")?,
+            }))
+        } else {
+            Ok(AttachHandshakeReply::Rejected(
+                raw.error
+                    .ok_or("rejected handshake reply is missing `error`")?,
+            ))
+        }
+    }
+}
+
+impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
+    fn from(reply: AttachHandshakeReply) -> Self {
+        match reply {
+            AttachHandshakeReply::Accepted(a) => RawAttachHandshakeReply {
+                ok: true,
+                kind: Some(a.kind),
+                mode: Some(a.mode),
+                seq: Some(a.seq),
+                server_epoch: Some(a.server_epoch),
+                tab_generation: Some(a.tab_generation),
+                error: None,
+            },
+            AttachHandshakeReply::Rejected(error) => RawAttachHandshakeReply {
+                ok: false,
+                error: Some(error),
+                ..RawAttachHandshakeReply::default()
+            },
+        }
+    }
+}
+
 // ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
@@ -1616,6 +1862,18 @@ pub mod ops {
     /// workspace, tear every PTY down, reply with the reap report, and
     /// only then run the process-level shutdown tail.
     pub const SESSION_STOP: &str = "session.stop";
+    /// Take the session's single interactive lease. Every lease-gated
+    /// op (`events.subscribe`, `tab.attach`) presents what this mints;
+    /// administrative ops stay lease-free. A lease lives until it is
+    /// replaced or the session stops — losing the connection does not
+    /// release it, so a reconnecting client always arrives as a
+    /// takeover.
+    pub const SESSION_CONNECT: &str = "session.connect";
+    /// Ask for a ticket to open a data connection for one tab. The
+    /// control-plane half of an attach: it negotiates payload kind,
+    /// build identity, and geometry on stable JSON, and hands back a
+    /// single-use token the binary handshake presents.
+    pub const TAB_ATTACH: &str = "tab.attach";
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";

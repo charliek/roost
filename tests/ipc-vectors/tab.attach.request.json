@@ -1,0 +1,14 @@
+{
+  "id": "4",
+  "op": "tab.attach",
+  "params": {
+    "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+    "tab_id": "5",
+    "kinds": ["ghostty-snapshot"],
+    "cols": 120,
+    "rows": 40,
+    "cell_w_px": 9,
+    "cell_h_px": 18,
+    "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1"
+  }
+}

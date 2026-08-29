@@ -152,7 +152,7 @@ impl ServerVtState {
         Self {
             workspace: config.workspace,
             capture_pty_input: config.capture_pty_input,
-            server_epoch: random_u64(),
+            server_epoch: random_epoch(),
             next_generation: AtomicU64::new(1),
             snapshot_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_SNAPSHOTS)),
         }
@@ -163,10 +163,15 @@ impl ServerVtState {
     }
 }
 
-fn random_u64() -> u64 {
+/// 63 bits, not 64: the epoch rides JSON as a bare number, and the Mac
+/// mirror's dynamic decode path (`AnyCodable`) tries `Int64` before
+/// falling back to lossy `Double` — a top-bit-set epoch would round-trip
+/// imprecisely there and break the resume identity check it exists for.
+/// 63 random bits collide as never as 64 do.
+fn random_epoch() -> u64 {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("the OS random source must be available");
-    u64::from_le_bytes(bytes)
+    u64::from_le_bytes(bytes) & (i64::MAX as u64)
 }
 
 /// A tab's snapshot plus the identity and fence it was taken at. The

@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use roost_ipc::framing::{write_frame, FrameReader};
-use roost_ipc::{Handler, HandlerError, HandlerOutcome, IpcServer};
+use roost_ipc::{ConnCtx, Handler, HandlerError, HandlerOutcome, IpcServer};
 use tempfile::tempdir;
 use tokio::net::UnixStream;
 
@@ -19,6 +19,7 @@ struct OkHandler;
 impl Handler for OkHandler {
     fn handle<'a>(
         &'a self,
+        _ctx: &'a ConnCtx,
         _op: &'a str,
         _params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {

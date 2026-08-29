@@ -48,7 +48,7 @@ use roost_ipc::messages::{
     TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, SESSION_PROTOCOL_VERSION,
 };
-use roost_ipc::{ConnAction, Handler, HandlerError, HandlerOutcome, StopFinalizer};
+use roost_ipc::{ConnAction, ConnCtx, Handler, HandlerError, HandlerOutcome, StopFinalizer};
 
 /// Text snapshot of a tab's terminal viewport, produced on the UI
 /// adapter's main thread for the `tab.dump` op. Neutral (lib-side) types so this crate
@@ -685,6 +685,7 @@ impl IpcHandler {
 impl Handler for IpcHandler {
     fn handle<'a>(
         &'a self,
+        _ctx: &'a ConnCtx,
         op: &'a str,
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {
