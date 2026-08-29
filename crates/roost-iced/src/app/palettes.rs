@@ -816,11 +816,7 @@ impl App {
                 &self.keybindings,
             ),
             "launcher" => launcher_palette_frame(&self.config),
-            "agents" => agent_palette::agent_frame(
-                &self.workspace.snapshot(),
-                self.backend.host(),
-                agent_palette::now_unix(),
-            ),
+            "agents" => self.agent_frame_now(),
             "notifications" => notification_inbox::frame(&self.notification_inbox),
             "custom" => provider_palette_frame(&self.config.providers),
             _ => return Err(format!("unknown palette kind {kind:?}")),
@@ -1238,12 +1234,9 @@ impl App {
                     }
                 }
                 palette::PaletteCommands::VIEW_AGENTS_ID => {
+                    let frame = self.agent_frame_now();
                     if let Some(state) = &mut self.palette {
-                        state.push(agent_palette::agent_frame(
-                            &self.workspace.snapshot(),
-                            self.backend.host(),
-                            agent_palette::now_unix(),
-                        ));
+                        state.push(frame);
                     }
                     self.refresh_agent_palette();
                 }
@@ -1597,6 +1590,36 @@ impl App {
         }
     }
 
+    /// Every workspace the agents palette draws rows from: the local one
+    /// and each **connected** host's mirror (plan 037 §3.1 — the agent
+    /// surfaces are host-blind). A disconnected host contributes none:
+    /// its rows cannot be activated, and a palette row that does nothing
+    /// is worse than a row that is not there.
+    fn agent_sources<'a>(&'a self, local: &'a [Project]) -> Vec<agent_palette::AgentSource<'a>> {
+        let mut sources = Vec::with_capacity(self.host_views.len() + 1);
+        sources.push(agent_palette::AgentSource::local(
+            local,
+            self.backend.host(),
+        ));
+        sources.extend(
+            self.host_views
+                .iter()
+                .filter(|view| view.state.interactive())
+                .map(|view| agent_palette::AgentSource {
+                    projects: &view.projects,
+                    host: view.host,
+                    label: Some(view.label.as_str()),
+                }),
+        );
+        sources
+    }
+
+    /// The agents frame as of right now, across every host.
+    pub(super) fn agent_frame_now(&self) -> palette::PaletteFrame {
+        let local = self.workspace.snapshot();
+        agent_palette::agent_frame_across(&self.agent_sources(&local), agent_palette::now_unix())
+    }
+
     pub(super) fn refresh_agent_palette(&mut self) {
         let has_agents = self.palette.as_ref().is_some_and(|state| {
             state
@@ -1614,9 +1637,9 @@ impl App {
         // the adapter's next general reconcile. The engine snapshot is the
         // authoritative resync source for this live frame.
         let projects = self.workspace.snapshot();
-        let host = self.backend.host();
-        let cwds = agent_palette::agent_tab_cwds(&projects, host);
-        let mut items = agent_palette::agent_items(&projects, host, agent_palette::now_unix());
+        let sources = self.agent_sources(&projects);
+        let cwds = agent_palette::agent_tab_cwds_across(&sources);
+        let mut items = agent_palette::agent_items_across(&sources, agent_palette::now_unix());
         self.apply_metrics_cache(&cwds, &mut items);
         if let Some(state) = &mut self.palette {
             state.update_items(agent_palette::FRAME_ID, items);

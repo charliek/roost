@@ -134,6 +134,28 @@ pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
 pub const PALETTE_HOVER: Color = Color::from_rgb8(0x3d, 0x3d, 0x43);
 pub const PALETTE_PLACEHOLDER: Color = Color::from_rgb8(0x9e, 0x9e, 0x9e);
 pub const PALETTE_MATCH: Color = Color::from_rgb8(0x5f, 0xa3, 0xf0);
+/// The host-section header's connection dot (plan 037 §3.1). Sampled
+/// from the approved mockup's `.hdot` rules: green connected, grey gone,
+/// amber in flight — the amber is the mockup's own busy-agent shade, so
+/// "something is happening" reads the same everywhere in the chrome.
+pub const HOST_DOT_CONNECTED: Color = Color::from_rgb8(0x3f, 0xca, 0x6b);
+pub const HOST_DOT_OFFLINE: Color = Color::from_rgb8(0x6a, 0x70, 0x76);
+pub const HOST_DOT_PENDING: Color = Color::from_rgb8(0xe6, 0xb2, 0x3a);
+pub const HOST_DOT_SIZE: f32 = 7.0;
+/// Gap between the dot, the label, and the rollup in a host band
+/// (mockup `.hosthdr { gap: 7px }`).
+pub const HOST_BAND_SPACING: f32 = 7.0;
+/// The band's right-aligned rollup ("2 agents", "disconnected") — one
+/// step quieter than [`MUTED_TEXT`], as the mockup's `.hosthdr small`.
+pub const HOST_ROLLUP_TEXT: Color = Color::from_rgb8(0x6e, 0x74, 0x7a);
+pub const HOST_ROLLUP_SIZE: f32 = 10.0;
+/// A disconnected section's rows stay listed at this opacity (mockup
+/// `.dim`). Applied to the row colors rather than to a layer: iced has no
+/// container opacity, and scaling alpha composites identically over the
+/// flat list fill.
+pub const HOST_SECTION_DIM: f32 = 0.45;
+/// The inline "↻ Reconnect" row (mockup `.reconnect`).
+pub const HOST_RECONNECT_TEXT: Color = Color::from_rgb8(0x7f, 0xa8, 0xe8);
 pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
 pub const DANGER: Color = Color::from_rgb8(0x8a, 0x2a, 0x2a);
 pub const DANGER_ACCENT: Color = Color::from_rgb8(0xa8, 0x33, 0x33);

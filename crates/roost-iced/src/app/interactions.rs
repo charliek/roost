@@ -1372,7 +1372,8 @@ impl App {
             self.cancel_editor_for_interaction();
         }
         let link_modifier_held = self.link_modifier_held();
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, self.backend.tab_key(tab_id)) else {
+        let key = self.terminal_event_key(tab_id);
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, key) else {
             tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
             return UiTask::None;
         };
@@ -1415,7 +1416,6 @@ impl App {
         );
         #[cfg(target_os = "linux")]
         if outcome.paste_selection {
-            let key = self.backend.tab_key(tab_id);
             self.clipboard
                 .enqueue_paste_read(ClipboardOp::Selection, key);
         }
@@ -1433,7 +1433,8 @@ impl App {
             col,
             row,
         } = event;
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, self.backend.tab_key(tab_id)) else {
+        let key = self.terminal_event_key(tab_id);
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, key) else {
             tracing::debug!(tab_id, "ignored terminal wheel event for a closed tab");
             return UiTask::None;
         };
@@ -1452,7 +1453,8 @@ impl App {
     }
 
     pub fn pointer_leave(&mut self, tab_id: i64) {
-        if let Some(tab) = self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
+        let key = self.terminal_event_key(tab_id);
+        if let Some(tab) = self.tabs.get_mut(&key) {
             tab.pointer_leave();
             if let Err(error) = tab.refresh_snapshot() {
                 tracing::warn!(?error, tab_id, "terminal hover refresh failed after leave");
@@ -1899,12 +1901,16 @@ impl App {
     }
 
     pub(super) fn copy_active_selection(&mut self) -> UiTask {
-        let tab_id = self.workspace.active().1;
-        let text = match self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
-            Some(tab) => match tab.selected_text() {
+        // The terminal on screen, which is the host's while a host row is
+        // selected — reading the workspace's own active id here would
+        // copy out of the hidden local terminal instead. The paste twin
+        // below has always resolved this way.
+        let tab = self.active_tab_key();
+        let text = match self.tabs.get_mut(&tab) {
+            Some(terminal) => match terminal.selected_text() {
                 Ok(text) => text,
                 Err(error) => {
-                    self.set_status(format!("copy selection from tab {tab_id}: {error}"));
+                    self.set_status(format!("copy selection from tab {tab}: {error}"));
                     return UiTask::None;
                 }
             },

@@ -57,33 +57,65 @@ pub fn now_unix() -> i64 {
         .unwrap_or_default()
 }
 
-/// The root/sub frame for the agents palette.
-///
-/// `host` is the instance whose id-space `projects` was drawn from — the
-/// snapshot is a wire value, so it carries bare ids and the caller is the
-/// only thing that knows which backend produced them.
-pub fn agent_frame(projects: &[Project], host: HostId, now: i64) -> PaletteFrame {
-    PaletteFrame::new(FRAME_ID, PLACEHOLDER, agent_items(projects, host, now))
+/// One workspace's contribution to the agents palette — the local one,
+/// or a connected host's mirror (plan 037 §3.1: agent surfaces are
+/// host-blind).
+#[derive(Debug, Clone, Copy)]
+pub struct AgentSource<'a> {
+    pub projects: &'a [Project],
+    /// The instance whose id-space `projects` carries.
+    pub host: HostId,
+    /// The saved host's label, appended to each row's context as
+    /// `project · host`. `None` for the local workspace — there is
+    /// nothing to disambiguate it from, and a bare install's rows must
+    /// read exactly as they do today.
+    pub label: Option<&'a str>,
+}
+
+impl<'a> AgentSource<'a> {
+    pub fn local(projects: &'a [Project], host: HostId) -> Self {
+        Self {
+            projects,
+            host,
+            label: None,
+        }
+    }
+}
+
+/// The agents frame across every source, in one merged `rank` order.
+pub fn agent_frame_across(sources: &[AgentSource<'_>], now: i64) -> PaletteFrame {
+    PaletteFrame::new(FRAME_ID, PLACEHOLDER, agent_items_across(sources, now))
 }
 
 /// Rows for every agent-owned tab in the snapshot, in `rank` order.
 /// Empty populations yield the single non-actionable sentinel row.
 pub fn agent_items(projects: &[Project], host: HostId, now: i64) -> Vec<PaletteItem> {
+    agent_items_across(&[AgentSource::local(projects, host)], now)
+}
+
+/// [`agent_items`] over several workspaces at once: needs-attention
+/// first regardless of which host a row came from, and rows from a host
+/// carry `project · host` as their context so the fuzzy filter can find
+/// them by machine.
+pub fn agent_items_across(sources: &[AgentSource<'_>], now: i64) -> Vec<PaletteItem> {
     let mut rows: Vec<Row> = Vec::new();
-    for project in projects {
-        for tab in &project.tabs {
-            let axes = tab.agent_state();
-            let Some(owner) = agent_owner(&axes) else {
-                continue;
-            };
-            rows.push(row_for(
-                project,
-                tab,
-                TabKey::new(host, tab.id),
-                owner,
-                agent::effective_lifecycle(&axes),
-                now,
-            ));
+    for (source_index, source) in sources.iter().enumerate() {
+        for project in source.projects {
+            for tab in &project.tabs {
+                let axes = tab.agent_state();
+                let Some(owner) = agent_owner(&axes) else {
+                    continue;
+                };
+                rows.push(row_for(
+                    project,
+                    source,
+                    source_index,
+                    tab,
+                    owner,
+                    agent::effective_lifecycle(&axes),
+                    now,
+                ));
+            }
         }
     }
     if rows.is_empty() {
@@ -91,11 +123,14 @@ pub fn agent_items(projects: &[Project], host: HostId, now: i64) -> Vec<PaletteI
     }
     // Total order (§3.5): urgency, then recency, then the workspace's
     // own deterministic layout order. Whole-second `last_event_at` ties
-    // are common, so the positional tiebreaks are load-bearing.
+    // are common, so the positional tiebreaks are load-bearing — and
+    // `source_index` is one of them now, since two hosts' projects can
+    // sit at the same position.
     rows.sort_by(|a, b| {
         b.rank
             .cmp(&a.rank)
             .then(b.last_event_at.cmp(&a.last_event_at))
+            .then(a.source_index.cmp(&b.source_index))
             .then(a.project_position.cmp(&b.project_position))
             .then(a.tab_position.cmp(&b.tab_position))
             .then(a.tab_id.cmp(&b.tab_id))
@@ -110,11 +145,20 @@ pub fn agent_items(projects: &[Project], host: HostId, now: i64) -> Vec<PaletteI
 /// filter is shared with [`agent_items`] rather than re-spelled in
 /// `app.rs`, where it could drift.
 pub fn agent_tab_cwds(projects: &[Project], host: HostId) -> HashMap<TabKey, String> {
+    agent_tab_cwds_across(&[AgentSource::local(projects, host)])
+}
+
+/// [`agent_tab_cwds`] over several workspaces at once, keyed the same
+/// way — a host tab's cwd is a path on that host, so the probe simply
+/// finds no repo there and the column stays muted.
+pub fn agent_tab_cwds_across(sources: &[AgentSource<'_>]) -> HashMap<TabKey, String> {
     let mut cwds = HashMap::new();
-    for project in projects {
-        for tab in &project.tabs {
-            if agent_owner(&tab.agent_state()).is_some() {
-                cwds.insert(TabKey::new(host, tab.id), tab.cwd.clone());
+    for source in sources {
+        for project in source.projects {
+            for tab in &project.tabs {
+                if agent_owner(&tab.agent_state()).is_some() {
+                    cwds.insert(TabKey::new(source.host, tab.id), tab.cwd.clone());
+                }
             }
         }
     }
@@ -328,6 +372,7 @@ pub fn metrics_role_hex(role: MetricsRole) -> &'static str {
 struct Row {
     rank: u8,
     last_event_at: i64,
+    source_index: usize,
     project_position: i32,
     tab_position: i32,
     tab_id: i64,
@@ -336,13 +381,22 @@ struct Row {
 
 fn row_for(
     project: &Project,
+    source: &AgentSource<'_>,
+    source_index: usize,
     tab: &Tab,
-    key: TabKey,
     owner: &Ownership,
     effective: AgentLifecycle,
     now: i64,
 ) -> Row {
+    let key = TabKey::new(source.host, tab.id);
+    // The row's context column: the project, plus the machine it runs on
+    // once there is more than one. Composed on the same `·` separator the
+    // title uses, so "disc pop" fuzzy-matches a remote row.
     let project_name = normalize_line(&project.name);
+    let project_name = match source.label {
+        Some(label) if !label.is_empty() => compose_title(&project_name, &normalize_line(label)),
+        _ => project_name,
+    };
     let name = row_name(tab, owner);
     let item = PaletteItem::new(
         format!("{ROW_ID_PREFIX}{key}"),
@@ -360,6 +414,7 @@ fn row_for(
     Row {
         rank: agent::rank(effective),
         last_event_at: owner.last_event_at,
+        source_index,
         project_position: project.position,
         tab_position: tab.position,
         tab_id: tab.id,
@@ -509,6 +564,120 @@ mod tests {
 
     fn agent_of(item: &PaletteItem) -> &AgentRowData {
         item.agent.as_ref().expect("agent row payload")
+    }
+
+    // ----- host-blind rows (plan 037 §3.1) ---------------------------
+
+    /// A remote row's context column names the machine; a local row's is
+    /// untouched, so a bare install reads exactly as it does today.
+    #[test]
+    fn a_host_row_carries_project_then_host_as_its_context() {
+        let local = [project(
+            1,
+            "roost",
+            vec![owned(
+                tab(1, "plan-037"),
+                "claude",
+                AgentLifecycle::Working,
+                NOW,
+            )],
+        )];
+        let remote = [project(
+            1,
+            "blogd",
+            vec![owned(
+                tab(1, "rss feed"),
+                "claude",
+                AgentLifecycle::Working,
+                NOW,
+            )],
+        )];
+        let items = agent_items_across(
+            &[
+                AgentSource::local(&local, HostId::LOCAL),
+                AgentSource {
+                    projects: &remote,
+                    host: HostId::new(3),
+                    label: Some("pop-os"),
+                },
+            ],
+            NOW,
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(agent_of(&items[0]).project, "roost");
+        assert_eq!(items[0].title, "roost · plan-037");
+        assert_eq!(agent_of(&items[1]).project, "blogd · pop-os");
+        assert_eq!(
+            items[1].title, "blogd · pop-os · rss feed",
+            "the fuzzy filter matches exactly what the row shows"
+        );
+        // Same numeric tab id on two instances, two distinct row ids.
+        assert_eq!(items[0].id, "agent:1");
+        assert_eq!(items[1].id, "agent:h3.1");
+    }
+
+    /// Needs-attention first regardless of host: a remote waiting agent
+    /// outranks a local working one, and the source order only breaks
+    /// ties.
+    #[test]
+    fn urgency_orders_across_hosts_before_source_order_does() {
+        let local = [project(
+            1,
+            "roost",
+            vec![owned(tab(1, "a"), "claude", AgentLifecycle::Working, NOW)],
+        )];
+        let remote = [project(
+            1,
+            "blogd",
+            vec![
+                owned(tab(1, "b"), "claude", AgentLifecycle::Waiting, NOW),
+                owned(tab(2, "c"), "claude", AgentLifecycle::Working, NOW),
+            ],
+        )];
+        let items = agent_items_across(
+            &[
+                AgentSource::local(&local, HostId::LOCAL),
+                AgentSource {
+                    projects: &remote,
+                    host: HostId::new(3),
+                    label: Some("pop-os"),
+                },
+            ],
+            NOW,
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent:h3.1", "agent:1", "agent:h3.2"],
+            "waiting first, then the tie broken by source order"
+        );
+    }
+
+    #[test]
+    fn cwds_span_every_source_and_stay_host_keyed() {
+        let local = [project(
+            1,
+            "roost",
+            vec![owned(tab(1, "a"), "claude", AgentLifecycle::Working, NOW)],
+        )];
+        let remote = [project(
+            1,
+            "blogd",
+            vec![owned(tab(1, "b"), "claude", AgentLifecycle::Working, NOW)],
+        )];
+        let cwds = agent_tab_cwds_across(&[
+            AgentSource::local(&local, HostId::LOCAL),
+            AgentSource {
+                projects: &remote,
+                host: HostId::new(3),
+                label: Some("pop-os"),
+            },
+        ]);
+        assert_eq!(cwds.len(), 2);
+        assert!(cwds.contains_key(&TabKey::local(1)));
+        assert!(cwds.contains_key(&TabKey::new(HostId::new(3), 1)));
     }
 
     // ----- status text ----------------------------------------------

@@ -368,6 +368,11 @@ impl App {
         // covers open, close, rename, reorder and select by construction.
         self.sync_window_menu();
         self.refresh_notification_palette();
+        // Host sections before the agent surfaces: both read the cached
+        // mirror copies, and before the selection check, which decides
+        // whether the window is still showing a row that exists.
+        self.refresh_host_views();
+        self.reconcile_host_selection();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
         // The workspace is one backend's id-space, so its ids qualify at
@@ -676,7 +681,16 @@ impl App {
             let tab = project.tabs.iter().find(|tab| tab.id == key.tab)?;
             Some((project, tab))
         })?;
-        Some((ProjectKey::new(key.host, project.id), tab.title.clone()))
+        // Composed exactly as a local tab's row is (`notification_title`):
+        // the inbox is one list across every host, so a host row that
+        // said only its bare title would read as a different kind of row.
+        Some((
+            ProjectKey::new(key.host, project.id),
+            notification_inbox::compose_title(
+                &project.name,
+                &notification_inbox::tab_title(&tab.title, &tab.cwd),
+            ),
+        ))
     }
 
     /// Resolve a wire-form tab reference against the UI's keyed map: a
@@ -910,6 +924,12 @@ impl App {
                             }
                         }
                     }
+                    // The mirror moving leaves the view's copy of it
+                    // behind — the tail reconcile is what rebuilds the
+                    // host sections, their agent rows and the palette.
+                    // `try_next` already marked the batch for it (a host
+                    // mirror is workspace state), so a request later in
+                    // this same batch reconciles before it reads.
                     self.hosts.apply_workspace(host, event);
                 }
                 EngineFeed::HostTab(key, frame) => {
@@ -930,16 +950,31 @@ impl App {
                         }
                         tracing::debug!(%host, "host connection state changed");
                     }
+                    // The band's dot and rollup are cached with the rows;
+                    // a state change moves both, and `try_next` marked
+                    // the batch for the reconcile that rebuilds them.
                 }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
                     if !tab.is_local() {
-                        // A host tab's jump: attach it. The sidebar
-                        // selection follows once C6 renders host
-                        // sections; until then the attach itself is the
-                        // whole of the jump.
-                        self.host_focus_tab(tab);
+                        // A host tab's jump: select it and attach, the
+                        // same pair its sidebar row does. A tab whose
+                        // host has since dropped selects nothing — the
+                        // banner outlived what it named.
+                        match self.focus_host_tab_and_clear(tab, true) {
+                            Ok(()) => {
+                                batch.mark_reconciled();
+                                if let Some(window) = self.window_id {
+                                    task = task.then(UiTask::Focus(window));
+                                }
+                            }
+                            Err(error) => tracing::debug!(
+                                %tab,
+                                %error,
+                                "notification click named a host tab that is gone"
+                            ),
+                        }
                     } else if let Some(raise) =
                         notification_activation(&self.workspace, self.window_id, tab)
                     {
@@ -1046,6 +1081,14 @@ impl App {
                 self.notification_inbox.remove(tab);
                 self.desktop_notifications.retire(tab);
             }
+            // The local workspace asserted its selection, so the host
+            // override is over. Reconcile's `local_active` watch catches
+            // the cases where the id moved; this catches the one where it
+            // did not — an IPC `tab.focus` of the tab that is already
+            // active is still a focus intent, and it must win the window
+            // back from the host row (`Workspace::focus_tab` emits this
+            // unconditionally, which is what makes it a reliable seam).
+            WorkspaceEvent::ActiveChanged { .. } => self.set_host_selection(None),
             WorkspaceEvent::ProjectDeleted { project_id } => {
                 let project = ProjectKey::new(self.backend.host(), project_id);
                 let stale: Vec<TabKey> = self
@@ -1077,16 +1120,12 @@ impl App {
             let project_name = project.name;
             project.tabs.into_iter().find_map(|tab| {
                 (tab.id == tab_id).then(|| {
-                    let tab_title = if !tab.title.is_empty() {
-                        tab.title
-                    } else if !tab.cwd.is_empty() {
-                        tab.cwd
-                    } else {
-                        "Tab".to_string()
-                    };
                     (
                         project_key,
-                        notification_inbox::compose_title(&project_name, &tab_title),
+                        notification_inbox::compose_title(
+                            &project_name,
+                            &notification_inbox::tab_title(&tab.title, &tab.cwd),
+                        ),
                     )
                 })
             })
@@ -1104,17 +1143,13 @@ impl App {
                     .iter()
                     .filter(|tab| tab.has_notification)
                     .map(move |tab| {
-                        let tab_title = if !tab.title.is_empty() {
-                            tab.title.clone()
-                        } else if !tab.cwd.is_empty() {
-                            tab.cwd.clone()
-                        } else {
-                            "Tab".to_string()
-                        };
                         (
                             TabKey::new(host, tab.id),
                             ProjectKey::new(host, project.id),
-                            notification_inbox::compose_title(&project.name, &tab_title),
+                            notification_inbox::compose_title(
+                                &project.name,
+                                &notification_inbox::tab_title(&tab.title, &tab.cwd),
+                            ),
                         )
                     })
             })
@@ -1351,10 +1386,52 @@ impl App {
         crate::macos::menu::sync_gating(gating, mtm);
     }
 
+    /// Rebuild the sidebar's host sections from the connection set.
+    ///
+    /// Every saved host gets a section whether or not it is connected —
+    /// a disconnected one lists the rows its last mirror published, and
+    /// one that has never connected lists none. With no saved hosts this
+    /// clears to empty and the sidebar keeps exactly today's chrome.
+    pub(super) fn refresh_host_views(&mut self) {
+        self.host_views = self
+            .workspace
+            .hosts()
+            .into_iter()
+            .map(|host| {
+                let (state, incarnation, mirror) = match self.hosts.section(&host.id) {
+                    Some(section) => (
+                        section.state.section_state(),
+                        section.incarnation,
+                        section.mirror.map(|mirror| mirror.read()),
+                    ),
+                    // Not being driven at all reads as disconnected: the
+                    // section is listed with a ↻, which is the whole of
+                    // the "no daemon is spawned silently" rule on screen.
+                    None => (host_sidebar::SectionState::Disconnected, None, None),
+                };
+                super::HostView {
+                    saved_id: host.id,
+                    // The registry's label wins over the connection's:
+                    // they are the same string, and the registry is the
+                    // one that exists before a connection does.
+                    label: host.label,
+                    host: incarnation.unwrap_or(HostId::LOCAL),
+                    state,
+                    projects: mirror
+                        .as_ref()
+                        .map(|mirror| mirror.projects.clone())
+                        .unwrap_or_default(),
+                    active_tab_id: mirror.as_ref().map_or(0, |mirror| mirror.active_tab_id),
+                    agents: 0,
+                }
+            })
+            .collect();
+    }
+
     fn refresh_sidebar_agents(&mut self) {
         let host = self.backend.host();
         let now = agent_palette::now_unix();
-        self.sidebar_agents = self
+        let mut rows: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>> = self
             .projects
             .iter()
             .map(|project| {
@@ -1364,6 +1441,36 @@ impl App {
                 )
             })
             .collect();
+        // Host sections carry the same rows under the same keys — the
+        // ⌘⇧A toggle and the row widget are host-blind by construction
+        // (plan 037 §3.1). A disconnected host's rows are still built:
+        // they render dimmed rather than disappearing, and the count they
+        // feed is what its band would say if the state left the rollup
+        // slot free.
+        for view in &mut self.host_views {
+            let mut agents = 0;
+            for project in &view.projects {
+                let project_rows = agent_palette::sidebar_agents(project, view.host, now);
+                agents += project_rows.len();
+                rows.insert(ProjectKey::new(view.host, project.id), project_rows);
+            }
+            view.agents = agents;
+        }
+        self.sidebar_agents = rows;
+        // Last, because the rollups read the counts filled just above.
+        self.host_sections = host_sidebar::sections(
+            &self
+                .host_views
+                .iter()
+                .map(|view| host_sidebar::HostInput {
+                    saved_id: view.saved_id.as_str(),
+                    label: view.label.as_str(),
+                    host: view.host,
+                    state: view.state,
+                    agents: view.agents,
+                })
+                .collect::<Vec<_>>(),
+        );
     }
 
     fn sidebar_dump(&self) -> SidebarDumpResult {

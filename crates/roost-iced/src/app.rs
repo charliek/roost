@@ -41,9 +41,9 @@ use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
-    custom_command,
+    custom_command, host_sidebar,
     keybind::{self, Accel, AccelMods, KeybindAction},
-    keys::{ProjectKey, TabKey},
+    keys::{HostId, ProjectKey, TabKey},
     notification_inbox, palette, provider,
     rollup::project_rollup,
     window_title,
@@ -609,6 +609,32 @@ fn focus_tab_in_core(workspace: &Workspace, tab: TabKey) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// See [`App::terminal_event_key`]. Split out so the "a host terminal is
+/// showing, so a bare id is that host's" rule can be checked without an
+/// `App` (which needs a bundle profile, the instance lock and the Iced
+/// runtime to build).
+fn terminal_event_key(active: TabKey, local_host: HostId, tab_id: i64) -> TabKey {
+    if active.tab == tab_id {
+        active
+    } else {
+        TabKey::new(local_host, tab_id)
+    }
+}
+
+/// The host tab whose attach a selection move releases, if any. See
+/// [`App::set_host_selection`] — this is the decision half, split out to
+/// be checkable without an `App`.
+fn host_selection_detach(
+    previous: Option<HostSelection>,
+    next: Option<HostSelection>,
+) -> Option<TabKey> {
+    let previous = previous?;
+    if next.is_some_and(|selection| selection.tab == previous.tab) {
+        return None;
+    }
+    Some(previous.tab)
+}
+
 fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> {
     if len == 0 || current >= len {
         return None;
@@ -616,25 +642,30 @@ fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> 
     Some((current as isize + delta).clamp(0, len as isize - 1) as usize)
 }
 
-fn project_id_at_index(projects: &[Project], index: u8) -> Option<i64> {
-    index
-        .checked_sub(1)
-        .and_then(|index| projects.get(usize::from(index)))
-        .map(|project| project.id)
-}
-
-fn active_project_tab_at_index(projects: &[Project], project_id: i64, index: u8) -> Option<i64> {
-    index.checked_sub(1).and_then(|index| {
-        projects
-            .iter()
-            .find(|project| project.id == project_id)
-            .and_then(|project| project.tabs.get(usize::from(index)))
-            .map(|tab| tab.id)
-    })
-}
-
 fn dispatch_keybind_once_unless_repeat<T>(repeat: bool, dispatch: impl FnOnce() -> T) -> Option<T> {
     (!repeat).then(dispatch)
+}
+
+/// The sidebar's band strip. The "PROJECTS" header and every host band
+/// are the same chrome, so the height and insets live in one place —
+/// that parity is the whole reason a host section reads as a band and
+/// not as a second visual language.
+fn sidebar_band<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .center_y(chrome::BAND_HEIGHT)
+        .width(Fill)
+        .padding([0, 12])
+        .style(chrome::band)
+        .into()
+}
+
+/// A band's label, in the one weight and size every band uses.
+fn sidebar_band_label(label: &str) -> Element<'_, Message> {
+    text(label)
+        .size(11)
+        .color(chrome::MUTED_TEXT)
+        .font(chrome::chrome_font(font::Weight::Semibold))
+        .into()
 }
 
 fn accel_label(accel: &Accel) -> Option<String> {
@@ -1275,6 +1306,35 @@ pub struct App {
     /// the connection incarnation, so a reconnect naturally orphans the
     /// stale entries and the purge drops them.
     host_resume: HashMap<TabKey, host_tab::ResumePoint>,
+    /// Which host row the window is showing, when it is showing one.
+    ///
+    /// The app's notion of "the active tab" is `workspace.active()`, and
+    /// the local workspace has no opinion about a host's tabs — so a host
+    /// selection is an override laid over it: [`Self::active_tab_key`]
+    /// and [`Self::active_project_key`] answer from here while it is set,
+    /// and focusing any local tab clears it (`focus_tab_and_clear`).
+    /// Every surface that asks "what is focused?" already goes through
+    /// those two joints, so nothing else has to know.
+    ///
+    /// Invalidated by [`Self::reconcile_host_selection`]: a tab that
+    /// closed, a host that dropped, or an incarnation that was replaced
+    /// all fall back to the local workspace's own selection. C7's
+    /// creation routing reads the same field to answer "which host does
+    /// ⌘N create on?".
+    host_selection: Option<HostSelection>,
+    /// One entry per saved host, in registry order — the sidebar's host
+    /// sections, refreshed by `reconcile`. **Empty with no saved hosts**,
+    /// and every host-aware branch in the view is gated on that, which is
+    /// what keeps the zero-host sidebar byte-identical to today's.
+    host_views: Vec<HostView>,
+    /// The bands drawn above those rows — LOCAL first, then one per
+    /// entry of `host_views`, so `host_sections[1..]` pairs off with it
+    /// positionally. Cached for the same reason `host_views` is: the
+    /// labels and rollups are `String`s the widget tree borrows, and
+    /// rebuilding them per frame would allocate on every PTY burst.
+    /// Rebuilt at the tail of `refresh_sidebar_agents`, which is where
+    /// the per-host agent counts the rollups read get filled in.
+    host_sections: Vec<host_sidebar::Section>,
     /// A clone of `runtime`'s handle, so a mutation can be spawned onto
     /// the engine runtime from a `&self` method and awaited by an Iced
     /// task. Cheap and `Send`; dropping one is inert, so it takes no part
@@ -1292,6 +1352,51 @@ pub struct App {
     feed_tx: EngineFeedSender,
     runtime: tokio::runtime::Runtime,
     _locks: InstanceLocks,
+}
+
+/// One saved host as the view reads it, cached at reconcile exactly the
+/// way [`App::projects`] caches the local workspace's snapshot.
+///
+/// The cache is not an optimization — it is a lifetime requirement. The
+/// live mirror is behind a mutex, and a widget tree borrows the strings
+/// it renders, so the view cannot both hold the guard and hand its
+/// contents back to iced. Reconcile takes the copy; the view borrows it.
+struct HostView {
+    /// `HostSnapshot.id`, which is what a reconnect verb is addressed to.
+    saved_id: String,
+    label: String,
+    /// The incarnation these rows are keyed at. `HostId::LOCAL` stands
+    /// for "no connection has ever published rows for this host" — the
+    /// section is then header-only, and `projects` is empty, so the
+    /// placeholder can never collide with a real local key.
+    host: HostId,
+    state: host_sidebar::SectionState,
+    /// The last rows this host's connection published. Kept across a
+    /// drop: those shells are still running over there, so the section
+    /// lists them dimmed rather than pretending they are gone.
+    projects: Vec<Project>,
+    active_tab_id: i64,
+    /// How many agent rows this host contributes, for the band's rollup.
+    agents: usize,
+}
+
+/// The host row the window is showing (plan 037 §3.1). Both halves are
+/// carried because the tab bar renders the project's tabs and the
+/// terminal renders the tab — the local path reads the same pair out of
+/// `workspace.active()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostSelection {
+    project: ProjectKey,
+    tab: TabKey,
+    /// The local workspace's active tab when this selection was made.
+    ///
+    /// The override has to yield to anything that focuses a local tab,
+    /// and not every such route goes through `focus_tab_and_clear` — an
+    /// IPC `tab.focus`, a notification banner, a close that refocuses
+    /// elsewhere all mutate the workspace and reach the UI as a
+    /// reconcile. Watching the value those routes move is what covers
+    /// them all at once, rather than a clear at each call site.
+    local_active: i64,
 }
 
 impl App {
@@ -1462,6 +1567,9 @@ impl App {
             ),
             host_attach: HashMap::new(),
             host_resume: HashMap::new(),
+            host_selection: None,
+            host_views: Vec::new(),
+            host_sections: Vec::new(),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
@@ -1494,27 +1602,38 @@ impl App {
             return;
         }
         for host in self.workspace.hosts() {
-            let (socket, localhost) = match crate::host_conn::resolve_target(&host.target) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    tracing::warn!(host = %host.id, ?error, "cannot resolve a saved host's target");
-                    continue;
-                }
-            };
-            if !localhost {
-                continue;
-            }
-            self.hosts.connect(
-                &host.id,
-                &host.label,
-                socket,
-                localhost,
-                crate::host_conn::ConnectMode::IfPresent,
-            );
+            self.connect_saved_host(&host, |localhost| {
+                // A remote host is manual-reconnect only, so it is not
+                // even resolved into a connection here.
+                localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
+            });
         }
         if !self.hosts.is_empty() {
             tracing::info!("probing saved host sessions");
         }
+    }
+
+    /// Resolve a saved host's target and hand it to the connection set.
+    /// `mode` answers what to do with a resolved target, and `None`
+    /// declines the connection — which is how the launch probe skips a
+    /// remote host without duplicating the resolve.
+    fn connect_saved_host(
+        &mut self,
+        host: &roost_engine::persistence::HostSnapshot,
+        mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
+    ) {
+        let (socket, localhost) = match crate::host_conn::resolve_target(&host.target) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(host = %host.id, ?error, "cannot resolve a saved host's target");
+                return;
+            }
+        };
+        let Some(mode) = mode(localhost) else {
+            return;
+        };
+        self.hosts
+            .connect(&host.id, &host.label, socket, localhost, mode);
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
@@ -1832,13 +1951,20 @@ impl App {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.modifiers = *modifiers;
             let held = self.link_modifier_held();
-            let tab_id = self.workspace.active().1;
-            if let Some(tab) = self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
+            // The terminal on screen: the link underline follows the
+            // cursor over the visible grid, which is the host's while a
+            // host row is selected.
+            let key = self.active_tab_key();
+            if let Some(tab) = self.tabs.get_mut(&key) {
                 if let Err(error) = tab
                     .set_link_modifier_held(held)
                     .and_then(|()| tab.refresh_snapshot())
                 {
-                    tracing::warn!(?error, tab_id, "terminal link hover refresh failed");
+                    tracing::warn!(
+                        ?error,
+                        tab_id = key.tab,
+                        "terminal link hover refresh failed"
+                    );
                 }
             }
         }
@@ -2108,11 +2234,17 @@ impl App {
         match action {
             KeybindAction::NewTab => Ok(self.new_tab_dispatch().task),
             KeybindAction::CloseTab => {
-                let tab_id = self.workspace.active().1;
-                if tab_id == 0 {
+                // The selection, not the local workspace's: with a host
+                // row showing, the tab under the keybind is that host's,
+                // and closing the hidden local one would be a destructive
+                // action on something the user cannot even see.
+                let tab = self.active_tab_key();
+                // The sentinel id 0 is the empty local workspace's; no
+                // host row is ever keyed at it.
+                if tab.tab == 0 {
                     return Ok(UiTask::None);
                 }
-                Ok(self.close_tab_dispatch(self.backend.tab_key(tab_id)).task)
+                Ok(self.close_tab_dispatch(tab).task)
             }
             KeybindAction::NewProject => Ok(self.new_project_dispatch().task),
             KeybindAction::RenameProject => {
@@ -2196,13 +2328,34 @@ impl App {
     /// [`Self::active_tab_key`] are the joints that qualify it at the
     /// backend that owns it.
     fn active_project_key(&self) -> ProjectKey {
-        ProjectKey::new(self.backend.host(), self.workspace.active().0)
+        match self.host_selection {
+            Some(selection) => selection.project,
+            None => ProjectKey::new(self.backend.host(), self.workspace.active().0),
+        }
     }
 
     /// [`Self::active_project_key`]'s twin: the one place the workspace's
     /// bare active tab id becomes a key.
     fn active_tab_key(&self) -> TabKey {
-        self.backend.tab_key(self.workspace.active().1)
+        match self.host_selection {
+            Some(selection) => selection.tab,
+            None => self.backend.tab_key(self.workspace.active().1),
+        }
+    }
+
+    /// The key an event off the terminal widget names. The widget renders
+    /// the selected tab and stamps its bare id onto every pointer, wheel
+    /// and hover event, so an id that still matches the selection belongs
+    /// to whatever host that selection is on — qualifying it at the local
+    /// backend would land the gesture on whichever LOCAL tab happens to
+    /// share the number while a host terminal is showing. An id that no
+    /// longer matches is a straggler from a previous frame and keeps
+    /// resolving exactly as it did before, at the local backend.
+    ///
+    /// With no host selection both branches are the same key, which is
+    /// what keeps the zero-host path byte-identical.
+    pub(super) fn terminal_event_key(&self, tab_id: i64) -> TabKey {
+        terminal_event_key(self.active_tab_key(), self.backend.host(), tab_id)
     }
 
     fn keyboard_route(&self) -> KeyboardRoute {
@@ -2310,12 +2463,249 @@ impl App {
         result
     }
 
+    /// One sidebar project row plus its agent rows — the same widgets
+    /// under every host, which is plan 037 §3.1's "project rows render
+    /// identically" made literal: there is one builder, and the section
+    /// header above a row is the only thing that says where it runs.
+    ///
+    /// `dim` is the disconnected-section treatment. Colors drop to
+    /// [`chrome::HOST_SECTION_DIM`] and no row publishes a message, so a
+    /// click and a keyboard traversal both pass the section by — those
+    /// shells are still running on the host, but nothing here can act on
+    /// them until the connection is back. With `dim` false this is the
+    /// local sidebar's path, widget for widget.
+    fn sidebar_project_group<'a>(
+        &'a self,
+        project: &'a Project,
+        project_key: ProjectKey,
+        dragged_project: Option<i64>,
+        dim: bool,
+    ) -> Element<'a, Message> {
+        let active = project_key == self.active_project_key();
+        let active_key = self.active_tab_key();
+        let hide_agent_rows = agent_rows_hidden(self.project_drag_preview.as_ref());
+        let alpha = if dim { chrome::HOST_SECTION_DIM } else { 1.0 };
+        let rollup = project_rollup(
+            project
+                .tabs
+                .iter()
+                .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
+        );
+        let notifying = project.tabs.iter().any(|tab| tab.has_notification);
+        let stripe = container(
+            iced::widget::Space::new()
+                .width(chrome::PROJECT_STRIPE_WIDTH)
+                .height(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_STRIPE_INSET_Y),
+        )
+        .style(move |_| {
+            let color = if rollup == roost_ipc::agent::AgentLifecycle::Inactive {
+                Color::TRANSPARENT
+            } else {
+                agent_color(rollup).scale_alpha(alpha)
+            };
+            iced::widget::container::Style::default()
+                .background(color)
+                .border(iced::border::rounded(2))
+        });
+        let project_label: Element<'a, Message> = match self.rename_editor.as_ref() {
+            Some(editor) if editor.target == RenameTarget::Project(project_key) => {
+                text_input("Project name", &editor.draft)
+                    .id(self.rename_input_id.clone())
+                    .on_input(Message::RenameDraftChanged)
+                    .on_submit(Message::RenameSubmit)
+                    .size(13)
+                    // Absolute line height so the editor's total height is
+                    // integral: the default relative line height makes it
+                    // ~18.9px, and centering that inside the pill puts the
+                    // 1px focus border on half-pixels — tiny-skia at scale 1
+                    // then blends the border away (fuzzy on screen, and the
+                    // real-input harness counts exact border pixels).
+                    .line_height(iced::widget::text::LineHeight::Absolute(18.0.into()))
+                    .padding([1, 3])
+                    .style(chrome::inline_rename_input)
+                    .into()
+            }
+            // Label leading, notification-dot slot trailing: the spacer
+            // holds that slot open against the pill's trailing inset
+            // (`PROJECT_DOT_INSET`, matched by the pill container's own
+            // right padding — chrome::badge lands 8px from the pill's
+            // right edge for free). The rename editor keeps the whole
+            // pill instead — a fill spacer beside it would halve the
+            // field, and no dot renders beside the editor.
+            _ => {
+                let label_color = if active {
+                    chrome::PROJECT_LABEL_ACTIVE
+                } else {
+                    chrome::PROJECT_LABEL_INACTIVE
+                }
+                .scale_alpha(alpha);
+                let mut label_row = row![
+                    text(&project.name).size(13).color(label_color),
+                    iced::widget::Space::new().width(Fill)
+                ]
+                .align_y(Alignment::Center);
+                if notifying {
+                    label_row = label_row.push(
+                        container(
+                            iced::widget::Space::new()
+                                .width(chrome::NOTIFICATION_DOT_SIZE)
+                                .height(chrome::NOTIFICATION_DOT_SIZE),
+                        )
+                        .style(chrome::badge),
+                    );
+                }
+                label_row.width(Fill).into()
+            }
+        };
+        let project_pill = container(project_label)
+            .width(Fill)
+            .center_y(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_PILL_INSET_Y)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: chrome::PROJECT_DOT_INSET,
+                bottom: 0.0,
+                left: chrome::PROJECT_LABEL_INSET,
+            })
+            .style(chrome::project_pill(
+                active,
+                dragged_project == Some(project.id),
+            ));
+        // The rail sits at the row's leading edge, inside the pill's own
+        // 6px inset — the two never overlap, so a plain row places both
+        // without a stack layer between the strip and its rows.
+        let project_row = container(
+            row![
+                stripe,
+                iced::widget::Space::new()
+                    .width(chrome::PROJECT_PILL_INSET_X - chrome::PROJECT_STRIPE_WIDTH),
+                project_pill,
+                iced::widget::Space::new().width(chrome::PROJECT_PILL_INSET_X)
+            ]
+            .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .height(chrome::ROW_HEIGHT);
+        // Local rows take their click from the reorder strip that wraps
+        // them (it owns press, drag and double-click as one gesture). A
+        // host section sits outside that strip — reordering a host's
+        // projects is a workspace mutation, which routes through the op
+        // queue rather than the local client — so its rows carry their
+        // own press, and a dimmed one carries none.
+        let project_row: Element<'a, Message> = if project_key.is_local() || dim {
+            project_row.into()
+        } else {
+            mouse_area(project_row)
+                .on_press(Message::ProjectSelected(project_key))
+                .into()
+        };
+        let mut project_group = column![project_row].spacing(2);
+        if self.config.show_sidebar_agents && !hide_agent_rows {
+            for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
+                let name = agent.name.clone();
+                let detail = format!("{} · {}", agent.status_text, agent.time_text);
+                let dot_color = agent_color(agent.lifecycle).scale_alpha(alpha);
+                let dot =
+                    container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
+                        iced::widget::container::Style::default()
+                            .background(dot_color)
+                            .border(iced::border::rounded(3))
+                    });
+                let agent_row = row![
+                    dot,
+                    text(name).size(11),
+                    text(detail)
+                        .size(9)
+                        .color(chrome::MUTED_TEXT.scale_alpha(alpha))
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+                // A dimmed row keeps its `button` so the layout is
+                // identical; without `on_press` iced renders it Disabled,
+                // which is the same reduced-contrast reading the colors
+                // above give the rest of the row.
+                let mut agent_button = button(agent_row)
+                    .width(Fill)
+                    .height(chrome::ROW_HEIGHT)
+                    .padding(iced::Padding {
+                        top: 3.0,
+                        right: 8.0,
+                        bottom: 3.0,
+                        left: chrome::AGENT_DOT_INSET,
+                    })
+                    .style(chrome::agent_button(agent.tab == active_key));
+                if !dim {
+                    agent_button = agent_button.on_press(Message::AgentSelected(agent.tab));
+                }
+                project_group = project_group.push(agent_button);
+            }
+        }
+        project_group.into()
+    }
+
+    /// One host section's band: the dot, the uppercase label, and the
+    /// right-aligned rollup. Same band as the "PROJECTS" header it
+    /// replaces — `chrome::band`, [`chrome::BAND_HEIGHT`], the same 11pt
+    /// semibold [`chrome::MUTED_TEXT`] label — so the sidebar gains a
+    /// structure without gaining a second visual language.
+    fn host_band<'a>(&'a self, section: &'a host_sidebar::Section) -> Element<'a, Message> {
+        let dot_color = match section.state.dot() {
+            host_sidebar::HostDot::Connected => chrome::HOST_DOT_CONNECTED,
+            host_sidebar::HostDot::Pending => chrome::HOST_DOT_PENDING,
+            host_sidebar::HostDot::Offline => chrome::HOST_DOT_OFFLINE,
+        };
+        let dot = container(
+            iced::widget::Space::new()
+                .width(chrome::HOST_DOT_SIZE)
+                .height(chrome::HOST_DOT_SIZE),
+        )
+        .style(move |_| {
+            iced::widget::container::Style::default()
+                .background(dot_color)
+                .border(iced::border::rounded(chrome::HOST_DOT_SIZE / 2.0))
+        });
+        let mut band = row![
+            dot,
+            sidebar_band_label(&section.label),
+            iced::widget::Space::new().width(Fill)
+        ]
+        .spacing(chrome::HOST_BAND_SPACING)
+        .align_y(Alignment::Center);
+        if let Some(rollup) = &section.rollup {
+            band = band.push(
+                text(rollup.as_str())
+                    .size(chrome::HOST_ROLLUP_SIZE)
+                    .color(chrome::HOST_ROLLUP_TEXT),
+            );
+        }
+        sidebar_band(band)
+    }
+
+    /// The inline "↻ Reconnect" row under a section that is not
+    /// connected — the only affordance a dimmed section offers. The same
+    /// verb lives in the palette (C7).
+    fn host_reconnect_row(&self, saved_id: &str) -> Element<'_, Message> {
+        button(
+            text("↻ Reconnect")
+                .size(12)
+                .color(chrome::HOST_RECONNECT_TEXT),
+        )
+        .width(Fill)
+        .padding([6, 12])
+        .style(chrome::transparent_button)
+        .on_press(Message::HostReconnect(saved_id.to_string()))
+        .into()
+    }
+
     fn view_body(&self) -> Element<'_, Message> {
-        let (active_project, active_tab) = self.workspace.active();
         // `self.projects` is this backend's snapshot, so every id read out
         // of it below qualifies at this backend's instance.
         let host = self.backend.host();
-        let active_key = TabKey::new(host, active_tab);
+        // The selection, which is the local workspace's unless a host row
+        // is showing (`host_selection`). With no saved hosts these are
+        // exactly `workspace.active()`, qualified at this backend.
+        let active_project_key = self.active_project_key();
+        let active_key = self.active_tab_key();
+        let active_project = active_project_key.project;
         let authoritative_project_ids = self.sidebar_project_ids();
         let visual_project_ids = self
             .project_drag_preview
@@ -2334,7 +2724,6 @@ impl App {
             .as_ref()
             .filter(|preview| preview.dragging)
             .map(|preview| preview.context.source_id);
-        let hide_agent_rows = agent_rows_hidden(self.project_drag_preview.as_ref());
         let mut sidebar_body = column![].spacing(2).padding([4, 0]);
         for project in visual_project_ids.iter().filter_map(|project_id| {
             self.projects
@@ -2342,152 +2731,14 @@ impl App {
                 .find(|project| project.id == *project_id)
         }) {
             let project_key = ProjectKey::new(host, project.id);
-            let rollup = project_rollup(
-                project
-                    .tabs
-                    .iter()
-                    .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
-            );
-            let notifying = project.tabs.iter().any(|tab| tab.has_notification);
-            let active = project.id == active_project;
-            let stripe = container(
-                iced::widget::Space::new()
-                    .width(chrome::PROJECT_STRIPE_WIDTH)
-                    .height(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_STRIPE_INSET_Y),
-            )
-            .style(move |_| {
-                let color = if rollup == roost_ipc::agent::AgentLifecycle::Inactive {
-                    Color::TRANSPARENT
-                } else {
-                    agent_color(rollup)
-                };
-                iced::widget::container::Style::default()
-                    .background(color)
-                    .border(iced::border::rounded(2))
-            });
-            let project_label: Element<'_, Message> = match self.rename_editor.as_ref() {
-                Some(editor) if editor.target == RenameTarget::Project(project_key) => {
-                    text_input("Project name", &editor.draft)
-                        .id(self.rename_input_id.clone())
-                        .on_input(Message::RenameDraftChanged)
-                        .on_submit(Message::RenameSubmit)
-                        .size(13)
-                        // Absolute line height so the editor's total height is
-                        // integral: the default relative line height makes it
-                        // ~18.9px, and centering that inside the pill puts the
-                        // 1px focus border on half-pixels — tiny-skia at scale 1
-                        // then blends the border away (fuzzy on screen, and the
-                        // real-input harness counts exact border pixels).
-                        .line_height(iced::widget::text::LineHeight::Absolute(18.0.into()))
-                        .padding([1, 3])
-                        .style(chrome::inline_rename_input)
-                        .into()
-                }
-                // Label leading, notification-dot slot trailing: the spacer
-                // holds that slot open against the pill's trailing inset
-                // (`PROJECT_DOT_INSET`, matched by the pill container's own
-                // right padding — chrome::badge lands 8px from the pill's
-                // right edge for free). The rename editor keeps the whole
-                // pill instead — a fill spacer beside it would halve the
-                // field, and no dot renders beside the editor.
-                _ => {
-                    let label_color = if active {
-                        chrome::PROJECT_LABEL_ACTIVE
-                    } else {
-                        chrome::PROJECT_LABEL_INACTIVE
-                    };
-                    let mut label_row = row![
-                        text(&project.name).size(13).color(label_color),
-                        iced::widget::Space::new().width(Fill)
-                    ]
-                    .align_y(Alignment::Center);
-                    if notifying {
-                        label_row = label_row.push(
-                            container(
-                                iced::widget::Space::new()
-                                    .width(chrome::NOTIFICATION_DOT_SIZE)
-                                    .height(chrome::NOTIFICATION_DOT_SIZE),
-                            )
-                            .style(chrome::badge),
-                        );
-                    }
-                    label_row.width(Fill).into()
-                }
-            };
-            let project_pill = container(project_label)
-                .width(Fill)
-                .center_y(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_PILL_INSET_Y)
-                .padding(iced::Padding {
-                    top: 0.0,
-                    right: chrome::PROJECT_DOT_INSET,
-                    bottom: 0.0,
-                    left: chrome::PROJECT_LABEL_INSET,
-                })
-                .style(chrome::project_pill(
-                    active,
-                    dragged_project == Some(project.id),
-                ));
-            // The rail sits at the row's leading edge, inside the pill's own
-            // 6px inset — the two never overlap, so a plain row places both
-            // without a stack layer between the strip and its rows.
-            let project_row = container(
-                row![
-                    stripe,
-                    iced::widget::Space::new()
-                        .width(chrome::PROJECT_PILL_INSET_X - chrome::PROJECT_STRIPE_WIDTH),
-                    project_pill,
-                    iced::widget::Space::new().width(chrome::PROJECT_PILL_INSET_X)
-                ]
-                .align_y(Alignment::Center),
-            )
-            .width(Fill)
-            .height(chrome::ROW_HEIGHT);
-            let mut project_group = column![project_row].spacing(2);
-            if self.config.show_sidebar_agents && !hide_agent_rows {
-                for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
-                    let name = agent.name.clone();
-                    let detail = format!("{} · {}", agent.status_text, agent.time_text);
-                    let dot_color = agent_color(agent.lifecycle);
-                    let dot =
-                        container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
-                            iced::widget::container::Style::default()
-                                .background(dot_color)
-                                .border(iced::border::rounded(3))
-                        });
-                    let agent_row = row![
-                        dot,
-                        text(name).size(11),
-                        text(detail).size(9).color(chrome::MUTED_TEXT)
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center);
-                    project_group = project_group.push(
-                        button(agent_row)
-                            .width(Fill)
-                            .height(chrome::ROW_HEIGHT)
-                            .padding(iced::Padding {
-                                top: 3.0,
-                                right: 8.0,
-                                bottom: 3.0,
-                                left: chrome::AGENT_DOT_INSET,
-                            })
-                            .style(chrome::agent_button(agent.tab == active_key))
-                            .on_press(Message::AgentSelected(agent.tab)),
-                    );
-                }
-            }
-            sidebar_body = sidebar_body.push(project_group);
+            sidebar_body = sidebar_body.push(self.sidebar_project_group(
+                project,
+                project_key,
+                dragged_project,
+                false,
+            ));
         }
-        let sidebar_header = container(
-            text("PROJECTS")
-                .size(11)
-                .color(chrome::MUTED_TEXT)
-                .font(chrome::chrome_font(font::Weight::Semibold)),
-        )
-        .center_y(chrome::BAND_HEIGHT)
-        .width(Fill)
-        .padding([0, 12])
-        .style(chrome::band);
+        let sidebar_header = || sidebar_band(sidebar_band_label("PROJECTS"));
         let sidebar_footer = container(
             button(text("+ New Project").size(13))
                 .height(chrome::PILL_HEIGHT)
@@ -2515,27 +2766,71 @@ impl App {
             self.project_strip_generation,
             self.strip_gestures_enabled(),
         );
+        // The two sidebars (plan 037 §3.1). With no saved hosts this is
+        // exactly today's — one sticky "PROJECTS" band over the strip.
+        // With hosts the band becomes one per host and moves *into* the
+        // scroll flow, because a section header only means anything
+        // sitting directly above the rows it names.
+        let sections = &self.host_sections;
+        let (sidebar_header, sidebar_list): (Option<Element<'_, Message>>, Element<'_, Message>) =
+            if sections.is_empty() {
+                (
+                    Some(sidebar_header()),
+                    scrollable(project_strip).height(Fill).into(),
+                )
+            } else {
+                let mut list = column![self.host_band(&sections[0]), project_strip];
+                for (section, view) in sections[1..].iter().zip(&self.host_views) {
+                    list = list.push(self.host_band(section));
+                    let dim = !section.state.interactive();
+                    let mut rows = column![].spacing(2).padding([4, 0]);
+                    for project in &view.projects {
+                        let project_key = ProjectKey::new(view.host, project.id);
+                        rows =
+                            rows.push(self.sidebar_project_group(project, project_key, None, dim));
+                    }
+                    list = list.push(rows);
+                    if section.state.offers_reconnect() {
+                        list = list.push(self.host_reconnect_row(&view.saved_id));
+                    }
+                }
+                (None, scrollable(list).height(Fill).into())
+            };
+        let sidebar_list = container(sidebar_list)
+            .width(Fill)
+            .height(Fill)
+            .style(chrome::list);
+        let mut sidebar_column = column![];
+        if let Some(header) = sidebar_header {
+            sidebar_column = sidebar_column.push(header);
+        }
         // The hairline lives inside the sidebar's own width — the outer
         // container paints it and pads the three region fills off it — so the
         // terminal grid keeps every pixel `sidebar_width` leaves it and the
         // resize grip's seam still lands on the sidebar's right edge.
-        let sidebar = container(column![
-            sidebar_header,
-            container(scrollable(project_strip).height(Fill))
-                .width(Fill)
-                .height(Fill)
-                .style(chrome::list),
-            sidebar_footer
-        ])
-        .width(self.live_sidebar_width())
-        .height(Fill)
-        .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
-        .style(chrome::divider);
+        let sidebar = container(sidebar_column.push(sidebar_list).push(sidebar_footer))
+            .width(self.live_sidebar_width())
+            .height(Fill)
+            .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
+            .style(chrome::divider);
 
-        let active_project_model = self
-            .projects
-            .iter()
-            .find(|project| project.id == active_project);
+        // The tab bar renders the selected project's tabs, whichever host
+        // it lives on — the pills themselves are host-blind, so only the
+        // list they come from changes.
+        let active_project_model = if active_project_key.is_local() {
+            self.projects
+                .iter()
+                .find(|project| project.id == active_project)
+        } else {
+            self.host_views
+                .iter()
+                .find(|view| view.host == active_project_key.host)
+                .and_then(|view| {
+                    view.projects
+                        .iter()
+                        .find(|project| project.id == active_project)
+                })
+        };
         let authoritative_tab_ids = active_project_model
             .map(|project| project.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -2563,9 +2858,9 @@ impl App {
         // frame on every ordinary click. Same rule the sidebar rows use.
         let mut tab_pills = row![].spacing(6);
         for tab in active_project_tabs {
-            let tab_key = TabKey::new(host, tab.id);
+            let tab_key = TabKey::new(active_project_key.host, tab.id);
             let title = pill_display_title(&tab.title);
-            let active = tab.id == active_tab;
+            let active = tab_key == active_key;
             let editing = self
                 .rename_editor
                 .as_ref()
@@ -2684,27 +2979,37 @@ impl App {
                         .on_press(Message::CloseTab(tab_key)),
                 );
             }
-            tab_pills = tab_pills.push(
-                container(pill)
-                    .id(tab_pill_id(tab_key))
-                    .width(pill_width)
-                    .height(chrome::PILL_HEIGHT)
-                    .padding([0.0, chrome::TAB_PILL_PADDING_X])
-                    .style(chrome::tab_pill(
-                        active,
-                        self.tab_drag_preview
-                            .as_ref()
-                            .is_some_and(|preview| preview.drags(tab.id)),
-                    )),
-            );
+            let pill_container = container(pill)
+                .id(tab_pill_id(tab_key))
+                .width(pill_width)
+                .height(chrome::PILL_HEIGHT)
+                .padding([0.0, chrome::TAB_PILL_PADDING_X])
+                .style(chrome::tab_pill(
+                    active,
+                    self.tab_drag_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.drags(tab.id)),
+                ));
+            // Local pills take their click from the strip below, which
+            // owns press + drag + double-click-to-rename as one gesture.
+            // A host project's strip is disabled (reordering its tabs is
+            // an op-queue mutation, not a local reorder), so its pills
+            // carry the plain press themselves.
+            tab_pills = tab_pills.push(if tab_key.is_local() {
+                Element::from(pill_container)
+            } else {
+                mouse_area(pill_container)
+                    .on_press(Message::TabSelected(tab_key))
+                    .into()
+            });
         }
         let tab_strip = ReorderStrip::tabs(
             tab_pills,
-            host,
+            active_project_key.host,
             active_project,
             visual_tab_ids,
             self.tab_strip_generation,
-            self.strip_gestures_enabled(),
+            self.strip_gestures_enabled() && active_project_key.is_local(),
         );
         let add_tab_button = button(text("+").size(16).color(chrome::MUTED_TEXT))
             .width(chrome::PILL_HEIGHT)
@@ -2740,7 +3045,7 @@ impl App {
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_key) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
-                tab_id: active_tab,
+                tab_id: active_key.tab,
                 snapshot: tab.snapshot.clone(),
                 metrics: tab.applied_metrics.unwrap_or(self.terminal_metrics),
                 metric_generation: tab.metric_generation,
@@ -2981,13 +3286,14 @@ impl App {
         // arms, exactly as the tab strip does in reverse.
         self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
-        let Some(project_id) = project.local_project() else {
-            tracing::debug!(?project, "project selection from another instance");
+        // Focusing the row's preferred tab is what selects the project —
+        // on either side of the ring there is no separate selection to
+        // set, since the sidebar draws off `active_project_key`.
+        let Some(tab) = self.preferred_tab_key(project) else {
+            tracing::debug!(?project, "project selection resolves to no tab");
             return;
         };
-        if let Some(tab_id) = self.workspace.preferred_tab(project_id) {
-            let _ = self.focus_tab_and_clear(self.backend.tab_key(tab_id), false);
-        }
+        let _ = self.focus_tab_and_clear(tab, false);
     }
 
     pub fn select_tab(&mut self, tab: TabKey) {
@@ -3084,6 +3390,15 @@ impl App {
     /// and the completion's reconcile is the whole tail. Nothing here
     /// reads `self.tabs` for the new id, so there is no intent to pend.
     fn new_tab_dispatch(&mut self) -> EngineDispatch {
+        // Creation follows context (plan 037 §3.1), and routing it to the
+        // selected project's host is C7's seam. Until that lands, a host
+        // row being shown means the local project below the override is
+        // not what the user asked to open a tab in — and opening one
+        // there would be invisible behind the host terminal.
+        if !self.active_project_key().is_local() {
+            tracing::debug!("new tab on a host project is not routed yet (plan 037 C7)");
+            return EngineDispatch::default();
+        }
         let (project_id, _) = self.workspace.active();
         if project_id == 0 {
             return EngineDispatch::default();
@@ -3212,8 +3527,7 @@ impl App {
 
     fn close_tab_dispatch(&mut self, tab: TabKey) -> EngineDispatch {
         let Some(tab_id) = tab.local_tab() else {
-            tracing::debug!(?tab, "close requested for a tab on another instance");
-            return EngineDispatch::default();
+            return self.close_host_tab_dispatch(tab);
         };
         let op = self.take_engine_op_id();
         let client = self.client.clone();
@@ -3226,49 +3540,140 @@ impl App {
         }
     }
 
-    fn cycle_tab(&mut self, delta: isize) -> Result<(), String> {
-        let (project_id, active_tab) = self.workspace.active();
-        let projects = self.workspace.snapshot();
-        let tabs = projects
+    /// Close a tab on the host that owns it: the intent goes on that
+    /// host's op queue, and the mirror's `tab.closed` event is what
+    /// retires the row (plan 037 §3.9 — event-confirmed, never
+    /// optimistic, so a refused close leaves the sidebar honest).
+    ///
+    /// Fire-and-forget, hence no engine op id: the local op-id fence
+    /// exists to reconcile a local dispatch against the local broadcast,
+    /// and a host's reply carries no local state to settle.
+    fn close_host_tab_dispatch(&mut self, tab: TabKey) -> EngineDispatch {
+        let intent = crate::host_conn::HostIntent::new(
+            roost_ipc::messages::ops::TAB_CLOSE,
+            serde_json::json!({ "tab_id": tab.tab.to_string() }),
+        );
+        if self.hosts.send_at(tab.host, intent).is_err() {
+            tracing::debug!(%tab, "close requested on a host that is not accepting ops");
+        }
+        EngineDispatch::default()
+    }
+
+    /// The tabs the tab bar is showing, in strip order — the selected
+    /// project's, whichever host it lives on. Tab hotkeys walk exactly
+    /// this, which is what "tab hotkeys walk the visible tab bar
+    /// unchanged" means once a host project can be the selected one.
+    fn visible_tab_keys(&self) -> Vec<TabKey> {
+        let project = self.active_project_key();
+        let Some(project_id) = project.local_project() else {
+            return self
+                .host_project_row(project)
+                .map(|(_, row)| {
+                    row.tabs
+                        .iter()
+                        .map(|tab| TabKey::new(project.host, tab.id))
+                        .collect()
+                })
+                .unwrap_or_default();
+        };
+        self.workspace
+            .snapshot()
             .iter()
             .find(|project| project.id == project_id)
-            .map(|project| project.tabs.as_slice())
-            .unwrap_or_default();
+            .map(|project| {
+                project
+                    .tabs
+                    .iter()
+                    .map(|tab| self.backend.tab_key(tab.id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn cycle_tab(&mut self, delta: isize) -> Result<(), String> {
+        let tabs = self.visible_tab_keys();
         if tabs.is_empty() {
             return Ok(());
         }
-        let current = tabs
-            .iter()
-            .position(|tab| tab.id == active_tab)
-            .unwrap_or(0);
+        let active_tab = self.active_tab_key();
+        let current = tabs.iter().position(|tab| *tab == active_tab).unwrap_or(0);
         let Some(next) = clamped_tab_index(current, tabs.len(), delta) else {
             return Ok(());
         };
         if next == current {
             return Ok(());
         }
-        self.focus_tab_and_clear(self.backend.tab_key(tabs[next].id), false)?;
+        self.focus_tab_and_clear(tabs[next], false)?;
         Ok(())
     }
 
+    /// Every section the navigation ring walks, top to bottom. The local
+    /// workspace leads; a saved host contributes its mirrored projects,
+    /// and a section that is not connected is listed but never traversed
+    /// (plan 037 §3.1).
+    fn ring_sections(&self) -> Vec<host_sidebar::RingSection> {
+        // The local rows come off a fresh snapshot, not the reconciled
+        // cache: `switch_project_N` resolved against `workspace.snapshot()`
+        // before the ring existed, and a dispatch that arrives ahead of
+        // the reconcile carrying a reorder must still count the same way
+        // it did then. A host's rows have no such source — its mirror is
+        // the only copy there is.
+        let local = host_sidebar::RingSection {
+            host: self.backend.host(),
+            navigable: true,
+            projects: self
+                .workspace
+                .snapshot()
+                .iter()
+                .map(|project| project.id)
+                .collect(),
+        };
+        if self.host_views.is_empty() {
+            return vec![local];
+        }
+        let mut sections = Vec::with_capacity(self.host_views.len() + 1);
+        sections.push(local);
+        sections.extend(
+            self.host_views
+                .iter()
+                .map(|view| host_sidebar::RingSection {
+                    host: view.host,
+                    navigable: view.state.interactive(),
+                    projects: view.projects.iter().map(|row| row.id).collect(),
+                }),
+        );
+        sections
+    }
+
     fn switch_project_by_index(&mut self, index: u8) -> Result<(), String> {
-        let projects = self.workspace.snapshot();
-        let Some(project_id) = project_id_at_index(&projects, index) else {
+        let Some(project) = host_sidebar::ring_index(&self.ring_sections(), index) else {
             return Ok(());
         };
-        let Some(tab_id) = self.workspace.preferred_tab(project_id) else {
+        let Some(tab) = self.preferred_tab_key(project) else {
             return Ok(());
         };
-        self.focus_tab_and_clear(self.backend.tab_key(tab_id), false)
+        self.focus_tab_and_clear(tab, false)
+    }
+
+    /// The tab a project row lands on, on either side of the ring.
+    fn preferred_tab_key(&self, project: ProjectKey) -> Option<TabKey> {
+        match project.local_project() {
+            Some(project_id) => self
+                .workspace
+                .preferred_tab(project_id)
+                .map(|tab_id| self.backend.tab_key(tab_id)),
+            None => self.host_preferred_tab(project),
+        }
     }
 
     fn switch_tab_by_index(&mut self, index: u8) -> Result<(), String> {
-        let project_id = self.workspace.active().0;
-        let projects = self.workspace.snapshot();
-        let Some(tab_id) = active_project_tab_at_index(&projects, project_id, index) else {
+        let Some(tab) = index
+            .checked_sub(1)
+            .and_then(|index| self.visible_tab_keys().get(usize::from(index)).copied())
+        else {
             return Ok(());
         };
-        self.focus_tab_and_clear(self.backend.tab_key(tab_id), false)
+        self.focus_tab_and_clear(tab, false)
     }
 
     /// Every focus change in the UI — strip clicks, sidebar rows, the
@@ -3276,6 +3681,12 @@ impl App {
     /// palettes — funnels through here, so this is the one place that owes
     /// them a reconcile.
     fn focus_tab_and_clear(&mut self, tab: TabKey, reveal_sidebar: bool) -> Result<(), String> {
+        if !tab.is_local() {
+            return self.focus_host_tab_and_clear(tab, reveal_sidebar);
+        }
+        // A local focus ends any host selection: the two are one
+        // selection, and the local workspace is the one that persists it.
+        self.set_host_selection(None);
         focus_tab_in_core(&self.workspace, tab)?;
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
@@ -3287,6 +3698,148 @@ impl App {
         // it" synchronous, exactly as the client-op sites do.
         self.reconcile();
         Ok(())
+    }
+
+    /// [`Self::focus_tab_and_clear`] for a connected host's tab: record
+    /// the selection the view renders from, then attach (C5's entry —
+    /// attach-on-focus detaches whatever was attached before).
+    ///
+    /// Refused for a host that is not connected, which is the other half
+    /// of "dimmed rows are non-interactive": the row publishes nothing,
+    /// and a selection arriving by any other route (a stale palette row,
+    /// a notification jump) still lands nowhere.
+    fn focus_host_tab_and_clear(
+        &mut self,
+        tab: TabKey,
+        reveal_sidebar: bool,
+    ) -> Result<(), String> {
+        let Some(project) = self.host_project_of(tab) else {
+            return Err(format!("tab {tab} is not listed by a connected host"));
+        };
+        self.set_host_selection(Some(HostSelection {
+            project,
+            tab,
+            local_active: self.workspace.active().1,
+        }));
+        if reveal_sidebar {
+            self.set_sidebar_collapsed(false);
+        }
+        self.host_focus_tab(tab);
+        self.reconcile();
+        Ok(())
+    }
+
+    /// The cached view of the host serving an incarnation, when its rows
+    /// are live enough to act on. Dimmed sections answer `None`, which is
+    /// what makes them non-interactive from every route at once — the
+    /// sidebar click, the palette row, a notification jump.
+    fn interactive_host_view(&self, host: HostId) -> Option<&HostView> {
+        self.host_views
+            .iter()
+            .find(|view| view.host == host && view.state.interactive())
+    }
+
+    /// The project a connected host lists a tab under. `None` for a tab
+    /// on a host that is not connected, or one its mirror never listed.
+    fn host_project_of(&self, tab: TabKey) -> Option<ProjectKey> {
+        let view = self.interactive_host_view(tab.host)?;
+        let project = view
+            .projects
+            .iter()
+            .find(|project| project.tabs.iter().any(|row| row.id == tab.tab))?;
+        Some(ProjectKey::new(tab.host, project.id))
+    }
+
+    /// One connected host's project row, as its last mirror listed it.
+    /// The single spelling of that lookup, so every host-aware surface
+    /// applies the same "dimmed sections answer nothing" gate.
+    fn host_project_row(&self, project: ProjectKey) -> Option<(&HostView, &Project)> {
+        let view = self.interactive_host_view(project.host)?;
+        let row = view.projects.iter().find(|row| row.id == project.project)?;
+        Some((view, row))
+    }
+
+    /// The tab a host project row selects: the host's own active tab when
+    /// it lives in that project, else the project's first. Mirrors
+    /// `Workspace::preferred_tab`, read off the mirror instead.
+    fn host_preferred_tab(&self, project: ProjectKey) -> Option<TabKey> {
+        let (view, rows) = self.host_project_row(project)?;
+        let tab = rows
+            .tabs
+            .iter()
+            .find(|tab| tab.id == view.active_tab_id)
+            .or_else(|| rows.tabs.first())?;
+        Some(TabKey::new(project.host, tab.id))
+    }
+
+    /// Drop a host selection the sidebar can no longer draw: its host
+    /// dropped, its incarnation was replaced, or its tab closed. Falls
+    /// back to the local workspace's own selection, which never went
+    /// anywhere.
+    fn reconcile_host_selection(&mut self) {
+        let Some(selection) = self.host_selection else {
+            return;
+        };
+        if self.workspace.active().1 != selection.local_active {
+            tracing::debug!("host selection dropped: a local tab took the focus");
+            self.set_host_selection(None);
+            return;
+        }
+        if self.host_project_of(selection.tab) != Some(selection.project) {
+            tracing::debug!(
+                tab = %selection.tab,
+                "host selection dropped: the tab is no longer listed"
+            );
+            self.set_host_selection(None);
+        }
+    }
+
+    /// The one writer of [`Self::host_selection`].
+    ///
+    /// Attach-on-focus owes a detach-on-defocus, and the two have to be
+    /// spelled in the same place or they drift: a selection leaving a
+    /// host tab — for a local tab, for another host's tab, or for
+    /// nothing at all — releases that tab's attach here, exactly once,
+    /// whichever route moved it. C5's detach keeps the resume point, so
+    /// refocusing picks the stream back up where it left off rather than
+    /// re-snapshotting.
+    ///
+    /// Re-selecting the same tab is not a move and does not detach —
+    /// which is what makes `focus_host_tab_and_clear`'s refocus path
+    /// (set the selection, then attach) idempotent.
+    fn set_host_selection(&mut self, next: Option<HostSelection>) {
+        let released = host_selection_detach(self.host_selection, next);
+        self.host_selection = next;
+        if let Some(tab) = released {
+            self.host_detach_tab(tab);
+        }
+    }
+
+    /// Connect a saved host again, from the sidebar's inline ↻ row.
+    ///
+    /// An explicit connect is unconditional takeover and may spawn a
+    /// localhost session that is not running (§3.2's explicit-connect
+    /// rule) — the launch-time probe is the only connect that does
+    /// neither. C7's `Connect Host` verb and the Add Host dialog land on
+    /// this same entry.
+    pub fn host_reconnect_requested(&mut self, saved_id: &str) {
+        let Some(host) = self
+            .workspace
+            .hosts()
+            .into_iter()
+            .find(|host| host.id == saved_id)
+        else {
+            tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
+            return;
+        };
+        tracing::info!(host = %host.id, "connecting a saved host session");
+        self.connect_saved_host(&host, |localhost| {
+            Some(if localhost {
+                crate::host_conn::ConnectMode::SpawnIfMissing
+            } else {
+                crate::host_conn::ConnectMode::Dial
+            })
+        });
     }
 
     /// The window title, recomposed from live state on every update batch
@@ -3469,6 +4022,7 @@ impl Message {
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
             Self::NewTab => return app.new_tab(),
             Self::NewProject => return app.new_project(),
+            Self::HostReconnect(saved_id) => app.host_reconnect_requested(&saved_id),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
             _ => {}
@@ -3776,6 +4330,89 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    /// The terminal widget stamps a bare tab id on every pointer, wheel
+    /// and hover event. While a host row is showing, that id is the
+    /// host's — resolving it at the local backend would land the gesture
+    /// on whichever local tab happens to share the number.
+    #[test]
+    fn a_terminal_event_qualifies_at_the_host_whose_terminal_is_showing() {
+        let local = HostId::LOCAL;
+        let remote = HostId::new(4);
+
+        // No host selection: every id is the local backend's, exactly as
+        // before the override existed.
+        assert_eq!(
+            terminal_event_key(TabKey::new(local, 7), local, 7),
+            TabKey::new(local, 7)
+        );
+        assert_eq!(
+            terminal_event_key(TabKey::new(local, 7), local, 9),
+            TabKey::new(local, 9)
+        );
+
+        // A host terminal is showing: its own id is its own key…
+        assert_eq!(
+            terminal_event_key(TabKey::new(remote, 7), local, 7),
+            TabKey::new(remote, 7),
+            "the same number under the local backend is a different tab"
+        );
+        // …and a straggler from a previous frame keeps resolving where it
+        // always did.
+        assert_eq!(
+            terminal_event_key(TabKey::new(remote, 7), local, 9),
+            TabKey::new(local, 9)
+        );
+    }
+
+    fn a_host_selection(host: HostId, project: i64, tab: i64) -> HostSelection {
+        HostSelection {
+            project: ProjectKey::new(host, project),
+            tab: TabKey::new(host, tab),
+            local_active: 1,
+        }
+    }
+
+    /// Attach-on-focus owes a detach-on-defocus. Every route that moves
+    /// the selection off a host tab — to a local tab, to another host's
+    /// tab, or to nothing — releases that tab's attach exactly once, and
+    /// re-asserting the same tab is not a move.
+    #[test]
+    fn leaving_a_host_tab_releases_its_attach_exactly_once() {
+        let host = HostId::new(4);
+        let other = HostId::new(5);
+        let showing = a_host_selection(host, 1, 7);
+
+        assert_eq!(
+            host_selection_detach(Some(showing), None),
+            Some(TabKey::new(host, 7)),
+            "falling back to the local workspace detaches"
+        );
+        assert_eq!(
+            host_selection_detach(Some(showing), Some(a_host_selection(host, 1, 8))),
+            Some(TabKey::new(host, 7)),
+            "so does moving within the same host"
+        );
+        assert_eq!(
+            host_selection_detach(Some(showing), Some(a_host_selection(other, 1, 7))),
+            Some(TabKey::new(host, 7)),
+            "and so does the same number on a different host"
+        );
+        assert_eq!(
+            host_selection_detach(Some(showing), Some(showing)),
+            None,
+            "re-asserting the same tab is not a move: refocus stays idempotent"
+        );
+        assert_eq!(
+            host_selection_detach(None, Some(showing)),
+            None,
+            "and there is nothing to release on the way in"
+        );
+        assert_eq!(host_selection_detach(None, None), None);
+    }
+
+    /// `switch_project_N` resolves against the navigation ring now, and
+    /// the ring's local section is the authoritative snapshot order — so
+    /// the numbering a bare install sees is unchanged.
     #[test]
     fn numeric_switch_helpers_follow_authoritative_snapshot_order() {
         let workspace = Workspace::new();
@@ -3785,21 +4422,25 @@ mod tests {
         let second = workspace.create_project("second", "/tmp").unwrap();
         let second_project_tab = workspace.open_tab(second.id, "/tmp", "three").unwrap();
 
-        let snapshot = workspace.snapshot();
-        assert_eq!(project_id_at_index(&snapshot, 1), Some(first.id));
-        assert_eq!(project_id_at_index(&snapshot, 2), Some(second.id));
-        assert_eq!(project_id_at_index(&snapshot, 0), None);
-        assert_eq!(project_id_at_index(&snapshot, 10), None);
-        assert_eq!(
-            active_project_tab_at_index(&snapshot, first.id, 2),
-            Some(second_tab.id)
-        );
-        assert_eq!(active_project_tab_at_index(&snapshot, first.id, 0), None);
-        assert_eq!(active_project_tab_at_index(&snapshot, first.id, 10), None);
+        let local_ring = |projects: &[Project]| {
+            vec![host_sidebar::RingSection {
+                host: HostId::LOCAL,
+                navigable: true,
+                projects: projects.iter().map(|project| project.id).collect(),
+            }]
+        };
+        let at = |sections: &[host_sidebar::RingSection], index: u8| {
+            host_sidebar::ring_index(sections, index).map(|key| key.project)
+        };
+        let sections = local_ring(&workspace.snapshot());
+        assert_eq!(at(&sections, 1), Some(first.id));
+        assert_eq!(at(&sections, 2), Some(second.id));
+        assert_eq!(at(&sections, 0), None);
+        assert_eq!(at(&sections, 10), None);
 
         workspace.reorder_projects(&[second.id, first.id]).unwrap();
-        let reordered = workspace.snapshot();
-        assert_eq!(project_id_at_index(&reordered, 1), Some(second.id));
+        let sections = local_ring(&workspace.snapshot());
+        assert_eq!(at(&sections, 1), Some(second.id));
         assert_eq!(workspace.preferred_tab(first.id), Some(second_tab.id));
         assert_eq!(
             workspace.preferred_tab(second.id),

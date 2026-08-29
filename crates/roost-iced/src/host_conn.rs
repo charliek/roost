@@ -80,7 +80,7 @@ pub(crate) mod state;
 pub(crate) mod task;
 
 pub(crate) use mirror::SharedMirror;
-pub(crate) use queue::{HostOpError, HostOps};
+pub(crate) use queue::{HostIntent, HostOpError, HostOps};
 pub(crate) use state::HostConnState;
 pub(crate) use task::{ConnectMode, Shutdown};
 
@@ -274,6 +274,14 @@ impl Drop for HostConn {
     }
 }
 
+/// One saved host's live facts, as the sidebar reads them.
+pub(crate) struct HostSectionView<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) state: &'a HostConnState,
+    pub(crate) incarnation: Option<HostId>,
+    pub(crate) mirror: Option<&'a Arc<SharedMirror>>,
+}
+
 /// Every connected host, and the mirrors their tasks publish.
 ///
 /// Inert with zero hosts: nothing is spawned, nothing is drained, and
@@ -436,6 +444,25 @@ impl HostConnSet {
         }
     }
 
+    /// [`Self::send`] addressed by connection incarnation — the form the
+    /// UI's own `TabKey`/`ProjectKey` already carry, so a call site
+    /// acting on the selection never has to look the saved id back up.
+    /// A stale incarnation answers the intent rather than dropping it,
+    /// same contract as [`Self::send`].
+    pub(crate) fn send_at(
+        &self,
+        incarnation: HostId,
+        intent: queue::HostIntent,
+    ) -> Result<(), HostOpError> {
+        match self.owner_of(incarnation) {
+            Some(host) => self.send(&host, intent),
+            None => {
+                intent.answer(Err(HostOpError::Unavailable));
+                Err(HostOpError::Unavailable)
+            }
+        }
+    }
+
     /// The op queue for whichever host owns this incarnation.
     pub(crate) fn ops_for(&self, incarnation: HostId) -> Option<&HostOps> {
         let host = self.owner_of(incarnation)?;
@@ -459,8 +486,32 @@ impl HostConnSet {
         self.mirrors.get(&incarnation)
     }
 
+    /// What one saved host's sidebar section renders from.
+    ///
+    /// `None` for a host this set is not driving at all (never
+    /// connected, or explicitly disconnected) — its section renders as
+    /// disconnected with no rows.
+    ///
+    /// The mirror deliberately outlives a *drop*: those shells are still
+    /// running on the host, so the section keeps listing them dimmed
+    /// until the connection is back. It does not outlive a *reconnect* —
+    /// `Connecting { previous }` purges it and the fresh `tab.list`
+    /// rebuilds, which is §3.2's purge-then-rebuild.
+    pub(crate) fn section(&self, host: &str) -> Option<HostSectionView<'_>> {
+        let conn = self.conns.get(host)?;
+        Some(HostSectionView {
+            label: conn.label.as_str(),
+            state: &conn.state,
+            incarnation: conn.incarnation,
+            mirror: conn
+                .incarnation
+                .and_then(|incarnation| self.mirrors.get(&incarnation)),
+        })
+    }
+
     /// Connected hosts, as `(saved id, label, incarnation, mirror)`.
-    /// What C6's sidebar sections iterate.
+    /// The sidebar iterates saved hosts through [`Self::section`]
+    /// instead — this is the connected-only view the palette verbs take.
     pub(crate) fn connected(
         &self,
     ) -> impl Iterator<Item = (&str, &str, HostId, &Arc<SharedMirror>)> {
@@ -779,6 +830,56 @@ mod tests {
         assert!(set.ops_for(live).is_some());
     }
 
+    /// A destructive verb aimed at the selection carries an incarnation,
+    /// not a saved id (plan 037 §3.9): `tab.close` on a host row is
+    /// addressed by the row's own `TabKey`. It has to reach that host's
+    /// queue — and a key minted by a connection that is gone must be
+    /// answered rather than routed onto whatever replaced it, or a close
+    /// lands on a same-numbered tab of a different session.
+    #[tokio::test]
+    async fn an_intent_addressed_by_incarnation_reaches_that_incarnation_or_nobody() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-send-at.sock"),
+            false,
+            ConnectMode::Dial,
+        );
+        let live = set.mint_for("h1");
+        set.apply_state(live, HostConnState::Connected);
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        assert!(set
+            .send_at(
+                live,
+                HostIntent::new(ops::TAB_CLOSE, serde_json::json!({ "tab_id": "7" })).answering(tx)
+            )
+            .is_ok());
+        assert!(
+            rx.try_recv().is_err(),
+            "the queued intent is the worker's to answer, not the enqueue's"
+        );
+
+        // A key from a connection that has been replaced, and one from a
+        // host that is gone entirely.
+        let stale = set.minter.mint("h1", set.conns["h1"].generation - 1);
+        for dead in [stale, HostId::new(9_999)] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            assert!(matches!(
+                set.send_at(
+                    dead,
+                    HostIntent::new(ops::TAB_CLOSE, serde_json::json!({})).answering(tx)
+                ),
+                Err(HostOpError::Unavailable)
+            ));
+            assert!(
+                matches!(rx.try_recv(), Ok(Err(HostOpError::Unavailable))),
+                "a refused intent is answered, never dropped on the floor"
+            );
+        }
+    }
+
     /// Disconnecting drops everything keyed on the host, so a late item
     /// from its task lands nowhere.
     #[tokio::test]
@@ -813,6 +914,61 @@ mod tests {
         assert!(set.state("anything").is_none());
         assert!(set.endpoint("anything").is_none());
         assert!(set.mirror(HostId::new(1)).is_none());
+        assert!(set.section("anything").is_none());
+    }
+
+    /// What the dimmed section is built on: a dropped connection keeps
+    /// the rows it published, because the shells they name are still
+    /// running on the host. A *reconnect* is the one thing that clears
+    /// them — the fresh `tab.list` is authoritative, so the rebuild is
+    /// purge-then-rebuild rather than a merge.
+    #[tokio::test]
+    async fn a_dropped_connection_keeps_its_rows_for_the_dimmed_section() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-section.sock"),
+            false,
+            ConnectMode::Dial,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.apply_workspace(incarnation, HostWorkspaceEvent::Reset(Arc::default()));
+
+        set.apply_state(
+            incarnation,
+            HostConnState::Disconnected(state::Disconnected {
+                reason: "connection refused".into(),
+                retry_in: None,
+            }),
+        );
+        let section = set.section("h1").expect("a saved host keeps its section");
+        assert_eq!(section.label, "pop-os");
+        assert!(!section.state.is_connected());
+        assert_eq!(section.incarnation, Some(incarnation));
+        assert!(
+            section.mirror.is_some(),
+            "the rows outlive the connection that published them"
+        );
+        assert_eq!(
+            set.connected().count(),
+            0,
+            "but the host contributes nothing that can be acted on"
+        );
+
+        let fresh = set.mint_for("h1");
+        set.apply_state(
+            fresh,
+            HostConnState::Connecting {
+                previous: Some(incarnation),
+            },
+        );
+        let section = set.section("h1").expect("still saved");
+        assert!(
+            section.mirror.is_none(),
+            "a reconnect purges rather than merging (plan 037 §3.2)"
+        );
     }
 
     #[test]

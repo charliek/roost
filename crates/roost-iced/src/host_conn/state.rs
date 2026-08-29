@@ -148,6 +148,22 @@ impl HostConnState {
         matches!(self, HostConnState::Connected)
     }
 
+    /// How this state reads in the sidebar's host band (plan 037 §3.1) —
+    /// which dot it paints, whether its rows respond, and what its
+    /// rollup says. The mapping lives here so the section model in
+    /// `roost-ui-model` stays free of the connection machinery.
+    pub(crate) fn section_state(&self) -> roost_ui_model::host_sidebar::SectionState {
+        use roost_ui_model::host_sidebar::SectionState;
+        match self {
+            Self::Disconnected(_) => SectionState::Disconnected,
+            Self::Connecting { .. } => SectionState::Connecting,
+            Self::Connected => SectionState::Connected,
+            Self::TakenOver => SectionState::TakenOver,
+            Self::Stopped => SectionState::Stopped,
+            Self::NeedsRestart(_) => SectionState::NeedsRestart,
+        }
+    }
+
     /// Whether an auto-retry is pending, and how long away.
     pub(crate) fn retry_in(&self) -> Option<Duration> {
         match self {
@@ -309,6 +325,64 @@ mod tests {
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),
         }
+    }
+
+    /// The sidebar's three-dot vocabulary, pinned against every
+    /// connection state: green only while actually connected, amber while
+    /// something is in flight or waiting on the user, grey once the
+    /// connection is gone. And only a connected section is interactive —
+    /// which is what makes a dimmed section's rows unclickable everywhere
+    /// at once (plan 037 §3.1).
+    #[test]
+    fn every_connection_state_maps_to_a_section_state() {
+        use roost_ui_model::host_sidebar::{HostDot, SectionState};
+
+        let dropped = HostConnState::Disconnected(Disconnected {
+            reason: "session ended".into(),
+            retry_in: None,
+        });
+        let mismatch = HostConnState::NeedsRestart(BuildMismatch {
+            kind: MismatchKind::Build,
+            session_protocol: SESSION_PROTOCOL_VERSION,
+            client_protocol: SESSION_PROTOCOL_VERSION,
+            session_build: "gb-old".into(),
+            client_build: "gb-1".into(),
+            session_payload_kinds: vec![REQUIRED_PAYLOAD_KIND.to_string()],
+            restartable: true,
+        });
+        let cases = [
+            (HostConnState::Connected, SectionState::Connected),
+            (
+                HostConnState::Connecting { previous: None },
+                SectionState::Connecting,
+            ),
+            (dropped, SectionState::Disconnected),
+            (HostConnState::TakenOver, SectionState::TakenOver),
+            (HostConnState::Stopped, SectionState::Stopped),
+            (mismatch, SectionState::NeedsRestart),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(state.section_state(), expected, "{state:?}");
+            assert_eq!(
+                state.section_state().interactive(),
+                state.is_connected(),
+                "only a connected host's rows respond ({state:?})"
+            );
+        }
+        assert_eq!(
+            HostConnState::Connected.section_state().dot(),
+            HostDot::Connected
+        );
+        assert_eq!(
+            HostConnState::Connecting { previous: None }
+                .section_state()
+                .dot(),
+            HostDot::Pending
+        );
+        assert_eq!(
+            HostConnState::TakenOver.section_state().dot(),
+            HostDot::Offline
+        );
     }
 
     #[test]

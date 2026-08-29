@@ -116,6 +116,10 @@ enum Message {
     CloseTab(TabKey),
     NewTab,
     NewProject,
+    /// The sidebar's inline "↻ Reconnect" row, carrying the saved host's
+    /// stable id (plan 037 §3.1). C7's `Connect Host: <label>` palette
+    /// verb lands on the same app entry.
+    HostReconnect(String),
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
@@ -523,6 +527,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::CloseTab(_)
         | Message::NewTab
         | Message::NewProject
+        | Message::HostReconnect(_)
         | Message::ConfirmDeleteCancel
         | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }
