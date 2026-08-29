@@ -33,8 +33,14 @@ it: `roostctl session start|stop|status` address the session profile's
 socket directly (a pre-connect carve-out, since `start` must work when
 nothing is listening yet), and any other op reaches a session only
 through an explicit `--socket`. A UI socket answers `unknown-op` for
-every `session.*` op and `not-implemented` for `events.subscribe`,
-byte-identical to before `roost-session` existed.
+every `session.*` op and for [`tab.attach`](#tabattach), and
+`not-implemented` for `events.subscribe`, byte-identical to before
+`roost-session` existed.
+
+A session socket also carries a second, **binary** protocol on its own
+connections — the per-tab attach stream a client renders a remote
+terminal from. It shares the socket path but not the framing; see
+[Data plane](#data-plane).
 
 ## Wire format
 
@@ -58,7 +64,10 @@ byte-identical to before `roost-session` existed.
   `{"event": "<dotted-name>", "data": {...}}` — no `id`, no response
   expected. Pushed inside an `EventBatch` on a connection that ran
   [`events.subscribe`](#eventssubscribe), which host-session sockets
-  serve and UI sockets do not. Catalog: [Events](#events) below.
+  serve and UI sockets do not. The one exception is the terminal
+  `session.stopping` control envelope, which rides bare (no batch, no
+  revision) as the last frame on the stream. Catalog:
+  [Events](#events) below.
 * **Bytes payloads** (e.g. `tab.write.data`, and any future binary
   field): **base64-encoded strings** using the standard alphabet,
   no padding stripping. Tested for binary fidelity (`0x00..0xff`
@@ -90,7 +99,11 @@ byte-identical to before `roost-session` existed.
   user. `shutting-down` is **session-socket only**: once
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
-  same session gets it too instead of a fresh reap report.
+  same session gets it too instead of a fresh reap report. Session
+  sockets add a further six, all of them about the lease and the attach
+  handshake: `connect-required`, `already-connected`, `taken-over`,
+  `too-many-tokens`, `unsupported-kind`, `build-mismatch` — see
+  [`session.connect`](#sessionconnect) and [`tab.attach`](#tabattach).
 
 ## Shared types
 
@@ -317,13 +330,20 @@ when the cursor is off-viewport. Response is permissive, so per-cell
 color / scrollback fields can be added forward-compatibly. CLI:
 `roostctl tab dump --tab N` (plain rows) / `--json` (full result).
 
+On a **host-session socket** this is answered from the tab's server
+Terminal instead of a UI's — same request, same response shape. It
+needs no lease and no attach: a session's terminal is authoritative
+whether or not anybody is watching it. (Before HS-1b a session had no
+terminal at all and answered `internal: no UI attached`.)
+
 ### `tab.dump_resolved`
 
 Companion to `tab.dump` — a richer read of the same viewport, but each
-cell carries the post-resolver fg/bg the production paint path computes
-(including the theme's `bold-color` accent). Ungated; useful both for
-debugging "why is this row gray" and as the resolver-walk regression
-op for #142.
+cell carries the post-resolver fg/bg the production paint path computes.
+Ungated; useful both for debugging "why is this row gray" and as the
+resolver-walk regression op for #142. (The only theme-derived input to
+the resolver is the default fg/bg pair; no `bold-color` accent is
+applied today, on either socket.)
 
 Request: `{"params": {"tab_id": "3"}}`.
 Response (truncated):
@@ -342,6 +362,13 @@ Response (truncated):
 distinguishes a default-bg cell (false) from an SGR-bg cell (true) so
 a test can pin paint behavior without reasoning about the canvas
 fallback. `text` is `" "` for blank cells.
+
+Also served on a **host-session socket**, from the server Terminal.
+Both sockets run the same resolver — the densifier and `resolve_colors`
+live in `roost-vt` and the iced UI imports them — so a session's answer
+and a UI's cannot drift. A session has no theme, so its default
+foreground/background are the server Terminal's own (white on black
+until a program changes them).
 
 ### `tab.feed_pty_bytes` *(test-only — gated)*
 
@@ -370,6 +397,19 @@ to observe the shell painting and then stopping (`tools/roosttest`'s
 `util.wait_tab_quiet` — non-empty `tab.dump` text, byte-identical
 across consecutive polls).
 
+On a **host-session socket** the op is served the same way, gated on
+the same `ROOST_TEST_MODE=1` (in the *session's* launch environment)
+and routed into the tab task's pipeline — so injected bytes are
+seq-assigned, teed to attached clients, and ringed exactly like real
+child output. They are **chunked to 4096 bytes** on the way in, the
+same granularity the PTY reader produces: a chunk is the unit a seq is
+assigned to, and one unchunked megabyte would be a single PTY frame
+past the data plane's 1 MiB frame cap. A large injection therefore
+arrives as several PTY frames, and the ordering caveat above applies
+unchanged. Unlike the UI path this op is a **mutation** on a session —
+it writes into the authoritative terminal — so it answers
+`shutting-down` once `session.stop` has latched.
+
 ### `tab.capture_pty_input` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` at UI launch.** Returns (and by default
@@ -384,6 +424,15 @@ defaults to `false` (peek). Response:
 ```json
 {"data": "G10xMTtyZ2I6MDAwMC8xMTExLzIyMjIH"}
 ```
+
+On a **host-session socket** it reads the same buffer one level down:
+the bytes the tab task queued for the child's PTY, which is where a
+session's terminal replies (DA/DSR/color queries) and any `INPUT`
+frames from an attached data connection both land, in the order the
+task produced them. `drain` is honored identically (consume vs. peek).
+This is how the exactly-once reply rule is asserted headlessly — one
+answer in the capture per query, no matter how many clients are
+attached.
 
 ### `tab.feed_ime` *(test-only — gated)*
 
@@ -1036,19 +1085,44 @@ state live on the UI side.
 ### `events.subscribe`
 
 Turn this connection into a one-way event stream. **Served by a
-host-session socket only.**
+host-session socket only**, and **lease-gated**: the caller presents
+the `lease` [`session.connect`](#sessionconnect) handed it.
 
-Request: `{"params": {"tab_id_filter": "0"}}`. Response (the last
-request/response frame on the connection):
+Request: `{"params": {"lease": "9f2c…6b83", "tab_id_filter": "0"}}`.
+Response (the last request/response frame on the connection):
 
 ```json
 {"id": "7", "ok": true, "result": {"revision": 42}}
 ```
 
-Everything after that ack is an `EventBatch` — one per workspace
+A missing or unknown lease is `{"code": "connect-required"}`; the lease
+of a client that was taken over is `{"code": "taken-over"}`. The two
+instruct differently on purpose — go get a lease, versus stop, somebody
+else drives this session now. Subscribing registers the connection
+under the lease, which is what lets a later takeover close *this*
+stream rather than leaving two clients both believing they drive the
+session.
+
+After the ack every frame is an `EventBatch` — one per workspace
 commit, `{"revision": <u64>, "events": [<EventEnvelope>, ...]}`, one
-per newline-delimited frame. The catalog of envelopes is
-[Events](#events) below.
+per newline-delimited frame — **except** the single terminal control
+envelope that ends the stream:
+
+```json
+{"event": "session.stopping", "data": {"reason": "stop"}}
+```
+
+`reason` is `"stop"` (the session is shutting down) or `"taken-over"`
+(another client took the lease). It carries **no `revision`** and is
+exempt from the gap check below: it is not a commit, it is the stream
+saying why it is over, and it is always the last frame before the
+close. The catalog of batch envelopes is [Events](#events) below.
+
+The envelope is **best-effort**. A peer that stopped reading has
+already made the write impossible once its socket buffer filled, so a
+plain EOF remains the fallback signal and a client must treat an
+unlabeled close exactly as it treated one before: reconnect and
+resync.
 
 Three properties make this lossless without a replay buffer:
 
@@ -1063,24 +1137,30 @@ Three properties make this lossless without a replay buffer:
   reading, falls behind the workspace broadcast, or the connection
   stalls, the server closes the connection instead of dropping events
   out of the stream. A close is the resync signal: reconnect,
-  re-subscribe, re-pull `tab.list`, and fence again.
+  re-subscribe, re-pull `tab.list`, and fence again — the
+  `session.stopping` envelope, where it arrives, only tells the client
+  *why* it is resyncing.
 
 After the flip the connection answers nothing. Frames a client writes
 on it are read and discarded (so the server still notices a peer that
 goes away), never dispatched and never replied to. That read is also
 why a client must keep its write half **open**: half-closing it is how
 a peer says it is gone, and the server ends the stream. `session.stop`
-closes every subscriber before it drains its in-flight work, so a
-client watching a session sees the stream end as the session goes down.
+labels and closes every subscriber before it drains its in-flight work,
+so a client watching a session sees the stream end — with a reason — as
+the session goes down.
 
 A non-zero `tab_id_filter` is rejected with `invalid-param` rather than
 ignored — HS-2 scope. Silently serving an unfiltered stream to a client
 that asked for one tab would make it mis-attribute every other tab's
 events.
 
-**Provisional.** HS-1b puts the stream behind a lease, which is a
-breaking change to this op. Today Roost's own tests are its only
-consumer.
+**Breaking change, HS-1b (plan 036).** HS-1a served this op with no
+lease at all. A client written against that form still *decodes* — the
+`lease` field defaults rather than being required — and gets
+`connect-required`, which names the step it skipped instead of an
+envelope-shaped `invalid-param` that names nothing.
+`SESSION_PROTOCOL_VERSION` bumped `1` → `2` for exactly this.
 
 On a **UI socket** the op is still unimplemented: it answers
 `{"ok": false, "error": {"code": "not-implemented", "message":
@@ -1091,8 +1171,16 @@ because a UI process pushes nothing. Callers there poll `tab.list` /
 ## Session ops
 
 Served **only by a host session** (`roost-session`), never by a UI
-socket. A UI socket answers `unknown-op` for both, which is how a client
-tells the two kinds of socket apart.
+socket. A UI socket answers `unknown-op` for every one of them —
+including [`tab.attach`](#tabattach), which is a `tab.*` name but a
+session-only op — which is how a client tells the two kinds of socket
+apart.
+
+The order a client runs them in is `session.identify` →
+`session.connect` → `events.subscribe` / `tab.attach`. Only the second
+half of that is enforced: `identify` is a stateless read and nothing
+requires it first, but the lease *is* required, and the ops that need
+it say so by name.
 
 ### Session sockets
 
@@ -1142,29 +1230,36 @@ its budget does the daemon fall back to a direct finalization — flush,
 socket/lock cleanup, exit — without the mutation barrier or a reap
 report; the children then die with the process.
 
-**Three deviations from
-[`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md)
-are provisional, not final**, and tracked to close in HS-1b
-([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)):
+HS-1a shipped with three documented deviations from
+[`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md);
+**HS-1b (plan 036) resolved all three**, and each is now described where
+it belongs: `events.subscribe` is
+[lease-gated](#eventssubscribe), `session.stop` and takeover
+[label what they close](#sessionstop), and terminal-generated queries
+are answered by the tab's own server Terminal (below).
 
-1. **`events.subscribe` ships leaseless.** §4.1/§9 of the architecture
-   doc gate the events connection behind a `session.connect` lease;
-   HS-1a serves it unconditionally to any client that asks. HS-1b's
-   lease will be a **breaking wire change** for anything written against
-   HS-1a's `events.subscribe`.
-2. **`session.stop` notifies push clients by closing the connection**,
-   not the architecture doc's §8 labeled shutdown envelope (`events`
-   connections get a labeled envelope; data connections close with a
-   labeled `ERROR`). HS-1a's plain close *is* the resync signal a
-   subscriber acts on — see [`events.subscribe`](#eventssubscribe) — but
-   it carries no reason code.
-3. **Terminal-generated queries go unanswered headless.** A program that
-   asks the terminal who it is (DA/DA2), where the cursor is (DSR), or
-   what a palette entry is set to gets no reply on any tab, because
-   answering one requires a libghostty terminal and a headless session
-   has none yet (`crates/roost-session/src/drain.rs`) — HS-1b's per-tab
-   server-side terminal is what fixes it. A program that blocks on such
-   a reply hangs; one that times out degrades.
+Every tab a session spawns now has an authoritative **server Terminal**
+behind it — a real libghostty terminal fed synchronously by a per-tab
+task, with 2000 lines of scrollback and VT continuation tracking on
+from construction. Three consequences a client can observe:
+
+* **Queries are answered, detached.** A program that asks the terminal
+  who it is (DA/DA2), where the cursor is (DSR), or what a palette
+  entry is set to gets its reply on any tab, whether or not anybody is
+  attached. The *server* answers, exactly once; a client that is
+  attached and runs its own terminal over the same bytes must discard
+  its own reply buffer, or the child sees the answer twice.
+* **The terminal is readable.** [`tab.dump`](#tabdump) and
+  [`tab.dump_resolved`](#tabdump_resolved) are served from it.
+* **The terminal is streamable.** [`tab.attach`](#tabattach) plus a
+  [data connection](#data-plane) hand a client the whole terminal as a
+  snapshot and then keep it live.
+
+Flow control is the shape of the pipeline, not a policy on top of it:
+the PTY reader feeds the tab task over a bounded channel, so a tab that
+falls behind stalls its own reader and the child blocks on `write`. The
+authoritative terminal never loses bytes; a runaway child pays for it
+in backpressure rather than the session paying for it in memory.
 
 ### `session.identify`
 
@@ -1173,9 +1268,9 @@ Params: `{}`. Response:
 ```json
 {
   "app_version": "0.0.18",
-  "session_protocol": 1,
-  "payload_kinds": [],
-  "libghostty_build": "",
+  "session_protocol": 2,
+  "payload_kinds": ["ghostty-snapshot", "vt"],
+  "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
   "started_at": "2026-08-27T14:03:11Z"
 }
@@ -1185,14 +1280,218 @@ The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
 `SESSION_PROTOCOL_VERSION` — deliberately separate from the
 request/response `protocol_version` in [`identify`](#identify), because
-the two version different things and move independently.
+the two version different things and move independently. It is **`2`**
+as of HS-1b: the bump is breaking because
+[`events.subscribe`](#eventssubscribe) and [`tab.attach`](#tabattach)
+now require a lease, and a client written against `1` subscribed with
+none. The [attach handshake](#data-plane) carries the same number and
+refuses a mismatch before it even looks at the token.
 
-`payload_kinds` is empty and `libghostty_build` is `""` in the current
-implementation: attach is not available yet, and an honest empty list is
-what lets a client fall back rather than negotiate a payload the session
-cannot produce. HS-1b populates both. `payload_kinds` is an open list of
-strings, not a closed enum — a client must preserve values it does not
-recognize.
+`payload_kinds` names what this session can encode a tab's attach
+payload as, in no particular order; it is an **open list of strings**,
+not a closed enum — a client preserves values it does not recognize and
+negotiates on the ones it does. The sample above shows a host offering
+two kinds, which is what a client's decode has to tolerate; the shipped
+`roost-session` advertises `["ghostty-snapshot"]` alone (`vt`, the
+replay-a-byte-stream fallback, is a named kind with no implementation
+behind it — architecture §4.4's escape hatch, not built).
+
+`libghostty_build` is this session's pinned Ghostty build identity,
+`ghostty-<first 16 hex of the pinned SHA>+snapshot.v<format version>`.
+It is the negotiation for `ghostty-snapshot`: two libghostty builds
+that disagree cannot exchange a snapshot, so `tab.attach` requires an
+**exact** string match and refuses a mismatch by name
+(`build-mismatch`) rather than letting it surface later as a corrupt
+screen. Both fields were empty in HS-1a, when there was nothing to
+attach to.
+
+### `session.connect`
+
+Claim the session's **interactive lease** — the authority to drive
+tabs, not merely to read them.
+
+Request:
+```json
+{"id": "3", "op": "session.connect", "params": {"takeover": true}}
+```
+
+Response:
+```json
+{"id": "3", "ok": true, "result": {
+  "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+  "revision": 42
+}}
+```
+
+`takeover` defaults to `false`. `lease` is 32 lowercase hex characters
+of OS entropy — a **bearer credential**: never log it, never print it
+in a failure dump, never echo it in an error. `revision` is the
+workspace commit the lease was minted at, read under the same lock as
+the snapshot, so a client can fence its first
+[`tab.list`](#tablist) against the event stream without a second round
+trip.
+
+The lease is the interactive-authority boundary, and a self-declared
+client id would not be one: possession of the token is what proves a
+client is *the* driver. It gates [`events.subscribe`](#eventssubscribe)
+and [`tab.attach`](#tabattach). Administrative ops — `tab.open`,
+`tab.list`, `tab.write`, `project.*`, `tab.agent_report`, the dumps —
+stay lease-free: they are same-UID control-plane use (`roostctl`, a
+Claude hook), not interactive ownership.
+
+**The lease outlives the connection it was minted on.** Dropping every
+socket releases nothing; a client that reconnects is a *new* client as
+far as the session is concerned. That is deliberate — a half-crashed
+client still holding a data connection must not be able to keep typing
+into tabs a replacement believes it owns, and the session cannot tell a
+crash from a slow network.
+
+So reconnecting is always a takeover:
+
+| Situation | `takeover: false` | `takeover: true` |
+|---|---|---|
+| No lease held | mints a lease | mints a lease |
+| Someone else holds it | `already-connected` | takes it |
+| **You** hold it, on this very connection | `already-connected` | takes it (fresh token) |
+
+The third row is not an oversight. A client that lost track of its own
+lease is exactly the one that has to re-establish it deliberately.
+
+A takeover, under one lock, atomically: invalidates the old lease,
+closes **every connection registered under it** except the requesting
+one, purges its outstanding attach tokens, and mints the new lease.
+What "closes" means depends on what the connection was doing:
+
+* a plain control connection just closes — there is no stream its peer
+  is waiting on, only a reply it never asked for;
+* an events connection gets the terminal
+  `{"event": "session.stopping", "data": {"reason": "taken-over"}}`
+  envelope, then closes;
+* a data connection gets an `ERROR` frame with code `taken-over`, then
+  closes.
+
+Both labels are best-effort under a 2 s deadline: a peer that stopped
+reading made the write impossible when its socket buffer filled, and
+EOF is then the only signal it gets.
+
+Purging the displaced lease's attach tokens matters for a reason that
+is easy to miss: they would be refused at the handshake's lease
+re-check anyway, but leaving them would let a dead client's 16
+outstanding tokens hold the whole quota against the new holder for a
+full TTL. A ticket purged this way answers `invalid-token` — the
+session no longer recognizes it at all — while an op that presents the
+*lease* answers `taken-over`.
+
+**Exactly one tombstone.** The session remembers the most recently
+displaced lease so its holder is told `taken-over` (someone else has
+it; stop) rather than `connect-required` (you never connected;
+reconnect). Only the most recent: after a second takeover the
+first-displaced client's lease is forgotten and it falls back to
+`connect-required`. It has already been told, and an unbounded graveyard
+of dead leases is not a thing a process meant to run for weeks should
+keep.
+
+`session.connect` is a mutating op for stop-latch purposes — it hands
+out authority — so it answers `shutting-down` once
+[`session.stop`](#sessionstop) has latched.
+
+### `tab.attach`
+
+Negotiate a payload kind for one tab and get a single-use ticket for
+one [data connection](#data-plane). Session sockets only; a UI socket
+answers `unknown-op`.
+
+Request:
+```json
+{"id": "4", "op": "tab.attach", "params": {
+  "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+  "tab_id": "5",
+  "kinds": ["ghostty-snapshot"],
+  "cols": 120,
+  "rows": 40,
+  "cell_w_px": 9,
+  "cell_h_px": 18,
+  "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1"
+}}
+```
+
+Response:
+```json
+{"id": "4", "ok": true, "result": {
+  "attach_token": "1a0be5c37d924f68b1c05e3a7f2d8496",
+  "kind": "ghostty-snapshot",
+  "server_epoch": 6032428321756423947,
+  "tab_generation": 3
+}}
+```
+
+`kinds` is the client's preference order and the server serves the
+first entry it supports; a list mixing kinds this build has never heard
+of with one it serves is fine.
+
+**Validation order is part of the contract**, because each failure
+tells the client to fix a different thing and an earlier one must not
+be masked by a later one:
+
+| # | Check | Error |
+|---|---|---|
+| 1 | lease is live | `connect-required` (unknown/absent) or `taken-over` (tombstoned) |
+| 2 | tab exists with a live terminal | `not-found` |
+| 3 | `kinds` contains something servable | `unsupported-kind` (message names both lists) |
+| 4 | `libghostty_build` matches exactly | `build-mismatch` (message names both strings) |
+| 5 | `cols` and `rows` both non-zero | `invalid-param` |
+| 6 | the tab accepts the geometry | `invalid-param` |
+| 7 | token quota not exhausted | `too-many-tokens` |
+
+Zero `cell_w_px` / `cell_h_px` are legal — a headless client has no
+cell metrics to report — but a zero-sized grid is not a grid.
+
+**Attach is when the server resizes.** Between checks 5 and 7 the
+session resizes the tab (server terminal *and* `TIOCSWINSZ`) to the
+requested geometry and waits for that to land, so the snapshot the
+data connection is about to encode is already at client size and needs
+no post-READY resize. Detach never resizes back — the PTY keeps the
+last attached size, so a TUI agent does not get a `SIGWINCH` because
+somebody closed a laptop. This does not contradict that rule: attach is
+exactly when an in-process Roost resizes too.
+
+`attach_token` is 32 hex characters, the same bearer credential the
+lease is and under the same no-logging rule. It is:
+
+* **single-use** — consumed under the registry lock, so two connections
+  presenting one token admit exactly one;
+* **short-lived** — 60 s TTL (`ATTACH_TOKEN_TTL`), a protocol constant
+  that is *not* scaled by `ROOST_TEST_TIMEOUT_SCALE`. A session started
+  with `ROOST_TEST_MODE=1` honors `ROOST_SESSION_ATTACH_TTL_MS` to
+  shorten it, which is how the expiry case is tested in seconds; a
+  production daemon ignores that variable entirely;
+* **quota-bounded** — at most 16 unconsumed tokens
+  (`MAX_OUTSTANDING_TOKENS`) exist at once. Past that, minting is
+  refused with `too-many-tokens` rather than evicting a token some
+  other connection is about to present. Reaching it means a client
+  minted 16 tickets inside one TTL and dialed none of them; a healthy
+  attach consumes its ticket within a round trip;
+* **lease-bound** — re-checked at the handshake, so a takeover between
+  this reply and the dial refuses the ticket with `taken-over`;
+* **pipeline-bound** — stamped with the `tab_generation` below, so a
+  respawn in the same window is a clean `not-found` rather than a
+  stream from a different terminal under the old identity.
+
+`server_epoch` and `tab_generation` are the **resume identity**. The
+epoch is a random value minted once per session process; the generation
+counts tab pipelines within it. A client that later wants to resume a
+stream hands both back, and the randomness is what makes a restarted
+session's streams unresumable *by construction* rather than by luck — a
+monotonic counter would collide across a restart and silently accept a
+stale stream. Both ride as **bare JSON numbers**, not the
+string-wrapped int64 ids use: they are counters, not ids. Neither can
+exceed `i64::MAX` — the epoch is deliberately 63 random bits, not 64,
+because a top-bit-set value round-trips imprecisely through a decoder
+that falls back to `Double`, and the whole point of the field is an
+exact match.
+
+Like `session.connect`, `tab.attach` answers `shutting-down` once
+`session.stop` has latched.
 
 ### `session.stop`
 
@@ -1205,10 +1504,20 @@ Params: `{}`. Response: the reap report,
 Stops the session. In order: the session latches *stopping* (every
 mutating op from that point answers `{"code": "shutting-down"}`, reads
 keep answering, and a second `session.stop` gets `shutting-down` too);
-it waits out the mutating requests already in flight, so a `tab.open`
-that got past the latch completes and its tab is included below; it
-flushes the workspace layout; then it hangs every PTY up, escalating to
-`SIGKILL` after a soft deadline.
+it **labels and closes every connection the lease holder owns** — an
+events connection gets the terminal
+`{"event": "session.stopping", "data": {"reason": "stop"}}` envelope, a
+data connection gets an `ERROR` frame with code `shutting-down`, a
+plain control connection just closes; it waits out the mutating
+requests already in flight, so a `tab.open` that got past the latch
+completes and its tab is included below; it flushes the workspace
+layout; then it hangs every PTY up, escalating to `SIGKILL` after a
+soft deadline.
+
+The labeling comes **before** the relays are torn down, on purpose: cut
+the relay first and the peer gets a bare EOF it cannot tell from a
+crash. It is still best-effort under a 2 s deadline — a peer that
+stopped reading gets EOF, which remains a valid signal.
 
 The three id lists partition the tabs that were live when the stop
 began — each id appears in exactly one, and each is sorted. `reaped`
@@ -1221,6 +1530,232 @@ The reply is written **before** the process-level shutdown tail runs, so
 a client always gets its report even though the session is on its way
 out.
 
+### Data plane
+
+One connection per attached tab, carrying one tab's terminal: a
+snapshot of what is on screen now, then everything that happens next.
+It shares the session's socket path with the JSON control plane but not
+its framing — after a one-line handshake the wire turns binary and
+stays that way.
+
+Why a second connection at all: the control plane is serial
+request→response, so keystrokes would queue behind their own acks and a
+slow op like [`tab.dump`](#tabdump) would head-of-line-block typing.
+The data connection is unacknowledged and bidirectional, which is what
+keeps input latency flat under control-plane load.
+
+#### The handshake
+
+The **first line** a connection writes decides what it is. A JSON
+object carrying `attach` and **no** `op` is a data handshake; anything
+else — an op-carrying envelope (even one that also has `attach`), a
+non-object, malformed JSON — stays a request connection and behaves
+exactly as it did before the data plane existed. The test applies to
+the first line only, so a request stream can never be diverted
+mid-flight by a payload that happens to look like a handshake.
+
+```json
+{"attach": "1a0be5c37d924f68b1c05e3a7f2d8496", "protocol_version": 2,
+ "resume_from_seq": 8814, "server_epoch": 6032428321756423947,
+ "tab_generation": 3}
+```
+
+`attach` and `protocol_version` are required; the resume triple is
+optional and all-or-nothing in practice (see [Resume](#resume) below).
+Decode is **permissive** — a newer client may carry fields this build
+has never heard of, and refusing the whole handshake over one would
+turn an additive change into a hard incompatibility.
+
+**Scope:** this sniff exists on Rust-served sockets only. The Mac UI's
+Swift IPC server has no data plane and is untouched — a handshake line
+there gets the `parse-error` it always got. A Rust **UI** socket
+recognizes the shape and answers `not-supported`, which is a different
+and more useful thing to tell a client than "your JSON is bad".
+
+The reply is one JSON line. Accepted:
+
+```json
+{"ok": true, "kind": "ghostty-snapshot", "mode": "snapshot",
+ "seq": 8813, "server_epoch": 6032428321756423947, "tab_generation": 3}
+```
+
+Rejected — then the connection closes, and **nothing binary is ever
+written**, so a client that got a refusal never has to guess whether
+the bytes after it are frames:
+
+```json
+{"ok": false, "error": {"code": "invalid-token", "message": "..."}}
+```
+
+| Code | Meaning |
+|---|---|
+| `protocol-mismatch` | wrong `protocol_version`. Checked **before** the token: the two ends disagree about what a token even is, and `invalid-token` would send the client hunting for the wrong bug. |
+| `invalid-token` | unknown, expired, already-used, or purged by a takeover. |
+| `taken-over` | the lease the token was minted under is no longer current. |
+| `not-found` | the tab has no live terminal, or was respawned between `tab.attach` and this handshake. |
+| `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. |
+| `shutting-down` | `session.stop` has latched. |
+| `parse-error` | the handshake line did not decode. |
+| `not-supported` | this socket serves no data connections. |
+
+`mode` is `"snapshot"` or `"resume"`, and `seq` is the **fence**: the
+client has everything up to and including it, and the first `PTY` frame
+carries `seq + 1`. In snapshot mode the fence is the snapshot's own
+encode point; in resume mode it is `resume_from_seq - 1`.
+
+#### Preamble and frames
+
+After an accepted reply the server writes the 8-byte magic
+`ROOSTDP2` — a client that reads anything else has negotiated with a
+host it cannot talk to and must not try to parse what follows — and
+then frames flow both ways:
+
+```text
+frame := u32-LE payload length | u8 type | payload
+```
+
+| Type | Dir | Payload |
+|---|---|---|
+| `0x01` `SNAP` | S→C | the next bytes of the encoded snapshot stream |
+| `0x02` `PTY` | S→C | `u64-LE seq` \| raw PTY bytes |
+| `0x03` `EXIT` | S→C | `u64-LE final_seq` \| `i32-LE` exit code |
+| `0x0F` `ERROR` | S→C | JSON `{code, message}`; the connection closes after it |
+| `0x11` `INPUT` | C→S | raw encoded key/paste bytes, ordered and unacknowledged |
+| `0x12` `RESIZE` | C→S | `u16-LE cols` \| `rows` \| `cell_w_px` \| `cell_h_px` |
+
+Rules, all fatal (best-effort `ERROR`, then close). Only the first is
+the framer's — it has to be, because it bounds the allocation made
+before anyone sees the frame; the rest belong to the endpoint that
+knows the protocol state, which is why a client validates the widths of
+what the server sends and vice versa:
+
+* **1 MiB per payload** (`MAX_DATA_FRAME_BYTES`), both directions,
+  reader and writer. A client with a bigger paste **splits it across
+  `INPUT` frames** — this is the client's job, not something the server
+  will do for it. The server splits an oversized snapshot record across
+  `SNAP` frames for the same reason.
+* Fixed-width payloads are exactly that width: `PTY` ≥ 9 bytes,
+  `EXIT` == 12, `RESIZE` == 8.
+* A zero-length payload is meaningful only for `SNAP`. An empty `INPUT`
+  is a `protocol-error`.
+* An unknown type byte is a `protocol-error` naming the byte. The
+  framer hands it up rather than failing the decode, precisely so the
+  endpoint can name it.
+
+`EXIT` is **always the last frame** on a connection that sees one, and
+`final_seq == last PTY seq + 1` — the exit consumes an ordinal of its
+own, so a client that has applied `PTY` frame `final_seq - 1` knows it
+missed nothing. Pixel dimensions on `RESIZE` are load-bearing, not
+decoration: the server terminal's resize and mode-2048 size reports
+both need them.
+
+Ordering, once the stream is running:
+
+1. The whole snapshot prefix **through Ghostty's READY record** goes
+   out at full speed, and live `PTY` frames are absorbed but **held**
+   until it has. A client has no terminal to apply a `PTY` frame to
+   before READY, and making it buffer them would move this queue into
+   every client. The window is tiny — that prefix is just the active
+   screen.
+2. After READY, `PTY` leads: a keystroke's echo must not wait behind a
+   scrollback page.
+3. But the snapshot cannot be starved. At least one `SNAP` frame goes
+   out after 256 KiB of `PTY` payload **or** 50 ms since the last one,
+   whichever comes first — a `yes`-style producer would otherwise hold
+   FINISH off for as long as it kept running, and a slow-but-endless
+   one would never trip a byte floor at all.
+4. `EXIT` goes out only once everything before it has.
+
+The snapshot's own record structure (GHOSTSNP: envelope, READY,
+history pages, FINISH) rides *inside* `SNAP` frames as an opaque byte
+stream — no record alignment, since Ghostty designed the format to be
+embedded and the client's decoder buffers to record boundaries itself.
+Ghostty's READY is the only READY in this design; the transport adds no
+second marker.
+
+`ERROR` frames carry a stable code:
+
+| Code | Meaning |
+|---|---|
+| `desync` | the stream cannot be trusted: a gap or duplicate `seq`, a lagged tee, a snapshot that blew the attach budgets. Re-attach. |
+| `overflow` | the peer is not reading — 8 MiB queued for it, or a single write past its deadline. |
+| `superseded` | a newer data connection took this tab. |
+| `taken-over` | another client took the session lease. |
+| `shutting-down` | `session.stop` latched. |
+| `protocol-error` | the client sent something the framing forbids. |
+
+A gap is fatal rather than papered over because the client's terminal
+would silently diverge and could never tell — and re-attach already
+rebuilds from a fresh snapshot, so there is nothing to gain by
+continuing. Every `ERROR` is best-effort: a peer that stopped reading
+made the write impossible, and EOF is the accepted fallback everywhere
+a label is promised.
+
+#### Resume
+
+A client that already holds a tab's stream up to some seq can ask for
+the rest instead of a whole new snapshot: send `resume_from_seq`
+together with the `server_epoch` and `tab_generation` the original
+`tab.attach` returned. On a hit the reply says `mode: "resume"`, no
+`SNAP` frames are sent at all, and the tab's replay ring (2 MiB,
+oldest evicted) plays back as ordinary `PTY` frames ahead of the live
+ones — through the same contiguity walk, so a hole in the ring is as
+fatal as a hole in the live stream.
+
+Resume is honored only when **all** of these hold:
+
+* `server_epoch` matches this session process exactly. A restarted
+  session mints a fresh random epoch, so a pre-restart stream cannot
+  match — by construction, not by luck.
+* `tab_generation` matches the tab's current pipeline, so a respawned
+  tab's seq space is never streamed under the old one's identity.
+* `ring_front <= resume_from_seq <= last_assigned + 1`. The upper bound
+  is inclusive: `last_assigned + 1` is a valid **empty-slice** resume —
+  the client missed nothing and simply carries on.
+
+Every miss — `resume_from_seq` of `0`, a seq past the end, an evicted
+range, an identity mismatch, a tab task that went away — falls back to
+`mode: "snapshot"` and a full attach **in the same reply**. A resume
+failure is never an error, and a client never has to handle one: it
+reads `mode` and does what it says.
+
+#### Supersede, and one connection per tab
+
+A tab has at most one live data connection. A second *admitted*
+handshake for the same tab supersedes the first, which closes with
+`ERROR superseded` — two forwarders racing one tee is not a state worth
+supporting, and the client that just attached is by definition the
+current one. Admission (token consume, lease re-check, registration,
+supersede) happens as a single step under one lock, so a takeover
+either wholly precedes an attach or wholly follows it.
+
+Client disconnect at any point simply aborts the forwarder; the tab
+keeps running and no partial state survives. That is the difference
+between detaching and stopping: dropping the socket leaves the session
+exactly as it was.
+
+#### Budgets
+
+The budgets are behavior a client can hit, not tuning knobs:
+
+| Budget | Value | On breach |
+|---|---|---|
+| Snapshot half of an attach, in time | 60 s from the fence | `ERROR desync` |
+| Snapshot half of an attach, in bytes | 512 MiB (snapshot + live PTY written alongside it) | `ERROR desync` |
+| Queued-but-unwritten PTY bytes | 8 MiB | `ERROR overflow` |
+| A single stalled write | the push write deadline | `ERROR overflow` |
+
+A slow consumer therefore gets cut off deterministically instead of
+growing the session's memory, and re-attaching immediately afterwards
+works — there is no thrash loop and no cooldown.
+
+**One ordering caveat, documented rather than solved:** control-plane
+[`tab.write`](#tabwrite) and data-plane `INPUT` frames have no
+cross-channel ordering guarantee. They arrive at the tab task in
+whatever order they reach it. `tab.write` is administrative,
+low-frequency scripting; interleaving it with live typing is not a
+supported pattern.
+
 ## Events
 
 Server-push only, delivered on a host-session socket after
@@ -1231,6 +1766,11 @@ atomic on the wire. The set below is exhaustive — the serializer
 (`crates/roost-engine/src/event_push.rs`) is a total match over the
 workspace's event enum, so a new event cannot ship without a name
 here.
+
+`session.stopping` is deliberately **not** in this set: it is not a
+workspace event, it carries no `revision`, and it never rides inside a
+batch. It is the connection's own terminal control envelope — see
+[`events.subscribe`](#eventssubscribe).
 
 * `tab.opened` — `{"tab": <Tab>}`.
 * `tab.closed` — `{"tab_id": "<id>"}`.

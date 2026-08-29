@@ -13,6 +13,33 @@ release workflow asserts they agree).
 
 ### Added
 
+- **Host sessions can be attached to: server terminals and a binary
+  attach stream (HS-1b, #363)** — every tab a `roost-session` spawns now
+  has an authoritative libghostty terminal behind it, fed synchronously by a
+  per-tab task over a bounded channel (so a runaway child feels backpressure
+  instead of the session growing without bound). Three things follow. A
+  program that asks the terminal who it is (DA/DA2), where the cursor is
+  (DSR), or what a palette entry holds now **gets an answer with nobody
+  attached** — it used to hang or time out. `tab.dump` and
+  `tab.dump_resolved` are **served headlessly** from that terminal, through
+  the same densifier the iced UI paints with, so the two cannot drift. And a
+  client can **attach**: `tab.attach` hands out a single-use ticket, a second
+  connection presents it, and the session streams the tab's whole terminal as
+  a snapshot followed by live output — length-prefixed binary frames, 1 MiB
+  cap, `EXIT` always last. A client that drops and comes back can **resume**
+  from where it left off out of a per-tab replay ring, scoped by a random
+  per-process epoch so a restarted session can never silently hand back a
+  stale stream. `session.connect` mints an **interactive lease** — the
+  authority to drive a session, as opposed to read it — and `takeover: true`
+  closes every connection the previous holder had, telling each one why:
+  events connections get a terminal `session.stopping` envelope, data
+  connections an `ERROR` frame. `session.stop` labels its teardown the same
+  way instead of closing bare, closing the last of HS-1a's three documented
+  deviations. **Breaking change:** `events.subscribe` on a session socket now
+  requires that lease and answers `connect-required` without one;
+  `session_protocol` is `2`. Nothing about a UI socket changes — it answers
+  `unknown-op` for the new ops and never sees a binary frame. See
+  [`docs/reference/ipc.md`](docs/reference/ipc.md#data-plane) for the wire.
 - **`roost-session`, an opt-in headless host-session daemon (HS-1a, #363)** —
   a new `crates/roost-session` binary that owns a workspace + PTY supervisor
   with no UI attached, for a session left running with nobody watching (e.g.
@@ -30,15 +57,14 @@ release workflow asserts they agree).
   to `SIGKILL`), and the reply carries a reap report
   (`{reaped, killed, abandoned}`). The wire adds `session.identify`,
   `session.stop`, and `events.subscribe` on this socket only — UI sockets
-  answer `unknown-op` / `not-implemented` for these, unchanged. **Breaking
-  change warning:** `events.subscribe` ships without the lease
-  `session.connect` will require once HS-1b lands attach — anything written
-  against this leaseless form will need to change then. A new `roostctl
+  answer `unknown-op` / `not-implemented` for these, unchanged.
+  (`events.subscribe` shipped leaseless here and is lease-gated by the HS-1b
+  entry above — both land in this release, so there is no leaseless form to
+  write against.) A new `roostctl
   --socket` reaches a running session for any other op; a dedicated
   `make e2e-session` pytest lane (`tools/roosttest/test_session.py`) is now a
   required CI gate. See [`docs/reference/ipc.md`](docs/reference/ipc.md#session-sockets)
-  for the full contract and its documented deviations from the architecture
-  doc.
+  for the full contract.
 - **Terminal snapshot encode + decode in `roost-vt`** — `Terminal::snapshot()`
   serializes a live terminal to libghostty's snapshot byte stream, and
   `SnapshotDecoder` restores one: buffered in a single call, or progressively,

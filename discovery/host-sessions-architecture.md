@@ -1,12 +1,16 @@
 # Host sessions — architecture
 
-Status: **design, with the HS-1a slice shipped** (plan 035, PR #372) —
-`roost-session`'s lifecycle and control plane are live per §8/§4.1
-below; the data plane (§3, §4.3, §5's wrapper wiring, §6, per-tab
-server Terminals) is still design, tracked into HS-1b. This file is
-the technical design the HS milestone plans implement, and stays
-normative for HS-1b/HS-2/HS-3; status annotations below mark what
-HS-1a already shipped. Companion docs:
+Status: **design, with the whole of HS-1 shipped** — HS-1a (plan 035,
+PR #372) for `roost-session`'s lifecycle and control plane per §8/§4.1,
+HS-1b (plan 036) for the data plane: per-tab server Terminals and the
+tab-task pipeline (§3), the binary attach stream (§4.3), the wrapper
+wiring §5 specifies, the one-authority reply rule (§6), and
+`session.connect` leases + takeover (§4.1). All three of HS-1a's
+documented deviations are closed. What remains design is HS-2 and
+beyond: the client side (§5's UI integration, §9), effect envelopes to
+a client (§6), and SSH (§10). This file is the technical design the HS
+milestone plans implement, and stays normative for HS-2/HS-3; status
+annotations below mark what shipped when. Companion docs:
 [`host-sessions-roadmap.md`](host-sessions-roadmap.md) (milestones,
 pinned direction, the HS-1a/HS-1b split) and
 [`host-sessions.md`](host-sessions.md) (rationale). For the shipped
@@ -74,6 +78,21 @@ frames.
 | `roost-cli` | Target rules for two sockets; `roostctl session …` verbs (start/stop/status) as thin ops. |
 
 ## 3. The per-tab pipeline inside `roost-session`
+
+**Shipped in HS-1b** (plan 036) as
+`crates/roost-engine/src/tab_task.rs`, built as specified: the bounded
+reader→task channel (32 chunks), seq assignment relocated onto the
+task, `vt_write` → OSC scan → reply drain → tee → replay ring in that
+order, and the snapshot fence taken on the task between writes.
+Constants as pinned: 2000-line scrollback, 1 MiB continuation cap,
+2 MiB replay ring, 4 concurrent snapshot encodes session-wide. Two
+details the section did not anticipate, both from implementation:
+the reply drain goes through a byte-capped (64 KiB) pending buffer
+rather than blocking on the PTY writer channel — a child that spews
+queries and never reads its input would otherwise deadlock its own
+tab — and *both* Exit producers (reader EOF and the reap task's
+deadline backstop) route through the task, which drains what is queued
+before publishing `Exit`, so `final_seq` is always last byte seq + 1.
 
 Today: `pty_reader_loop` (spawn_blocking, 4 KiB reads) →
 `broadcast::Sender<PtyOutputEvent>` (capacity 256) → per-tab drain
@@ -149,9 +168,10 @@ existing `roost-ipc` framing and op set. New/changed ops:
   session_id, started_at }`. The client calls this **first** on any
   new host connection; every incompatibility is detected here, on
   stable JSON, before any binary frame exists (Herdr's lesson).
-  **Shipped in HS-1a**, with `payload_kinds: []` and
-  `libghostty_build: ""` until HS-1b populates them (attach doesn't
-  exist yet to name a kind for).
+  **Shipped in HS-1a**; **HS-1b populated both fields** —
+  `payload_kinds: ["ghostty-snapshot"]` and a real
+  `libghostty_build` (`ghostty-<16 hex>+snapshot.v1`, derived from the
+  pinned SHA at build time), and bumped `session_protocol` to `2`.
 - `session.connect` `{ takeover: true }` → registers the client and
   returns a **lease**: a cryptographically random token that is the
   interactive-authority boundary (a self-declared client id is
@@ -168,11 +188,15 @@ existing `roost-ipc` framing and op set. New/changed ops:
   revision. Required ordering on a new connection set:
   `session.identify` → `session.connect` → `events.subscribe` /
   `tab.attach`; out-of-order ops get a clean error naming the
-  missing step. **Not yet enforced**: `session.connect` and its lease
-  don't exist yet, so HS-1a's `events.subscribe` is leaseless and
-  provisional (any client that asks gets pushed events); ordering
-  enforcement arrives with HS-1b's lease — see
-  [ipc.md's deviation list](../docs/reference/ipc.md#session-sockets).
+  missing step. **Shipped in HS-1b** as written, with one resolution:
+  the `identify`-before-`connect` half is deliberately *not* enforced
+  — `identify` is a stateless read, and the load-bearing ordering is
+  lease-before-subscribe/attach, which is. `connect-required` is the
+  clean error naming the missing step. Takeover keeps exactly one
+  tombstone (the most recently displaced lease answers `taken-over`;
+  older ones fall back to `connect-required`) and purges the displaced
+  lease's outstanding attach tokens. See
+  [ipc.md's `session.connect`](../docs/reference/ipc.md#sessionconnect).
 - `session.stop` → graceful shutdown (§8). Distinct from disconnect,
   which is just closing connections. **Shipped in HS-1a**, reap
   report included.
@@ -187,6 +211,12 @@ existing `roost-ipc` framing and op set. New/changed ops:
   arrives at client geometry and no post-READY resize is needed in
   the common case. (This does not violate the detach-doesn't-resize
   rule — attach is exactly when in-process Roost resizes too.)
+  **Shipped in HS-1b**, with a pinned validation order and two fields
+  this section did not name: the result also carries
+  `{server_epoch, tab_generation}`, the resume identity (§4.3), and
+  the params carry the client's `libghostty_build` so the exact-match
+  gate is checked here rather than left to §4.4's `session.identify`
+  advisory.
 - `events.subscribe` → implemented for real (below).
 - Existing ops (`project.*`, `tab.open/close/list/write/resize/
   set_title/agent_report/dump…`) work unchanged — this is the point
@@ -241,23 +271,41 @@ for the wire shape as built: the subscribe ack returns `{revision}`
 as the fence, the first batch is exactly `revision + 1`, every commit
 (including a quiet one) produces a batch so a skipped number always
 means loss, and a bounded per-client queue plus close-don't-thin
-backpressure is implemented as specified. One deviation from this
-section as originally written: the connection is **leaseless** —
-HS-1b's `session.connect` lease is what this doc's §4.1 gates
-`events.subscribe` behind, and until then any client that asks gets
-served (documented as a breaking-change-pending in
-[ipc.md](../docs/reference/ipc.md#session-sockets)). Consumed by
-HS-2.
+backpressure is implemented as specified. HS-1a's one deviation — a
+**leaseless** connection — **is closed in HS-1b**: `events.subscribe`
+now requires the lease §4.1 gates it behind, which is the breaking wire
+change `SESSION_PROTOCOL_VERSION: 2` announces. The stream also gained
+the terminal control envelope §8 calls for: every frame is an
+`EventBatch` except a final revision-less
+`{"event":"session.stopping","data":{"reason":"stop"|"taken-over"}}`,
+exempt from the gap check. Consumed by HS-2.
 
 ### 4.3 Data plane (binary attach stream)
+
+**Shipped in HS-1b** (plan 036), essentially as specified — frame
+types, byte layouts, the 8-byte preamble (`ROOSTDP2`), the 1 MiB
+frame cap, the fence discipline, weighted scheduling, and
+resume-from-seq all landed as written. Deltas worth knowing: the
+handshake carries `server_epoch` + `tab_generation` alongside
+`resume_from_seq` (D6's restart-safety fix — see the resume bullet
+below); step 3's "queues the rest" is implemented **exactly**, as a
+hold — tee records are absorbed but not written until the READY prefix
+is fully out, since a client has no terminal to apply them to yet; and
+the "coalesces queued `SeqBytes`" of the slow-link section became
+per-syscall batching with **one frame per tee record**, not
+cross-record coalescing, because a merged frame would have to invent a
+seq. The wire's authoritative description is
+[ipc.md's Data plane](../docs/reference/ipc.md#data-plane).
 
 One connection per attached tab. First line: JSON handshake
 `{ attach: attach_token, protocol_version, resume_from_seq? }`;
 server replies one JSON line `{ ok, kind, mode: "snapshot" |
 "resume", seq }` — `seq` is the fence value — then the connection
-switches to length-prefixed binary frames, server → client only.
-(This handshake shape is normative; where the roadmap's summary of
-it differs, this section wins.)
+switches to length-prefixed binary frames. The stream is
+**bidirectional**: SNAP/PTY/EXIT/ERROR from the server, INPUT/RESIZE
+from the client, per the table below. (This handshake shape is
+normative; where the roadmap's summary of it differs, this section
+wins.)
 
 ```text
  preamble: 8-byte magic (guards against SSH banners / stray stdout)
@@ -376,6 +424,16 @@ continuation bytes); decode *time* is not capped by the wrapper and
 stays the consumer's watchdog, as below. What follows is the
 specification the wrapper was built to.
 
+**The wiring is shipped in HS-1b too**, though not yet in a UI: the
+Rust integration client (`crates/roost-session/tests/
+attach_stream_test.rs`) drives the real socket, feeds SNAP bytes into
+`SnapshotDecoder`, applies PTY frames through `vt_write` interleaved
+with history steps, and asserts the decoded terminal's dump equals the
+server's `tab.dump` at the fence — including a fence landing
+mid-UTF-8/CSI/OSC/DCS. What is still HS-2 is everything on the UI side
+of this section: `TabBackend::Host`, the host pump, and the
+resize-withhold state machine.
+
 The Ghostty decoder's `GhosttyReader` is synchronous and
 blocking-only (zero-byte read = EOF, never "would block"), the
 decoder may retain borrowed input until FINISH, and the client
@@ -420,6 +478,19 @@ under the decoder's feet):
 - Decoder error → drop the attach, re-attach.
 
 ## 6. One authority for replies and effects
+
+**The server half is shipped in HS-1b.** The tab task drains the
+server Terminal's reply buffer after every `vt_write` *and* every
+resize, so DA/DSR/XTGETTCAP/color queries are answered exactly once,
+detached — `tab.capture_pty_input` on a session socket reads that
+buffer, which is how the exactly-once rule is asserted headlessly, and
+the Rust integration client proves the other half by showing the
+decoded client Terminal's own reply buffer is non-empty and
+verifiably discarded. Effects are the part that did **not** ship:
+`OscAction::Workspace` is applied server-side as specified, but
+client-local effects (OSC 52 write, bell, notifications, pointer
+shape) are dropped and debug-logged rather than sent as envelopes,
+with the seam commented for HS-2. OSC 52 read stays default-deny.
 
 Both VTs parse the same byte stream, and libghostty generates reply
 bytes (DA, DSR, color queries, XTGETTCAP) into a buffer the embedder
@@ -519,10 +590,13 @@ deviation is the client-notification step of Stop, noted inline.
   winner.
 - **Stop:** `session.stop` → refuse new tabs/attaches → notify
   clients (events envelope; data conns close with a labeled ERROR —
-  **deviation: HS-1a notifies push clients by plain connection close,
-  with no reason code; the labeled envelope/ERROR arrives with the
-  data plane in HS-1b, per
-  [ipc.md](../docs/reference/ipc.md#session-sockets)**)
+  **shipped in HS-1b**, closing HS-1a's plain-close deviation: events
+  connections get the terminal `session.stopping` envelope with
+  `reason: "stop"`, data connections an `ERROR shutting-down`, both
+  best-effort under a 2 s deadline with EOF as the accepted fallback
+  when the peer has stopped reading; the labeling happens *before* the
+  relays are aborted, or the peer would get a bare EOF it could not
+  tell from a crash)
   → flush `state.json` (existing `Workspace::flush`) → **awaited**
   `shutdown_all(deadline)` reap of every child (SIGHUP, waitpid
   loop, SIGKILL escalation — the current `terminate_child` is a
@@ -631,7 +705,7 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 | Version / payload-kind mismatch | Clean `session.identify` error naming both versions; nothing binary ever sent. Localhost after a package upgrade is the *common* instance — HS-2's "Restart session" flow (§4.4). |
 | Tab process exits mid-attach | Server completes the SNAP stream, flushes pending PTY frames, then sends EXIT as the final frame — EXIT is always last on a data conn. (The engine's existing deadline path can emit Exit before trailing bytes internally; the data plane reorders so EXIT is terminal.) |
 | Takeover mid-attach | Prior client's data conn closes mid-SNAP (ordinary close/ERROR path); its control/events conns close with a `taken-over` envelope. |
-| `session.stop` during attach | Clients get a labeled shutdown envelope on events; data conns close with ERROR(shutting-down), not bare EOF. (HS-1b — HS-1a's events connections close plain, per §8's deviation note.) |
+| `session.stop` during attach | Clients get a labeled shutdown envelope on events; data conns close with ERROR(shutting-down), not bare EOF. (**Shipped in HS-1b**; EOF stays the fallback for a peer that has stopped reading.) |
 | Tab task panic | Tab marked dead, EXIT-equivalent to attached clients, rest of session unaffected; crash-report path per existing engine crash handling. |
 | Session crash | Children die; layout persisted; client shows host disconnected; reconnect = fresh shells, same layout. |
 | Client crash / quit | Session unaffected (this is the feature). |
@@ -655,10 +729,27 @@ contract tests in `crates/roost-engine/tests/`
 `session_ops_test.rs`, `pty_shutdown_test.rs`) plus the
 `session_daemon`-marked pytest module
 (`tools/roosttest/test_session.py`) and its required `session-e2e` CI
-job. The attach/data-plane/perf items in the lists below (fence on
-the tab task, resume-from-seq, snapshot byte fidelity, exactly-once
-replies, the input-latency-under-`tab.dump` budget) remain HS-1b work
-— annotated where they occur.
+job.
+
+**HS-1b shipped the rest of this section**: the attach/data-plane/perf
+items called out below (fence on the tab task, resume-from-seq,
+snapshot byte fidelity, exactly-once replies, the
+input-latency-under-`tab.dump` budget) are covered by
+`crates/roost-engine/tests/tab_task_test.rs` +
+`attach_forwarder_test.rs`, the Rust integration client
+`crates/roost-session/tests/attach_stream_test.rs` (the only place
+GHOSTSNP is semantically decoded — Python never reimplements it), and
+the new `tools/roosttest/test_session_attach.py` contract lane
+(+ `dataplane.py`, a frame reader and record-*tag* scanner only), all
+on the same `session_daemon` marker and the same required `session-e2e`
+job. Four items from the lists below are **deferred, not done**, with
+destinations: large-paste throughput over an artificially delayed link
+→ HS-3 (needs a link-shaping harness); the package-upgrade-while-
+running restart flow → HS-2 (§4.4 assigns the UI flow there);
+client-side gap/duplicate/generation rejection and the resize-withhold
+state machine → HS-2's client (the wire rules are documented, and the
+server side is proven gap-free here); colliding integer ids across
+hosts → HS-2 (needs two hosts and a client).
 
 - **Rust unit tier** (repo convention, `_test.rs` under `tests/`):
   the §5 record-boundary buffering (split headers, partial records,
@@ -667,13 +758,13 @@ replies, the input-latency-under-`tab.dump` budget) remain HS-1b work
   down to 1-byte feeds, corruption/truncation, caps, continuation
   round-trips); fence assignment on the tab task (including the
   HS-0→HS-1 seq relocation — a test pins fence semantics across the
-  move — **HS-1b, tab task doesn't exist yet**); the resize-withhold
-  state machine (**HS-1b**); **exactly-once replies**
-  (DA/DSR/color query answered once by the server, client reply
-  buffer verifiably discarded — the two-VT design reintroduces the
-  doubled-reply bug class `osc_drain_reply_test.rs` exists for, so
-  it gets the same treatment — **HS-1b, no server VT yet to answer
-  from**); `Error::from_result` coverage for any new codes.
+  move — **shipped in HS-1b**); the resize-withhold
+  state machine (**deferred to HS-2 with the client**); **exactly-once
+  replies** (DA/DSR/color query answered once by the server, client
+  reply buffer verifiably discarded — the two-VT design reintroduces
+  the doubled-reply bug class `osc_drain_reply_test.rs` exists for, so
+  it gets the same treatment — **shipped in HS-1b**, proven from both
+  sides); `Error::from_result` coverage for any new codes.
 - **HS-1 (no UI):** a roosttest module speaks both planes from
   Python — control ops via the existing IPC client, the data plane
   via a small binary-frame reader. **HS-1a shipped the control-plane
@@ -682,8 +773,9 @@ replies, the input-latency-under-`tab.dump` budget) remain HS-1b work
   identify, the events atomic-batch fence and resync, stale-socket
   recovery, hydration, and OSC drain are covered there and in the
   Rust tests listed above. Everything below that names `seq`, attach,
-  takeover, or the data connection is **HS-1b** (takeover needs
-  `session.connect`'s lease, which doesn't exist yet). Contract tests: fence
+  takeover, or the data connection **shipped in HS-1b** as
+  `tools/roosttest/test_session_attach.py`, except the four deferrals
+  named at the top of this section. Contract tests: fence
   correctness (no lost/duplicated bytes around `seq`), READY-before-history
   ordering, PTY-frame priority, resume-from-seq (ring hit and ring
   miss), a fast-producer/slow-consumer soak proving no attach
@@ -715,12 +807,15 @@ replies, the input-latency-under-`tab.dump` budget) remain HS-1b work
   budget in HS-1 acceptance: localhost attach of a 2000-line tab
   reaches READY < 500 ms; N concurrent attaches bounded (exact N in
   the plan); input latency and large-paste throughput measured over
-  an artificially delayed link. New modules must be added to the
-  Makefile `ICED_E2E_TESTS` and CI lists or they never run — and
-  the new `roost-session` crate + lane must be added to CI's
-  **path filters**, or the lane silently won't run on the PRs that
-  matter; whether the session lane lives under the iced lists or
-  its own job (it needs no iced build) is decided in the HS-1 plan.
+  an artificially delayed link. **Shipped in HS-1b** as median-of-3
+  under 500 ms × `ROOST_TEST_TIMEOUT_SCALE`, N = 8 distinct tabs
+  within twice that, and an input-latency case measured during a large
+  `tab.dump`; the delayed-link large-paste measurement is the HS-3
+  deferral above. The session lane got **its own job** (`session-e2e`,
+  marker-based, no enumerated CI lists to update) with its own path
+  filters — decided in HS-1a and unchanged by HS-1b, which only added
+  a module to `SESSION_E2E_TESTS` and a ghostty build step now that
+  `roost-session` links `roost-vt/ffi`.
 - **HS-2:** the same lane, now driving the real iced client against
   a session (the harness already launches either target); screenshot
   smoke for the Hosts chrome.
@@ -736,9 +831,16 @@ replies, the input-latency-under-`tab.dump` budget) remain HS-1b work
   per commit including empty ones — see
   [ipc.md's `events.subscribe`](../docs/reference/ipc.md#eventssubscribe).
 - Whether `session.connect` carries the client theme seed or a
-  separate op does (§6).
-- Data-plane priority implementation detail (two queues vs one with
-  priority) and the exact forwarder/ring byte budgets — HS-1 plan.
+  separate op does (§6). Still open — HS-1b's `session.connect` takes
+  `{takeover}` only, and the server terminal's palette is seeded from
+  its own defaults at spawn with no reseed op.
+- ~~Data-plane priority implementation detail (two queues vs one with
+  priority) and the exact forwarder/ring byte budgets~~ **Resolved,
+  shipped in HS-1b**: one pump, no second queue — the snapshot and the
+  tee are weighed against each other per frame (PTY leads; SNAP is
+  guaranteed a turn after 256 KiB of PTY payload or 50 ms). Budgets:
+  2 MiB replay ring, 8 MiB forwarder queue, 512 MiB / 60 s per attach.
+  See [ipc.md's Data plane](../docs/reference/ipc.md#data-plane).
 - Remote image paste policy over SSH (HS-3 plan; OSC 52 read is
   already pinned default-deny).
 - Mac `roost-session` packaging (post-HS-3; code is portable
