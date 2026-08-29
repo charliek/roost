@@ -32,6 +32,30 @@
 //! the client's terminal would silently diverge — so it ends the
 //! connection with `ERROR desync` and lets a re-attach rebuild from a
 //! fresh snapshot.
+//!
+//! # Resume
+//!
+//! A client that already holds this tab's stream up to some seq can ask
+//! for the rest instead of a whole new snapshot, and then the shape
+//! above loses its left half:
+//!
+//! ```text
+//!   ring slice ──┐
+//!                ├─► PTY frames ─► the client's decoder
+//!   tab tee ─────┘
+//! ```
+//!
+//! The fence is `resume_from_seq - 1`, there are no SNAP frames at all,
+//! and the ring records the client missed are framed through the same
+//! contiguity walk the live ones are — a hole in the ring is as fatal as
+//! a hole in the tee. The slice and the tee subscription come out of the
+//! tab task together ([`TabCmd::Resume`]), so nothing can be published
+//! between reading one and taking the other.
+//!
+//! Resume is an optimization, never a demand: a stale epoch, a respawned
+//! tab, a seq the ring no longer covers, or a tab task that went away all
+//! fall back to a full snapshot **in the same reply**. A client is told
+//! which it got by `mode`, and never has to handle a resume failure.
 
 use std::time::{Duration, Instant};
 
@@ -166,19 +190,31 @@ async fn attach_tab(
     // the encode queues behind `MAX_CONCURRENT_SNAPSHOTS` and is exactly
     // the part of an attach the time budget exists to bound.
     let started = Instant::now();
-    let fenced = match fence_tab(h, tab_generation, tab_id).await {
-        Ok(fenced) => fenced,
-        Err((code, message)) => {
-            reject(&mut writer, code, &message).await;
-            return;
-        }
+    // Resume first, and only ever as an optimization: everything it
+    // cannot honor comes back `None` and is served as a full attach
+    // under the same reply (D6).
+    let attached = match resume_tab(h, tab_generation, tab_id, handshake).await {
+        Some(attached) => attached,
+        None => match fence_tab(h, tab_generation, tab_id).await {
+            Ok(fenced) => fenced,
+            Err((code, message)) => {
+                reject(&mut writer, code, &message).await;
+                return;
+            }
+        },
     };
-    let Fenced {
+    let Attached {
         tee,
         commands,
+        mode,
+        seq: fence,
+        server_epoch,
+        tab_generation: live_generation,
         snapshot,
         ready_end,
-    } = fenced;
+        replay,
+        stored_exit,
+    } = attached;
 
     // The fence is a round trip through the tab task, and a supersede or
     // a takeover during it means this client lost authority before it
@@ -192,23 +228,12 @@ async fn attach_tab(
         return;
     }
 
-    // `resume_from_seq` is accepted and answered with `mode: "snapshot"`
-    // — a documented, legal fallback (D6: every unhonorable resume falls
-    // back rather than erroring). C6 turns the honorable cases into
-    // `TabCmd::Resume` here; until then every attach is a full one.
-    if handshake.resume_from_seq.is_some() {
-        debug!(
-            tab_id,
-            "resume requested; answering with a full snapshot until the ring handoff lands"
-        );
-    }
-
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
         kind: AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
-        mode: AttachMode::Snapshot,
-        seq: snapshot.seq,
-        server_epoch: snapshot.server_epoch,
-        tab_generation: snapshot.tab_generation,
+        mode,
+        seq: fence,
+        server_epoch,
+        tab_generation: live_generation,
     });
     let Ok(body) = serde_json::to_vec(&accepted) else {
         return;
@@ -220,30 +245,46 @@ async fn attach_tab(
         return;
     }
 
-    let fence = snapshot.seq;
     let ending = Pump {
         tab_id,
         commands,
         tee,
         writer,
         close,
-        snapshot: snapshot.bytes,
+        snapshot,
         ready_end,
+        replay,
+        stored_exit,
         fence,
         started,
     }
     .run(reader)
     .await;
-    debug!(tab_id, ?ending, "attach data connection ended");
+    debug!(tab_id, ?mode, ?ending, "attach data connection ended");
 }
 
-/// A tab pinned for one attach: the two live streams, and the snapshot
-/// every byte that follows is measured against.
-struct Fenced {
+/// A tab pinned for one attach: the live tee, the fence every byte that
+/// follows is measured against, and whichever catch-up the client is
+/// owed — an encoded snapshot (`mode: "snapshot"`) or the ring records it
+/// missed (`mode: "resume"`), never both.
+struct Attached {
     tee: broadcast::Receiver<PtyOutputEvent>,
     commands: mpsc::Sender<TabCmd>,
-    snapshot: SnapshotAt,
+    mode: AttachMode,
+    /// The fence: the client has everything up to and including this,
+    /// and the first PTY frame carries `seq + 1`.
+    seq: u64,
+    server_epoch: u64,
+    tab_generation: u64,
+    /// Empty in resume mode — the client already has this history.
+    snapshot: Vec<u8>,
     ready_end: usize,
+    /// Pre-fence records from the replay ring, sent as ordinary PTY
+    /// frames ahead of the live tee. Empty in snapshot mode.
+    replay: Vec<(u64, Vec<u8>)>,
+    /// An exit the tab published before this connection subscribed, so a
+    /// resume that arrives after the tab died still ends in EXIT.
+    stored_exit: Option<(u64, i32)>,
 }
 
 /// Everything that must hold before a byte of terminal goes out, in the
@@ -254,7 +295,7 @@ async fn fence_tab(
     h: &IpcHandler,
     tab_generation: u64,
     tab_id: i64,
-) -> Result<Fenced, (&'static str, String)> {
+) -> Result<Attached, (&'static str, String)> {
     let no_terminal = || ("not-found", "that tab has no live terminal".to_string());
     // Subscribed FIRST, before the snapshot is even asked for: the
     // encode runs on the tab task between two chunks, so a subscription
@@ -307,11 +348,91 @@ async fn fence_tab(
         )
     })?;
 
-    Ok(Fenced {
+    Ok(Attached {
         tee,
         commands,
-        snapshot,
+        mode: AttachMode::Snapshot,
+        seq: snapshot.seq,
+        server_epoch: snapshot.server_epoch,
+        tab_generation: snapshot.tab_generation,
+        snapshot: snapshot.bytes,
         ready_end,
+        replay: Vec::new(),
+        stored_exit: None,
+    })
+}
+
+/// The resume handoff (D6), or `None` for every reason it cannot be
+/// honored — a stale epoch, a respawned tab, a seq outside the ring, a
+/// tab task that is gone. Never an error: the caller serves a full
+/// snapshot instead, in the same reply, and a client that has been away
+/// too long simply pays for a snapshot rather than being told off.
+///
+/// Nothing here subscribes to the tee. The whole point is that the ring
+/// slice and the subscription come back from one turn of the tab task
+/// ([`TabCmd::Resume`]), with no instant in between for a record to fall
+/// into.
+async fn resume_tab(
+    h: &IpcHandler,
+    tab_generation: u64,
+    tab_id: i64,
+    handshake: &AttachHandshake,
+) -> Option<Attached> {
+    let from_seq = handshake.resume_from_seq?;
+    // Seqs start at 1, so `0` is a client holding nothing at all — which
+    // is a snapshot, not a resume.
+    if from_seq == 0 {
+        return None;
+    }
+    // A restarted daemon mints a fresh random epoch, so a stream from
+    // before the restart cannot match here. That is the whole reason the
+    // epoch is random rather than a counter: a client cannot resume onto
+    // a different server's seq space even by accident.
+    let server_epoch = h.supervisor.server_epoch()?;
+    if handshake.server_epoch != Some(server_epoch) {
+        return None;
+    }
+    // Channel and generation under one lock, so the pipeline that
+    // answers `Resume` is provably the one whose identity was just
+    // checked — against what the client claims AND against what the
+    // token was minted for. The second half of that has no test: it
+    // needs the same `tab_id` respawned between `tab.attach` and the
+    // handshake, and ids are never reused. It is the resume twin of the
+    // snapshot path's own generation re-check, and it stays for the same
+    // reason: streaming a second terminal's seq space under the first's
+    // identity is the exact thing the generation exists to prevent.
+    let (commands, live_generation) = h.supervisor.tab_task_handle(tab_id)?;
+    if handshake.tab_generation != Some(live_generation) || live_generation != tab_generation {
+        return None;
+    }
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    commands
+        .send(TabCmd::Resume {
+            from_seq,
+            reply: reply_tx,
+        })
+        .await
+        .ok()?;
+    let resumed = match reply_rx.await.ok()? {
+        Ok(resumed) => resumed,
+        Err(error) => {
+            debug!(tab_id, from_seq, %error, "resume is unservable; falling back to a snapshot");
+            return None;
+        }
+    };
+
+    Some(Attached {
+        tee: resumed.receiver,
+        commands,
+        mode: AttachMode::Resume,
+        seq: from_seq - 1,
+        server_epoch,
+        tab_generation: live_generation,
+        snapshot: Vec::new(),
+        ready_end: 0,
+        replay: resumed.slice,
+        stored_exit: resumed.stored_exit,
     })
 }
 
@@ -331,8 +452,13 @@ struct Pump {
     tee: broadcast::Receiver<PtyOutputEvent>,
     writer: OwnedWriteHalf,
     close: ConnCloseWatch,
+    /// Empty on a resume, which is what makes the whole SNAP half of the
+    /// pump inert: no frames, no budgets, no scheduling floors.
     snapshot: Vec<u8>,
     ready_end: usize,
+    /// Ring records replayed as PTY frames before the live tee.
+    replay: Vec<(u64, Vec<u8>)>,
+    stored_exit: Option<(u64, i32)>,
     fence: u64,
     /// When the attach's snapshot half began — at the fence, not at the
     /// first frame. [`ATTACH_TIME_BUDGET`] is measured from here.
@@ -399,6 +525,17 @@ impl Pump {
                     message,
                 })
                 .await;
+        }
+
+        // A resume starts with what the client missed, framed through
+        // the very same fence walk the live tee goes through: the ring
+        // slice must be contiguous from the fence too, so a hole in it
+        // ends the connection instead of reaching a terminal that could
+        // never tell. Nothing to do in snapshot mode — the replay is
+        // empty and the loop below starts at the tee.
+        if let Some(ending) = self.preload(&mut tee).await {
+            client_task.abort();
+            return self.finish(ending).await;
         }
 
         let ending = 'pump: loop {
@@ -579,6 +716,27 @@ impl Pump {
 
         client_task.abort();
         self.finish(ending).await
+    }
+
+    /// Frame the resume handoff's records into the tee state, ahead of
+    /// anything the live subscription carries. `Some` ends the
+    /// connection.
+    async fn preload(&mut self, tee: &mut TeeState) -> Option<Ending> {
+        for (seq, data) in std::mem::take(&mut self.replay) {
+            if let Err(ending) = tee.absorb(PtyOutputEvent::Bytes { seq, data }).await {
+                return Some(ending);
+            }
+        }
+        // The tab died before this client came back, so its `Exit` is not
+        // on the subscription — it was published before it existed — and
+        // the handoff carried it instead. Absorbed like any other record
+        // so it stays the final frame, after the slice.
+        if let Some((seq, code)) = self.stored_exit {
+            if let Err(ending) = tee.absorb(PtyOutputEvent::Exit { seq, code }).await {
+                return Some(ending);
+            }
+        }
+        None
     }
 
     /// Route one client frame. `Some` ends the connection.

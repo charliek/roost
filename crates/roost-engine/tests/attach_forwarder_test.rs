@@ -169,6 +169,27 @@ impl Harness {
         data.read_snapshot().await;
         (client, tab_id, data)
     }
+
+    /// A tab that has been attached once and has gone quiet again, with
+    /// the data connection dropped the way a client's would be. The seq
+    /// is the last record that client applied — what it would carry into
+    /// `resume_from_seq + 1`.
+    async fn caught_up(&self) -> (IpcClient, String, i64, u64) {
+        let (mut client, lease, tab_id) = self.leased_tab().await;
+        let ticket = attach(&mut client, &lease, tab_id).await;
+        let (accepted, mut data) = dial(&self.socket, handshake(&ticket.attach_token))
+            .await
+            .expect("accepted");
+        let (_snapshot, pty) = data.read_snapshot().await;
+        // Round-tripped rather than assumed: reading one marker back
+        // proves the tab is quiesced at a seq this test knows, instead of
+        // guessing that nothing was in flight behind FINISH.
+        let after = pty.last().map_or(accepted.seq, |(seq, _)| *seq);
+        feed(&mut client, tab_id, b"ROOST_CAUGHT_UP\r\n".to_vec()).await;
+        let (applied, _) = data.read_pty_until(after, b"ROOST_CAUGHT_UP").await;
+        drop(data);
+        (client, lease, tab_id, applied)
+    }
 }
 
 async fn attach(client: &mut IpcClient, lease: &str, tab_id: i64) -> TabAttachResult {
@@ -259,6 +280,23 @@ fn handshake(token: &str) -> serde_json::Value {
     serde_json::json!({"attach": token, "protocol_version": SESSION_PROTOCOL_VERSION})
 }
 
+/// The same handshake, plus the resume triple. Every field is spelled
+/// out by the caller so a test can lie about exactly one of them.
+fn resume_handshake(
+    token: &str,
+    from_seq: u64,
+    server_epoch: u64,
+    tab_generation: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "attach": token,
+        "protocol_version": SESSION_PROTOCOL_VERSION,
+        "resume_from_seq": from_seq,
+        "server_epoch": server_epoch,
+        "tab_generation": tab_generation,
+    })
+}
+
 impl DataClient {
     async fn next(&mut self) -> Option<DataFrame> {
         timeout(BUDGET, self.reader.next_frame())
@@ -302,6 +340,35 @@ impl DataClient {
         }
         (snapshot, pty)
     }
+}
+
+impl DataClient {
+    /// Read PTY frames until `marker` has come through, asserting the
+    /// stream is contiguous from `after + 1` and carries nothing but PTY
+    /// frames — which is also what makes "a resume sends no SNAP"
+    /// observable. Returns the last seq seen and the bytes read.
+    async fn read_pty_until(&mut self, after: u64, marker: &[u8]) -> (u64, Vec<u8>) {
+        let mut next = after + 1;
+        let mut text = Vec::new();
+        while !contains(&text, marker) {
+            let frame = self.frame().await;
+            assert_eq!(
+                frame.frame_type, FRAME_PTY,
+                "expected PTY frames and nothing else"
+            );
+            let (seq, bytes) = split_pty(&frame);
+            assert_eq!(seq, next, "PTY frames must be contiguous");
+            next += 1;
+            text.extend_from_slice(&bytes);
+        }
+        (next - 1, text)
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn split_pty(frame: &DataFrame) -> (u64, Vec<u8>) {
@@ -932,4 +999,356 @@ async fn an_attach_after_the_stop_latch_is_refused() {
         .await
         .expect_err("an unminted token is not admissible");
     assert_eq!(unknown.code, "invalid-token");
+}
+
+// ---------------------------------------------------------------------
+// Resume — the ring instead of a snapshot, and every way it falls back
+// ---------------------------------------------------------------------
+
+/// The hit: a client that was away for a few records gets exactly those
+/// records back, as ordinary PTY frames, with no snapshot in sight — and
+/// the live tee continues from them without a seam.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    // What the client misses while it is away. Dumped first so the ring
+    // provably holds it before the handoff runs.
+    let missed = b"ROOST_MISSED_ONE\r\nROOST_MISSED_TWO\r\n";
+    feed(&mut client, tab_id, missed.to_vec()).await;
+    wait_for_dump(&mut client, tab_id, "the missed bytes to land", |d| {
+        d.rows_text
+            .iter()
+            .any(|row| row.contains("ROOST_MISSED_TWO"))
+    })
+    .await;
+
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+    )
+    .await
+    .expect("accepted");
+    assert_eq!(accepted.mode, AttachMode::Resume);
+    assert_eq!(accepted.seq, applied, "the fence is resume_from_seq - 1");
+    assert_eq!(accepted.server_epoch, ticket.server_epoch);
+    assert_eq!(accepted.tab_generation, ticket.tab_generation);
+
+    let (last, replayed) = data.read_pty_until(applied, b"ROOST_MISSED_TWO").await;
+    assert_eq!(
+        replayed, missed,
+        "the ring hands back the missed bytes, exactly and only them"
+    );
+
+    // The subscription came out of the same handoff, so the live stream
+    // continues from the replay with no gap and no duplicate.
+    feed(&mut client, tab_id, b"ROOST_LIVE_AGAIN\r\n".to_vec()).await;
+    let (mut last, live) = data.read_pty_until(last, b"ROOST_LIVE_AGAIN").await;
+    assert_eq!(live, b"ROOST_LIVE_AGAIN\r\n");
+
+    // Drained to the end of the connection rather than stopping at the
+    // last marker: "no SNAP frames" is a claim about the whole resumed
+    // stream, and a scheduling floor that fired late would show up here.
+    // Closing the tab is what makes the drain terminate without a sleep.
+    client
+        .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
+        .await
+        .expect("tab.close");
+    loop {
+        let frame = data.frame().await;
+        match frame.frame_type {
+            FRAME_PTY => {
+                let (seq, _) = split_pty(&frame);
+                assert_eq!(seq, last + 1, "PTY frames stay contiguous to the end");
+                last = seq;
+            }
+            FRAME_EXIT => break,
+            other => panic!("a resumed stream carries no frame {other:#04x}"),
+        }
+    }
+    assert!(data.next().await.is_none());
+}
+
+/// `last_assigned + 1` is a hit, not a miss: the client missed nothing,
+/// and an empty slice is the honest answer. It must not be turned into a
+/// snapshot the client already has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_slice_resume_is_a_hit() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+    )
+    .await
+    .expect("accepted");
+    assert_eq!(accepted.mode, AttachMode::Resume);
+    assert_eq!(accepted.seq, applied);
+
+    feed(&mut client, tab_id, b"ROOST_AFTER_NOTHING\r\n".to_vec()).await;
+    let (_, text) = data.read_pty_until(applied, b"ROOST_AFTER_NOTHING").await;
+    assert_eq!(
+        text, b"ROOST_AFTER_NOTHING\r\n",
+        "nothing was missed, so the first frame is a live one"
+    );
+}
+
+/// The eligibility rules, one dial each. None of these is an error and
+/// none of them is a refusal: an unhonorable resume triple is served as
+/// a full attach, and `mode` is how the client finds out.
+///
+/// Not covered here, because it is not reachable through the wire: the
+/// resume path also checks the live generation against the one the
+/// *token* was minted for. Reaching it needs a respawn of the same
+/// `tab_id` between `tab.attach` and the handshake, and ids are never
+/// reused — the same guard on the snapshot path
+/// (`the_control_op_refuses_what_cannot_be_served`) is equally
+/// unreachable from a test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unhonorable_resume_triple_falls_back_to_a_snapshot() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    // Seq 0: a client holding nothing is asking for everything.
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    falls_back(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            0,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+        "seq 0",
+    )
+    .await;
+
+    // The triple is all-or-nothing: a seq with no identity beside it
+    // names a stream on no particular server.
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    falls_back(
+        &h.socket,
+        serde_json::json!({
+            "attach": ticket.attach_token,
+            "protocol_version": SESSION_PROTOCOL_VERSION,
+            "resume_from_seq": applied + 1,
+        }),
+        "a resume with no identity",
+    )
+    .await;
+
+    // A seq the tab has not reached yet: the client claims to hold
+    // records that do not exist, which is the one direction a replay
+    // could never fix.
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    falls_back(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1_000_000,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+        "a seq past the tab's own",
+    )
+    .await;
+}
+
+/// Dial with a handshake that must not be honored as a resume, and prove
+/// what came back is a real full attach rather than just a label.
+async fn falls_back(socket: &Path, handshake: serde_json::Value, what: &str) {
+    let (accepted, mut data) = dial(socket, handshake)
+        .await
+        .unwrap_or_else(|error| panic!("{what} must be served, not refused: {}", error.code));
+    assert_eq!(
+        accepted.mode,
+        AttachMode::Snapshot,
+        "{what} must fall back to a snapshot"
+    );
+    let (snapshot, _pty) = data.read_snapshot().await;
+    assert!(has_tag(&snapshot, TAG_READY), "{what} must get a snapshot");
+}
+
+/// A generation that is not the tab's current one is a different
+/// terminal with a different seq space. Falling back is the contract —
+/// the client is served, and told by `mode` what it got.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generation_mismatch_falls_back_to_a_snapshot() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch,
+            ticket.tab_generation + 1,
+        ),
+    )
+    .await
+    .expect("a stale resume is served, not refused");
+    assert_eq!(accepted.mode, AttachMode::Snapshot);
+    assert_eq!(
+        accepted.tab_generation, ticket.tab_generation,
+        "the reply carries the tab's real identity, not the claim"
+    );
+    // Really a full attach, not just a label.
+    let (snapshot, _pty) = data.read_snapshot().await;
+    assert!(has_tag(&snapshot, TAG_READY));
+}
+
+/// The epoch is what makes a resume across a daemon restart impossible.
+/// A client claiming the wrong one is exactly that case, and gets the
+/// same fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_epoch_mismatch_falls_back_to_a_snapshot() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch ^ 1,
+            ticket.tab_generation,
+        ),
+    )
+    .await
+    .expect("a stale resume is served, not refused");
+    assert_eq!(accepted.mode, AttachMode::Snapshot);
+    assert_eq!(accepted.server_epoch, ticket.server_epoch);
+    data.read_snapshot().await;
+}
+
+/// A client away long enough for its seq to fall out of the 2 MiB ring
+/// cannot be replayed — the records are gone. It pays for a snapshot
+/// rather than being told off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seq_the_ring_no_longer_covers_falls_back_to_a_snapshot() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    let mut flood = vec![b'.'; 3 * 1024 * 1024];
+    flood.extend_from_slice(b"\r\nROOST_FLOOD_DONE\r\n");
+    feed(&mut client, tab_id, flood).await;
+    wait_for_dump(&mut client, tab_id, "the ring to be overrun", |d| {
+        d.rows_text
+            .iter()
+            .any(|row| row.contains("ROOST_FLOOD_DONE"))
+    })
+    .await;
+
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+    )
+    .await
+    .expect("an evicted resume is served, not refused");
+    assert_eq!(accepted.mode, AttachMode::Snapshot);
+    assert!(
+        accepted.seq > applied,
+        "the snapshot fences at the tab's current seq, far past the evicted one"
+    );
+    data.read_snapshot().await;
+}
+
+/// EXIT is the last frame on a resumed connection too: the whole ring
+/// slice goes out ahead of it, never interleaved with it and never lost
+/// to it.
+///
+/// The tab is killed before a single frame is read, so the replay and
+/// the exit are both waiting on the pump when it starts — the pump
+/// writes its framed batch (step 3) before it will write EXIT (step 4),
+/// which is what this asserts. Which pass EXIT lands in is scheduling
+/// and not pinned here; the ordering is.
+///
+/// The remaining shape — a tab that died *before* the handshake, so the
+/// handoff carries `stored_exit` and the pump absorbs it right behind
+/// the slice — takes this same code path but is not reachable from a
+/// test: the supervisor drops a dead tab's task handle *before* the exit
+/// is published, so a resume that arrives after the death finds no
+/// pipeline and falls back (and its `tab.attach` would already have been
+/// refused). Only the reap's own race window can produce it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_connection_replays_its_slice_then_exits() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    let missed = b"ROOST_LAST_WORDS\r\n";
+    feed(&mut client, tab_id, missed.to_vec()).await;
+    wait_for_dump(&mut client, tab_id, "the missed bytes to land", |d| {
+        d.rows_text
+            .iter()
+            .any(|row| row.contains("ROOST_LAST_WORDS"))
+    })
+    .await;
+
+    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+    )
+    .await
+    .expect("accepted");
+    assert_eq!(accepted.mode, AttachMode::Resume);
+
+    // Before any frame is read: the slice is already in the pump's hands
+    // (the handoff ran during the handshake) and the exit arrives on the
+    // subscription that came with it.
+    client
+        .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
+        .await
+        .expect("tab.close");
+
+    let mut last_seq = applied;
+    let mut replayed = Vec::new();
+    let exit = loop {
+        let frame = data.frame().await;
+        match frame.frame_type {
+            FRAME_PTY => {
+                let (seq, bytes) = split_pty(&frame);
+                assert_eq!(seq, last_seq + 1, "PTY frames stay contiguous");
+                last_seq = seq;
+                replayed.extend_from_slice(&bytes);
+            }
+            FRAME_EXIT => break frame,
+            other => panic!("a resumed stream carries no frame {other:#04x} before EXIT"),
+        }
+    };
+    assert_eq!(
+        replayed, missed,
+        "every record the client missed precedes EXIT"
+    );
+    let final_seq = u64::from_le_bytes(exit.payload[..8].try_into().unwrap());
+    assert_eq!(final_seq, last_seq + 1);
+    assert!(data.next().await.is_none(), "EXIT is the last frame");
 }
