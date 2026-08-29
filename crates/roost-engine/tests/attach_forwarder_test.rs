@@ -849,35 +849,35 @@ async fn a_large_feed_reaches_an_attached_client_as_framed_records() {
     payload.extend_from_slice(b"\r\nROOST_BIG_DONE\r\n");
     let expected = payload.len();
 
-    // Fed from a second connection so this test keeps reading while the
-    // bytes flow: a client that stops reading during a burst this size
-    // is a different test (the forwarder's overflow rule).
-    let socket = h.socket.clone();
-    let feeder = tokio::spawn(async move {
-        let mut feeder = IpcClient::connect(&socket).await.expect("connect");
-        feed(&mut feeder, tab_id, payload).await;
-    });
-
+    // Feed and drain STRICTLY ALTERNATE. FeedBytes bypasses the PTY, so
+    // one 1.5 MB op hits the tab task at memory speed and can legally
+    // lap the forwarder's tee on a slow machine (Lagged is fatal by
+    // contract — that shape is the soak's and CI's macos runner proved
+    // it, not this case's). Each ~96 KiB op is ~24 tee records — far
+    // inside the 256-event window — and every op's frames are fully
+    // read back before the next op exists, so this stays a framing and
+    // fidelity claim on every machine speed.
+    let mut feeder = IpcClient::connect(&h.socket).await.expect("connect");
     let mut seen = 0usize;
     let mut next_seq = None;
-    while seen < expected {
-        let frame = data.frame().await;
-        assert_eq!(
-            frame.frame_type, FRAME_PTY,
-            "a feed produces PTY frames and nothing else"
-        );
-        let (seq, bytes) = split_pty(&frame);
-        if let Some(expected_seq) = next_seq {
-            assert_eq!(seq, expected_seq, "PTY frames stay contiguous");
+    for piece in payload.chunks(96 * 1024) {
+        feed(&mut feeder, tab_id, piece.to_vec()).await;
+        let target = seen + piece.len();
+        while seen < target {
+            let frame = data.frame().await;
+            assert_eq!(
+                frame.frame_type, FRAME_PTY,
+                "a feed produces PTY frames and nothing else"
+            );
+            let (seq, bytes) = split_pty(&frame);
+            if let Some(expected_seq) = next_seq {
+                assert_eq!(seq, expected_seq, "PTY frames stay contiguous");
+            }
+            next_seq = Some(seq + 1);
+            seen += bytes.len();
         }
-        next_seq = Some(seq + 1);
-        seen += bytes.len();
     }
     assert_eq!(seen, expected, "every fed byte arrives exactly once");
-    timeout(BUDGET, feeder)
-        .await
-        .expect("the feed finishes")
-        .ok();
 
     wait_for_dump(&mut client, tab_id, "the fed bytes to render", |d| {
         d.rows_text.iter().any(|row| row.contains("ROOST_BIG_DONE"))
