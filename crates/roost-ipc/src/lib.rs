@@ -22,8 +22,11 @@
 //! * [`socket_state`] — the one shared answer to "is a listener alive
 //!   at this socket path?", used by the bind path and `roostctl
 //!   doctor` and mirrored in Swift.
-//! * [`client`] — `IpcClient`: typed wrappers around the framed
-//!   request/response cycle, one method per op.
+//! * [`client`] — the three client transports: `IpcClient` (typed
+//!   wrappers around the framed request/response cycle), `EventStream`
+//!   (subscribe-then-stream), and `DataConnection` (the attach data
+//!   plane), plus the `ServerCode` mapping of every refusal they can
+//!   hand back.
 //! * [`server`] — `IpcServer` + `Handler` trait. The UI implements
 //!   `Handler`; the server crate drives the accept loop.
 //! * [`peer`] — peer-credential lookup ([`peer_uid`]) behind the
@@ -49,7 +52,8 @@ pub mod session_launch;
 pub mod socket_state;
 pub mod target;
 
-mod client;
+pub mod client;
+
 mod peer;
 mod runtime_dir;
 mod server;
@@ -96,6 +100,13 @@ pub enum Error {
     DataFrameTooLarge,
     #[error("data connection did not open with the expected preamble")]
     BadPreamble,
+    /// A data frame the framer accepted but the endpoint's own rules
+    /// forbid: a fixed-width payload at the wrong width, or a type byte
+    /// this direction may not carry. [`dataframe`] stops at the length
+    /// cap on purpose — that one has to precede the allocation — and
+    /// this is the other half of the split.
+    #[error("data-plane protocol error: {0}")]
+    DataProtocol(String),
 }
 
 impl Error {
@@ -127,6 +138,8 @@ impl Error {
             // protocol at all — the same class of failure as an
             // unparseable line.
             Error::BadPreamble => "parse-error",
+            // The data plane's own `ERROR` catalogue spells this one.
+            Error::DataProtocol(_) => "protocol-error",
         }
     }
 }

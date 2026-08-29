@@ -30,22 +30,19 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use roost_ipc::dataframe::{
-    write_data_frame, DataFrame, DataFrameReader, FRAME_EXIT, FRAME_INPUT, FRAME_PTY, FRAME_SNAP,
-};
-use roost_ipc::framing::{write_frame, FrameReader};
+use roost_ipc::client::{ClientError, DataConnection};
+use roost_ipc::dataframe::{DataFrame, FRAME_EXIT, FRAME_INPUT, FRAME_PTY, FRAME_SNAP};
 use roost_ipc::messages::{
-    ops, AttachAccepted, AttachHandshakeReply, AttachMode, AttachPayloadKind, ResolvedCell,
-    ResponseError, TabAttachParams, TabAttachResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabCloseParams, TabDumpCursor, TabDumpResolvedResult, TabDumpResult,
-    TabFeedPtyBytesParams, SESSION_PROTOCOL_VERSION,
+    ops, AttachAccepted, AttachHandshake, AttachMode, AttachPayloadKind, ResolvedCell,
+    TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabCloseParams, TabDumpCursor, TabDumpResolvedResult, TabDumpResult, TabFeedPtyBytesParams,
 };
 use roost_ipc::IpcClient;
 use roost_vt::{
     Cell, CursorInfo, DecodedTerminal, DrawCell, HistoryStep, ReadyState, RenderState, RenderedRow,
     ScrollViewport, SnapshotDecodeOptions, SnapshotDecoder, Terminal,
 };
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -230,31 +227,33 @@ impl Session {
 // The client half of the data plane
 // ---------------------------------------------------------------------
 
-struct DataClient<R> {
-    reader: DataFrameReader<R>,
-    writer: OwnedWriteHalf,
+/// The shipped client transport ([`roost_ipc::client::DataConnection`])
+/// plus this lane's deadline discipline: every read is bounded, because
+/// a stalled stream is a failure to report and not something to wait
+/// out. The handshake, the preamble, the residue hand-off and the
+/// framing are all the library's — running the real session against the
+/// same code a host client uses is the point.
+struct DataClient<R>(DataConnection<R, OwnedWriteHalf>);
+
+fn handshake(token: &str) -> AttachHandshake {
+    AttachHandshake::snapshot(token)
 }
 
-fn handshake(token: &str) -> serde_json::Value {
-    serde_json::json!({"attach": token, "protocol_version": SESSION_PROTOCOL_VERSION})
-}
-
-fn resume_handshake(ticket: &TabAttachResult, from_seq: u64) -> serde_json::Value {
-    serde_json::json!({
-        "attach": ticket.attach_token,
-        "protocol_version": SESSION_PROTOCOL_VERSION,
-        "resume_from_seq": from_seq,
-        "server_epoch": ticket.server_epoch,
-        "tab_generation": ticket.tab_generation,
-    })
+fn resume_handshake(ticket: &TabAttachResult, from_seq: u64) -> AttachHandshake {
+    AttachHandshake::resume(
+        &ticket.attach_token,
+        from_seq,
+        ticket.server_epoch,
+        ticket.tab_generation,
+    )
 }
 
 /// Dial a data connection and run the handshake: one JSON line out, one
 /// JSON line back, then the preamble and binary for the rest of its life.
 async fn dial(
     socket: &Path,
-    handshake: serde_json::Value,
-) -> Result<(AttachAccepted, DataClient<OwnedReadHalf>), ResponseError> {
+    handshake: AttachHandshake,
+) -> Result<(AttachAccepted, DataClient<OwnedReadHalf>), ClientError> {
     dial_with(socket, handshake, |half| half).await
 }
 
@@ -263,46 +262,30 @@ async fn dial(
 /// split across as many reads as they have bytes.
 async fn dial_one_byte_at_a_time(
     socket: &Path,
-    handshake: serde_json::Value,
-) -> Result<(AttachAccepted, DataClient<OneByteAtATime<OwnedReadHalf>>), ResponseError> {
+    handshake: AttachHandshake,
+) -> Result<(AttachAccepted, DataClient<OneByteAtATime<OwnedReadHalf>>), ClientError> {
     dial_with(socket, handshake, OneByteAtATime).await
 }
 
 async fn dial_with<R: AsyncRead + Unpin>(
     socket: &Path,
-    handshake: serde_json::Value,
+    handshake: AttachHandshake,
     wrap: impl FnOnce(OwnedReadHalf) -> R,
-) -> Result<(AttachAccepted, DataClient<R>), ResponseError> {
+) -> Result<(AttachAccepted, DataClient<R>), ClientError> {
     let stream = UnixStream::connect(socket).await.expect("dial the session");
-    let (read_half, mut writer) = stream.into_split();
-    let body = serde_json::to_vec(&handshake).expect("encode the handshake");
-    write_frame(&mut writer, &body)
-        .await
-        .expect("write the handshake");
-
-    let mut lines = FrameReader::new(wrap(read_half));
-    let line = timeout(budget(), lines.read_line())
-        .await
-        .expect("a handshake reply in time")
-        .expect("read")
-        .expect("the server answers every handshake");
-    let accepted = match serde_json::from_slice(&line).expect("a typed handshake reply") {
-        AttachHandshakeReply::Accepted(accepted) => accepted,
-        AttachHandshakeReply::Rejected(error) => return Err(error),
-    };
-
-    let (read_half, residue) = lines.into_parts();
-    let mut reader = DataFrameReader::new(read_half, residue);
-    timeout(budget(), reader.read_preamble())
-        .await
-        .expect("a preamble in time")
-        .expect("the preamble follows an accepted handshake");
-    Ok((accepted, DataClient { reader, writer }))
+    let (read_half, writer) = stream.into_split();
+    let (accepted, conn) = timeout(
+        budget(),
+        DataConnection::handshake(wrap(read_half), writer, &handshake),
+    )
+    .await
+    .expect("a handshake reply in time")?;
+    Ok((accepted, DataClient(conn)))
 }
 
 impl<R: AsyncRead + Unpin> DataClient<R> {
     async fn next(&mut self) -> Option<DataFrame> {
-        timeout(budget(), self.reader.next_frame())
+        timeout(budget(), self.0.next_frame())
             .await
             .expect("a frame in time")
             .expect("frame read")
@@ -317,12 +300,10 @@ impl<R: AsyncRead + Unpin> DataClient<R> {
     /// claim about what was never sent, and it is only worth anything
     /// because every send goes through here.
     async fn send(&mut self, frame_type: u8, payload: &[u8]) {
-        let mut bytes = Vec::new();
-        write_data_frame(&mut bytes, frame_type, payload)
+        self.0
+            .send_frame(frame_type, payload)
             .await
-            .expect("frame the payload");
-        self.writer.write_all(&bytes).await.expect("write");
-        self.writer.flush().await.expect("flush");
+            .expect("write the frame");
     }
 }
 

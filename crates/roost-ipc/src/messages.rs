@@ -1712,6 +1712,38 @@ pub struct AttachHandshake {
     pub tab_generation: Option<u64>,
 }
 
+impl AttachHandshake {
+    /// A fresh attach: the ticket [`ops::TAB_ATTACH`] minted, and a
+    /// full snapshot stream behind it.
+    pub fn snapshot(attach_token: impl Into<String>) -> Self {
+        AttachHandshake {
+            attach: attach_token.into(),
+            protocol_version: SESSION_PROTOCOL_VERSION,
+            ..AttachHandshake::default()
+        }
+    }
+
+    /// Ask for the stream from `from_seq` on instead of a new snapshot.
+    ///
+    /// The identity triple is what makes a stale stream unresumable by
+    /// construction, so it is not optional here even though serde
+    /// tolerates its absence: a miss on any of the three is answered
+    /// with `mode: "snapshot"` in the same reply, never an error.
+    pub fn resume(
+        attach_token: impl Into<String>,
+        from_seq: u64,
+        server_epoch: u64,
+        tab_generation: u64,
+    ) -> Self {
+        AttachHandshake {
+            resume_from_seq: Some(from_seq),
+            server_epoch: Some(server_epoch),
+            tab_generation: Some(tab_generation),
+            ..AttachHandshake::snapshot(attach_token)
+        }
+    }
+}
+
 /// How the server chose to serve an accepted handshake.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
