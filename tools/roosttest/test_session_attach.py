@@ -516,6 +516,20 @@ def test_finish_arrives_under_a_flooding_producer(env):
         )
         assert conn.error is None, conn.error
         assert conn.snap.finish_seen
+        # The producer's frames may all land BEHIND FINISH on a slow
+        # machine: the snapshot is small and the pump drains it in a few
+        # passes, so whether any PTY frame beats FINISH onto the wire is
+        # a race this case must not bet on (it did once, on a shared CI
+        # runner). The producer is endless, so reading on until the
+        # first PTY frame is deterministic — and proves live output
+        # keeps flowing after the snapshot completes, which is the half
+        # of the claim FINISH itself doesn't cover.
+        if conn.pty_bytes == 0:
+            conn.read_frames_until(
+                lambda f: f.frame_type == dataplane.FRAME_PTY,
+                timeout=30.0,
+                what="live output after FINISH",
+            )
         assert conn.pty_bytes > 0, "the producer wrote nothing during the attach"
         # The flood reached the wire only behind READY. `DataPlane` fails
         # the read itself on a PTY frame ahead of the prefix; this states
