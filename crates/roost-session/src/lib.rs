@@ -8,13 +8,16 @@
 //!
 //! # What makes it a session rather than a headless UI
 //!
-//! `IpcHandler::with_session` is the whole of it. That promotes the
-//! socket: `session.identify` and `session.stop` start answering, tab
-//! sizes default to this session's stated geometry rather than a
-//! window's, and every mutating op becomes gated on the stop latch. The
-//! ops a UI answers by hopping to its main thread — screenshots, dumps,
-//! the palette — fail with `internal: no UI attached`, which is exactly
-//! true.
+//! Two things. `IpcHandler::with_session` promotes the socket:
+//! `session.identify`, `session.stop`, `session.connect` and
+//! `tab.attach` start answering, tab sizes default to this session's
+//! stated geometry rather than a window's, and every mutating op becomes
+//! gated on the stop latch. `PtySupervisor::enable_server_vt` gives
+//! every tab an authoritative server terminal, which is what makes a
+//! headless `tab.dump`, an answered device query, and an attach stream
+//! possible at all. The ops that still need a real UI — screenshots,
+//! the palette, clipboard — fail with `internal: no UI attached`, which
+//! is exactly true.
 //!
 //! # Layout
 //!
@@ -26,15 +29,12 @@
 //! * [`serve`] — bind, hydrate, answer, stop. In-process and
 //!   fork-free, so tests drive it directly.
 //! * [`hydrate`] — the saved layout back into live shells.
-//! * [`drain`] — the per-tab PTY consumers that keep OSC-reported state
-//!   flowing with no terminal to write into. HS-1b scaffolding.
 //! * [`socket_guard`] — unlink our socket, never a successor's.
 //! * [`identity`], [`logging`], [`consts`] — session id + timestamp, the
 //!   file appender, and every named constant.
 
 pub mod consts;
 pub mod daemonize;
-pub mod drain;
 pub mod hydrate;
 pub mod identity;
 pub mod logging;

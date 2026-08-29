@@ -21,8 +21,8 @@ use roost_engine::{PtySupervisor, Workspace, WorkspaceEvent};
 use roost_ipc::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use roost_ipc::framing::{write_frame, FrameReader};
 use roost_ipc::messages::{
-    ops, EventBatch, EventsSubscribeResult, Project, Response, SessionStopResult, Tab,
-    TabListResult, TabState,
+    ops, EventBatch, EventsSubscribeResult, Project, Response, SessionConnectResult,
+    SessionStopResult, Tab, TabListResult, TabState, SESSION_STOPPING_EVENT,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -62,6 +62,7 @@ async fn harness(session: bool, limits: Option<PushLimits>) -> Harness {
                 payload_kinds: Vec::new(),
                 libghostty_build: String::new(),
                 default_tab_size: (120, 40),
+                test_mode: false,
             },
             StopHandle::new(|| async {}),
         );
@@ -92,10 +93,35 @@ impl Harness {
         panic!("server never came up at {}", self.socket.display());
     }
 
+    /// Take the session lease on a throwaway control connection.
+    ///
+    /// Takeover on purpose: these tests connect freely and the lease
+    /// survives the connection that took it, so the second caller in a
+    /// test would otherwise get `already-connected`.
+    async fn lease(&self) -> String {
+        let mut client = IpcClient::connect(&self.socket).await.expect("connect");
+        let result: SessionConnectResult = client
+            .call(ops::SESSION_CONNECT, serde_json::json!({"takeover": true}))
+            .await
+            .expect("session.connect");
+        result.lease
+    }
+
     /// Dial, subscribe, and return the connection plus the acked fence.
     async fn subscribe(&self) -> (Reader, Writer, u64) {
+        let lease = self.lease().await;
+        self.subscribe_with(&lease).await
+    }
+
+    async fn subscribe_with(&self, lease: &str) -> (Reader, Writer, u64) {
         let (mut reader, mut w) = self.dial().await;
-        request(&mut w, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
+        request(
+            &mut w,
+            1,
+            ops::EVENTS_SUBSCRIBE,
+            serde_json::json!({"lease": lease}),
+        )
+        .await;
         let ack = read_frame(&mut reader).await;
         assert_eq!(ack["ok"], serde_json::json!(true), "ack: {ack}");
         let result: EventsSubscribeResult =
@@ -407,11 +433,16 @@ async fn a_request_sent_after_the_flip_is_discarded() {
     );
 }
 
-/// A stop cuts every push connection. The client sees a plain close —
-/// the same signal it already treats as "resync" — and it sees it by the
-/// time the stop's own reply comes back.
+/// A stop cuts every push connection, and says so: the last frame a
+/// subscriber reads is the terminal `session.stopping` envelope, and it
+/// is there by the time the stop's own reply comes back.
+///
+/// The ordering this pins is the load-bearing half — the stop fires the
+/// registered connections' closers BEFORE it aborts their relays. Aborted
+/// first, the relay's sender would drop, the push loop's source would
+/// end, and the peer would get an unlabeled EOF.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_stop_closes_a_live_push_connection() {
+async fn session_stop_labels_and_closes_a_live_push_connection() {
     let h = harness(true, None).await;
     let (mut reader, _w, _fence) = h.subscribe().await;
 
@@ -422,22 +453,71 @@ async fn session_stop_closes_a_live_push_connection() {
         .expect("session.stop");
     assert!(report.reaped.is_empty() && report.killed.is_empty());
 
-    // The stop tears pushes down before the barrier, so by the time its
-    // reply is on the wire the subscriber's connection is already gone.
-    let tail = tokio::time::timeout(TIMEOUT, reader.read_line())
-        .await
-        .expect("the push connection must close");
+    let (last, tail) = read_to_close(&mut reader).await;
+    let last = last.expect("the stream must end with a labeled frame, not a bare EOF");
+    assert_eq!(last["event"], SESSION_STOPPING_EVENT, "last frame: {last}");
+    assert_eq!(last["data"]["reason"], "stop");
     assert!(
-        matches!(tail, Ok(None) | Err(_)),
-        "expected EOF on the push connection, got a frame"
+        last.get("revision").is_none(),
+        "the control envelope is not a batch and carries no revision: {last}"
     );
+    assert!(tail, "the envelope must be the last frame before the close");
 
     // And a subscribe after the latch is refused rather than handed a
     // stream nothing will ever end.
     let (mut reader, mut w) = h.dial().await;
-    request(&mut w, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
+    request(
+        &mut w,
+        1,
+        ops::EVENTS_SUBSCRIBE,
+        serde_json::json!({"lease": "whatever"}),
+    )
+    .await;
     let reply = read_frame(&mut reader).await;
-    assert_eq!(reply["error"]["code"], "shutting-down");
+    // The lease gate runs first, and a session that already stopped has
+    // no lease to present — either answer tells the client to stop
+    // retrying on this connection.
+    assert!(
+        ["shutting-down", "connect-required"].contains(&reply["error"]["code"].as_str().unwrap()),
+        "unexpected refusal: {reply}"
+    );
+}
+
+/// A takeover closes the previous holder's stream, labeled with the
+/// reason that distinguishes it from a shutdown: a taken-over client must
+/// not reconnect the way a client whose session stopped would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_labels_and_closes_the_previous_holders_stream() {
+    let h = harness(true, None).await;
+    let (mut reader, _w, _fence) = h.subscribe().await;
+
+    // A second client takes the lease. Its own connection is untouched;
+    // the first holder's is cut.
+    let _second = h.lease().await;
+
+    let (last, tail) = read_to_close(&mut reader).await;
+    let last = last.expect("a taken-over stream must be labeled");
+    assert_eq!(last["event"], SESSION_STOPPING_EVENT, "last frame: {last}");
+    assert_eq!(last["data"]["reason"], "taken-over");
+    assert!(tail, "the envelope must be the last frame before the close");
+}
+
+/// Read to EOF and report the last frame seen plus whether the close
+/// actually followed it. Batches committed before the cut are
+/// legitimately still in flight, so the label is asserted on the *last*
+/// frame rather than the next one.
+async fn read_to_close(reader: &mut Reader) -> (Option<serde_json::Value>, bool) {
+    let mut last = None;
+    let closed = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match reader.read_line().await {
+                Ok(Some(line)) => last = serde_json::from_slice(&line).ok(),
+                Ok(None) | Err(_) => return,
+            }
+        }
+    })
+    .await;
+    (last, closed.is_ok())
 }
 
 /// The UI socket is untouched by all of the above: the op still answers
@@ -751,8 +831,15 @@ async fn a_malformed_frame_after_the_flip_produces_no_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ack_is_an_ordinary_response_envelope() {
     let h = harness(true, None).await;
+    let lease = h.lease().await;
     let (mut reader, mut w) = h.dial().await;
-    request(&mut w, 42, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
+    request(
+        &mut w,
+        42,
+        ops::EVENTS_SUBSCRIBE,
+        serde_json::json!({"lease": lease}),
+    )
+    .await;
     let raw = read_frame(&mut reader).await;
     let response: Response = serde_json::from_value(raw).expect("response envelope");
     assert_eq!(response.id, 42);

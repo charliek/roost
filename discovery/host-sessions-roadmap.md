@@ -348,8 +348,14 @@ Linux `.deb` shipping `/usr/bin/roost-session`, and a dedicated
 data plane: server-side Terminals (`server-vt`, D5), the attach stream
 (D2/D3), connect leases (D8) — which turns HS-1a's leaseless
 `events.subscribe` into a breaking change — and session-side
-`tab.dump`/`dump_resolved`. The bullets below describe HS-1 as
-originally scoped; the split above is what actually shipped.
+`tab.dump`/`dump_resolved`. **HS-1b shipped (plan 036)**: the
+server-VT tab task, the binary attach data plane (snapshot payload,
+resume-from-seq, INPUT/RESIZE), `session.connect` leases with takeover,
+and headless dumps + terminal replies — which closes the leaseless-
+`events.subscribe` deviation (now lease-gated,
+`SESSION_PROTOCOL_VERSION: 2`) along with HS-1a's other two. The
+bullets below describe HS-1 as originally scoped; the split above is
+what actually shipped.
 
 - New crate + binary: engine bootstrapped headless (the
   `ipc_dispatch.rs` pattern), session socket profile, daemonize +

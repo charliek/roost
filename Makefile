@@ -105,7 +105,7 @@ ICED_RELEASE_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_ice
 # drives no UI at all — it spawns `roost-session` daemons against
 # throwaway profiles — so it needs neither a display nor the shared
 # UI-session fixture, and it gets its own target + CI job.
-SESSION_E2E_TESTS := tools/roosttest/test_session.py
+SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py
 # Every whole-directory pytest run must deselect the session lane: those
 # runs drive a UI, nothing in them builds `roost-session`, and the first
 # session case would therefore `cargo build` mid-test on a shared runner.
@@ -134,9 +134,10 @@ test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swi
 # `--workspace` run compiles and then silently skips every one of them. The
 # second line mirrors CI's separate `cargo test -p roost-vt --features ffi`
 # step (.github/workflows/ci.yml, rust job) so `make test` runs them too.
-test-rust:  ## cargo test --workspace (+ roost-vt ffi tests, cfg-gated out of the default run)
+test-rust:  ## cargo test --workspace (+ roost-vt ffi and roost-engine server-vt tests, cfg-gated out of the default run)
 	cargo test --workspace
 	cargo test -p roost-vt --features ffi
+	cargo test -p roost-engine --features server-vt
 
 test-iced:  ## Iced unit tests (renderer + input + adapter)
 	cargo test -p roost-iced
@@ -179,12 +180,15 @@ e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not h
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest $(SESSION_E2E_DESELECT) --roost-target mac
 
-# No ghostty step and no display: `roost-session` does not depend on
-# roost-vt (`cargo tree -p roost-session | grep roost-vt` is empty), and
-# the lane spawns daemons rather than windows. Both binaries are built
-# first because the harness would otherwise `cargo build` mid-test and
-# charge the first case for it.
+# No display — the lane spawns daemons rather than windows — but it does
+# need libghostty-vt: `roost-session` enables `roost-engine/server-vt`,
+# which pulls `roost-vt/ffi`, so the archive is a build input. The
+# build.sh call is idempotent and cached (it no-ops once
+# third_party/ghostty/out exists). Both binaries are built first because
+# the harness would otherwise `cargo build` mid-test and charge the first
+# case for it.
 e2e-session:  ## Headless host-session E2E (spawns roost-session daemons; no UI)
+	./third_party/ghostty/build.sh
 	cargo build -p roost-session -p roost-cli
 	uv run --group test pytest $(SESSION_E2E_TESTS)
 
@@ -253,10 +257,15 @@ fmt:  ## Format Rust (cargo fmt --all)
 fmt-check:  ## Check formatting (what CI's rust-lint runs)
 	cargo fmt --all -- --check
 
-clippy:  ## Lint Rust at CI parity (warnings are errors)
+clippy: $(GHOSTTY_LIB)  ## Lint Rust at CI parity (warnings are errors)
 	# `-D warnings` matches the `rust-lint` CI job. Without it `make check`
 	# passed while CI failed, which is worse than no local gate at all.
 	cargo clippy --workspace --all-targets -- -D warnings
+	# roost-engine's `server-vt` module and its test target are cfg-gated,
+	# so the workspace run above compiles neither. Same trap the roost-vt
+	# comment on `test-rust` documents: a member's gated targets get
+	# features only from an explicit `-p --features` run.
+	cargo clippy -p roost-engine --features server-vt --all-targets -- -D warnings
 
 # `linux-package` is off in every dev build, so without the second test +
 # clippy pair the packaging configuration would compile for the first time
@@ -269,6 +278,13 @@ check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency
 		( echo "roost-iced has a forbidden GTK dependency"; exit 1 )
 	@! cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced|notify-rust|zbus|arboard) v' || \
 		( echo "roost-engine has a UI toolkit dependency"; exit 1 )
+	# roost-vt is an OPTIONAL roost-engine edge (`server-vt`). A
+	# default-features build must not pull it in, or every UI build would
+	# require the libghostty-vt archive — architecture §2's "no
+	# default-build ghostty dependency", machine-enforced now that the
+	# edge exists at all.
+	@! cargo tree -p roost-engine | grep -E '(^| )roost-vt v' || \
+		( echo "roost-engine pulls roost-vt with default features"; exit 1 )
 	@cargo tree -p roost-iced | grep -q 'swash v0.2.10 (.*third_party/swash)' || \
 		( echo "swash [patch.crates-io] not applied"; exit 1 )
 

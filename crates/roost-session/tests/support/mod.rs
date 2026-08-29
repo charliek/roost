@@ -18,9 +18,10 @@ use std::time::{Duration, Instant};
 
 use roost_engine::single_instance::{self, InstanceLocks};
 use roost_ipc::messages::{
-    ops, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams, SessionStopParams,
-    SessionStopResult, Tab, TabListResult, TabOpenParams, TabOpenResult, TabResizeParams,
-    TabSetTitleParams,
+    ops, IdentifyParams, IdentifyResult, SessionConnectParams, SessionConnectResult,
+    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult, Tab,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams,
 };
 use roost_ipc::IpcClient;
 use roost_session::{Readiness, SessionConfig};
@@ -103,6 +104,12 @@ impl Layout {
             app_label: APP_LABEL.into(),
             app_id: APP_ID.into(),
             launch_cwd: launch_cwd.to_path_buf(),
+            // Always on here: `tab.feed_pty_bytes` and
+            // `tab.capture_pty_input` are how a test puts known bytes
+            // through a real tab without scripting a shell, and the
+            // sessions these tests start are torn down within seconds,
+            // so the capture buffer's growth is bounded by the test.
+            test_mode: true,
         }
     }
 
@@ -169,6 +176,19 @@ pub async fn session_identify(client: &mut IpcClient) -> SessionIdentify {
         .expect("session.identify")
 }
 
+/// Take the session's interactive lease. Every lease-gated op needs one,
+/// and a test that only wants the lease does not care who held it, so
+/// this always takes over.
+pub async fn session_connect(client: &mut IpcClient) -> SessionConnectResult {
+    client
+        .call(
+            ops::SESSION_CONNECT,
+            SessionConnectParams { takeover: true },
+        )
+        .await
+        .expect("session.connect")
+}
+
 pub async fn session_stop(client: &mut IpcClient) -> SessionStopResult {
     client
         .call(ops::SESSION_STOP, SessionStopParams {})
@@ -230,6 +250,26 @@ pub async fn resize_tab(
         .call::<_, serde_json::Value>(ops::TAB_RESIZE, TabResizeParams { tab_id, cols, rows })
         .await
         .map(|_| ())
+}
+
+/// `tab.dump` — served from the tab's own server terminal, with no UI
+/// anywhere in the process. On a UI socket this same op hops to the main
+/// thread; here it is a round trip through the tab task.
+pub async fn tab_dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
+    client
+        .call(ops::TAB_DUMP, TabDumpParams { tab_id })
+        .await
+        .expect("tab.dump")
+}
+
+/// `tab.dump_resolved` — the same walk, through the production color
+/// resolver. Served from the tab task too, so a headless dump and a UI
+/// dump come out of one implementation.
+pub async fn tab_dump_resolved(client: &mut IpcClient, tab_id: i64) -> TabDumpResolvedResult {
+    client
+        .call(ops::TAB_DUMP_RESOLVED, TabDumpResolvedParams { tab_id })
+        .await
+        .expect("tab.dump_resolved")
 }
 
 pub async fn set_tab_title(client: &mut IpcClient, tab_id: i64, title: &str) {

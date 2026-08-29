@@ -127,6 +127,16 @@ impl OutputPublisher {
         self.tx.subscribe()
     }
 
+    /// The raw fan-out sender, for the server-VT tab task. That task
+    /// owns seq assignment for its tab (plan 036 D3), so it sends
+    /// already-numbered events and this publisher's own counter stays
+    /// untouched — two numbering authorities on one channel is exactly
+    /// the gap/duplicate bug the seq contract exists to rule out.
+    #[cfg(feature = "server-vt")]
+    fn sender(&self) -> broadcast::Sender<PtyOutputEvent> {
+        self.tx.clone()
+    }
+
     fn send_bytes(&self, data: Vec<u8>) {
         self.publish(|seq| PtyOutputEvent::Bytes { seq, data });
     }
@@ -205,7 +215,7 @@ impl Victim {
 /// A command on a tab's single writer channel. Input and resize share
 /// one FIFO so they reach the PTY in submission order end-to-end —
 /// the writer loop applies them in the exact order they were sent (#80).
-enum WriterCmd {
+pub(crate) enum WriterCmd {
     Input(Vec<u8>),
     Resize(PtySize),
 }
@@ -240,6 +250,12 @@ pub struct PtySupervisor {
     /// One broadcast channel for supervisor-level events. The
     /// `Workspace` subscribes once at startup.
     lifecycle: broadcast::Sender<SupervisorEvent>,
+    /// Set by [`PtySupervisor::enable_server_vt`] before the first
+    /// spawn. `None` — the default, and what every UI build sees even
+    /// when feature unification compiles the code in — means the reader
+    /// feeds the publisher directly, exactly as it always has.
+    #[cfg(feature = "server-vt")]
+    server_vt: std::sync::OnceLock<Arc<crate::tab_task::ServerVtState>>,
 }
 
 struct Session {
@@ -270,6 +286,16 @@ struct Session {
     /// buffer instead of vanishing before a late `subscribe_output`.
     /// `take_initial_receiver` hands it out exactly once.
     initial_rx: Option<broadcast::Receiver<PtyOutputEvent>>,
+    /// The server-VT tab task's command channel and this spawn's
+    /// `tab_generation` — the second half of the identity a resuming
+    /// client must match (plan 036 D6). One field, so a channel without
+    /// its generation is not representable.
+    ///
+    /// Holding the sender here is also what keeps the task alive: the
+    /// task ends when every sender is gone, and the reap task removes
+    /// this session before anyone can observe the exit.
+    #[cfg(feature = "server-vt")]
+    tab_task: Option<(mpsc::Sender<crate::tab_task::TabCmd>, u64)>,
 }
 
 impl Default for PtySupervisor {
@@ -288,7 +314,65 @@ impl PtySupervisor {
             sweep_started: AtomicBool::new(false),
             shutdown_gate: tokio::sync::Mutex::new(()),
             lifecycle,
+            #[cfg(feature = "server-vt")]
+            server_vt: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Turn the server-VT pipeline on for every tab this supervisor
+    /// spawns from here on. Must be called before the first `spawn`;
+    /// only `roost-session` calls it (plan 036 D1).
+    ///
+    /// Errors if it was already enabled: a second call would mint a
+    /// second `server_epoch`, and two epochs on one supervisor would
+    /// make a resuming client's identity check meaningless.
+    #[cfg(feature = "server-vt")]
+    pub fn enable_server_vt(&self, config: crate::tab_task::ServerVtConfig) -> anyhow::Result<()> {
+        self.server_vt
+            .set(Arc::new(crate::tab_task::ServerVtState::new(config)))
+            .map_err(|_| anyhow::anyhow!("server-vt is already enabled on this supervisor"))
+    }
+
+    /// The random per-supervisor epoch tab streams are scoped by, or
+    /// `None` when server-VT is off.
+    #[cfg(feature = "server-vt")]
+    pub fn server_epoch(&self) -> Option<u64> {
+        self.server_vt.get().map(|state| state.server_epoch())
+    }
+
+    /// A live tab's server-VT command channel **and** the generation
+    /// that channel belongs to, read under one lock — `None` when the
+    /// tab has no live PTY or server-VT is off.
+    ///
+    /// One acquisition is the point: a respawn between two reads would
+    /// otherwise let a caller resize one pipeline, stamp a token with a
+    /// second's generation, and snapshot a third. Every caller that
+    /// needs both must come through here.
+    #[cfg(feature = "server-vt")]
+    pub fn tab_task_handle(
+        &self,
+        tab_id: i64,
+    ) -> Option<(mpsc::Sender<crate::tab_task::TabCmd>, u64)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&tab_id)
+            .and_then(|session| session.tab_task.as_ref())
+            .map(|(cmd_tx, generation)| (cmd_tx.clone(), *generation))
+    }
+
+    /// A live tab's server-VT command channel, or `None` when the tab
+    /// has no live PTY or server-VT is off.
+    #[cfg(feature = "server-vt")]
+    pub fn tab_commands(&self, tab_id: i64) -> Option<mpsc::Sender<crate::tab_task::TabCmd>> {
+        self.tab_task_handle(tab_id).map(|(cmd_tx, _)| cmd_tx)
+    }
+
+    /// A live tab's `tab_generation`, or `None` as above.
+    #[cfg(feature = "server-vt")]
+    pub fn tab_generation(&self, tab_id: i64) -> Option<u64> {
+        self.tab_task_handle(tab_id)
+            .map(|(_, generation)| generation)
     }
 
     /// Subscribe to supervisor-level lifecycle events
@@ -368,6 +452,12 @@ impl PtySupervisor {
     /// on either channel. So a session always has a waiter that will
     /// take it back out, and by the time a consumer sees `Exit` (or
     /// `TabExited`) the tab is already gone from the map.
+    ///
+    /// Server-VT (plan 036, [`Self::enable_server_vt`]) reshapes both
+    /// halves of that: the reader feeds a bounded channel instead of the
+    /// publisher, and BOTH exit producers route through the tab task, so
+    /// the deadline path becomes drain-then-`Exit` and nothing is teed
+    /// after it. The flag-off path — every UI build — is untouched.
     ///
     /// Errors:
     /// * [`PtyError::DuplicateTab`] — `tab_id` already has a live
@@ -457,6 +547,18 @@ impl PtySupervisor {
             .context("master.try_clone_reader")?;
         let writer = pair.master.take_writer().context("master.take_writer")?;
 
+        // The server Terminal is built HERE, before the child: it is
+        // fallible, and `spawn_command` has to stay the last fallible
+        // step so a failure leaves no live shell behind (plan 036 D2).
+        #[cfg(feature = "server-vt")]
+        let tab_vt = match self.server_vt.get() {
+            Some(state) => Some(
+                crate::tab_task::TabVt::new(state, cols, rows)
+                    .context("build the server terminal")?,
+            ),
+            None => None,
+        };
+
         let cmd = build_command(cwd, argv, tab_id, socket_path);
         let mut child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         // Sendable killer handle taken before the child moves into
@@ -498,6 +600,16 @@ impl PtySupervisor {
         let (reader_alive_tx, reader_alive_rx) = std::sync::mpsc::channel::<()>();
         let exit_published = Arc::new(AtomicBool::new(false));
 
+        // Server-VT: the tab task becomes the single authority for this
+        // tab's seq, tee, replies and exit. Started before the reader so
+        // no byte can be read before there is somewhere to put it.
+        #[cfg(feature = "server-vt")]
+        let tab_pipe = tab_vt.map(|vt| vt.start(tab_id, output.sender(), cmd_tx.clone()));
+        #[cfg(feature = "server-vt")]
+        let reader_bytes_tx = tab_pipe.as_ref().map(|pipe| pipe.bytes_tx.clone());
+        #[cfg(feature = "server-vt")]
+        let reap_exit_tx = tab_pipe.as_ref().map(|pipe| pipe.exit_tx.clone());
+
         // Reader: blocking read off the master fd, push to broadcast,
         // then publish the exit.
         tokio::task::spawn_blocking({
@@ -505,7 +617,34 @@ impl PtySupervisor {
             let exit_published = exit_published.clone();
             move || {
                 let _reader_alive = reader_alive_tx;
-                pty_reader_loop(reader_handle, &output, tab_id);
+                #[cfg(feature = "server-vt")]
+                {
+                    if let Some(bytes_tx) = reader_bytes_tx {
+                        // The tab task owns the exit under server-VT:
+                        // dropping `bytes_tx` with this closure IS the
+                        // EOF signal, and the reap task hands over the
+                        // status.
+                        //
+                        // `blocking_send` on a bounded channel is the
+                        // point (architecture §3): when the tab task
+                        // falls behind, this read stalls, the kernel PTY
+                        // buffer fills and the child blocks on `write`.
+                        // That backpressure is what lets the
+                        // authoritative terminal never miss a byte.
+                        pty_reader_loop(reader_handle, tab_id, |chunk| {
+                            let sent = bytes_tx.blocking_send(chunk).is_ok();
+                            if !sent {
+                                debug!(tab_id, "server-vt tab task is gone; stopping reader");
+                            }
+                            sent
+                        });
+                        return;
+                    }
+                }
+                pty_reader_loop(reader_handle, tab_id, |chunk| {
+                    output.send_bytes(chunk);
+                    true
+                });
                 // EOF: everything the PTY produced is on the channel,
                 // so `Exit` published from here can only follow it.
                 // The status normally lands within microseconds (the
@@ -561,6 +700,10 @@ impl PtySupervisor {
             pid,
             reaped,
             initial_rx: Some(initial_rx),
+            #[cfg(feature = "server-vt")]
+            tab_task: tab_pipe
+                .as_ref()
+                .map(|pipe| (pipe.cmd_tx.clone(), pipe.tab_generation)),
         };
         // Promote the slot from pending → sessions atomically, BEFORE
         // the reap task exists (see below).
@@ -646,6 +789,30 @@ impl PtySupervisor {
             }
             let _ = status_tx.send(status);
             let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status });
+            #[cfg(feature = "server-vt")]
+            {
+                if let Some(exit_tx) = reap_exit_tx {
+                    // Hand the code over at once — the tab task holds it
+                    // until the reader's queue is drained — then, only if
+                    // the reader is STILL alive past the grace, tell it to
+                    // publish anyway. `Err(Disconnected)` means the reader
+                    // finished, which is the EOF path, not the deadline.
+                    let _ = exit_tx.send(crate::tab_task::ExitSignal::Status(status));
+                    let deadline_hit = matches!(
+                        reader_alive_rx.recv_timeout(EXIT_PUBLISH_GRACE),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    );
+                    if deadline_hit {
+                        debug!(
+                            tab_id,
+                            "pty reader had not finished; the tab task publishes Exit on the \
+                             deadline path"
+                        );
+                        let _ = exit_tx.send(crate::tab_task::ExitSignal::Deadline(status));
+                    }
+                    return;
+                }
+            }
             // Backstop for a reader that never reaches EOF (#255).
             // Ends as soon as the reader task drops its sender —
             // by then it has published `Exit` and this is a no-op —
@@ -675,7 +842,24 @@ impl PtySupervisor {
         Ok(early_rx)
     }
 
+    /// Under server-VT the tab task is the one authority ordering input
+    /// against terminal replies (architecture §3), so a tab that has one
+    /// routes through it; writing straight to the writer channel would
+    /// interleave keystrokes with in-flight query replies.
     pub async fn write(&self, tab_id: i64, data: Vec<u8>) -> Result<(), PtyError> {
+        #[cfg(feature = "server-vt")]
+        let task_tx = {
+            let sessions = self.sessions.lock().unwrap();
+            let session = sessions.get(&tab_id).ok_or(PtyError::NotFound(tab_id))?;
+            session.tab_task.as_ref().map(|(tx, _)| tx.clone())
+        };
+        #[cfg(feature = "server-vt")]
+        if let Some(tx) = task_tx {
+            return tx
+                .send(crate::tab_task::TabCmd::Input(data))
+                .await
+                .map_err(|_| PtyError::Closed(tab_id));
+        }
         let tx = {
             let sessions = self.sessions.lock().unwrap();
             sessions
@@ -689,7 +873,29 @@ impl PtySupervisor {
         Ok(())
     }
 
+    /// Same authority rule as [`Self::write`]: a server-VT tab's resize
+    /// must move the authoritative Terminal (and drain its mode-2048
+    /// report) before `TIOCSWINSZ`, which only the tab task can order.
     pub async fn resize(&self, tab_id: i64, cols: u16, rows: u16) -> Result<(), PtyError> {
+        #[cfg(feature = "server-vt")]
+        let task_tx = {
+            let sessions = self.sessions.lock().unwrap();
+            let session = sessions.get(&tab_id).ok_or(PtyError::NotFound(tab_id))?;
+            session.tab_task.as_ref().map(|(tx, _)| tx.clone())
+        };
+        #[cfg(feature = "server-vt")]
+        if let Some(tx) = task_tx {
+            return tx
+                .send(crate::tab_task::TabCmd::Resize {
+                    cols,
+                    rows,
+                    cell_w: 0,
+                    cell_h: 0,
+                    ack: None,
+                })
+                .await
+                .map_err(|_| PtyError::Closed(tab_id));
+        }
         let tx = {
             let sessions = self.sessions.lock().unwrap();
             sessions
@@ -1298,7 +1504,18 @@ fn publish_exit_once(output: &OutputPublisher, published: &AtomicBool, status: i
     true
 }
 
-fn pty_reader_loop(mut reader: Box<dyn Read + Send>, output: &OutputPublisher, tab_id: i64) {
+/// Blocking reads off the master fd until EOF or a hard error, handing
+/// each chunk to `sink`. `sink` returns whether to keep reading, so a
+/// consumer that has gone away stops the loop.
+///
+/// The two consumers are the default publisher and — under server-VT —
+/// the tab task's bounded channel; sharing the loop keeps the read,
+/// EOF and `Interrupted` handling identical for both.
+fn pty_reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    tab_id: i64,
+    mut sink: impl FnMut(Vec<u8>) -> bool,
+) {
     let mut buf = vec![0u8; PTY_OUTPUT_CHUNK_SIZE];
     loop {
         match reader.read(&mut buf) {
@@ -1307,7 +1524,9 @@ fn pty_reader_loop(mut reader: Box<dyn Read + Send>, output: &OutputPublisher, t
                 return;
             }
             Ok(n) => {
-                output.send_bytes(buf[..n].to_vec());
+                if !sink(buf[..n].to_vec()) {
+                    return;
+                }
             }
             Err(err) => {
                 if matches!(err.kind(), std::io::ErrorKind::Interrupted) {

@@ -16,7 +16,9 @@ import XCTest
 
 final class IPCSessionTypesTests: XCTestCase {
     func testSessionProtocolVersionIsSeparateFromTheWireVersion() {
-        XCTAssertEqual(ipcSessionProtocolVersion, 1)
+        // HS-1b's lease gate bumped the session protocol to 2; the
+        // request/response wire version did not move with it.
+        XCTAssertEqual(ipcSessionProtocolVersion, 2)
         XCTAssertEqual(ipcProtocolVersion, 1)
     }
 
@@ -170,6 +172,83 @@ final class IPCSessionTypesTests: XCTestCase {
         let fence = try JSONDecoder().decode(IPCEventBatch.self, from: Data("{\"revision\":4}".utf8))
         XCTAssertEqual(fence.revision, 4)
         XCTAssertTrue(fence.events.isEmpty)
+    }
+
+    // MARK: - Leases + attach (plan 036 §D11)
+
+    func testSessionConnectVectorDecodes() throws {
+        let raw = try Data(contentsOf: vectorURL("session.connect.response.json"))
+        let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
+        XCTAssertTrue(response.ok)
+        let body = try JSONSerialization.data(
+            withJSONObject: try XCTUnwrap(response.result).value)
+        let result = try JSONDecoder().decode(IPCSessionConnectResult.self, from: body)
+
+        XCTAssertEqual(result.lease, "9f2c1d7a4b6e08315c0d9a72e4f16b83")
+        // A counter, not an id: a bare JSON number, like the events
+        // fence.
+        XCTAssertEqual(result.revision, 42)
+
+        let reencoded = try JSONEncoder().encode(result)
+        XCTAssertEqual(
+            try JSONDecoder().decode(IPCSessionConnectResult.self, from: reencoded), result)
+    }
+
+    func testSessionConnectRequestVectorDefaultsTakeoverToAnExplicitBool() throws {
+        let raw = try Data(contentsOf: vectorURL("session.connect.request.json"))
+        let request = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: raw) as? [String: Any])
+        XCTAssertEqual(request["op"] as? String, "session.connect")
+        let params = try XCTUnwrap(request["params"] as? [String: Any])
+        XCTAssertEqual(params["takeover"] as? Bool, true)
+    }
+
+    func testTabAttachVectorsDecode() throws {
+        let requestRaw = try Data(contentsOf: vectorURL("tab.attach.request.json"))
+        let request = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: requestRaw) as? [String: Any])
+        XCTAssertEqual(request["op"] as? String, "tab.attach")
+        let params = try XCTUnwrap(request["params"] as? [String: Any])
+        // The id encoding is the part that silently breaks across
+        // languages: tab ids are strings, geometry is numbers.
+        XCTAssertEqual(params["tab_id"] as? String, "5")
+        XCTAssertEqual(params["cols"] as? Int, 120)
+        XCTAssertEqual(params["rows"] as? Int, 40)
+        XCTAssertEqual(params["kinds"] as? [String], ["ghostty-snapshot"])
+
+        let raw = try Data(contentsOf: vectorURL("tab.attach.response.json"))
+        let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
+        XCTAssertTrue(response.ok)
+        let body = try JSONSerialization.data(
+            withJSONObject: try XCTUnwrap(response.result).value)
+        let result = try JSONDecoder().decode(IPCTabAttachResult.self, from: body)
+
+        XCTAssertEqual(result.attachToken, "1a0be5c37d924f68b1c05e3a7f2d8496")
+        XCTAssertEqual(result.kind, IPCAttachPayloadKind.ghosttySnapshot)
+        // Past 2^53 and still exact: the epoch is a bare u64 number, so
+        // a Swift side that routed it through a Double would drift.
+        XCTAssertEqual(result.serverEpoch, 6_032_428_321_756_423_947)
+        XCTAssertEqual(result.tabGeneration, 3)
+
+        let reencoded = try JSONEncoder().encode(result)
+        XCTAssertEqual(
+            try JSONDecoder().decode(IPCTabAttachResult.self, from: reencoded), result)
+    }
+
+    func testSessionStoppingVectorDecodesAsAnEventEnvelope() throws {
+        let raw = try Data(contentsOf: vectorURL("session.stopping.event.json"))
+        let envelope = try JSONDecoder().decode(IPCEventEnvelope.self, from: raw)
+        XCTAssertEqual(envelope.event, ipcSessionStoppingEvent)
+
+        let body = try JSONSerialization.data(withJSONObject: envelope.data.value)
+        let stopping = try JSONDecoder().decode(IPCSessionStoppingEvent.self, from: body)
+        XCTAssertEqual(stopping.reason, "stop")
+
+        // The envelope carries no revision — it is the one frame on an
+        // events connection exempt from the gap check.
+        let fields = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: raw) as? [String: Any])
+        XCTAssertEqual(Set(fields.keys), ["event", "data"])
     }
 
     private func vectorURL(_ name: String) throws -> URL {

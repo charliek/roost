@@ -438,6 +438,46 @@ struct IPCSessionIdentify: Codable, Equatable, Sendable {
     }
 }
 
+/// `session.connect` result — the bearer lease every lease-gated op
+/// presents, plus the workspace revision it was minted at. Mirrors
+/// Rust's `SessionConnectResult`. The lease is a credential: never log
+/// it.
+struct IPCSessionConnectResult: Codable, Equatable, Sendable {
+    var lease: String
+    var revision: UInt64
+}
+
+/// `tab.attach` result — a single-use ticket for one data connection,
+/// plus the identity that scopes every seq on it. `serverEpoch` is
+/// random per session process and `tabGeneration` counts tab pipelines
+/// within it, so a resume against a restarted server can never be
+/// silently accepted. Mirrors Rust's `TabAttachResult`.
+struct IPCTabAttachResult: Codable, Equatable, Sendable {
+    var attachToken: String
+    var kind: IPCAttachPayloadKind
+    var serverEpoch: UInt64
+    var tabGeneration: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case attachToken = "attach_token"
+        case kind
+        case serverEpoch = "server_epoch"
+        case tabGeneration = "tab_generation"
+    }
+}
+
+/// `data` of the `session.stopping` envelope — the one frame on an
+/// events connection that is not an `IPCEventBatch`. `"stop"` or
+/// `"taken-over"`; either way the stream is over. Mirrors Rust's
+/// `SessionStoppingEvent`.
+struct IPCSessionStoppingEvent: Codable, Equatable, Sendable {
+    var reason: String
+}
+
+/// The event name of that envelope. Mirrors Rust's
+/// `messages::SESSION_STOPPING_EVENT`.
+let ipcSessionStoppingEvent = "session.stopping"
+
 /// One atomic push on the events connection. A single workspace commit
 /// can publish several events under the same `revision`, so the batch —
 /// not the envelope — is the unit a client checks for gaps.
@@ -610,7 +650,11 @@ let ipcProtocolVersion: UInt32 = 1
 /// which versions the request/response format every client speaks —
 /// the two move independently. Mirrors Rust's
 /// `messages::SESSION_PROTOCOL_VERSION`.
-let ipcSessionProtocolVersion: UInt32 = 1
+///
+/// `2` is HS-1b's breaking bump: `events.subscribe` and `tab.attach`
+/// require the lease `session.connect` mints, so a client written
+/// against `1` is rejected rather than served.
+let ipcSessionProtocolVersion: UInt32 = 2
 
 /// Maximum length of a single framed line. Matches roost-ipc's
 /// `MAX_FRAME_BYTES`.

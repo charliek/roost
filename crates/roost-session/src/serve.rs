@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
 use roost_engine::single_instance::InstanceLocks;
-use roost_engine::{LocalClient, PtySupervisor, Workspace};
-use roost_ipc::messages::{ops, SessionStopParams};
+use roost_engine::{LocalClient, PtySupervisor, ServerVtConfig, ServerVtWorkspace, Workspace};
+use roost_ipc::messages::{ops, AttachPayloadKind, SessionStopParams};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::{IpcClient, IpcServer};
 use tokio::sync::{oneshot, watch};
@@ -47,7 +47,7 @@ use crate::consts::{
 };
 use crate::readiness::{Readiness, Verdict};
 use crate::socket_guard::{unlink_if_ours, SocketIdentity, Unlinked};
-use crate::{drain, hydrate, identity};
+use crate::{hydrate, identity};
 
 /// Everything a session needs that is not a lock and not a log.
 #[derive(Debug, Clone)]
@@ -60,6 +60,22 @@ pub struct SessionConfig {
     /// Directory the user launched from, captured before the daemon
     /// `chdir`'d to `/`. Seeds the first project on an empty state file.
     pub launch_cwd: PathBuf,
+    /// Whether this session serves the test-mode op set
+    /// (`tab.feed_pty_bytes`, `tab.capture_pty_input`) and keeps the
+    /// input-capture buffer.
+    ///
+    /// **This is the in-process test-harness knob, and nothing else.**
+    /// The shipped binary never sets it directly: `start` builds its
+    /// config through [`SessionConfig::from_profile`], which derives
+    /// this from `ROOST_TEST_MODE` exactly as `serve` used to read it,
+    /// so a daemon's behaviour is still decided by that one environment
+    /// variable.
+    ///
+    /// A field rather than a read inside `serve` because the in-process
+    /// integration tests run several sessions in one process, and a
+    /// process-global env var is neither settable safely from a
+    /// `#[tokio::test]` nor scopable to one of them.
+    pub test_mode: bool,
 }
 
 impl SessionConfig {
@@ -71,6 +87,7 @@ impl SessionConfig {
             app_label: profile.app_label.to_string(),
             app_id: profile.app_id.to_string(),
             launch_cwd,
+            test_mode: std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -88,16 +105,30 @@ pub async fn serve(
 ) -> Result<()> {
     let workspace = Arc::new(Workspace::open(config.state_path.clone()));
     let supervisor = Arc::new(PtySupervisor::new());
+
+    // Before the first spawn, which is what makes it total: every tab
+    // this session ever opens — hydrated or asked for over the wire —
+    // gets a server terminal, so there is no second class of tab that
+    // cannot be attached, dumped, or answer a device query. The
+    // workspace is handed in as the seam the tab tasks apply OSC
+    // transitions and row-closes through (the supervisor itself stays
+    // workspace-agnostic).
+    let test_mode = config.test_mode;
+    supervisor
+        .enable_server_vt(
+            ServerVtConfig::new(Arc::clone(&workspace) as Arc<dyn ServerVtWorkspace>)
+                // The capture buffer only grows, so it is test-mode
+                // only — the same gate `tab.capture_pty_input` itself
+                // is behind.
+                .with_input_capture(test_mode),
+        )
+        .context("enable the server-VT pipeline")?;
+
     let client = LocalClient::new(
         Arc::clone(&workspace),
         Arc::clone(&supervisor),
         config.socket_path.clone(),
     );
-
-    // Subscribed before hydration, so the restored tabs' `TabOpened`
-    // events are already queued when the attacher starts: there is no
-    // window in which a tab opens with nobody watching for it.
-    let attacher = drain::spawn_attacher(client.clone(), workspace.subscribe());
 
     hydrate::hydrate(&client, &config.launch_cwd)
         .await
@@ -119,12 +150,15 @@ pub async fn serve(
         session_id: identity::session_id(),
         started_at: identity::rfc3339_utc(std::time::SystemTime::now()),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
-        // HS-1a has no attach data plane, so the honest answer to "how
-        // can you encode a tab for me" is "I can't yet". Empty rather
-        // than a kind the session cannot actually produce.
-        payload_kinds: Vec::new(),
-        libghostty_build: String::new(),
+        // Both answered for real now that every tab has a server
+        // terminal behind it. The build string is the negotiation: a
+        // client whose libghostty pin differs cannot decode this
+        // session's snapshots, and `tab.attach` refuses it by name
+        // rather than letting the mismatch surface as a corrupt screen.
+        payload_kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
+        libghostty_build: roost_vt::libghostty_build(),
         default_tab_size: (DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS),
+        test_mode,
     };
     info!(
         session_id = %session.session_id,
@@ -171,11 +205,6 @@ pub async fn serve(
             let _ = cancel.wait_for(|cancelled| *cancelled).await;
         })
         .await;
-
-    // Stop attaching drains to tabs nobody will ever ask about again.
-    // The per-tab drains themselves end with their PTYs, which the stop
-    // has already reaped.
-    attacher.abort();
 
     if stop.finalized.load(Ordering::Acquire) {
         // The tail runs on a detached task (that is what lets it survive

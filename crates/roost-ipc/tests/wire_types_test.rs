@@ -1,10 +1,10 @@
-//! Host-session wire types (plan 033 §D4): `SessionIdentify`,
-//! `EventBatch`, `AttachPayloadKind`, `SESSION_PROTOCOL_VERSION`.
+//! Host-session wire types (plan 033 §D4, plan 036 §D11):
+//! `SessionIdentify`, `EventBatch`, `AttachPayloadKind`, the
+//! `session.connect` / `tab.attach` shapes, the attach handshake and
+//! its reply, and `SESSION_PROTOCOL_VERSION`.
 //!
-//! No op serves these yet — HS-1 does — so the only thing pinning
-//! their shape is this file plus the golden vectors
-//! (`tests/ipc-vectors/session.identify.response.json` and
-//! `events.batch.json`), which the Swift mirror in
+//! What pins their shape is this file plus the golden vectors under
+//! `tests/ipc-vectors/`, which the Swift mirror in
 //! `mac/Sources/Roost/IPCMessages.swift` consumes too. The
 //! assertions are deliberately byte-exact against literal JSON:
 //! a field rename or a reordering that a `round_trip` would happily
@@ -14,8 +14,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use roost_ipc::messages::{
-    AttachPayloadKind, EventBatch, EventEnvelope, SessionIdentify, SessionIdentifyParams,
-    SessionStopParams, SessionStopResult, SESSION_PROTOCOL_VERSION,
+    AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
+    EventBatch, EventEnvelope, ResponseError, SessionConnectParams, SessionConnectResult,
+    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
+    SessionStoppingEvent, TabAttachParams, TabAttachResult, SESSION_PROTOCOL_VERSION,
+    SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -72,11 +75,13 @@ where
     assert_eq!(value, &back, "round-trip mismatch via {json}");
 }
 
+/// HS-1b's breaking bump: `events.subscribe` and `tab.attach` are
+/// lease-gated now, so a client written against `1` is rejected rather
+/// than silently served. The request/response wire version did not move
+/// with it — the two version different things.
 #[test]
-fn session_protocol_version_is_one() {
-    assert_eq!(SESSION_PROTOCOL_VERSION, 1);
-    // Distinct constant from the request/response wire version on
-    // purpose: they version different things and move independently.
+fn session_protocol_version_is_two() {
+    assert_eq!(SESSION_PROTOCOL_VERSION, 2);
     assert_eq!(roost_ipc::PROTOCOL_VERSION, 1);
 }
 
@@ -129,7 +134,7 @@ fn unknown_attach_payload_kind_survives_a_round_trip() {
 #[test]
 fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.18","session_protocol":1,"#,
+        r#"{"app_version":"0.0.18","session_protocol":2,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
@@ -270,6 +275,289 @@ fn session_stop_vector_decodes_into_its_typed_result() {
     let result: SessionStopResult =
         serde_json::from_value(resp.result.expect("result body")).expect("decode stop report");
     assert_eq!(result, sample_stop_report());
+}
+
+// ============================================================================
+// Leases + attach (plan 036 §D4/D5/D6)
+// ============================================================================
+
+const LEASE: &str = "9f2c1d7a4b6e08315c0d9a72e4f16b83";
+const TOKEN: &str = "1a0be5c37d924f68b1c05e3a7f2d8496";
+const EPOCH: u64 = 6_032_428_321_756_423_947;
+
+fn sample_attach_params() -> TabAttachParams {
+    TabAttachParams {
+        lease: LEASE.into(),
+        tab_id: 5,
+        kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
+        cols: 120,
+        rows: 40,
+        cell_w_px: 9,
+        cell_h_px: 18,
+        libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
+    }
+}
+
+fn sample_attach_result() -> TabAttachResult {
+    TabAttachResult {
+        attach_token: TOKEN.into(),
+        kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
+        server_epoch: EPOCH,
+        tab_generation: 3,
+    }
+}
+
+#[test]
+fn session_connect_params_default_to_no_takeover() {
+    assert_eq!(
+        serde_json::to_string(&SessionConnectParams::default()).unwrap(),
+        r#"{"takeover":false}"#
+    );
+    // Absent is false: the safe answer, since a takeover kicks whoever
+    // is connected.
+    let decoded: SessionConnectParams = serde_json::from_str("{}").unwrap();
+    assert!(!decoded.takeover);
+    let decoded: SessionConnectParams = serde_json::from_str(r#"{"takeover":true}"#).unwrap();
+    assert!(decoded.takeover);
+    round_trip(&decoded);
+    // Params are strict, like every other op's.
+    assert!(serde_json::from_str::<SessionConnectParams>(r#"{"force":true}"#).is_err());
+}
+
+#[test]
+fn session_connect_result_matches_its_golden_json() {
+    const GOLDEN: &str = r#"{"lease":"9f2c1d7a4b6e08315c0d9a72e4f16b83","revision":42}"#;
+
+    let value = SessionConnectResult {
+        lease: LEASE.into(),
+        revision: 42,
+    };
+    round_trip(&value);
+    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
+    let decoded: SessionConnectResult = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(decoded, value);
+}
+
+#[test]
+fn tab_attach_params_match_their_golden_json() {
+    const GOLDEN: &str = concat!(
+        r#"{"lease":"9f2c1d7a4b6e08315c0d9a72e4f16b83","tab_id":"5","#,
+        r#""kinds":["ghostty-snapshot"],"cols":120,"rows":40,"#,
+        r#""cell_w_px":9,"cell_h_px":18,"#,
+        r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1"}"#,
+    );
+
+    let value = sample_attach_params();
+    round_trip(&value);
+    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
+    let decoded: TabAttachParams = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(decoded, value);
+}
+
+/// A headless client has no cell metrics to report, so the pixel
+/// geometry defaults away — but `cols`/`rows` do not, because a zero
+/// viewport is not a thing a tab can be resized to.
+#[test]
+fn tab_attach_params_default_the_pixel_geometry_only() {
+    let decoded: TabAttachParams = serde_json::from_str(
+        r#"{"lease":"l","tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
+            "libghostty_build":"b"}"#,
+    )
+    .unwrap();
+    assert_eq!((decoded.cell_w_px, decoded.cell_h_px), (0, 0));
+    assert_eq!(decoded.tab_id, 7);
+
+    assert!(serde_json::from_str::<TabAttachParams>(
+        r#"{"lease":"l","tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b"}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn tab_attach_result_matches_its_golden_json() {
+    const GOLDEN: &str = concat!(
+        r#"{"attach_token":"1a0be5c37d924f68b1c05e3a7f2d8496","#,
+        r#""kind":"ghostty-snapshot","server_epoch":6032428321756423947,"#,
+        r#""tab_generation":3}"#,
+    );
+
+    let value = sample_attach_result();
+    round_trip(&value);
+    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
+    let decoded: TabAttachResult = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(decoded, value);
+    // Past 2^53 and a bare JSON number, like every other counter on
+    // this wire (`EventBatch.revision`), not a string-encoded id — so
+    // the golden above is also a precision guard.
+    const _: () = assert!(EPOCH > (1u64 << 53));
+}
+
+#[test]
+fn attach_handshake_matches_its_golden_json() {
+    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":2}"#;
+    const RESUME: &str = concat!(
+        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":2,"#,
+        r#""resume_from_seq":901,"server_epoch":6032428321756423947,"#,
+        r#""tab_generation":3}"#,
+    );
+
+    let fresh = AttachHandshake {
+        attach: TOKEN.into(),
+        protocol_version: SESSION_PROTOCOL_VERSION,
+        ..AttachHandshake::default()
+    };
+    round_trip(&fresh);
+    assert_eq!(serde_json::to_string(&fresh).unwrap(), SNAPSHOT);
+
+    let resuming = AttachHandshake {
+        attach: TOKEN.into(),
+        protocol_version: SESSION_PROTOCOL_VERSION,
+        resume_from_seq: Some(901),
+        server_epoch: Some(EPOCH),
+        tab_generation: Some(3),
+    };
+    round_trip(&resuming);
+    assert_eq!(serde_json::to_string(&resuming).unwrap(), RESUME);
+    assert_eq!(
+        serde_json::from_str::<AttachHandshake>(RESUME).unwrap(),
+        resuming
+    );
+}
+
+/// The handshake is the one line a client of a *newer* build might send
+/// with fields this build has never heard of; refusing it over one
+/// would turn an additive change into a hard incompatibility.
+#[test]
+fn attach_handshake_tolerates_unknown_fields() {
+    let decoded: AttachHandshake = serde_json::from_str(
+        r#"{"attach":"t","protocol_version":2,"resume_from_seq":5,
+            "viewport_hint":{"top":0},"future_field":true}"#,
+    )
+    .unwrap();
+    assert_eq!(decoded.attach, "t");
+    assert_eq!(decoded.resume_from_seq, Some(5));
+    assert_eq!(decoded.server_epoch, None);
+}
+
+#[test]
+fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
+    const ACCEPTED: &str = concat!(
+        r#"{"ok":true,"kind":"ghostty-snapshot","mode":"snapshot","seq":900,"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
+    );
+    const REJECTED: &str =
+        r#"{"ok":false,"error":{"code":"invalid-token","message":"unknown or expired token"}}"#;
+
+    let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
+        kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
+        mode: AttachMode::Snapshot,
+        seq: 900,
+        server_epoch: EPOCH,
+        tab_generation: 3,
+    });
+    round_trip(&accepted);
+    assert_eq!(serde_json::to_string(&accepted).unwrap(), ACCEPTED);
+    assert_eq!(
+        serde_json::from_str::<AttachHandshakeReply>(ACCEPTED).unwrap(),
+        accepted
+    );
+
+    let rejected = AttachHandshakeReply::rejected("invalid-token", "unknown or expired token");
+    round_trip(&rejected);
+    assert_eq!(serde_json::to_string(&rejected).unwrap(), REJECTED);
+    assert_eq!(
+        serde_json::from_str::<AttachHandshakeReply>(REJECTED).unwrap(),
+        rejected
+    );
+    assert_eq!(
+        rejected,
+        AttachHandshakeReply::Rejected(ResponseError {
+            code: "invalid-token".into(),
+            message: "unknown or expired token".into(),
+        })
+    );
+}
+
+/// `ok` is the discriminant, so an accepted arm missing a field it
+/// promises must fail loudly rather than decode as a rejection with no
+/// error body.
+#[test]
+fn a_truncated_handshake_reply_is_a_decode_error() {
+    assert!(serde_json::from_str::<AttachHandshakeReply>(r#"{"ok":true,"seq":1}"#).is_err());
+    assert!(serde_json::from_str::<AttachHandshakeReply>(r#"{"ok":false}"#).is_err());
+}
+
+#[test]
+fn attach_mode_is_a_lowercase_string() {
+    assert_eq!(
+        serde_json::to_string(&AttachMode::Snapshot).unwrap(),
+        r#""snapshot""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AttachMode::Resume).unwrap(),
+        r#""resume""#
+    );
+    assert_eq!(
+        serde_json::from_str::<AttachMode>(r#""resume""#).unwrap(),
+        AttachMode::Resume
+    );
+    assert!(serde_json::from_str::<AttachMode>(r#""Snapshot""#).is_err());
+}
+
+#[test]
+fn session_connect_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("session.connect.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_CONNECT);
+    let params: SessionConnectParams =
+        serde_json::from_value(request.params).expect("decode connect params");
+    assert!(params.takeover);
+
+    let raw = read_vector("session.connect.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: SessionConnectResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode connect result");
+    assert_eq!(result.lease, LEASE);
+    assert_eq!(result.revision, 42);
+}
+
+#[test]
+fn tab_attach_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("tab.attach.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request.op, roost_ipc::messages::ops::TAB_ATTACH);
+    let params: TabAttachParams =
+        serde_json::from_value(request.params).expect("decode attach params");
+    assert_eq!(params, sample_attach_params());
+
+    let raw = read_vector("tab.attach.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: TabAttachResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode attach result");
+    assert_eq!(result, sample_attach_result());
+}
+
+#[test]
+fn session_stopping_vector_decodes_into_its_typed_shape() {
+    let raw = read_vector("session.stopping.event.json");
+    let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
+    assert_eq!(envelope.event, SESSION_STOPPING_EVENT);
+    let data: SessionStoppingEvent =
+        serde_json::from_value(envelope.data).expect("decode stopping data");
+    assert_eq!(data.reason, "stop");
+
+    // The other half of the published vocabulary. Both are terminal;
+    // only the retry advice differs.
+    let taken_over: SessionStoppingEvent =
+        serde_json::from_str(r#"{"reason":"taken-over"}"#).unwrap();
+    assert_eq!(taken_over.reason, "taken-over");
+    round_trip(&taken_over);
 }
 
 #[test]

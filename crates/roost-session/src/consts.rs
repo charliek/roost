@@ -53,22 +53,6 @@ pub fn parent_ready_timeout() -> Duration {
 pub const DEFAULT_TAB_COLS: u16 = 120;
 pub const DEFAULT_TAB_ROWS: u16 = 40;
 
-/// The workspace announces `TabOpened` before the supervisor has
-/// spawned the PTY (the dispatcher opens the row first so a failed spawn
-/// can roll it back), so the drain attacher polls for the live PTY
-/// rather than assuming one.
-pub const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-/// How long that poll runs before the attacher stops waiting for a PTY.
-///
-/// This is the backstop, not the mechanism: a PTY that came and went
-/// before the drain looked is reported by the supervisor's `TabExited`,
-/// which the attacher subscribes to before any tab exists. The deadline
-/// only covers the case where that event was lost (a lagged lifecycle
-/// broadcast), so it is long — nothing should ever reach it — and
-/// reaching it still closes the row rather than leaving a phantom.
-pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long `serve` waits, after the accept loop unwinds, for the
 /// detached stop finalizer to finish unlinking the socket and releasing
 /// the locks.

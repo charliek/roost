@@ -11,6 +11,15 @@ every ordinary `call`, so this is its own connection and its own module.
 One batch per workspace commit, empty commits included, so a gap in
 `revision` always means loss — [`EventStream.expect_contiguous`] is the
 client half of that contract.
+
+Two things every subscriber has to know about, both HS-1b:
+
+* the stream is lease-gated — `session.connect` first, its lease on the
+  subscribe, or the server answers `connect-required`;
+* every frame is a batch EXCEPT one: a terminal control envelope
+  `{"event": "session.stopping", "data": {"reason": ...}}` that names why
+  the stream is ending. It carries no `revision` and is exempt from the
+  gap check, and the close that follows it is clean rather than a loss.
 """
 
 from __future__ import annotations
@@ -22,17 +31,25 @@ import time
 from client import RoostError, scaled_timeout
 
 
-class EventStream:
-    """One subscribed connection. Open it, [`subscribe`], then
-    [`recv_frame`] until the test has what it needs."""
+STOPPING_EVENT = "session.stopping"
 
-    def __init__(self, socket_path, timeout: float = 15.0):
+
+class EventStream:
+    """One subscribed connection. Open it with the lease a
+    `session.connect` handed out, [`subscribe`], then [`recv_frame`]
+    until the test has what it needs."""
+
+    def __init__(self, socket_path, lease: str = "", timeout: float = 15.0):
         self.path = str(socket_path)
+        self.lease = lease
         self._buf = b""
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.settimeout(scaled_timeout(timeout))
         self._sock.connect(self.path)
         self.revision: int | None = None
+        # Set when the terminal control envelope arrives; a close after
+        # it is the session saying goodbye, not a dropped stream.
+        self.stopping_reason: str | None = None
 
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:
@@ -48,17 +65,24 @@ class EventStream:
         self.close()
 
     # -- protocol ---------------------------------------------------------
-    def subscribe(self, tab_id_filter: int = 0) -> int:
+    def subscribe(self, tab_id_filter: int = 0, lease: str | None = None) -> int:
         """Send `events.subscribe` and return the ack's fence revision.
 
         The client already has everything at or below this revision (that
         is what a `tab.list` taken at the same moment means), so the first
         batch it should see is `revision + 1`.
+
+        Raises `RoostError('connect-required')` without a live lease and
+        `RoostError('taken-over')` with one another client has since
+        taken.
         """
         request = {
             "id": "1",
             "op": "events.subscribe",
-            "params": {"tab_id_filter": str(tab_id_filter)},
+            "params": {
+                "lease": self.lease if lease is None else lease,
+                "tab_id_filter": str(tab_id_filter),
+            },
         }
         self._sock.sendall((json.dumps(request) + "\n").encode())
         ack = json.loads(self._readline())
@@ -69,7 +93,8 @@ class EventStream:
         return self.revision
 
     def recv_frame(self, timeout: float = 10.0) -> dict:
-        """One pushed `EventBatch` — `{"revision": int, "events": [...]}`.
+        """One pushed frame: an `EventBatch` — `{"revision": int,
+        "events": [...]}` — or the terminal `session.stopping` envelope.
 
         Raises `TimeoutError` when nothing arrives inside the (scaled)
         budget and `RoostError("disconnected", ...)` when the server
@@ -77,6 +102,29 @@ class EventStream:
         is how the session says "resync" (`event_push.rs`).
         """
         return self._recv_within(scaled_timeout(timeout))
+
+    def recv_stopping(self, timeout: float = 10.0) -> str:
+        """Read to the close and return the reason the stream ended.
+
+        The label is best-effort by contract (a peer that stopped reading
+        makes the write impossible), but a session stopping a healthy
+        connection must produce it, so its absence is a failure here.
+        """
+        deadline = time.monotonic() + scaled_timeout(timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"the stream at {self.path} never ended within its budget")
+            try:
+                self._recv_within(remaining)
+            except RoostError as error:
+                if error.code != "disconnected":
+                    raise
+                if self.stopping_reason is None:
+                    raise AssertionError(
+                        f"the stream at {self.path} closed with no {STOPPING_EVENT} envelope"
+                    ) from error
+                return self.stopping_reason
 
     def recv_until(
         self, event: str, timeout: float = 10.0, max_batches: int = 512
@@ -103,7 +151,15 @@ class EventStream:
                     f"never saw {event!r} on {self.path} within its budget "
                     f"(read {len(batches)} batches)"
                 )
-            batches.append(self._recv_within(remaining))
+            frame = self._recv_within(remaining)
+            if "revision" not in frame:
+                # The only non-batch frame is the terminal envelope, and
+                # it means `event` is never coming.
+                raise RoostError(
+                    "disconnected",
+                    f"the session stopped ({self.stopping_reason}) before {event!r} arrived",
+                )
+            batches.append(frame)
             if len(batches) > max_batches:
                 raise AssertionError(
                     f"read {len(batches)} batches from {self.path} without seeing "
@@ -122,11 +178,15 @@ class EventStream:
         """
         want = start + 1
         for batch in batches:
+            if "revision" not in batch:
+                # The terminal control envelope is not a batch and does
+                # not participate in the revision sequence.
+                continue
             got = int(batch["revision"])
             if got != want:
                 raise AssertionError(
                     f"event stream skipped a revision: expected {want}, got {got} "
-                    f"(batches={[b['revision'] for b in batches]})"
+                    f"(batches={[b.get('revision', b.get('event')) for b in batches]})"
                 )
             want += 1
 
@@ -136,7 +196,10 @@ class EventStream:
         happens once, at the public entry point, so a caller spending a
         shared deadline down doesn't re-scale what it has left."""
         self._sock.settimeout(seconds)
-        return json.loads(self._readline())
+        frame = json.loads(self._readline())
+        if frame.get("event") == STOPPING_EVENT:
+            self.stopping_reason = (frame.get("data") or {}).get("reason", "")
+        return frame
 
     def _readline(self) -> str:
         while b"\n" not in self._buf:

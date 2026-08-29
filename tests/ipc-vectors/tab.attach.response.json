@@ -1,0 +1,10 @@
+{
+  "id": "4",
+  "ok": true,
+  "result": {
+    "attach_token": "1a0be5c37d924f68b1c05e3a7f2d8496",
+    "kind": "ghostty-snapshot",
+    "server_epoch": 6032428321756423947,
+    "tab_generation": 3
+  }
+}
