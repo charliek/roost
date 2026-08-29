@@ -32,6 +32,11 @@ mod ffi {
                 manifest_dir.display()
             )
         });
+        let ghostty_build_script = workspace_root.join("third_party/ghostty/build.sh");
+        let sha = parse_ghostty_sha(&ghostty_build_script);
+        println!("cargo:rustc-env=ROOST_GHOSTTY_SHA={sha}");
+        println!("cargo:rerun-if-changed={}", ghostty_build_script.display());
+
         let ghostty_out = workspace_root.join("third_party/ghostty/out");
 
         let header = ghostty_out.join("include/ghostty/vt.h");
@@ -99,6 +104,51 @@ mod ffi {
         bindings
             .write_to_file(&out_path)
             .expect("could not write bindings");
+    }
+
+    /// Extract the pinned Ghostty commit from
+    /// `third_party/ghostty/build.sh`'s `GHOSTTY_SHA="<40 hex>"` line.
+    /// Requires exactly one line matching `^GHOSTTY_SHA="[0-9a-f]{40}"` —
+    /// zero matches means the script's pin format moved out from under
+    /// us, and more than one means the pin is ambiguous. Either way a
+    /// silently wrong SHA baked into `libghostty_build()`'s output is
+    /// worse than a build failure that names the file to fix.
+    fn parse_ghostty_sha(build_script: &Path) -> String {
+        let contents = std::fs::read_to_string(build_script).unwrap_or_else(|err| {
+            panic!(
+                "could not read {} to extract GHOSTTY_SHA: {err}",
+                build_script.display()
+            )
+        });
+
+        const PREFIX: &str = "GHOSTTY_SHA=\"";
+        let matches: Vec<&str> = contents
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix(PREFIX)?;
+                let candidate = rest.get(..40)?;
+                (rest[40..].starts_with('"')
+                    && candidate
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')))
+                .then_some(candidate)
+            })
+            .collect();
+
+        match matches.as_slice() {
+            [sha] => (*sha).to_string(),
+            [] => panic!(
+                "no line in {} matches ^GHOSTTY_SHA=\"[0-9a-f]{{40}}\" — \
+                 the pin format moved; update build.rs's parser to match.",
+                build_script.display()
+            ),
+            multiple => panic!(
+                "expected exactly one GHOSTTY_SHA=\"<40 hex>\" line in {}, found {}: {:?}",
+                build_script.display(),
+                multiple.len(),
+                multiple
+            ),
+        }
     }
 
     /// Walk upward from `start` looking for the workspace root. We anchor

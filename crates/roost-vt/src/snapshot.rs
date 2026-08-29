@@ -135,6 +135,12 @@ impl Terminal {
 /// behind a wrapper one.
 const ENVELOPE_LEN: usize = 10;
 
+/// The envelope's u16 version at this libghostty pin
+/// (`third_party/ghostty/build.sh`'s `GHOSTTY_SHA`). Shared with
+/// [`crate::libghostty_build`] so the build-identifier string and the
+/// on-wire format version can't drift apart silently.
+pub const SNAPSHOT_FORMAT_VERSION: u16 = 1;
+
 /// `tag u16 | payload_len u32 | crc u32` (`snapshot.h:69-77`).
 const RECORD_HEADER_LEN: usize = 10;
 

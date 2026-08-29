@@ -133,6 +133,8 @@ mod mouse_encoder;
 #[cfg(feature = "ffi")]
 mod render_state;
 #[cfg(feature = "ffi")]
+mod resolve;
+#[cfg(feature = "ffi")]
 mod scroll;
 #[cfg(feature = "ffi")]
 mod selection;
@@ -156,12 +158,15 @@ pub use render_state::{
     Cell, CellWide, Colors, CursorInfo, CursorVisualStyle, Dirty, RenderState, RowWrap, Style,
 };
 #[cfg(feature = "ffi")]
+pub use resolve::{resolve_colors, DrawCell, RenderedRow};
+#[cfg(feature = "ffi")]
 pub use scroll::{PageDirection, PageRoute, ScrollDirection, ScrollRoute, TerminalScroll};
 #[cfg(feature = "ffi")]
 pub use selection::{RowTextProjection, SelectionSnapshot, SelectionSpan, TerminalSelection};
 #[cfg(feature = "ffi")]
 pub use snapshot::{
     DecodedTerminal, HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder,
+    SNAPSHOT_FORMAT_VERSION,
 };
 #[cfg(feature = "ffi")]
 pub use terminal::{
@@ -169,6 +174,21 @@ pub use terminal::{
 };
 #[cfg(feature = "ffi")]
 pub use tracked_ref::TrackedRef;
+
+/// Human-readable build identifier combining the pinned libghostty-vt
+/// commit (`third_party/ghostty/build.sh`'s `GHOSTTY_SHA`, captured at
+/// compile time by `build.rs`) with the snapshot wire format version.
+/// Host-sessions surfaces this so a client can tell whether a daemon's
+/// snapshot payload is compatible with its own libghostty-vt pin,
+/// without either side parsing the other's full version string.
+#[cfg(feature = "ffi")]
+pub fn libghostty_build() -> String {
+    format!(
+        "ghostty-{}+snapshot.v{}",
+        &env!("ROOST_GHOSTTY_SHA")[..16],
+        SNAPSHOT_FORMAT_VERSION
+    )
+}
 
 // ============================================================================
 // FFI smoke
@@ -288,5 +308,20 @@ mod tests {
             Err(Error::Other(-99)) => {}
             other => panic!("unknown rc should fall through to Other(-99), got {other:?}"),
         }
+    }
+
+    /// Pins the exact build-identifier string against the current
+    /// `third_party/ghostty/build.sh` pin, rather than just its shape —
+    /// the point is to catch drift between the pinned SHA and this
+    /// constant, which a pattern match would miss.
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn libghostty_build_matches_current_pin() {
+        assert_eq!(
+            libghostty_build(),
+            "ghostty-f2d5758f6305867d+snapshot.v1",
+            "GHOSTTY_SHA in third_party/ghostty/build.sh changed without \
+             updating this pin (or vice versa)"
+        );
     }
 }

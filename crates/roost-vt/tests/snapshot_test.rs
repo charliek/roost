@@ -20,7 +20,7 @@
 use roost_vt::{
     ffi, ActiveScreen, Cell, CellWide, ColorRgb, DecodedTerminal, Error, HistoryStep, ReadyState,
     RenderState, ScrollViewport, SnapshotDecodeOptions, SnapshotDecoder, Style, Terminal,
-    TerminalOptions, TerminalSelection,
+    TerminalOptions, TerminalSelection, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// `snapshot.h:53-118`: 8-byte magic then a u16 LE version.
@@ -46,7 +46,10 @@ fn assert_envelope(bytes: &[u8]) {
     );
     assert_eq!(&bytes[..8], MAGIC, "snapshot magic");
     let version = u16::from_le_bytes([bytes[8], bytes[9]]);
-    assert_eq!(version, 1, "snapshot format version at this pin");
+    assert_eq!(
+        version, SNAPSHOT_FORMAT_VERSION,
+        "snapshot format version at this pin"
+    );
 }
 
 // ============================================================================
