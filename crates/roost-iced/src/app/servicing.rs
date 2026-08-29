@@ -613,6 +613,17 @@ impl App {
                     task = task.then(self.menu_event(event));
                     batch.mark_dirty();
                 }
+                // Host mirrors + lifecycle land in the connection set.
+                // C6/C7 render off it; C4 only keeps it current, so with
+                // zero hosts these arms never run.
+                EngineFeed::HostWorkspace(host, event) => {
+                    self.hosts.apply_workspace(host, event);
+                }
+                EngineFeed::HostState(host, state) => {
+                    if let Some(host) = self.hosts.apply_state(host, state) {
+                        tracing::debug!(%host, "host connection state changed");
+                    }
+                }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {

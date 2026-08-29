@@ -11,8 +11,6 @@
 //! resolved and connected (`main.rs`'s ordinary target-selector
 //! prologue), never the session profile.
 
-use std::path::Path;
-
 use anyhow::Result;
 use clap::Subcommand;
 
@@ -109,7 +107,15 @@ async fn add(client: &mut IpcClient, label: &str, target: &str, verify: bool) ->
 /// `session`'s CI-scaled timeout, so a wedged or unreachable target
 /// fails fast instead of hanging `roostctl`.
 async fn verify_target(target: &str) -> Result<()> {
-    let mut client = session::connect(Path::new(target)).await?;
+    // "localhost" is the sentinel for this machine's own session (plan
+    // 037 §3.5), not a file literally named that. Same mapping the UI's
+    // host_conn::resolve_target applies.
+    let socket = if target == "localhost" {
+        roost_ipc::paths::BundleProfile::session()?.socket_path
+    } else {
+        std::path::PathBuf::from(target)
+    };
+    let mut client = session::connect(&socket).await?;
     let identity = session::identify_on(&mut client)
         .await
         .map_err(|e| anyhow::anyhow!("session.identify failed: {e}"))?;

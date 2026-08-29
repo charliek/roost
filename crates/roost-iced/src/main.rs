@@ -2,6 +2,9 @@ mod app;
 mod chrome;
 mod engine_feed;
 mod font_registry;
+/// Host sessions, client side (plan 037): one connection owner per
+/// connected `roost-session`, publishing onto the engine feed.
+mod host_conn;
 mod input;
 /// The AppKit seam. `cfg`'d whole rather than stubbed per-function: every
 /// call site pairs with a `not(macos)` no-op of its own, so nothing outside

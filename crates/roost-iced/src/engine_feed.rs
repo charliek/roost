@@ -22,7 +22,7 @@ use iced::Subscription;
 use roost_engine::ipc::UiRequest;
 use roost_engine::session::TabOutput;
 use roost_engine::{Workspace, WorkspaceEvent};
-use roost_ui_model::keys::TabKey;
+use roost_ui_model::keys::{HostId, TabKey};
 use tokio::sync::{mpsc, Notify};
 
 use crate::app::{AgentMetricsResult, ProviderRunResult};
@@ -57,6 +57,23 @@ pub(crate) enum EngineFeed {
     NotificationActivated {
         tab: TabKey,
     },
+    /// One connected host's workspace mirror moving forward, tagged with
+    /// the connection *instance* that produced it.
+    ///
+    /// [`EngineFeed::Workspace`] stays untagged and local-only: the
+    /// in-process workspace is the one every existing consumer means by
+    /// "the workspace", and giving it a tag would have been a rename of
+    /// every call site for no gain. A host's mirror is a different
+    /// thing arriving on the same ordered channel — which is what keeps
+    /// a remote `tab.opened` ordered against the local events around it.
+    ///
+    /// Carries no copy of the mirror: the connection task writes the
+    /// shared one in place, so this is a wake plus the envelopes that
+    /// have to be exact per commit.
+    HostWorkspace(HostId, crate::host_conn::HostWorkspaceEvent),
+    /// One host's connection lifecycle, for the sidebar headers,
+    /// takeover banner and upgrade dialog.
+    HostState(HostId, crate::host_conn::HostConnState),
 }
 
 /// The only way to put an item on the feed. Raw senders are never handed

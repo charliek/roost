@@ -1254,6 +1254,15 @@ pub struct App {
     palette_activate_replies: HashMap<u64, PaletteActivateReply>,
     clipboard: ClipboardQueue,
     desktop_notifications: DesktopNotifications,
+    /// Connected host sessions and their workspace mirrors (plan 037).
+    /// Empty until a host is connected, and inert while it is: with zero
+    /// hosts nothing is spawned and no feed item can arrive.
+    ///
+    /// Sits above `feed_rx`/`runtime` for the drop-order contract below —
+    /// each connection owns a runtime task, and its `Drop` signals that
+    /// task to wind down, which it can only act on while the runtime it
+    /// runs on is still there.
+    hosts: crate::host_conn::HostConnSet,
     /// A clone of `runtime`'s handle, so a mutation can be spawned onto
     /// the engine runtime from a `&self` method and awaited by an Iced
     /// task. Cheap and `Send`; dropping one is inert, so it takes no part
@@ -1311,6 +1320,9 @@ impl App {
             .theme_name
             .clone()
             .unwrap_or_else(|| "roost-dark".into());
+        // Read before the struct literal moves `active_theme_name`: the
+        // host connection set seeds every session's palette from it.
+        let host_theme = Theme::load_bundled(&active_theme_name);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1431,6 +1443,11 @@ impl App {
                 feed_tx.clone(),
                 profile.app_id.to_owned(),
             ),
+            hosts: crate::host_conn::HostConnSet::new(
+                runtime.handle().clone(),
+                feed_tx.clone(),
+                &host_theme,
+            ),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
@@ -1439,8 +1456,51 @@ impl App {
         };
         app.reconcile();
         app.resize(app.window_size);
+        app.reconnect_saved_hosts();
         tracing::info!(socket = %profile.socket_path.display(), "Iced walking skeleton ready");
         Ok(app)
+    }
+
+    /// Launch-time auto-reconnect for saved host sessions: **connect if
+    /// present**, and nothing more (plan 037 §3.2).
+    ///
+    /// Three rules, all deliberate. No daemon is ever spawned here — an
+    /// absent socket leaves the host disconnected with a ↻, because a
+    /// silent start on every launch is not something an app should do.
+    /// Only a localhost host is dialed — a remote host is
+    /// manual-reconnect only (D8), and an `ssh -L` forward that is not up
+    /// would otherwise make every launch wait on a dial. And on macOS
+    /// nothing happens at all: no `roost-session` is packaged there, so
+    /// the localhost surface is hidden (§3.1's Mac gate).
+    ///
+    /// With no saved hosts this is a no-op over an empty list, which is
+    /// the zero-change baseline.
+    fn reconnect_saved_hosts(&mut self) {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        for host in self.workspace.hosts() {
+            let (socket, localhost) = match crate::host_conn::resolve_target(&host.target) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    tracing::warn!(host = %host.id, ?error, "cannot resolve a saved host's target");
+                    continue;
+                }
+            };
+            if !localhost {
+                continue;
+            }
+            self.hosts.connect(
+                &host.id,
+                &host.label,
+                socket,
+                localhost,
+                crate::host_conn::ConnectMode::IfPresent,
+            );
+        }
+        if !self.hosts.is_empty() {
+            tracing::info!("probing saved host sessions");
+        }
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
