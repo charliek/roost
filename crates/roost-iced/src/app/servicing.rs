@@ -422,6 +422,277 @@ impl App {
         }
     }
 
+    // ---- host tab attach (plan 037 §3.4) --------------------------------
+
+    /// Focus a host tab: build its rendering state if needed and start
+    /// the attach. Attach-on-focus is the policy, so every other host
+    /// attach detaches first — client memory and data connections stay
+    /// bounded at one per host. C6's sidebar click and C7's creation
+    /// routing are the callers.
+    pub(super) fn host_focus_tab(&mut self, key: TabKey) {
+        debug_assert!(!key.is_local(), "local tabs focus through the workspace");
+        let others: Vec<TabKey> = self
+            .host_attach
+            .keys()
+            .copied()
+            .filter(|other| *other != key)
+            .collect();
+        for other in others {
+            self.host_detach_tab(other);
+        }
+        if self.host_attach.contains_key(&key) {
+            return;
+        }
+        let (cols, rows) = super::terminal_grid(
+            self.window_size,
+            self.effective_sidebar_width(),
+            self.terminal_metrics,
+        );
+        let geometry = self.host_geometry(cols, rows);
+        let attach =
+            host_tab::HostAttach::new(key, geometry).with_resume(self.host_resume.remove(&key));
+        let handle = TabHandle::host(attach.input_tx(), self.test_mode);
+        match self.tabs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                // Refocus: the surviving terminal keeps rendering (and is
+                // the resume base); only the handle turns over, so input
+                // reaches the NEW attempt's queue instead of a dead one.
+                entry.get_mut().session = handle;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let built = {
+                    let _guard = self.runtime.enter();
+                    TerminalTab::attach_host(
+                        cols,
+                        rows,
+                        Theme::load_bundled(&self.active_theme_name),
+                        self.config.word_break_chars.clone(),
+                        handle,
+                    )
+                };
+                match built {
+                    Ok(tab) => {
+                        entry.insert(tab);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%key, ?error, "host tab terminal build failed");
+                        return;
+                    }
+                }
+            }
+        }
+        self.host_attach.insert(key, attach);
+        self.host_begin_attach(key);
+    }
+
+    /// The grid plus the cell pixel size an attach negotiates, from the
+    /// metrics the local tabs are already laid out with.
+    pub(super) fn host_geometry(&self, cols: u16, rows: u16) -> host_tab::Geometry {
+        host_tab::Geometry {
+            cols,
+            rows,
+            cell_w: self.terminal_metrics.cell_width.round().max(1.0) as u32,
+            cell_h: self.terminal_metrics.cell_height.round().max(1.0) as u32,
+        }
+    }
+
+    /// Detach a host tab (focus moved away, or its stream told us to let
+    /// go). The rendering state survives in `tabs` — disconnect is not
+    /// stop, and refocus resumes from the point saved here.
+    pub(super) fn host_detach_tab(&mut self, key: TabKey) {
+        if let Some(attach) = self.host_attach.remove(&key) {
+            if let Some(resume) = attach.detach() {
+                self.host_resume.insert(key, resume);
+            }
+        }
+    }
+
+    /// Drop every piece of app state keyed by a dead connection
+    /// incarnation. The fresh mirror is authoritative; purge-then-
+    /// re-derive is what prevents duplicates (plan 037 §3.2).
+    fn purge_host_incarnation(&mut self, incarnation: HostId) {
+        // Every attach and every resume point belongs to a key that also
+        // has a `tabs` entry (`host_focus_tab` mints them together), so
+        // dropping the incarnation's tabs drops all three. The retain
+        // afterwards is belt-and-braces for a resume point whose tab
+        // already went.
+        let dead: Vec<TabKey> = self
+            .tabs
+            .keys()
+            .copied()
+            .filter(|key| key.host == incarnation)
+            .collect();
+        for key in dead {
+            self.host_drop_tab(key);
+        }
+        self.host_resume.retain(|key, _| key.host != incarnation);
+    }
+
+    /// The tab is over (EXIT, or its whole connection incarnation went):
+    /// drop everything local to it. The mirror's `tab.closed` event
+    /// retires its sidebar row.
+    fn host_drop_tab(&mut self, key: TabKey) {
+        self.host_detach_tab(key);
+        self.host_resume.remove(&key);
+        self.tabs.remove(&key);
+        self.notification_inbox.remove(key);
+        self.desktop_notifications.retire(key);
+    }
+
+    fn host_begin_attach(&mut self, key: TabKey) {
+        let Some(attach) = self.host_attach.get_mut(&key) else {
+            return;
+        };
+        let (Some(ops), Some(socket)) = (
+            self.hosts.ops_for(key.host),
+            self.hosts.endpoint_for(key.host),
+        ) else {
+            // The connection this key belongs to is gone (stale
+            // incarnation, or the host dropped between frames). Nothing
+            // to attach to; the entry goes with it.
+            tracing::debug!(%key, "host attach requested for a dead connection incarnation");
+            self.host_attach.remove(&key);
+            return;
+        };
+        let _guard = self.runtime.enter();
+        attach.begin(ops, socket, &roost_vt::libghostty_build(), &self.feed_tx);
+    }
+
+    fn apply_host_tab_frame(
+        &mut self,
+        key: TabKey,
+        frame: host_tab::HostTabFrame,
+        pty: &mut TabOutputBatch,
+    ) {
+        let step = match (self.host_attach.get_mut(&key), self.tabs.get_mut(&key)) {
+            (Some(attach), Some(tab)) => {
+                // The machine arms its own timers, so it needs the app
+                // runtime ambient the same way `begin` and `arm_reattach`
+                // below do — `tokio::spawn` panics without it.
+                let _guard = self.runtime.enter();
+                attach.on_frame(frame, tab, &self.feed_tx)
+            }
+            // A frame for a key with no attach state: the tab detached,
+            // the tab dropped, or the whole incarnation is stale — every
+            // case is the same harmless late delivery.
+            _ => {
+                tracing::debug!(%key, "host tab frame without attach state");
+                return;
+            }
+        };
+        match step {
+            host_tab::AttachStep::None => {}
+            host_tab::AttachStep::Refresh => {
+                pty.touched.insert(key);
+            }
+            host_tab::AttachStep::Reattach { delay } => {
+                if delay.is_zero() {
+                    self.host_begin_attach(key);
+                } else if let Some(attach) = self.host_attach.get_mut(&key) {
+                    let _guard = self.runtime.enter();
+                    attach.arm_reattach(delay, &self.feed_tx);
+                }
+            }
+            host_tab::AttachStep::Detach => self.host_detach_tab(key),
+            host_tab::AttachStep::Closed { code } => {
+                tracing::debug!(%key, code, "host tab exited");
+                pty.touched.remove(&key);
+                self.host_drop_tab(key);
+            }
+        }
+    }
+
+    /// Apply one `tab.effect` envelope from a connected host: bell rings
+    /// the notification inbox (the app's attention surface — local tabs
+    /// have no bell path, so this is the closest existing one), and an
+    /// OSC 52 write lands on this client's clipboard under the same
+    /// config policy a local tab's write obeys. The caller chains the
+    /// returned task — it is the queue pump, exactly as
+    /// `apply_osc_actions`'s tail is for a local write.
+    fn apply_host_effect(
+        &mut self,
+        host: HostId,
+        effect: &roost_ipc::messages::TabEffectEvent,
+    ) -> UiTask {
+        let key = TabKey::new(host, effect.tab_id);
+        match effect.effect {
+            roost_ipc::messages::TabEffect::Bell => {
+                let Some((project, title)) = self.host_notification_title(key) else {
+                    return UiTask::None;
+                };
+                self.notification_inbox
+                    .upsert(notification_inbox::NotificationRecord::new(
+                        key, project, title, "Bell",
+                    ));
+                UiTask::None
+            }
+            roost_ipc::messages::TabEffect::ClipboardWrite => {
+                let Some(data) = effect.data.as_deref() else {
+                    return UiTask::None;
+                };
+                let Ok(bytes) = roost_ipc::messages::bytes_base64::decode(data) else {
+                    tracing::debug!(%key, "clipboard effect with undecodable payload");
+                    return UiTask::None;
+                };
+                let target = match effect.target.unwrap_or_default() {
+                    roost_ipc::messages::ClipboardEffectTarget::System => {
+                        roost_engine::osc::ClipboardTarget::System
+                    }
+                    roost_ipc::messages::ClipboardEffectTarget::Selection => {
+                        roost_engine::osc::ClipboardTarget::Selection
+                    }
+                };
+                // Reject rather than repair: the local OSC 52 parser
+                // refuses non-UTF-8 payloads, and a peer that sends one
+                // must not get replacement-altered text onto the
+                // clipboard here either.
+                let Ok(text) = String::from_utf8(bytes) else {
+                    tracing::debug!(%key, "clipboard effect payload is not UTF-8; dropped");
+                    return UiTask::None;
+                };
+                if !enqueue_osc_clipboard_write(
+                    &mut self.clipboard,
+                    self.config.clipboard_write,
+                    target,
+                    text,
+                ) {
+                    tracing::info!(
+                        %key,
+                        "host OSC 52 clipboard write dropped — clipboard-write = deny"
+                    );
+                    return UiTask::None;
+                }
+                self.clipboard.start_next()
+            }
+        }
+    }
+
+    /// The inbox row identity for a host tab, from the mirror the events
+    /// stream keeps current.
+    fn host_notification_title(&self, key: TabKey) -> Option<(ProjectKey, String)> {
+        let mirror = self.hosts.mirror(key.host)?;
+        let mirror = mirror.read();
+        let (project, tab) = mirror.projects.iter().find_map(|project| {
+            let tab = project.tabs.iter().find(|tab| tab.id == key.tab)?;
+            Some((project, tab))
+        })?;
+        Some((ProjectKey::new(key.host, project.id), tab.title.clone()))
+    }
+
+    /// Resolve a wire-form tab reference against the UI's keyed map: a
+    /// bare id is one of the local backend's, a host-qualified ref names
+    /// an attached host tab's client-side terminal (plan 037 §3.4). A
+    /// ref from a dead connection epoch simply misses the map — the
+    /// staleness contract `HostId` minting exists for.
+    fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> TabKey {
+        match tab {
+            roost_ipc::messages::WireTabRef::Local(tab_id) => self.backend.tab_key(tab_id),
+            roost_ipc::messages::WireTabRef::Host { host, tab } => {
+                TabKey::new(HostId::new(host), tab)
+            }
+        }
+    }
+
     /// Queue a strip reveal when the OBSERVED active tab changed. Hooked
     /// to reconcile rather than to a focus helper on purpose: `tab.focus`
     /// over IPC mutates the workspace in its handler and reaches the UI
@@ -617,17 +888,59 @@ impl App {
                 // C6/C7 render off it; C4 only keeps it current, so with
                 // zero hosts these arms never run.
                 EngineFeed::HostWorkspace(host, event) => {
+                    // Effects ride the batch verbatim and are applied
+                    // here, before the mirror folds the commit away.
+                    // Lease-holder-only is structural: this stream only
+                    // flows while our connection holds the lease — a
+                    // displaced client's events connection is closed at
+                    // takeover before the new holder can generate any.
+                    if let crate::host_conn::HostWorkspaceEvent::Applied { events, .. } = &event {
+                        for envelope in events {
+                            if envelope.event != roost_ipc::messages::ops::EVENT_TAB_EFFECT {
+                                continue;
+                            }
+                            match serde_json::from_value(envelope.data.clone()) {
+                                Ok(effect) => {
+                                    task = task.then(self.apply_host_effect(host, &effect));
+                                }
+                                Err(error) => tracing::debug!(
+                                    ?host, %error,
+                                    "a tab.effect envelope did not decode"
+                                ),
+                            }
+                        }
+                    }
                     self.hosts.apply_workspace(host, event);
                 }
+                EngineFeed::HostTab(key, frame) => {
+                    self.apply_host_tab_frame(key, frame, &mut pty);
+                }
                 EngineFeed::HostState(host, state) => {
+                    let previous = match &state {
+                        crate::host_conn::HostConnState::Connecting { previous } => *previous,
+                        _ => None,
+                    };
                     if let Some(host) = self.hosts.apply_state(host, state) {
+                        // Attributed (not a stale task's publication): the
+                        // app-side purge follows the set's — everything
+                        // keyed by the dead incarnation is re-derived from
+                        // the fresh mirror (plan 037 §3.2).
+                        if let Some(previous) = previous {
+                            self.purge_host_incarnation(previous);
+                        }
                         tracing::debug!(%host, "host connection state changed");
                     }
                 }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
-                    if let Some(raise) =
+                    if !tab.is_local() {
+                        // A host tab's jump: attach it. The sidebar
+                        // selection follows once C6 renders host
+                        // sections; until then the attach itself is the
+                        // whole of the jump.
+                        self.host_focus_tab(tab);
+                    } else if let Some(raise) =
                         notification_activation(&self.workspace, self.window_id, tab)
                     {
                         // The rest of a notification jump, exactly as the
@@ -1181,7 +1494,7 @@ impl App {
             UiRequest::Dump { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&self.backend.tab_key(tab_id))
+                    .get(&self.wire_tab_key(tab_id))
                     .map(TerminalTab::dump)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -1220,7 +1533,7 @@ impl App {
             } => {
                 let result = self
                     .tabs
-                    .get(&self.backend.tab_key(tab_id))
+                    .get(&self.wire_tab_key(tab_id))
                     .and_then(|tab| tab.session.capture())
                     .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
                     .and_then(|capture| {
@@ -1289,7 +1602,7 @@ impl App {
             UiRequest::TabDumpResolved { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&self.backend.tab_key(tab_id))
+                    .get(&self.wire_tab_key(tab_id))
                     .map(TerminalTab::resolved_cells)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);

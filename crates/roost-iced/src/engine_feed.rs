@@ -41,6 +41,12 @@ pub(crate) enum EngineFeed {
     /// backend's items can never land on another backend's tab that
     /// happens to carry the same numeric id.
     Tab(TabKey, TabOutput),
+    /// One attached host tab's data-plane traffic: handshake outcomes,
+    /// SNAP/PTY/EXIT/ERROR frames off the data connection, and the
+    /// attach machinery's own timers. Background tasks only move the
+    /// frames; the decoder and the client terminal they drive live in
+    /// the per-tab attach state on the main thread (plan 037 §3.3).
+    HostTab(TabKey, crate::app::host_tab::HostTabFrame),
     UiRequest(UiRequest),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
@@ -125,6 +131,16 @@ impl EngineFeedReceiver {
         let tab_bytes = matches!(
             item,
             EngineFeed::Tab(_, TabOutput::Bytes(_) | TabOutput::Scanned { .. })
+                // `StepDecoder` joins them: it only steps history pages
+                // or finishes the swap, so it moves terminal state and
+                // never workspace state — a batch carrying one must not
+                // pay a full reconcile.
+                | EngineFeed::HostTab(
+                    _,
+                    crate::app::host_tab::HostTabFrame::Pty { .. }
+                        | crate::app::host_tab::HostTabFrame::Snap { .. }
+                        | crate::app::host_tab::HostTabFrame::StepDecoder { .. }
+                )
         );
         batch.workspace_events |= workspace;
         batch.non_tab_bytes |= !tab_bytes;

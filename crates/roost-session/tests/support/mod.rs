@@ -21,7 +21,7 @@ use roost_ipc::messages::{
     ops, IdentifyParams, IdentifyResult, SessionConnectParams, SessionConnectResult,
     SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult, Tab,
     TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams,
+    TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams, WireTabRef,
 };
 use roost_ipc::IpcClient;
 use roost_session::{Readiness, SessionConfig};
@@ -261,7 +261,12 @@ pub async fn resize_tab(
 /// thread; here it is a round trip through the tab task.
 pub async fn tab_dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
     client
-        .call(ops::TAB_DUMP, TabDumpParams { tab_id })
+        .call(
+            ops::TAB_DUMP,
+            TabDumpParams {
+                tab_id: WireTabRef::Local(tab_id),
+            },
+        )
         .await
         .expect("tab.dump")
 }
@@ -271,7 +276,12 @@ pub async fn tab_dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
 /// dump come out of one implementation.
 pub async fn tab_dump_resolved(client: &mut IpcClient, tab_id: i64) -> TabDumpResolvedResult {
     client
-        .call(ops::TAB_DUMP_RESOLVED, TabDumpResolvedParams { tab_id })
+        .call(
+            ops::TAB_DUMP_RESOLVED,
+            TabDumpResolvedParams {
+                tab_id: WireTabRef::Local(tab_id),
+            },
+        )
         .await
         .expect("tab.dump_resolved")
 }

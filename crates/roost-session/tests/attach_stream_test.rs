@@ -36,6 +36,7 @@ use roost_ipc::messages::{
     ops, AttachAccepted, AttachHandshake, AttachMode, AttachPayloadKind, ResolvedCell,
     TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
     TabCloseParams, TabDumpCursor, TabDumpResolvedResult, TabDumpResult, TabFeedPtyBytesParams,
+    WireTabRef,
 };
 use roost_ipc::IpcClient;
 use roost_vt::{
@@ -144,7 +145,7 @@ impl Session {
             .call(
                 ops::TAB_CAPTURE_PTY_INPUT,
                 TabCapturePtyInputParams {
-                    tab_id,
+                    tab_id: WireTabRef::Local(tab_id),
                     drain: true,
                 },
             )

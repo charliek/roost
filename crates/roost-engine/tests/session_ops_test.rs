@@ -159,6 +159,24 @@ async fn a_session_socket_does_not_know_the_host_ops() {
     );
 }
 
+/// A session's tab ids are one bare id-space; the `h<host>.<id>` wire
+/// spelling names a UI's client-side tab and is refused by name rather
+/// than silently narrowed to a number (plan 037 §3.4). The refusal
+/// lives in the server-VT `served` twins — a featureless build's stub
+/// falls through to the (absent) UI path instead, so the test rides
+/// the feature.
+#[cfg(feature = "server-vt")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_socket_refuses_host_qualified_tab_refs() {
+    let f = fixture(true);
+    for op in [ops::TAB_DUMP, ops::TAB_DUMP_RESOLVED] {
+        let err = call(&f.handler, op, serde_json::json!({"tab_id": "h3.7"}))
+            .await
+            .expect_err("a host-qualified ref must be refused");
+        assert_eq!(err.code, "invalid-param", "{op}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_identify_reports_the_installed_identity() {
     let f = fixture(true);

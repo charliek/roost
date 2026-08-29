@@ -1469,6 +1469,11 @@ impl App {
             return Err(message);
         }
         self.active_theme_name = name.to_string();
+        // Connected hosts re-seed their server terminals with the same
+        // palette (`session.set_theme` rides each host's op queue), so
+        // the colors a host tab's queries answer with move with the
+        // theme exactly as a local tab's drain state does above.
+        self.hosts.set_theme(&theme);
         Ok(())
     }
 

@@ -48,7 +48,7 @@ use roost_ipc::messages::{
     TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
     TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
     TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, SESSION_PROTOCOL_VERSION,
+    WindowResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -198,8 +198,14 @@ pub enum UiRequest {
     /// Render the whole window (sidebar + tabs + active terminal) to a
     /// PNG.
     Screenshot { scale: u32, reply: ScreenshotReply },
-    /// Read a tab's terminal viewport as text.
-    Dump { tab_id: i64, reply: DumpReply },
+    /// Read a tab's terminal viewport as text. `tab_id` is the wire
+    /// form: bare = a local tab, host-qualified = an attached host
+    /// tab's client-side terminal — the UI resolves both against its
+    /// keyed map (plan 037 §3.4).
+    Dump {
+        tab_id: WireTabRef,
+        reply: DumpReply,
+    },
     /// Open a command-palette root frame and reply with its state.
     /// `kind`: "" / "commands" → command palette; "launcher" → the
     /// custom-command launcher.
@@ -265,7 +271,7 @@ pub enum UiRequest {
     /// bytes the UI has queued onto a tab's PTY-input channel.
     /// Gated like `TabFeedPtyBytes`.
     TabCapturePtyInput {
-        tab_id: i64,
+        tab_id: WireTabRef,
         drain: bool,
         reply: CapturedBytesReply,
     },
@@ -273,7 +279,7 @@ pub enum UiRequest {
     /// viewport after the production color resolver has run. Ungated
     /// (no shadow state — same walk the real paint loop runs).
     TabDumpResolved {
-        tab_id: i64,
+        tab_id: WireTabRef,
         reply: DumpResolvedReply,
     },
     /// `tab.expand_selection_at` — run the production
@@ -1279,24 +1285,42 @@ fn session_test_mode(h: &IpcHandler) -> Result<(), HandlerError> {
 mod served {
     use super::{
         session_test_mode, tab_ask, tab_commands, tab_gone, DumpData, HandlerError, IpcHandler,
-        ResolvedCellsData,
+        ResolvedCellsData, WireTabRef,
     };
     use crate::tab_task::TabCmd;
 
+    /// A session's ids are one bare id-space by design; the
+    /// `h<host>.<id>` spelling names a UI's client-side tab and is
+    /// refused here rather than silently narrowed to a number that
+    /// would read some unrelated tab.
+    fn bare(tab: WireTabRef) -> Result<i64, HandlerError> {
+        tab.local().ok_or_else(|| {
+            HandlerError::invalid_param(
+                "host-qualified tab refs are a UI-socket form; session tab ids are bare",
+            )
+        })
+    }
+
     pub(super) async fn dump(
         h: &IpcHandler,
-        tab_id: i64,
+        tab: WireTabRef,
     ) -> Option<Result<DumpData, HandlerError>> {
         h.session.as_ref()?;
-        Some(tab_ask(h, tab_id, TabCmd::Dump).await)
+        Some(match bare(tab) {
+            Ok(tab_id) => tab_ask(h, tab_id, TabCmd::Dump).await,
+            Err(error) => Err(error),
+        })
     }
 
     pub(super) async fn dump_resolved(
         h: &IpcHandler,
-        tab_id: i64,
+        tab: WireTabRef,
     ) -> Option<Result<ResolvedCellsData, HandlerError>> {
         h.session.as_ref()?;
-        Some(tab_ask(h, tab_id, TabCmd::DumpResolved).await)
+        Some(match bare(tab) {
+            Ok(tab_id) => tab_ask(h, tab_id, TabCmd::DumpResolved).await,
+            Err(error) => Err(error),
+        })
     }
 
     pub(super) async fn feed_pty_bytes(
@@ -1332,11 +1356,14 @@ mod served {
 
     pub(super) async fn capture_pty_input(
         h: &IpcHandler,
-        tab_id: i64,
+        tab: WireTabRef,
         drain: bool,
     ) -> Option<Result<Vec<u8>, HandlerError>> {
         h.session.as_ref()?;
-        Some(capture(h, tab_id, drain).await)
+        Some(match bare(tab) {
+            Ok(tab_id) => capture(h, tab_id, drain).await,
+            Err(error) => Err(error),
+        })
     }
 
     async fn capture(h: &IpcHandler, tab_id: i64, drain: bool) -> Result<Vec<u8>, HandlerError> {
@@ -1363,15 +1390,18 @@ mod served {
     // every one is an `async fn` that never awaits.
     #![allow(clippy::unused_async)]
 
-    use super::{DumpData, HandlerError, IpcHandler, ResolvedCellsData};
+    use super::{DumpData, HandlerError, IpcHandler, ResolvedCellsData, WireTabRef};
 
-    pub(super) async fn dump(_: &IpcHandler, _: i64) -> Option<Result<DumpData, HandlerError>> {
+    pub(super) async fn dump(
+        _: &IpcHandler,
+        _: WireTabRef,
+    ) -> Option<Result<DumpData, HandlerError>> {
         None
     }
 
     pub(super) async fn dump_resolved(
         _: &IpcHandler,
-        _: i64,
+        _: WireTabRef,
     ) -> Option<Result<ResolvedCellsData, HandlerError>> {
         None
     }
@@ -1386,7 +1416,7 @@ mod served {
 
     pub(super) async fn capture_pty_input(
         _: &IpcHandler,
-        _: i64,
+        _: WireTabRef,
         _: bool,
     ) -> Option<Result<Vec<u8>, HandlerError>> {
         None

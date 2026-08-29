@@ -72,6 +72,7 @@ use crate::{chrome, input};
 // `mod palette` would collide with the `roost_ui_model::palette` import in
 // this module's namespace, so the palette-overlay half of App lives in
 // `palettes` (it hosts the command/agent/provider/notification palettes).
+pub(crate) mod host_tab;
 mod interactions;
 mod palettes;
 mod servicing;
@@ -1263,6 +1264,17 @@ pub struct App {
     /// task to wind down, which it can only act on while the runtime it
     /// runs on is still there.
     hosts: crate::host_conn::HostConnSet,
+    /// The focused host tab's attach machinery. Attach-on-focus keeps
+    /// exactly one entry alive at a time today (plan 037 §3.4) — the map
+    /// is keyed like `tabs` so C6/C7 can widen that policy without
+    /// reshaping the state. Dropped before the runtime for the same
+    /// reason as `hosts`: each attach owns runtime tasks.
+    host_attach: HashMap<TabKey, host_tab::HostAttach>,
+    /// Resume points of previously attached host tabs: refocus resumes
+    /// from here (`mode: "resume"` when the ring covers it). Keyed by
+    /// the connection incarnation, so a reconnect naturally orphans the
+    /// stale entries and the purge drops them.
+    host_resume: HashMap<TabKey, host_tab::ResumePoint>,
     /// A clone of `runtime`'s handle, so a mutation can be spawned onto
     /// the engine runtime from a `&self` method and awaited by an Iced
     /// task. Cheap and `Send`; dropping one is inert, so it takes no part
@@ -1448,6 +1460,8 @@ impl App {
                 feed_tx.clone(),
                 &host_theme,
             ),
+            host_attach: HashMap::new(),
+            host_resume: HashMap::new(),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
@@ -1777,6 +1791,13 @@ impl App {
         self.window_size = size;
         let (cols, rows) =
             terminal_grid(size, self.effective_sidebar_width(), self.terminal_metrics);
+        // The attached host tab's server must follow the grid too — the
+        // machine decides when (immediately while live; withheld during
+        // hydration, where a mid-snapshot resize forfeits history).
+        let host_geometry = self.host_geometry(cols, rows);
+        for attach in self.host_attach.values_mut() {
+            attach.note_resize(host_geometry);
+        }
         for (key, tab) in &mut self.tabs {
             match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
                 Ok(Some(change)) => {

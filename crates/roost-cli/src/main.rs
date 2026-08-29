@@ -60,7 +60,7 @@ use roost_ipc::messages::{
     ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
     TabCloseParams, TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams,
     TabOpenResult, TabReorderParams, TabResizeParams, TabSetStateParams, TabSetTitleParams,
-    TabState, TabWriteParams,
+    TabState, TabWriteParams, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -414,9 +414,12 @@ enum TabCmd {
     /// Dump the tab's terminal viewport as text — one line per visible
     /// row, for content assertions in automated tests. Prints the rows
     /// to stdout; `--json` emits the full result (dims + cursor + rows).
+    /// `--tab` takes a bare id or, against the UI socket, the
+    /// `h<host>.<id>` spelling of an attached host tab's client-side
+    /// terminal (host-sessions §3.4).
     Dump {
         #[arg(long, env = "ROOST_TAB_ID")]
-        tab: Option<i64>,
+        tab: Option<String>,
         /// Emit the structured JSON result instead of plain text rows.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -654,7 +657,12 @@ async fn main() -> Result<()> {
                     let text_ok = match &text {
                         Some(needle) => {
                             match client
-                                .call::<_, TabDumpResult>(ops::TAB_DUMP, TabDumpParams { tab_id })
+                                .call::<_, TabDumpResult>(
+                                    ops::TAB_DUMP,
+                                    TabDumpParams {
+                                        tab_id: WireTabRef::Local(tab_id),
+                                    },
+                                )
                                 .await
                             {
                                 Ok(dump) => dump.rows_text.join("\n").contains(needle.as_str()),
@@ -874,7 +882,11 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Cmd::Tab(TabCmd::Dump { tab, json }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = match tab.as_deref() {
+                Some(raw) => WireTabRef::parse(raw)
+                    .ok_or_else(|| anyhow::anyhow!("invalid --tab reference: {raw}"))?,
+                None => WireTabRef::Local(resolve_tab(&mut client, None).await?),
+            };
             let result: TabDumpResult =
                 client.call(ops::TAB_DUMP, TabDumpParams { tab_id }).await?;
             if json {

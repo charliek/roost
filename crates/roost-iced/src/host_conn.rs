@@ -330,6 +330,13 @@ impl HostConnSet {
         localhost: bool,
         mode: ConnectMode,
     ) {
+        // The incarnation this reconnect displaces, threaded into the
+        // replacement task so its FIRST `Connecting` carries it — that
+        // is the one message consumers purge dead-incarnation state off,
+        // and without it an explicit reconnect would leak everything the
+        // old connection's tabs left behind (attach state, terminals,
+        // inbox rows).
+        let supersedes = self.conns.get(host).and_then(|conn| conn.incarnation);
         self.forget(host);
         self.next_generation += 1;
         let generation = self.next_generation;
@@ -342,6 +349,7 @@ impl HostConnSet {
             socket: socket.clone(),
             localhost,
             generation,
+            supersedes,
             mode,
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
@@ -379,8 +387,15 @@ impl HostConnSet {
 
     /// Stop driving a host. Disconnect is never Stop: the session keeps
     /// running, and its tabs with it.
-    pub(crate) fn disconnect(&mut self, host: &str) {
+    /// Returns the incarnation that was live, so the caller can purge
+    /// the app state keyed on it (attach machinery, client terminals,
+    /// inbox rows) — a disconnect with no reconnect never publishes a
+    /// `Connecting { previous }` for consumers to purge off. C7's
+    /// disconnect verb is the caller.
+    pub(crate) fn disconnect(&mut self, host: &str) -> Option<HostId> {
+        let incarnation = self.conns.get(host).and_then(|conn| conn.incarnation);
         self.forget(host);
+        incarnation
     }
 
     /// Drop the connection and everything keyed on its incarnation.
@@ -461,6 +476,14 @@ impl HostConnSet {
         self.conns
             .get(host)
             .map(|conn| (conn.socket.as_path(), conn.localhost))
+    }
+
+    /// The socket a live incarnation's data connections dial — owned, so
+    /// an attach task can carry it off the main thread. `None` for a
+    /// stale incarnation, same contract as [`Self::ops_for`].
+    pub(crate) fn endpoint_for(&self, incarnation: HostId) -> Option<std::path::PathBuf> {
+        let host = self.owner_of(incarnation)?;
+        self.endpoint(&host).map(|(socket, _)| socket.to_path_buf())
     }
 
     /// The theme changed. The slot every task re-reads on reconnect is

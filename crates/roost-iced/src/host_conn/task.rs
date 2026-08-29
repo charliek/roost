@@ -117,6 +117,11 @@ pub(crate) struct ConnectionConfig {
     /// incarnation it mints is registered under it, so the app can tell
     /// this task's publications from a replaced task's.
     pub(crate) generation: u64,
+    /// The incarnation an explicit reconnect displaced, if any — seeds
+    /// the first attempt's `Connecting { previous }` so consumers purge
+    /// the dead incarnation's state exactly as they do for this task's
+    /// own later retries.
+    pub(crate) supersedes: Option<HostId>,
     pub(crate) mode: ConnectMode,
     /// This session's pinned libghostty identity, compared exactly.
     pub(crate) client_build: String,
@@ -265,7 +270,7 @@ async fn connect_loop(
     shutdown: &Shutdown,
 ) {
     let mut machine = HostStateMachine::new(config.localhost);
-    let mut previous: Option<HostId> = None;
+    let mut previous: Option<HostId> = config.supersedes;
     let mut mode = config.mode;
     // The lease this task last held. `Some` means an auto-retry, and an
     // auto-retry has to ask before it takes the session back — see
@@ -1026,6 +1031,7 @@ mod tests {
             socket,
             localhost,
             generation: 1,
+            supersedes: None,
             mode,
             client_build: "gb".into(),
             theme: Arc::new(Mutex::new(super::super::blank_theme())),

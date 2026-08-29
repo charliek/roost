@@ -14,6 +14,8 @@
 //! attribute — clients see them as permissive, allowing the server
 //! to add fields in a backwards-compatible way.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
@@ -331,8 +333,9 @@ pub struct TabResizeParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabDumpParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id, or the `h<host>.<id>` wire spelling for an
+    /// attached host tab's client-side terminal (UI socket only).
+    pub tab_id: WireTabRef,
 }
 
 /// Cursor position within the dumped viewport, 0-indexed from the top-left.
@@ -648,8 +651,10 @@ pub struct TabFeedPtyBytesParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabCapturePtyInputParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id, or the `h<host>.<id>` wire spelling for an
+    /// attached host tab (UI socket only) — the capture then reads the
+    /// INPUT-frame bytes the UI queued toward that host.
+    pub tab_id: WireTabRef,
     #[serde(default)]
     pub drain: bool,
 }
@@ -693,8 +698,9 @@ pub struct TabFeedImeParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabDumpResolvedParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id, or the `h<host>.<id>` wire spelling for an
+    /// attached host tab's client-side terminal (UI socket only).
+    pub tab_id: WireTabRef,
 }
 
 /// `tab.expand_selection_at` request: drive the same double-/triple-
@@ -2268,6 +2274,87 @@ pub mod string_int64 {
     }
 }
 
+// ============================================================================
+// Wire tab reference — bare id or host-qualified spelling
+// ============================================================================
+
+/// A wire-facing tab reference: the bare string-wrapped engine id every
+/// existing caller sends (`"5"`), or the host-qualified `h<host>.<id>`
+/// spelling the UI's keyed maps use (`"h3.7"`) — host-sessions plan 037
+/// §3.4. The UI socket's dump/capture ops accept both, resolving the
+/// qualified form to the client-side terminal of an attached host tab;
+/// a session socket (whose ids are one bare id-space by design) narrows
+/// with [`Self::local`] and answers `invalid-param` for a qualified ref.
+///
+/// The parser is canonical, mirroring `roost-ui-model`'s
+/// `TabKey::from_wire`: `from(s)` round-trips to exactly `s`, so `h0.7`
+/// (local is always bare), `+7`, and leading zeros are rejected rather
+/// than normalized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireTabRef {
+    Local(i64),
+    Host { host: u32, tab: i64 },
+}
+
+/// `Local(0)` — the same "no tab named" a defaulted string-wrapped id
+/// decoded to before this type existed.
+impl Default for WireTabRef {
+    fn default() -> Self {
+        Self::Local(0)
+    }
+}
+
+impl WireTabRef {
+    /// The bare engine id, or `None` for a host-qualified ref — the
+    /// narrowing every host-unaware consumer applies.
+    pub fn local(self) -> Option<i64> {
+        match self {
+            Self::Local(tab) => Some(tab),
+            Self::Host { .. } => None,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let parsed = match text.strip_prefix('h') {
+            Some(qualified) => {
+                let (host, tab) = qualified.split_once('.')?;
+                Self::Host {
+                    host: host.parse().ok()?,
+                    tab: tab.parse().ok()?,
+                }
+            }
+            None => Self::Local(text.parse().ok()?),
+        };
+        if let Self::Host { host: 0, .. } = parsed {
+            return None;
+        }
+        (parsed.to_string() == text).then_some(parsed)
+    }
+}
+
+impl fmt::Display for WireTabRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(tab) => write!(f, "{tab}"),
+            Self::Host { host, tab } => write!(f, "h{host}.{tab}"),
+        }
+    }
+}
+
+impl Serialize for WireTabRef {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for WireTabRef {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        Self::parse(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid tab reference: {raw}")))
+    }
+}
+
 pub mod vec_string_int64 {
     use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -2322,6 +2409,11 @@ pub mod bytes_base64 {
     pub fn encode(bytes: &[u8]) -> String {
         STANDARD.encode(bytes)
     }
+
+    /// [`encode`]'s inverse, for the client applying such a field.
+    pub fn decode(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
+        STANDARD.decode(text.as_bytes())
+    }
 }
 
 // ============================================================================
@@ -2340,6 +2432,35 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(value, &back, "round-trip mismatch via {}", json);
+    }
+
+    /// The wire-form tab ref (plan 037 §3.4): bare stays byte-identical
+    /// to the pre-keys wire, host-qualified round-trips, and only
+    /// canonical spellings parse — an aliased spelling would let a
+    /// crafted ref reach a tab its literal text never named.
+    #[test]
+    fn wire_tab_ref_parses_canonically() {
+        assert_eq!(WireTabRef::parse("5"), Some(WireTabRef::Local(5)));
+        assert_eq!(
+            WireTabRef::parse("h3.7"),
+            Some(WireTabRef::Host { host: 3, tab: 7 })
+        );
+        for rejected in ["", "h0.7", "+7", "07", "h3.07", "h3.", "h.7", "3.7", "h3x7"] {
+            assert_eq!(WireTabRef::parse(rejected), None, "{rejected:?}");
+        }
+        round_trip(&WireTabRef::Local(5));
+        round_trip(&WireTabRef::Host { host: 3, tab: 7 });
+        assert_eq!(
+            serde_json::to_string(&WireTabRef::Local(5)).unwrap(),
+            "\"5\"",
+            "bare refs stay byte-identical on the wire"
+        );
+        assert_eq!(
+            serde_json::to_string(&WireTabRef::Host { host: 3, tab: 7 }).unwrap(),
+            "\"h3.7\""
+        );
+        let params: TabDumpParams = serde_json::from_str(r#"{"tab_id": "h3.7"}"#).unwrap();
+        assert_eq!(params.tab_id, WireTabRef::Host { host: 3, tab: 7 });
     }
 
     #[test]
@@ -2644,7 +2765,7 @@ mod tests {
     #[test]
     fn tab_capture_pty_input_params_default_drain_is_false() {
         let p: TabCapturePtyInputParams = serde_json::from_str(r#"{"tab_id":"5"}"#).unwrap();
-        assert_eq!(p.tab_id, 5);
+        assert_eq!(p.tab_id, WireTabRef::Local(5));
         assert!(!p.drain);
         round_trip(&p);
     }
@@ -2694,7 +2815,7 @@ mod tests {
     #[test]
     fn tab_dump_round_trips_and_cursor_is_optional() {
         let p: TabDumpParams = serde_json::from_str(r#"{"tab_id":"7"}"#).unwrap();
-        assert_eq!(p.tab_id, 7);
+        assert_eq!(p.tab_id, WireTabRef::Local(7));
         round_trip(&p);
 
         let with_cursor = TabDumpResult {
