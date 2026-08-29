@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roost_ipc::agent::{self, TabAgentReportParams};
+#[cfg(feature = "server-vt")]
+use roost_ipc::messages::TabAttachResult;
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
@@ -40,7 +42,7 @@ use roost_ipc::messages::{
     SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
     SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
     SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
     TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
     TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
     TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
@@ -576,6 +578,11 @@ struct ClientRegistry {
 /// One single-use attach ticket. Bound to the lease that minted it and
 /// to the exact tab pipeline it describes, so a takeover or a respawn
 /// between `tab.attach` and the handshake cannot be papered over.
+///
+/// Read only by the `server-vt` attach path; a default build (a UI
+/// binary built without `roost-session` in its graph) compiles the
+/// registry but never consumes tickets, hence the gated allow.
+#[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
 struct AttachToken {
     token: String,
     lease: String,
@@ -585,6 +592,7 @@ struct AttachToken {
 }
 
 /// What consuming a token admitted, handed to the forwarder.
+#[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AdmittedAttach {
     pub(crate) tab_id: i64,
@@ -692,6 +700,11 @@ impl ClientRegistry {
     }
 
     /// Mint a single-use ticket for one data connection.
+    ///
+    /// The ticket methods are consumed only by the `server-vt` attach
+    /// path; a default build compiles the registry without them being
+    /// reachable, hence the gated allows here and on the two below.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn mint_token(
         &mut self,
         lease: &str,
@@ -746,6 +759,7 @@ impl ClientRegistry {
     /// this session never issued must answer `invalid-token` even during
     /// a stop — telling such a client `shutting-down` would send it
     /// reconnecting with a credential that was never going to work.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn admit_attach(
         &mut self,
         token: &str,
@@ -803,6 +817,7 @@ impl ClientRegistry {
     /// Drop a tab's data-connection entry, but only if it is still the
     /// one this connection registered — a superseded forwarder unwinding
     /// after its replacement registered must not evict it.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn release_data_conn(&mut self, tab_id: i64, conn_id: u64) {
         if self
             .data_conns
@@ -901,6 +916,7 @@ impl SessionState {
     /// gate and the stop latch; both are re-checked under this lock,
     /// because a ticket is authority and authority minted after a sweep
     /// is authority nobody can revoke.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn mint_attach_token(
         &self,
         lease: &str,
@@ -914,6 +930,7 @@ impl SessionState {
         guard.mint_token(lease, tab_id, tab_generation, self.attach_token_ttl())
     }
 
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn attach_token_ttl(&self) -> Duration {
         if !self.info.test_mode {
             return ATTACH_TOKEN_TTL;
@@ -929,6 +946,7 @@ impl SessionState {
     /// [`ClientRegistry::admit_attach`], which takes the latch's value
     /// rather than reading it first, so the refusals stay in the order
     /// the client can act on.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn admit_attach(&self, token: &str, ctx: &ConnCtx) -> Result<AdmittedAttach, HandlerError> {
         let mut guard = lock(&self.clients);
         let stopping = self.stopping.load(Ordering::Acquire);
@@ -941,6 +959,7 @@ impl SessionState {
         Ok(admitted)
     }
 
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn release_data_conn(&self, tab_id: i64, conn_id: u64) {
         lock(&self.clients).release_data_conn(tab_id, conn_id);
     }
