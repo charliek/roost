@@ -12,10 +12,18 @@ description = "Toolkit-neutral Roost workspace, PTY runtime, persistence, events
 # Experimental Swift-facing boundary (facade.rs). Unconsumed by the Rust
 # UIs; gated until a real adapter proves the seam (roadmap M5).
 facade = []
+# Host sessions: the per-tab authoritative server Terminal and its tab
+# task (`tab_task.rs`). The feature only makes the code AVAILABLE — a
+# workspace build unifies features, so a UI binary can link it. What
+# turns the pipeline on is the runtime opt-in
+# `PtySupervisor::enable_server_vt`, which only `roost-session` calls.
+server-vt = ["dep:roost-vt", "dep:getrandom", "roost-vt/ffi"]
 
 [dependencies]
 roost-ipc = { path = "../roost-ipc" }
 roost-osc = { path = "../roost-osc" }
+roost-vt = { path = "../roost-vt", optional = true }
+getrandom = { workspace = true, optional = true }
 
 portable-pty = { workspace = true }
 libc = "0.2"

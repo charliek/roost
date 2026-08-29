@@ -145,45 +145,51 @@ impl LocalClient {
     /// via `ReportOsc`; in M3b the UI parses OSC in-process and
     /// updates state locally with no round-trip.
     pub fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
-        match command {
-            0..=2 => {
-                // Title set from the shell. OSC-from-shell path
-                // never overrides a manual rename.
-                let _ = self.workspace.set_tab_title_from_osc(tab_id, payload);
+        apply_osc(&self.workspace, tab_id, command, payload);
+    }
+}
+
+/// The workspace half of [`LocalClient::apply_osc`], free-standing so a
+/// consumer that holds only a `Workspace` can apply the same transitions
+/// — the server-VT tab task does, and routing it through a `LocalClient`
+/// would put an `Arc<PtySupervisor>` back inside the supervisor.
+pub fn apply_osc(workspace: &Workspace, tab_id: i64, command: u32, payload: &str) {
+    match command {
+        0..=2 => {
+            // Title set from the shell. OSC-from-shell path
+            // never overrides a manual rename.
+            let _ = workspace.set_tab_title_from_osc(tab_id, payload);
+        }
+        7 => {
+            // OSC 7: cwd as `file://host/path` URI.
+            if let Some(path) = parse_osc7_path(payload) {
+                let _ = workspace.set_tab_cwd(tab_id, &path);
             }
-            7 => {
-                // OSC 7: cwd as `file://host/path` URI.
-                if let Some(path) = parse_osc7_path(payload) {
-                    let _ = self.workspace.set_tab_cwd(tab_id, &path);
-                }
-            }
-            9 | 99 | 777 => {
-                // Notification payload — surface to the UI via the
-                // workspace's notification event. The actual
-                // libnotify call happens in the UI layer once it
-                // sees the WorkspaceEvent::NotificationFired event.
-                //
-                // `RawOsc` is dropped while a live agent session is
-                // mid-turn: the agent already reports its own attention
-                // through `tab.agent_report`, and a wrapper shell
-                // echoing OSC 9 on top of that double-notifies. The gate
-                // is read inside `raise_attention`'s lock — reading it
-                // here first would let a concurrent claim slip between
-                // the check and the commit.
-                let (title, body) = parse_notification_payload(command, payload);
-                let _ =
-                    self.workspace
-                        .raise_attention(tab_id, &title, &body, AttentionSource::RawOsc);
-            }
-            133 => {
-                // OSC 133 prompt/command mark → the shell axis. Never
-                // gated: the shell and agent axes are independent, and
-                // derivation decides which one the tab shows.
-                let _ = self.workspace.apply_shell_mark(tab_id, payload);
-            }
-            _ => {
-                tracing::debug!(tab_id, command, "ignored OSC");
-            }
+        }
+        9 | 99 | 777 => {
+            // Notification payload — surface to the UI via the
+            // workspace's notification event. The actual
+            // libnotify call happens in the UI layer once it
+            // sees the WorkspaceEvent::NotificationFired event.
+            //
+            // `RawOsc` is dropped while a live agent session is
+            // mid-turn: the agent already reports its own attention
+            // through `tab.agent_report`, and a wrapper shell
+            // echoing OSC 9 on top of that double-notifies. The gate
+            // is read inside `raise_attention`'s lock — reading it
+            // here first would let a concurrent claim slip between
+            // the check and the commit.
+            let (title, body) = parse_notification_payload(command, payload);
+            let _ = workspace.raise_attention(tab_id, &title, &body, AttentionSource::RawOsc);
+        }
+        133 => {
+            // OSC 133 prompt/command mark → the shell axis. Never
+            // gated: the shell and agent axes are independent, and
+            // derivation decides which one the tab shows.
+            let _ = workspace.apply_shell_mark(tab_id, payload);
+        }
+        _ => {
+            tracing::debug!(tab_id, command, "ignored OSC");
         }
     }
 }

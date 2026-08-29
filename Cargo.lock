@@ -2712,10 +2712,12 @@ version = "0.0.18"
 dependencies = [
  "anyhow",
  "futures",
+ "getrandom 0.4.2",
  "libc",
  "portable-pty",
  "roost-ipc",
  "roost-osc",
+ "roost-vt",
  "serde",
  "serde_json",
  "tempfile",

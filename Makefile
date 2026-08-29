@@ -134,9 +134,10 @@ test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swi
 # `--workspace` run compiles and then silently skips every one of them. The
 # second line mirrors CI's separate `cargo test -p roost-vt --features ffi`
 # step (.github/workflows/ci.yml, rust job) so `make test` runs them too.
-test-rust:  ## cargo test --workspace (+ roost-vt ffi tests, cfg-gated out of the default run)
+test-rust:  ## cargo test --workspace (+ roost-vt ffi and roost-engine server-vt tests, cfg-gated out of the default run)
 	cargo test --workspace
 	cargo test -p roost-vt --features ffi
+	cargo test -p roost-engine --features server-vt
 
 test-iced:  ## Iced unit tests (renderer + input + adapter)
 	cargo test -p roost-iced
@@ -257,6 +258,11 @@ clippy:  ## Lint Rust at CI parity (warnings are errors)
 	# `-D warnings` matches the `rust-lint` CI job. Without it `make check`
 	# passed while CI failed, which is worse than no local gate at all.
 	cargo clippy --workspace --all-targets -- -D warnings
+	# roost-engine's `server-vt` module and its test target are cfg-gated,
+	# so the workspace run above compiles neither. Same trap the roost-vt
+	# comment on `test-rust` documents: a member's gated targets get
+	# features only from an explicit `-p --features` run.
+	cargo clippy -p roost-engine --features server-vt --all-targets -- -D warnings
 
 # `linux-package` is off in every dev build, so without the second test +
 # clippy pair the packaging configuration would compile for the first time

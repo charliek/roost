@@ -80,6 +80,7 @@ bindgen = "0.70"
 cc      = "1.0"
 
 # Misc
+getrandom        = "0.4"
 percent-encoding = "2.3"
 regex            = { version = "1.10" }
 unicode-width    = "0.2"

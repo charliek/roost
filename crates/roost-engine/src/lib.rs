@@ -27,6 +27,12 @@ pub mod pty;
 pub mod reconcile;
 pub mod session;
 pub mod single_instance;
+// Host sessions: the per-tab authoritative server Terminal and its task.
+// Feature-gated for AVAILABILITY; the pipeline itself is a runtime
+// opt-in (`PtySupervisor::enable_server_vt`) so a feature-unified UI
+// build keeps the default reader → broadcast flow (plan 036 D1).
+#[cfg(feature = "server-vt")]
+pub mod tab_task;
 pub mod workspace;
 
 pub use application::LocalClient;
@@ -36,6 +42,12 @@ pub use facade::{
     EngineSnapshot,
 };
 pub use pty::{PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, SupervisorEvent};
+#[cfg(feature = "server-vt")]
+pub use tab_task::{
+    ResumeAt, ServerVtConfig, ServerVtWorkspace, SnapshotAt, TabCmd, TabError,
+    MAX_CONCURRENT_SNAPSHOTS, REPLAY_RING_BYTES, REPLY_PENDING_MAX, SERVER_VT_CONTINUATION_MAX,
+    SERVER_VT_SCROLLBACK, TAB_CHANNEL_CHUNKS, TAB_CMD_CAPACITY,
+};
 pub use workspace::{
     AttentionSource, RestoreLayout, RestoreProject, RestoreTab, VersionedWorkspaceEvent, Workspace,
     WorkspaceError, WorkspaceEvent, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,

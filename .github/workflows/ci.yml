@@ -274,6 +274,25 @@ jobs:
       - name: cargo test (roost-vt with ffi)
         run: cargo test -p roost-vt --features ffi
 
+      # roost-engine's host-session tab task lives behind `server-vt`
+      # (which pulls roost-vt's ffi in), and its test target starts with
+      # `#![cfg(feature = "server-vt")]` — the workspace build and test
+      # below compile neither. Same reason as the roost-vt pair above.
+      - name: cargo build (roost-engine with server-vt)
+        run: cargo build -p roost-engine --features server-vt
+
+      - name: cargo test (roost-engine with server-vt)
+        run: cargo test -p roost-engine --features server-vt
+
+      # `rust-lint`'s workspace clippy compiles neither the gated module
+      # nor its gated test target, and that job has no libghostty step to
+      # build them with. Lint here, where the archive already exists, so
+      # the `-D warnings` gate `make clippy` applies locally is a real CI
+      # gate too — otherwise a lint regression merges green and then
+      # fails `make check` for everyone.
+      - name: cargo clippy (roost-engine with server-vt)
+        run: cargo clippy -p roost-engine --features server-vt --all-targets -- -D warnings
+
       - name: cargo test
         run: cargo test --workspace
 

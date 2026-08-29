@@ -30,7 +30,7 @@ libc = "0.2"
 # 128 bits for the session id. Already in the workspace graph (tempfile,
 # jobserver); the smallest thing that answers "give me entropy" without
 # pulling a generator framework in behind it.
-getrandom = "0.4"
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile   = "3"
