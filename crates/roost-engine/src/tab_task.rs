@@ -228,11 +228,17 @@ pub enum TabCmd {
     /// Client keystrokes / `tab.write`.
     Input(Vec<u8>),
     /// Client RESIZE / `tab.resize`.
+    ///
+    /// `ack` fires once the server terminal AND the PTY winsize have
+    /// both been given the new geometry. `tab.attach` waits on it so the
+    /// snapshot it mints a ticket for cannot be encoded at the old size;
+    /// every other caller passes `None` and stays fire-and-forget.
     Resize {
         cols: u16,
         rows: u16,
         cell_w: u32,
         cell_h: u32,
+        ack: Option<oneshot::Sender<Result<(), TabError>>>,
     },
     Snapshot(oneshot::Sender<Result<SnapshotAt, TabError>>),
     Resume {
@@ -245,7 +251,13 @@ pub enum TabCmd {
     FeedBytes(Vec<u8>),
     /// Test-mode: everything the task has queued toward the PTY writer
     /// since the last drain (client input AND terminal replies).
-    CaptureInput(oneshot::Sender<Vec<u8>>),
+    /// `drain` consumes the buffer; otherwise it is copied and left in
+    /// place, matching `tab.capture_pty_input`'s peek semantics on the
+    /// UI path.
+    CaptureInput {
+        drain: bool,
+        reply: oneshot::Sender<Vec<u8>>,
+    },
 }
 
 /// What the reap task tells the tab task about the child's death.
@@ -666,12 +678,18 @@ impl TabTask {
                 rows,
                 cell_w,
                 cell_h,
+                ack,
             } => {
                 self.vt.cols = cols;
                 self.vt.rows = rows;
-                if let Err(error) = self.vt.terminal.resize(cols, rows, cell_w, cell_h) {
-                    warn!(tab_id = self.tab_id, %error, "server terminal resize failed");
-                }
+                let applied =
+                    self.vt
+                        .terminal
+                        .resize(cols, rows, cell_w, cell_h)
+                        .map_err(|error| {
+                            warn!(tab_id = self.tab_id, %error, "server terminal resize failed");
+                            TabError::from(error)
+                        });
                 // Pixel geometry stays 0 on the PTY winsize, matching
                 // `PtySupervisor::resize`; libghostty gets the real cell
                 // metrics above, which is what its size reports read.
@@ -685,6 +703,12 @@ impl TabTask {
                 // outside any `vt_write` — draining only after writes
                 // would silently drop them.
                 self.take_replies();
+                // Answered only here, with both halves applied: a waiter
+                // that resumed at the terminal resize alone could still
+                // snapshot a tab whose child had not been told.
+                if let Some(ack) = ack {
+                    let _ = ack.send(applied);
+                }
             }
             TabCmd::Snapshot(reply) => {
                 let seq = self.last_byte_seq;
@@ -716,8 +740,13 @@ impl TabTask {
                 let _ = reply.send(self.dump_resolved());
             }
             TabCmd::FeedBytes(data) => self.ingest(data),
-            TabCmd::CaptureInput(reply) => {
-                let _ = reply.send(std::mem::take(&mut self.captured));
+            TabCmd::CaptureInput { drain, reply } => {
+                let data = if drain {
+                    std::mem::take(&mut self.captured)
+                } else {
+                    self.captured.clone()
+                };
+                let _ = reply.send(data);
             }
         }
     }

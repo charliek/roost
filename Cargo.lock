@@ -2788,6 +2788,7 @@ dependencies = [
  "libc",
  "roost-engine",
  "roost-ipc",
+ "roost-vt",
  "serde_json",
  "tempfile",
  "tokio",

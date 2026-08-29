@@ -62,6 +62,7 @@ async fn harness(session: bool, limits: Option<PushLimits>) -> Harness {
                 payload_kinds: Vec::new(),
                 libghostty_build: String::new(),
                 default_tab_size: (120, 40),
+                test_mode: false,
             },
             StopHandle::new(|| async {}),
         );

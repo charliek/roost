@@ -40,6 +40,7 @@ fn fixture() -> Fixture {
             payload_kinds: Vec::new(),
             libghostty_build: String::new(),
             default_tab_size: (120, 40),
+            test_mode: false,
         },
         StopHandle::new(|| async {}),
     );

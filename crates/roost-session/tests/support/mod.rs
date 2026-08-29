@@ -20,7 +20,8 @@ use roost_engine::single_instance::{self, InstanceLocks};
 use roost_ipc::messages::{
     ops, IdentifyParams, IdentifyResult, SessionConnectParams, SessionConnectResult,
     SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult, Tab,
-    TabListResult, TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams,
 };
 use roost_ipc::IpcClient;
 use roost_session::{Readiness, SessionConfig};
@@ -243,6 +244,26 @@ pub async fn resize_tab(
         .call::<_, serde_json::Value>(ops::TAB_RESIZE, TabResizeParams { tab_id, cols, rows })
         .await
         .map(|_| ())
+}
+
+/// `tab.dump` — served from the tab's own server terminal, with no UI
+/// anywhere in the process. On a UI socket this same op hops to the main
+/// thread; here it is a round trip through the tab task.
+pub async fn tab_dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
+    client
+        .call(ops::TAB_DUMP, TabDumpParams { tab_id })
+        .await
+        .expect("tab.dump")
+}
+
+/// `tab.dump_resolved` — the same walk, through the production color
+/// resolver. Served from the tab task too, so a headless dump and a UI
+/// dump come out of one implementation.
+pub async fn tab_dump_resolved(client: &mut IpcClient, tab_id: i64) -> TabDumpResolvedResult {
+    client
+        .call(ops::TAB_DUMP_RESOLVED, TabDumpResolvedParams { tab_id })
+        .await
+        .expect("tab.dump_resolved")
 }
 
 pub async fn set_tab_title(client: &mut IpcClient, tab_id: i64, title: &str) {

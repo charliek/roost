@@ -40,12 +40,13 @@ use roost_ipc::messages::{
     SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
     SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
     SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
-    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{
@@ -440,17 +441,26 @@ pub struct SessionInfo {
     pub started_at: String,
     pub app_version: String,
     /// What this session can encode a tab's attach payload as. Empty
-    /// until HS-1b implements the attach data plane — an honest "attach
-    /// unavailable" rather than a promise the session cannot keep.
+    /// when the daemon runs without the server-VT pipeline — an honest
+    /// "attach unavailable" rather than a promise it cannot keep.
     pub payload_kinds: Vec<AttachPayloadKind>,
     /// Pinned libghostty build identity, which must match exactly for
     /// [`AttachPayloadKind::GHOSTTY_SNAPSHOT`] to be negotiable. Empty
-    /// in this slice for the same reason as `payload_kinds`.
+    /// for the same reason as `payload_kinds`.
     pub libghostty_build: String,
     /// `(cols, rows)` a `tab.open` that omits both falls back to. A
     /// headless session has no window to measure, so the daemon states
     /// the size rather than inheriting a UI's 80×24.
     pub default_tab_size: (u16, u16),
+    /// Whether the daemon was launched with `ROOST_TEST_MODE=1`.
+    ///
+    /// Passed in rather than read from the environment here: the engine
+    /// is also linked into UI processes, and a test-mode decision that
+    /// depends on which process happens to be asking is one nobody can
+    /// reason about. Gates the same ops a UI gates
+    /// (`tab.feed_pty_bytes`, `tab.capture_pty_input`) plus the attach
+    /// token's TTL override.
+    pub test_mode: bool,
 }
 
 /// The process-level shutdown tail a `session.stop` runs *after* its
@@ -517,8 +527,34 @@ struct SessionState {
     clients: std::sync::Mutex<ClientRegistry>,
 }
 
+/// How long an attach token minted by `tab.attach` stays usable.
+///
+/// A protocol constant, not a test wait: it is not scaled by
+/// `ROOST_TEST_TIMEOUT_SCALE`, because what it bounds is how long a
+/// credential a client already holds stays valid, not how long anything
+/// waits. A session in test mode may shorten it (see
+/// [`ATTACH_TTL_OVERRIDE_ENV`]) so the expiry case is testable in
+/// seconds.
+pub const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(60);
+
+/// Shortens [`ATTACH_TOKEN_TTL`], in milliseconds. Honored **only** when
+/// the session was started with `ROOST_TEST_MODE=1`; a production daemon
+/// ignores it entirely.
+pub const ATTACH_TTL_OVERRIDE_ENV: &str = "ROOST_SESSION_ATTACH_TTL_MS";
+
+/// How many minted-but-undialed attach tokens one session will hold.
+///
+/// The quota is what bounds the registry. Reaching it means a client
+/// minted 16 tokens inside one TTL and dialed none of them — every
+/// healthy attach consumes its token within a round trip — so the
+/// answer is to refuse rather than to evict a token some other
+/// connection is about to present.
+pub const MAX_OUTSTANDING_TOKENS: usize = 16;
+
 /// The lease registry. Bounded by construction: one live lease, one
-/// tombstone, and one entry per live connection under the lease.
+/// tombstone, one entry per live connection under the lease, at most
+/// [`MAX_OUTSTANDING_TOKENS`] unconsumed tokens, and one live data
+/// connection per tab.
 #[derive(Default)]
 struct ClientRegistry {
     current: Option<Lease>,
@@ -528,6 +564,31 @@ struct ClientRegistry {
     /// Exactly one: an older tombstone is a client that has already been
     /// told twice over.
     tombstone: Option<String>,
+    /// Attach tickets handed out but not yet presented on a data
+    /// connection.
+    tokens: Vec<AttachToken>,
+    /// The live data connection per tab id, so a second admitted
+    /// handshake for the same tab can supersede the first rather than
+    /// leaving two forwarders racing one tee.
+    data_conns: std::collections::HashMap<i64, (u64, ConnCloser)>,
+}
+
+/// One single-use attach ticket. Bound to the lease that minted it and
+/// to the exact tab pipeline it describes, so a takeover or a respawn
+/// between `tab.attach` and the handshake cannot be papered over.
+struct AttachToken {
+    token: String,
+    lease: String,
+    tab_id: i64,
+    tab_generation: u64,
+    expires_at: std::time::Instant,
+}
+
+/// What consuming a token admitted, handed to the forwarder.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdmittedAttach {
+    pub(crate) tab_id: i64,
+    pub(crate) tab_generation: u64,
 }
 
 struct Lease {
@@ -570,6 +631,13 @@ impl ClientRegistry {
                     closer.close(CloseReason::TakenOver);
                 }
             }
+            // Tickets minted under the displaced lease die with it —
+            // `admit_attach` would refuse them at the lease re-check
+            // anyway. Purged in the SAME critical section as the
+            // takeover, because leaving them would let a dead client's
+            // 16 outstanding tokens hold the whole quota against the new
+            // holder for a full TTL.
+            self.tokens.retain(|token| token.lease != previous.token);
             self.tombstone = Some(previous.token);
         }
         let token = random_hex_128();
@@ -610,6 +678,138 @@ impl ClientRegistry {
             for (_, closer) in current.conns.drain(..) {
                 closer.close(reason);
             }
+        }
+        // Their closers were in the list above, so this only drops the
+        // per-tab index — but leaving it would keep an entry alive per
+        // tab that ever attached.
+        self.data_conns.clear();
+        // The tokens deliberately stay. `admit_attach`'s stop latch is
+        // what refuses them, and it can only say `shutting-down` about a
+        // ticket it can still recognize; dropping them here would send a
+        // client that holds a perfectly good pre-stop token hunting for
+        // a bad credential instead. They are bounded at
+        // [`MAX_OUTSTANDING_TOKENS`] and the process is on its way out.
+    }
+
+    /// Mint a single-use ticket for one data connection.
+    fn mint_token(
+        &mut self,
+        lease: &str,
+        tab_id: i64,
+        tab_generation: u64,
+        ttl: Duration,
+    ) -> Result<String, HandlerError> {
+        let now = std::time::Instant::now();
+        self.tokens.retain(|t| t.expires_at > now);
+        // The lease is re-checked here because minting and the
+        // `require_lease` that preceded it are two acquisitions of this
+        // lock; a takeover in between must not leave a ticket behind
+        // that outlives the authority it was issued under.
+        match self.current.as_ref() {
+            Some(current) if !lease.is_empty() && current.token == lease => {}
+            _ => {
+                return Err(HandlerError::new(
+                    "taken-over",
+                    "this lease was taken over by another client",
+                ))
+            }
+        }
+        if self.tokens.len() >= MAX_OUTSTANDING_TOKENS {
+            return Err(HandlerError::new(
+                "too-many-tokens",
+                format!(
+                    "{MAX_OUTSTANDING_TOKENS} attach tokens are already outstanding; \
+                     dial the data connections you asked for"
+                ),
+            ));
+        }
+        let token = random_hex_128();
+        self.tokens.push(AttachToken {
+            token: token.clone(),
+            lease: lease.to_string(),
+            tab_id,
+            tab_generation,
+            expires_at: now + ttl,
+        });
+        Ok(token)
+    }
+
+    /// Consume a token and register `ctx` as the tab's data connection.
+    ///
+    /// The whole admission is one step under one lock — consume, lease
+    /// re-check, stop latch, register, supersede — so two connections
+    /// presenting the same token produce exactly one forwarder, and a
+    /// takeover either wholly precedes this or wholly follows it.
+    ///
+    /// The order of the three refusals is the contract, not an accident:
+    /// each names a different thing for the client to fix, so a token
+    /// this session never issued must answer `invalid-token` even during
+    /// a stop — telling such a client `shutting-down` would send it
+    /// reconnecting with a credential that was never going to work.
+    fn admit_attach(
+        &mut self,
+        token: &str,
+        ctx: &ConnCtx,
+        stopping: bool,
+    ) -> Result<(AdmittedAttach, Option<ConnCloser>), HandlerError> {
+        let now = std::time::Instant::now();
+        self.tokens.retain(|t| t.expires_at > now);
+        let Some(index) = self.tokens.iter().position(|t| t.token == token) else {
+            return Err(HandlerError::new(
+                "invalid-token",
+                "unknown, expired, revoked, or already-used attach token",
+            ));
+        };
+        let ticket = self.tokens.remove(index);
+        if !self
+            .current
+            .as_ref()
+            .is_some_and(|current| current.token == ticket.lease)
+        {
+            return Err(HandlerError::new(
+                "taken-over",
+                "the lease this attach token was minted under is no longer current",
+            ));
+        }
+        // Checked only once the ticket is known good, and still under
+        // this lock: the stop latches first and sweeps this registry
+        // second, so a data connection admitted past the latch but
+        // registered after the sweep would be one no closer can reach.
+        if stopping {
+            return Err(shutting_down());
+        }
+        let live = self
+            .current
+            .as_mut()
+            .expect("the lease was just confirmed current under this lock");
+        live.conns.retain(|(_, closer)| !closer.is_closed());
+        if !live.conns.iter().any(|(id, _)| *id == ctx.conn_id) {
+            live.conns.push((ctx.conn_id, ctx.closer.clone()));
+        }
+        let displaced = self
+            .data_conns
+            .insert(ticket.tab_id, (ctx.conn_id, ctx.closer.clone()))
+            .filter(|(conn_id, _)| *conn_id != ctx.conn_id)
+            .map(|(_, closer)| closer);
+        Ok((
+            AdmittedAttach {
+                tab_id: ticket.tab_id,
+                tab_generation: ticket.tab_generation,
+            },
+            displaced,
+        ))
+    }
+
+    /// Drop a tab's data-connection entry, but only if it is still the
+    /// one this connection registered — a superseded forwarder unwinding
+    /// after its replacement registered must not evict it.
+    fn release_data_conn(&mut self, tab_id: i64, conn_id: u64) {
+        if self
+            .data_conns
+            .get(&tab_id)
+            .is_some_and(|(id, _)| *id == conn_id)
+        {
+            self.data_conns.remove(&tab_id);
         }
     }
 }
@@ -696,6 +896,54 @@ impl SessionState {
     fn close_clients(&self, reason: CloseReason) {
         lock(&self.clients).close_all(reason);
     }
+
+    /// Mint one attach ticket. The caller has already passed the lease
+    /// gate and the stop latch; both are re-checked under this lock,
+    /// because a ticket is authority and authority minted after a sweep
+    /// is authority nobody can revoke.
+    fn mint_attach_token(
+        &self,
+        lease: &str,
+        tab_id: i64,
+        tab_generation: u64,
+    ) -> Result<String, HandlerError> {
+        let mut guard = lock(&self.clients);
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(shutting_down());
+        }
+        guard.mint_token(lease, tab_id, tab_generation, self.attach_token_ttl())
+    }
+
+    fn attach_token_ttl(&self) -> Duration {
+        if !self.info.test_mode {
+            return ATTACH_TOKEN_TTL;
+        }
+        std::env::var(ATTACH_TTL_OVERRIDE_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map_or(ATTACH_TOKEN_TTL, Duration::from_millis)
+    }
+
+    /// The data plane's single admission point. See
+    /// [`ClientRegistry::admit_attach`], which takes the latch's value
+    /// rather than reading it first, so the refusals stay in the order
+    /// the client can act on.
+    fn admit_attach(&self, token: &str, ctx: &ConnCtx) -> Result<AdmittedAttach, HandlerError> {
+        let mut guard = lock(&self.clients);
+        let stopping = self.stopping.load(Ordering::Acquire);
+        let (admitted, displaced) = guard.admit_attach(token, ctx, stopping)?;
+        // Fired under the lock so no third connection can slip between
+        // "this tab's data conn is now mine" and "the old one is told".
+        if let Some(closer) = displaced {
+            closer.close(CloseReason::Superseded);
+        }
+        Ok(admitted)
+    }
+
+    fn release_data_conn(&self, tab_id: i64, conn_id: u64) {
+        lock(&self.clients).release_data_conn(tab_id, conn_id);
+    }
 }
 
 /// Lock recovering from poisoning: a panicked holder must not be able to
@@ -717,9 +965,12 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Reads (`identify`, `tab.list`, `tab.dump*`, `session.identify`) stay
 /// answerable throughout, so a client can still find out what happened.
 /// The UI-only ops (`palette.*`, `window.*`, `app.*`, clipboard,
-/// selection, and the test-mode feed ops) are not listed: they route
-/// through `ui_call`, and a session socket has no UI attached, so they
-/// already fail with `internal: no UI attached`.
+/// selection) are not listed: they route through `ui_call`, and a
+/// session socket has no UI attached, so they already fail with
+/// `internal: no UI attached`. `tab.feed_pty_bytes` is the exception —
+/// on a session it writes into the tab task's terminal, which is a
+/// mutation like any other. This whole set is consulted only on a
+/// session socket, so listing it costs a UI nothing.
 fn is_mutating_op(op: &str) -> bool {
     matches!(
         op,
@@ -741,6 +992,7 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::NOTIFICATION_CREATE
             | ops::SESSION_CONNECT
             | ops::TAB_ATTACH
+            | ops::TAB_FEED_PTY_BYTES
     )
 }
 
@@ -865,6 +1117,254 @@ impl Handler for IpcHandler {
     ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {
         Box::pin(async move { dispatch_outcome(self, ctx, op, params).await })
     }
+
+    /// A data connection is a session's business only. Without a
+    /// [`SessionState`] this is a UI socket, and the answer is the same
+    /// "not-supported" the trait's default gives — restated here rather
+    /// than delegated because overriding the method takes the default
+    /// off the table.
+    #[cfg(feature = "server-vt")]
+    fn handle_data<'a>(
+        &'a self,
+        ctx: &'a ConnCtx,
+        handshake: roost_ipc::messages::AttachHandshake,
+        conn: roost_ipc::DataConn,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if self.session.is_none() {
+                crate::attach::refuse(
+                    conn,
+                    "not-supported",
+                    "this socket does not serve attach data connections",
+                )
+                .await;
+                return;
+            }
+            crate::attach::serve_attach(self, ctx, handshake, conn).await;
+        })
+    }
+}
+
+/// The two registry operations the data plane needs. They live on the
+/// handler rather than on `SessionState` because the forwarder lives in
+/// another module and the registry is this one's private business.
+#[cfg(feature = "server-vt")]
+impl IpcHandler {
+    pub(crate) fn admit_attach(
+        &self,
+        token: &str,
+        ctx: &ConnCtx,
+    ) -> Result<AdmittedAttach, HandlerError> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| {
+                HandlerError::new(
+                    "not-supported",
+                    "this socket does not serve attach data connections",
+                )
+            })?
+            .admit_attach(token, ctx)
+    }
+
+    pub(crate) fn release_data_conn(&self, tab_id: i64, conn_id: u64) {
+        if let Some(session) = self.session.as_ref() {
+            session.release_data_conn(tab_id, conn_id);
+        }
+    }
+}
+
+/// The tab task's command channel for a session-served op, or the error
+/// a client gets when the tab has no live terminal.
+#[cfg(feature = "server-vt")]
+fn tab_commands(
+    h: &IpcHandler,
+    tab_id: i64,
+) -> Result<tokio::sync::mpsc::Sender<crate::tab_task::TabCmd>, HandlerError> {
+    h.supervisor
+        .tab_commands(tab_id)
+        .ok_or_else(|| HandlerError::not_found(format!("tab {tab_id} has no live terminal")))
+}
+
+/// The one answer for a tab whose task stopped listening, whichever half
+/// of a round trip noticed — the same "the tab is gone" a UI socket
+/// gives for a dead tab.
+#[cfg(feature = "server-vt")]
+fn tab_gone(tab_id: i64) -> HandlerError {
+    HandlerError::not_found(format!("tab {tab_id} is gone"))
+}
+
+/// Round-trip one command through a tab task.
+#[cfg(feature = "server-vt")]
+async fn tab_ask<T>(
+    h: &IpcHandler,
+    tab_id: i64,
+    make: impl FnOnce(
+        tokio::sync::oneshot::Sender<Result<T, crate::tab_task::TabError>>,
+    ) -> crate::tab_task::TabCmd,
+) -> Result<T, HandlerError> {
+    let commands = tab_commands(h, tab_id)?;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    commands
+        .send(make(reply_tx))
+        .await
+        .map_err(|_| tab_gone(tab_id))?;
+    reply_rx
+        .await
+        .map_err(|_| tab_gone(tab_id))?
+        .map_err(tab_err)
+}
+
+/// Map a tab-task failure onto the wire. `Gone` and a missing tab are
+/// the same fact to a client; a render or encode failure is the server's
+/// own problem and says so.
+#[cfg(feature = "server-vt")]
+#[allow(clippy::needless_pass_by_value)] // `Result::map_err` adapter owns its error.
+fn tab_err(e: crate::tab_task::TabError) -> HandlerError {
+    use crate::tab_task::TabError;
+    match e {
+        TabError::Gone | TabError::RingMiss { .. } => HandlerError::not_found(e.to_string()),
+        TabError::SnapshotFailed(_) | TabError::Render(_) => {
+            HandlerError::new("internal", e.to_string())
+        }
+    }
+}
+
+/// Whether the session serving this op was started in test mode. A UI
+/// socket never reaches these arms (`dispatch` routes it to `ui_call`),
+/// so `false` here means a production daemon.
+#[cfg(feature = "server-vt")]
+fn session_test_mode(h: &IpcHandler) -> Result<(), HandlerError> {
+    if h.session.as_ref().is_some_and(|s| s.info.test_mode) {
+        return Ok(());
+    }
+    Err(HandlerError::new(
+        "not-enabled",
+        "this op requires the session to have been started with ROOST_TEST_MODE=1",
+    ))
+}
+
+/// The four terminal-reading ops a session answers from its own tab
+/// tasks instead of from a UI it does not have.
+///
+/// `None` means "not a session socket, keep the UI path" — the whole of
+/// what makes these additive: a UI handler reaches `ui_call` exactly as
+/// it always did, byte for byte.
+#[cfg(feature = "server-vt")]
+mod served {
+    use super::{
+        session_test_mode, tab_ask, tab_commands, tab_gone, DumpData, HandlerError, IpcHandler,
+        ResolvedCellsData,
+    };
+    use crate::tab_task::TabCmd;
+
+    pub(super) async fn dump(
+        h: &IpcHandler,
+        tab_id: i64,
+    ) -> Option<Result<DumpData, HandlerError>> {
+        h.session.as_ref()?;
+        Some(tab_ask(h, tab_id, TabCmd::Dump).await)
+    }
+
+    pub(super) async fn dump_resolved(
+        h: &IpcHandler,
+        tab_id: i64,
+    ) -> Option<Result<ResolvedCellsData, HandlerError>> {
+        h.session.as_ref()?;
+        Some(tab_ask(h, tab_id, TabCmd::DumpResolved).await)
+    }
+
+    pub(super) async fn feed_pty_bytes(
+        h: &IpcHandler,
+        tab_id: i64,
+        data: Vec<u8>,
+    ) -> Option<Result<(), HandlerError>> {
+        h.session.as_ref()?;
+        Some(feed(h, tab_id, data).await)
+    }
+
+    /// Injected bytes are chunked to the same granularity the real PTY
+    /// reader produces, and for the same reason the reader has one: a
+    /// chunk is the unit a seq is assigned to, so an unchunked megabyte
+    /// would be ONE tee record — one PTY frame past the wire's 1 MiB
+    /// frame cap, fatal to every attached client. Splitting here keeps a
+    /// test-mode injection indistinguishable from a busy child.
+    const FEED_CHUNK_BYTES: usize = 4096;
+
+    async fn feed(h: &IpcHandler, tab_id: i64, data: Vec<u8>) -> Result<(), HandlerError> {
+        session_test_mode(h)?;
+        let commands = tab_commands(h, tab_id)?;
+        // An empty payload sends nothing: it would take a seq and tee a
+        // record with no bytes, which is a PTY frame no client accepts.
+        for chunk in data.chunks(FEED_CHUNK_BYTES) {
+            commands
+                .send(TabCmd::FeedBytes(chunk.to_vec()))
+                .await
+                .map_err(|_| tab_gone(tab_id))?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn capture_pty_input(
+        h: &IpcHandler,
+        tab_id: i64,
+        drain: bool,
+    ) -> Option<Result<Vec<u8>, HandlerError>> {
+        h.session.as_ref()?;
+        Some(capture(h, tab_id, drain).await)
+    }
+
+    async fn capture(h: &IpcHandler, tab_id: i64, drain: bool) -> Result<Vec<u8>, HandlerError> {
+        session_test_mode(h)?;
+        let commands = tab_commands(h, tab_id)?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        commands
+            .send(TabCmd::CaptureInput {
+                drain,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| tab_gone(tab_id))?;
+        reply_rx.await.map_err(|_| tab_gone(tab_id))
+    }
+}
+
+/// Without the feature there are no tab tasks, so every op keeps the UI
+/// path — which on a session answers `internal: no UI attached`, the
+/// same honest failure it gave before host sessions existed.
+#[cfg(not(feature = "server-vt"))]
+mod served {
+    // Signature parity with the served twins is the point of these, so
+    // every one is an `async fn` that never awaits.
+    #![allow(clippy::unused_async)]
+
+    use super::{DumpData, HandlerError, IpcHandler, ResolvedCellsData};
+
+    pub(super) async fn dump(_: &IpcHandler, _: i64) -> Option<Result<DumpData, HandlerError>> {
+        None
+    }
+
+    pub(super) async fn dump_resolved(
+        _: &IpcHandler,
+        _: i64,
+    ) -> Option<Result<ResolvedCellsData, HandlerError>> {
+        None
+    }
+
+    pub(super) async fn feed_pty_bytes(
+        _: &IpcHandler,
+        _: i64,
+        _: Vec<u8>,
+    ) -> Option<Result<(), HandlerError>> {
+        None
+    }
+
+    pub(super) async fn capture_pty_input(
+        _: &IpcHandler,
+        _: i64,
+        _: bool,
+    ) -> Option<Result<Vec<u8>, HandlerError>> {
+        None
+    }
 }
 
 /// The session layer wrapped around the op dispatcher: `session.*`, the
@@ -935,7 +1435,141 @@ async fn dispatch_outcome(
         return encode(&SessionConnectResult { lease, revision }).map(HandlerOutcome::Reply);
     }
 
+    // Same reason as `session.connect`: the token is bound to the lease
+    // presented on *this* connection, which `dispatch` cannot see.
+    if op == ops::TAB_ATTACH {
+        let p: TabAttachParams = decode(params)?;
+        return tab_attach(h, session, ctx, p)
+            .await
+            .map(HandlerOutcome::Reply);
+    }
+
     dispatch(h, op, params).await.map(HandlerOutcome::Reply)
+}
+
+/// `tab.attach`: negotiate a payload kind and hand back a single-use
+/// ticket for one data connection.
+///
+/// The validation order is pinned (D5) and each earlier failure wins,
+/// because the codes instruct differently: `connect-required` means "go
+/// get a lease", `not-found` means "that tab is gone", `unsupported-kind`
+/// and `build-mismatch` both mean "we cannot talk", and only then does
+/// geometry get looked at. Reordering would tell a client to fix the
+/// wrong thing.
+#[cfg(feature = "server-vt")]
+async fn tab_attach(
+    h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: TabAttachParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+
+    // One lookup, so the channel this resizes, the generation the token
+    // is stamped with, and the task the forwarder will snapshot are the
+    // same pipeline — two reads could straddle a respawn.
+    let (commands, tab_generation) = h.supervisor.tab_task_handle(p.tab_id).ok_or_else(|| {
+        HandlerError::not_found(format!("tab {} has no live terminal to attach", p.tab_id))
+    })?;
+
+    // A list mixing kinds this build has never heard of with one it
+    // serves is fine — the client states a preference order and the
+    // first servable entry wins.
+    let kind = p
+        .kinds
+        .iter()
+        .find(|kind| kind.as_str() == AttachPayloadKind::GHOSTTY_SNAPSHOT)
+        .cloned()
+        .ok_or_else(|| {
+            HandlerError::new(
+                "unsupported-kind",
+                format!(
+                    "this session serves {:?}; the client offered {:?}",
+                    session.info.payload_kinds, p.kinds
+                ),
+            )
+        })?;
+
+    // Exact match, both strings named: two libghostty builds that
+    // disagree cannot exchange a snapshot, and a client that sees only
+    // "mismatch" cannot tell which side to upgrade.
+    if p.libghostty_build != session.info.libghostty_build {
+        return Err(HandlerError::new(
+            "build-mismatch",
+            format!(
+                "this session is {:?}; the client is {:?}",
+                session.info.libghostty_build, p.libghostty_build
+            ),
+        ));
+    }
+
+    // Zero cell pixels are legal — a headless client has no cell metrics
+    // to report — but a zero-sized grid is not a grid.
+    if p.cols == 0 || p.rows == 0 {
+        return Err(HandlerError::invalid_param(format!(
+            "cols and rows must both be non-zero (got {}x{})",
+            p.cols, p.rows
+        )));
+    }
+
+    // The attach geometry is the client's, so the tab takes it now
+    // rather than at first frame: a snapshot encoded at the old size
+    // would be re-laid-out on the client the instant it resized.
+    // Detach never resizes back (roadmap D7).
+    //
+    // Awaited, not fired and forgotten: the ticket minted below is the
+    // client's authority to snapshot this tab, and a `Resize` still
+    // sitting on the command channel would let that snapshot be encoded
+    // at the geometry the attach exists to replace.
+    let (resized_tx, resized_rx) = tokio::sync::oneshot::channel();
+    commands
+        .send(crate::tab_task::TabCmd::Resize {
+            cols: p.cols,
+            rows: p.rows,
+            cell_w: u32::from(p.cell_w_px),
+            cell_h: u32::from(p.cell_h_px),
+            ack: Some(resized_tx),
+        })
+        .await
+        .map_err(|_| tab_gone(p.tab_id))?;
+    resized_rx
+        .await
+        // The task dropped the ack without answering, which only
+        // happens when the task itself is going away.
+        .map_err(|_| tab_gone(p.tab_id))?
+        // The terminal refused the geometry the client asked for, which
+        // is the client's parameter to fix.
+        .map_err(|error| {
+            HandlerError::invalid_param(format!(
+                "tab {} could not be resized to {}x{}: {error}",
+                p.tab_id, p.cols, p.rows
+            ))
+        })?;
+
+    let attach_token = session.mint_attach_token(&p.lease, p.tab_id, tab_generation)?;
+    encode(&TabAttachResult {
+        attach_token,
+        kind,
+        server_epoch: h.supervisor.server_epoch().unwrap_or_default(),
+        tab_generation,
+    })
+}
+
+/// Without the `server-vt` feature there is no server terminal to
+/// snapshot, so there is nothing to hand a ticket for.
+#[cfg(not(feature = "server-vt"))]
+#[allow(clippy::unused_async)]
+async fn tab_attach(
+    _h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: TabAttachParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+    Err(HandlerError::new(
+        "unsupported-kind",
+        "this session was built without the server-VT data plane",
+    ))
 }
 
 /// `events.subscribe` on a session socket: ack with the fence, then push.
@@ -1144,13 +1778,16 @@ async fn dispatch(
         }
         ops::TAB_DUMP => {
             let p: TabDumpParams = decode(params)?;
-            let data = h
-                .ui_call(|reply| UiRequest::Dump {
-                    tab_id: p.tab_id,
-                    reply,
-                })
-                .await?
-                .map_err(HandlerError::not_found)?;
+            let data = match served::dump(h, p.tab_id).await {
+                Some(served) => served?,
+                None => h
+                    .ui_call(|reply| UiRequest::Dump {
+                        tab_id: p.tab_id,
+                        reply,
+                    })
+                    .await?
+                    .map_err(HandlerError::not_found)?,
+            };
             encode(&TabDumpResult {
                 cols: data.cols,
                 rows: data.rows,
@@ -1470,25 +2107,32 @@ async fn dispatch(
         }
         ops::TAB_FEED_PTY_BYTES => {
             let p: TabFeedPtyBytesParams = decode(params)?;
-            h.ui_call(|reply| UiRequest::TabFeedPtyBytes {
-                tab_id: p.tab_id,
-                data: p.data,
-                reply,
-            })
-            .await?
-            .map_err(map_test_op_err)?;
+            match served::feed_pty_bytes(h, p.tab_id, p.data.clone()).await {
+                Some(served) => served?,
+                None => h
+                    .ui_call(|reply| UiRequest::TabFeedPtyBytes {
+                        tab_id: p.tab_id,
+                        data: p.data,
+                        reply,
+                    })
+                    .await?
+                    .map_err(map_test_op_err)?,
+            }
             Ok(serde_json::json!({}))
         }
         ops::TAB_CAPTURE_PTY_INPUT => {
             let p: TabCapturePtyInputParams = decode(params)?;
-            let data = h
-                .ui_call(|reply| UiRequest::TabCapturePtyInput {
-                    tab_id: p.tab_id,
-                    drain: p.drain,
-                    reply,
-                })
-                .await?
-                .map_err(map_test_op_err)?;
+            let data = match served::capture_pty_input(h, p.tab_id, p.drain).await {
+                Some(served) => served?,
+                None => h
+                    .ui_call(|reply| UiRequest::TabCapturePtyInput {
+                        tab_id: p.tab_id,
+                        drain: p.drain,
+                        reply,
+                    })
+                    .await?
+                    .map_err(map_test_op_err)?,
+            };
             encode(&TabCapturePtyInputResult { data })
         }
         ops::TAB_EXPAND_SELECTION_AT => {
@@ -1585,13 +2229,16 @@ async fn dispatch(
         }
         ops::TAB_DUMP_RESOLVED => {
             let p: TabDumpResolvedParams = decode(params)?;
-            let dump = h
-                .ui_call(|reply| UiRequest::TabDumpResolved {
-                    tab_id: p.tab_id,
-                    reply,
-                })
-                .await?
-                .map_err(HandlerError::not_found)?;
+            let dump = match served::dump_resolved(h, p.tab_id).await {
+                Some(served) => served?,
+                None => h
+                    .ui_call(|reply| UiRequest::TabDumpResolved {
+                        tab_id: p.tab_id,
+                        reply,
+                    })
+                    .await?
+                    .map_err(HandlerError::not_found)?,
+            };
             let cells = dump
                 .cells
                 .into_iter()
@@ -1906,6 +2553,7 @@ mod tests {
                 payload_kinds: Vec::new(),
                 libghostty_build: String::new(),
                 default_tab_size: (120, 40),
+                test_mode: false,
             },
             stop: StopHandle::new(|| async {}),
             stopping: AtomicBool::new(false),

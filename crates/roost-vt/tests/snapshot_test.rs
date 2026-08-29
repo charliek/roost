@@ -442,6 +442,55 @@ fn history_rows(terminal: &Terminal) -> u64 {
 }
 
 // ============================================================================
+// 0b. The READY boundary a host session streams at full speed
+// ============================================================================
+
+/// The exported scanner and this file's independent record walk must
+/// agree on where READY ends. They are two implementations of the same
+/// framing on purpose: the test's is written from the format doc, the
+/// crate's is what a session actually streams by.
+#[test]
+fn ready_boundary_lands_just_past_the_ready_record() {
+    for source in [
+        term(TerminalOptions::default()),
+        fixture(MULTI_PAGE_LINES, false),
+    ] {
+        let bytes = source.snapshot().expect("snapshot");
+        let boundary = roost_vt::ready_boundary(&bytes).expect("READY is in every snapshot");
+        assert_eq!(boundary, first_record(&bytes, TAG_READY).end);
+        // Everything the client needs to render is behind it, and there
+        // is always something after it (FINISH at minimum).
+        assert!(boundary > ENVELOPE_LEN && boundary < bytes.len());
+
+        // The prefix alone must decode to a renderable terminal — that
+        // is the whole reason the boundary exists.
+        let mut decode = SnapshotDecoder::new(SnapshotDecodeOptions::default());
+        decode.feed(&bytes[..boundary]).expect("feed the prefix");
+        assert_eq!(decode.try_ready().expect("try_ready"), ReadyState::Ready);
+    }
+}
+
+/// A buffer that stops mid-record is an error, never a boundary in the
+/// middle of a record: a server that trusted a short read would split
+/// SNAP frames at a byte offset the client's decoder never asked for.
+#[test]
+fn ready_boundary_refuses_a_truncated_stream() {
+    let bytes = fixture(MULTI_PAGE_LINES, false)
+        .snapshot()
+        .expect("snapshot");
+    let ready_end = first_record(&bytes, TAG_READY).end;
+    for cut in [0, ENVELOPE_LEN, ENVELOPE_LEN + 4, ready_end - 1] {
+        assert!(
+            matches!(
+                roost_vt::ready_boundary(&bytes[..cut]),
+                Err(Error::InvalidValue)
+            ),
+            "a stream cut at {cut} must not report a boundary"
+        );
+    }
+}
+
+// ============================================================================
 // 1. Ground round-trip (buffered path)
 // ============================================================================
 

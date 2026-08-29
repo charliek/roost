@@ -154,6 +154,56 @@ const TAG_READY: u16 = 5;
 const TAG_FINISH: u16 = 6;
 const TAG_CONTINUATION: u16 = 7;
 
+/// Offset of the first byte after the READY record in an encoded
+/// snapshot.
+///
+/// A host session sends everything up to this offset at full speed
+/// before it starts interleaving live PTY traffic with the rest
+/// (`docs/reference/ipc.md`, data plane): READY is where a client's
+/// decoder can first render, so delaying it delays the whole attach,
+/// while the history pages behind it are catch-up.
+///
+/// Lives here because the envelope and record-header layout does — a
+/// second walk of the same bytes in another crate is exactly the
+/// duplication that goes stale when the format version moves. Boundary
+/// scanning only: tags are not validated and CRCs are not checked, which
+/// is the decoder's job.
+///
+/// [`Error::InvalidValue`] for a buffer that ends mid-record, or one
+/// whose FINISH arrives with no READY before it.
+pub fn ready_boundary(encoded: &[u8]) -> Result<usize> {
+    let mut at = ENVELOPE_LEN;
+    loop {
+        let header_end = at
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::InvalidValue)?;
+        if encoded.len() < header_end {
+            return Err(Error::InvalidValue);
+        }
+        let tag = u16::from_le_bytes([encoded[at], encoded[at + 1]]);
+        let payload_len = u32::from_le_bytes([
+            encoded[at + 2],
+            encoded[at + 3],
+            encoded[at + 4],
+            encoded[at + 5],
+        ]) as usize;
+        let record_end = header_end
+            .checked_add(payload_len)
+            .ok_or(Error::InvalidValue)?;
+        if encoded.len() < record_end {
+            return Err(Error::InvalidValue);
+        }
+        at = record_end;
+        match tag {
+            TAG_READY => return Ok(at),
+            // FINISH closes the stream; reaching it means there was no
+            // READY, which is not a snapshot any client can render.
+            TAG_FINISH => return Err(Error::InvalidValue),
+            _ => {}
+        }
+    }
+}
+
 /// Wrapper hard caps, generous but finite. A hostile or corrupt stream
 /// must not be able to make roost buffer without bound before libghostty
 /// ever sees a byte (architecture doc §5). HS-1 overrides these with its

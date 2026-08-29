@@ -340,27 +340,39 @@ impl PtySupervisor {
         self.server_vt.get().map(|state| state.server_epoch())
     }
 
-    /// A live tab's server-VT command channel, or `None` when the tab
-    /// has no live PTY or server-VT is off.
+    /// A live tab's server-VT command channel **and** the generation
+    /// that channel belongs to, read under one lock — `None` when the
+    /// tab has no live PTY or server-VT is off.
+    ///
+    /// One acquisition is the point: a respawn between two reads would
+    /// otherwise let a caller resize one pipeline, stamp a token with a
+    /// second's generation, and snapshot a third. Every caller that
+    /// needs both must come through here.
     #[cfg(feature = "server-vt")]
-    pub fn tab_commands(&self, tab_id: i64) -> Option<mpsc::Sender<crate::tab_task::TabCmd>> {
+    pub fn tab_task_handle(
+        &self,
+        tab_id: i64,
+    ) -> Option<(mpsc::Sender<crate::tab_task::TabCmd>, u64)> {
         self.sessions
             .lock()
             .unwrap()
             .get(&tab_id)
             .and_then(|session| session.tab_task.as_ref())
-            .map(|(cmd_tx, _)| cmd_tx.clone())
+            .map(|(cmd_tx, generation)| (cmd_tx.clone(), *generation))
+    }
+
+    /// A live tab's server-VT command channel, or `None` when the tab
+    /// has no live PTY or server-VT is off.
+    #[cfg(feature = "server-vt")]
+    pub fn tab_commands(&self, tab_id: i64) -> Option<mpsc::Sender<crate::tab_task::TabCmd>> {
+        self.tab_task_handle(tab_id).map(|(cmd_tx, _)| cmd_tx)
     }
 
     /// A live tab's `tab_generation`, or `None` as above.
     #[cfg(feature = "server-vt")]
     pub fn tab_generation(&self, tab_id: i64) -> Option<u64> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(&tab_id)
-            .and_then(|session| session.tab_task.as_ref())
-            .map(|(_, generation)| *generation)
+        self.tab_task_handle(tab_id)
+            .map(|(_, generation)| generation)
     }
 
     /// Subscribe to supervisor-level lifecycle events
@@ -879,6 +891,7 @@ impl PtySupervisor {
                     rows,
                     cell_w: 0,
                     cell_h: 0,
+                    ack: None,
                 })
                 .await
                 .map_err(|_| PtyError::Closed(tab_id));

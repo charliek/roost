@@ -165,8 +165,8 @@ pub use scroll::{PageDirection, PageRoute, ScrollDirection, ScrollRoute, Termina
 pub use selection::{RowTextProjection, SelectionSnapshot, SelectionSpan, TerminalSelection};
 #[cfg(feature = "ffi")]
 pub use snapshot::{
-    DecodedTerminal, HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder,
-    SNAPSHOT_FORMAT_VERSION,
+    ready_boundary, DecodedTerminal, HistoryStep, ReadyState, SnapshotDecodeOptions,
+    SnapshotDecoder, SNAPSHOT_FORMAT_VERSION,
 };
 #[cfg(feature = "ffi")]
 pub use terminal::{

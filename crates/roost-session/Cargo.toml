@@ -13,8 +13,16 @@ name = "roost-session"
 path = "src/main.rs"
 
 [dependencies]
-roost-engine = { path = "../roost-engine" }
+# `server-vt` is what makes this a host session rather than a headless
+# UI: every tab gets an authoritative server terminal, which is what
+# `tab.attach`, headless `tab.dump`, and answered device queries are all
+# built on. It pulls roost-vt's `ffi` in, so building this crate needs
+# the vendored libghostty-vt archive (`third_party/ghostty/build.sh`).
+roost-engine = { path = "../roost-engine", features = ["server-vt"] }
 roost-ipc    = { path = "../roost-ipc" }
+# For `libghostty_build()` alone — the pin identity `session.identify`
+# advertises and `tab.attach` matches against.
+roost-vt     = { path = "../roost-vt", features = ["ffi"] }
 
 tokio   = { workspace = true }
 anyhow  = { workspace = true }

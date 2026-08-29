@@ -133,6 +133,13 @@ def test_daemonized_start_identify_stop(env):
     assert identity["session_protocol"] >= 1
     assert identity["app_version"]
     assert identity["started_at"]
+    # Every tab has an authoritative server terminal behind it, so the
+    # session advertises what it can encode one as and which libghostty
+    # pin it speaks. The exact sha belongs to `third_party/ghostty` — the
+    # Rust side pins the literal — so this asserts the shape a client
+    # negotiates on, not the value.
+    assert "ghostty-snapshot" in identity["payload_kinds"]
+    assert identity["libghostty_build"].startswith("ghostty-")
 
     report = env.stop_over_the_wire()
     assert set(report) >= {"reaped", "killed", "abandoned"}

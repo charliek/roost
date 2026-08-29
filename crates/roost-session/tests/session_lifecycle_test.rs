@@ -37,19 +37,42 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
     assert_eq!(session.app_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(session.session_id.len(), 32, "{}", session.session_id);
     assert!(session.started_at.ends_with('Z'), "{}", session.started_at);
-    // HS-1a has no attach data plane; advertising a payload kind here
-    // would be a promise the session cannot keep.
-    assert_eq!(session.payload_kinds, Vec::<AttachPayloadKind>::new());
-    assert_eq!(session.libghostty_build, "");
+    // Every tab has a server terminal behind it, so the snapshot kind
+    // is a promise this session can keep — and the build string is what
+    // a client checks its own libghostty pin against. Asserted by shape,
+    // not by value: the exact sha is `roost-vt`'s to pin (it has a test
+    // for the literal), and repeating it here would make every pin bump
+    // a two-crate edit.
+    assert_eq!(
+        session.payload_kinds,
+        vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)]
+    );
+    assert!(
+        session.libghostty_build.starts_with("ghostty-"),
+        "{}",
+        session.libghostty_build
+    );
 
     // Hydration seeded one project from the launch directory.
     let seeded = support::tabs(&mut client).await;
     assert_eq!(seeded.len(), 1, "a fresh session opens exactly one tab");
     let project_id = seeded[0].project_id;
 
+    // `tab.dump` with no UI in the process: the answer comes from the
+    // tab's own server terminal, at the session's stated geometry.
+    let dump = support::tab_dump(&mut client, seeded[0].id).await;
+    assert_eq!((dump.cols, dump.rows), (120, 40));
+    assert_eq!(dump.rows_text.len(), 40, "a dump covers the whole viewport");
+
+    // And its resolved twin: every cell, through the same color resolver
+    // the UIs paint from.
+    let resolved = support::tab_dump_resolved(&mut client, seeded[0].id).await;
+    assert_eq!((resolved.cols, resolved.rows), (120, 40));
+    assert_eq!(resolved.cells.len(), 120 * 40, "a resolved dump is dense");
+
     // A tab whose shell exits on its own must lose its workspace row
-    // without anybody asking — that is the headless drain's job, and
-    // nothing else in the process is watching the PTY.
+    // without anybody asking — that is the tab task's job, and nothing
+    // else in the process is watching the PTY.
     let transient_cwd = layout.subdir("transient");
     let transient = support::open_tab(
         &mut client,

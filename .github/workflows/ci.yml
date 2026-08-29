@@ -149,14 +149,44 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Covers a cold run: on a cache miss this job now builds the
+    # libghostty-vt archive before it can lint.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
+      # The workspace clippy below compiles `roost-session`, which enables
+      # `roost-engine/server-vt` and so links roost-vt's ffi: the
+      # libghostty-vt archive is a build input here, exactly as it is in
+      # `rust-build`. Full step parity with that job — toolchain, mise/zig,
+      # libclang, the same two-path cache key, conditional build — because
+      # a cache miss with any of them missing fails the job.
+      - name: Install libclang (Linux)
+        # libclang-dev is needed by bindgen when roost-vt is built with
+        # `--features ffi`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target
         uses: actions/cache@v5
@@ -260,8 +290,12 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       - name: cargo build (workspace, default features)
-        # Default features: roost-vt's `ffi` feature is OFF, so this build does
-        # not consume libghostty-vt.
+        # "Default features" no longer means "no libghostty-vt": a
+        # workspace build unifies features across the graph, and
+        # `roost-session` enables `roost-engine/server-vt`, which enables
+        # `roost-vt/ffi`. The archive built above is what makes this step
+        # work. The boundary that still holds — and is enforced in
+        # iced-build-e2e — is that roost-engine ALONE has no roost-vt edge.
         run: cargo build --workspace --all-targets
 
       - name: cargo build (roost-vt with ffi)
@@ -559,6 +593,15 @@ jobs:
           set -euo pipefail
           if cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced) v'; then
             echo "FAIL: roost-engine depends on a UI toolkit"
+            exit 1
+          fi
+          # roost-vt is an OPTIONAL roost-engine edge (the `server-vt`
+          # feature only `roost-session` turns on). A default-features
+          # build must not pull it in, or every UI build would require the
+          # libghostty-vt archive — architecture §2's "no default-build
+          # ghostty dependency".
+          if cargo tree -p roost-engine | grep -E '(^| )roost-vt v'; then
+            echo "FAIL: roost-engine pulls roost-vt with default features"
             exit 1
           fi
           if cargo tree -p roost-ui-model | grep -E '(^| )(gtk4|libadwaita|iced|pango|cairo-rs|wgpu) v'; then
@@ -1713,26 +1756,49 @@ jobs:
   # them over the same IPC op set `roostctl` speaks (tools/roosttest/
   # test_session.py). Required (in ci-success).
   #
-  # Deliberately lean compared with the UI lanes: no display, no apt
-  # packages (portable-pty needs none), and no libghostty-vt step —
-  # `roost-session` depends on roost-engine, not roost-vt, so
-  # `cargo tree -p roost-session | grep roost-vt` is empty and a ghostty
-  # build here would be pure cost.
+  # No display — the lane spawns daemons, not windows — but it does build
+  # libghostty-vt: `roost-session` enables `roost-engine/server-vt`, which
+  # pulls `roost-vt/ffi`, so every tab it opens has a real terminal behind
+  # it and the archive is a build input. Same step set as `rust-build`
+  # (toolchain, mise/zig, libclang, the two-path cache, conditional
+  # build), because a cache miss with any of them missing fails the job.
   session-e2e:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Covers a cold run: an uncached archive build now precedes the lane.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
+      - name: Install libclang (Linux)
+        # bindgen needs it to build roost-vt with `--features ffi`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      - uses: jdx/mise-action@v4
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target
         uses: actions/cache@v5

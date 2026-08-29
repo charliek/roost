@@ -8,6 +8,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod application;
+// The attach data plane: one forwarder per admitted data connection,
+// gated with the tab task it streams from (plan 036 D6).
+#[cfg(feature = "server-vt")]
+pub mod attach;
 pub mod crash;
 pub mod event_push;
 pub mod events;

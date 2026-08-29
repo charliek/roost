@@ -180,12 +180,15 @@ e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not h
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest $(SESSION_E2E_DESELECT) --roost-target mac
 
-# No ghostty step and no display: `roost-session` does not depend on
-# roost-vt (`cargo tree -p roost-session | grep roost-vt` is empty), and
-# the lane spawns daemons rather than windows. Both binaries are built
-# first because the harness would otherwise `cargo build` mid-test and
-# charge the first case for it.
+# No display — the lane spawns daemons rather than windows — but it does
+# need libghostty-vt: `roost-session` enables `roost-engine/server-vt`,
+# which pulls `roost-vt/ffi`, so the archive is a build input. The
+# build.sh call is idempotent and cached (it no-ops once
+# third_party/ghostty/out exists). Both binaries are built first because
+# the harness would otherwise `cargo build` mid-test and charge the first
+# case for it.
 e2e-session:  ## Headless host-session E2E (spawns roost-session daemons; no UI)
+	./third_party/ghostty/build.sh
 	cargo build -p roost-session -p roost-cli
 	uv run --group test pytest $(SESSION_E2E_TESTS)
 
@@ -275,6 +278,13 @@ check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency
 		( echo "roost-iced has a forbidden GTK dependency"; exit 1 )
 	@! cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced|notify-rust|zbus|arboard) v' || \
 		( echo "roost-engine has a UI toolkit dependency"; exit 1 )
+	# roost-vt is an OPTIONAL roost-engine edge (`server-vt`). A
+	# default-features build must not pull it in, or every UI build would
+	# require the libghostty-vt archive — architecture §2's "no
+	# default-build ghostty dependency", machine-enforced now that the
+	# edge exists at all.
+	@! cargo tree -p roost-engine | grep -E '(^| )roost-vt v' || \
+		( echo "roost-engine pulls roost-vt with default features"; exit 1 )
 	@cargo tree -p roost-iced | grep -q 'swash v0.2.10 (.*third_party/swash)' || \
 		( echo "swash [patch.crates-io] not applied"; exit 1 )
 

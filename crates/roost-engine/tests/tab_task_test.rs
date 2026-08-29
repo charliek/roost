@@ -104,6 +104,10 @@ async fn ask<T>(
         .expect("reply")
 }
 
+async fn capture(commands: &mpsc::Sender<TabCmd>, drain: bool) -> Vec<u8> {
+    ask(commands, |reply| TabCmd::CaptureInput { drain, reply }).await
+}
+
 async fn feed(commands: &mpsc::Sender<TabCmd>, bytes: &[u8]) {
     commands
         .send(TabCmd::FeedBytes(bytes.to_vec()))
@@ -248,7 +252,17 @@ async fn terminal_queries_are_answered_exactly_once_with_no_client() {
     feed(&commands, b"\x1b]11;?\x07").await;
     quiesce(&commands).await;
 
-    let captured = ask(&commands, TabCmd::CaptureInput).await;
+    // `drain: false` is a peek: the same bytes twice, still there.
+    let peeked = capture(&commands, false).await;
+    assert!(!peeked.is_empty(), "the queries were answered");
+    assert_eq!(
+        capture(&commands, false).await,
+        peeked,
+        "a peek must leave the buffer where it found it"
+    );
+
+    let captured = capture(&commands, true).await;
+    assert_eq!(captured, peeked, "the drain returns what the peek showed");
     let text = String::from_utf8_lossy(&captured).into_owned();
     assert_eq!(
         text.matches("\x1b[?").count(),
@@ -266,7 +280,7 @@ async fn terminal_queries_are_answered_exactly_once_with_no_client() {
         "expected exactly one OSC 11 color answer, got {text:?}"
     );
     // A second drain returns nothing: the buffer is a drain, not a log.
-    let again = ask(&commands, TabCmd::CaptureInput).await;
+    let again = capture(&commands, true).await;
     assert!(again.is_empty(), "capture must drain, got {again:?}");
 
     drop(commands);
@@ -687,7 +701,7 @@ async fn a_resize_drains_the_in_band_size_report() {
     // Mode 2048 on; drop the enable's own report before resizing.
     feed(&commands, b"\x1b[?2048h").await;
     quiesce(&commands).await;
-    let _ = ask(&commands, TabCmd::CaptureInput).await;
+    let _ = capture(&commands, true).await;
 
     commands
         .send(TabCmd::Resize {
@@ -695,13 +709,14 @@ async fn a_resize_drains_the_in_band_size_report() {
             rows: 12,
             cell_w: 8,
             cell_h: 16,
+            ack: None,
         })
         .await
         .expect("tab task is alive");
     let dump = quiesce(&commands).await;
     assert_eq!((dump.cols, dump.rows), (40, 12), "the server VT resized");
 
-    let captured = ask(&commands, TabCmd::CaptureInput).await;
+    let captured = capture(&commands, true).await;
     let text = String::from_utf8_lossy(&captured).into_owned();
     assert!(
         text.contains("48;12;40"),
