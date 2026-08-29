@@ -110,6 +110,10 @@ impl Layout {
             // sessions these tests start are torn down within seconds,
             // so the capture buffer's growth is bounded by the test.
             test_mode: true,
+            // No override: these sessions report the real build. The
+            // mismatch fixture is driven out of process by the session
+            // e2e lane, which spawns a daemon with the env var set.
+            fake_libghostty_build: None,
         }
     }
 

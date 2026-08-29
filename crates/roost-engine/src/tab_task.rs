@@ -38,14 +38,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use portable_pty::PtySize;
+use roost_ipc::messages::{ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
 use roost_vt::{Cell, Colors, CursorInfo, RenderState, RenderedRow, Terminal, TerminalOptions};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tracing::{debug, warn};
 
 use crate::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
-use crate::osc::{OscAction, OscColorSnapshot, OscColorState, OscRgb, OscRouter};
+use crate::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscColorState, OscRgb, OscRouter};
 use crate::pty::{PtyOutputEvent, WriterCmd};
+use crate::workspace::TabEffectKind;
 
 /// Scrollback the server Terminal retains, matching both UIs' policy.
 pub const SERVER_VT_SCROLLBACK: usize = 2000;
@@ -94,6 +96,13 @@ pub trait ServerVtWorkspace: Send + Sync + 'static {
     fn apply_osc(&self, tab_id: i64, command: u32, payload: &str);
     /// The tab's PTY is gone; drop its workspace row.
     fn close_row(&self, tab_id: i64);
+    /// Publish one client-local effect (plan 037 §3.6) — a bell or an
+    /// OSC 52 clipboard write. A session has no view of its own, so
+    /// this is the only thing it can do with one: hand it to whoever is
+    /// attached, on the events stream, in commit order with the state
+    /// changes around it. A clipboard write's text is user content: it
+    /// goes on the wire and into no log line.
+    fn tab_effect(&self, tab_id: i64, effect: TabEffectKind);
 }
 
 impl ServerVtWorkspace for crate::Workspace {
@@ -105,6 +114,10 @@ impl ServerVtWorkspace for crate::Workspace {
         if let Err(error) = crate::Workspace::close_tab(self, tab_id) {
             debug!(tab_id, %error, "tab row was already gone at PTY exit");
         }
+    }
+
+    fn tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
+        self.publish_tab_effect(tab_id, effect);
     }
 }
 
@@ -145,6 +158,18 @@ pub(crate) struct ServerVtState {
     server_epoch: u64,
     next_generation: AtomicU64,
     snapshot_permits: Arc<Semaphore>,
+    /// The last theme `session.set_theme` seeded (or `None` while no
+    /// client has stated one — the headless white-on-black default
+    /// stands), with the generation it was stored at. Session-wide
+    /// rather than per-tab because that is what makes it total: a tab
+    /// opened after the theme landed is seeded with it at construction,
+    /// so there is no second class of tab rendering the client's colors
+    /// wrong until the next reseed. The generation is what makes
+    /// last-writer-wins real under concurrency: every apply site keeps
+    /// the highest generation it has seen and ignores older ones, so
+    /// interleaved fan-outs converge on the newest theme instead of on
+    /// whichever send happened to land last.
+    theme: Mutex<(u64, Option<OscColorSnapshot>)>,
 }
 
 impl ServerVtState {
@@ -155,11 +180,30 @@ impl ServerVtState {
             server_epoch: random_epoch(),
             next_generation: AtomicU64::new(1),
             snapshot_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_SNAPSHOTS)),
+            theme: Mutex::new((0, None)),
         }
     }
 
     pub(crate) fn server_epoch(&self) -> u64 {
         self.server_epoch
+    }
+
+    /// Record the session-wide theme every tab opened from now on is
+    /// seeded with, and mint the generation the fan-out carries. Last
+    /// writer wins — which writer is last is decided here, under this
+    /// lock, not by whose sends happen to land last.
+    pub(crate) fn set_theme(&self, seed: OscColorSnapshot) -> u64 {
+        let mut theme = self.theme.lock().unwrap_or_else(PoisonError::into_inner);
+        theme.0 += 1;
+        theme.1 = Some(seed);
+        theme.0
+    }
+
+    pub(crate) fn theme(&self) -> (u64, Option<OscColorSnapshot>) {
+        self.theme
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -240,6 +284,14 @@ pub enum TabCmd {
         cell_h: u32,
         ack: Option<oneshot::Sender<Result<(), TabError>>>,
     },
+    /// `session.set_theme` — re-seed this tab's terminal (and its color
+    /// tracker) with the attached client's palette. Fire-and-forget:
+    /// the op's reply reports how many tabs it was sent to, and a tab
+    /// that dies mid-flight is one the client is about to lose anyway.
+    /// The generation is the store's; the task applies a seed only when
+    /// it is newer than the last one it took, so a stale fan-out racing
+    /// a fresh one can never roll a terminal's colors back.
+    SetTheme(OscColorSnapshot, u64),
     Snapshot(oneshot::Sender<Result<SnapshotAt, TabError>>),
     Resume {
         from_seq: u64,
@@ -276,6 +328,11 @@ pub(crate) struct TabPipe {
     pub(crate) exit_tx: mpsc::UnboundedSender<ExitSignal>,
     pub(crate) cmd_tx: mpsc::Sender<TabCmd>,
     pub(crate) tab_generation: u64,
+    /// The theme generation the terminal was built from, so the spawn's
+    /// promotion can tell whether `session.set_theme` landed while this
+    /// tab was in flight — a window the fan-out's sessions snapshot
+    /// cannot see (plan 037 §3.6).
+    pub(crate) theme_generation: u64,
 }
 
 /// The server-side terminal for one tab, built **before** the child is
@@ -292,6 +349,9 @@ pub(crate) struct TabVt {
     cols: u16,
     rows: u16,
     tab_generation: u64,
+    /// Highest theme generation this terminal has taken — seeded at
+    /// build, advanced by `TabCmd::SetTheme`, never rolled back.
+    theme_generation: u64,
 }
 
 impl TabVt {
@@ -306,9 +366,20 @@ impl TabVt {
             max_scrollback: SERVER_VT_SCROLLBACK,
             continuation_max_bytes: SERVER_VT_CONTINUATION_MAX,
         })?;
-        terminal.set_color_foreground(HEADLESS_FG)?;
-        terminal.set_color_background(HEADLESS_BG)?;
-        terminal.set_color_cursor(HEADLESS_FG)?;
+        // A tab opened after `session.set_theme` starts on the client's
+        // colors; one opened before any theme landed starts on the
+        // headless default. Either way it happens before the tracker
+        // reads the terminal back below, so both start from one set of
+        // values (plan 037 §3.6).
+        let (theme_generation, theme) = state.theme();
+        match theme {
+            Some(seed) => seed_theme(&mut terminal, &seed)?,
+            None => {
+                terminal.set_color_foreground(HEADLESS_FG)?;
+                terminal.set_color_background(HEADLESS_BG)?;
+                terminal.set_color_cursor(HEADLESS_FG)?;
+            }
+        }
         let replies = Arc::new(Mutex::new(Vec::new()));
         // Installed before the first byte: a device query in the very
         // first chunk must be answered like any other.
@@ -325,6 +396,7 @@ impl TabVt {
             cols,
             rows,
             tab_generation: state.next_generation.fetch_add(1, Ordering::SeqCst),
+            theme_generation,
         })
     }
 
@@ -356,14 +428,39 @@ impl TabVt {
             captured: Vec::new(),
             stored_exit: None,
         };
+        let theme_generation = task.vt.theme_generation;
         tokio::spawn(task.run(bytes_rx, exit_rx, cmd_rx));
         TabPipe {
             bytes_tx,
             exit_tx,
             cmd_tx,
             tab_generation,
+            theme_generation,
         }
     }
+}
+
+/// Push a theme's colors into a terminal — the server-side twin of the
+/// iced UI's `apply_theme_candidate` (`terminal_tab.rs`), and the same
+/// four FFI calls in the same order.
+///
+/// Only the terminal: the caller moves [`OscColorState`] separately,
+/// because construction seeds it by reading the terminal back while a
+/// reseed re-seeds the tracker it already has (which keeps whatever the
+/// program set for itself — see [`OscColorState::reseed`]).
+fn seed_theme(terminal: &mut Terminal, seed: &OscColorSnapshot) -> Result<(), roost_vt::Error> {
+    terminal.set_color_foreground(vt_rgb(seed.foreground))?;
+    terminal.set_color_background(vt_rgb(seed.background))?;
+    terminal.set_color_cursor(vt_rgb(seed.cursor))?;
+    let palette: [roost_vt::ColorRgb; 256] = (*seed.palette).map(vt_rgb);
+    terminal.set_color_palette(&palette)
+}
+
+/// The tracker's color spelling → libghostty's. Named, because
+/// [`color_seed`] converts the other way and an anonymous `rgb` closure
+/// in each read identically at a glance.
+fn vt_rgb(c: OscRgb) -> roost_vt::ColorRgb {
+    roost_vt::ColorRgb::new(c.0, c.1, c.2)
 }
 
 /// Seed the OSC color tracker from the terminal itself, so the tracker
@@ -512,6 +609,16 @@ impl TabTask {
         for action in actions {
             self.apply_action(action);
         }
+        // One `bell` per chunk that carried at least one BEL, not one
+        // per byte: a program that rings twenty times in a burst wants
+        // the client's attention once, and each effect is its own
+        // commit on the events stream.
+        if self.vt.router.take_bells() > 0 {
+            self.vt
+                .state
+                .workspace
+                .tab_effect(self.tab_id, TabEffectKind::Bell);
+        }
         // 4. reply drain — required after EVERY vt_write.
         self.take_replies();
         // 5 + 6. tee, then the replay ring.
@@ -532,15 +639,34 @@ impl TabTask {
                     .workspace
                     .apply_osc(self.tab_id, command, &payload);
             }
-            // Client-local effects. A session has no view, and a client
-            // that attaches later wants the clipboard as it is then, not
-            // a replay. HS-2's effects envelope is where these start
-            // reaching an attached client.
-            OscAction::ClipboardWrite { target, .. } => {
-                debug!(
-                    tab_id = self.tab_id,
-                    ?target,
-                    "dropped an OSC clipboard write: no client effects channel yet"
+            // Client-local effects. A session has no view, so the only
+            // thing it can do with one is hand it to whoever is
+            // attached — the `tab.effect` envelope (plan 037 §3.6).
+            // Nothing is replayed to a client that attaches later: a
+            // clipboard is wanted as it is then, not as it was.
+            OscAction::ClipboardWrite { target, text } => {
+                // The scanner already refuses a truncated body; this is
+                // the smaller policy bound on what a session will fan
+                // out. Logged by size — the payload is user content and
+                // never reaches a log line.
+                if text.len() > CLIPBOARD_EFFECT_MAX_BYTES {
+                    debug!(
+                        tab_id = self.tab_id,
+                        bytes = text.len(),
+                        cap = CLIPBOARD_EFFECT_MAX_BYTES,
+                        "dropped an oversized OSC clipboard write"
+                    );
+                    return;
+                }
+                self.vt.state.workspace.tab_effect(
+                    self.tab_id,
+                    TabEffectKind::ClipboardWrite {
+                        text,
+                        target: match target {
+                            ClipboardTarget::System => ClipboardEffectTarget::System,
+                            ClipboardTarget::Selection => ClipboardEffectTarget::Selection,
+                        },
+                    },
                 );
             }
             OscAction::PointerShape(shape) => {
@@ -709,6 +835,28 @@ impl TabTask {
                 if let Some(ack) = ack {
                     let _ = ack.send(applied);
                 }
+            }
+            TabCmd::SetTheme(seed, generation) => {
+                // Monotonic: a stale fan-out racing a fresh one (or the
+                // promotion's catch-up send) must not roll colors back.
+                if generation <= self.vt.theme_generation {
+                    return;
+                }
+                self.vt.theme_generation = generation;
+                if let Err(error) = seed_theme(&mut self.vt.terminal, &seed) {
+                    warn!(tab_id = self.tab_id, %error, "server terminal theme reseed failed");
+                    return;
+                }
+                // The tracker moves with the terminal, in the same
+                // command, so nothing on the drain side can read a
+                // theme the terminal has not taken. Program-set colors
+                // survive both — that is `reseed`'s contract.
+                self.vt.colors.reseed(seed);
+                // `set_color_*` is not a `vt_write`, but the drain
+                // contract is "after every call that can emit", and a
+                // reply left sitting in the buffer would ride out on
+                // whatever wrote next.
+                self.take_replies();
             }
             TabCmd::Snapshot(reply) => {
                 let seq = self.last_byte_seq;

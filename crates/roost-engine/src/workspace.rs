@@ -187,6 +187,26 @@ pub struct RestoreTab {
     pub user_titled: bool,
 }
 
+/// What a [`WorkspaceEvent::TabEffect`] carries, in process.
+///
+/// The wire shape is flat — an `effect` name beside optional `data` and
+/// `target` fields (plan 037 §3.6) — but in process the payload belongs
+/// to the one variant that has one, so a bell cannot be built carrying
+/// clipboard text. `crate::event_push` flattens this into the wire form,
+/// the same boundary that already does every other event's projection.
+///
+/// The clipboard text is user content: it goes on the wire and into no
+/// log line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "kebab-case")]
+pub enum TabEffectKind {
+    Bell,
+    ClipboardWrite {
+        text: String,
+        target: roost_ipc::messages::ClipboardEffectTarget,
+    },
+}
+
 /// Workspace event channel. The server-push relay
 /// (`crate::event_push`) converts these to wire-format
 /// `EventEnvelope`s; its serializer is a total match over this enum, so
@@ -262,6 +282,17 @@ pub enum WorkspaceEvent {
         project_id: i64,
         #[serde(with = "roost_ipc::messages::vec_string_int64")]
         tab_ids: Vec<i64>,
+    },
+    /// One client-local effect a server-VT tab produced — a bell or an
+    /// OSC 52 clipboard write (plan 037 §3.6). Transient like
+    /// [`Self::NotificationFired`]: it is not workspace state, it is
+    /// something that happened, and it rides the commit stream so an
+    /// attached client sees it in order with everything else. Minted
+    /// only by `tab_task`, so a UI's own workspace never emits one.
+    TabEffect {
+        #[serde(with = "roost_ipc::messages::string_int64")]
+        tab_id: i64,
+        effect: TabEffectKind,
     },
     /// Fired after `reorder_projects`. `project_ids` is the
     /// post-reorder sidebar order.
@@ -1184,6 +1215,40 @@ impl Workspace {
             Persist::Skip,
         );
         Ok(true)
+    }
+
+    /// Publish one client-local tab effect (plan 037 §3.6) — a bell or
+    /// an OSC 52 clipboard write a server-VT tab produced.
+    ///
+    /// A commit like any other, for the reason the events stream's
+    /// whole loss-detection protocol depends on: every batch a
+    /// subscriber sees carries the next revision, so an effect that
+    /// rode outside the sequence would either need a revision it
+    /// cannot have or a second delivery channel with no ordering
+    /// against the state changes around it. `Persist::Skip` — nothing
+    /// here is in the snapshot.
+    ///
+    /// Not gated on the tab still existing: the tab task is the only
+    /// caller and it emits from inside its own tab's pipeline —
+    /// `pub(crate)` so that stays true.
+    pub(crate) fn publish_tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
+        let inner = self.inner.lock().unwrap();
+        // The tab task outlives its workspace row on purpose (it keeps
+        // ingesting descendant output past the exit deadline), so a late
+        // BEL or OSC 52 can arrive here after `tab.closed` committed. An
+        // effect for a tab a subscriber has already watched close is
+        // noise at best and a mis-attribution at worst — checked under
+        // the same lock as the commit, so close-then-effect cannot
+        // interleave the other way around.
+        if !inner.tabs.contains_key(&tab_id) {
+            tracing::debug!(tab_id, "dropping a tab effect for a closed tab");
+            return;
+        }
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabEffect { tab_id, effect }],
+            Persist::Skip,
+        );
     }
 
     /// `tab.agent_report` — the one op every agent adapter writes

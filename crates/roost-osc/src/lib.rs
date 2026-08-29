@@ -203,6 +203,17 @@ pub struct OscScanner {
     /// the user's clipboard. Reset on each new OSC.
     body_truncated: bool,
     pending: Vec<OscEvent>,
+    /// BEL bytes seen **outside** any OSC since the last
+    /// [`OscScanner::take_bells`] — the terminal bell.
+    ///
+    /// Not an [`OscEvent`]: a bell is not an OSC, and the scanner is
+    /// the only thing in the stack that already knows whether a `0x07`
+    /// is a sequence terminator or the control character itself. Kept
+    /// as a counter read on demand rather than pushed onto `pending`,
+    /// so every existing `feed` consumer is untouched — one that never
+    /// asks simply never learns, and the counter saturates rather than
+    /// growing.
+    bells: usize,
 }
 
 impl Default for OscScanner {
@@ -219,7 +230,17 @@ impl OscScanner {
             body: Vec::new(),
             body_truncated: false,
             pending: Vec::new(),
+            bells: 0,
         }
+    }
+
+    /// How many terminal bells the bytes fed since the last call
+    /// carried, resetting the count.
+    ///
+    /// A caller that wants bells calls this after each [`Self::feed`];
+    /// one that does not never has to know the counter exists.
+    pub fn take_bells(&mut self) -> usize {
+        std::mem::take(&mut self.bells)
     }
 
     /// Feed a slice of PTY bytes. Returns all OSC events parsed out
@@ -238,6 +259,18 @@ impl OscScanner {
             State::Outside => {
                 if b == 0x1B {
                     self.state = State::Esc;
+                } else if b == 0x07 {
+                    // A BEL that terminates an OSC is consumed by the
+                    // `Prefix`/`Body` arms below, so one reaching here
+                    // is the control character: the bell.
+                    //
+                    // Limitation: this state machine models OSC only, so
+                    // a BEL carried inside a DCS/APC/PM/SOS string
+                    // (sixel, tmux passthrough) also lands here and is
+                    // counted. libghostty's own bell callback would not
+                    // — wiring it needs the `OPT_USERDATA` callback
+                    // multiplexing that `roost-vt` defers.
+                    self.bells = self.bells.saturating_add(1);
                 }
             }
             State::Esc => match b {
@@ -650,6 +683,34 @@ mod tests {
     fn feed_all(bytes: &[u8]) -> Vec<OscEvent> {
         let mut s = OscScanner::new();
         s.feed(bytes)
+    }
+
+    // The bell (BEL outside an OSC)
+
+    #[test]
+    fn a_bare_bel_is_counted_and_an_osc_terminator_is_not() {
+        let mut s = OscScanner::new();
+        // Two bells around an OSC whose own BEL terminator must not
+        // count as a third — the whole reason the scanner owns this.
+        let events = s.feed(b"a\x07b\x1b]0;title\x07c\x07");
+        assert_eq!(events, vec![OscEvent::Title("title".into())]);
+        assert_eq!(s.take_bells(), 2);
+        // Taking resets: the next chunk reports only its own bells.
+        assert_eq!(s.take_bells(), 0);
+        s.feed(b"\x07");
+        assert_eq!(s.take_bells(), 1);
+    }
+
+    /// A BEL arriving while a body is still open belongs to that
+    /// sequence even across a feed boundary — the split case is where a
+    /// stateless scan would mis-ring.
+    #[test]
+    fn a_bel_terminating_a_split_osc_is_not_a_bell() {
+        let mut s = OscScanner::new();
+        assert!(s.feed(b"\x1b]0;ti").is_empty());
+        assert_eq!(s.take_bells(), 0);
+        assert_eq!(s.feed(b"tle\x07"), vec![OscEvent::Title("title".into())]);
+        assert_eq!(s.take_bells(), 0);
     }
 
     // OSC 9 (iTerm2 notification)

@@ -21,11 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roost_ipc::messages::{
-    ops, ActiveChangedEvent, AgentReportChangedEvent, EventBatch, EventEnvelope,
+    bytes_base64, ops, ActiveChangedEvent, AgentReportChangedEvent, EventBatch, EventEnvelope,
     HookActiveChangedEvent, NotificationFiredEvent, ProjectCreatedEvent, ProjectDeletedEvent,
-    ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent, TabCwdChangedEvent,
-    TabNotificationEvent, TabOpenedEvent, TabStateChangedEvent, TabTitleChangedEvent,
-    TabsReorderedEvent,
+    ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent, TabCwdChangedEvent, TabEffect,
+    TabEffectEvent, TabNotificationEvent, TabOpenedEvent, TabStateChangedEvent,
+    TabTitleChangedEvent, TabsReorderedEvent,
 };
 use roost_ipc::PushSource;
 use tokio::sync::broadcast::error::RecvError;
@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::{debug, warn};
 
+use crate::workspace::TabEffectKind;
 use crate::{VersionedWorkspaceEvent, Workspace, WorkspaceEvent};
 
 /// How many batches may be queued for one subscriber before it is
@@ -202,6 +203,28 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
             to_value(TabsReorderedEvent {
                 project_id: *project_id,
                 tab_ids: tab_ids.clone(),
+            }),
+        ),
+        // Plan 037 §3.6. The in-process payload is plaintext; base64 is
+        // the wire's encoding for bytes, so it is applied here, at the
+        // projection boundary, like every other wire-shape difference.
+        // The clipboard payload goes on the wire and nowhere else — no
+        // log line here or in the tab task ever carries it.
+        WorkspaceEvent::TabEffect { tab_id, effect } => (
+            ops::EVENT_TAB_EFFECT,
+            to_value(match effect {
+                TabEffectKind::Bell => TabEffectEvent {
+                    tab_id: *tab_id,
+                    effect: TabEffect::Bell,
+                    data: None,
+                    target: None,
+                },
+                TabEffectKind::ClipboardWrite { text, target } => TabEffectEvent {
+                    tab_id: *tab_id,
+                    effect: TabEffect::ClipboardWrite,
+                    data: Some(bytes_base64::encode(text.as_bytes())),
+                    target: Some(*target),
+                },
             }),
         ),
         WorkspaceEvent::ProjectsReordered { project_ids } => (

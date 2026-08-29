@@ -15,9 +15,10 @@ use std::path::PathBuf;
 
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    EventBatch, EventEnvelope, ResponseError, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
-    SessionStoppingEvent, TabAttachParams, TabAttachResult, SESSION_PROTOCOL_VERSION,
+    ClipboardEffectTarget, EventBatch, EventEnvelope, ResponseError, SessionConnectParams,
+    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetThemeParams,
+    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent,
+    TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, SESSION_PROTOCOL_VERSION,
     SESSION_STOPPING_EVENT,
 };
 
@@ -578,4 +579,130 @@ fn event_batch_vector_decodes_into_its_typed_shape() {
         serde_json::from_value(batch.events[1].data.clone()).expect("decode active.changed data");
     assert_eq!(active.project_id, 1);
     assert_eq!(active.tab_id, 5);
+}
+
+// ============================================================================
+// HS-2 server additions (plan 037 §3.6): effects + theme reseed
+// ============================================================================
+
+/// The two effect spellings a client switches on. Kebab-case is not
+/// serde's default rendering, so the wire strings are stated here rather
+/// than inferred — renaming a variant must break this file, not a
+/// client.
+#[test]
+fn tab_effect_names_are_their_wire_strings() {
+    assert_eq!(
+        serde_json::to_string(&TabEffect::Bell).unwrap(),
+        r#""bell""#
+    );
+    assert_eq!(
+        serde_json::to_string(&TabEffect::ClipboardWrite).unwrap(),
+        r#""clipboard-write""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ClipboardEffectTarget::System).unwrap(),
+        r#""system""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ClipboardEffectTarget::Selection).unwrap(),
+        r#""selection""#
+    );
+    // An effect this build has never heard of fails to decode rather
+    // than landing on a default: a client that cannot tell what happened
+    // must ignore the envelope, and the decode is how it finds out.
+    assert!(serde_json::from_str::<TabEffect>(r#""pointer-shape""#).is_err());
+}
+
+/// A bell carries no payload at all — the optional fields are absent
+/// from the wire rather than present and null, so a client reading
+/// `data` unconditionally fails loudly on a bell instead of pasting
+/// "null" into a clipboard.
+#[test]
+fn a_bell_effect_omits_its_payload_fields() {
+    let bell = TabEffectEvent {
+        tab_id: 5,
+        effect: TabEffect::Bell,
+        data: None,
+        target: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&bell).unwrap(),
+        r#"{"tab_id":"5","effect":"bell"}"#
+    );
+    round_trip(&bell);
+}
+
+#[test]
+fn tab_effect_vector_decodes_into_its_typed_shape() {
+    let raw = read_vector("tab.effect.event.json");
+    let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
+    assert_eq!(envelope.event, roost_ipc::messages::ops::EVENT_TAB_EFFECT);
+    let data: TabEffectEvent = serde_json::from_value(envelope.data).expect("decode effect data");
+    assert_eq!(
+        data,
+        TabEffectEvent {
+            tab_id: 5,
+            effect: TabEffect::ClipboardWrite,
+            // base64 of "hello": the payload rides encoded like every
+            // other bytes field on this wire.
+            data: Some("aGVsbG8=".into()),
+            target: Some(ClipboardEffectTarget::System),
+        }
+    );
+    round_trip(&data);
+}
+
+#[test]
+fn session_set_theme_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("session.set_theme.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_SET_THEME);
+    let params: SessionSetThemeParams =
+        serde_json::from_value(request.params).expect("decode set_theme params");
+    assert_eq!(params.lease, LEASE);
+    assert_eq!(params.osc_colors.foreground, "#ffffff");
+    assert_eq!(params.osc_colors.background, "#1c1c1c");
+    assert_eq!(params.osc_colors.cursor, "#98989d");
+    // A full palette or nothing — the server refuses a short one rather
+    // than applying half a theme, so the vector states all 256.
+    assert_eq!(params.osc_colors.palette.len(), 256);
+    assert_eq!(params.osc_colors.palette[0], "#000000");
+    assert_eq!(params.osc_colors.palette[255], "#ffffff");
+    round_trip(&params);
+
+    let raw = read_vector("session.set_theme.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: SessionSetThemeResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode set_theme result");
+    assert_eq!(result.tabs, 3);
+}
+
+/// Strict on the server side, like every other request type: an unknown
+/// field is a rejected request, not one applied with a typo in it.
+#[test]
+fn session_set_theme_params_reject_unknown_fields() {
+    let colors = serde_json::json!({
+        "foreground": "#ffffff",
+        "background": "#000000",
+        "cursor": "#ffffff",
+        "palette": vec!["#000000"; 256],
+    });
+    assert!(
+        serde_json::from_value::<SessionSetThemeParams>(serde_json::json!({
+            "lease": LEASE,
+            "osc_colors": colors.clone(),
+        }))
+        .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<SessionSetThemeParams>(serde_json::json!({
+            "lease": LEASE,
+            "osc_colors": colors,
+            "tab_id": "5",
+        }))
+        .is_err()
+    );
 }

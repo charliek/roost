@@ -66,6 +66,7 @@ struct NoopWorkspace;
 impl ServerVtWorkspace for NoopWorkspace {
     fn apply_osc(&self, _tab_id: i64, _command: u32, _payload: &str) {}
     fn close_row(&self, _tab_id: i64) {}
+    fn tab_effect(&self, _tab_id: i64, _effect: roost_engine::TabEffectKind) {}
 }
 
 async fn harness() -> Harness {

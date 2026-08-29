@@ -115,6 +115,12 @@ impl EngineError {
             Self::Workspace(WorkspaceError::TabProjectMismatch { .. }) => "tab_project_mismatch",
             Self::Workspace(WorkspaceError::Io(_)) => "io_error",
             Self::Workspace(WorkspaceError::Json(_)) => "invalid_state",
+            Self::Workspace(WorkspaceError::HostNotFound(_)) => "host_not_found",
+            Self::Workspace(
+                WorkspaceError::HostLabelEmpty
+                | WorkspaceError::HostLabelReserved
+                | WorkspaceError::HostLabelTaken(_),
+            ) => "invalid_argument",
             Self::Pty(PtyError::NotFound(_)) | Self::Pty(PtyError::Closed(_)) => "tab_not_found",
             Self::Pty(PtyError::Cancelled(_)) => "cancelled",
             Self::Pty(PtyError::DuplicateTab(_)) => "duplicate_tab",

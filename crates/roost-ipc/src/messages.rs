@@ -1912,6 +1912,115 @@ pub struct HostListResult {
 }
 
 // ============================================================================
+// HS-2 server-side additions: effects envelopes + theme reseed
+// ============================================================================
+//
+// Both are additive (plan 037 §3.6): a new event name inside the
+// existing `EventBatch` and a new lease-gated session op. Old clients
+// ignore an event they have no name for, so `SESSION_PROTOCOL_VERSION`
+// stays 2.
+
+/// Which client-directed effect a [`TabEffectEvent`] carries.
+///
+/// Deliberately short: HS-2 ships **bell** and **OSC 52 clipboard
+/// writes** only. Every other client-local OSC effect (pointer shape,
+/// today) stays dropped + debug-logged in the tab task — an envelope
+/// design invites "just one more effect", so the set is pinned rather
+/// than open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TabEffect {
+    /// A BEL byte reached the tab's terminal outside any escape
+    /// sequence. Carries no `data`.
+    Bell,
+    /// An OSC 52 clipboard write. `data` is the decoded payload,
+    /// base64-encoded per the wire's bytes convention.
+    ClipboardWrite,
+}
+
+/// Which selection an [`TabEffect::ClipboardWrite`] targets. Mirrors
+/// `roost_osc::ClipboardTarget`: OSC 52's `c` selector (and the empty
+/// default) is [`System`](Self::System), `p`/`s` is
+/// [`Selection`](Self::Selection).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardEffectTarget {
+    #[default]
+    System,
+    Selection,
+}
+
+/// `tab.effect` event data — one client-local effect a session's tab
+/// produced, for the attached client to apply.
+///
+/// `data` is present only for [`TabEffect::ClipboardWrite`], where it
+/// carries the decoded clipboard text base64-encoded (standard
+/// alphabet, like every other bytes field). The server caps it at
+/// [`CLIPBOARD_EFFECT_MAX_BYTES`] decoded and drops anything larger, so
+/// a client never has to bound it a second time. **The payload is user
+/// data: never log it.**
+///
+/// `target` is present on clipboard writes too, so a primary-selection
+/// write does not land on the system clipboard. Absent means
+/// [`ClipboardEffectTarget::System`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabEffectEvent {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    pub effect: TabEffect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ClipboardEffectTarget>,
+}
+
+/// Decoded-size cap on a [`TabEffect::ClipboardWrite`] payload. The
+/// OSC 52 scanner already bounds a body at 1 MiB; this is the smaller,
+/// policy bound on what a session will fan out to a client
+/// (architecture §6's bounded-size rule). Oversized writes are dropped
+/// and debug-logged by size, never by content.
+pub const CLIPBOARD_EFFECT_MAX_BYTES: usize = 256 * 1024;
+
+/// One full terminal palette, as the client's theme states it.
+///
+/// Colors ride as `#rrggbb` strings, the spelling `tab.dump_resolved`
+/// already uses, so a theme is readable in a wire trace. `palette` is
+/// exactly 256 entries — a short or long one is `invalid-param` rather
+/// than a partially applied theme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OscColorsParams {
+    pub foreground: String,
+    pub background: String,
+    pub cursor: String,
+    pub palette: Vec<String>,
+}
+
+/// [`ops::SESSION_SET_THEME`] params: seed every tab's server terminal
+/// with the attached client's palette.
+///
+/// Lease-gated, like every other interactive session op — a client that
+/// does not drive the session does not get to recolor it. Applies to
+/// the tabs that exist now **and** is remembered for tabs the session
+/// opens later, so a client sends it once after `session.connect`
+/// (before the first `tab.attach`) and again whenever its theme
+/// changes. Concurrent callers are last-writer-wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSetThemeParams {
+    pub lease: String,
+    pub osc_colors: OscColorsParams,
+}
+
+/// [`ops::SESSION_SET_THEME`] result: how many live tabs were reseeded.
+/// Zero is a success — a session with no tabs still records the theme
+/// for the ones it opens next.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetThemeResult {
+    pub tabs: u32,
+}
+
+// ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
 
@@ -1956,6 +2065,10 @@ pub mod ops {
     /// release it, so a reconnecting client always arrives as a
     /// takeover.
     pub const SESSION_CONNECT: &str = "session.connect";
+    /// Seed every tab's server terminal with the attached client's
+    /// theme palette, and remember it for the tabs opened next. Lease-
+    /// gated; last-writer-wins between concurrent clients.
+    pub const SESSION_SET_THEME: &str = "session.set_theme";
     /// Ask for a ticket to open a data connection for one tab. The
     /// control-plane half of an attach: it negotiates payload kind,
     /// build identity, and geometry on stable JSON, and hands back a
@@ -2120,6 +2233,11 @@ pub mod ops {
     /// tabs moved plus the full post-reorder order.
     pub const EVENT_TABS_REORDERED: &str = "tabs.reordered";
     pub const EVENT_PROJECTS_REORDERED: &str = "projects.reordered";
+    /// One client-local effect a session tab produced — bell, or an
+    /// OSC 52 clipboard write. A session has no view of its own, so
+    /// these only mean anything to an attached client;
+    /// [`crate::messages::TabEffectEvent`] is the payload.
+    pub const EVENT_TAB_EFFECT: &str = "tab.effect";
 
     /// Client-side saved-host registry (host-sessions HS-2, plan 037
     /// C1). Registry only — no connect/disconnect here (`host.connect`
@@ -2194,6 +2312,15 @@ pub mod bytes_base64 {
         STANDARD
             .decode(raw.as_bytes())
             .map_err(|e| serde::de::Error::custom(format!("invalid base64: {e}")))
+    }
+
+    /// The same encoding, for a field that carries its base64 as a
+    /// `String` rather than through a `#[serde(with = ...)]` hook —
+    /// [`super::TabEffectEvent::data`], which is optional and minted
+    /// engine-side. One alphabet, one place.
+    #[must_use]
+    pub fn encode(bytes: &[u8]) -> String {
+        STANDARD.encode(bytes)
     }
 }
 

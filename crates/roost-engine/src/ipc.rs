@@ -24,8 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roost_ipc::agent::{self, TabAgentReportParams};
-#[cfg(feature = "server-vt")]
-use roost_ipc::messages::TabAttachResult;
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
@@ -41,16 +39,19 @@ use roost_ipc::messages::{
     ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams,
     ScreenshotResult, SelectionClearParams, SelectionDumpParams, SelectionDumpResult,
     SelectionSetParams, SessionConnectParams, SessionConnectResult, SessionIdentify,
-    SessionIdentifyParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
-    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
-    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    SessionIdentifyParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, SESSION_PROTOCOL_VERSION,
 };
+#[cfg(feature = "server-vt")]
+use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
 use roost_ipc::{
     CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
     StopFinalizer,
@@ -1002,6 +1003,7 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::PROJECT_REORDER
             | ops::NOTIFICATION_CREATE
             | ops::SESSION_CONNECT
+            | ops::SESSION_SET_THEME
             | ops::TAB_ATTACH
             | ops::TAB_FEED_PTY_BYTES
             | ops::HOST_ADD
@@ -1204,6 +1206,17 @@ fn tab_commands(
 #[cfg(feature = "server-vt")]
 fn tab_gone(tab_id: i64) -> HandlerError {
     HandlerError::not_found(format!("tab {tab_id} is gone"))
+}
+
+/// The one answer for a data-plane op on a session that cannot serve
+/// one — either the feature was compiled out or `enable_server_vt` was
+/// never called. A client cannot act on the difference, and the text is
+/// worded to be true of both.
+fn no_server_vt() -> HandlerError {
+    HandlerError::new(
+        "unsupported-kind",
+        "this session has no server-VT data plane",
+    )
 }
 
 /// Round-trip one command through a tab task.
@@ -1454,6 +1467,18 @@ async fn dispatch_outcome(
         return encode(&SessionConnectResult { lease, revision }).map(HandlerOutcome::Reply);
     }
 
+    // Served here rather than in `dispatch` for the same reason
+    // `tab.attach` is: the lease it presents is bound to *this*
+    // connection, which `dispatch` cannot see. And it is lease-gated at
+    // all because it is the attached client's theme — only the client
+    // driving the session gets to state it.
+    if op == ops::SESSION_SET_THEME {
+        let p: SessionSetThemeParams = decode(params)?;
+        return session_set_theme(h, session, ctx, p)
+            .await
+            .map(HandlerOutcome::Reply);
+    }
+
     // Same reason as `session.connect`: the token is bound to the lease
     // presented on *this* connection, which `dispatch` cannot see.
     if op == ops::TAB_ATTACH {
@@ -1592,9 +1617,107 @@ async fn tab_attach(
     p: TabAttachParams,
 ) -> Result<serde_json::Value, HandlerError> {
     session.require_lease(&p.lease, ctx)?;
-    Err(HandlerError::new(
-        "unsupported-kind",
-        "this session was built without the server-VT data plane",
+    Err(no_server_vt())
+}
+
+/// `session.set_theme`: seed every tab's server terminal with the
+/// attached client's palette, and remember it for the tabs opened next
+/// (plan 037 §3.6).
+///
+/// This is the op that closes the reseed gap the architecture notes
+/// left open: without it, a session's terminals answer OSC 4 / 10 / 11 /
+/// 12 queries with the headless white-on-black default, so a program in
+/// a host tab picks its colors against a theme nobody is looking at.
+///
+/// Whole-theme, not a diff: the client states the palette it renders
+/// with and the server takes it. Two clients racing (a takeover during
+/// a theme change) are last-writer-wins by construction — there is one
+/// stored seed and the last `set_theme` to reach the tab task is the
+/// one its terminal ends on.
+#[cfg(feature = "server-vt")]
+async fn session_set_theme(
+    h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: SessionSetThemeParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+    let seed = decode_osc_colors(&p.osc_colors)?;
+    // Storing the seed and reseeding the live tabs is one supervisor
+    // call — see `PtySupervisor::set_theme` for why the pair cannot be
+    // split without a spawn racing between them.
+    let tabs = h
+        .supervisor
+        .set_theme(&seed)
+        .await
+        .ok_or_else(no_server_vt)?;
+    encode(&SessionSetThemeResult { tabs })
+}
+
+/// Without the `server-vt` feature there are no server terminals to
+/// recolor — the same answer `tab.attach` gives, for the same reason.
+#[cfg(not(feature = "server-vt"))]
+#[allow(clippy::unused_async)]
+async fn session_set_theme(
+    _h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: SessionSetThemeParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+    Err(no_server_vt())
+}
+
+/// Wire colors → the engine's theme seed.
+///
+/// `#rrggbb` is the spelling `tab.dump_resolved` already answers in, so
+/// a theme is readable in a wire trace and a test can state one as a
+/// literal. Every failure is `invalid-param` and names the field: a
+/// half-applied palette is worse than a refused one.
+#[cfg(feature = "server-vt")]
+fn decode_osc_colors(
+    colors: &roost_ipc::messages::OscColorsParams,
+) -> Result<crate::osc::OscColorSnapshot, HandlerError> {
+    if colors.palette.len() != 256 {
+        return Err(HandlerError::invalid_param(format!(
+            "osc_colors.palette must have exactly 256 entries (got {})",
+            colors.palette.len()
+        )));
+    }
+    let mut palette = [(0u8, 0u8, 0u8); 256];
+    for (index, raw) in colors.palette.iter().enumerate() {
+        palette[index] = parse_rgb_hex(raw)
+            .ok_or_else(|| invalid_color(&format!("osc_colors.palette[{index}]"), raw))?;
+    }
+    Ok(crate::osc::OscColorSnapshot::new(
+        parse_rgb_hex(&colors.foreground)
+            .ok_or_else(|| invalid_color("osc_colors.foreground", &colors.foreground))?,
+        parse_rgb_hex(&colors.background)
+            .ok_or_else(|| invalid_color("osc_colors.background", &colors.background))?,
+        parse_rgb_hex(&colors.cursor)
+            .ok_or_else(|| invalid_color("osc_colors.cursor", &colors.cursor))?,
+        palette,
+    ))
+}
+
+#[cfg(feature = "server-vt")]
+fn invalid_color(field: &str, raw: &str) -> HandlerError {
+    HandlerError::invalid_param(format!("{field} is not a #rrggbb color (got {raw:?})"))
+}
+
+/// The inverse of [`rgb_hex`]. Long form only — the wire is machine-
+/// written, and accepting `#abc` too would mean two spellings of one
+/// color for the vectors to disagree about.
+#[cfg(feature = "server-vt")]
+fn parse_rgb_hex(raw: &str) -> Option<(u8, u8, u8)> {
+    let body = raw.strip_prefix('#')?;
+    if body.len() != 6 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&body[0..2], 16).ok()?,
+        u8::from_str_radix(&body[2..4], 16).ok()?,
+        u8::from_str_radix(&body[4..6], 16).ok()?,
     ))
 }
 

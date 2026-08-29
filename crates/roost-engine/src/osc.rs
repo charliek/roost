@@ -253,6 +253,13 @@ impl OscRouter {
         }
         map_events(events)
     }
+
+    /// How many terminal bells the bytes fed since the last call
+    /// carried, resetting the count. See [`OscScanner::take_bells`] for
+    /// why bells ride beside the actions rather than inside them.
+    pub fn take_bells(&mut self) -> usize {
+        self.scanner.take_bells()
+    }
 }
 
 /// The pure event → action mapping both feed paths share.
@@ -572,5 +579,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Bells ride beside the actions rather than inside them, and the
+    /// stateful path counts them too — the server-VT tab task only ever
+    /// calls that one.
+    #[test]
+    fn bells_are_counted_beside_the_actions_on_both_feed_paths() {
+        let mut router = OscRouter::new();
+        let mut state = OscColorState::new(colors());
+        let actions = router.feed_stateful(b"\x07\x1b]0;t\x07\x07", &mut state);
+        assert_eq!(
+            actions,
+            vec![OscAction::Workspace {
+                command: 0,
+                payload: "t".into(),
+            }]
+        );
+        assert_eq!(router.take_bells(), 2);
+        assert_eq!(router.take_bells(), 0);
+
+        router.feed(b"\x07");
+        assert_eq!(router.take_bells(), 1);
     }
 }
