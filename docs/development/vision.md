@@ -17,7 +17,7 @@ installs beside `Roost.app` and is not a third implementation, just the
 Linux UI on a different host. `libghostty-vt` is vendored once and
 linked into both for in-process VT parsing and rendering. There is no
 daemon by default — the one opt-in exception is `roost-session`, a
-headless daemon for host-sessions ([DL-17](#dl-17-roost-session-an-opt-in-headless-daemon-for-host-sessions-2026-08-28)).
+headless daemon for host-sessions ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)).
 
 ## The command core (north star)
 
@@ -104,7 +104,7 @@ cross-process serialization, the gRPC bindings (`tonic`, `prost`,
 plumbing.
 
 **The one exception is opt-in.** `roost-session`
-([DL-17](#dl-17-roost-session-an-opt-in-headless-daemon-for-host-sessions-2026-08-28))
+([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28))
 is a headless daemon for host-sessions — a workspace that outlives any
 UI attached to it, e.g. left running on a remote host — not a
 replacement for the one-user-one-UI-process deployment this paragraph
@@ -192,7 +192,7 @@ chunk, then everything else is in-process memory.
 - **No split-pane.** One terminal per tab.
 - **No remote / network IPC.** Unix domain socket only — including the
   session socket `roost-session`
-  ([DL-17](#dl-17-roost-session-an-opt-in-headless-daemon-for-host-sessions-2026-08-28))
+  ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28))
   serves, which is still a local UDS with a same-UID peer check, not a
   network listener. The JSON wire format is local IPC, not a public API.
   A planned bridge for reaching a session on a remote host (HS-3) tunnels
@@ -476,7 +476,7 @@ AppKit gives the Swift sidebar and menus VoiceOver support for free; an
 iced canvas gives essentially none. Named here so it stays a conscious
 trade rather than a late surprise.
 
-### DL-17: `roost-session` — an opt-in headless daemon for host-sessions (2026-08-28)
+### DL-17: an opt-in headless roost-session daemon for host-sessions (2026-08-28)
 
 Plan 035 (HS-1a) added `crates/roost-session`, a headless daemon built on
 `roost-engine` that owns a workspace + PTY supervisor with no UI
@@ -549,7 +549,7 @@ candidate roadmap. The first spike, **remote host support without
 needing tmux or herdr**
 ([`discovery/host-sessions.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions.md)),
 is landing, not just a candidate: `roost-session`
-([DL-17](#dl-17-roost-session-an-opt-in-headless-daemon-for-host-sessions-2026-08-28)),
+([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)),
 an opt-in session daemon built from `roost-engine` with the UI as one of
 its clients, shipped its lifecycle + control plane as HS-1a; the data
 plane (attach, leases, headless `tab.dump`, snapshot payload) is HS-1b,

@@ -579,12 +579,13 @@ async fn stop() -> Result<i32> {
         )
     })?;
 
+    let stop_budget = scaled(STOP_CALL_TIMEOUT);
     let report: SessionStopResult = tokio::time::timeout(
-        scaled(STOP_CALL_TIMEOUT),
+        stop_budget,
         client.call(ops::SESSION_STOP, SessionStopParams {}),
     )
     .await
-    .map_err(|_| anyhow!("session.stop did not answer within {STOP_CALL_TIMEOUT:?}"))?
+    .map_err(|_| anyhow!("session.stop did not answer within {stop_budget:?}"))?
     .context("session.stop")?;
 
     println!("stopping session {}", identity.session_id);

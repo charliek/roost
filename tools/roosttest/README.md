@@ -1,7 +1,8 @@
 # roosttest — pytest E2E harness
 
 Functional end-to-end tests that drive a **real** Roost UI (Mac or Iced)
-over the JSON IPC socket and assert on the op set — exactly what users
+over the JSON IPC socket and assert on the op set (one headless
+exception: `test_session.py` drives the UI-less `roost-session` daemon) — exactly what users
 and `roostctl` drive (the [north star](../../docs/development/vision.md#the-command-core-north-star)).
 Most tests read back via `tab.dump` / `tab.list` / `identify`; the
 byte-level OSC pipeline tests additionally use the gated test-mode

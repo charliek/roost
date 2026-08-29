@@ -631,7 +631,7 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 | Version / payload-kind mismatch | Clean `session.identify` error naming both versions; nothing binary ever sent. Localhost after a package upgrade is the *common* instance — HS-2's "Restart session" flow (§4.4). |
 | Tab process exits mid-attach | Server completes the SNAP stream, flushes pending PTY frames, then sends EXIT as the final frame — EXIT is always last on a data conn. (The engine's existing deadline path can emit Exit before trailing bytes internally; the data plane reorders so EXIT is terminal.) |
 | Takeover mid-attach | Prior client's data conn closes mid-SNAP (ordinary close/ERROR path); its control/events conns close with a `taken-over` envelope. |
-| `session.stop` during attach | Clients get a labeled shutdown envelope on events; data conns close with ERROR(shutting-down), not bare EOF. |
+| `session.stop` during attach | Clients get a labeled shutdown envelope on events; data conns close with ERROR(shutting-down), not bare EOF. (HS-1b — HS-1a's events connections close plain, per §8's deviation note.) |
 | Tab task panic | Tab marked dead, EXIT-equivalent to attached clients, rest of session unaffected; crash-report path per existing engine crash handling. |
 | Session crash | Children die; layout persisted; client shows host disconnected; reconnect = fresh shells, same layout. |
 | Client crash / quit | Session unaffected (this is the feature). |

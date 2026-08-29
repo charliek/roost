@@ -1042,7 +1042,7 @@ Request: `{"params": {"tab_id_filter": "0"}}`. Response (the last
 request/response frame on the connection):
 
 ```json
-{"revision": 42}
+{"id": "7", "ok": true, "result": {"revision": 42}}
 ```
 
 Everything after that ack is an `EventBatch` — one per workspace
