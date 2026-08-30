@@ -24,6 +24,50 @@
 //! writes it to stdout itself. Either way stdout carries this line and
 //! nothing else — the log lives in a file and the console tee is on
 //! stderr — so a caller can read stdout without a parser.
+//!
+//! # The spawn ladder
+//!
+//! Everything below the verdict format — finding the binary, spawning
+//! it, reading its one line, and confirming a session actually answers
+//! — is the *ladder* `roostctl session start` climbs. It lives here
+//! because HS-2's client climbs the identical ladder: an explicit
+//! Connect on a localhost host spawns a missing session exactly the way
+//! the CLI does, and two implementations of "which `roost-session` is
+//! this user's" is one more than the contract can survive.
+//!
+//! # The stop ladder
+//!
+//! Its mirror image lives here for the same reason: `roostctl session
+//! stop` and the UI's upgrade/restart flow (plan 037 §3.7 — stop, wait
+//! for the socket to go, spawn, reconnect) both need "ask the session to
+//! stop, then wait until it really left", and the waiting half has
+//! fail-safe rules ([`stop_completed`]) that must not be written twice.
+//!
+//! The budgets stay with the caller: every entry point takes its
+//! `Duration` rather than reading a constant of its own, so a CLI
+//! invocation and a UI's background connect can want different
+//! patience. The two *defaults* live here anyway
+//! ([`DEFAULT_VERDICT_BUDGET`], [`DEFAULT_CONFIRM_BUDGET`]) because
+//! they are not a caller's preference — they are read off the daemon's
+//! own waits, and a client that picks a smaller number reports a
+//! timeout for a start that was still going to answer.
+
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::time::Instant;
+
+use crate::messages::{
+    ops, SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
+};
+use crate::socket_state::{self, SocketState};
+use crate::IpcClient;
 
 /// Consumed-once hint naming the directory the user ran `roostctl
 /// session start` from.
@@ -173,9 +217,649 @@ fn one_line(reason: &str, budget: usize) -> String {
     flattened
 }
 
+// ============================================================================
+// Resolving a saved host's target
+// ============================================================================
+
+/// The `target` spelling that means "this machine's own session".
+///
+/// Everything else is a socket path — including, in HS-2, the local end
+/// of an `ssh -L` forward, which is what makes a remote machine
+/// reachable with no SSH code on this side (HS-3 makes `ssh://` targets
+/// first-class).
+pub const LOCALHOST_TARGET: &str = "localhost";
+
+/// Resolve a saved host's `target` to a socket path, and say whether it
+/// is this machine's own session.
+///
+/// The localhost/remote answer is load-bearing three times over: it is
+/// the only host a client may spawn, the only one whose drops
+/// auto-retry, and the only one the macOS platform gate hides. Both the
+/// UI (`host_conn`) and `roostctl host add --verify` resolve through
+/// here so a target can never mean two different sockets depending on
+/// which binary read it.
+pub fn resolve_target(target: &str) -> Result<(PathBuf, bool)> {
+    if target == LOCALHOST_TARGET {
+        return Ok((crate::paths::BundleProfile::session()?.socket_path, true));
+    }
+    Ok((PathBuf::from(target), false))
+}
+
+/// Resolve a prospective host's target, dial it, and check it is a
+/// session this build can talk to at all.
+///
+/// Coarse on purpose, and the same bar wherever it is offered: both
+/// `roostctl host add --verify` and the Add Host dialog's
+/// "Add & Connect" promise exactly "is something answering, and does it
+/// speak this protocol". The exact-build half of the compatibility gate
+/// belongs to the attach path, which turns a mismatch into an upgrade
+/// prompt — refusing the *save* over it would leave the user with no way
+/// to record the host at all.
+///
+/// One definition for the same reason [`resolve_target`] is one: this
+/// bar moves when the attach path grows its upgrade flow, and a second
+/// copy would be the one nobody updated.
+pub async fn verify_target(target: &str, budget: Duration) -> Result<SessionIdentify> {
+    let (socket, _localhost) = resolve_target(target)?;
+    let identity = identify(&socket, budget)
+        .await
+        .with_context(|| format!("{} did not answer", socket.display()))?;
+    if identity.session_protocol != crate::messages::SESSION_PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "that session speaks protocol {}, this build speaks {}",
+            identity.session_protocol,
+            crate::messages::SESSION_PROTOCOL_VERSION,
+        ));
+    }
+    Ok(identity)
+}
+
+// ============================================================================
+// Locating the daemon binary
+// ============================================================================
+
+/// The daemon binary's name, as installed next to `roostctl`
+/// (`/usr/bin/roost-session` from the deb).
+pub const BIN_NAME: &str = "roost-session";
+
+/// Override naming the daemon binary outright. First rung of
+/// [`locate_session_binary`]; the tests and a from-source `cargo run`
+/// both need it.
+pub const BIN_ENV: &str = "ROOST_SESSION_BIN";
+
+/// Which rung of [`locate_session_binary`]'s ladder produced a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOrigin {
+    /// `ROOST_SESSION_BIN`.
+    Env,
+    /// Next to the running `roostctl` — the packaged layout, where both
+    /// binaries land in the same directory.
+    Sibling,
+    /// Found on `PATH`.
+    Path,
+}
+
+impl BinOrigin {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Env => "$ROOST_SESSION_BIN",
+            Self::Sibling => "next to roostctl",
+            Self::Path => "$PATH",
+        }
+    }
+}
+
+/// Where the daemon binary was found, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedBin {
+    pub path: PathBuf,
+    pub origin: BinOrigin,
+}
+
+/// First hit *this user can actually run* wins: `ROOST_SESSION_BIN`,
+/// then a sibling of the running `roostctl`, then `PATH`.
+///
+/// The inputs arrive as arguments rather than being read here so the
+/// precedence is testable without mutating process-global env that
+/// every other test in this binary also reads.
+///
+/// The two rungs that are guesses — sibling and `PATH` — fall through
+/// anything unusable: a root-owned `0700` `roost-session` next to
+/// `roostctl` is not this user's program, and stopping the search on it
+/// would trade a working `PATH` hit for an `EACCES` at spawn.
+///
+/// The rung that is not a guess behaves the other way: an explicit
+/// `ROOST_SESSION_BIN` that cannot be run is a hard error, because
+/// silently starting a *different* binary than the one the user named
+/// would look like success while pointing at the wrong session.
+pub fn locate_session_binary(
+    env_override: Option<&OsStr>,
+    roostctl_exe: Option<&Path>,
+    path_env: Option<&OsStr>,
+) -> Result<LocatedBin> {
+    let env_override = env_override.filter(|v| !v.is_empty());
+    if let Some(raw) = env_override {
+        let path = PathBuf::from(raw);
+        if is_executable_file(&path) {
+            return Ok(LocatedBin {
+                path,
+                origin: BinOrigin::Env,
+            });
+        }
+        return Err(anyhow!(
+            "{BIN_ENV}={} is not a file this user can execute",
+            path.display()
+        ));
+    }
+
+    let sibling = roostctl_exe
+        .and_then(Path::parent)
+        .map(|dir| dir.join(BIN_NAME));
+    if let Some(path) = sibling.clone().filter(|p| is_executable_file(p)) {
+        return Ok(LocatedBin {
+            path,
+            origin: BinOrigin::Sibling,
+        });
+    }
+
+    let path_dirs: Vec<PathBuf> = path_env
+        .map(|raw| std::env::split_paths(raw).collect())
+        .unwrap_or_default();
+    for dir in &path_dirs {
+        // An empty PATH element means "the current directory" to the
+        // shell; joining it here would produce a bare `roost-session`
+        // that resolves against our cwd. Skip it — an implicit
+        // cwd-relative daemon is not something to start.
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(BIN_NAME);
+        if is_executable_file(&candidate) {
+            return Ok(LocatedBin {
+                path: candidate,
+                origin: BinOrigin::Path,
+            });
+        }
+    }
+
+    Err(anyhow!(
+        "cannot find the {BIN_NAME} binary. Tried:\n  \
+         {}: unset\n  \
+         {}: {}\n  \
+         {}: {}",
+        BinOrigin::Env.describe(),
+        BinOrigin::Sibling.describe(),
+        sibling
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "unknown (cannot resolve this binary's path)".into()),
+        BinOrigin::Path.describe(),
+        if path_dirs.is_empty() {
+            "unset".to_string()
+        } else {
+            path_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
+        }
+    ))
+}
+
+/// Can *this* process exec this path?
+///
+/// `access(X_OK)` rather than a permission-bit read, because the bits
+/// alone do not answer the question: a `0700` file owned by root has an
+/// execute bit set and is still `EACCES` for everyone else, and the same
+/// read gets ACLs and read-only mounts wrong. The kernel already knows;
+/// ask it.
+///
+/// The `is_file` check stays in front of it because `X_OK` on a
+/// *directory* means "traversable", which every `0755` directory is —
+/// without it a directory named `roost-session` would satisfy the
+/// search.
+fn is_executable_file(path: &Path) -> bool {
+    if !std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        // An interior NUL cannot name a real file.
+        return false;
+    };
+    // SAFETY: a NUL-terminated pointer this call does not retain.
+    unsafe { libc::access(c_path.as_ptr(), libc::X_OK) == 0 }
+}
+
+// ============================================================================
+// Spawning it and reading the verdict
+// ============================================================================
+
+/// How long to wait for a spawned `roost-session start` to print its
+/// verdict line.
+///
+/// Must comfortably exceed the daemon's own `parent_ready_timeout()`
+/// (30s), because that parent is who the caller is reading: expiring
+/// first would report a timeout for a start that was still going to
+/// answer. On expiry the child is killed — it is the *forking parent*,
+/// so killing it never touches a session that did come up.
+pub const DEFAULT_VERDICT_BUDGET: Duration = Duration::from_secs(45);
+
+/// How long to poll `session.identify` before declaring that the
+/// verdict lied. The winner of the socket-lock race has already bound
+/// by the time it writes `ready`, so this only ever covers the
+/// `already-running` loser overtaking the winner — microseconds in
+/// practice.
+pub const DEFAULT_CONFIRM_BUDGET: Duration = Duration::from_secs(10);
+
+/// What came back on the launcher's stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerdictRead {
+    /// A newline-terminated line within the cap. The newline is not
+    /// included.
+    Line(String),
+    /// The stream ended before any newline. The daemon's own reader
+    /// (`daemonize::read_verdict`) calls this no-verdict, and so does
+    /// this one: an unterminated frame is not a verdict, however much
+    /// it looks like one.
+    Eof,
+    /// The cap was reached with no newline in sight.
+    TooLong,
+    /// The read itself failed.
+    Io(String),
+}
+
+/// Read one verdict line, refusing to buffer more than `cap` bytes of
+/// it.
+///
+/// Generic over the reader so the four outcomes are unit-testable
+/// without a subprocess. `take(cap + 1)` is what bounds it: the extra
+/// byte is the newline a maximal legal line ends with, so hitting the
+/// limit without one is unambiguously [`VerdictRead::TooLong`] rather
+/// than a line that happened to end exactly at the cap.
+pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> VerdictRead {
+    let mut buf = Vec::new();
+    if let Err(error) = BufReader::new(reader.take(cap as u64 + 1))
+        .read_until(b'\n', &mut buf)
+        .await
+    {
+        return VerdictRead::Io(error.to_string());
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        return VerdictRead::Line(String::from_utf8_lossy(&buf).into_owned());
+    }
+    // Unterminated. Reading `cap + 1` bytes means the limiter stopped
+    // us, not the writer; anything shorter is a stream that ended.
+    if buf.len() > cap {
+        VerdictRead::TooLong
+    } else {
+        VerdictRead::Eof
+    }
+}
+
+/// Spawn `<bin> start` with the launch-cwd hint and read the one line
+/// it prints, everything bounded by `budget`.
+///
+/// The child here is the *launcher* — for a real `roost-session` it is
+/// the forking parent, which exits the moment its daemonized child
+/// reports. That is why every wait on it may be cut short and the
+/// process killed: killing the launcher never touches a session that
+/// did come up, and a launcher that will not exit must not be able to
+/// hold its caller open past its budget.
+pub async fn spawn_and_read_verdict(bin: &Path, cwd: &Path, budget: Duration) -> Result<Verdict> {
+    let deadline = Instant::now() + budget;
+    let mut child = Command::new(bin)
+        .arg("start")
+        .env(LAUNCH_CWD_ENV, cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Inherited: the session tees its startup log there, and a
+        // failed start is far easier to read with it in front of you.
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawn {}", bin.display()))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("no stdout pipe on the spawned {BIN_NAME}"))?;
+
+    let read =
+        tokio::time::timeout_at(deadline, read_verdict_line(stdout, MAX_VERDICT_BYTES)).await;
+
+    // One reap for every path, bounded by what is left of the same
+    // budget. A launcher still alive at the deadline is killed —
+    // including on the timeout path, where nothing is left of it.
+    let result = match read {
+        Ok(VerdictRead::Line(line)) => Ok(Verdict::parse(&line)),
+        Ok(VerdictRead::Eof) => Err(anyhow!(
+            "{BIN_NAME} closed its output without a complete readiness line; \
+             see the session log"
+        )),
+        Ok(VerdictRead::TooLong) => Err(anyhow!(
+            "{BIN_NAME} wrote more than {MAX_VERDICT_BYTES} bytes with no newline; \
+             that is not a readiness verdict"
+        )),
+        Ok(VerdictRead::Io(error)) => Err(anyhow!("reading {BIN_NAME}'s readiness line: {error}")),
+        Err(_elapsed) => Err(anyhow!(
+            "{BIN_NAME} did not report readiness within {}s",
+            budget.as_secs().max(1)
+        )),
+    };
+    reap_by(&mut child, deadline).await;
+    result
+}
+
+/// Wait for the launcher to exit, but no later than `deadline`; kill and
+/// reap it if it outlives that. Never returns a zombie and never
+/// outlives the budget.
+async fn reap_by(child: &mut Child, deadline: Instant) {
+    if tokio::time::timeout_at(deadline, child.wait())
+        .await
+        .is_err()
+    {
+        // `kill` is SIGKILL + reap, so the wait behind it is the one
+        // the kernel is about to satisfy.
+        let _ = child.kill().await;
+    }
+}
+
+// ============================================================================
+// Confirming a session actually answers
+// ============================================================================
+
+/// Interval for the confirmation poll. Short: these are local
+/// `connect(2)` calls, and the thing being waited for usually lands
+/// immediately.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A single IPC leg's budget. [`IpcClient`] has no timeout of its own
+/// and "the session is wedged" must render as an error, not a hung
+/// caller.
+pub const IPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`IPC_TIMEOUT`] under the ambient scale — what one leg of a poll
+/// round actually gets. The polls here spend several legs inside an
+/// outer deadline, so they read it once per call rather than per round.
+pub fn leg_budget() -> Duration {
+    IPC_TIMEOUT.mul_f64(timeout_scale())
+}
+
+/// Dial a session socket, bounded.
+pub async fn dial(socket: &Path, timeout: Duration) -> Result<IpcClient> {
+    tokio::time::timeout(timeout, IpcClient::connect(socket))
+        .await
+        .map_err(|_| anyhow!("connecting to {} timed out", socket.display()))?
+        .with_context(|| format!("connect to {}", socket.display()))
+}
+
+/// `session.identify` on an already-dialed client, bounded.
+pub async fn identify_on(client: &mut IpcClient, timeout: Duration) -> Result<SessionIdentify> {
+    tokio::time::timeout(
+        timeout,
+        client.call(ops::SESSION_IDENTIFY, SessionIdentifyParams {}),
+    )
+    .await
+    .map_err(|_| anyhow!("{} timed out", ops::SESSION_IDENTIFY))?
+    .map_err(Into::into)
+}
+
+/// Dial and `session.identify` in one step, each leg bounded by
+/// `timeout`.
+pub async fn identify(socket: &Path, timeout: Duration) -> Result<SessionIdentify> {
+    let mut client = dial(socket, timeout).await?;
+    identify_on(&mut client, timeout).await
+}
+
+/// Poll `session.identify` until a session answers or the budget runs
+/// out. This is what turns a printed verdict into a fact.
+///
+/// The outer `timeout_at` is what makes `budget` a real bound. A single
+/// round can block for a connect plus a call — two [`IPC_TIMEOUT`]s —
+/// so a loop that only checked the deadline *between* rounds would
+/// overrun the budget it advertises by more than double.
+pub async fn confirm_serving(socket: &Path, budget: Duration) -> Result<SessionIdentify> {
+    let deadline = Instant::now() + budget;
+    // The caller scaled `budget`; the legs inside must widen with it or
+    // a loaded runner spends the whole budget on one timed-out dial.
+    let leg = leg_budget();
+    let polling = async {
+        loop {
+            let error = match identify(socket, leg).await {
+                Ok(identity) => return Ok(identity),
+                Err(error) => error,
+            };
+            if Instant::now() + POLL_INTERVAL >= deadline {
+                return Err(anyhow!(
+                    "gave up after {}s: {error:#}",
+                    budget.as_secs().max(1)
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    };
+    tokio::time::timeout_at(deadline, polling)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "gave up after {}s: no session answered",
+                budget.as_secs().max(1)
+            ))
+        })
+}
+
+// ============================================================================
+// Stopping a session, and waiting for it to go
+// ============================================================================
+
+/// How long a stop waits for the reap report. Generous: the reply does
+/// not come back until every child is accounted for, which is the
+/// engine's 5s soft deadline plus the post-SIGKILL tail.
+pub const DEFAULT_STOP_CALL_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long a stop waits, after the reap report, for the socket to
+/// actually go away. The session unlinks it in a detached finalizer that
+/// runs *after* the reply, so "stopped" is only true once the poll below
+/// says so.
+pub const DEFAULT_STOP_GONE_BUDGET: Duration = Duration::from_secs(30);
+
+/// The two socket states that prove nothing can be listening. Same pair
+/// [`socket_state`] calls safe-to-unlink, read here as "not running" —
+/// every other state, including `Indeterminate`, means assume-live.
+fn socket_gone(state: &SocketState) -> bool {
+    matches!(state, SocketState::Missing | SocketState::Stale)
+}
+
+/// Probe once and read off whether nothing is listening.
+pub async fn probe_gone(socket: &Path) -> bool {
+    socket_gone(&socket_state::probe(socket, socket_state::PROBE_TIMEOUT).await)
+}
+
+/// One round of the post-stop poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollObservation<'a> {
+    /// The socket is gone or refuses connections — nothing is listening.
+    Unreachable,
+    /// A session answered `session.identify` with this id.
+    Identified(&'a str),
+    /// Something is at the path but it could not be asked (a full accept
+    /// backlog, a permission error, a timeout).
+    Indeterminate,
+}
+
+/// Has the session we asked to stop finished stopping?
+///
+/// A *different* session id counts as stopped: between our reap report
+/// and this poll, something (a spawn-if-missing client, a supervisor)
+/// may have started a fresh session on the same socket. Ours is gone,
+/// which is what was asked — reporting a failure there would be a lie.
+///
+/// [`PollObservation::Indeterminate`] keeps waiting, mirroring
+/// [`socket_state`]'s fail-safe rule: the one thing we must never do is
+/// call a live session dead.
+fn stop_completed(observation: PollObservation<'_>, stopping: &str) -> bool {
+    match observation {
+        PollObservation::Unreachable => true,
+        PollObservation::Identified(id) => id != stopping,
+        PollObservation::Indeterminate => false,
+    }
+}
+
+/// A stop that reached a live session: who answered, and what it reaped.
+///
+/// The identity is not a courtesy — [`await_stopped`] needs it to tell
+/// "our session left" from "a fresh one took the socket".
+#[derive(Debug, Clone)]
+pub struct StopReport {
+    pub identity: SessionIdentify,
+    pub reap: SessionStopResult,
+}
+
+/// Ask the session at `socket` to stop, and hand back its reap report.
+///
+/// `Ok(None)` means nothing was listening — a success in the
+/// `systemctl stop` sense: the caller asked for a state and it already
+/// holds. The session is identified *before* the stop so the caller can
+/// wait for the right process to leave.
+///
+/// This and [`await_stopped`] are the two rungs of a stop, split so a
+/// caller can report the reap before spending the socket-gone budget.
+/// `roostctl session stop` and the UI's client-side restart composition
+/// (plan 037 §3.7) climb the same pair.
+pub async fn stop_session(socket: &Path, budget: Duration) -> Result<Option<StopReport>> {
+    if probe_gone(socket).await {
+        return Ok(None);
+    }
+    // `budget` is the *reap* budget and is deliberately generous; the two
+    // legs before it are ordinary control-plane calls and get the
+    // ordinary leg budget, so a wedged socket fails in seconds rather
+    // than holding the whole minute a reap is allowed.
+    let leg = leg_budget();
+    let mut client = dial(socket, leg).await?;
+    let identity = identify_on(&mut client, leg).await.with_context(|| {
+        format!(
+            "a socket exists at {} but no session answered {}",
+            socket.display(),
+            ops::SESSION_IDENTIFY
+        )
+    })?;
+    let reap: SessionStopResult =
+        tokio::time::timeout(budget, client.call(ops::SESSION_STOP, SessionStopParams {}))
+            .await
+            .map_err(|_| anyhow!("{} did not answer within {budget:?}", ops::SESSION_STOP))?
+            .context(ops::SESSION_STOP)?;
+    Ok(Some(StopReport { identity, reap }))
+}
+
+/// Wait for the stopped session to actually leave, bounded by `budget`.
+///
+/// Bounded the same way [`confirm_serving`] is, and for the same reason:
+/// one round can spend two [`IPC_TIMEOUT`]s plus a probe, so only the
+/// outer `timeout_at` makes the advertised budget true.
+pub async fn await_stopped(socket: &Path, stopping: &str, budget: Duration) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    // What the last completed round saw — the timeout message has to
+    // say which of the two very different failures happened.
+    let mut last = LastSeen::StillAnswering;
+    let leg = leg_budget();
+    let polling = async {
+        loop {
+            // `None` = nothing is listening; `Some(None)` = a socket
+            // that would not answer, which is the ambiguous case.
+            let answered = if probe_gone(socket).await {
+                None
+            } else {
+                Some(identify(socket, leg).await.ok().map(|i| i.session_id))
+            };
+            let observation = match &answered {
+                None => PollObservation::Unreachable,
+                Some(None) => PollObservation::Indeterminate,
+                Some(Some(id)) => PollObservation::Identified(id),
+            };
+            last = match observation {
+                PollObservation::Indeterminate => LastSeen::SocketWontAnswer,
+                _ => LastSeen::StillAnswering,
+            };
+            if stop_completed(observation, stopping) {
+                return Ok(());
+            }
+            if Instant::now() + POLL_INTERVAL >= deadline {
+                return Err(last);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    };
+    // An outer expiry means the round in flight never finished, which is
+    // the unanswerable case by definition.
+    match tokio::time::timeout_at(deadline, polling).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(last)) => Err(last.into_error(socket, stopping, budget)),
+        Err(_) => Err(LastSeen::SocketWontAnswer.into_error(socket, stopping, budget)),
+    }
+}
+
+/// How the last poll round saw the socket. Only exists so the timeout
+/// error says something true: "still answering as the same session" and
+/// "left a socket that will not answer" are different faults, and
+/// reporting the first for the second sends the reader hunting a process
+/// that is already gone.
+#[derive(Debug, Clone, Copy)]
+enum LastSeen {
+    StillAnswering,
+    SocketWontAnswer,
+}
+
+impl LastSeen {
+    fn into_error(self, socket: &Path, stopping: &str, budget: Duration) -> anyhow::Error {
+        let seconds = budget.as_secs().max(1);
+        match self {
+            Self::StillAnswering => anyhow!(
+                "session {stopping} reported its reap but was still answering at {} \
+                 after {seconds}s",
+                socket.display()
+            ),
+            Self::SocketWontAnswer => anyhow!(
+                "session {stopping} reported its reap but left a socket at {} that \
+                 would not answer session.identify after {seconds}s",
+                socket.display()
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one sentinel, resolved in one place. A path that merely
+    /// *contains* the word is an ordinary socket path — the comparison
+    /// is the whole string, because a directory called `localhost` is a
+    /// perfectly legal place to keep a socket.
+    #[test]
+    fn only_the_bare_localhost_spelling_means_this_machines_session() {
+        let (socket, localhost) = resolve_target(LOCALHOST_TARGET).expect("resolve localhost");
+        assert!(localhost);
+        assert_eq!(
+            socket,
+            crate::paths::BundleProfile::session()
+                .expect("session profile")
+                .socket_path
+        );
+
+        for target in [
+            "/tmp/roost-popos.sock",
+            "/var/run/localhost/roost.sock",
+            "localhost.sock",
+            "Localhost",
+            "",
+        ] {
+            let (socket, localhost) = resolve_target(target).expect("resolve a path target");
+            assert!(!localhost, "{target:?} is a socket path, not the sentinel");
+            assert_eq!(socket, PathBuf::from(target));
+        }
+    }
 
     #[test]
     fn verdicts_round_trip_through_their_wire_line() {
@@ -305,5 +989,68 @@ mod tests {
             let scaled = budget.mul_f64(parse_timeout_scale(Some(raw)));
             assert!(!scaled.is_zero(), "{raw} rounded the budget to zero");
         }
+    }
+
+    #[test]
+    fn nothing_listening_is_the_only_state_read_as_stopped() {
+        assert!(socket_gone(&SocketState::Missing));
+        assert!(socket_gone(&SocketState::Stale));
+        assert!(!socket_gone(&SocketState::Live));
+        assert!(!socket_gone(&SocketState::Indeterminate("backlog".into())));
+        assert!(!socket_gone(&SocketState::NotASocket("regular file")));
+    }
+
+    /// The poll's whole decision table. The interesting row is the
+    /// third: a *different* session on the socket means ours left, which
+    /// is what was asked for.
+    #[test]
+    fn the_stop_poll_finishes_only_when_our_session_is_the_one_that_left() {
+        assert!(stop_completed(PollObservation::Unreachable, "sess-1"));
+        assert!(stop_completed(
+            PollObservation::Identified("sess-2"),
+            "sess-1"
+        ));
+        assert!(!stop_completed(
+            PollObservation::Identified("sess-1"),
+            "sess-1"
+        ));
+        // Fail-safe: an unanswerable socket is never called dead.
+        assert!(!stop_completed(PollObservation::Indeterminate, "sess-1"));
+    }
+
+    /// Stopping a path nothing is listening at is a success that costs
+    /// no round trip — the rung that lets the UI's restart flow run
+    /// against an already-dead session without special-casing it.
+    #[tokio::test]
+    async fn stopping_a_socket_nobody_is_serving_reports_nothing_to_stop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("absent.sock");
+        assert!(stop_session(&socket, DEFAULT_STOP_CALL_BUDGET)
+            .await
+            .expect("an absent socket is not a failure")
+            .is_none());
+        // And the wait that follows it has nothing to wait for.
+        await_stopped(&socket, "sess-1", DEFAULT_STOP_GONE_BUDGET)
+            .await
+            .expect("an absent socket is already gone");
+    }
+
+    /// A listener that never answers `session.identify` is the
+    /// ambiguous case, and the wait must spend its budget rather than
+    /// calling it stopped.
+    #[tokio::test]
+    async fn a_socket_that_will_not_answer_is_never_called_stopped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("mute.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+
+        let error = await_stopped(&socket, "sess-1", Duration::from_millis(150))
+            .await
+            .expect_err("a live socket is not a stopped session");
+        assert!(
+            format!("{error:#}").contains("would not answer"),
+            "{error:#}"
+        );
+        drop(listener);
     }
 }

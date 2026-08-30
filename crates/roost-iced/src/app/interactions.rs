@@ -9,6 +9,24 @@ pub(crate) enum RenameTarget {
 }
 
 impl RenameTarget {
+    /// Which instance owns this target.
+    pub(super) fn host(self) -> HostId {
+        match self {
+            Self::Project(project) => project.host,
+            Self::Tab(tab) => tab.host,
+        }
+    }
+
+    /// The bare id, in its own instance's id-space. Only ever compared
+    /// against rows from that same instance (`App::rename_rows` picks
+    /// them), which is what the `host` half above is for.
+    fn raw_id(self) -> i64 {
+        match self {
+            Self::Project(project) => project.project,
+            Self::Tab(tab) => tab.tab,
+        }
+    }
+
     /// The engine id this target renames, or `None` when it names an
     /// entity on another instance — the local client cannot rename it,
     /// and its number would rename whatever local entity shares it.
@@ -19,11 +37,23 @@ impl RenameTarget {
         }
     }
 
-    /// [`Self::local_id`] for the two callers that owe the caller a
-    /// reason rather than a silent `None`.
-    fn local_id_or_error(self) -> Result<i64, String> {
-        self.local_id()
-            .ok_or_else(|| format!("rename target {self:?} belongs to another instance"))
+    /// The `project.rename` / `tab.set_title` op this target renames
+    /// through, whichever instance owns it — the wire spelling is the
+    /// same on a session socket as on the local one.
+    fn wire_op(self) -> &'static str {
+        match self {
+            Self::Project(_) => roost_ipc::messages::ops::PROJECT_RENAME,
+            Self::Tab(_) => roost_ipc::messages::ops::TAB_SET_TITLE,
+        }
+    }
+
+    /// That op's params, for a host.
+    fn wire_params(self, label: &str) -> serde_json::Value {
+        let id = self.raw_id().to_string();
+        match self {
+            Self::Project(_) => serde_json::json!({ "project_id": id, "name": label }),
+            Self::Tab(_) => serde_json::json!({ "tab_id": id, "title": label }),
+        }
     }
 }
 
@@ -75,10 +105,11 @@ pub(super) struct RenameEditor {
     pub(super) draft: String,
 }
 
+/// `projects` must be the rows of the instance `target` names — the
+/// local snapshot for a local key, that host's mirrored rows for a host
+/// key (`App::rename_rows` picks).
 fn rename_target_label(projects: &[Project], target: RenameTarget) -> Option<&str> {
-    // The snapshot is one instance's, so only that instance's keys can
-    // name a row in it.
-    let id = target.local_id()?;
+    let id = target.raw_id();
     match target {
         RenameTarget::Project(_) => projects
             .iter()
@@ -93,8 +124,7 @@ fn rename_target_label(projects: &[Project], target: RenameTarget) -> Option<&st
 }
 
 fn begin_rename_editor(projects: &[Project], target: RenameTarget) -> Result<RenameEditor, String> {
-    let id = target.local_id_or_error()?;
-    if id == 0 {
+    if target.raw_id() == 0 {
         return Err("no active project or tab to rename".into());
     }
     let label = rename_target_label(projects, target)
@@ -112,9 +142,7 @@ fn rename_editor_is_renderable(
     active_project: i64,
     sidebar_collapsed: bool,
 ) -> bool {
-    let Some(id) = editor.target.local_id() else {
-        return false;
-    };
+    let id = editor.target.raw_id();
     match editor.target {
         RenameTarget::Project(_) => {
             !sidebar_collapsed && projects.iter().any(|project| project.id == id)
@@ -233,6 +261,33 @@ fn take_rename_focus_request(requested: &mut bool, editor_open: bool, input_id: 
 }
 
 impl App {
+    /// [`App::instance_rows`] for a rename target, plus the active
+    /// project id those rows are read against.
+    ///
+    /// `None` for a host that is not connected: a dimmed section's rows
+    /// are non-interactive, so a rename cannot be started on one from
+    /// any route (§3.1). Only the active-project half is this route's
+    /// own — the gate itself belongs to `instance_rows`, so the rename
+    /// editor and the delete confirmation can never disagree about
+    /// whether a section is actionable.
+    fn rename_rows(&self, target: RenameTarget) -> Option<(&[Project], i64)> {
+        let host = target.host();
+        let rows = self.instance_rows(host)?;
+        if host.is_local() {
+            return Some((rows, self.workspace.active().0));
+        }
+        // The active project as the tab bar has it, which for a host
+        // selection is the selection's own project — the same value the
+        // local branch reads out of `workspace.active()`.
+        let active = self.active_project_key();
+        let active = if active.host == host {
+            active.project
+        } else {
+            0
+        };
+        Some((rows, active))
+    }
+
     pub(super) fn begin_rename_target(&mut self, target: RenameTarget) -> Result<(), String> {
         self.cancel_drags();
         self.cancel_confirm_delete();
@@ -247,11 +302,14 @@ impl App {
         if matches!(target, RenameTarget::Project(_)) && self.workspace.sidebar_collapsed() {
             self.set_sidebar_collapsed(false);
         }
-        let editor = begin_rename_editor(&self.projects, target)?;
+        let (rows, active_project) = self
+            .rename_rows(target)
+            .ok_or_else(|| format!("rename target {target:?} belongs to another instance"))?;
+        let editor = begin_rename_editor(rows, target)?;
         if !rename_editor_is_renderable(
             &editor,
-            &self.projects,
-            self.workspace.active().0,
+            rows,
+            active_project,
             self.workspace.sidebar_collapsed(),
         ) {
             return Err(format!("rename target {target:?} is not visible"));
@@ -304,10 +362,17 @@ impl App {
             }
             RenameSubmission::Dispatch { target, label, op } => {
                 self.rename_op = Some(op);
+                let Some(id) = target.local_id() else {
+                    // A host's row: same op, same op-id fence, sent on
+                    // that host's queue instead of the local client
+                    // (plan 037 §3.9). The editor closes on the reply
+                    // exactly as it does locally — the mirror's own event
+                    // is what repaints the row underneath it.
+                    return self.host_rename_dispatch(target, &label, op);
+                };
                 let client = self.client.clone();
                 self.engine_op(
                     async move {
-                        let id = target.local_id_or_error()?;
                         match target {
                             RenameTarget::Project(_) => client.rename_project(id, &label).await,
                             RenameTarget::Tab(_) => client.set_tab_title(id, &label).await,
@@ -318,6 +383,31 @@ impl App {
                 )
             }
         }
+    }
+
+    /// [`Self::submit_rename_editor`]'s host arm.
+    ///
+    /// A host that is not accepting ops answers the intent rather than
+    /// dropping it (`HostOps`' contract), so the completion always
+    /// arrives and the editor never sticks open waiting on nothing.
+    fn host_rename_dispatch(&mut self, target: RenameTarget, label: &str, op: u64) -> UiTask {
+        let Some(ops) = self.hosts.ops_for(target.host()).cloned() else {
+            return self.engine_op(
+                async move { Err("that host is not accepting operations".to_string()) },
+                move |result| EngineOpResult::Renamed { op, target, result },
+            );
+        };
+        let params = target.wire_params(label);
+        let wire_op = target.wire_op();
+        self.engine_op(
+            async move {
+                ops.call(wire_op, params, false)
+                    .await
+                    .map(drop)
+                    .map_err(|error| error.to_string())
+            },
+            move |result| EngineOpResult::Renamed { op, target, result },
+        )
     }
 
     pub(super) fn rename_completed(
@@ -365,12 +455,19 @@ impl App {
 
     pub(super) fn reconcile_rename_editor(&mut self) {
         let visible = self.rename_editor.as_ref().is_none_or(|editor| {
-            rename_editor_is_renderable(
-                editor,
-                &self.projects,
-                self.workspace.active().0,
-                self.workspace.sidebar_collapsed(),
-            )
+            // A host whose section went dimmed answers `None` here, which
+            // closes the editor — the same outcome a deleted local row
+            // gets, and the reason the check is one lookup rather than a
+            // liveness test plus a host test.
+            self.rename_rows(editor.target)
+                .is_some_and(|(rows, active_project)| {
+                    rename_editor_is_renderable(
+                        editor,
+                        rows,
+                        active_project,
+                        self.workspace.sidebar_collapsed(),
+                    )
+                })
         });
         if !visible {
             self.cancel_rename_editor();
@@ -1372,7 +1469,8 @@ impl App {
             self.cancel_editor_for_interaction();
         }
         let link_modifier_held = self.link_modifier_held();
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, self.backend.tab_key(tab_id)) else {
+        let key = self.terminal_event_key(tab_id);
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, key) else {
             tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
             return UiTask::None;
         };
@@ -1415,7 +1513,6 @@ impl App {
         );
         #[cfg(target_os = "linux")]
         if outcome.paste_selection {
-            let key = self.backend.tab_key(tab_id);
             self.clipboard
                 .enqueue_paste_read(ClipboardOp::Selection, key);
         }
@@ -1433,7 +1530,8 @@ impl App {
             col,
             row,
         } = event;
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, self.backend.tab_key(tab_id)) else {
+        let key = self.terminal_event_key(tab_id);
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, key) else {
             tracing::debug!(tab_id, "ignored terminal wheel event for a closed tab");
             return UiTask::None;
         };
@@ -1452,7 +1550,8 @@ impl App {
     }
 
     pub fn pointer_leave(&mut self, tab_id: i64) {
-        if let Some(tab) = self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
+        let key = self.terminal_event_key(tab_id);
+        if let Some(tab) = self.tabs.get_mut(&key) {
             tab.pointer_leave();
             if let Err(error) = tab.refresh_snapshot() {
                 tracing::warn!(?error, tab_id, "terminal hover refresh failed after leave");
@@ -1582,6 +1681,7 @@ pub(super) fn native_file_drop_origin(
             KeyboardRoute::Terminal(tab_id) => Some(tab_id),
             KeyboardRoute::None
             | KeyboardRoute::Confirm
+            | KeyboardRoute::HostDialog
             | KeyboardRoute::Editor
             | KeyboardRoute::Palette => None,
         })
@@ -1899,12 +1999,16 @@ impl App {
     }
 
     pub(super) fn copy_active_selection(&mut self) -> UiTask {
-        let tab_id = self.workspace.active().1;
-        let text = match self.tabs.get_mut(&self.backend.tab_key(tab_id)) {
-            Some(tab) => match tab.selected_text() {
+        // The terminal on screen, which is the host's while a host row is
+        // selected — reading the workspace's own active id here would
+        // copy out of the hidden local terminal instead. The paste twin
+        // below has always resolved this way.
+        let tab = self.active_tab_key();
+        let text = match self.tabs.get_mut(&tab) {
+            Some(terminal) => match terminal.selected_text() {
                 Ok(text) => text,
                 Err(error) => {
-                    self.set_status(format!("copy selection from tab {tab_id}: {error}"));
+                    self.set_status(format!("copy selection from tab {tab}: {error}"));
                     return UiTask::None;
                 }
             },

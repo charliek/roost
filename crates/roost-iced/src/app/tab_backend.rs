@@ -39,10 +39,8 @@ pub(super) enum ReplyPolicy {
     /// Drain them onto the tab's PTY input channel. This client owns the
     /// only VT for the tab, so its replies are the program's answers.
     DrainToPty,
-    // HS-2: a host session's server runs the authoritative VT and
-    // answers queries itself, so a client-side reply would double every
-    // answer.
-    #[expect(dead_code)]
+    /// A host session's server runs the authoritative VT and answers
+    /// queries itself, so a client-side reply would double every answer.
     Discard,
 }
 
@@ -53,9 +51,8 @@ pub(super) enum OscScanMode {
     /// non-reply actions up with the bytes (query replies are
     /// libghostty's job since the plan-032 pin).
     Scanned,
-    // HS-2: the host server scans and reports effects as events, so the
-    // client must not run a second router over the same bytes.
-    #[expect(dead_code)]
+    /// The host server scans and reports effects as events, so the
+    /// client must not run a second router over the same bytes.
     Unscanned,
 }
 
@@ -146,22 +143,49 @@ impl InProcessBackend {
         Ok(TabHandle {
             kind: TabHandleKind::InProcess(session),
             capture,
-            forwarder,
+            forwarder: Some(forwarder),
         })
     }
+}
+
+/// What the app queues toward an attached host tab's data connection.
+/// Input and resize share one channel so they reach the wire in
+/// submission order — the same serial-channel rule the local PTY path
+/// pins (CLAUDE.md threading table).
+pub(super) enum HostDataMsg {
+    Input(Vec<u8>),
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell_w: u32,
+        cell_h: u32,
+    },
+}
+
+/// A host tab's attachment: the queue the per-attempt writer task
+/// drains onto the data connection. The channel outlives any one
+/// attach attempt on purpose — keystrokes typed during a re-attach
+/// window buffer here instead of vanishing.
+pub(super) struct HostTabSession {
+    input_tx: tokio::sync::mpsc::UnboundedSender<HostDataMsg>,
 }
 
 /// One tab's live attachment to its backend.
 pub(super) struct TabHandle {
     kind: TabHandleKind,
     /// Test-mode tap on the outbound input side, read back by
-    /// `tab.capture_pty_input`. `None` in production.
+    /// `tab.capture_pty_input`. `None` in production. For a host tab it
+    /// captures the INPUT-frame payloads queued toward the host.
     capture: Option<InputCapture>,
-    forwarder: tokio::task::AbortHandle,
+    /// `None` for a host tab: its reader/writer tasks belong to the
+    /// attach state (they turn over on every re-attach attempt), not to
+    /// the handle.
+    forwarder: Option<tokio::task::AbortHandle>,
 }
 
 enum TabHandleKind {
     InProcess(TabSession),
+    Host(HostTabSession),
 }
 
 impl Drop for TabHandle {
@@ -174,20 +198,41 @@ impl Drop for TabHandle {
     /// interleave into one terminal. Aborting drops the receiver, which
     /// ends the engine-side bridge on its next send.
     fn drop(&mut self) {
-        self.forwarder.abort();
+        if let Some(forwarder) = &self.forwarder {
+            forwarder.abort();
+        }
     }
 }
 
 impl TabHandle {
+    /// A host tab's handle: input rides `input_tx` toward the data
+    /// connection, replies are discarded (the server's authoritative VT
+    /// answers queries — a client reply would double every answer), and
+    /// the byte stream is unscanned (the server's scan is the only
+    /// effect authority; effects reach this client as `tab.effect`
+    /// events).
+    pub(super) fn host(
+        input_tx: tokio::sync::mpsc::UnboundedSender<HostDataMsg>,
+        test_mode: bool,
+    ) -> Self {
+        Self {
+            kind: TabHandleKind::Host(HostTabSession { input_tx }),
+            capture: test_mode.then(|| Arc::new(Mutex::new(Vec::new()))),
+            forwarder: None,
+        }
+    }
+
     fn reply_policy(&self) -> ReplyPolicy {
         match self.kind {
             TabHandleKind::InProcess(_) => ReplyPolicy::DrainToPty,
+            TabHandleKind::Host(_) => ReplyPolicy::Discard,
         }
     }
 
     fn osc_scan(&self) -> OscScanMode {
         match self.kind {
             TabHandleKind::InProcess(_) => OscScanMode::Scanned,
+            TabHandleKind::Host(_) => OscScanMode::Unscanned,
         }
     }
 
@@ -197,13 +242,31 @@ impl TabHandle {
 
     pub(super) fn send_input(&self, data: Vec<u8>) {
         match &self.kind {
+            // `TabSession` taps the capture itself on the way past; a
+            // host tab has no session to do it, so the tap is here.
             TabHandleKind::InProcess(session) => session.send_input(data),
+            TabHandleKind::Host(session) => {
+                if let Some(Ok(mut bytes)) = self.capture.as_ref().map(|c| c.lock()) {
+                    bytes.extend_from_slice(&data);
+                }
+                let _ = session.input_tx.send(HostDataMsg::Input(data));
+            }
         }
     }
 
     pub(super) fn send_resize(&self, cols: u16, rows: u16) {
         match &self.kind {
             TabHandleKind::InProcess(session) => session.send_resize(cols, rows),
+            // A host tab's resize is the attach machine's to send — it
+            // owns the pre-FINISH withhold and the pixel dimensions the
+            // RESIZE frame carries (plan 037 §3.4). Nothing routes here.
+            TabHandleKind::Host(_) => {
+                tracing::debug!(
+                    cols,
+                    rows,
+                    "host tab resize must go through the attach state"
+                );
+            }
         }
     }
 
@@ -226,11 +289,12 @@ impl TabHandle {
     /// indistinguishable from a real one; the returned actions are the
     /// non-reply ones, exactly as `TabOutput::Scanned` carries them.
     pub(super) fn scan_osc(&self, bytes: &[u8]) -> Vec<OscAction> {
-        match self.osc_scan() {
-            OscScanMode::Scanned => match &self.kind {
-                TabHandleKind::InProcess(session) => session.scan_osc(bytes),
-            },
-            OscScanMode::Unscanned => Vec::new(),
+        match (self.osc_scan(), &self.kind) {
+            (OscScanMode::Scanned, TabHandleKind::InProcess(session)) => session.scan_osc(bytes),
+            // Unscanned — a host tab. The server scans and reports its
+            // effects as events; a second client-side router over the
+            // same bytes would double every one.
+            _ => Vec::new(),
         }
     }
 
@@ -239,6 +303,11 @@ impl TabHandle {
     pub(super) fn reseed_theme(&self, colors: OscColorSnapshot) {
         match &self.kind {
             TabHandleKind::InProcess(session) => session.reseed_osc_colors(colors),
+            // A host tab's colors are the server's: `session.set_theme`
+            // reseeds every server terminal in one op (HostConnSet::
+            // set_theme), and the client's Discard policy means no local
+            // query answers exist to move.
+            TabHandleKind::Host(_) => {}
         }
     }
 }

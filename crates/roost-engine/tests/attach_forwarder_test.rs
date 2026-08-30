@@ -29,7 +29,7 @@ use roost_ipc::messages::{
     SessionConnectParams, SessionConnectResult, SessionStopParams, SessionStopResult,
     TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
     TabCloseParams, TabDumpParams, TabDumpResult, TabFeedPtyBytesParams, TabOpenParams,
-    TabOpenResult, SESSION_PROTOCOL_VERSION,
+    TabOpenResult, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -66,6 +66,7 @@ struct NoopWorkspace;
 impl ServerVtWorkspace for NoopWorkspace {
     fn apply_osc(&self, _tab_id: i64, _command: u32, _payload: &str) {}
     fn close_row(&self, _tab_id: i64) {}
+    fn tab_effect(&self, _tab_id: i64, _effect: roost_engine::TabEffectKind) {}
 }
 
 async fn harness() -> Harness {
@@ -417,7 +418,12 @@ async fn feed(client: &mut IpcClient, tab_id: i64, data: Vec<u8>) {
 
 async fn dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
     client
-        .call(ops::TAB_DUMP, TabDumpParams { tab_id })
+        .call(
+            ops::TAB_DUMP,
+            TabDumpParams {
+                tab_id: WireTabRef::Local(tab_id),
+            },
+        )
         .await
         .expect("tab.dump")
 }
@@ -550,7 +556,7 @@ async fn an_input_frame_reaches_the_pty() {
             .call(
                 ops::TAB_CAPTURE_PTY_INPUT,
                 TabCapturePtyInputParams {
-                    tab_id,
+                    tab_id: WireTabRef::Local(tab_id),
                     drain: true,
                 },
             )

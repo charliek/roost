@@ -572,8 +572,12 @@ jobs:
           key: cargo-iced-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-iced-${{ runner.os }}-
 
-      - name: Build Iced + roostctl
-        run: cargo build -p roost-iced -p roost-cli
+      # `roost-session` rides along because the host-client E2E steps
+      # below run a real daemon beside the UI (plan 037 C9). Building it
+      # here rather than letting `tools/roosttest/session.py` build it on
+      # demand keeps a cargo compile out of the middle of a timed test.
+      - name: Build Iced + roostctl + roost-session
+        run: cargo build -p roost-iced -p roost-cli -p roost-session
 
       - name: Test and lint Iced
         run: |
@@ -689,6 +693,29 @@ jobs:
           tools/roosttest/test_menu_quit.py
           --roost-target iced --roost-fresh -v
 
+      # HS-2's host-client lane (plan 037 C9): a real `roost-session`
+      # daemon beside a real UI. Its own invocation for the same reason
+      # `make e2e-host-client` is its own target — the module spawns and
+      # reaps daemons per test, which the shared-session lane above knows
+      # nothing about, and it needs the `roost-session` binary the build
+      # step now produces. Marked `host_client`, so the whole-directory
+      # runs (`e2e-mac`, release.yml) and the macOS cells deselect it;
+      # see the Makefile's DAEMON_E2E_DESELECT for every mirror.
+      - name: Run host-client E2E (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-client-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-client-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_host_client.py
+          --roost-target iced --roost-fresh -v
+
       - name: Run Iced real-input clipboard (Linux X11)
         if: runner.os == 'Linux'
         env:
@@ -775,6 +802,33 @@ jobs:
           tools/roosttest/test_menu_quit.py
           --roost-target iced --roost-fresh -v
 
+      # The Wayland twin of the X11 host-client step above — this is also
+      # the lane that proves HS-2 on a real Linux compositor, which is
+      # what makes "Linux client support" a tested claim rather than a
+      # structural one.
+      - name: Run host-client E2E (Linux Wayland)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-client-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-client-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_host_client.py
+          --roost-target iced --roost-fresh -v
+
+      # The three macOS iced cells (this one, the bundle smoke and the
+      # Sparkle lane below) all carry `-m 'not host_client'`. Nothing
+      # ships a macOS `roost-session`, so HS-2's host lane is a Linux
+      # gate — and the deselect is a *fence*, not a filter: these are
+      # enumerated file lists, so its job is to keep the lane out of the
+      # macOS cells the day someone adds the module to all three lists at
+      # once (the enumerated-lists gotcha). Mirrors the Makefile's
+      # DAEMON_E2E_DESELECT.
       - name: Run Iced functional E2E (macOS)
         if: runner.os == 'macOS'
         env:
@@ -807,6 +861,7 @@ jobs:
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
           tools/roosttest/test_osc52.py
+          -m 'not host_client'
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (macOS)
@@ -1053,6 +1108,7 @@ jobs:
           tools/roosttest/test_smoke.py
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_menu_bar.py
+          -m 'not host_client'
           --roost-target iced --roost-fresh -v
 
       # Deliberately AFTER the keyless assemble + its assertion block:
@@ -1097,6 +1153,7 @@ jobs:
         run: >
           uv run --group test pytest
           tools/roosttest/test_sparkle.py
+          -m 'not host_client'
           --roost-target iced --roost-fresh -v
 
       # Branch-side proof of the release path's packaging half (plan 030
@@ -1717,13 +1774,18 @@ jobs:
         # ROOST_STATE_DIR (replaces the old ROOST_TEST_RESET_STATE clean-slate
         # hack — the harness no longer deletes the real state.json).
         #
-        # `-m 'not session_daemon'` deselects the headless host-session lane,
-        # which has its own `session-e2e` job. This whole-directory run builds
-        # no `roost-session`, so collecting it here would make the first
-        # session case `cargo build` mid-test on a shared macOS runner. Mirror
-        # of the Makefile's SESSION_E2E_DESELECT — see the comment there.
+        # The marker expression deselects both daemon lanes, which have
+        # their own jobs/steps: the headless host-session lane
+        # (`session-e2e`) and HS-2's host-client lane (`iced-build-e2e`'s
+        # Linux steps). This whole-directory run builds no
+        # `roost-session`, so collecting either here would make the first
+        # case `cargo build` mid-test on a shared macOS runner — and the
+        # Swift app answers `unknown-op` to every `host.*` op besides.
+        # Mirror of the Makefile's DAEMON_E2E_DESELECT — see the comment
+        # there.
         run: >
-          uv run --group test pytest tools/roosttest -m 'not session_daemon'
+          uv run --group test pytest tools/roosttest
+          -m 'not session_daemon and not host_client'
           --roost-target mac --roost-fresh -v
           --junitxml=test-results/e2e-mac.xml
 

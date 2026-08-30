@@ -60,6 +60,10 @@ arboard = { version = "3.6", default-features = false, features = [
     "wayland-data-control",
 ] }
 png = "=0.18.1"
+# Trait-only: the host op queue's replies are `serde_json::Value`, and the
+# typed decode of one needs `DeserializeOwned` to be nameable. No derives
+# live in this crate — the wire types are `roost-ipc`'s.
+serde = "1.0"
 serde_json = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }

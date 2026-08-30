@@ -97,6 +97,11 @@ _SANITIZE = (
     "ROOST_TAB_ID",
     "ROOST_SESSION_BIN",
     "ROOST_SESSION_LAUNCH_CWD",
+    # The test-mode build-string override (plan 037 §3.7). A stray value
+    # in a developer's shell would make every session here report a
+    # libghostty build no client can match, so the cases that want it
+    # pass it per launch and nothing else inherits one.
+    "ROOST_SESSION_FAKE_BUILD",
 )
 
 

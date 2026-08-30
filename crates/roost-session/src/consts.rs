@@ -16,6 +16,19 @@ use std::time::Duration;
 /// look for a named constant.
 pub use roost_ipc::session_launch::{timeout_scale, LAUNCH_CWD_ENV, MAX_VERDICT_BYTES};
 
+/// Test-mode override for the `libghostty_build` string this session
+/// reports and negotiates against (plan 037 §3.7).
+///
+/// Read **only** when `ROOST_TEST_MODE=1`. The build string is the
+/// attach negotiation's identity check: a client whose libghostty pin
+/// differs cannot decode this session's snapshots, and `tab.attach`
+/// refuses it with `build-mismatch`. That refusal drives a whole
+/// user-facing flow (the upgrade/restart dialog), and reproducing it
+/// otherwise takes a second binary built against a second Ghostty pin —
+/// which no CI lane can produce. Setting this makes the mismatch a
+/// one-line fixture instead.
+pub const FAKE_BUILD_ENV: &str = "ROOST_SESSION_FAKE_BUILD";
+
 /// `umask` the daemon installs before it creates anything. Everything
 /// downstream — state dir, log dir, `state.json`, crash reports, the
 /// socket — inherits this posture rather than restating it.

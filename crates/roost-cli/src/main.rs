@@ -25,6 +25,8 @@
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
 //!   roostctl session {start,stop,status}
+//!   roostctl host {add,list,remove,connect,disconnect}
+//!     add: --label, --target, [--verify]; the last three: --id
 //!
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
@@ -39,6 +41,7 @@
 //! reaches a session only through an explicit `--socket`.
 
 mod doctor;
+mod host;
 mod session;
 
 use std::io::{IsTerminal, Read, Write};
@@ -58,7 +61,7 @@ use roost_ipc::messages::{
     ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
     TabCloseParams, TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams,
     TabOpenResult, TabReorderParams, TabResizeParams, TabSetStateParams, TabSetTitleParams,
-    TabState, TabWriteParams,
+    TabState, TabWriteParams, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -214,6 +217,12 @@ enum Cmd {
     /// via an explicit `--socket`.
     #[command(subcommand)]
     Session(session::SessionCmd),
+    /// Client-side saved-host subcommands: add, list, remove, connect,
+    /// disconnect (host-sessions HS-2). Unlike `session`, these address the
+    /// ordinary UI socket target — a saved host is UI state, not the
+    /// session daemon's own workspace.
+    #[command(subcommand)]
+    Host(host::HostCmd),
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
@@ -289,9 +298,11 @@ enum ProjectCmd {
 
 #[derive(Subcommand, Debug)]
 enum TabCmd {
+    /// Focus a tab. `--tab` takes a bare id, or the `h<host>.<id>`
+    /// spelling to select (and attach) a connected host's tab.
     Focus {
         #[arg(long, env = "ROOST_TAB_ID")]
-        tab: Option<i64>,
+        tab: Option<String>,
     },
     /// List projects + their tabs. `--json` emits the machine-readable
     /// workspace snapshot (the `tab.list` result) instead of plain text.
@@ -406,9 +417,12 @@ enum TabCmd {
     /// Dump the tab's terminal viewport as text — one line per visible
     /// row, for content assertions in automated tests. Prints the rows
     /// to stdout; `--json` emits the full result (dims + cursor + rows).
+    /// `--tab` takes a bare id or, against the UI socket, the
+    /// `h<host>.<id>` spelling of an attached host tab's client-side
+    /// terminal (host-sessions §3.4).
     Dump {
         #[arg(long, env = "ROOST_TAB_ID")]
-        tab: Option<i64>,
+        tab: Option<String>,
         /// Emit the structured JSON result instead of plain text rows.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -646,7 +660,12 @@ async fn main() -> Result<()> {
                     let text_ok = match &text {
                         Some(needle) => {
                             match client
-                                .call::<_, TabDumpResult>(ops::TAB_DUMP, TabDumpParams { tab_id })
+                                .call::<_, TabDumpResult>(
+                                    ops::TAB_DUMP,
+                                    TabDumpParams {
+                                        tab_id: WireTabRef::Local(tab_id),
+                                    },
+                                )
                                 .await
                             {
                                 Ok(dump) => dump.rows_text.join("\n").contains(needle.as_str()),
@@ -675,7 +694,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Tab(TabCmd::Focus { tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
             client
                 .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id })
                 .await?;
@@ -819,7 +838,12 @@ async fn main() -> Result<()> {
             }
             if focus {
                 client
-                    .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id: new_id })
+                    .call::<_, serde_json::Value>(
+                        ops::TAB_FOCUS,
+                        TabFocusParams {
+                            tab_id: WireTabRef::Local(new_id),
+                        },
+                    )
                     .await?;
             }
             // Print just the new tab id (matches the documented contract;
@@ -866,7 +890,7 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Cmd::Tab(TabCmd::Dump { tab, json }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
             let result: TabDumpResult =
                 client.call(ops::TAB_DUMP, TabDumpParams { tab_id }).await?;
             if json {
@@ -1018,6 +1042,9 @@ async fn main() -> Result<()> {
                 println!("{id}");
             }
             // Dismissed → print nothing; exit 0 either way.
+        }
+        Cmd::Host(cmd) => {
+            std::process::exit(host::run(&cmd, &mut client).await);
         }
         // Already handled above before client connect.
         Cmd::ClaudeHook { .. } | Cmd::Claude(_) | Cmd::Doctor { .. } | Cmd::Session(_) => {
@@ -1386,6 +1413,18 @@ fn decode_escapes(s: &str) -> Vec<u8> {
     out
 }
 
+/// A `--tab` argument as the wire wants it: a bare id, the
+/// `h<host>.<id>` spelling of a connected host's tab, or — when the flag
+/// is absent — the UI's own active tab, which is always local.
+async fn wire_tab_ref(client: &mut IpcClient, explicit: Option<&str>) -> Result<WireTabRef> {
+    match explicit {
+        Some(raw) => {
+            WireTabRef::parse(raw).ok_or_else(|| anyhow::anyhow!("invalid --tab reference: {raw}"))
+        }
+        None => Ok(WireTabRef::Local(resolve_tab(client, None).await?)),
+    }
+}
+
 /// Resolve the tab id for a per-tab command. Falls back to the
 /// running UI's active tab via `identify` when neither `--tab` nor
 /// `ROOST_TAB_ID` is set. Errors with a clear message when the UI
@@ -1469,6 +1508,24 @@ fn order_with_after(ids: &[i64], new: i64, after: i64) -> Vec<i64> {
 mod tests {
     use super::*;
     use roost_ipc::agent::OwnershipAction;
+
+    /// `--tab` is the one flag that can name a tab on another machine,
+    /// so what it accepts is a contract: both spellings parse, and a
+    /// non-canonical one is refused rather than normalized — an
+    /// aliasing parser would let a crafted `--tab` reach a tab its
+    /// literal text never named.
+    #[test]
+    fn an_explicit_tab_ref_takes_both_spellings_and_only_canonical_ones() {
+        assert_eq!(WireTabRef::parse("7"), Some(WireTabRef::Local(7)));
+        assert_eq!(
+            WireTabRef::parse("h2.7"),
+            Some(WireTabRef::Host { host: 2, tab: 7 })
+        );
+        // `h0.*` is the local id-space, which is always spelled bare.
+        for refused in ["h0.7", "007", "+7", "h2.", "", "h.7"] {
+            assert!(WireTabRef::parse(refused).is_none(), "{refused:?}");
+        }
+    }
 
     #[test]
     fn held_argv_wraps_command_and_execs_shell() {

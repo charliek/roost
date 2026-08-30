@@ -1,0 +1,8 @@
+{
+  "id": "33",
+  "ok": false,
+  "error": {
+    "code": "invalid-param",
+    "message": "a host named \"pop-os\" already exists"
+  }
+}

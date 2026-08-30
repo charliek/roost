@@ -24,8 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roost_ipc::agent::{self, TabAgentReportParams};
-#[cfg(feature = "server-vt")]
-use roost_ipc::messages::TabAttachResult;
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
@@ -33,24 +31,27 @@ use roost_ipc::messages::{
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, SESSION_PROTOCOL_VERSION,
+    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
+    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
+    HostListParams, HostListResult, HostRemoveParams, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
+    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
+#[cfg(feature = "server-vt")]
+use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
 use roost_ipc::{
     CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
     StopFinalizer,
@@ -98,6 +99,16 @@ type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
 /// `PaletteActivate` ever returns the `Err` arm (no palette open, or no
 /// row with the given id); the rest always answer `Ok`.
 type PaletteReply = tokio::sync::oneshot::Sender<Result<PaletteStateResult, String>>;
+
+/// Reply for the `host.*` [`UiRequest`]s (plan 037 §3.5).
+///
+/// The error half is the registry's own [`WorkspaceError`] rather than a
+/// message, which is what lets `ws_err` mint the same wire code the
+/// engine-served path does: a reserved label is `invalid-param` and an
+/// unsaved id is `not-found`, whether the op was answered by the app or
+/// by a headless workspace. Stringifying at the seam would flatten both
+/// onto one code.
+pub type HostReply<T> = tokio::sync::oneshot::Sender<Result<T, WorkspaceError>>;
 
 /// Reply for [`UiRequest::PalettePresent`]: the user's choice, delivered
 /// once the palette closes (a pick or a dismissal). Unlike the other
@@ -197,8 +208,14 @@ pub enum UiRequest {
     /// Render the whole window (sidebar + tabs + active terminal) to a
     /// PNG.
     Screenshot { scale: u32, reply: ScreenshotReply },
-    /// Read a tab's terminal viewport as text.
-    Dump { tab_id: i64, reply: DumpReply },
+    /// Read a tab's terminal viewport as text. `tab_id` is the wire
+    /// form: bare = a local tab, host-qualified = an attached host
+    /// tab's client-side terminal — the UI resolves both against its
+    /// keyed map (plan 037 §3.4).
+    Dump {
+        tab_id: WireTabRef,
+        reply: DumpReply,
+    },
     /// Open a command-palette root frame and reply with its state.
     /// `kind`: "" / "commands" → command palette; "launcher" → the
     /// custom-command launcher.
@@ -264,7 +281,7 @@ pub enum UiRequest {
     /// bytes the UI has queued onto a tab's PTY-input channel.
     /// Gated like `TabFeedPtyBytes`.
     TabCapturePtyInput {
-        tab_id: i64,
+        tab_id: WireTabRef,
         drain: bool,
         reply: CapturedBytesReply,
     },
@@ -272,7 +289,7 @@ pub enum UiRequest {
     /// viewport after the production color resolver has run. Ungated
     /// (no shadow state — same walk the real paint loop runs).
     TabDumpResolved {
-        tab_id: i64,
+        tab_id: WireTabRef,
         reply: DumpResolvedReply,
     },
     /// `tab.expand_selection_at` — run the production
@@ -409,6 +426,47 @@ pub enum UiRequest {
     AppNotificationStatus {
         reply: tokio::sync::oneshot::Sender<Result<AppNotificationStatusResult, String>>,
     },
+    /// `host.add` — save a host to the client-side registry (plan 037
+    /// §3.5).
+    ///
+    /// The registry is a plain `Workspace` accessor, so the engine could
+    /// serve this itself — and does, headless. It routes through the app
+    /// when there is one because saving a host is only half the story:
+    /// the sidebar grows a section, the launch probe may start dialing,
+    /// and neither happens off a mutation nothing re-reads. A
+    /// `roostctl host add` against an idle UI has to be as visible as
+    /// the Add Host dialog's own save.
+    HostAdd {
+        label: String,
+        target: String,
+        reply: HostReply<Host>,
+    },
+    /// `host.remove` — forget a saved host. Disconnects it first if it
+    /// is connected; never stops the session (roadmap D8).
+    HostRemove { id: String, reply: HostReply<()> },
+    /// `tab.focus` for a host-qualified ref: select that host's tab and
+    /// attach it, exactly as a sidebar click does. The local form never
+    /// reaches here — it mutates the workspace in the handler, headless
+    /// or not — so this arm exists only because a host selection is
+    /// app-owned state (plan 037 §3.4).
+    HostTabFocus {
+        host: u32,
+        tab_id: i64,
+        reply: HostReply<()>,
+    },
+    /// `host.connect` — the palette's `Connect Host` and the sidebar's
+    /// ↻ Reconnect, as an op. Unconditional takeover, and it may start a
+    /// localhost session that is not running.
+    HostConnect {
+        id: String,
+        reply: HostReply<HostConnectionResult>,
+    },
+    /// `host.disconnect` — drop the connection, leave the session
+    /// running.
+    HostDisconnect {
+        id: String,
+        reply: HostReply<HostConnectionResult>,
+    },
 }
 
 /// Resolved clipboard target for the `clipboard.*` ops. Lives in this
@@ -421,6 +479,7 @@ pub enum ClipboardOp {
 }
 
 use crate::event_push::{self, PushLimits};
+use crate::persistence::HostSnapshot;
 use crate::{AttentionSource, PtyError, PtySupervisor, Workspace, WorkspaceError};
 
 /// How long `session.stop` lets a hung-up child live before it escalates
@@ -836,16 +895,7 @@ impl ClientRegistry {
 /// point: the socket's uid check bounds who can guess at it at all, and
 /// 128 bits ends the question.
 fn random_hex_128() -> String {
-    use std::fmt::Write as _;
-    let mut bytes = [0u8; 16];
-    // A failure here means the OS could not produce entropy, which is
-    // not a condition a process handing out credentials can paper over.
-    getrandom::fill(&mut bytes).expect("the OS random source must be available");
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    crate::workspace::random_hex(16)
 }
 
 impl SessionState {
@@ -1010,8 +1060,11 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::PROJECT_REORDER
             | ops::NOTIFICATION_CREATE
             | ops::SESSION_CONNECT
+            | ops::SESSION_SET_THEME
             | ops::TAB_ATTACH
             | ops::TAB_FEED_PTY_BYTES
+            | ops::HOST_ADD
+            | ops::HOST_REMOVE
     )
 }
 
@@ -1104,16 +1157,30 @@ impl IpcHandler {
         self
     }
 
+    /// Whether a UI adapter is driving this handler.
+    ///
+    /// Only the `host.*` registry ops ask: they have a working headless
+    /// implementation and route through the app purely so a live UI
+    /// reconciles (see [`UiRequest::HostAdd`]). Everything else is
+    /// UI-only and lets `ui_call` answer `no UI attached`.
+    fn has_ui(&self) -> bool {
+        self.ui_tx.is_some()
+    }
+
     /// Hand a request-reply [`UiRequest`] to the UI adapter's main thread
     /// and await its answer. The outer `Result` reports channel/UI health
     /// (no UI attached, UI gone, reply dropped); the inner `Result` is
     /// the op's own outcome, which the caller maps to the right error
     /// code (e.g. `not-found` for a missing tab). Shared by the
     /// screenshot + dump arms so the oneshot plumbing lives in one place.
-    async fn ui_call<T>(
+    ///
+    /// The error half is whatever the variant's reply channel carries:
+    /// `String` for most, a [`WorkspaceError`] for the `host.*` ops so
+    /// the dispatcher can mint the same wire code the headless path does.
+    async fn ui_call<T, E>(
         &self,
-        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> UiRequest,
-    ) -> Result<Result<T, String>, HandlerError> {
+        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, E>>) -> UiRequest,
+    ) -> Result<Result<T, E>, HandlerError> {
         let tx = self
             .ui_tx
             .as_ref()
@@ -1212,6 +1279,17 @@ fn tab_gone(tab_id: i64) -> HandlerError {
     HandlerError::not_found(format!("tab {tab_id} is gone"))
 }
 
+/// The one answer for a data-plane op on a session that cannot serve
+/// one — either the feature was compiled out or `enable_server_vt` was
+/// never called. A client cannot act on the difference, and the text is
+/// worded to be true of both.
+fn no_server_vt() -> HandlerError {
+    HandlerError::new(
+        "unsupported-kind",
+        "this session has no server-VT data plane",
+    )
+}
+
 /// Round-trip one command through a tab task.
 #[cfg(feature = "server-vt")]
 async fn tab_ask<T>(
@@ -1272,24 +1350,42 @@ fn session_test_mode(h: &IpcHandler) -> Result<(), HandlerError> {
 mod served {
     use super::{
         session_test_mode, tab_ask, tab_commands, tab_gone, DumpData, HandlerError, IpcHandler,
-        ResolvedCellsData,
+        ResolvedCellsData, WireTabRef,
     };
     use crate::tab_task::TabCmd;
 
+    /// A session's ids are one bare id-space by design; the
+    /// `h<host>.<id>` spelling names a UI's client-side tab and is
+    /// refused here rather than silently narrowed to a number that
+    /// would read some unrelated tab.
+    fn bare(tab: WireTabRef) -> Result<i64, HandlerError> {
+        tab.local().ok_or_else(|| {
+            HandlerError::invalid_param(
+                "host-qualified tab refs are a UI-socket form; session tab ids are bare",
+            )
+        })
+    }
+
     pub(super) async fn dump(
         h: &IpcHandler,
-        tab_id: i64,
+        tab: WireTabRef,
     ) -> Option<Result<DumpData, HandlerError>> {
         h.session.as_ref()?;
-        Some(tab_ask(h, tab_id, TabCmd::Dump).await)
+        Some(match bare(tab) {
+            Ok(tab_id) => tab_ask(h, tab_id, TabCmd::Dump).await,
+            Err(error) => Err(error),
+        })
     }
 
     pub(super) async fn dump_resolved(
         h: &IpcHandler,
-        tab_id: i64,
+        tab: WireTabRef,
     ) -> Option<Result<ResolvedCellsData, HandlerError>> {
         h.session.as_ref()?;
-        Some(tab_ask(h, tab_id, TabCmd::DumpResolved).await)
+        Some(match bare(tab) {
+            Ok(tab_id) => tab_ask(h, tab_id, TabCmd::DumpResolved).await,
+            Err(error) => Err(error),
+        })
     }
 
     pub(super) async fn feed_pty_bytes(
@@ -1325,11 +1421,14 @@ mod served {
 
     pub(super) async fn capture_pty_input(
         h: &IpcHandler,
-        tab_id: i64,
+        tab: WireTabRef,
         drain: bool,
     ) -> Option<Result<Vec<u8>, HandlerError>> {
         h.session.as_ref()?;
-        Some(capture(h, tab_id, drain).await)
+        Some(match bare(tab) {
+            Ok(tab_id) => capture(h, tab_id, drain).await,
+            Err(error) => Err(error),
+        })
     }
 
     async fn capture(h: &IpcHandler, tab_id: i64, drain: bool) -> Result<Vec<u8>, HandlerError> {
@@ -1356,15 +1455,18 @@ mod served {
     // every one is an `async fn` that never awaits.
     #![allow(clippy::unused_async)]
 
-    use super::{DumpData, HandlerError, IpcHandler, ResolvedCellsData};
+    use super::{DumpData, HandlerError, IpcHandler, ResolvedCellsData, WireTabRef};
 
-    pub(super) async fn dump(_: &IpcHandler, _: i64) -> Option<Result<DumpData, HandlerError>> {
+    pub(super) async fn dump(
+        _: &IpcHandler,
+        _: WireTabRef,
+    ) -> Option<Result<DumpData, HandlerError>> {
         None
     }
 
     pub(super) async fn dump_resolved(
         _: &IpcHandler,
-        _: i64,
+        _: WireTabRef,
     ) -> Option<Result<ResolvedCellsData, HandlerError>> {
         None
     }
@@ -1379,7 +1481,7 @@ mod served {
 
     pub(super) async fn capture_pty_input(
         _: &IpcHandler,
-        _: i64,
+        _: WireTabRef,
         _: bool,
     ) -> Option<Result<Vec<u8>, HandlerError>> {
         None
@@ -1421,6 +1523,16 @@ async fn dispatch_outcome(
             let p: EventsSubscribeParams = decode(params)?;
             return events_subscribe(h, session, ctx, &p);
         }
+        // The host registry is client-side state (D8): a UI socket's op
+        // family. Letting it fall through would grow a shadow registry in
+        // the daemon's own state.json that nothing ever reads.
+        ops::HOST_ADD
+        | ops::HOST_REMOVE
+        | ops::HOST_LIST
+        | ops::HOST_CONNECT
+        | ops::HOST_DISCONNECT => {
+            return Err(HandlerError::unknown_op(op));
+        }
         _ => {}
     }
 
@@ -1452,6 +1564,18 @@ async fn dispatch_outcome(
         // could have moved between two.
         let (revision, _projects) = h.workspace.snapshot_with_revision();
         return encode(&SessionConnectResult { lease, revision }).map(HandlerOutcome::Reply);
+    }
+
+    // Served here rather than in `dispatch` for the same reason
+    // `tab.attach` is: the lease it presents is bound to *this*
+    // connection, which `dispatch` cannot see. And it is lease-gated at
+    // all because it is the attached client's theme — only the client
+    // driving the session gets to state it.
+    if op == ops::SESSION_SET_THEME {
+        let p: SessionSetThemeParams = decode(params)?;
+        return session_set_theme(h, session, ctx, p)
+            .await
+            .map(HandlerOutcome::Reply);
     }
 
     // Same reason as `session.connect`: the token is bound to the lease
@@ -1592,9 +1716,107 @@ async fn tab_attach(
     p: TabAttachParams,
 ) -> Result<serde_json::Value, HandlerError> {
     session.require_lease(&p.lease, ctx)?;
-    Err(HandlerError::new(
-        "unsupported-kind",
-        "this session was built without the server-VT data plane",
+    Err(no_server_vt())
+}
+
+/// `session.set_theme`: seed every tab's server terminal with the
+/// attached client's palette, and remember it for the tabs opened next
+/// (plan 037 §3.6).
+///
+/// This is the op that closes the reseed gap the architecture notes
+/// left open: without it, a session's terminals answer OSC 4 / 10 / 11 /
+/// 12 queries with the headless white-on-black default, so a program in
+/// a host tab picks its colors against a theme nobody is looking at.
+///
+/// Whole-theme, not a diff: the client states the palette it renders
+/// with and the server takes it. Two clients racing (a takeover during
+/// a theme change) are last-writer-wins by construction — there is one
+/// stored seed and the last `set_theme` to reach the tab task is the
+/// one its terminal ends on.
+#[cfg(feature = "server-vt")]
+async fn session_set_theme(
+    h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: SessionSetThemeParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+    let seed = decode_osc_colors(&p.osc_colors)?;
+    // Storing the seed and reseeding the live tabs is one supervisor
+    // call — see `PtySupervisor::set_theme` for why the pair cannot be
+    // split without a spawn racing between them.
+    let tabs = h
+        .supervisor
+        .set_theme(&seed)
+        .await
+        .ok_or_else(no_server_vt)?;
+    encode(&SessionSetThemeResult { tabs })
+}
+
+/// Without the `server-vt` feature there are no server terminals to
+/// recolor — the same answer `tab.attach` gives, for the same reason.
+#[cfg(not(feature = "server-vt"))]
+#[allow(clippy::unused_async)]
+async fn session_set_theme(
+    _h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: SessionSetThemeParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+    Err(no_server_vt())
+}
+
+/// Wire colors → the engine's theme seed.
+///
+/// `#rrggbb` is the spelling `tab.dump_resolved` already answers in, so
+/// a theme is readable in a wire trace and a test can state one as a
+/// literal. Every failure is `invalid-param` and names the field: a
+/// half-applied palette is worse than a refused one.
+#[cfg(feature = "server-vt")]
+fn decode_osc_colors(
+    colors: &roost_ipc::messages::OscColorsParams,
+) -> Result<crate::osc::OscColorSnapshot, HandlerError> {
+    if colors.palette.len() != 256 {
+        return Err(HandlerError::invalid_param(format!(
+            "osc_colors.palette must have exactly 256 entries (got {})",
+            colors.palette.len()
+        )));
+    }
+    let mut palette = [(0u8, 0u8, 0u8); 256];
+    for (index, raw) in colors.palette.iter().enumerate() {
+        palette[index] = parse_rgb_hex(raw)
+            .ok_or_else(|| invalid_color(&format!("osc_colors.palette[{index}]"), raw))?;
+    }
+    Ok(crate::osc::OscColorSnapshot::new(
+        parse_rgb_hex(&colors.foreground)
+            .ok_or_else(|| invalid_color("osc_colors.foreground", &colors.foreground))?,
+        parse_rgb_hex(&colors.background)
+            .ok_or_else(|| invalid_color("osc_colors.background", &colors.background))?,
+        parse_rgb_hex(&colors.cursor)
+            .ok_or_else(|| invalid_color("osc_colors.cursor", &colors.cursor))?,
+        palette,
+    ))
+}
+
+#[cfg(feature = "server-vt")]
+fn invalid_color(field: &str, raw: &str) -> HandlerError {
+    HandlerError::invalid_param(format!("{field} is not a #rrggbb color (got {raw:?})"))
+}
+
+/// The inverse of [`rgb_hex`]. Long form only — the wire is machine-
+/// written, and accepting `#abc` too would mean two spellings of one
+/// color for the vectors to disagree about.
+#[cfg(feature = "server-vt")]
+fn parse_rgb_hex(raw: &str) -> Option<(u8, u8, u8)> {
+    let body = raw.strip_prefix('#')?;
+    if body.len() != 6 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&body[0..2], 16).ok()?,
+        u8::from_str_radix(&body[2..4], 16).ok()?,
+        u8::from_str_radix(&body[4..6], 16).ok()?,
     ))
 }
 
@@ -1862,8 +2084,32 @@ async fn dispatch(
         }
         ops::TAB_FOCUS => {
             let p: TabFocusParams = decode(params)?;
+            let tab_id = match p.tab_id {
+                WireTabRef::Local(tab_id) => tab_id,
+                WireTabRef::Host { host, tab } => {
+                    if !h.has_ui() {
+                        return Err(HandlerError::invalid_param(
+                            "a host-qualified tab.focus needs a UI: host selection is client state",
+                        ));
+                    }
+                    h.ui_call(|reply| UiRequest::HostTabFocus {
+                        host,
+                        tab_id: tab,
+                        reply,
+                    })
+                    .await?
+                    .map_err(ws_err)?;
+                    // The host's own workspace owns its active row; this
+                    // client only moved its selection, so there is no
+                    // local "previous" to report.
+                    return encode(&TabFocusResult {
+                        previous_project_id: 0,
+                        previous_tab_id: 0,
+                    });
+                }
+            };
             let (previous_project_id, previous_tab_id) =
-                h.workspace.focus_tab(p.tab_id).map_err(ws_err)?;
+                h.workspace.focus_tab(tab_id).map_err(ws_err)?;
             encode(&TabFocusResult {
                 previous_project_id,
                 previous_tab_id,
@@ -2422,7 +2668,86 @@ async fn dispatch(
                 "events.subscribe is not yet implemented",
             ))
         }
+        // The four registry mutations route through the app when one is
+        // attached (plan 037 §3.5): the app owns the connections and the
+        // sidebar, so a `roostctl host add` has to reach it or it
+        // mutates state nothing re-reads. Headless — the engine's own
+        // tests, an embedder with no UI — the workspace answers
+        // directly, which is also why the error type crossing the seam
+        // is `WorkspaceError`: both paths mint the same wire code.
+        ops::HOST_ADD => {
+            let p: HostAddParams = decode(params)?;
+            let host = if h.has_ui() {
+                h.ui_call(|reply| UiRequest::HostAdd {
+                    label: p.label,
+                    target: p.target,
+                    reply,
+                })
+                .await?
+                .map_err(ws_err)?
+            } else {
+                h.workspace
+                    .add_host(&p.label, &p.target)
+                    .map_err(ws_err)?
+                    .into()
+            };
+            encode(&HostAddResult { host })
+        }
+        ops::HOST_REMOVE => {
+            let p: HostRemoveParams = decode(params)?;
+            if h.has_ui() {
+                h.ui_call(|reply| UiRequest::HostRemove { id: p.id, reply })
+                    .await?
+                    .map_err(ws_err)?;
+            } else {
+                h.workspace.remove_host(&p.id).map_err(ws_err)?;
+            }
+            Ok(serde_json::json!({}))
+        }
+        ops::HOST_CONNECT | ops::HOST_DISCONNECT => {
+            // Connection state is the app's alone — there is no headless
+            // fallback to give, and `no UI attached` is the honest
+            // answer for a socket with no window behind it.
+            let id = if op == ops::HOST_CONNECT {
+                decode::<HostConnectParams>(params)?.id
+            } else {
+                decode::<HostDisconnectParams>(params)?.id
+            };
+            let connect = op == ops::HOST_CONNECT;
+            let result = h
+                .ui_call(move |reply| {
+                    if connect {
+                        UiRequest::HostConnect { id, reply }
+                    } else {
+                        UiRequest::HostDisconnect { id, reply }
+                    }
+                })
+                .await?
+                .map_err(ws_err)?;
+            encode(&result)
+        }
+        ops::HOST_LIST => {
+            let _p: HostListParams = decode(params)?;
+            let hosts = h.workspace.hosts().into_iter().map(Host::from).collect();
+            encode(&HostListResult { hosts })
+        }
         other => Err(HandlerError::unknown_op(other)),
+    }
+}
+
+/// `persistence::HostSnapshot` (storage) → `messages::Host` (wire).
+/// `Host` is foreign to this crate, but the orphan rule still allows the
+/// impl here because `HostSnapshot` — the trait's type parameter — is
+/// local; `roost-engine`, the only crate that sees both types, is where
+/// the mapping belongs either way.
+impl From<HostSnapshot> for Host {
+    fn from(host: HostSnapshot) -> Self {
+        Host {
+            id: host.id,
+            label: host.label,
+            target: host.target,
+            last_connected: host.last_connected,
+        }
     }
 }
 
@@ -2527,6 +2852,10 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
         WorkspaceError::Io(_) | WorkspaceError::Json(_) => {
             HandlerError::new("internal", e.to_string())
         }
+        WorkspaceError::HostNotFound(_) => HandlerError::not_found(e.to_string()),
+        WorkspaceError::HostLabelEmpty
+        | WorkspaceError::HostLabelReserved
+        | WorkspaceError::HostLabelTaken(_) => HandlerError::invalid_param(e.to_string()),
     }
 }
 

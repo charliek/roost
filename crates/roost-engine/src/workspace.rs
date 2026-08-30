@@ -187,6 +187,26 @@ pub struct RestoreTab {
     pub user_titled: bool,
 }
 
+/// What a [`WorkspaceEvent::TabEffect`] carries, in process.
+///
+/// The wire shape is flat — an `effect` name beside optional `data` and
+/// `target` fields (plan 037 §3.6) — but in process the payload belongs
+/// to the one variant that has one, so a bell cannot be built carrying
+/// clipboard text. `crate::event_push` flattens this into the wire form,
+/// the same boundary that already does every other event's projection.
+///
+/// The clipboard text is user content: it goes on the wire and into no
+/// log line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "kebab-case")]
+pub enum TabEffectKind {
+    Bell,
+    ClipboardWrite {
+        text: String,
+        target: roost_ipc::messages::ClipboardEffectTarget,
+    },
+}
+
 /// Workspace event channel. The server-push relay
 /// (`crate::event_push`) converts these to wire-format
 /// `EventEnvelope`s; its serializer is a total match over this enum, so
@@ -262,6 +282,17 @@ pub enum WorkspaceEvent {
         project_id: i64,
         #[serde(with = "roost_ipc::messages::vec_string_int64")]
         tab_ids: Vec<i64>,
+    },
+    /// One client-local effect a server-VT tab produced — a bell or an
+    /// OSC 52 clipboard write (plan 037 §3.6). Transient like
+    /// [`Self::NotificationFired`]: it is not workspace state, it is
+    /// something that happened, and it rides the commit stream so an
+    /// attached client sees it in order with everything else. Minted
+    /// only by `tab_task`, so a UI's own workspace never emits one.
+    TabEffect {
+        #[serde(with = "roost_ipc::messages::string_int64")]
+        tab_id: i64,
+        effect: TabEffectKind,
     },
     /// Fired after `reorder_projects`. `project_ids` is the
     /// post-reorder sidebar order.
@@ -341,6 +372,14 @@ pub enum WorkspaceError {
     Io(#[from] std::io::Error),
     #[error("serde_json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("host {0} not found")]
+    HostNotFound(String),
+    #[error("host label must not be empty")]
+    HostLabelEmpty,
+    #[error("host label \"local\" is reserved")]
+    HostLabelReserved,
+    #[error("a host named {0:?} already exists")]
+    HostLabelTaken(String),
 }
 
 /// Repair persisted project positions that collide, in place.
@@ -404,6 +443,40 @@ fn normalize_project_positions(projects: &mut [ProjectSnapshot]) {
         p.position = position;
         previous = Some(position);
     }
+}
+
+/// A saved host's label, checked before it is added: non-empty, unique
+/// among the existing saved hosts case-insensitively, and not `local` —
+/// that word is the sidebar's reserved header for the in-process
+/// workspace, so a saved host claiming it would be indistinguishable
+/// from the local section (host-sessions plan §3.1).
+fn validate_host_label(existing: &[HostSnapshot], label: &str) -> Result<(), WorkspaceError> {
+    if label.is_empty() {
+        return Err(WorkspaceError::HostLabelEmpty);
+    }
+    // Unicode folding, not `eq_ignore_ascii_case`: "Éclair" and "éclair"
+    // must collide, or the sidebar shows two visually identical headers.
+    //
+    // Both directions, because `to_lowercase` is not full case folding:
+    // "straße" lowercases to itself while "STRASSE" lowercases to
+    // "strasse", so a lowercase-only rule saves both — and the sidebar
+    // then draws the header "STRASSE" twice, which is the collision this
+    // rule exists to prevent. The uppercase comparison IS that display
+    // form, so it catches the pair a lowercase one misses; the lowercase
+    // comparison still catches the everyday "Pop-OS" / "pop-os". Either
+    // form colliding is a collision.
+    let lower = label.to_lowercase();
+    let upper = label.to_uppercase();
+    if lower == "local" || upper == "LOCAL" {
+        return Err(WorkspaceError::HostLabelReserved);
+    }
+    if existing
+        .iter()
+        .any(|h| h.label.to_lowercase() == lower || h.label.to_uppercase() == upper)
+    {
+        return Err(WorkspaceError::HostLabelTaken(label.to_string()));
+    }
+    Ok(())
 }
 
 impl Workspace {
@@ -572,6 +645,81 @@ impl Workspace {
     /// [`raise_attention`]: Workspace::raise_attention
     pub fn set_window_focused(&self, focused: bool) {
         self.inner.lock().unwrap().window_focused = focused;
+    }
+
+    /// The client's saved host sessions, in the order the sidebar lists
+    /// them. Purely a registry read — connecting to one is HS-2's
+    /// `HostConn`, not this crate.
+    pub fn hosts(&self) -> Vec<HostSnapshot> {
+        self.inner.lock().unwrap().hosts.clone()
+    }
+
+    /// Save a new host, minting its stable id. Rejects the label per
+    /// [`validate_host_label`]; `target` is carried opaquely (a socket
+    /// path or, later, an SSH destination — HS-3) and is not validated
+    /// here, since only actually dialing it (`roostctl host add
+    /// --verify`, or the UI's "Add & Connect") can tell whether it is
+    /// reachable.
+    pub fn add_host(&self, label: &str, target: &str) -> Result<HostSnapshot, WorkspaceError> {
+        // Trimmed before validation AND storage, so "  " cannot pass the
+        // non-empty check and " local " cannot dodge the reserved one.
+        let label = label.trim();
+        let mut inner = self.inner.lock().unwrap();
+        validate_host_label(&inner.hosts, label)?;
+        let host = HostSnapshot {
+            id: mint_host_id(&inner.hosts),
+            label: label.to_string(),
+            target: target.to_string(),
+            last_connected: None,
+        };
+        inner.hosts.push(host.clone());
+        self.commit(inner, Vec::new(), Persist::Write);
+        Ok(host)
+    }
+
+    /// Would this label be accepted? The registry's own rules, asked
+    /// without saving.
+    ///
+    /// The Add Host dialog checks here before it spends a round trip
+    /// dialing the socket, so "local is reserved" is answered
+    /// immediately rather than after a five-second timeout on a name
+    /// that was never going to be saved. [`Self::add_host`] re-validates
+    /// under the lock, so this is a courtesy and never the enforcement —
+    /// which is also why it is the same function underneath: a second
+    /// spelling of the rules would drift.
+    pub fn check_host_label(&self, label: &str) -> Result<(), WorkspaceError> {
+        let inner = self.inner.lock().unwrap();
+        validate_host_label(&inner.hosts, label.trim())
+    }
+
+    /// Forget a saved host by its stable id. Does not touch a live
+    /// connection — HostConn owns disconnecting before a remove reaches
+    /// here (the UI only offers Remove while disconnected, §3.1).
+    pub fn remove_host(&self, id: &str) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.hosts.len();
+        inner.hosts.retain(|h| h.id != id);
+        if inner.hosts.len() == before {
+            return Err(WorkspaceError::HostNotFound(id.to_string()));
+        }
+        self.commit(inner, Vec::new(), Persist::Write);
+        Ok(())
+    }
+
+    /// Stamp a saved host's `last_connected` with the current time
+    /// (RFC3339 UTC), for a successful connect. Owned by whoever mints
+    /// the connection (HostConn, or `roostctl host add --verify`) —
+    /// this accessor only persists the stamp.
+    pub fn touch_host_connected(&self, id: &str) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let host = inner
+            .hosts
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or_else(|| WorkspaceError::HostNotFound(id.to_string()))?;
+        host.last_connected = Some(rfc3339_now());
+        self.commit(inner, Vec::new(), Persist::Write);
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WorkspaceEvent> {
@@ -1095,6 +1243,44 @@ impl Workspace {
             Persist::Skip,
         );
         Ok(true)
+    }
+
+    /// Publish one client-local tab effect (plan 037 §3.6) — a bell or
+    /// an OSC 52 clipboard write a server-VT tab produced.
+    ///
+    /// A commit like any other, for the reason the events stream's
+    /// whole loss-detection protocol depends on: every batch a
+    /// subscriber sees carries the next revision, so an effect that
+    /// rode outside the sequence would either need a revision it
+    /// cannot have or a second delivery channel with no ordering
+    /// against the state changes around it. `Persist::Skip` — nothing
+    /// here is in the snapshot.
+    ///
+    /// Not gated on the tab still existing: the tab task is the only
+    /// caller and it emits from inside its own tab's pipeline —
+    /// `pub(crate)` so that stays true. That single caller is
+    /// `server-vt`-only, so without the feature this is genuinely dead
+    /// rather than merely unreferenced — which the iced lane's
+    /// `-D warnings` lint of a featureless `roost-engine` catches.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    pub(crate) fn publish_tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
+        let inner = self.inner.lock().unwrap();
+        // The tab task outlives its workspace row on purpose (it keeps
+        // ingesting descendant output past the exit deadline), so a late
+        // BEL or OSC 52 can arrive here after `tab.closed` committed. An
+        // effect for a tab a subscriber has already watched close is
+        // noise at best and a mis-attribution at worst — checked under
+        // the same lock as the commit, so close-then-effect cannot
+        // interleave the other way around.
+        if !inner.tabs.contains_key(&tab_id) {
+            tracing::debug!(tab_id, "dropping a tab effect for a closed tab");
+            return;
+        }
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabEffect { tab_id, effect }],
+            Persist::Skip,
+        );
     }
 
     /// `tab.agent_report` — the one op every agent adapter writes
@@ -1749,6 +1935,78 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A saved host's stable id: 64 bits of OS entropy as 16 lowercase hex
+/// characters. Not a credential (unlike a session lease) — it only has
+/// to not collide with another saved host — so half the width
+/// `roost-session`'s bearer tokens use is plenty. Far past birthday risk
+/// for a hand-curated list, but a collision would be silent and
+/// permanent — two entries answering one id — so the loop buys
+/// certainty for one extra comparison per add.
+fn mint_host_id(existing: &[HostSnapshot]) -> String {
+    loop {
+        let id = random_hex(8);
+        if !existing.iter().any(|h| h.id == id) {
+            return id;
+        }
+    }
+}
+
+/// `n` random bytes from the OS entropy source, rendered as lowercase
+/// hex. Shared by [`random_host_id`] and `ipc::random_hex_128` — only
+/// the byte width and the security expectations riding on it differ
+/// per call site.
+pub(crate) fn random_hex(n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut bytes = vec![0u8; n];
+    getrandom::fill(&mut bytes).expect("the OS random source must be available");
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// `SystemTime::now()` as `YYYY-MM-DDTHH:MM:SSZ`. Hand-rolled rather
+/// than pulling in a date-time crate for one timestamp — mirrors
+/// `roost_session::identity::rfc3339_utc` exactly, which this crate
+/// cannot depend on (`roost-session` depends on `roost-engine`, not the
+/// other way).
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let time_of_day = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days-since-epoch to `(year, month, day)` — Howard Hinnant's
+/// `civil_from_days`, the standard closed-form for this (avoids a
+/// leap-year loop). Duplicated from `roost_session::identity` for the
+/// same dependency-direction reason as [`rfc3339_now`].
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn derive_title(cwd: &str) -> String {

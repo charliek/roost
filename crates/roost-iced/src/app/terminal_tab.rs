@@ -308,9 +308,24 @@ impl TerminalTab {
         word_break_chars: String,
         feed: EngineFeedSender,
     ) -> Result<Self> {
+        let session = backend.attach(tab_id, theme_osc_colors(&theme), feed)?;
+        Self::build(DEFAULT_COLS, DEFAULT_ROWS, theme, word_break_chars, session)
+    }
+
+    /// The one `TerminalTab` constructor: a themed terminal at `cols` ×
+    /// `rows` with the reply buffer installed, driven by `session`.
+    /// Where that session comes from is the caller's business — a local
+    /// backend attach, or a host tab's queue toward its data connection.
+    fn build(
+        cols: u16,
+        rows: u16,
+        theme: Theme,
+        word_break_chars: String,
+        session: TabHandle,
+    ) -> Result<Self> {
         let mut terminal = Terminal::new(TerminalOptions {
-            cols: DEFAULT_COLS,
-            rows: DEFAULT_ROWS,
+            cols,
+            rows,
             max_scrollback: 2_000,
             continuation_max_bytes: 0,
         })?;
@@ -322,15 +337,11 @@ impl TerminalTab {
         terminal
             .set_write_pty_buffer(Arc::clone(&reply_buffer))
             .context("install libghostty PTY reply buffer")?;
-        let render_state = RenderState::new()?;
-        let encoder = KeyEncoder::new()?;
-        let mouse_encoder = MouseEncoder::new()?;
-        let session = backend.attach(tab_id, theme_osc_colors(&theme), feed)?;
         Ok(Self {
             terminal,
-            render_state,
-            encoder,
-            mouse_encoder,
+            render_state: RenderState::new()?,
+            encoder: KeyEncoder::new()?,
+            mouse_encoder: MouseEncoder::new()?,
             scroll: TerminalScroll::new(),
             motion_emitter: MotionEmitter::new(),
             drag_gate: DragCellGate::new(),
@@ -347,7 +358,7 @@ impl TerminalTab {
             pointer_shape: "default".into(),
             theme,
             preedit: None,
-            snapshot: TerminalSnapshot::blank(DEFAULT_COLS, DEFAULT_ROWS),
+            snapshot: TerminalSnapshot::blank(cols, rows),
             // Left empty on purpose: the first `refresh_snapshot` finds no
             // cached grid size, sizes the grid and forces a full rebuild.
             grid: Vec::new(),
@@ -355,12 +366,87 @@ impl TerminalTab {
             cached_defaults: None,
             cached_theme_generation: None,
             theme_generation: 0,
-            cols: DEFAULT_COLS,
-            rows: DEFAULT_ROWS,
+            cols,
+            rows,
             applied_metrics: None,
             metric_generation: 0,
             render_stats: crate::perf::TabRenderStats::default(),
         })
+    }
+
+    /// Attach the UI to a tab that lives on a connected host. No local
+    /// backend is involved: `handle` queues input toward the host's data
+    /// connection, and the terminal built here is the blank stand-in the
+    /// hydration swaps out at READY (`swap_terminal`) — which is also
+    /// why a re-attach never blanks the tab: the old terminal keeps
+    /// rendering until the new one is ready (plan 037 §3.4).
+    pub(super) fn attach_host(
+        cols: u16,
+        rows: u16,
+        theme: Theme,
+        word_break_chars: String,
+        handle: TabHandle,
+    ) -> Result<Self> {
+        Self::build(cols, rows, theme, word_break_chars, handle)
+    }
+
+    /// Install a hydrated terminal in place of the one this tab renders
+    /// — the READY swap. The decoder built `terminal` from the host's
+    /// snapshot; from here on the tab's own `write_vt` drives it. The
+    /// reply buffer moves onto the new terminal (its replies are then
+    /// discarded under the host handle's policy), the selection drops
+    /// (its grid refs pointed into the old terminal), and the render
+    /// caches reset so the next `refresh_snapshot` rebuilds every row.
+    pub(super) fn swap_terminal(
+        &mut self,
+        mut terminal: Terminal,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        self.reply_buffer
+            .lock()
+            .map(|mut buffer| buffer.clear())
+            .ok();
+        terminal
+            .set_write_pty_buffer(Arc::clone(&self.reply_buffer))
+            .context("install libghostty PTY reply buffer")?;
+        self.terminal = terminal;
+        self.cols = cols;
+        self.rows = rows;
+        self.selection = TerminalSelection::new();
+        self.scroll = TerminalScroll::new();
+        self.grid = Vec::new();
+        self.cached_grid_size = None;
+        self.cached_defaults = None;
+        self.cached_theme_generation = None;
+        Ok(())
+    }
+
+    /// Resize a host tab's client terminal directly — the attach
+    /// machine's mirror of a RESIZE frame it just queued. Bypasses the
+    /// `apply_geometry` transaction on purpose: there is no PTY to
+    /// report to (the server owns it), replies are discarded under the
+    /// host handle's policy, and the machine already owns latest-wins.
+    pub(super) fn resize_for_host(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_w: u32,
+        cell_h: u32,
+    ) -> Result<()> {
+        self.terminal
+            .resize(cols, rows, cell_w.max(1), cell_h.max(1))?;
+        let _ = self.take_terminal_replies();
+        self.cols = cols;
+        self.rows = rows;
+        self.hover_url = None;
+        self.last_pointer_cell = self.last_pointer_cell.map(|(col, row)| {
+            (
+                col.min(cols.saturating_sub(1)),
+                row.min(rows.saturating_sub(1)),
+            )
+        });
+        Ok(())
     }
 
     /// Apply a chunk of terminal output that has ALREADY been scanned

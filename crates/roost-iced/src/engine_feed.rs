@@ -22,7 +22,7 @@ use iced::Subscription;
 use roost_engine::ipc::UiRequest;
 use roost_engine::session::TabOutput;
 use roost_engine::{Workspace, WorkspaceEvent};
-use roost_ui_model::keys::TabKey;
+use roost_ui_model::keys::{HostId, TabKey};
 use tokio::sync::{mpsc, Notify};
 
 use crate::app::{AgentMetricsResult, ProviderRunResult};
@@ -41,6 +41,12 @@ pub(crate) enum EngineFeed {
     /// backend's items can never land on another backend's tab that
     /// happens to carry the same numeric id.
     Tab(TabKey, TabOutput),
+    /// One attached host tab's data-plane traffic: handshake outcomes,
+    /// SNAP/PTY/EXIT/ERROR frames off the data connection, and the
+    /// attach machinery's own timers. Background tasks only move the
+    /// frames; the decoder and the client terminal they drive live in
+    /// the per-tab attach state on the main thread (plan 037 §3.3).
+    HostTab(TabKey, crate::app::host_tab::HostTabFrame),
     UiRequest(UiRequest),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
@@ -57,6 +63,23 @@ pub(crate) enum EngineFeed {
     NotificationActivated {
         tab: TabKey,
     },
+    /// One connected host's workspace mirror moving forward, tagged with
+    /// the connection *instance* that produced it.
+    ///
+    /// [`EngineFeed::Workspace`] stays untagged and local-only: the
+    /// in-process workspace is the one every existing consumer means by
+    /// "the workspace", and giving it a tag would have been a rename of
+    /// every call site for no gain. A host's mirror is a different
+    /// thing arriving on the same ordered channel — which is what keeps
+    /// a remote `tab.opened` ordered against the local events around it.
+    ///
+    /// Carries no copy of the mirror: the connection task writes the
+    /// shared one in place, so this is a wake plus the envelopes that
+    /// have to be exact per commit.
+    HostWorkspace(HostId, crate::host_conn::HostWorkspaceEvent),
+    /// One host's connection lifecycle, for the sidebar headers,
+    /// takeover banner and upgrade dialog.
+    HostState(HostId, crate::host_conn::HostConnState),
 }
 
 /// The only way to put an item on the feed. Raw senders are never handed
@@ -104,10 +127,31 @@ impl EngineFeedReceiver {
         }
         let item = self.rx.try_recv().ok()?;
         batch.items += 1;
-        let workspace = matches!(item, EngineFeed::Workspace(_));
+        // A host's mirror and its connection lifecycle are workspace
+        // state too — the sidebar's rows, the tab bar and the palettes
+        // read them through the same reconciled caches the local
+        // snapshot lands in. Classifying them here (rather than marking
+        // the batch from their arms) is what puts them in front of the
+        // mid-drain reconcile a later `UiRequest` pulls forward, so an
+        // IPC read in the same batch answers from a cache that already
+        // contains the host mutation that preceded it.
+        let workspace = matches!(
+            item,
+            EngineFeed::Workspace(_) | EngineFeed::HostWorkspace(..) | EngineFeed::HostState(..)
+        );
         let tab_bytes = matches!(
             item,
             EngineFeed::Tab(_, TabOutput::Bytes(_) | TabOutput::Scanned { .. })
+                // `StepDecoder` joins them: it only steps history pages
+                // or finishes the swap, so it moves terminal state and
+                // never workspace state — a batch carrying one must not
+                // pay a full reconcile.
+                | EngineFeed::HostTab(
+                    _,
+                    crate::app::host_tab::HostTabFrame::Pty { .. }
+                        | crate::app::host_tab::HostTabFrame::Snap { .. }
+                        | crate::app::host_tab::HostTabFrame::StepDecoder { .. }
+                )
         );
         batch.workspace_events |= workspace;
         batch.non_tab_bytes |= !tab_bytes;
@@ -475,6 +519,44 @@ mod tests {
             batch.workspace_events && batch.non_tab_bytes,
             "the whole-batch stats keep describing the whole batch"
         );
+    }
+
+    /// A host's mirror and its connection lifecycle are workspace state:
+    /// the sidebar rows, tab bar and palettes read them through the same
+    /// reconciled caches. So an IPC read later in the batch has to be
+    /// preceded by the mid-drain reconcile, exactly as a local event's is
+    /// — which is a fact about the classification, not about the arms
+    /// that apply them.
+    #[tokio::test]
+    async fn a_host_mirror_or_lifecycle_item_dirties_the_batch_like_a_workspace_event() {
+        for item in [
+            EngineFeed::HostWorkspace(
+                HostId::new(3),
+                crate::host_conn::HostWorkspaceEvent::Applied {
+                    revision: 1,
+                    events: Vec::new(),
+                },
+            ),
+            EngineFeed::HostState(HostId::new(3), crate::host_conn::HostConnState::Connected),
+        ] {
+            let (tx, mut rx) = channel();
+            assert!(tx.send(item));
+            assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+
+            let mut batch = EngineBatch::default();
+            assert!(rx.try_next(&mut batch).is_some());
+            assert!(
+                batch.workspace_dirty(),
+                "a request behind this item would read a stale host cache"
+            );
+            assert!(batch.workspace_events && batch.should_reconcile());
+            batch.mark_reconciled();
+            assert!(rx.try_next(&mut batch).is_some());
+            assert!(
+                !batch.workspace_dirty(),
+                "and the request itself is not a workspace event"
+            );
+        }
     }
 
     /// The other half of the lifecycle: a reconcile clears the slate, and

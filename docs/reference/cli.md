@@ -107,9 +107,12 @@ Prints `key=value` lines, not JSON. Useful for verifying the socket is reachable
 ```bash
 roostctl tab focus               # focus the calling shell's tab
 roostctl tab focus --tab 7
+roostctl tab focus --tab h3.7    # a tab on connected host 3 (host sessions)
 ```
 
 Raises the window, switches the active project, selects the tab. Used as the click-through target for desktop banners.
+
+`--tab` also accepts the host-qualified `h<host>.<id>` spelling (see [Host Sessions](../guides/host-sessions.md)) on a UI target — selects that host's tab in the sidebar rather than reporting a local previous selection. Against a bare session socket the qualified form is `invalid-param`: a session has no UI to hold a selection.
 
 ## `tab list`
 
@@ -161,6 +164,8 @@ roostctl tab dump --tab 5 --json   # full result: dims + cursor + rows
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
 `tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
+
+`--tab` on `dump` (and the `tab.dump_resolved` op, plus the test-only `tab.capture_pty_input`) accepts the same host-qualified `h<host>.<id>` spelling `tab focus` does, reading an attached host tab's **client-side** terminal — the UI's own copy, distinct from the session's own `tab dump` served over its socket. See [Host Sessions](../guides/host-sessions.md).
 
 ## `wait`
 
@@ -298,6 +303,28 @@ is a real fault and exits 1, not 3.
 | `session start` | a session confirmed serving (fresh or already-running) | spawn failed, or no session answered `session.identify` within the confirm window | — |
 | `session stop` | stopped, or already not running | a socket exists but never answered, or the reap timed out | — |
 | `session status` | a session answered; identity printed | a socket exists but would not answer | no session is running |
+
+## `host` subcommands
+
+Manage the **client-side** saved-host registry for [host sessions](../guides/host-sessions.md) — `add`, `list`, `remove`, `connect`, `disconnect`. Unlike `session`, a saved host is UI state (`Workspace.hosts` in the running UI's own `state.json`), not a session daemon's workspace — so every verb here addresses the ordinary UI socket (`--target` / auto-detect / `ROOST_BUNDLE_PROFILE`, same as `tab`/`project`), never `--socket` against a session. Each verb drives the matching `host.*` IPC op one-to-one, so the CLI can never diverge from what a palette click does. See [ipc.md](ipc.md) for the wire.
+
+```bash
+roostctl host add --label pop-os --target /home/charlie/.local/state/roost/roost-session.sock
+roostctl host add --label pop-os --target ~/.roost-session.sock --verify
+roostctl host list
+roostctl host list --json
+roostctl host remove --id 3f9a2b7c1d4e4f5a
+roostctl host connect --id 3f9a2b7c1d4e4f5a
+roostctl host disconnect --id 3f9a2b7c1d4e4f5a
+```
+
+`host add` is **registry-only by default**: it saves `--label`/`--target` without dialing anything, so a typo'd socket path still saves cleanly — the sidebar's connection dot is what reports it at the next connect attempt. `--verify` additionally dials `session.identify` against `--target` first (through the same `localhost` sentinel resolution `roost_ipc::session_launch` and the Add Host dialog's own "Add & Connect" both use) and refuses to save on an unreachable or incompatible session — the CLI equivalent of the dialog's validation, stated once so the two bars cannot drift apart.
+
+`host connect` is unconditional takeover (reconnecting to an already-connected host IS takeover on this wire) and, on a `localhost` target, spawns the session first if nothing is listening. It returns once the attempt is under way, not once it settles — watch the sidebar or poll `host list` for the connected/taken-over/needs-restart outcome. `host disconnect` never stops the session; its shells keep running and a later connect picks them back up.
+
+There is no `roostctl host stop`: the palette's **Stop Session** verb goes straight onto the host's own connection as an ordinary `session.stop`, not through a client-side `host.*` op, so there is nothing yet for a CLI verb to drive.
+
+**Swift Mac app note:** `roostctl host *` against `--target mac` answers `unknown-op` — a documented, permanent boundary, not a gap. Host sessions are iced-only (the Linux `roost` build and the experimental Roost-Iced Mac app); the Swift `Roost.app` never grows this surface.
 
 ## `doctor`
 

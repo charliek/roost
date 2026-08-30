@@ -7,6 +7,8 @@ pub mod bracketed_paste;
 pub mod config;
 pub mod custom_command;
 pub mod drop_content;
+pub mod host_sidebar;
+pub mod host_verbs;
 pub mod keybind;
 pub mod keys;
 pub mod notification_inbox;

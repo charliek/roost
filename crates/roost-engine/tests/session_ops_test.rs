@@ -133,6 +133,52 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
     assert_eq!(open_tab_reporting_size(&f, None).await, (80, 24));
 }
 
+/// The mirror of the UI-socket rule: the host registry is client-side
+/// state (D8), so a session daemon must not serve `host.*` — a fall-
+/// through would grow a shadow registry in the daemon's own state.json.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_socket_does_not_know_the_host_ops() {
+    let f = fixture(true);
+
+    for (op, params) in [
+        (
+            ops::HOST_ADD,
+            serde_json::json!({"label": "shed", "target": "localhost"}),
+        ),
+        (ops::HOST_REMOVE, serde_json::json!({"id": "abc"})),
+        (ops::HOST_LIST, serde_json::json!({})),
+        (ops::HOST_CONNECT, serde_json::json!({"id": "abc"})),
+        (ops::HOST_DISCONNECT, serde_json::json!({"id": "abc"})),
+    ] {
+        let err = call(&f.handler, op, params)
+            .await
+            .expect_err("a session socket must not serve host ops");
+        assert_eq!(err.code, "unknown-op", "{op}");
+    }
+    assert!(
+        f.workspace.hosts().is_empty(),
+        "no shadow registry entry may have been created"
+    );
+}
+
+/// A session's tab ids are one bare id-space; the `h<host>.<id>` wire
+/// spelling names a UI's client-side tab and is refused by name rather
+/// than silently narrowed to a number (plan 037 §3.4). The refusal
+/// lives in the server-VT `served` twins — a featureless build's stub
+/// falls through to the (absent) UI path instead, so the test rides
+/// the feature.
+#[cfg(feature = "server-vt")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_socket_refuses_host_qualified_tab_refs() {
+    let f = fixture(true);
+    for op in [ops::TAB_DUMP, ops::TAB_DUMP_RESOLVED] {
+        let err = call(&f.handler, op, serde_json::json!({"tab_id": "h3.7"}))
+            .await
+            .expect_err("a host-qualified ref must be refused");
+        assert_eq!(err.code, "invalid-param", "{op}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_identify_reports_the_installed_identity() {
     let f = fixture(true);

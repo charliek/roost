@@ -1,0 +1,9 @@
+{
+  "event": "tab.effect",
+  "data": {
+    "tab_id": "5",
+    "effect": "clipboard-write",
+    "data": "aGVsbG8=",
+    "target": "system"
+  }
+}

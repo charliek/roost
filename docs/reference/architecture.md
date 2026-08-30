@@ -42,6 +42,8 @@ crates/
   roost-cli/              # roostctl binary
   roost-iced/             # iced UI — packaged .deb ships it as /usr/bin/roost;
                           #   src/macos/ holds the AppKit seams for Roost-Iced.app
+  roost-session/          # opt-in headless host-session daemon (roost-session binary);
+                          #   Linux-only, started with `roostctl session start`
 mac/
   Sources/Roost/          # Swift Mac UI — embeds Workspace + PtySupervisor + IPC server
   Resources/              # themes, Info.plist.template, Info-iced.plist.template, entitlements
@@ -71,16 +73,20 @@ flowchart LR
     Stripe["sidebar rollup stripe"]
     Banner["desktop notification"]
     IPC["JSON IPC server"]
+    Session["roost-session<br/>(opt-in host, Linux)"]
 
     CLI --> IPC
     Hook --> IPC
     IPC --> Workspace
     OSC --> PTY --> Scanner --> Workspace
     Workspace --> UI
+    Session -- "events + tab.effect<br/>(host mirror)" --> UI
     UI --> Indicator
     UI --> Stripe
     UI --> Banner
 ```
+
+**The session/client edge is the one path that skips `Workspace`.** A `roost-session` a UI has connected to (host sessions, `docs/development/host-sessions.md`) is a *separate* in-process workspace running on another machine or process; its tabs never enter this UI's own `Workspace`. Instead `HostConn` mirrors that session's events straight into the UI event handler, so a host tab's bell, clipboard write (`tab.effect`), and attention notifications reach the same output surfaces a local tab's do: the notification inbox, the desktop banner, the sidebar's rows and dots, and the agents palette. Those surfaces are host-*aware* where identity matters — every row is keyed by `TabKey`, so a host tab and a local tab that share a number can never be confused, and the agents palette names the host in each row's context — and host-*blind* in what they render, since a remote row is drawn by the same widgets as a local one.
 
 The wire surface is small enough to inspect by hand:
 

@@ -207,6 +207,48 @@ fn agents_vector_file_decodes_as_typed_palette_state() {
     );
 }
 
+/// The host connection ops, decoded as the types the engine and
+/// `roostctl` actually use. `deny_unknown_fields` on the params makes
+/// this a real check on both directions: a vector that grew a field the
+/// struct has no name for fails here rather than at a user's socket.
+#[test]
+fn host_connection_vectors_decode_as_typed_params_and_results() {
+    fn vector(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/../../tests/ipc-vectors/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    }
+
+    let request = vector("host.connect.request.json");
+    assert_eq!(request["op"], ops::HOST_CONNECT);
+    let params: HostConnectParams =
+        serde_json::from_value(request["params"].clone()).expect("host.connect params decode");
+    assert_eq!(params.id, "3f9a2b7c1d4e4f5a");
+    assert_eq!(serde_json::to_value(&params).unwrap(), request["params"]);
+
+    let response = vector("host.connect.response.json");
+    let result: HostConnectionResult =
+        serde_json::from_value(response["result"].clone()).expect("host.connect result decode");
+    assert_eq!(result.state, host_state::CONNECTING);
+    assert_eq!(result.host.label, "pop-os");
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+
+    let request = vector("host.disconnect.request.json");
+    assert_eq!(request["op"], ops::HOST_DISCONNECT);
+    let params: HostDisconnectParams =
+        serde_json::from_value(request["params"].clone()).expect("host.disconnect params decode");
+    assert_eq!(params.id, result.host.id);
+
+    let response = vector("host.disconnect.response.json");
+    let result: HostConnectionResult =
+        serde_json::from_value(response["result"].clone()).expect("host.disconnect result decode");
+    assert_eq!(result.state, host_state::DISCONNECTED);
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+}
+
 #[test]
 fn malformed_agent_payload_decodes_to_none_not_error() {
     for junk in [

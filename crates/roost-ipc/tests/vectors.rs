@@ -333,6 +333,63 @@ fn the_revision_fence_vectors_decode_into_their_typed_results() {
     assert!(!re.as_object().unwrap().contains_key("revision"));
 }
 
+/// The saved-host registry (`host.*`, plan 037 C1) is the newest
+/// UI-socket op family; decode both request vectors and the list
+/// response into their typed structs so a field-name or
+/// `last_connected: null`-vs-omitted drift fails here rather than in
+/// `roostctl` or a future `HostConn`.
+#[test]
+fn host_vectors_decode_into_their_typed_params() {
+    use roost_ipc::messages::{
+        ops, HostAddParams, HostAddResult, HostListResult, HostRemoveParams, RawRequest, Response,
+    };
+
+    let mut path = vectors_dir();
+    path.push("host.add.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::HOST_ADD);
+    let params: HostAddParams = serde_json::from_value(req.params).expect("decode host.add params");
+    assert_eq!(params.label, "pop-os");
+    assert_eq!(
+        params.target,
+        "/home/charlie/.local/state/roost/roost-session.sock"
+    );
+
+    let mut path = vectors_dir();
+    path.push("host.add.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let resp: Response = serde_json::from_str(&raw).expect("decode response envelope");
+    let result: HostAddResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode result");
+    assert_eq!(result.host.id, "3f9a2b7c1d4e4f5a");
+    assert_eq!(result.host.label, "pop-os");
+    assert_eq!(result.host.last_connected, None);
+
+    let mut path = vectors_dir();
+    path.push("host.remove.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::HOST_REMOVE);
+    let params: HostRemoveParams =
+        serde_json::from_value(req.params).expect("decode host.remove params");
+    assert_eq!(params.id, "3f9a2b7c1d4e4f5a");
+
+    let mut path = vectors_dir();
+    path.push("host.list.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let resp: Response = serde_json::from_str(&raw).expect("decode response envelope");
+    let result: HostListResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode result");
+    assert_eq!(result.hosts.len(), 2);
+    assert_eq!(
+        result.hosts[0].last_connected.as_deref(),
+        Some("2026-08-27T00:00:00Z")
+    );
+    assert_eq!(result.hosts[1].label, "shed");
+    assert_eq!(result.hosts[1].last_connected, None);
+}
+
 /// The two reorder events joined the wire catalog with the push
 /// implementation (plan 035 C4). Their ids are string-encoded *inside a
 /// list*, which is the encoding a JSON client is most likely to get

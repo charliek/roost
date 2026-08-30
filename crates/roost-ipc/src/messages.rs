@@ -14,6 +14,8 @@
 //! attribute — clients see them as permissive, allowing the server
 //! to add fields in a backwards-compatible way.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
@@ -331,8 +333,9 @@ pub struct TabResizeParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabDumpParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id, or the `h<host>.<id>` wire spelling for an
+    /// attached host tab's client-side terminal (UI socket only).
+    pub tab_id: WireTabRef,
 }
 
 /// Cursor position within the dumped viewport, 0-indexed from the top-left.
@@ -648,8 +651,10 @@ pub struct TabFeedPtyBytesParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabCapturePtyInputParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id, or the `h<host>.<id>` wire spelling for an
+    /// attached host tab (UI socket only) — the capture then reads the
+    /// INPUT-frame bytes the UI queued toward that host.
+    pub tab_id: WireTabRef,
     #[serde(default)]
     pub drain: bool,
 }
@@ -693,8 +698,9 @@ pub struct TabFeedImeParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabDumpResolvedParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id, or the `h<host>.<id>` wire spelling for an
+    /// attached host tab's client-side terminal (UI socket only).
+    pub tab_id: WireTabRef,
 }
 
 /// `tab.expand_selection_at` request: drive the same double-/triple-
@@ -1064,8 +1070,12 @@ pub struct ProjectReorderParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabFocusParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id for a local tab, or the `h<host>.<id>` spelling to
+    /// select (and attach) a connected host's tab — the op form of the
+    /// sidebar click, which is what makes the attach path drivable from
+    /// a test or `roostctl` (plan 037 §3.4's wire spelling, §7's
+    /// ops-parity rule).
+    pub tab_id: WireTabRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1712,6 +1722,38 @@ pub struct AttachHandshake {
     pub tab_generation: Option<u64>,
 }
 
+impl AttachHandshake {
+    /// A fresh attach: the ticket [`ops::TAB_ATTACH`] minted, and a
+    /// full snapshot stream behind it.
+    pub fn snapshot(attach_token: impl Into<String>) -> Self {
+        AttachHandshake {
+            attach: attach_token.into(),
+            protocol_version: SESSION_PROTOCOL_VERSION,
+            ..AttachHandshake::default()
+        }
+    }
+
+    /// Ask for the stream from `from_seq` on instead of a new snapshot.
+    ///
+    /// The identity triple is what makes a stale stream unresumable by
+    /// construction, so it is not optional here even though serde
+    /// tolerates its absence: a miss on any of the three is answered
+    /// with `mode: "snapshot"` in the same reply, never an error.
+    pub fn resume(
+        attach_token: impl Into<String>,
+        from_seq: u64,
+        server_epoch: u64,
+        tab_generation: u64,
+    ) -> Self {
+        AttachHandshake {
+            resume_from_seq: Some(from_seq),
+            server_epoch: Some(server_epoch),
+            tab_generation: Some(tab_generation),
+            ..AttachHandshake::snapshot(attach_token)
+        }
+    }
+}
+
 /// How the server chose to serve an accepted handshake.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1836,6 +1878,201 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
 }
 
 // ============================================================================
+// Host registry (client-side saved hosts, host-sessions HS-2)
+// ============================================================================
+
+/// A saved host, as the UI socket's `host.*` ops carry it. Mirrors
+/// `roost-engine`'s `persistence::HostSnapshot` field-for-field; kept as
+/// a separate type because this crate does not depend on `roost-engine`
+/// (the wire is the shared vocabulary, not the storage struct).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Host {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub last_connected: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAddParams {
+    pub label: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAddResult {
+    pub host: Host,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRemoveParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostListParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostListResult {
+    pub hosts: Vec<Host>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConnectParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDisconnectParams {
+    pub id: String,
+}
+
+/// What `host.connect` / `host.disconnect` answer: the saved host and
+/// the connection state the request left it in.
+///
+/// The state is what the client asked *for*, not the far end's verdict:
+/// `host.connect` starts an attempt and answers `connecting`, because
+/// waiting for a dial, an identify and a lease before replying would
+/// block the caller on a remote round trip it can watch on the events
+/// stream instead. A caller that wants the settled answer polls
+/// `host.list` / the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostConnectionResult {
+    pub host: Host,
+    /// One of [`host_state`]'s spellings.
+    pub state: String,
+}
+
+/// The wire spellings of a host's connection state, shared by
+/// `host.connect`, `host.disconnect`, and anything that reports one.
+///
+/// Kebab-case to match the error codes beside them on this wire
+/// (`taken-over`, `build-mismatch`).
+pub mod host_state {
+    pub const DISCONNECTED: &str = "disconnected";
+    pub const CONNECTING: &str = "connecting";
+    pub const CONNECTED: &str = "connected";
+    pub const TAKEN_OVER: &str = "taken-over";
+    pub const STOPPED: &str = "stopped";
+    pub const NEEDS_RESTART: &str = "needs-restart";
+}
+
+// ============================================================================
+// HS-2 server-side additions: effects envelopes + theme reseed
+// ============================================================================
+//
+// Both are additive (plan 037 §3.6): a new event name inside the
+// existing `EventBatch` and a new lease-gated session op. Old clients
+// ignore an event they have no name for, so `SESSION_PROTOCOL_VERSION`
+// stays 2.
+
+/// Which client-directed effect a [`TabEffectEvent`] carries.
+///
+/// Deliberately short: HS-2 ships **bell** and **OSC 52 clipboard
+/// writes** only. Every other client-local OSC effect (pointer shape,
+/// today) stays dropped + debug-logged in the tab task — an envelope
+/// design invites "just one more effect", so the set is pinned rather
+/// than open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TabEffect {
+    /// A BEL byte reached the tab's terminal outside any escape
+    /// sequence. Carries no `data`.
+    Bell,
+    /// An OSC 52 clipboard write. `data` is the decoded payload,
+    /// base64-encoded per the wire's bytes convention.
+    ClipboardWrite,
+}
+
+/// Which selection an [`TabEffect::ClipboardWrite`] targets. Mirrors
+/// `roost_osc::ClipboardTarget`: OSC 52's `c` selector (and the empty
+/// default) is [`System`](Self::System), `p`/`s` is
+/// [`Selection`](Self::Selection).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardEffectTarget {
+    #[default]
+    System,
+    Selection,
+}
+
+/// `tab.effect` event data — one client-local effect a session's tab
+/// produced, for the attached client to apply.
+///
+/// `data` is present only for [`TabEffect::ClipboardWrite`], where it
+/// carries the decoded clipboard text base64-encoded (standard
+/// alphabet, like every other bytes field). The server caps it at
+/// [`CLIPBOARD_EFFECT_MAX_BYTES`] decoded and drops anything larger, so
+/// a client never has to bound it a second time. **The payload is user
+/// data: never log it.**
+///
+/// `target` is present on clipboard writes too, so a primary-selection
+/// write does not land on the system clipboard. Absent means
+/// [`ClipboardEffectTarget::System`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabEffectEvent {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    pub effect: TabEffect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ClipboardEffectTarget>,
+}
+
+/// Decoded-size cap on a [`TabEffect::ClipboardWrite`] payload. The
+/// OSC 52 scanner already bounds a body at 1 MiB; this is the smaller,
+/// policy bound on what a session will fan out to a client
+/// (architecture §6's bounded-size rule). Oversized writes are dropped
+/// and debug-logged by size, never by content.
+pub const CLIPBOARD_EFFECT_MAX_BYTES: usize = 256 * 1024;
+
+/// One full terminal palette, as the client's theme states it.
+///
+/// Colors ride as `#rrggbb` strings, the spelling `tab.dump_resolved`
+/// already uses, so a theme is readable in a wire trace. `palette` is
+/// exactly 256 entries — a short or long one is `invalid-param` rather
+/// than a partially applied theme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OscColorsParams {
+    pub foreground: String,
+    pub background: String,
+    pub cursor: String,
+    pub palette: Vec<String>,
+}
+
+/// [`ops::SESSION_SET_THEME`] params: seed every tab's server terminal
+/// with the attached client's palette.
+///
+/// Lease-gated, like every other interactive session op — a client that
+/// does not drive the session does not get to recolor it. Applies to
+/// the tabs that exist now **and** is remembered for tabs the session
+/// opens later, so a client sends it once after `session.connect`
+/// (before the first `tab.attach`) and again whenever its theme
+/// changes. Concurrent callers are last-writer-wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSetThemeParams {
+    pub lease: String,
+    pub osc_colors: OscColorsParams,
+}
+
+/// [`ops::SESSION_SET_THEME`] result: how many live tabs were reseeded.
+/// Zero is a success — a session with no tabs still records the theme
+/// for the ones it opens next.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetThemeResult {
+    pub tabs: u32,
+}
+
+// ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
 
@@ -1880,6 +2117,10 @@ pub mod ops {
     /// release it, so a reconnecting client always arrives as a
     /// takeover.
     pub const SESSION_CONNECT: &str = "session.connect";
+    /// Seed every tab's server terminal with the attached client's
+    /// theme palette, and remember it for the tabs opened next. Lease-
+    /// gated; last-writer-wins between concurrent clients.
+    pub const SESSION_SET_THEME: &str = "session.set_theme";
     /// Ask for a ticket to open a data connection for one tab. The
     /// control-plane half of an attach: it negotiates payload kind,
     /// build identity, and geometry on stable JSON, and hands back a
@@ -2044,6 +2285,27 @@ pub mod ops {
     /// tabs moved plus the full post-reorder order.
     pub const EVENT_TABS_REORDERED: &str = "tabs.reordered";
     pub const EVENT_PROJECTS_REORDERED: &str = "projects.reordered";
+    /// One client-local effect a session tab produced — bell, or an
+    /// OSC 52 clipboard write. A session has no view of its own, so
+    /// these only mean anything to an attached client;
+    /// [`crate::messages::TabEffectEvent`] is the payload.
+    pub const EVENT_TAB_EFFECT: &str = "tab.effect";
+
+    /// Client-side saved-host registry and its connections
+    /// (host-sessions HS-2, plan 037 §3.5). Every palette host verb has
+    /// its equivalent here, so the UI, `roostctl` and future Lua all
+    /// drive one path.
+    pub const HOST_ADD: &str = "host.add";
+    pub const HOST_REMOVE: &str = "host.remove";
+    pub const HOST_LIST: &str = "host.list";
+    /// Start a connection to a saved host — the palette's
+    /// `Connect Host: <label>` and the sidebar's ↻ Reconnect. An
+    /// explicit connect is unconditional takeover, and may start a
+    /// localhost session that is not running.
+    pub const HOST_CONNECT: &str = "host.connect";
+    /// Drop a saved host's connection. Never Stop: the session keeps
+    /// running and its shells with it (roadmap D8).
+    pub const HOST_DISCONNECT: &str = "host.disconnect";
 }
 
 // ============================================================================
@@ -2064,6 +2326,87 @@ pub mod string_int64 {
         let raw = String::deserialize(de)?;
         raw.parse::<i64>()
             .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
+    }
+}
+
+// ============================================================================
+// Wire tab reference — bare id or host-qualified spelling
+// ============================================================================
+
+/// A wire-facing tab reference: the bare string-wrapped engine id every
+/// existing caller sends (`"5"`), or the host-qualified `h<host>.<id>`
+/// spelling the UI's keyed maps use (`"h3.7"`) — host-sessions plan 037
+/// §3.4. The UI socket's dump/capture ops accept both, resolving the
+/// qualified form to the client-side terminal of an attached host tab;
+/// a session socket (whose ids are one bare id-space by design) narrows
+/// with [`Self::local`] and answers `invalid-param` for a qualified ref.
+///
+/// The parser is canonical, mirroring `roost-ui-model`'s
+/// `TabKey::from_wire`: `from(s)` round-trips to exactly `s`, so `h0.7`
+/// (local is always bare), `+7`, and leading zeros are rejected rather
+/// than normalized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireTabRef {
+    Local(i64),
+    Host { host: u32, tab: i64 },
+}
+
+/// `Local(0)` — the same "no tab named" a defaulted string-wrapped id
+/// decoded to before this type existed.
+impl Default for WireTabRef {
+    fn default() -> Self {
+        Self::Local(0)
+    }
+}
+
+impl WireTabRef {
+    /// The bare engine id, or `None` for a host-qualified ref — the
+    /// narrowing every host-unaware consumer applies.
+    pub fn local(self) -> Option<i64> {
+        match self {
+            Self::Local(tab) => Some(tab),
+            Self::Host { .. } => None,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let parsed = match text.strip_prefix('h') {
+            Some(qualified) => {
+                let (host, tab) = qualified.split_once('.')?;
+                Self::Host {
+                    host: host.parse().ok()?,
+                    tab: tab.parse().ok()?,
+                }
+            }
+            None => Self::Local(text.parse().ok()?),
+        };
+        if let Self::Host { host: 0, .. } = parsed {
+            return None;
+        }
+        (parsed.to_string() == text).then_some(parsed)
+    }
+}
+
+impl fmt::Display for WireTabRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(tab) => write!(f, "{tab}"),
+            Self::Host { host, tab } => write!(f, "h{host}.{tab}"),
+        }
+    }
+}
+
+impl Serialize for WireTabRef {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for WireTabRef {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        Self::parse(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid tab reference: {raw}")))
     }
 }
 
@@ -2112,6 +2455,20 @@ pub mod bytes_base64 {
             .decode(raw.as_bytes())
             .map_err(|e| serde::de::Error::custom(format!("invalid base64: {e}")))
     }
+
+    /// The same encoding, for a field that carries its base64 as a
+    /// `String` rather than through a `#[serde(with = ...)]` hook —
+    /// [`super::TabEffectEvent::data`], which is optional and minted
+    /// engine-side. One alphabet, one place.
+    #[must_use]
+    pub fn encode(bytes: &[u8]) -> String {
+        STANDARD.encode(bytes)
+    }
+
+    /// [`encode`]'s inverse, for the client applying such a field.
+    pub fn decode(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
+        STANDARD.decode(text.as_bytes())
+    }
 }
 
 // ============================================================================
@@ -2130,6 +2487,66 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(value, &back, "round-trip mismatch via {}", json);
+    }
+
+    /// The wire-form tab ref (plan 037 §3.4): bare stays byte-identical
+    /// to the pre-keys wire, host-qualified round-trips, and only
+    /// canonical spellings parse — an aliased spelling would let a
+    /// crafted ref reach a tab its literal text never named.
+    #[test]
+    fn wire_tab_ref_parses_canonically() {
+        assert_eq!(WireTabRef::parse("5"), Some(WireTabRef::Local(5)));
+        assert_eq!(
+            WireTabRef::parse("h3.7"),
+            Some(WireTabRef::Host { host: 3, tab: 7 })
+        );
+        for rejected in ["", "h0.7", "+7", "07", "h3.07", "h3.", "h.7", "3.7", "h3x7"] {
+            assert_eq!(WireTabRef::parse(rejected), None, "{rejected:?}");
+        }
+        round_trip(&WireTabRef::Local(5));
+        round_trip(&WireTabRef::Host { host: 3, tab: 7 });
+        assert_eq!(
+            serde_json::to_string(&WireTabRef::Local(5)).unwrap(),
+            "\"5\"",
+            "bare refs stay byte-identical on the wire"
+        );
+        assert_eq!(
+            serde_json::to_string(&WireTabRef::Host { host: 3, tab: 7 }).unwrap(),
+            "\"h3.7\""
+        );
+        let params: TabDumpParams = serde_json::from_str(r#"{"tab_id": "h3.7"}"#).unwrap();
+        assert_eq!(params.tab_id, WireTabRef::Host { host: 3, tab: 7 });
+    }
+
+    /// Every op that names a tab the UI can render takes the same
+    /// reference type — the dumps, the capture, and `tab.focus`, which
+    /// is what makes attaching a host tab drivable from a test or
+    /// `roostctl` rather than only by clicking (plan 037 §7's
+    /// ops-parity rule).
+    #[test]
+    fn the_tab_naming_ops_share_one_reference_type() {
+        let bare = r#"{"tab_id": "5"}"#;
+        let qualified = r#"{"tab_id": "h3.7"}"#;
+        for raw in [bare, qualified] {
+            let want = serde_json::from_str::<TabDumpParams>(raw).unwrap().tab_id;
+            assert_eq!(
+                serde_json::from_str::<TabFocusParams>(raw).unwrap().tab_id,
+                want,
+                "tab.focus reads {raw}"
+            );
+            assert_eq!(
+                serde_json::from_str::<TabDumpResolvedParams>(raw)
+                    .unwrap()
+                    .tab_id,
+                want
+            );
+            assert_eq!(
+                serde_json::from_str::<TabCapturePtyInputParams>(raw)
+                    .unwrap()
+                    .tab_id,
+                want
+            );
+        }
     }
 
     #[test]
@@ -2434,7 +2851,7 @@ mod tests {
     #[test]
     fn tab_capture_pty_input_params_default_drain_is_false() {
         let p: TabCapturePtyInputParams = serde_json::from_str(r#"{"tab_id":"5"}"#).unwrap();
-        assert_eq!(p.tab_id, 5);
+        assert_eq!(p.tab_id, WireTabRef::Local(5));
         assert!(!p.drain);
         round_trip(&p);
     }
@@ -2484,7 +2901,7 @@ mod tests {
     #[test]
     fn tab_dump_round_trips_and_cursor_is_optional() {
         let p: TabDumpParams = serde_json::from_str(r#"{"tab_id":"7"}"#).unwrap();
-        assert_eq!(p.tab_id, 7);
+        assert_eq!(p.tab_id, WireTabRef::Local(7));
         round_trip(&p);
 
         let with_cursor = TabDumpResult {

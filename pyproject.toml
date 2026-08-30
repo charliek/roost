@@ -33,4 +33,10 @@ markers = [
     # profile — never a UI. conftest's autouse UI fixture stands down when
     # every collected test carries this marker (see `make e2e-session`).
     "session_daemon: headless roost-session E2E; needs no UI",
+    # Drives a `roost-session` daemon AND the harness UI at once, over the
+    # host-client wire (plan 037). Unlike `session_daemon` it needs a UI, so
+    # conftest's autouse fixture still launches one; the marker exists so the
+    # lane can be selected on its own (`make e2e-host-client`) and deselected
+    # where no session binary is built (see DAEMON_E2E_DESELECT).
+    "host_client: HS-2 host-client E2E; needs a UI *and* a roost-session daemon",
 ]

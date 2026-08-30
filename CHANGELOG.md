@@ -13,6 +13,49 @@ release workflow asserts they agree).
 
 ### Added
 
+- **The iced UI attaches to host sessions (HS-2, #374)** — closing Roost
+  no longer has to kill what is running in it. Save a `roost-session`
+  socket as a **host** (`roostctl host add` or the palette's **Add
+  Host…** dialog, which validates by dialing `session.identify` before
+  saving) and the sidebar grows a per-host section beside your local
+  projects — a connection dot (green connected, amber connecting/needs
+  a restart, grey disconnected), a right-aligned agent rollup, and the
+  same project/tab rows a local workspace renders, agent surfaces and
+  all: the agents palette, the notification inbox, and desktop banners
+  are host-blind. Attaching is on-focus — switching to a host's tab
+  dials that session's data plane, hydrates a client-side terminal
+  from its snapshot (never blanking mid-retry), and detaches when you
+  switch away, so client memory and connections stay bounded at one
+  per host. Disconnect (closing the window, or the palette's
+  **Disconnect Host**) leaves the session's shells running, dimmed but
+  listed, with an inline "↻ Reconnect"; **Stop Session** actually ends
+  them. A second window connecting **takes over** — the displaced
+  window keeps its last frame on screen, dimmed, under a banner with a
+  **Reconnect here** button. On localhost (Linux only — no packaged
+  `roost-session` on macOS yet, so the surface there is Add Host
+  pointed at a remote machine's forwarded socket) a saved host
+  auto-reconnects on launch if the session is already running, never
+  spawning one silently; an explicit Connect spawns it if needed. A
+  build or protocol mismatch — the feature's most common failure mode,
+  hit on every upgrade — puts the host in `needs-restart` and raises a
+  dialog instead of a corrupt screen: **Restart session** composes
+  `session.stop` + relaunch + reconnect client-side (every tab reopens
+  as a fresh shell in its directory; running programs end), and a
+  mismatched *remote* host, which this client cannot restart, gets a
+  docs pointer instead of a dead button. Creation follows context:
+  `⌘N`/`Alt-N` and the **+ New Project** button create on the selected
+  project's host, `⌘⇧N`/`Alt-Shift-N` opens a **New Project on…**
+  host picker, and `⌘T`/`Alt-T` never lands a tab on a different host
+  than its project. Every palette verb has a `roostctl host` (`add`,
+  `list`, `remove`, `connect`, `disconnect`) equivalent driving the
+  identical op, so a script can never diverge from a click. Two small
+  additive server changes ship alongside: a session now forwards a
+  tab's bell and OSC 52 clipboard writes to whichever client holds the
+  lease (`tab.effect` events, 256 KiB clipboard cap), and
+  `session.set_theme` seeds a session's terminals with the connecting
+  client's palette so query replies match what the client actually
+  renders. See the [Host Sessions guide](docs/guides/host-sessions.md)
+  and [`docs/reference/ipc.md`](docs/reference/ipc.md) for the wire.
 - **Host sessions can be attached to: server terminals and a binary
   attach stream (HS-1b, #363)** — every tab a `roost-session` spawns now
   has an authoritative libghostty terminal behind it, fed synchronously by a

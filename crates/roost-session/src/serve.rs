@@ -43,7 +43,7 @@ use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::consts::{
-    DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS, FINALIZE_JOIN_TIMEOUT, SIGNAL_STOP_TIMEOUT,
+    self, DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS, FINALIZE_JOIN_TIMEOUT, SIGNAL_STOP_TIMEOUT,
 };
 use crate::readiness::{Readiness, Verdict};
 use crate::socket_guard::{unlink_if_ours, SocketIdentity, Unlinked};
@@ -76,18 +76,35 @@ pub struct SessionConfig {
     /// process-global env var is neither settable safely from a
     /// `#[tokio::test]` nor scopable to one of them.
     pub test_mode: bool,
+    /// What this session reports as its `libghostty_build`, when a test
+    /// wants it to be something other than the truth.
+    ///
+    /// `None` in every shipped run: [`SessionConfig::from_profile`]
+    /// fills it from [`consts::FAKE_BUILD_ENV`] and only while
+    /// `test_mode` is on, so a production daemon cannot be talked into
+    /// lying about the pin it can actually decode. Carried as a field
+    /// rather than read where it is used, so the environment is
+    /// consulted once, at the edge, and everything downstream reads the
+    /// config — the session e2e lane drives it by spawning a daemon
+    /// with the env var set.
+    pub fake_libghostty_build: Option<String>,
 }
 
 impl SessionConfig {
     /// The shipped configuration for a profile.
     pub fn from_profile(profile: &BundleProfile, launch_cwd: PathBuf) -> Self {
+        let test_mode = std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1");
         Self {
             socket_path: profile.socket_path.clone(),
             state_path: profile.state_json_path(),
             app_label: profile.app_label.to_string(),
             app_id: profile.app_id.to_string(),
             launch_cwd,
-            test_mode: std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1"),
+            test_mode,
+            fake_libghostty_build: test_mode
+                .then(|| std::env::var(consts::FAKE_BUILD_ENV).ok())
+                .flatten()
+                .filter(|value| !value.is_empty()),
         }
     }
 }
@@ -156,7 +173,31 @@ pub async fn serve(
         // session's snapshots, and `tab.attach` refuses it by name
         // rather than letting the mismatch surface as a corrupt screen.
         payload_kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
-        libghostty_build: roost_vt::libghostty_build(),
+        // One string, both uses: what `session.identify` reports and
+        // what `tab.attach` compares against. A test-mode override
+        // therefore makes a build mismatch reproducible end to end
+        // without a second binary (plan 037 §3.7) — and cannot make the
+        // two disagree, which would be a failure mode no client could
+        // make sense of.
+        // `.filter(test_mode)` restates `from_profile`'s gate
+        // structurally: `SessionConfig` is a public struct, so a caller
+        // that hand-builds one with `test_mode: false` and a fake set
+        // still gets the truth.
+        libghostty_build: match config
+            .fake_libghostty_build
+            .clone()
+            .filter(|_| config.test_mode)
+        {
+            Some(fake) => {
+                warn!(
+                    build = %fake,
+                    "reporting a fake libghostty build: {} is set in test mode",
+                    consts::FAKE_BUILD_ENV
+                );
+                fake
+            }
+            None => roost_vt::libghostty_build(),
+        },
         default_tab_size: (DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS),
         test_mode,
     };

@@ -141,15 +141,33 @@ pub(super) fn palette_agent_left_text(name: &str, status: &str) -> (String, Stri
     )
 }
 
+/// The command frame's `PaletteFrame` id, and the "New Project on…"
+/// picker's. Named because three places have to agree: the builder, the
+/// activation's `match frame_id`, and the live refresh that rebuilds the
+/// host rows under an open palette.
+pub(super) const COMMANDS_FRAME_ID: &str = "commands";
+pub(super) const HOST_PICKER_FRAME_ID: &str = "host_targets";
+
+/// Which accelerator a multiply-bound action advertises: the lowest
+/// `(modifiers, key)` pair wins.
+///
+/// Stated once because two callers depend on agreeing — the builder
+/// sorts by it to fill its reverse map, and `App::shortcut_for` takes
+/// the minimum directly. A tie-break that differed between them would
+/// print one accelerator when the palette opened and another after the
+/// next reconcile refreshed the same row.
+fn accel_order(left: &Accel, right: &Accel) -> std::cmp::Ordering {
+    (left.modifiers.bits(), &left.key).cmp(&(right.modifiers.bits(), &right.key))
+}
+
 fn command_palette_frame(
     notification_count: usize,
     providers: &[provider::Provider],
     keybindings: &HashMap<Accel, KeybindAction>,
+    hosts: &[host_verbs::HostRow<'_>],
 ) -> palette::PaletteFrame {
     let mut bindings = keybindings.iter().collect::<Vec<_>>();
-    bindings.sort_by(|(left, _), (right, _)| {
-        (left.modifiers.bits(), &left.key).cmp(&(right.modifiers.bits(), &right.key))
-    });
+    bindings.sort_by(|(left, _), (right, _)| accel_order(left, right));
     let mut reverse = HashMap::new();
     for (accel, action) in bindings {
         reverse.entry(*action).or_insert(accel);
@@ -180,7 +198,48 @@ fn command_palette_frame(
             ),
         );
     }
-    palette::PaletteFrame::new("commands", "Execute a command…", items)
+    // The host verbs sit last, as their own block: they are the only
+    // rows addressed to something outside this window, and the family
+    // reads as a family when it is contiguous (plan 037 §3.1).
+    let picker_shortcut = reverse
+        .get(&KeybindAction::NewProjectOnHost)
+        .and_then(|accel| accel_label(accel));
+    items.extend(host_verb_items(hosts, picker_shortcut.as_deref()));
+    palette::PaletteFrame::new(COMMANDS_FRAME_ID, "Execute a command…", items)
+}
+
+/// The host verb rows, as palette items.
+///
+/// Which verbs exist is `host_verbs`' call — pure, platform-gated, and
+/// tested there. This only dresses them, which is why the shortcut hint
+/// (the one thing the model has no business knowing) is passed in.
+fn host_verb_items(
+    hosts: &[host_verbs::HostRow<'_>],
+    new_project_on_shortcut: Option<&str>,
+) -> Vec<palette::PaletteItem> {
+    host_verbs::verbs(hosts, host_verbs::VerbPolicy::current())
+        .into_iter()
+        .map(|verb| {
+            let trailing = (verb.id == host_verbs::NEW_PROJECT_ON_ID)
+                .then_some(new_project_on_shortcut)
+                .flatten()
+                .map(str::to_string);
+            palette::PaletteItem::new(verb.id, verb.title)
+                .with_subtitle(verb.subtitle)
+                .with_trailing(trailing)
+        })
+        .collect()
+}
+
+/// The "New Project on…" picker (plan 037 §3.1). Same palette surface as
+/// every other frame — the mock's host picker *is* the command palette
+/// one level down.
+fn host_picker_frame(hosts: &[host_verbs::HostRow<'_>]) -> palette::PaletteFrame {
+    let items = host_verbs::create_targets(hosts, host_sidebar::LOCAL_LABEL)
+        .into_iter()
+        .map(|target| palette::PaletteItem::new(target.id, target.title))
+        .collect();
+    palette::PaletteFrame::new(HOST_PICKER_FRAME_ID, "Create on…", items)
 }
 
 fn provider_palette_frame(providers: &[provider::Provider]) -> palette::PaletteFrame {
@@ -777,15 +836,16 @@ impl App {
         report_palette_query_result(&mut self.status, result.map(drop), Instant::now());
     }
 
-    /// The palette's rename rows open the inline editor, so every
-    /// activation route ends with the rename-focus tail rather than
-    /// waiting for a timer to notice the request.
+    /// The palette's rename rows open the inline editor and `Add Host…`
+    /// opens its dialog, so every activation route ends with both focus
+    /// tails rather than waiting for a timer to notice the request.
     pub fn palette_activate(&mut self, id: &str) -> UiTask {
         let (error, task) = self.activate_palette(id).error();
         if let Some(error) = error {
             self.set_status(error);
         }
         task.then(self.take_rename_focus_task())
+            .then(self.take_add_host_focus_task())
     }
 
     pub fn palette_confirm(&mut self) -> UiTask {
@@ -798,6 +858,7 @@ impl App {
             self.rename_editor.is_some(),
         );
         task.then(self.take_rename_focus_task())
+            .then(self.take_add_host_focus_task())
     }
 
     pub fn palette_pointer_dismiss(&mut self) -> UiTask {
@@ -814,15 +875,13 @@ impl App {
                 self.notification_inbox.count(),
                 &self.config.providers,
                 &self.keybindings,
+                &self.host_verb_rows(),
             ),
             "launcher" => launcher_palette_frame(&self.config),
-            "agents" => agent_palette::agent_frame(
-                &self.workspace.snapshot(),
-                self.backend.host(),
-                agent_palette::now_unix(),
-            ),
+            "agents" => self.agent_frame_now(),
             "notifications" => notification_inbox::frame(&self.notification_inbox),
             "custom" => provider_palette_frame(&self.config.providers),
+            HOST_PICKER_FRAME_ID => host_picker_frame(&self.host_verb_rows()),
             _ => return Err(format!("unknown palette kind {kind:?}")),
         };
         self.try_dismiss_palette()?;
@@ -1238,12 +1297,9 @@ impl App {
                     }
                 }
                 palette::PaletteCommands::VIEW_AGENTS_ID => {
+                    let frame = self.agent_frame_now();
                     if let Some(state) = &mut self.palette {
-                        state.push(agent_palette::agent_frame(
-                            &self.workspace.snapshot(),
-                            self.backend.host(),
-                            agent_palette::now_unix(),
-                        ));
+                        state.push(frame);
                     }
                     self.refresh_agent_palette();
                 }
@@ -1347,9 +1403,16 @@ impl App {
                     }
                 }
                 command => {
-                    return Err(format!(
-                        "palette command {command:?} is not implemented by Iced"
-                    ));
+                    // The host verb family (plan 037 §3.1) is the one
+                    // block of command rows built from live state rather
+                    // than from a static spec, so it is matched by id
+                    // shape rather than listed here.
+                    let Some(verb) = host_verbs::parse(command) else {
+                        return Err(format!(
+                            "palette command {command:?} is not implemented by Iced"
+                        ));
+                    };
+                    dispatch = self.run_host_verb(verb)?;
                 }
             },
             "launcher" => {
@@ -1405,6 +1468,14 @@ impl App {
                     None,
                 );
             }
+            HOST_PICKER_FRAME_ID => {
+                let verb = host_verbs::parse(&item.id)
+                    .filter(|verb| matches!(verb, host_verbs::HostVerb::CreateOn(_)));
+                let Some(verb) = verb else {
+                    return Err(format!("host picker row {:?} cannot be activated", item.id));
+                };
+                dispatch = self.run_host_verb(verb)?;
+            }
             "present" => {
                 if let Some(reply) = self.palette_present_reply.take() {
                     let _ = reply.send(Ok(PalettePresentResult {
@@ -1429,6 +1500,178 @@ impl App {
             }
         }
         Ok(dispatch)
+    }
+
+    /// Run one host verb (plan 037 §3.1). Every row in the family lands
+    /// here, and every one of them lands on the same `App` entry a
+    /// `roostctl host` verb reaches through the op set — the palette is
+    /// a surface over the ops, never a second implementation.
+    ///
+    /// Two rows do not act at all: `Add Host…` and `Stop Session` open a
+    /// dialog, because one needs free text and the other needs a
+    /// confirmation. Both dismiss the palette first — a modal behind a
+    /// palette is not a modal.
+    fn run_host_verb(&mut self, verb: host_verbs::HostVerb) -> Result<EngineDispatch, String> {
+        use host_verbs::HostVerb;
+        match verb {
+            HostVerb::Add => {
+                self.clear_palette_state();
+                self.open_add_host_dialog();
+            }
+            HostVerb::ConnectSeed => {
+                // The seeded row is a save and a connect in one gesture:
+                // from the next frame on it is an ordinary saved host,
+                // with the ordinary verbs.
+                self.clear_palette_state();
+                self.host_add_requested(
+                    host_verbs::SEED_LABEL,
+                    crate::host_conn::LOCALHOST_TARGET,
+                    true,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            HostVerb::Connect(saved_id) => {
+                self.clear_palette_state();
+                // The gated entry: a build mismatch answers this verb
+                // with the upgrade prompt rather than a dial that would
+                // fail the same way again (plan 037 §3.7).
+                self.host_connect_requested(&saved_id);
+            }
+            HostVerb::Disconnect(saved_id) => {
+                self.clear_palette_state();
+                self.host_disconnect_requested(&saved_id);
+            }
+            HostVerb::Stop(saved_id) => {
+                let label = self
+                    .host_label(&saved_id)
+                    .ok_or_else(|| format!("host {saved_id} is no longer saved"))?;
+                self.clear_palette_state();
+                self.open_host_stop_dialog(&saved_id, &label);
+            }
+            HostVerb::Remove(saved_id) => {
+                self.clear_palette_state();
+                self.host_remove_requested(&saved_id)
+                    .map_err(|error| error.to_string())?;
+            }
+            HostVerb::NewProjectOn => {
+                let frame = host_picker_frame(&self.host_verb_rows());
+                if let Some(state) = &mut self.palette {
+                    state.push(frame);
+                }
+            }
+            HostVerb::CreateOn(target) => {
+                // A picker row names a *saved* host; the creation is
+                // addressed to the incarnation currently serving it, so a
+                // row for a host that dropped between the frame being
+                // built and the row being confirmed refuses rather than
+                // creating on whatever replaced it.
+                let host = match target {
+                    None => self.backend.host(),
+                    Some(saved_id) => self
+                        .hosts
+                        .incarnation(&saved_id)
+                        .ok_or_else(|| format!("host {saved_id} is not connected"))?,
+                };
+                self.clear_palette_state();
+                return Ok(self.create_project_on(host));
+            }
+        }
+        Ok(EngineDispatch::default())
+    }
+
+    /// A saved host's label, as the registry has it.
+    pub(super) fn host_label(&self, saved_id: &str) -> Option<String> {
+        self.host_views
+            .iter()
+            .find(|view| view.saved_id == saved_id)
+            .map(|view| view.label.clone())
+    }
+
+    /// Refresh the host rows under an open palette.
+    ///
+    /// The same live-frame contract `refresh_agent_palette` has, for the
+    /// same reason: a host connecting or dropping changes which verbs
+    /// apply, and a palette left open across that would offer Stop on a
+    /// session nothing is attached to. Selection follows the row id, so
+    /// the highlight stays put unless the row itself went away.
+    ///
+    /// The commands frame is **spliced**, not rebuilt: its non-host rows
+    /// are carried over verbatim, so the notification count (and
+    /// anything else that is a snapshot taken at open) keeps behaving
+    /// exactly as it did before hosts existed.
+    ///
+    /// This runs on every reconcile that finds a palette open, so the
+    /// no-news path is the one that matters: each block is built only
+    /// when its own frame is up, and the comparison is against the rows
+    /// already there, so nothing is materialized until something has
+    /// actually changed.
+    pub(super) fn refresh_host_palette(&mut self) {
+        let Some(state) = self.palette.as_ref() else {
+            return;
+        };
+        let hosts = self.host_verb_rows();
+        let commands = state
+            .frames()
+            .iter()
+            .find(|frame| frame.id == COMMANDS_FRAME_ID)
+            .and_then(|frame| {
+                let shortcut = self.shortcut_for(KeybindAction::NewProjectOnHost);
+                let verbs = host_verb_items(&hosts, shortcut.as_deref());
+                // The family is one contiguous tail (`command_palette_frame`
+                // appends it last), so the splice is everything before the
+                // first host row followed by the new block — and the
+                // unchanged case is a slice comparison, not a rebuild.
+                let head = frame
+                    .items
+                    .iter()
+                    .position(|item| host_verbs::parse(&item.id).is_some())
+                    .unwrap_or(frame.items.len());
+                if frame.items[head..] == verbs[..] {
+                    return None;
+                }
+                let mut items = frame.items[..head].to_vec();
+                items.extend(verbs);
+                Some(items)
+            });
+        let picker = state
+            .frames()
+            .iter()
+            .find(|frame| frame.id == HOST_PICKER_FRAME_ID)
+            .and_then(|frame| {
+                let items = host_picker_frame(&hosts).items;
+                (items != frame.items).then_some(items)
+            });
+        if commands.is_none() && picker.is_none() {
+            return;
+        }
+
+        let before_layout = self.palette_layout_signature();
+        let before_render = self.palette_render_signature();
+        if let Some(state) = &mut self.palette {
+            if let Some(items) = commands {
+                state.update_items(COMMANDS_FRAME_ID, items);
+            }
+            if let Some(items) = picker {
+                state.update_items(HOST_PICKER_FRAME_ID, items);
+            }
+        }
+        let request = dynamic_refresh_request(
+            before_layout != self.palette_layout_signature(),
+            before_render != self.palette_render_signature(),
+        );
+        if request.is_pending() {
+            self.invalidate_palette_geometry(request);
+        }
+    }
+
+    /// The accelerator hint an action advertises, as the palette prints
+    /// it. `None` when nothing is bound to it.
+    fn shortcut_for(&self, action: KeybindAction) -> Option<String> {
+        self.keybindings
+            .iter()
+            .filter(|(_, bound)| **bound == action)
+            .min_by(|(left, _), (right, _)| accel_order(left, right))
+            .and_then(|(accel, _)| accel_label(accel))
     }
 
     fn preview_selected_palette_item(&mut self) -> Result<(), String> {
@@ -1474,6 +1717,19 @@ impl App {
 
     fn commit_theme_name(&mut self, name: &str) -> Result<Option<String>, String> {
         self.apply_theme_name(name)?;
+        // Connected hosts re-seed their server terminals with the same
+        // palette (`session.set_theme` rides each host's op queue), so
+        // the colors a host tab's queries answer with move with the
+        // theme exactly as a local tab's drain state does.
+        //
+        // On COMMIT only. `apply_theme_name` is also the preview path —
+        // it runs on every selection move in the theme palette, and
+        // again when the user backs out — so reseeding there would push
+        // a lease-gated op to every connected host on every arrow key,
+        // and a browse-then-cancel would leave hosts recoloured to a
+        // theme the user rejected. A preview is local by nature: it
+        // costs an in-process repaint here and nothing on the wire.
+        self.hosts.set_theme(&Theme::load_bundled(name));
         let path = config::config_path();
         Ok(
             persist_theme_selection_with(&mut self.config, path.as_deref(), name, config::set_key)
@@ -1592,6 +1848,36 @@ impl App {
         }
     }
 
+    /// Every workspace the agents palette draws rows from: the local one
+    /// and each **connected** host's mirror (plan 037 §3.1 — the agent
+    /// surfaces are host-blind). A disconnected host contributes none:
+    /// its rows cannot be activated, and a palette row that does nothing
+    /// is worse than a row that is not there.
+    fn agent_sources<'a>(&'a self, local: &'a [Project]) -> Vec<agent_palette::AgentSource<'a>> {
+        let mut sources = Vec::with_capacity(self.host_views.len() + 1);
+        sources.push(agent_palette::AgentSource::local(
+            local,
+            self.backend.host(),
+        ));
+        sources.extend(
+            self.host_views
+                .iter()
+                .filter(|view| view.state.interactive())
+                .map(|view| agent_palette::AgentSource {
+                    projects: &view.projects,
+                    host: view.host,
+                    label: Some(view.label.as_str()),
+                }),
+        );
+        sources
+    }
+
+    /// The agents frame as of right now, across every host.
+    pub(super) fn agent_frame_now(&self) -> palette::PaletteFrame {
+        let local = self.workspace.snapshot();
+        agent_palette::agent_frame_across(&self.agent_sources(&local), agent_palette::now_unix())
+    }
+
     pub(super) fn refresh_agent_palette(&mut self) {
         let has_agents = self.palette.as_ref().is_some_and(|state| {
             state
@@ -1609,9 +1895,9 @@ impl App {
         // the adapter's next general reconcile. The engine snapshot is the
         // authoritative resync source for this live frame.
         let projects = self.workspace.snapshot();
-        let host = self.backend.host();
-        let cwds = agent_palette::agent_tab_cwds(&projects, host);
-        let mut items = agent_palette::agent_items(&projects, host, agent_palette::now_unix());
+        let sources = self.agent_sources(&projects);
+        let cwds = agent_palette::agent_tab_cwds_across(&sources);
+        let mut items = agent_palette::agent_items_across(&sources, agent_palette::now_unix());
         self.apply_metrics_cache(&cwds, &mut items);
         if let Some(state) = &mut self.palette {
             state.update_items(agent_palette::FRAME_ID, items);
@@ -1685,6 +1971,14 @@ impl App {
         });
     }
 
+    /// What a provider script is told about "where the user is".
+    ///
+    /// Reads the *local* workspace on purpose, even while a host row is
+    /// showing (plan 037 §3.1's title sweep looked at this and left it):
+    /// `socket` is this UI's own socket, and the ids beside it are the
+    /// ids a script would send back through it. A host tab's id belongs
+    /// to another process's id-space — handing it over would name
+    /// whichever local tab happens to share the number.
     fn provider_context(&self, selected_id: Option<String>) -> provider::ProviderContext {
         let (project_id, tab_id) = self.workspace.active();
         let active_title = self
@@ -2328,7 +2622,7 @@ mod tests {
         let config = RoostConfig::parse(r#"provider = label="Fixture" run="fixture.sh""#);
         let bindings = keybind::default_bindings().into_iter().collect();
         let mut state =
-            palette::PaletteState::new(command_palette_frame(2, &config.providers, &bindings));
+            palette::PaletteState::new(command_palette_frame(2, &config.providers, &bindings, &[]));
         let ids: Vec<String> = state
             .matches()
             .into_iter()
@@ -2360,6 +2654,84 @@ mod tests {
             state.selected_item().map(|item| item.id),
             Some(palette::PaletteCommands::SELECT_THEME_ID.to_string())
         );
+    }
+
+    /// The host block is spliced into the command frame, so the two have
+    /// to coexist: the existing rows keep their order and ids, and the
+    /// verbs arrive as a contiguous tail (plan 037 §3.1).
+    #[test]
+    fn the_command_frame_carries_the_host_verbs_after_its_own_rows() {
+        let config = RoostConfig::parse("");
+        let bindings: HashMap<Accel, KeybindAction> =
+            keybind::default_bindings().into_iter().collect();
+        let hosts = [host_verbs::HostRow {
+            saved_id: "h1",
+            label: "pop-os",
+            state: host_sidebar::SectionState::Connected,
+            localhost: false,
+        }];
+
+        let frame = command_palette_frame(0, &config.providers, &bindings, &hosts);
+        let ids: Vec<&str> = frame.items.iter().map(|item| item.id.as_str()).collect();
+        let first_host = ids
+            .iter()
+            .position(|id| host_verbs::parse(id).is_some())
+            .expect("the family is present");
+        assert!(
+            ids[..first_host].contains(&"new_tab"),
+            "the ordinary command rows come first"
+        );
+        assert!(
+            ids[first_host..]
+                .iter()
+                .all(|id| host_verbs::parse(id).is_some()),
+            "and the family is one contiguous block: {ids:?}"
+        );
+        assert!(ids.contains(&"host:disconnect:h1"));
+        assert!(ids.contains(&"host:stop:h1"));
+
+        // Zero hosts is the baseline: no host row is a *saved* host's, so
+        // the block is just Add Host (plus the seed where the platform
+        // has a session to reach).
+        let bare = command_palette_frame(0, &config.providers, &bindings, &[]);
+        let bare_ids: Vec<&str> = bare.items.iter().map(|item| item.id.as_str()).collect();
+        assert!(bare_ids.contains(&host_verbs::ADD_ID));
+        assert!(!bare_ids.contains(&host_verbs::NEW_PROJECT_ON_ID));
+    }
+
+    /// ⌘⇧N's picker is the same palette surface, and its rows carry the
+    /// LOCAL band's own label so the two name the local workspace
+    /// identically.
+    #[test]
+    fn the_host_picker_frame_leads_with_local() {
+        let hosts = [host_verbs::HostRow {
+            saved_id: "h1",
+            label: "pop-os",
+            state: host_sidebar::SectionState::Connected,
+            localhost: false,
+        }];
+        let frame = host_picker_frame(&hosts);
+        assert_eq!(frame.id, HOST_PICKER_FRAME_ID);
+        assert_eq!(frame.items[0].id, host_verbs::CREATE_ON_LOCAL_ID);
+        assert_eq!(frame.items[0].title, host_sidebar::LOCAL_LABEL);
+        assert_eq!(frame.items[1].title, "pop-os");
+    }
+
+    /// The "New Project on…" row advertises ⌘⇧N; the rest of the family
+    /// has no binding and must not borrow one.
+    #[test]
+    fn only_the_picker_row_carries_a_shortcut() {
+        let hosts = [host_verbs::HostRow {
+            saved_id: "h1",
+            label: "pop-os",
+            state: host_sidebar::SectionState::Disconnected,
+            localhost: false,
+        }];
+        let items = host_verb_items(&hosts, Some("Alt+Shift+N"));
+        for item in &items {
+            let expected = (item.id == host_verbs::NEW_PROJECT_ON_ID).then_some("Alt+Shift+N");
+            assert_eq!(item.trailing_text.as_deref(), expected, "{}", item.id);
+        }
     }
 
     #[test]

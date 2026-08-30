@@ -2,6 +2,9 @@ mod app;
 mod chrome;
 mod engine_feed;
 mod font_registry;
+/// Host sessions, client side (plan 037): one connection owner per
+/// connected `roost-session`, publishing onto the engine feed.
+mod host_conn;
 mod input;
 /// The AppKit seam. `cfg`'d whole rather than stubbed per-function: every
 /// call site pairs with a `not(macos)` no-op of its own, so nothing outside
@@ -113,6 +116,34 @@ enum Message {
     CloseTab(TabKey),
     NewTab,
     NewProject,
+    /// The sidebar's inline "↻ Reconnect" row, carrying the saved host's
+    /// stable id (plan 037 §3.1). C7's `Connect Host: <label>` palette
+    /// verb lands on the same app entry — the one that raises the
+    /// upgrade prompt for a mismatched build rather than re-dialing it.
+    HostReconnect(String),
+    /// The banner over a frozen host frame (plan 037 §3.1). Separate
+    /// from [`Self::HostReconnect`] because it carries the frame it was
+    /// drawn on: a click that lands after the host moved on is dropped
+    /// rather than aborting the reconnect already under way.
+    HostFrameReconnect {
+        saved_id: String,
+        frame: app::host_notice::FrozenFrame,
+    },
+    /// The Add Host dialog's two fields and its confirming button (plan
+    /// 037 §3.1) — the one free-text flow in the host verb family.
+    AddHostNameChanged(String),
+    AddHostSocketChanged(String),
+    AddHostSubmit,
+    /// Dismiss whichever host modal is up: Cancel, the backdrop, or Esc.
+    HostDialogCancel,
+    /// A press that landed on the modal card itself. Swallowed, so it
+    /// does not reach the backdrop's dismiss underneath.
+    HostDialogCardPressed,
+    /// The Stop Session confirmation's destructive button.
+    HostStopConfirm,
+    /// The upgrade prompt's "Restart session" (plan 037 §3.7). Only a
+    /// host this client could spawn for has the button at all.
+    HostRestartConfirm,
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
@@ -520,6 +551,15 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::CloseTab(_)
         | Message::NewTab
         | Message::NewProject
+        | Message::HostReconnect(_)
+        | Message::HostFrameReconnect { .. }
+        | Message::AddHostNameChanged(_)
+        | Message::AddHostSocketChanged(_)
+        | Message::AddHostSubmit
+        | Message::HostDialogCancel
+        | Message::HostDialogCardPressed
+        | Message::HostStopConfirm
+        | Message::HostRestartConfirm
         | Message::ConfirmDeleteCancel
         | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }

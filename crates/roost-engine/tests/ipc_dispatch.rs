@@ -287,6 +287,270 @@ async fn app_dock_badge_rejects_unknown_params() {
     }
 }
 
+/// `host.add` / `host.list` / `host.remove` over the wire: the full
+/// round trip a real `roostctl host` or the Hosts sidebar drives,
+/// proving the dispatch arms (not just the `Workspace` accessors
+/// `state_persist.rs` exercises directly).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_add_list_remove_round_trip_over_the_wire() {
+    use roost_ipc::messages::{HostAddParams, HostAddResult, HostListResult, HostRemoveParams};
+
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+
+    let added: HostAddResult = client
+        .call(
+            ops::HOST_ADD,
+            HostAddParams {
+                label: "pop-os".into(),
+                target: "test1@localhost".into(),
+            },
+        )
+        .await
+        .expect("host.add");
+    assert_eq!(added.host.label, "pop-os");
+    assert_eq!(added.host.target, "test1@localhost");
+    assert_eq!(added.host.last_connected, None);
+    assert!(!added.host.id.is_empty());
+
+    let listed: HostListResult = client
+        .call(ops::HOST_LIST, serde_json::json!({}))
+        .await
+        .expect("host.list");
+    assert_eq!(listed.hosts.len(), 1);
+    assert_eq!(listed.hosts[0].id, added.host.id);
+
+    client
+        .call::<_, serde_json::Value>(
+            ops::HOST_REMOVE,
+            HostRemoveParams {
+                id: added.host.id.clone(),
+            },
+        )
+        .await
+        .expect("host.remove");
+
+    let after: HostListResult = client
+        .call(ops::HOST_LIST, serde_json::json!({}))
+        .await
+        .expect("host.list after remove");
+    assert!(after.hosts.is_empty());
+}
+
+/// Label validation surfaces as `invalid-param` at the wire, and a
+/// removal of an id that was never added surfaces as `not-found` —
+/// both mapped by `ws_err` in `ipc.rs`, not left as `internal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_add_rejects_reserved_label_and_remove_reports_not_found() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+
+    let err = client
+        .call_raw(
+            ops::HOST_ADD,
+            serde_json::json!({"label": "local", "target": "localhost"}),
+        )
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "invalid-param"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+
+    let err = client
+        .call_raw(ops::HOST_REMOVE, serde_json::json!({"id": "never-added"}))
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "not-found"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
+/// With a UI attached, the registry mutations and both connection ops
+/// route to it (plan 037 §3.5).
+///
+/// The reason is not symmetry: the app owns the connections and the
+/// sidebar, so a `roostctl host add` that mutated the workspace behind
+/// its back would be invisible until something else forced a reconcile.
+/// The headless fallback above stays for embedders with no UI, and
+/// `host.connect` has no fallback at all — there is no connection to
+/// report without an app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_ops_route_to_an_attached_ui() {
+    use roost_engine::ipc::UiRequest;
+    use roost_ipc::messages::{host_state, Host, HostAddResult, HostConnectionResult};
+
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+    let workspace = Arc::new(Workspace::new());
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = IpcHandler::new(
+        workspace.clone(),
+        Arc::new(PtySupervisor::new()),
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    )
+    .with_ui(ui_tx);
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Stand in for the app's main thread: answer whatever arrives, and
+    // record what it was.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let recorder = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let host = |id: &str| Host {
+            id: id.to_string(),
+            label: "pop-os".into(),
+            target: "/tmp/s.sock".into(),
+            last_connected: None,
+        };
+        while let Some(request) = ui_rx.recv().await {
+            match request {
+                UiRequest::HostAdd { reply, .. } => {
+                    recorder.lock().unwrap().push("add");
+                    let _ = reply.send(Ok(host("h1")));
+                }
+                UiRequest::HostRemove { reply, .. } => {
+                    recorder.lock().unwrap().push("remove");
+                    let _ = reply.send(Ok(()));
+                }
+                UiRequest::HostConnect { reply, .. } => {
+                    recorder.lock().unwrap().push("connect");
+                    let _ = reply.send(Ok(HostConnectionResult {
+                        host: host("h1"),
+                        state: host_state::CONNECTING.to_string(),
+                    }));
+                }
+                UiRequest::HostDisconnect { id, reply } => {
+                    recorder.lock().unwrap().push("disconnect");
+                    let _ = reply.send(Err(roost_engine::WorkspaceError::HostNotFound(id)));
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut client = connect_with_retry(&server_socket).await;
+
+    let added: HostAddResult = client
+        .call(
+            ops::HOST_ADD,
+            serde_json::json!({"label": "pop-os", "target": "/tmp/s.sock"}),
+        )
+        .await
+        .expect("host.add");
+    assert_eq!(added.host.id, "h1");
+    assert!(
+        workspace.hosts().is_empty(),
+        "the engine must not also write the registry it delegated"
+    );
+
+    let connected: HostConnectionResult = client
+        .call(ops::HOST_CONNECT, serde_json::json!({"id": "h1"}))
+        .await
+        .expect("host.connect");
+    assert_eq!(connected.state, host_state::CONNECTING);
+
+    // The UI's own refusal keeps its wire code: a `WorkspaceError`
+    // crosses the seam, so `not-found` survives rather than flattening
+    // into `internal`.
+    let err = client
+        .call_raw(ops::HOST_DISCONNECT, serde_json::json!({"id": "h1"}))
+        .await
+        .expect_err("expected the UI's refusal");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "not-found"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+
+    client
+        .call::<_, serde_json::Value>(ops::HOST_REMOVE, serde_json::json!({"id": "h1"}))
+        .await
+        .expect("host.remove");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["add", "connect", "disconnect", "remove"]
+    );
+}
+
+/// `host.connect` / `host.disconnect` have no headless implementation:
+/// connection state belongs to the app, and inventing one would answer
+/// with a state nothing is in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_connection_ops_have_no_headless_answer() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+    let handler = IpcHandler::new(
+        Arc::new(Workspace::new()),
+        Arc::new(PtySupervisor::new()),
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+
+    for op in [ops::HOST_CONNECT, ops::HOST_DISCONNECT] {
+        let err = client
+            .call_raw(op, serde_json::json!({"id": "h1"}))
+            .await
+            .expect_err("expected error");
+        match err {
+            roost_ipc::ClientError::Server { code, message } => {
+                assert_eq!(code, "internal", "{op}");
+                assert_eq!(message, "no UI attached", "{op}");
+            }
+            other => panic!("expected Server error, got {other:?}"),
+        }
+    }
+}
+
 /// Connect to a freshly-bound server with bounded retries instead of
 /// a flat sleep. CI runners under load can take more than 50ms to
 /// schedule the accept loop; a bounded retry is robust without

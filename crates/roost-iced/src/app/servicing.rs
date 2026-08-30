@@ -211,6 +211,139 @@ fn notification_activation(
     Some(window_id.map_or(UiTask::None, UiTask::Focus))
 }
 
+/// What one envelope from a connected host's event batch asks this
+/// client to do.
+///
+/// Some of the batch's events are per-commit *facts* the mirror
+/// deliberately does not model (`mirror.rs`'s "workspace facts only"),
+/// and the split is the authority split from architecture §6:
+/// `tab.effect` is something that happened to a tab and the attached
+/// client applies it; `notification.fired` is the same one surface up —
+/// a host agent asking for attention reaches the inbox and the desktop
+/// exactly as a local one does (plan 037 §3.1's host-blind agent
+/// surfaces). The other three ride along for their *retiring* edges,
+/// because an attention row that nothing takes down is worse than one
+/// that never appeared: `tab.notification` clears one tab's marker,
+/// `tab.closed` retires the row and the desktop banner with the tab, and
+/// `project.deleted` sweeps every row under the project — the same three
+/// arms `apply_workspace_event` runs for the local workspace.
+///
+/// They are read off the batch rather than off the mirror because they
+/// are exact per-commit: the mirror may already be further ahead, and a
+/// fire-then-clear pair folded away would leave a banner nobody asked
+/// for. What happened while nothing was attached is **not** replayed —
+/// plan 037 §4's non-goal; a connect mirrors current state, never a
+/// backlog.
+///
+/// XXX: a session's own workspace defaults `window_focused = true`
+/// (`workspace.rs:152`) and nothing pushes the client's focus to it, so
+/// `attention_suppressed_by_focus` drops `notification.fired` for
+/// whichever tab that session considers active — the one host tab whose
+/// agent cannot reach this path. No op exists to push client focus to a
+/// session and plan 037 §3.6 pinned the server additions to effects +
+/// `session.set_theme`, so it is HS-3 work, documented here rather than
+/// papered over client-side.
+#[derive(Debug)]
+enum HostEnvelopeAction {
+    Effect(roost_ipc::messages::TabEffectEvent),
+    Notify(roost_ipc::messages::NotificationFiredEvent),
+    /// A tab's pending flag went false: retire its inbox row.
+    ClearNotification(i64),
+    /// The tab is gone: retire its row and the banner naming it.
+    TabClosed(i64),
+    /// The project is gone: retire every row under it.
+    ProjectDeleted(i64),
+    /// A workspace fact the mirror already folded in, or an event from a
+    /// newer session this client does not know. Both are silent by
+    /// contract (`ipc.md` #versioning: old clients ignore new events).
+    Ignore,
+    Undecodable(serde_json::Error),
+}
+
+fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEnvelopeAction {
+    use roost_ipc::messages::{
+        ops, NotificationFiredEvent, ProjectDeletedEvent, TabClosedEvent, TabNotificationEvent,
+    };
+    use serde::Deserialize;
+    // Read out of the borrowed payload: `serde_json` deserializes from
+    // `&Value`, so the batch's tree is never copied to build the small
+    // owned struct each arm wants.
+    fn decode<'a, T: Deserialize<'a>>(
+        envelope: &'a roost_ipc::messages::EventEnvelope,
+    ) -> Result<T, serde_json::Error> {
+        T::deserialize(&envelope.data)
+    }
+    match envelope.event.as_str() {
+        ops::EVENT_TAB_EFFECT => decode(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, HostEnvelopeAction::Effect),
+        ops::EVENT_NOTIFICATION_FIRED => decode::<NotificationFiredEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, HostEnvelopeAction::Notify),
+        ops::EVENT_TAB_NOTIFICATION => match decode::<TabNotificationEvent>(envelope) {
+            // A *fired* flag is the mirror's — it paints the row's dot,
+            // and the body only ever arrives on `notification.fired`.
+            // Acting on both would upsert a bodyless duplicate beside
+            // the real one.
+            Ok(event) if event.has_pending => HostEnvelopeAction::Ignore,
+            Ok(event) => HostEnvelopeAction::ClearNotification(event.tab_id),
+            Err(error) => HostEnvelopeAction::Undecodable(error),
+        },
+        ops::EVENT_TAB_CLOSED => decode::<TabClosedEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
+                HostEnvelopeAction::TabClosed(event.tab_id)
+            }),
+        ops::EVENT_PROJECT_DELETED => decode::<ProjectDeletedEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
+                HostEnvelopeAction::ProjectDeleted(event.project_id)
+            }),
+        _ => HostEnvelopeAction::Ignore,
+    }
+}
+
+/// The inbox rows one instance's project list currently owes, in
+/// snapshot order.
+///
+/// One function over the local workspace's snapshot and over a host
+/// mirror's rows, because they are the same shape and the same rule:
+/// `has_notification` is the membership edge, and the row's title is
+/// composed identically so a host row cannot read as a different kind of
+/// row in a list that spans every host (plan 037 §3.1's host-blind agent
+/// surfaces).
+fn pending_notification_rows(
+    host: HostId,
+    projects: &[Project],
+    rung: &HashSet<TabKey>,
+) -> Vec<(TabKey, ProjectKey, String)> {
+    projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .tabs
+                .iter()
+                .filter(|tab| {
+                    // Two sources, one derivation. `has_notification` is
+                    // the server's own attention state; `rung` is a bell
+                    // this client heard, which raises attention without
+                    // any server flag behind it (plan 037 §3.6 — a bell
+                    // is an effect, not workspace state). Folding it in
+                    // here rather than exempting the row from the prune
+                    // is what keeps the inbox purely derived: a row is
+                    // shown exactly while something still says so.
+                    tab.has_notification || rung.contains(&TabKey::new(host, tab.id))
+                })
+                .map(move |tab| {
+                    (
+                        TabKey::new(host, tab.id),
+                        ProjectKey::new(host, project.id),
+                        notification_inbox::compose_title(
+                            &project.name,
+                            &notification_inbox::tab_title(&tab.title, &tab.cwd),
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
 /// The main-thread marker an IPC-serviced macOS seam call needs. The
 /// IPC drain runs in the iced update loop, so the marker is obtainable;
 /// `None` would be an invariant break, and surfacing it as an op error
@@ -343,6 +476,13 @@ impl App {
         // `Resync` and this rebuild is what heals it: deltas are an
         // optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        // The host sections are the other half of that snapshot, and
+        // they come first for the same reason: everything below re-
+        // resolves a key against the rows of whichever instance owns it,
+        // and a host key resolves against these. (They read only the
+        // registry and the connection set, so nothing below can affect
+        // them.)
+        self.refresh_host_views();
         // Every pill-relevant change (title, active, notification) lands
         // here, so this is where the elision memo is refreshed. Gated on a
         // window: the bootstrap reconcile runs before the chrome fonts are
@@ -352,7 +492,7 @@ impl App {
             self.refresh_pill_labels();
         }
         self.request_exit_if_empty();
-        reconcile_confirm_delete(&mut self.confirm_delete, &self.projects);
+        self.reconcile_confirm_delete();
         self.reconcile_tab_drag_preview();
         self.reconcile_project_drag_preview();
         self.reconcile_rename_editor();
@@ -368,8 +508,17 @@ impl App {
         // covers open, close, rename, reorder and select by construction.
         self.sync_window_menu();
         self.refresh_notification_palette();
+        // Before the selection check, which decides whether the window
+        // is still showing a row that exists: whatever this selects is
+        // then validated exactly as any other selection would be.
+        self.resolve_pending_host_selection();
+        self.reconcile_host_selection();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
+        // Host verbs are live state too: a host that connected while the
+        // palette was open must stop offering Connect and start offering
+        // Stop (plan 037 §3.1's "verbs appear only when applicable").
+        self.refresh_host_palette();
         // The workspace is one backend's id-space, so its ids qualify at
         // that backend's instance — and the prune below is scoped to it
         // for the same reason: a connected host's tabs are pruned by that
@@ -419,6 +568,412 @@ impl App {
     fn request_exit_if_empty(&mut self) {
         if self.exit_state.observe(self.projects.is_empty()) {
             tracing::info!("last project closed; exiting");
+        }
+    }
+
+    // ---- host tab attach (plan 037 §3.4) --------------------------------
+
+    /// Focus a host tab: build its rendering state if needed and start
+    /// the attach. Attach-on-focus is the policy, so every other host
+    /// attach detaches first — client memory and data connections stay
+    /// bounded at one per host. C6's sidebar click and C7's creation
+    /// routing are the callers.
+    pub(super) fn host_focus_tab(&mut self, key: TabKey) {
+        debug_assert!(!key.is_local(), "local tabs focus through the workspace");
+        let others: Vec<TabKey> = self
+            .host_attach
+            .keys()
+            .copied()
+            .filter(|other| *other != key)
+            .collect();
+        for other in others {
+            self.host_detach_tab(other);
+        }
+        if self.host_attach.contains_key(&key) {
+            return;
+        }
+        let (cols, rows) = super::terminal_grid(
+            self.window_size,
+            self.effective_sidebar_width(),
+            self.terminal_metrics,
+        );
+        let geometry = self.host_geometry(cols, rows);
+        let attach =
+            host_tab::HostAttach::new(key, geometry).with_resume(self.host_resume.remove(&key));
+        let handle = TabHandle::host(attach.input_tx(), self.test_mode);
+        match self.tabs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                // Refocus: the surviving terminal keeps rendering (and is
+                // the resume base); only the handle turns over, so input
+                // reaches the NEW attempt's queue instead of a dead one.
+                entry.get_mut().session = handle;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let built = {
+                    let _guard = self.runtime.enter();
+                    TerminalTab::attach_host(
+                        cols,
+                        rows,
+                        Theme::load_bundled(&self.active_theme_name),
+                        self.config.word_break_chars.clone(),
+                        handle,
+                    )
+                };
+                match built {
+                    Ok(mut tab) => {
+                        // Install renderer metrics before the tab is
+                        // rendered at all: the view draws only a tab with
+                        // `applied_metrics`, and a host tab is created
+                        // between window resizes, so nothing else would
+                        // ever give it any — the terminal would stay
+                        // blank while its snapshot filled up. The local
+                        // attach does exactly this for the same reason.
+                        // The resize half is a no-op on the wire: this
+                        // geometry is what `tab.attach` already asked
+                        // for, and a host handle drops `send_resize`
+                        // anyway (the attach machine owns that).
+                        match tab.apply_geometry(
+                            cols,
+                            rows,
+                            self.terminal_metrics,
+                            self.metric_generation,
+                        ) {
+                            Ok(Some(change)) => tab.commit_geometry(change),
+                            Ok(None) => {
+                                tracing::warn!(%key, "host terminal did not install metrics");
+                                return;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%key, ?error, "host terminal geometry failed");
+                                return;
+                            }
+                        }
+                        entry.insert(tab);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%key, ?error, "host tab terminal build failed");
+                        return;
+                    }
+                }
+            }
+        }
+        self.host_attach.insert(key, attach);
+        self.host_begin_attach(key);
+    }
+
+    /// The grid plus the cell pixel size an attach negotiates, from the
+    /// metrics the local tabs are already laid out with.
+    pub(super) fn host_geometry(&self, cols: u16, rows: u16) -> host_tab::Geometry {
+        host_tab::Geometry {
+            cols,
+            rows,
+            cell_w: self.terminal_metrics.cell_width.round().max(1.0) as u32,
+            cell_h: self.terminal_metrics.cell_height.round().max(1.0) as u32,
+        }
+    }
+
+    /// Detach a host tab (focus moved away, or its stream told us to let
+    /// go). The rendering state survives in `tabs` — disconnect is not
+    /// stop, and refocus resumes from the point saved here.
+    pub(super) fn host_detach_tab(&mut self, key: TabKey) {
+        if let Some(attach) = self.host_attach.remove(&key) {
+            if let Some(resume) = attach.detach() {
+                self.host_resume.insert(key, resume);
+            }
+        }
+    }
+
+    /// Drop every piece of app state keyed by a dead connection
+    /// incarnation. The fresh mirror is authoritative; purge-then-
+    /// re-derive is what prevents duplicates (plan 037 §3.2).
+    pub(super) fn purge_host_incarnation(&mut self, incarnation: HostId) {
+        // Every attach and every resume point belongs to a key that also
+        // has a `tabs` entry (`host_focus_tab` mints them together), so
+        // dropping the incarnation's tabs drops all three. The retain
+        // afterwards is belt-and-braces for a resume point whose tab
+        // already went.
+        let dead: Vec<TabKey> = self
+            .tabs
+            .keys()
+            .copied()
+            .filter(|key| key.host == incarnation)
+            .collect();
+        for key in dead {
+            self.host_drop_tab(key);
+        }
+        self.host_resume.retain(|key, _| key.host != incarnation);
+        // Bells belong to the incarnation that heard them: the fresh
+        // mirror is authoritative, and a tab that is still ringing will
+        // ring again.
+        self.host_bells.retain(|key| key.host != incarnation);
+        // A creation still waiting for this incarnation's mirror will
+        // never be answered by it (plan 037 §3.9's "dropped on
+        // disconnect").
+        if self
+            .pending_host_selection
+            .is_some_and(|pending| pending.tab.host == incarnation)
+        {
+            self.pending_host_selection = None;
+        }
+    }
+
+    /// The tab is over (EXIT, or its whole connection incarnation went):
+    /// drop everything local to it. The mirror's `tab.closed` event
+    /// retires its sidebar row.
+    fn host_drop_tab(&mut self, key: TabKey) {
+        self.host_detach_tab(key);
+        self.host_resume.remove(&key);
+        self.host_bells.remove(&key);
+        self.tabs.remove(&key);
+        self.notification_inbox.remove(key);
+        self.desktop_notifications.retire(key);
+    }
+
+    fn host_begin_attach(&mut self, key: TabKey) {
+        let Some(attach) = self.host_attach.get_mut(&key) else {
+            return;
+        };
+        let (Some(ops), Some(socket)) = (
+            self.hosts.ops_for(key.host),
+            self.hosts.endpoint_for(key.host),
+        ) else {
+            // The connection this key belongs to is gone (stale
+            // incarnation, or the host dropped between frames). Nothing
+            // to attach to; the entry goes with it.
+            tracing::debug!(%key, "host attach requested for a dead connection incarnation");
+            self.host_attach.remove(&key);
+            return;
+        };
+        let _guard = self.runtime.enter();
+        attach.begin(ops, socket, &roost_vt::libghostty_build(), &self.feed_tx);
+    }
+
+    fn apply_host_tab_frame(
+        &mut self,
+        key: TabKey,
+        frame: host_tab::HostTabFrame,
+        pty: &mut TabOutputBatch,
+    ) {
+        let step = match (self.host_attach.get_mut(&key), self.tabs.get_mut(&key)) {
+            (Some(attach), Some(tab)) => {
+                // The machine arms its own timers, so it needs the app
+                // runtime ambient the same way `begin` and `arm_reattach`
+                // below do — `tokio::spawn` panics without it.
+                let _guard = self.runtime.enter();
+                attach.on_frame(frame, tab, &self.feed_tx)
+            }
+            // A frame for a key with no attach state: the tab detached,
+            // the tab dropped, or the whole incarnation is stale — every
+            // case is the same harmless late delivery.
+            _ => {
+                tracing::debug!(%key, "host tab frame without attach state");
+                return;
+            }
+        };
+        match step {
+            host_tab::AttachStep::None => {}
+            host_tab::AttachStep::Refresh => {
+                pty.touched.insert(key);
+            }
+            host_tab::AttachStep::Reattach { delay } => {
+                if delay.is_zero() {
+                    self.host_begin_attach(key);
+                } else if let Some(attach) = self.host_attach.get_mut(&key) {
+                    let _guard = self.runtime.enter();
+                    attach.arm_reattach(delay, &self.feed_tx);
+                }
+            }
+            host_tab::AttachStep::Detach => self.host_detach_tab(key),
+            host_tab::AttachStep::Closed { code } => {
+                tracing::debug!(%key, code, "host tab exited");
+                pty.touched.remove(&key);
+                self.host_drop_tab(key);
+            }
+        }
+    }
+
+    /// Route one host batch's per-commit envelopes to the surfaces that
+    /// own them (plan 037 §3.1). [`host_envelope_action`] says which is
+    /// which and why they are read off the batch rather than the mirror.
+    fn apply_host_envelopes(
+        &mut self,
+        host: HostId,
+        events: &[roost_ipc::messages::EventEnvelope],
+    ) -> UiTask {
+        let mut task = UiTask::None;
+        for envelope in events {
+            match host_envelope_action(envelope) {
+                HostEnvelopeAction::Ignore => {}
+                HostEnvelopeAction::Effect(effect) => {
+                    task = task.then(self.apply_host_effect(host, &effect));
+                }
+                HostEnvelopeAction::Notify(fired) => {
+                    self.fire_notification(TabKey::new(host, fired.tab_id), fired.title, fired.body)
+                }
+                HostEnvelopeAction::ClearNotification(tab_id) => {
+                    // The tab's id is kept, exactly as the local clear
+                    // keeps it: a later re-notify then replaces the
+                    // banner still on the desktop rather than stacking a
+                    // duplicate beside it.
+                    self.notification_inbox.remove(TabKey::new(host, tab_id));
+                }
+                HostEnvelopeAction::TabClosed(tab_id) => {
+                    // Both surfaces, exactly as the local `TabClosed`
+                    // arm does it: the tab is gone, so the banner naming
+                    // it is retired rather than left on the desktop
+                    // pointing at nothing.
+                    let tab = TabKey::new(host, tab_id);
+                    self.notification_inbox.remove(tab);
+                    self.desktop_notifications.retire(tab);
+                }
+                HostEnvelopeAction::ProjectDeleted(project_id) => {
+                    self.retire_project_notifications(ProjectKey::new(host, project_id));
+                }
+                HostEnvelopeAction::Undecodable(error) => tracing::debug!(
+                    ?host, event = %envelope.event, %error,
+                    "a host event envelope did not decode"
+                ),
+            }
+        }
+        task
+    }
+
+    /// An agent asked for attention: one inbox row and one desktop
+    /// banner, wherever the tab lives (plan 037 §3.1's host-blind agent
+    /// surfaces).
+    ///
+    /// The two surfaces are composed here rather than once per event
+    /// stream because the ordering is the contract: the banner fires
+    /// whether or not the row could be composed. A title lookup that
+    /// misses means the rows for that key have not landed yet — the
+    /// notification is true either way, and a banner is the half the
+    /// user is not looking at the window to see. The row is not lost
+    /// with it: the same commit sets the tab's `has_notification`, so
+    /// [`Self::reconcile_notification_inbox`] derives the row (bodyless)
+    /// as soon as the mirror lists that tab.
+    ///
+    /// Only the lookup differs by key-space, and each answers `None` for
+    /// the other's keys: local rows come from this backend's snapshot,
+    /// a host's from that session's mirror.
+    fn fire_notification(&mut self, key: TabKey, title: String, body: String) {
+        let row = if key.is_local() {
+            self.notification_title(key)
+        } else {
+            self.host_notification_title(key)
+        };
+        if let Some((project, row_title)) = row {
+            self.notification_inbox
+                .upsert(notification_inbox::NotificationRecord::new(
+                    key,
+                    project,
+                    row_title,
+                    body.clone(),
+                ));
+        }
+        self.desktop_notifications.fire(key, title, body);
+    }
+
+    /// Apply one `tab.effect` envelope from a connected host: bell rings
+    /// the notification inbox (the app's attention surface — local tabs
+    /// have no bell path, so this is the closest existing one), and an
+    /// OSC 52 write lands on this client's clipboard under the same
+    /// config policy a local tab's write obeys. The caller chains the
+    /// returned task — it is the queue pump, exactly as
+    /// `apply_osc_actions`'s tail is for a local write.
+    fn apply_host_effect(
+        &mut self,
+        host: HostId,
+        effect: &roost_ipc::messages::TabEffectEvent,
+    ) -> UiTask {
+        let key = TabKey::new(host, effect.tab_id);
+        match effect.effect {
+            roost_ipc::messages::TabEffect::Bell => {
+                // Record that this tab rang, then let the ordinary
+                // reconcile derive the row from it. Upserting the row
+                // here instead would put an undeclared row in a set the
+                // reconcile prunes against the mirror, and the next
+                // reconcile would erase it — which is exactly what a
+                // bell used to do: arrive, and vanish before anyone saw
+                // it. It clears where every attention marker clears, on
+                // focus.
+                if self.host_bells.insert(key) {
+                    self.reconcile_notification_inbox();
+                }
+                UiTask::None
+            }
+            roost_ipc::messages::TabEffect::ClipboardWrite => {
+                let Some(data) = effect.data.as_deref() else {
+                    return UiTask::None;
+                };
+                let Ok(bytes) = roost_ipc::messages::bytes_base64::decode(data) else {
+                    tracing::debug!(%key, "clipboard effect with undecodable payload");
+                    return UiTask::None;
+                };
+                let target = match effect.target.unwrap_or_default() {
+                    roost_ipc::messages::ClipboardEffectTarget::System => {
+                        roost_engine::osc::ClipboardTarget::System
+                    }
+                    roost_ipc::messages::ClipboardEffectTarget::Selection => {
+                        roost_engine::osc::ClipboardTarget::Selection
+                    }
+                };
+                // Reject rather than repair: the local OSC 52 parser
+                // refuses non-UTF-8 payloads, and a peer that sends one
+                // must not get replacement-altered text onto the
+                // clipboard here either.
+                let Ok(text) = String::from_utf8(bytes) else {
+                    tracing::debug!(%key, "clipboard effect payload is not UTF-8; dropped");
+                    return UiTask::None;
+                };
+                if !enqueue_osc_clipboard_write(
+                    &mut self.clipboard,
+                    self.config.clipboard_write,
+                    target,
+                    text,
+                ) {
+                    tracing::info!(
+                        %key,
+                        "host OSC 52 clipboard write dropped — clipboard-write = deny"
+                    );
+                    return UiTask::None;
+                }
+                self.clipboard.start_next()
+            }
+        }
+    }
+
+    /// The inbox row identity for a host tab, from the mirror the events
+    /// stream keeps current.
+    fn host_notification_title(&self, key: TabKey) -> Option<(ProjectKey, String)> {
+        let mirror = self.hosts.mirror(key.host)?;
+        let mirror = mirror.read();
+        let (project, tab) = mirror.projects.iter().find_map(|project| {
+            let tab = project.tabs.iter().find(|tab| tab.id == key.tab)?;
+            Some((project, tab))
+        })?;
+        // Composed exactly as a local tab's row is (`notification_title`):
+        // the inbox is one list across every host, so a host row that
+        // said only its bare title would read as a different kind of row.
+        Some((
+            ProjectKey::new(key.host, project.id),
+            notification_inbox::compose_title(
+                &project.name,
+                &notification_inbox::tab_title(&tab.title, &tab.cwd),
+            ),
+        ))
+    }
+
+    /// Resolve a wire-form tab reference against the UI's keyed map: a
+    /// bare id is one of the local backend's, a host-qualified ref names
+    /// an attached host tab's client-side terminal (plan 037 §3.4). A
+    /// ref from a dead connection epoch simply misses the map — the
+    /// staleness contract `HostId` minting exists for.
+    fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> TabKey {
+        match tab {
+            roost_ipc::messages::WireTabRef::Local(tab_id) => self.backend.tab_key(tab_id),
+            roost_ipc::messages::WireTabRef::Host { host, tab } => {
+                TabKey::new(HostId::new(host), tab)
+            }
         }
     }
 
@@ -613,10 +1168,95 @@ impl App {
                     task = task.then(self.menu_event(event));
                     batch.mark_dirty();
                 }
+                // Host mirrors + lifecycle land in the connection set.
+                // C6/C7 render off it; C4 only keeps it current, so with
+                // zero hosts these arms never run.
+                EngineFeed::HostWorkspace(host, event) => {
+                    // Attribution before application, and it has to be
+                    // here rather than only inside `apply_workspace`: the
+                    // envelopes below reach surfaces no later purge can
+                    // take back (a desktop banner, the clipboard), so a
+                    // batch queued by a connection this app has since
+                    // removed or replaced must fire nothing at all.
+                    if !self.hosts.owns(host) {
+                        tracing::debug!(
+                            ?host,
+                            "dropping an event batch from a dead connection incarnation"
+                        );
+                        continue;
+                    }
+                    // Effects ride the batch verbatim and are applied
+                    // here, before the mirror folds the commit away.
+                    // Lease-holder-only is structural: this stream only
+                    // flows while our connection holds the lease — a
+                    // displaced client's events connection is closed at
+                    // takeover before the new holder can generate any.
+                    if let crate::host_conn::HostWorkspaceEvent::Applied { events, .. } = &event {
+                        task = task.then(self.apply_host_envelopes(host, events));
+                    }
+                    // The mirror moving leaves the view's copy of it
+                    // behind — the tail reconcile is what rebuilds the
+                    // host sections, their agent rows and the palette.
+                    // `try_next` already marked the batch for it (a host
+                    // mirror is workspace state), so a request later in
+                    // this same batch reconciles before it reads.
+                    self.hosts.apply_workspace(host, event);
+                }
+                EngineFeed::HostTab(key, frame) => {
+                    self.apply_host_tab_frame(key, frame, &mut pty);
+                }
+                EngineFeed::HostState(host, state) => {
+                    let previous = match &state {
+                        crate::host_conn::HostConnState::Connecting { previous } => *previous,
+                        _ => None,
+                    };
+                    let connected = matches!(state, crate::host_conn::HostConnState::Connected);
+                    if let Some(host) = self.hosts.apply_state(host, state) {
+                        // Stamp the registry the moment a connection
+                        // settles — `last_connected` is what the Add Host
+                        // list and a `roostctl host list` read to tell a
+                        // host that has ever worked from one that never
+                        // has, and nothing else writes it.
+                        if connected {
+                            if let Err(error) = self.workspace.touch_host_connected(&host) {
+                                tracing::debug!(%host, %error, "could not stamp last_connected");
+                            }
+                        }
+                        // Attributed (not a stale task's publication): the
+                        // app-side purge follows the set's — everything
+                        // keyed by the dead incarnation is re-derived from
+                        // the fresh mirror (plan 037 §3.2).
+                        if let Some(previous) = previous {
+                            self.purge_host_incarnation(previous);
+                        }
+                        tracing::debug!(%host, "host connection state changed");
+                    }
+                    // The band's dot and rollup are cached with the rows;
+                    // a state change moves both, and `try_next` marked
+                    // the batch for the reconcile that rebuilds them.
+                }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
-                    if let Some(raise) =
+                    if !tab.is_local() {
+                        // A host tab's jump: select it and attach, the
+                        // same pair its sidebar row does. A tab whose
+                        // host has since dropped selects nothing — the
+                        // banner outlived what it named.
+                        match self.focus_host_tab_and_clear(tab, true) {
+                            Ok(()) => {
+                                batch.mark_reconciled();
+                                if let Some(window) = self.window_id {
+                                    task = task.then(UiTask::Focus(window));
+                                }
+                            }
+                            Err(error) => tracing::debug!(
+                                %tab,
+                                %error,
+                                "notification click named a host tab that is gone"
+                            ),
+                        }
+                    } else if let Some(raise) =
                         notification_activation(&self.workspace, self.window_id, tab)
                     {
                         // The rest of a notification jump, exactly as the
@@ -695,16 +1335,7 @@ impl App {
             } => {
                 // The workspace broadcast is one backend's id-space.
                 let tab = self.backend.tab_key(tab_id);
-                if let Some((project, row_title)) = self.notification_title(tab) {
-                    self.notification_inbox
-                        .upsert(notification_inbox::NotificationRecord::new(
-                            tab,
-                            project,
-                            row_title,
-                            body.clone(),
-                        ));
-                }
-                self.desktop_notifications.fire(tab, title, body);
+                self.fire_notification(tab, title, body);
             }
             WorkspaceEvent::TabNotification {
                 tab_id,
@@ -722,18 +1353,16 @@ impl App {
                 self.notification_inbox.remove(tab);
                 self.desktop_notifications.retire(tab);
             }
+            // The local workspace asserted its selection, so the host
+            // override is over. Reconcile's `local_active` watch catches
+            // the cases where the id moved; this catches the one where it
+            // did not — an IPC `tab.focus` of the tab that is already
+            // active is still a focus intent, and it must win the window
+            // back from the host row (`Workspace::focus_tab` emits this
+            // unconditionally, which is what makes it a reliable seam).
+            WorkspaceEvent::ActiveChanged { .. } => self.set_host_selection(None),
             WorkspaceEvent::ProjectDeleted { project_id } => {
-                let project = ProjectKey::new(self.backend.host(), project_id);
-                let stale: Vec<TabKey> = self
-                    .notification_inbox
-                    .snapshot()
-                    .iter()
-                    .filter(|record| record.project == project)
-                    .map(|record| record.tab)
-                    .collect();
-                for tab in stale {
-                    self.notification_inbox.remove(tab);
-                }
+                self.retire_project_notifications(ProjectKey::new(self.backend.host(), project_id));
             }
             // The bridge turns a lagged broadcast into a full-snapshot
             // resync; the batch's reconcile is the recovery, so there is
@@ -745,6 +1374,28 @@ impl App {
         }
     }
 
+    /// A project is gone: sweep the inbox rows that named it.
+    ///
+    /// Deliberately inbox-only, and shared by the local and host paths so
+    /// they cannot drift. The desktop banners are already retired by the
+    /// `tab.closed` events that precede a delete on both sides (the
+    /// engine commits `TabClosed*` then `ProjectDeleted`,
+    /// `workspace.rs:952`); this is the sweep for rows whose tab event
+    /// was missed.
+    fn retire_project_notifications(&mut self, project: ProjectKey) {
+        let stale: Vec<TabKey> = self
+            .notification_inbox
+            .snapshot()
+            .iter()
+            .filter(|record| record.project == project)
+            .map(|record| record.tab)
+            .collect();
+        for tab in stale {
+            self.notification_inbox.remove(tab);
+            self.host_bells.remove(&tab);
+        }
+    }
+
     fn notification_title(&self, key: TabKey) -> Option<(ProjectKey, String)> {
         let tab_id = key.local_tab()?;
         let host = self.backend.host();
@@ -753,57 +1404,61 @@ impl App {
             let project_name = project.name;
             project.tabs.into_iter().find_map(|tab| {
                 (tab.id == tab_id).then(|| {
-                    let tab_title = if !tab.title.is_empty() {
-                        tab.title
-                    } else if !tab.cwd.is_empty() {
-                        tab.cwd
-                    } else {
-                        "Tab".to_string()
-                    };
                     (
                         project_key,
-                        notification_inbox::compose_title(&project_name, &tab_title),
+                        notification_inbox::compose_title(
+                            &project_name,
+                            &notification_inbox::tab_title(&tab.title, &tab.cwd),
+                        ),
                     )
                 })
             })
         })
     }
 
+    /// Rebuild the inbox from the authoritative rows of **every**
+    /// id-space the window can currently see: the local backend's
+    /// snapshot, plus each host section's mirror.
+    ///
+    /// The host half is what makes a reconnect restore that host's
+    /// attention rows — the fresh `tab.list` already says which tabs are
+    /// pending, and §4 forbids replaying the `notification.fired` that
+    /// set them — and it is what makes a `notification.fired` whose tab
+    /// the mirror had not listed yet heal itself on the next pass rather
+    /// than being lost.
     fn reconcile_notification_inbox(&mut self) {
         let host = self.backend.host();
-        let pending_rows: Vec<(TabKey, ProjectKey, String)> = self
-            .projects
-            .iter()
-            .flat_map(|project| {
-                project
-                    .tabs
-                    .iter()
-                    .filter(|tab| tab.has_notification)
-                    .map(move |tab| {
-                        let tab_title = if !tab.title.is_empty() {
-                            tab.title.clone()
-                        } else if !tab.cwd.is_empty() {
-                            tab.cwd.clone()
-                        } else {
-                            "Tab".to_string()
-                        };
-                        (
-                            TabKey::new(host, tab.id),
-                            ProjectKey::new(host, project.id),
-                            notification_inbox::compose_title(&project.name, &tab_title),
-                        )
-                    })
-            })
-            .collect();
+        let mut pending_rows: Vec<(TabKey, ProjectKey, String)> =
+            pending_notification_rows(host, &self.projects, &self.host_bells);
+        for view in &self.host_views {
+            // A saved host that has never published rows carries
+            // `HostId::LOCAL` as its placeholder (`refresh_host_views`);
+            // deriving from it would mean minting rows in the LOCAL
+            // id-space out of an empty project list.
+            if view.host.is_local() {
+                continue;
+            }
+            pending_rows.extend(pending_notification_rows(
+                view.host,
+                &view.projects,
+                &self.host_bells,
+            ));
+        }
         let pending: HashSet<TabKey> = pending_rows.iter().map(|row| row.0).collect();
-        // Scoped to this backend's instance for `retain_live`'s reason: a
-        // connected host's rows are absent from this snapshot because it
-        // is not their snapshot, not because they were cleared.
+        // Unscoped, because the derivation above now covers every
+        // id-space that has rows to show: a key absent from it is either
+        // a tab that stopped being pending, or one keyed at a connection
+        // incarnation no section names any more — a reconnect's dead
+        // epoch, which nothing will ever list, clear or render again.
+        // Both are gone, and §3.2's purge-then-rebuild is exactly the
+        // second case. A *dropped* host is not among them: its section
+        // keeps its last mirror (that is what the dimmed rows are drawn
+        // from), so its pending tabs are still derived here.
         let stale: Vec<TabKey> = self
             .notification_inbox
             .tab_keys()
             .into_iter()
-            .filter(|tab| tab.host == host && !pending.contains(tab))
+            .filter(|tab| !pending.contains(tab))
             .collect();
         for tab in stale {
             self.notification_inbox.remove(tab);
@@ -1027,10 +1682,56 @@ impl App {
         crate::macos::menu::sync_gating(gating, mtm);
     }
 
+    /// Rebuild the sidebar's host sections from the connection set.
+    ///
+    /// Every saved host gets a section whether or not it is connected —
+    /// a disconnected one lists the rows its last mirror published, and
+    /// one that has never connected lists none. With no saved hosts this
+    /// clears to empty and the sidebar keeps exactly today's chrome.
+    pub(super) fn refresh_host_views(&mut self) {
+        self.host_views = self
+            .workspace
+            .hosts()
+            .into_iter()
+            .map(|host| {
+                let (state, incarnation, mirror) = match self.hosts.section(&host.id) {
+                    Some(section) => (
+                        section.state.section_state(),
+                        section.incarnation,
+                        section.mirror.map(|mirror| mirror.read()),
+                    ),
+                    // Not being driven at all reads as disconnected: the
+                    // section is listed with a ↻, which is the whole of
+                    // the "no daemon is spawned silently" rule on screen.
+                    None => (host_sidebar::SectionState::Disconnected, None, None),
+                };
+                super::HostView {
+                    saved_id: host.id,
+                    // The registry's label wins over the connection's:
+                    // they are the same string, and the registry is the
+                    // one that exists before a connection does.
+                    label: host.label,
+                    // Same reason the label comes from here: the verb
+                    // policy has to know whether a host is this
+                    // machine's own *before* anything connects to it.
+                    localhost: host.target == crate::host_conn::LOCALHOST_TARGET,
+                    host: incarnation.unwrap_or(HostId::LOCAL),
+                    state,
+                    projects: mirror
+                        .as_ref()
+                        .map(|mirror| mirror.projects.clone())
+                        .unwrap_or_default(),
+                    active_tab_id: mirror.as_ref().map_or(0, |mirror| mirror.active_tab_id),
+                    agents: 0,
+                }
+            })
+            .collect();
+    }
+
     fn refresh_sidebar_agents(&mut self) {
         let host = self.backend.host();
         let now = agent_palette::now_unix();
-        self.sidebar_agents = self
+        let mut rows: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>> = self
             .projects
             .iter()
             .map(|project| {
@@ -1040,6 +1741,36 @@ impl App {
                 )
             })
             .collect();
+        // Host sections carry the same rows under the same keys — the
+        // ⌘⇧A toggle and the row widget are host-blind by construction
+        // (plan 037 §3.1). A disconnected host's rows are still built:
+        // they render dimmed rather than disappearing, and the count they
+        // feed is what its band would say if the state left the rollup
+        // slot free.
+        for view in &mut self.host_views {
+            let mut agents = 0;
+            for project in &view.projects {
+                let project_rows = agent_palette::sidebar_agents(project, view.host, now);
+                agents += project_rows.len();
+                rows.insert(ProjectKey::new(view.host, project.id), project_rows);
+            }
+            view.agents = agents;
+        }
+        self.sidebar_agents = rows;
+        // Last, because the rollups read the counts filled just above.
+        self.host_sections = host_sidebar::sections(
+            &self
+                .host_views
+                .iter()
+                .map(|view| host_sidebar::HostInput {
+                    saved_id: view.saved_id.as_str(),
+                    label: view.label.as_str(),
+                    host: view.host,
+                    state: view.state,
+                    agents: view.agents,
+                })
+                .collect::<Vec<_>>(),
+        );
     }
 
     fn sidebar_dump(&self) -> SidebarDumpResult {
@@ -1170,7 +1901,7 @@ impl App {
             UiRequest::Dump { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&self.backend.tab_key(tab_id))
+                    .get(&self.wire_tab_key(tab_id))
                     .map(TerminalTab::dump)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -1209,7 +1940,7 @@ impl App {
             } => {
                 let result = self
                     .tabs
-                    .get(&self.backend.tab_key(tab_id))
+                    .get(&self.wire_tab_key(tab_id))
                     .and_then(|tab| tab.session.capture())
                     .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
                     .and_then(|capture| {
@@ -1266,6 +1997,7 @@ impl App {
                         )),
                         KeyboardRoute::None
                         | KeyboardRoute::Confirm
+                        | KeyboardRoute::HostDialog
                         | KeyboardRoute::Editor
                         | KeyboardRoute::Palette => Err(format!(
                             "tab {tab_id} is not the active terminal \
@@ -1278,7 +2010,7 @@ impl App {
             UiRequest::TabDumpResolved { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get(&self.backend.tab_key(tab_id))
+                    .get(&self.wire_tab_key(tab_id))
                     .map(TerminalTab::resolved_cells)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -1447,10 +2179,12 @@ impl App {
                         self.palette_activate_replies.insert(op, reply);
                     }
                 }
-                // The rename rows open the inline editor from here too.
+                // The rename rows open the inline editor from here too,
+                // and `Add Host…` opens its dialog — both owe a focus.
                 task = task
                     .then(activation.task)
-                    .then(self.take_rename_focus_task());
+                    .then(self.take_rename_focus_task())
+                    .then(self.take_add_host_focus_task());
             }
             UiRequest::PaletteDismiss { reply } => {
                 let result = self
@@ -1578,8 +2312,109 @@ impl App {
                 };
                 let _ = reply.send(result);
             }
+            // The host registry + connections, as ops (plan 037 §3.5).
+            // Served here rather than in the engine so a `roostctl host`
+            // verb reconciles the same surfaces the palette row does —
+            // the sidebar section, the connection, the saved list — and
+            // so every verb has exactly one implementation.
+            UiRequest::HostAdd {
+                label,
+                target,
+                reply,
+            } => {
+                // Registry-only, per `roostctl host add`'s documented
+                // semantics; `host.connect` is the second step, and the
+                // Add Host dialog's "Add & Connect" takes both.
+                let _ = reply.send(
+                    self.host_add_requested(&label, &target, false)
+                        .map(Into::into),
+                );
+            }
+            UiRequest::HostRemove { id, reply } => {
+                let _ = reply.send(self.host_remove_requested(&id));
+            }
+            UiRequest::HostTabFocus {
+                host,
+                tab_id,
+                reply,
+            } => {
+                let key = TabKey::new(HostId::new(host), tab_id);
+                // The same two steps the sidebar click takes, in the
+                // same order: the selection first (so the view and the
+                // keyboard route move together), then the attach.
+                let result = self
+                    .focus_host_tab_and_clear(key, false)
+                    .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
+                let _ = reply.send(result);
+            }
+            UiRequest::HostConnect { id, reply } => {
+                let _ = reply.send(self.host_connect_op(&id));
+            }
+            UiRequest::HostDisconnect { id, reply } => {
+                let _ = reply.send(self.host_disconnect_op(&id));
+            }
         }
         task
+    }
+
+    /// `host.connect`, as the op answers it: start the attempt and
+    /// report the state it left the host in.
+    ///
+    /// `connecting` rather than `connected` is the honest answer — the
+    /// dial, the identify and the lease are a round trip this reply does
+    /// not wait for, and a client that wants the settled verdict watches
+    /// the section (or asks again).
+    fn host_connect_op(
+        &mut self,
+        saved_id: &str,
+    ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
+        let host = self.saved_host(saved_id)?;
+        self.host_reconnect_requested(saved_id);
+        Ok(self.host_connection_result(host))
+    }
+
+    fn host_disconnect_op(
+        &mut self,
+        saved_id: &str,
+    ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
+        let host = self.saved_host(saved_id)?;
+        self.host_disconnect_requested(saved_id);
+        Ok(self.host_connection_result(host))
+    }
+
+    /// The saved host with this id, as the registry has it. The one
+    /// spelling of "look a host up by id" on the app side.
+    pub(super) fn saved_host(
+        &self,
+        saved_id: &str,
+    ) -> Result<roost_engine::persistence::HostSnapshot, roost_engine::WorkspaceError> {
+        self.workspace
+            .hosts()
+            .into_iter()
+            .find(|host| host.id == saved_id)
+            .ok_or_else(|| roost_engine::WorkspaceError::HostNotFound(saved_id.to_string()))
+    }
+
+    /// The `{host, state}` both connection ops answer with, read off the
+    /// connection set *after* the verb ran.
+    fn host_connection_result(
+        &self,
+        host: roost_engine::persistence::HostSnapshot,
+    ) -> HostConnectionResult {
+        // Through the section state the sidebar itself reads, so the
+        // reply and the dot drawn beside it can never disagree. A host
+        // this app is not driving at all reads as disconnected, which is
+        // exactly what its section shows.
+        let state = self
+            .hosts
+            .state(&host.id)
+            .map_or(host_sidebar::SectionState::Disconnected, |state| {
+                state.section_state()
+            });
+        HostConnectionResult {
+            host: host.into(),
+            state: state.wire().to_string(),
+        }
     }
 
     pub(super) fn apply_osc_actions(&mut self, key: TabKey, actions: Vec<OscAction>) -> UiTask {
@@ -1628,6 +2463,237 @@ mod tests {
     use roost_ui_model::keys::HostId;
 
     use super::*;
+
+    fn envelope(event: &str, data: serde_json::Value) -> roost_ipc::messages::EventEnvelope {
+        roost_ipc::messages::EventEnvelope {
+            event: event.to_string(),
+            data,
+        }
+    }
+
+    /// A host agent's notification is routed to the notification path,
+    /// carrying the title and body verbatim — the inbox row and the
+    /// desktop banner are then composed exactly as a local tab's are
+    /// (plan 037 §3.1's "notifications from host tabs fire like local
+    /// ones").
+    ///
+    /// The wire spells `tab_id` as a string, so the decode is half the
+    /// point: a host tab id is an `i64` in a foreign id-space, and it
+    /// only becomes addressable once `apply_host_envelopes` qualifies it
+    /// at that host's incarnation.
+    #[test]
+    fn a_hosts_notification_envelope_routes_to_the_notification_path() {
+        let fired = envelope(
+            roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED,
+            serde_json::json!({"tab_id": "7", "title": "Claude", "body": "needs input"}),
+        );
+        let HostEnvelopeAction::Notify(notification) = host_envelope_action(&fired) else {
+            panic!("a notification.fired must reach the notification path");
+        };
+        assert_eq!(notification.tab_id, 7);
+        assert_eq!(notification.title, "Claude");
+        assert_eq!(notification.body, "needs input");
+
+        // And the key it lands under is the host's, never the local
+        // workspace's — the id-collision rule (AC11) at this seam.
+        let host = HostId::new(4);
+        let key = TabKey::new(host, notification.tab_id);
+        assert!(!key.is_local());
+        assert_ne!(key, TabKey::local(7));
+    }
+
+    /// The clearing edge only. A *pending* flag is the mirror's to paint
+    /// and carries no body; acting on it here would upsert a bodyless
+    /// duplicate beside the row `notification.fired` already made.
+    #[test]
+    fn only_the_clearing_edge_of_a_tabs_pending_flag_is_acted_on() {
+        let op = roost_ipc::messages::ops::EVENT_TAB_NOTIFICATION;
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                op,
+                serde_json::json!({"tab_id": "7", "has_pending": false})
+            )),
+            HostEnvelopeAction::ClearNotification(7)
+        ));
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                op,
+                serde_json::json!({"tab_id": "7", "has_pending": true})
+            )),
+            HostEnvelopeAction::Ignore
+        ));
+    }
+
+    /// Effects still route where C5 put them, and everything else is
+    /// silent: a workspace fact the mirror folds in, and an event from a
+    /// newer session this client has never heard of, are both ignored
+    /// rather than logged as faults (`ipc.md` #versioning).
+    #[test]
+    fn effects_route_and_unknown_envelopes_are_silently_ignored() {
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_TAB_EFFECT,
+                serde_json::json!({"tab_id": "3", "effect": "bell"})
+            )),
+            HostEnvelopeAction::Effect(_)
+        ));
+        for event in ["tab.title_changed", "something.from.the.future"] {
+            assert!(
+                matches!(
+                    host_envelope_action(&envelope(event, serde_json::json!({}))),
+                    HostEnvelopeAction::Ignore
+                ),
+                "{event}"
+            );
+        }
+    }
+
+    /// The retiring edges a host owes, and the reason they are here at
+    /// all: an attention row nothing takes down outlives the tab it
+    /// names. The local workspace already retires both surfaces on
+    /// `TabClosed` and sweeps the project on `ProjectDeleted`; a host
+    /// tab closed from anywhere — another window, `roostctl`, the shell
+    /// exiting — must do the same.
+    #[test]
+    fn a_hosts_close_and_delete_retire_what_they_named() {
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_TAB_CLOSED,
+                serde_json::json!({"tab_id": "7"})
+            )),
+            HostEnvelopeAction::TabClosed(7)
+        ));
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_PROJECT_DELETED,
+                serde_json::json!({"project_id": "4"})
+            )),
+            HostEnvelopeAction::ProjectDeleted(4)
+        ));
+    }
+
+    /// The inbox derivation is one rule over both id-spaces, which is
+    /// what makes a reconnect restore a host's attention rows: the
+    /// mirror already says which tabs are pending, so the reconcile
+    /// rebuilds them without a replayed `notification.fired` (plan 037
+    /// §4 forbids the replay).
+    ///
+    /// The keys are the point. The same numeric tab id under a host and
+    /// under the local workspace are two rows, and a host row's title
+    /// reads exactly like a local one so the single cross-host list does
+    /// not look like two kinds of list.
+    #[test]
+    fn pending_rows_derive_identically_for_a_host_and_for_the_local_workspace() {
+        fn tab(id: i64, has_notification: bool) -> roost_ipc::messages::Tab {
+            roost_ipc::messages::Tab {
+                id,
+                project_id: 4,
+                title: format!("tab-{id}"),
+                cwd: "/w/roost".into(),
+                state: roost_ipc::messages::TabState::None,
+                has_notification,
+                is_active: false,
+                user_titled: false,
+                position: 0,
+                created_at: 0,
+                last_active: 0,
+                hook_active: false,
+                shell_state: roost_ipc::agent::ShellState::default(),
+                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
+                ownership: None,
+            }
+        }
+        let projects = vec![Project {
+            id: 4,
+            name: "roost".into(),
+            cwd: "/w/roost".into(),
+            position: 0,
+            created_at: 0,
+            tabs: vec![tab(7, true), tab(8, false)],
+        }];
+
+        let host = HostId::new(3);
+        let none = HashSet::new();
+        let remote = pending_notification_rows(host, &projects, &none);
+        let local = pending_notification_rows(HostId::LOCAL, &projects, &none);
+        assert_eq!(remote.len(), 1, "only the pending tab earns a row");
+        assert_eq!(remote[0].0, TabKey::new(host, 7));
+        assert_eq!(remote[0].1, ProjectKey::new(host, 4));
+        assert_ne!(remote[0].0, local[0].0, "one number, two id-spaces");
+        assert_eq!(
+            remote[0].2, local[0].2,
+            "and one composed title, so the list reads as one list"
+        );
+
+        assert!(pending_notification_rows(host, &[], &none).is_empty());
+    }
+
+    /// A bell has no server flag behind it, so unless the derivation
+    /// itself knows about it the very next reconcile prunes its row —
+    /// which is what made a host bell a no-op on screen. It is an input
+    /// here, keyed at the host that rang: a bell on one incarnation must
+    /// not light the same number on another.
+    #[test]
+    fn a_bell_earns_a_row_the_reconcile_will_not_prune() {
+        fn tab(id: i64) -> roost_ipc::messages::Tab {
+            roost_ipc::messages::Tab {
+                id,
+                project_id: 4,
+                title: format!("tab-{id}"),
+                cwd: "/w/roost".into(),
+                state: roost_ipc::messages::TabState::None,
+                has_notification: false,
+                is_active: false,
+                user_titled: false,
+                position: 0,
+                created_at: 0,
+                last_active: 0,
+                hook_active: false,
+                shell_state: roost_ipc::agent::ShellState::default(),
+                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
+                ownership: None,
+            }
+        }
+        let projects = vec![Project {
+            id: 4,
+            name: "roost".into(),
+            cwd: "/w/roost".into(),
+            position: 0,
+            created_at: 0,
+            tabs: vec![tab(7), tab(8)],
+        }];
+        let host = HostId::new(3);
+
+        assert!(
+            pending_notification_rows(host, &projects, &HashSet::new()).is_empty(),
+            "no flags, no bells, no rows"
+        );
+
+        let rung: HashSet<TabKey> = [TabKey::new(host, 7)].into_iter().collect();
+        let rows = pending_notification_rows(host, &projects, &rung);
+        assert_eq!(rows.len(), 1, "the tab that rang earns exactly one row");
+        assert_eq!(rows[0].0, TabKey::new(host, 7));
+
+        // The same bare number on another incarnation is another tab.
+        assert!(
+            pending_notification_rows(HostId::new(9), &projects, &rung).is_empty(),
+            "a bell is keyed at the host that heard it"
+        );
+    }
+
+    /// A malformed payload is reported as undecodable rather than
+    /// silently dropped — the two are the same on screen and very
+    /// different in a log.
+    #[test]
+    fn a_malformed_payload_is_distinguishable_from_an_unknown_event() {
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED,
+                serde_json::json!({"title": "no tab id"})
+            )),
+            HostEnvelopeAction::Undecodable(_)
+        ));
+    }
 
     /// These tests hand `collect_tab_output` the items a forwarder would
     /// have delivered, so the feed receiver is surplus.

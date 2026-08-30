@@ -41,6 +41,7 @@ nav = [
     { "Claude Code Hooks" = "guides/claude-code.md" },
     { "Working Directory Tracking" = "guides/cwd-tracking.md" },
     { "Extending Roost" = "guides/extending.md" },
+    { "Host Sessions" = "guides/host-sessions.md" },
   ] },
   { "Reference" = [
     { "Configuration" = "reference/config.md" },
@@ -57,6 +58,7 @@ nav = [
   { "Development" = [
     { "Architecture & principles" = "development/vision.md" },
     { "Iced migration" = "development/iced-migration.md" },
+    { "Host sessions" = "development/host-sessions.md" },
     { "Shared Rust engine" = "development/shared-rust-engine.md" },
     { "Test automation" = "development/test-automation.md" },
     { "Setup" = "development/setup.md" },

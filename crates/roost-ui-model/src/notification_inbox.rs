@@ -176,6 +176,23 @@ pub fn compose_title(project: &str, tab: &str) -> String {
     format!("{project} · {tab}")
 }
 
+/// [`compose_title`]'s tab half: the tab's own title, its working
+/// directory when it has not published one, and a stable placeholder
+/// when it has neither.
+///
+/// One spelling for local and host tabs both (plan 037 §3.1's host inbox
+/// parity) — the inbox is a single list, so a row must not be
+/// identifiable as remote by the shape of its title.
+pub fn tab_title(title: &str, cwd: &str) -> String {
+    if !title.is_empty() {
+        title.to_string()
+    } else if !cwd.is_empty() {
+        cwd.to_string()
+    } else {
+        "Tab".to_string()
+    }
+}
+
 /// Compact relative-time label ("just now", "2m", "1h", "3d") for the
 /// inbox row's trailing text. Mirrors the Mac `relativeTimeLabel`.
 pub fn relative_time(elapsed_secs: u64) -> String {
@@ -278,6 +295,15 @@ mod tests {
     #[test]
     fn compose_title_is_project_forward() {
         assert_eq!(compose_title("roost", "claude"), "roost · claude");
+    }
+
+    /// The same fallback chain whichever host the tab runs on, so an
+    /// inbox row is never identifiable as remote by its shape.
+    #[test]
+    fn tab_title_falls_back_to_cwd_then_a_placeholder() {
+        assert_eq!(tab_title("claude", "/tmp"), "claude");
+        assert_eq!(tab_title("", "/tmp"), "/tmp");
+        assert_eq!(tab_title("", ""), "Tab");
     }
 
     #[test]

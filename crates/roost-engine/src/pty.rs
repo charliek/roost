@@ -368,6 +368,48 @@ impl PtySupervisor {
         self.tab_task_handle(tab_id).map(|(cmd_tx, _)| cmd_tx)
     }
 
+    /// `session.set_theme`: record the session-wide theme and reseed
+    /// every live tab, returning how many took it.
+    ///
+    /// Stored before the fan-out, because the pair is a race otherwise:
+    /// a tab spawned between the store and the fan-out builds its
+    /// terminal from the stored theme, and one spawned just before it
+    /// is in the snapshot. A tab can therefore be seeded twice, which is
+    /// idempotent, but never zero times.
+    ///
+    /// A tab whose task died between the snapshot and its send is not an
+    /// error — its client is about to see `tab.closed` — so it is left
+    /// out of the count rather than failing the op.
+    ///
+    /// `None` when server-VT is off — a UI supervisor has no terminals
+    /// of its own to recolor.
+    #[cfg(feature = "server-vt")]
+    pub async fn set_theme(&self, seed: &crate::osc::OscColorSnapshot) -> Option<u32> {
+        let state = self.server_vt.get()?;
+        let generation = state.set_theme(seed.clone());
+        // The guard is scoped so it is released before the first await:
+        // this is a `std::sync::Mutex`, and the spawn path takes it.
+        let tabs: Vec<mpsc::Sender<crate::tab_task::TabCmd>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|session| session.tab_task.as_ref())
+            .map(|(cmd_tx, _)| cmd_tx.clone())
+            .collect();
+        let mut reseeded: u32 = 0;
+        for commands in tabs {
+            if commands
+                .send(crate::tab_task::TabCmd::SetTheme(seed.clone(), generation))
+                .await
+                .is_ok()
+            {
+                reseeded = reseeded.saturating_add(1);
+            }
+        }
+        Some(reseeded)
+    }
+
     /// A live tab's `tab_generation`, or `None` as above.
     #[cfg(feature = "server-vt")]
     pub fn tab_generation(&self, tab_id: i64) -> Option<u64> {
@@ -735,6 +777,28 @@ impl PtySupervisor {
         // Either branch consumed the pending entry (ours, or the one
         // `close()` already took), so the guard has nothing left to do.
         slot.armed = false;
+
+        // A `session.set_theme` that ran between this tab's terminal
+        // build and its promotion snapshotted a sessions map this tab
+        // was not in yet — the one window the fan-out cannot see. The
+        // generation check makes the catch-up idempotent, and the task's
+        // own monotonic check makes it safe against a racing fresh
+        // fan-out. `try_send` on a freshly minted channel cannot
+        // meaningfully be full; a dropped catch-up is repaired by the
+        // next set_theme like any other missed reseed.
+        #[cfg(feature = "server-vt")]
+        if unwanted.is_none() {
+            if let (Some(pipe), Some(state)) = (tab_pipe.as_ref(), self.server_vt.get()) {
+                let (generation, seed) = state.theme();
+                if generation > pipe.theme_generation {
+                    if let Some(seed) = seed {
+                        let _ = pipe
+                            .cmd_tx
+                            .try_send(crate::tab_task::TabCmd::SetTheme(seed, generation));
+                    }
+                }
+            }
+        }
 
         // Wait for the child to exit; hand the status to the reader
         // task (which publishes it onto the output channel) and send

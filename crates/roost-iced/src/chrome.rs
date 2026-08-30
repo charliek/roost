@@ -134,6 +134,44 @@ pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
 pub const PALETTE_HOVER: Color = Color::from_rgb8(0x3d, 0x3d, 0x43);
 pub const PALETTE_PLACEHOLDER: Color = Color::from_rgb8(0x9e, 0x9e, 0x9e);
 pub const PALETTE_MATCH: Color = Color::from_rgb8(0x5f, 0xa3, 0xf0);
+/// The host-section header's connection dot (plan 037 §3.1). Sampled
+/// from the approved mockup's `.hdot` rules: green connected, grey gone,
+/// amber in flight — the amber is the mockup's own busy-agent shade, so
+/// "something is happening" reads the same everywhere in the chrome.
+pub const HOST_DOT_CONNECTED: Color = Color::from_rgb8(0x3f, 0xca, 0x6b);
+pub const HOST_DOT_OFFLINE: Color = Color::from_rgb8(0x6a, 0x70, 0x76);
+pub const HOST_DOT_PENDING: Color = Color::from_rgb8(0xe6, 0xb2, 0x3a);
+pub const HOST_DOT_SIZE: f32 = 7.0;
+/// Gap between the dot, the label, and the rollup in a host band
+/// (mockup `.hosthdr { gap: 7px }`).
+pub const HOST_BAND_SPACING: f32 = 7.0;
+/// The band's right-aligned rollup ("2 agents", "disconnected") — one
+/// step quieter than [`MUTED_TEXT`], as the mockup's `.hosthdr small`.
+pub const HOST_ROLLUP_TEXT: Color = Color::from_rgb8(0x6e, 0x74, 0x7a);
+pub const HOST_ROLLUP_SIZE: f32 = 10.0;
+/// A disconnected section's rows stay listed at this opacity (mockup
+/// `.dim`). Applied to the row colors rather than to a layer: iced has no
+/// container opacity, and scaling alpha composites identically over the
+/// flat list fill.
+pub const HOST_SECTION_DIM: f32 = 0.45;
+/// The inline "↻ Reconnect" row (mockup `.reconnect`).
+pub const HOST_RECONNECT_TEXT: Color = Color::from_rgb8(0x7f, 0xa8, 0xe8);
+/// The takeover / session-ended banner over a host tab's last frame
+/// (plan 037 §3.1). Sampled from the approved mockup's `.banner` rules —
+/// a warm amber band that is deliberately nothing like the terminal
+/// palette underneath it, because the whole point is that it is not part
+/// of the frame it sits on.
+pub const HOST_BANNER_BG: Color = Color::from_rgb8(0x4a, 0x33, 0x23);
+pub const HOST_BANNER_TEXT: Color = Color::from_rgb8(0xee, 0xcf, 0xa2);
+pub const HOST_BANNER_BORDER: Color = Color::from_rgb8(0x6b, 0x4a, 0x2a);
+pub const HOST_BANNER_BUTTON_BORDER: Color = Color::from_rgb8(0x8a, 0x6a, 0x40);
+pub const HOST_BANNER_TEXT_SIZE: f32 = 12.0;
+pub const HOST_BANNER_ACTION_SIZE: f32 = 11.5;
+/// The scrim over the frozen frame. A layer rather than
+/// [`HOST_SECTION_DIM`]'s alpha scaling: the terminal is drawn by a
+/// custom widget from an owned snapshot, so the only way to dim it
+/// without touching every cell color is to composite over it.
+pub const HOST_FRAME_SCRIM: Color = Color::from_rgba8(0x14, 0x16, 0x18, 0.55);
 pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
 pub const DANGER: Color = Color::from_rgb8(0x8a, 0x2a, 0x2a);
 pub const DANGER_ACCENT: Color = Color::from_rgb8(0xa8, 0x33, 0x33);
@@ -343,6 +381,28 @@ pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// A dialog's confirming action — Add Host's "Add & Connect" (plan 037
+/// §3.1, the mock's `.btn.primary`).
+///
+/// The accent twin of [`danger_button`]: same geometry and the same
+/// disabled treatment, so a dialog's button row reads as one control set
+/// whichever of the two it ends with. `ACTIVE_BLUE` is the chrome's
+/// existing pressed-blue, reused rather than inventing a shade.
+pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (ACTIVE_BLUE, TEXT),
+        button::Status::Active => (ACCENT, TEXT),
+        button::Status::Disabled => (ACCENT.scale_alpha(0.5), MUTED_TEXT.scale_alpha(0.5)),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().rounded(4),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
     let (background, text_color) = match status {
         button::Status::Hovered | button::Status::Pressed => (DANGER_ACCENT, TEXT),
@@ -356,6 +416,48 @@ pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
         shadow: Shadow::default(),
         snap: true,
     }
+}
+
+/// The banner strip itself: a filled band with a hairline along its
+/// bottom edge, so it reads as chrome laid over the frame rather than as
+/// something the terminal drew.
+pub fn host_banner(_: &Theme) -> container::Style {
+    container::Style::default().background(HOST_BANNER_BG)
+}
+
+/// The hairline under the banner. A separate 1px container rather than a
+/// border: iced borders draw on all four edges, and a box around the
+/// full-width strip reads as a framed callout instead of a band.
+pub fn host_banner_edge(_: &Theme) -> container::Style {
+    container::Style::default().background(HOST_BANNER_BORDER)
+}
+
+/// The banner's one action ("Reconnect here"). Outlined in the band's
+/// own border shade — a filled accent button here would compete with the
+/// message for the eye, and the mockup's `.banner .btn` does not.
+pub fn host_banner_button(_: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => Some(Background::Color(
+            HOST_BANNER_BUTTON_BORDER.scale_alpha(0.4),
+        )),
+        button::Status::Active | button::Status::Disabled => None,
+    };
+    button::Style {
+        background,
+        text_color: HOST_BANNER_TEXT,
+        border: Border {
+            color: HOST_BANNER_BUTTON_BORDER,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// The dimming layer over a frame nothing will update again.
+pub fn host_frame_scrim(_: &Theme) -> container::Style {
+    container::Style::default().background(HOST_FRAME_SCRIM)
 }
 
 pub fn palette_panel(_: &Theme) -> container::Style {

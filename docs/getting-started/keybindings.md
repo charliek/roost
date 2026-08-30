@@ -10,7 +10,7 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Cmd-T`          | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)) |
+| `Cmd-T`          | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)); on a project living on a [host session](../guides/host-sessions.md), the new tab opens on that same host |
 | `Cmd-W`          | Close the active tab                            |
 | `Cmd-R`          | Rename the active tab                           |
 | `Cmd-Shift-]`    | Cycle to the next tab (stops at the last tab; no wrap-around) |
@@ -21,7 +21,8 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 
 | Shortcut             | Action                                       |
 |----------------------|----------------------------------------------|
-| `Cmd-N`              | Create a new project (`untitled`, `untitled 2`, …) |
+| `Cmd-N`              | Create a new project (`untitled`, `untitled 2`, …) — on a [host session](../guides/host-sessions.md), creates on the currently selected project's host |
+| `Cmd-Shift-N`        | "New Project on…" — pick which host (or LOCAL) to create on; offered once at least one host is saved, and the picker lists the connected ones |
 | `Cmd-Shift-R`        | Rename the active project                   |
 | `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
@@ -65,7 +66,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Alt-T`         | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)) |
+| `Alt-T`         | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)); on a project living on a [host session](../guides/host-sessions.md), the new tab opens on that same host |
 | `Alt-W`         | Close the active tab                            |
 | `Alt-R`          | Rename the active tab                           |
 | `Alt-Shift-]`   | Cycle to the next tab (stops at the last tab; no wrap-around) |
@@ -76,7 +77,8 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 
 | Shortcut             | Action                                       |
 |----------------------|----------------------------------------------|
-| `Alt-N`              | Create a new project (`untitled`, `untitled 2`, …) |
+| `Alt-N`              | Create a new project (`untitled`, `untitled 2`, …) — on a [host session](../guides/host-sessions.md), creates on the currently selected project's host |
+| `Alt-Shift-N`        | "New Project on…" — pick which host (or LOCAL) to create on; offered once at least one host is saved, and the picker lists the connected ones |
 | `Alt-Shift-R`        | Rename the active project                   |
 | `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
@@ -220,6 +222,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `paste`               | `super+v`, `ctrl+shift+v` / `alt+v`, `ctrl+shift+v`    |
 | `copy`                | `super+c`, `ctrl+shift+c` / `alt+c`, `ctrl+shift+c`    |
 | `new_project`         | `super+n` / `alt+n`                                    |
+| `new_project_on_host` | `super+shift+n` / `alt+shift+n`                        |
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
 | `close_project`       | `super+shift+w` / `alt+shift+w`                        |
 | `toggle_sidebar`      | `super+b` / `alt+b`                                    |

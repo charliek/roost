@@ -18,8 +18,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use roost_engine::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
+use roost_engine::osc::{OscColorSnapshot, OscRgb};
 use roost_engine::tab_task::{ServerVtConfig, ServerVtWorkspace, TabCmd, TabError};
-use roost_engine::{PtyOutputEvent, PtySupervisor};
+use roost_engine::{PtyOutputEvent, PtySupervisor, TabEffectKind};
+use roost_ipc::messages::{bytes_base64, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -35,6 +37,7 @@ const BUDGET: Duration = Duration::from_secs(10);
 struct TestWorkspace {
     osc: Mutex<Vec<(i64, u32, String)>>,
     closed: Mutex<Vec<i64>>,
+    effects: Mutex<Vec<(i64, TabEffectKind)>>,
     gate: Mutex<bool>,
     released: Condvar,
 }
@@ -56,6 +59,10 @@ impl TestWorkspace {
     fn osc_calls(&self) -> Vec<(i64, u32, String)> {
         self.osc.lock().unwrap().clone()
     }
+
+    fn effects(&self) -> Vec<(i64, TabEffectKind)> {
+        self.effects.lock().unwrap().clone()
+    }
 }
 
 impl ServerVtWorkspace for TestWorkspace {
@@ -72,6 +79,10 @@ impl ServerVtWorkspace for TestWorkspace {
 
     fn close_row(&self, tab_id: i64) {
         self.closed.lock().unwrap().push(tab_id);
+    }
+
+    fn tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
+        self.effects.lock().unwrap().push((tab_id, effect));
     }
 }
 
@@ -606,10 +617,18 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
     // pipeline after the flood.
     feed(&commands, b"\x1b[2J\x1b[Hstill-here").await;
     let dump = quiesce(&commands).await;
-    assert_eq!(
-        dump.rows_text.first().map(String::as_str),
-        Some("still-here"),
-        "the tab task must keep processing output through a reply flood"
+    let row = dump.rows_text.first().map(String::as_str).unwrap_or("");
+    // Starts-with, not equals: the flood's own replies are ECHOED back
+    // by the line discipline (see the tee comment below), and an echo
+    // that lands after the clear-and-write leaves its tail on this row —
+    // `\x1b[24;1R` arriving late shows up as a stray `;`. How much echo
+    // laps back is platform- and load-dependent, which is why an exact
+    // match failed on CI while passing on a fast local box. What this
+    // test is about is that the marker was processed AT ALL after the
+    // flood; the debris after it is the flood, not a regression.
+    assert!(
+        row.starts_with("still-here"),
+        "the tab task must keep processing output through a reply flood; row was {row:?}"
     );
 
     // …and the tee kept flowing through it, contiguously. The replies
@@ -745,9 +764,11 @@ async fn a_resize_drains_the_in_band_size_report() {
 
 /// OSC that carries workspace facts still reaches the workspace — the
 /// job `drain.rs` did in HS-1a, now done by the task that also owns the
-/// terminal. Client-local effects (clipboard, pointer) are dropped.
+/// terminal. Client-local effects take the other seam (`tab_effect`),
+/// except the ones HS-2 left out of scope: a pointer shape is still
+/// dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn workspace_osc_routes_through_the_seam_and_effects_are_dropped() {
+async fn workspace_osc_and_client_effects_take_their_own_seams() {
     let (sup, workspace) = enabled_supervisor(false);
     let _output = sup
         .spawn(922, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("osc"))
@@ -766,9 +787,203 @@ async fn workspace_osc_routes_through_the_seam_and_effects_are_dropped() {
             (922, 0, "build".to_string()),
             (922, 7, "file:///tmp/work".to_string()),
         ],
-        "only workspace-directed actions cross the seam"
+        "only workspace-directed actions cross the workspace seam"
+    );
+    assert_eq!(
+        workspace.effects(),
+        vec![(
+            922,
+            TabEffectKind::ClipboardWrite {
+                text: "hello".to_string(),
+                target: ClipboardEffectTarget::System,
+            }
+        )],
+        "the clipboard write is an effect; the pointer shape is still dropped"
     );
 
     drop(commands);
     sup.close(922);
+}
+
+/// Plan 037 §3.6, the effects envelope's two halves.
+///
+/// The bell is the interesting one: a BEL that TERMINATES an OSC is not
+/// a bell, and telling the two apart is the whole reason the scan owns
+/// the count. The primary-selection target rides along so a `p` write
+/// cannot be mistaken for a system-clipboard one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bells_and_clipboard_writes_reach_the_effects_seam() {
+    let (sup, workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(923, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("effects"))
+        .expect("spawn");
+    let commands = sup.tab_commands(923).expect("server-vt tab task");
+
+    // Two BELs in one chunk, around an OSC 0 whose own BEL terminator
+    // must not ring: one `bell` effect for the chunk.
+    feed(&commands, b"\x07\x1b]0;title\x07\x07").await;
+    // A second chunk rings again — the coalescing is per chunk, not a
+    // latch that swallows every later bell.
+    feed(&commands, b"\x07").await;
+    // A primary-selection write, base64 of "sel".
+    feed(&commands, b"\x1b]52;p;c2Vs\x07").await;
+    quiesce(&commands).await;
+
+    assert_eq!(
+        workspace.effects(),
+        vec![
+            (923, TabEffectKind::Bell),
+            (923, TabEffectKind::Bell),
+            (
+                923,
+                TabEffectKind::ClipboardWrite {
+                    text: "sel".to_string(),
+                    target: ClipboardEffectTarget::Selection,
+                }
+            ),
+        ]
+    );
+
+    drop(commands);
+    sup.close(923);
+}
+
+/// The cap is on the DECODED payload and it is a drop, not a truncation:
+/// half a clipboard is worse than none, and a client that trusted a
+/// truncated one would paste it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_clipboard_write_is_dropped_whole() {
+    let (sup, workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(924, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("cap"))
+        .expect("spawn");
+    let commands = sup.tab_commands(924).expect("server-vt tab task");
+
+    // Straddle the cap from both sides in one run, so a regression that
+    // moved the bound either way shows up here.
+    let at_cap = "a".repeat(CLIPBOARD_EFFECT_MAX_BYTES);
+    let over_cap = "b".repeat(CLIPBOARD_EFFECT_MAX_BYTES + 1);
+    for payload in [&at_cap, &over_cap] {
+        let mut osc = b"\x1b]52;c;".to_vec();
+        osc.extend_from_slice(bytes_base64::encode(payload.as_bytes()).as_bytes());
+        osc.push(0x07);
+        feed(&commands, &osc).await;
+    }
+    quiesce(&commands).await;
+
+    assert_eq!(
+        workspace.effects(),
+        vec![(
+            924,
+            TabEffectKind::ClipboardWrite {
+                text: at_cap,
+                target: ClipboardEffectTarget::System,
+            }
+        )],
+        "exactly the at-cap write survives, and its payload is unmodified"
+    );
+
+    drop(commands);
+    sup.close(924);
+}
+
+/// `session.set_theme` reaches the terminal, not just the tracker: the
+/// proof is the terminal's own OSC 11 answer, which libghostty writes
+/// through `write_pty` from the colors it actually holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_theme_reseed_changes_what_a_color_query_is_answered_with() {
+    let (sup, _workspace) = enabled_supervisor(true);
+    let _output = sup
+        .spawn(925, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("theme"))
+        .expect("spawn");
+    let commands = sup.tab_commands(925).expect("server-vt tab task");
+
+    // The headless default is white on black.
+    feed(&commands, b"\x1b]11;?\x07").await;
+    quiesce(&commands).await;
+    let before = String::from_utf8_lossy(&capture(&commands, true).await).into_owned();
+    assert!(
+        before.contains("0000/0000/0000"),
+        "expected the headless black background, got {before:?}"
+    );
+
+    commands
+        .send(TabCmd::SetTheme(
+            theme((0xff, 0xff, 0xff), (0x1c, 0x2b, 0x3a)),
+            // Any generation newer than the build's (0 here — no
+            // session-wide theme was stored before this tab spawned).
+            1,
+        ))
+        .await
+        .expect("tab task is alive");
+    feed(&commands, b"\x1b]11;?\x07").await;
+    quiesce(&commands).await;
+    let after = String::from_utf8_lossy(&capture(&commands, true).await).into_owned();
+    assert!(
+        after.contains("1c1c/2b2b/3a3a"),
+        "expected the reseeded background, got {after:?}"
+    );
+
+    // A stale fan-out must not roll the terminal back: generation 1 is
+    // already applied, so a racing older send (same generation or
+    // lower) is ignored — last-writer-wins is decided by the store's
+    // counter, not by whose send lands last.
+    commands
+        .send(TabCmd::SetTheme(
+            theme((0x00, 0x00, 0x00), (0x99, 0x99, 0x99)),
+            1,
+        ))
+        .await
+        .expect("tab task is alive");
+    feed(&commands, b"\x1b]11;?\x07").await;
+    quiesce(&commands).await;
+    let stale = String::from_utf8_lossy(&capture(&commands, true).await).into_owned();
+    assert!(
+        stale.contains("1c1c/2b2b/3a3a"),
+        "a stale generation must not reseed, got {stale:?}"
+    );
+
+    drop(commands);
+    sup.close(925);
+}
+
+/// The seed is session-wide, so a tab opened AFTER the theme landed
+/// starts on it — otherwise every tab created during a session renders
+/// the client's colors wrong until the next reseed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tab_opened_after_a_reseed_starts_on_the_new_theme() {
+    let (sup, _workspace) = enabled_supervisor(true);
+    assert_eq!(
+        sup.set_theme(&theme((0xff, 0xff, 0xff), (0x0a, 0x0b, 0x0c)))
+            .await
+            .expect("server-vt is on"),
+        0,
+        "no tabs exist yet, so the theme is only recorded"
+    );
+
+    let _output = sup
+        .spawn(926, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("theme2"))
+        .expect("spawn");
+    let commands = sup.tab_commands(926).expect("server-vt tab task");
+    feed(&commands, b"\x1b]11;?\x07").await;
+    quiesce(&commands).await;
+    let answer = String::from_utf8_lossy(&capture(&commands, true).await).into_owned();
+    assert!(
+        answer.contains("0a0a/0b0b/0c0c"),
+        "a tab built after the reseed starts on the stored theme, got {answer:?}"
+    );
+
+    drop(commands);
+    sup.close(926);
+}
+
+/// A theme seed with a distinguishable background; the palette is a
+/// per-index ramp so a test that cares can tell entries apart.
+fn theme(foreground: OscRgb, background: OscRgb) -> OscColorSnapshot {
+    let mut palette = [(0u8, 0u8, 0u8); 256];
+    for (index, entry) in palette.iter_mut().enumerate() {
+        let value = u8::try_from(index).expect("256 entries fit a u8");
+        *entry = (value, value, value);
+    }
+    OscColorSnapshot::new(foreground, background, foreground, palette)
 }
