@@ -617,10 +617,18 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
     // pipeline after the flood.
     feed(&commands, b"\x1b[2J\x1b[Hstill-here").await;
     let dump = quiesce(&commands).await;
-    assert_eq!(
-        dump.rows_text.first().map(String::as_str),
-        Some("still-here"),
-        "the tab task must keep processing output through a reply flood"
+    let row = dump.rows_text.first().map(String::as_str).unwrap_or("");
+    // Starts-with, not equals: the flood's own replies are ECHOED back
+    // by the line discipline (see the tee comment below), and an echo
+    // that lands after the clear-and-write leaves its tail on this row —
+    // `\x1b[24;1R` arriving late shows up as a stray `;`. How much echo
+    // laps back is platform- and load-dependent, which is why an exact
+    // match failed on CI while passing on a fast local box. What this
+    // test is about is that the marker was processed AT ALL after the
+    // flood; the debris after it is the flood, not a regression.
+    assert!(
+        row.starts_with("still-here"),
+        "the tab task must keep processing output through a reply flood; row was {row:?}"
     );
 
     // …and the tee kept flowing through it, contiguously. The replies

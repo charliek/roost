@@ -1258,7 +1258,11 @@ impl Workspace {
     ///
     /// Not gated on the tab still existing: the tab task is the only
     /// caller and it emits from inside its own tab's pipeline —
-    /// `pub(crate)` so that stays true.
+    /// `pub(crate)` so that stays true. That single caller is
+    /// `server-vt`-only, so without the feature this is genuinely dead
+    /// rather than merely unreferenced — which the iced lane's
+    /// `-D warnings` lint of a featureless `roost-engine` catches.
+    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     pub(crate) fn publish_tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
         let inner = self.inner.lock().unwrap();
         // The tab task outlives its workspace row on purpose (it keeps
