@@ -365,6 +365,28 @@ pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// A dialog's confirming action — Add Host's "Add & Connect" (plan 037
+/// §3.1, the mock's `.btn.primary`).
+///
+/// The accent twin of [`danger_button`]: same geometry and the same
+/// disabled treatment, so a dialog's button row reads as one control set
+/// whichever of the two it ends with. `ACTIVE_BLUE` is the chrome's
+/// existing pressed-blue, reused rather than inventing a shade.
+pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (ACTIVE_BLUE, TEXT),
+        button::Status::Active => (ACCENT, TEXT),
+        button::Status::Disabled => (ACCENT.scale_alpha(0.5), MUTED_TEXT.scale_alpha(0.5)),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().rounded(4),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
     let (background, text_color) = match status {
         button::Status::Hovered | button::Status::Pressed => (DANGER_ACCENT, TEXT),

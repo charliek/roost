@@ -297,9 +297,11 @@ enum ProjectCmd {
 
 #[derive(Subcommand, Debug)]
 enum TabCmd {
+    /// Focus a tab. `--tab` takes a bare id, or the `h<host>.<id>`
+    /// spelling to select (and attach) a connected host's tab.
     Focus {
         #[arg(long, env = "ROOST_TAB_ID")]
-        tab: Option<i64>,
+        tab: Option<String>,
     },
     /// List projects + their tabs. `--json` emits the machine-readable
     /// workspace snapshot (the `tab.list` result) instead of plain text.
@@ -691,7 +693,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Tab(TabCmd::Focus { tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
             client
                 .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id })
                 .await?;
@@ -835,7 +837,12 @@ async fn main() -> Result<()> {
             }
             if focus {
                 client
-                    .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id: new_id })
+                    .call::<_, serde_json::Value>(
+                        ops::TAB_FOCUS,
+                        TabFocusParams {
+                            tab_id: WireTabRef::Local(new_id),
+                        },
+                    )
                     .await?;
             }
             // Print just the new tab id (matches the documented contract;
@@ -882,11 +889,7 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Cmd::Tab(TabCmd::Dump { tab, json }) => {
-            let tab_id = match tab.as_deref() {
-                Some(raw) => WireTabRef::parse(raw)
-                    .ok_or_else(|| anyhow::anyhow!("invalid --tab reference: {raw}"))?,
-                None => WireTabRef::Local(resolve_tab(&mut client, None).await?),
-            };
+            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
             let result: TabDumpResult =
                 client.call(ops::TAB_DUMP, TabDumpParams { tab_id }).await?;
             if json {
@@ -1407,6 +1410,18 @@ fn decode_escapes(s: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// A `--tab` argument as the wire wants it: a bare id, the
+/// `h<host>.<id>` spelling of a connected host's tab, or — when the flag
+/// is absent — the UI's own active tab, which is always local.
+async fn wire_tab_ref(client: &mut IpcClient, explicit: Option<&str>) -> Result<WireTabRef> {
+    match explicit {
+        Some(raw) => {
+            WireTabRef::parse(raw).ok_or_else(|| anyhow::anyhow!("invalid --tab reference: {raw}"))
+        }
+        None => Ok(WireTabRef::Local(resolve_tab(client, None).await?)),
+    }
 }
 
 /// Resolve the tab id for a per-tab command. Falls back to the

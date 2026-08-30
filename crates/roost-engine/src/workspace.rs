@@ -456,11 +456,24 @@ fn validate_host_label(existing: &[HostSnapshot], label: &str) -> Result<(), Wor
     }
     // Unicode folding, not `eq_ignore_ascii_case`: "Éclair" and "éclair"
     // must collide, or the sidebar shows two visually identical headers.
-    let folded = label.to_lowercase();
-    if folded == "local" {
+    //
+    // Both directions, because `to_lowercase` is not full case folding:
+    // "straße" lowercases to itself while "STRASSE" lowercases to
+    // "strasse", so a lowercase-only rule saves both — and the sidebar
+    // then draws the header "STRASSE" twice, which is the collision this
+    // rule exists to prevent. The uppercase comparison IS that display
+    // form, so it catches the pair a lowercase one misses; the lowercase
+    // comparison still catches the everyday "Pop-OS" / "pop-os". Either
+    // form colliding is a collision.
+    let lower = label.to_lowercase();
+    let upper = label.to_uppercase();
+    if lower == "local" || upper == "LOCAL" {
         return Err(WorkspaceError::HostLabelReserved);
     }
-    if existing.iter().any(|h| h.label.to_lowercase() == folded) {
+    if existing
+        .iter()
+        .any(|h| h.label.to_lowercase() == lower || h.label.to_uppercase() == upper)
+    {
         return Err(WorkspaceError::HostLabelTaken(label.to_string()));
     }
     Ok(())
@@ -662,6 +675,21 @@ impl Workspace {
         inner.hosts.push(host.clone());
         self.commit(inner, Vec::new(), Persist::Write);
         Ok(host)
+    }
+
+    /// Would this label be accepted? The registry's own rules, asked
+    /// without saving.
+    ///
+    /// The Add Host dialog checks here before it spends a round trip
+    /// dialing the socket, so "local is reserved" is answered
+    /// immediately rather than after a five-second timeout on a name
+    /// that was never going to be saved. [`Self::add_host`] re-validates
+    /// under the lock, so this is a courtesy and never the enforcement —
+    /// which is also why it is the same function underneath: a second
+    /// spelling of the rules would drift.
+    pub fn check_host_label(&self, label: &str) -> Result<(), WorkspaceError> {
+        let inner = self.inner.lock().unwrap();
+        validate_host_label(&inner.hosts, label.trim())
     }
 
     /// Forget a saved host by its stable id. Does not touch a live

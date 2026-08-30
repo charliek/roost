@@ -260,6 +260,36 @@ fn add_host_rejects_a_duplicate_label_across_unicode_case() {
     assert!(matches!(err, WorkspaceError::HostLabelTaken(label) if label == "éclair"));
 }
 
+/// The pair `to_lowercase` alone cannot separate: "straße" lowercases to
+/// itself, so a lowercase-only comparison saves it alongside "STRASSE"
+/// — and the sidebar then draws the identical header "STRASSE" twice,
+/// which is exactly what the uniqueness rule exists to prevent. The
+/// uppercase form IS that header, so it is compared too.
+#[test]
+fn add_host_rejects_a_duplicate_the_uppercase_header_would_collapse() {
+    for (first, second) in [("straße", "STRASSE"), ("STRASSE", "straße")] {
+        let ws = Workspace::new();
+        ws.add_host(first, "localhost").unwrap();
+        let err = ws.add_host(second, "elsewhere").unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::HostLabelTaken(label) if label == second),
+            "{first:?} then {second:?} must collide"
+        );
+        assert_eq!(ws.hosts().len(), 1);
+    }
+}
+
+/// Labels that only *look* alike under one folding still both save —
+/// the rule is about the two rendered headers being the same string, not
+/// about visual similarity.
+#[test]
+fn add_host_still_accepts_labels_that_fold_apart() {
+    let ws = Workspace::new();
+    ws.add_host("pop-os", "localhost").unwrap();
+    ws.add_host("pop-os-2", "elsewhere").unwrap();
+    assert_eq!(ws.hosts().len(), 2);
+}
+
 #[test]
 fn legacy_state_without_hosts_loads_and_rewrites_empty() {
     let dir = tempdir().unwrap();

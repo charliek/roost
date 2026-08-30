@@ -120,6 +120,18 @@ enum Message {
     /// stable id (plan 037 §3.1). C7's `Connect Host: <label>` palette
     /// verb lands on the same app entry.
     HostReconnect(String),
+    /// The Add Host dialog's two fields and its confirming button (plan
+    /// 037 §3.1) — the one free-text flow in the host verb family.
+    AddHostNameChanged(String),
+    AddHostSocketChanged(String),
+    AddHostSubmit,
+    /// Dismiss whichever host modal is up: Cancel, the backdrop, or Esc.
+    HostDialogCancel,
+    /// A press that landed on the modal card itself. Swallowed, so it
+    /// does not reach the backdrop's dismiss underneath.
+    HostDialogCardPressed,
+    /// The Stop Session confirmation's destructive button.
+    HostStopConfirm,
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
@@ -528,6 +540,12 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::NewTab
         | Message::NewProject
         | Message::HostReconnect(_)
+        | Message::AddHostNameChanged(_)
+        | Message::AddHostSocketChanged(_)
+        | Message::AddHostSubmit
+        | Message::HostDialogCancel
+        | Message::HostDialogCardPressed
+        | Message::HostStopConfirm
         | Message::ConfirmDeleteCancel
         | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }

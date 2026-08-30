@@ -84,6 +84,29 @@ impl SectionState {
     pub fn offers_reconnect(self) -> bool {
         !matches!(self, Self::Local | Self::Connected)
     }
+
+    /// This state's spelling on the wire, as `host.connect` and
+    /// `host.disconnect` report it.
+    ///
+    /// The fourth projection of the same classification the dot, the
+    /// rollup word and interactivity already read, and it is one table
+    /// for the same reason they are: a reclassification has to move what
+    /// the palette offers and what the op answers together, or a reply
+    /// would contradict the section drawn beside it.
+    pub fn wire(self) -> &'static str {
+        use roost_ipc::messages::host_state;
+        match self {
+            // The LOCAL band is connected by construction and is never a
+            // saved host, so it does not reach the wire — `connected` is
+            // the honest answer if it ever does.
+            Self::Local | Self::Connected => host_state::CONNECTED,
+            Self::Connecting => host_state::CONNECTING,
+            Self::Disconnected => host_state::DISCONNECTED,
+            Self::NeedsRestart => host_state::NEEDS_RESTART,
+            Self::TakenOver => host_state::TAKEN_OVER,
+            Self::Stopped => host_state::STOPPED,
+        }
+    }
 }
 
 /// One saved host, as the sidebar assembly reads it.
@@ -321,6 +344,24 @@ mod tests {
         assert_eq!(SectionState::Disconnected.dot(), HostDot::Offline);
         assert_eq!(SectionState::TakenOver.dot(), HostDot::Offline);
         assert_eq!(SectionState::Stopped.dot(), HostDot::Offline);
+    }
+
+    /// The wire spelling every state answers with, pinned against the
+    /// `host_state` constants themselves — `host.connect` and
+    /// `host.disconnect` report these, so a rename here is a wire break.
+    #[test]
+    fn every_state_has_its_wire_spelling() {
+        use roost_ipc::messages::host_state;
+        assert_eq!(SectionState::Connected.wire(), host_state::CONNECTED);
+        assert_eq!(SectionState::Connecting.wire(), host_state::CONNECTING);
+        assert_eq!(SectionState::Disconnected.wire(), host_state::DISCONNECTED);
+        assert_eq!(SectionState::NeedsRestart.wire(), host_state::NEEDS_RESTART);
+        assert_eq!(SectionState::TakenOver.wire(), host_state::TAKEN_OVER);
+        assert_eq!(SectionState::Stopped.wire(), host_state::STOPPED);
+        // The LOCAL band is connected by construction; it never reaches
+        // the wire, but it must not answer something that is not a
+        // spelling at all.
+        assert_eq!(SectionState::Local.wire(), host_state::CONNECTED);
     }
 
     #[test]

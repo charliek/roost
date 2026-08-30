@@ -207,6 +207,63 @@ fn one_line(reason: &str, budget: usize) -> String {
 }
 
 // ============================================================================
+// Resolving a saved host's target
+// ============================================================================
+
+/// The `target` spelling that means "this machine's own session".
+///
+/// Everything else is a socket path — including, in HS-2, the local end
+/// of an `ssh -L` forward, which is what makes a remote machine
+/// reachable with no SSH code on this side (HS-3 makes `ssh://` targets
+/// first-class).
+pub const LOCALHOST_TARGET: &str = "localhost";
+
+/// Resolve a saved host's `target` to a socket path, and say whether it
+/// is this machine's own session.
+///
+/// The localhost/remote answer is load-bearing three times over: it is
+/// the only host a client may spawn, the only one whose drops
+/// auto-retry, and the only one the macOS platform gate hides. Both the
+/// UI (`host_conn`) and `roostctl host add --verify` resolve through
+/// here so a target can never mean two different sockets depending on
+/// which binary read it.
+pub fn resolve_target(target: &str) -> Result<(PathBuf, bool)> {
+    if target == LOCALHOST_TARGET {
+        return Ok((crate::paths::BundleProfile::session()?.socket_path, true));
+    }
+    Ok((PathBuf::from(target), false))
+}
+
+/// Resolve a prospective host's target, dial it, and check it is a
+/// session this build can talk to at all.
+///
+/// Coarse on purpose, and the same bar wherever it is offered: both
+/// `roostctl host add --verify` and the Add Host dialog's
+/// "Add & Connect" promise exactly "is something answering, and does it
+/// speak this protocol". The exact-build half of the compatibility gate
+/// belongs to the attach path, which turns a mismatch into an upgrade
+/// prompt — refusing the *save* over it would leave the user with no way
+/// to record the host at all.
+///
+/// One definition for the same reason [`resolve_target`] is one: this
+/// bar moves when the attach path grows its upgrade flow, and a second
+/// copy would be the one nobody updated.
+pub async fn verify_target(target: &str, budget: Duration) -> Result<SessionIdentify> {
+    let (socket, _localhost) = resolve_target(target)?;
+    let identity = identify(&socket, budget)
+        .await
+        .with_context(|| format!("{} did not answer", socket.display()))?;
+    if identity.session_protocol != crate::messages::SESSION_PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "that session speaks protocol {}, this build speaks {}",
+            identity.session_protocol,
+            crate::messages::SESSION_PROTOCOL_VERSION,
+        ));
+    }
+    Ok(identity)
+}
+
+// ============================================================================
 // Locating the daemon binary
 // ============================================================================
 
@@ -578,6 +635,34 @@ pub async fn confirm_serving(socket: &Path, budget: Duration) -> Result<SessionI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one sentinel, resolved in one place. A path that merely
+    /// *contains* the word is an ordinary socket path — the comparison
+    /// is the whole string, because a directory called `localhost` is a
+    /// perfectly legal place to keep a socket.
+    #[test]
+    fn only_the_bare_localhost_spelling_means_this_machines_session() {
+        let (socket, localhost) = resolve_target(LOCALHOST_TARGET).expect("resolve localhost");
+        assert!(localhost);
+        assert_eq!(
+            socket,
+            crate::paths::BundleProfile::session()
+                .expect("session profile")
+                .socket_path
+        );
+
+        for target in [
+            "/tmp/roost-popos.sock",
+            "/var/run/localhost/roost.sock",
+            "localhost.sock",
+            "Localhost",
+            "",
+        ] {
+            let (socket, localhost) = resolve_target(target).expect("resolve a path target");
+            assert!(!localhost, "{target:?} is a socket path, not the sentinel");
+            assert_eq!(socket, PathBuf::from(target));
+        }
+    }
 
     #[test]
     fn verdicts_round_trip_through_their_wire_line() {

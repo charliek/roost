@@ -8,7 +8,7 @@
 
 mod support;
 
-use roost_ipc::messages::{ops, TabFocusParams, TabFocusResult};
+use roost_ipc::messages::{ops, TabFocusParams, TabFocusResult, WireTabRef};
 
 /// Run 1 builds a layout; run 2 must come back to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -39,7 +39,12 @@ async fn a_restart_reopens_the_saved_layout() {
     // Select it, so the restored selection has something to be wrong
     // about: position 1, not the default 0.
     let _: TabFocusResult = client
-        .call(ops::TAB_FOCUS, TabFocusParams { tab_id: notes.id })
+        .call(
+            ops::TAB_FOCUS,
+            TabFocusParams {
+                tab_id: WireTabRef::Local(notes.id),
+            },
+        )
         .await
         .expect("tab.focus");
 

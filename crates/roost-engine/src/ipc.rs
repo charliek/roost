@@ -32,22 +32,22 @@ use roost_ipc::messages::{
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
     ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
-    HostAddParams, HostAddResult, HostListParams, HostListResult, HostRemoveParams, IdentifyParams,
-    IdentifyResult, NotificationCreateParams, PaletteActivateParams, PaletteDismissParams,
-    PaletteOpenParams, PalettePresentParams, PalettePresentResult, PaletteQueryParams,
-    PaletteStateParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
-    ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams,
-    ScreenshotResult, SelectionClearParams, SelectionDumpParams, SelectionDumpResult,
-    SelectionSetParams, SessionConnectParams, SessionConnectResult, SessionIdentify,
-    SessionIdentifyParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
+    HostListParams, HostListResult, HostRemoveParams, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
+    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
@@ -99,6 +99,16 @@ type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
 /// `PaletteActivate` ever returns the `Err` arm (no palette open, or no
 /// row with the given id); the rest always answer `Ok`.
 type PaletteReply = tokio::sync::oneshot::Sender<Result<PaletteStateResult, String>>;
+
+/// Reply for the `host.*` [`UiRequest`]s (plan 037 §3.5).
+///
+/// The error half is the registry's own [`WorkspaceError`] rather than a
+/// message, which is what lets `ws_err` mint the same wire code the
+/// engine-served path does: a reserved label is `invalid-param` and an
+/// unsaved id is `not-found`, whether the op was answered by the app or
+/// by a headless workspace. Stringifying at the seam would flatten both
+/// onto one code.
+pub type HostReply<T> = tokio::sync::oneshot::Sender<Result<T, WorkspaceError>>;
 
 /// Reply for [`UiRequest::PalettePresent`]: the user's choice, delivered
 /// once the palette closes (a pick or a dismissal). Unlike the other
@@ -415,6 +425,47 @@ pub enum UiRequest {
     /// macOS-iced-only like `AppDockBadge`.
     AppNotificationStatus {
         reply: tokio::sync::oneshot::Sender<Result<AppNotificationStatusResult, String>>,
+    },
+    /// `host.add` — save a host to the client-side registry (plan 037
+    /// §3.5).
+    ///
+    /// The registry is a plain `Workspace` accessor, so the engine could
+    /// serve this itself — and does, headless. It routes through the app
+    /// when there is one because saving a host is only half the story:
+    /// the sidebar grows a section, the launch probe may start dialing,
+    /// and neither happens off a mutation nothing re-reads. A
+    /// `roostctl host add` against an idle UI has to be as visible as
+    /// the Add Host dialog's own save.
+    HostAdd {
+        label: String,
+        target: String,
+        reply: HostReply<Host>,
+    },
+    /// `host.remove` — forget a saved host. Disconnects it first if it
+    /// is connected; never stops the session (roadmap D8).
+    HostRemove { id: String, reply: HostReply<()> },
+    /// `tab.focus` for a host-qualified ref: select that host's tab and
+    /// attach it, exactly as a sidebar click does. The local form never
+    /// reaches here — it mutates the workspace in the handler, headless
+    /// or not — so this arm exists only because a host selection is
+    /// app-owned state (plan 037 §3.4).
+    HostTabFocus {
+        host: u32,
+        tab_id: i64,
+        reply: HostReply<()>,
+    },
+    /// `host.connect` — the palette's `Connect Host` and the sidebar's
+    /// ↻ Reconnect, as an op. Unconditional takeover, and it may start a
+    /// localhost session that is not running.
+    HostConnect {
+        id: String,
+        reply: HostReply<HostConnectionResult>,
+    },
+    /// `host.disconnect` — drop the connection, leave the session
+    /// running.
+    HostDisconnect {
+        id: String,
+        reply: HostReply<HostConnectionResult>,
     },
 }
 
@@ -1106,16 +1157,30 @@ impl IpcHandler {
         self
     }
 
+    /// Whether a UI adapter is driving this handler.
+    ///
+    /// Only the `host.*` registry ops ask: they have a working headless
+    /// implementation and route through the app purely so a live UI
+    /// reconciles (see [`UiRequest::HostAdd`]). Everything else is
+    /// UI-only and lets `ui_call` answer `no UI attached`.
+    fn has_ui(&self) -> bool {
+        self.ui_tx.is_some()
+    }
+
     /// Hand a request-reply [`UiRequest`] to the UI adapter's main thread
     /// and await its answer. The outer `Result` reports channel/UI health
     /// (no UI attached, UI gone, reply dropped); the inner `Result` is
     /// the op's own outcome, which the caller maps to the right error
     /// code (e.g. `not-found` for a missing tab). Shared by the
     /// screenshot + dump arms so the oneshot plumbing lives in one place.
-    async fn ui_call<T>(
+    ///
+    /// The error half is whatever the variant's reply channel carries:
+    /// `String` for most, a [`WorkspaceError`] for the `host.*` ops so
+    /// the dispatcher can mint the same wire code the headless path does.
+    async fn ui_call<T, E>(
         &self,
-        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> UiRequest,
-    ) -> Result<Result<T, String>, HandlerError> {
+        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, E>>) -> UiRequest,
+    ) -> Result<Result<T, E>, HandlerError> {
         let tx = self
             .ui_tx
             .as_ref()
@@ -1461,7 +1526,11 @@ async fn dispatch_outcome(
         // The host registry is client-side state (D8): a UI socket's op
         // family. Letting it fall through would grow a shadow registry in
         // the daemon's own state.json that nothing ever reads.
-        ops::HOST_ADD | ops::HOST_REMOVE | ops::HOST_LIST => {
+        ops::HOST_ADD
+        | ops::HOST_REMOVE
+        | ops::HOST_LIST
+        | ops::HOST_CONNECT
+        | ops::HOST_DISCONNECT => {
             return Err(HandlerError::unknown_op(op));
         }
         _ => {}
@@ -2015,8 +2084,32 @@ async fn dispatch(
         }
         ops::TAB_FOCUS => {
             let p: TabFocusParams = decode(params)?;
+            let tab_id = match p.tab_id {
+                WireTabRef::Local(tab_id) => tab_id,
+                WireTabRef::Host { host, tab } => {
+                    if !h.has_ui() {
+                        return Err(HandlerError::invalid_param(
+                            "a host-qualified tab.focus needs a UI: host selection is client state",
+                        ));
+                    }
+                    h.ui_call(|reply| UiRequest::HostTabFocus {
+                        host,
+                        tab_id: tab,
+                        reply,
+                    })
+                    .await?
+                    .map_err(ws_err)?;
+                    // The host's own workspace owns its active row; this
+                    // client only moved its selection, so there is no
+                    // local "previous" to report.
+                    return encode(&TabFocusResult {
+                        previous_project_id: 0,
+                        previous_tab_id: 0,
+                    });
+                }
+            };
             let (previous_project_id, previous_tab_id) =
-                h.workspace.focus_tab(p.tab_id).map_err(ws_err)?;
+                h.workspace.focus_tab(tab_id).map_err(ws_err)?;
             encode(&TabFocusResult {
                 previous_project_id,
                 previous_tab_id,
@@ -2575,15 +2668,63 @@ async fn dispatch(
                 "events.subscribe is not yet implemented",
             ))
         }
+        // The four registry mutations route through the app when one is
+        // attached (plan 037 §3.5): the app owns the connections and the
+        // sidebar, so a `roostctl host add` has to reach it or it
+        // mutates state nothing re-reads. Headless — the engine's own
+        // tests, an embedder with no UI — the workspace answers
+        // directly, which is also why the error type crossing the seam
+        // is `WorkspaceError`: both paths mint the same wire code.
         ops::HOST_ADD => {
             let p: HostAddParams = decode(params)?;
-            let host = h.workspace.add_host(&p.label, &p.target).map_err(ws_err)?;
-            encode(&HostAddResult { host: host.into() })
+            let host = if h.has_ui() {
+                h.ui_call(|reply| UiRequest::HostAdd {
+                    label: p.label,
+                    target: p.target,
+                    reply,
+                })
+                .await?
+                .map_err(ws_err)?
+            } else {
+                h.workspace
+                    .add_host(&p.label, &p.target)
+                    .map_err(ws_err)?
+                    .into()
+            };
+            encode(&HostAddResult { host })
         }
         ops::HOST_REMOVE => {
             let p: HostRemoveParams = decode(params)?;
-            h.workspace.remove_host(&p.id).map_err(ws_err)?;
+            if h.has_ui() {
+                h.ui_call(|reply| UiRequest::HostRemove { id: p.id, reply })
+                    .await?
+                    .map_err(ws_err)?;
+            } else {
+                h.workspace.remove_host(&p.id).map_err(ws_err)?;
+            }
             Ok(serde_json::json!({}))
+        }
+        ops::HOST_CONNECT | ops::HOST_DISCONNECT => {
+            // Connection state is the app's alone — there is no headless
+            // fallback to give, and `no UI attached` is the honest
+            // answer for a socket with no window behind it.
+            let id = if op == ops::HOST_CONNECT {
+                decode::<HostConnectParams>(params)?.id
+            } else {
+                decode::<HostDisconnectParams>(params)?.id
+            };
+            let connect = op == ops::HOST_CONNECT;
+            let result = h
+                .ui_call(move |reply| {
+                    if connect {
+                        UiRequest::HostConnect { id, reply }
+                    } else {
+                        UiRequest::HostDisconnect { id, reply }
+                    }
+                })
+                .await?
+                .map_err(ws_err)?;
+            encode(&result)
         }
         ops::HOST_LIST => {
             let _p: HostListParams = decode(params)?;

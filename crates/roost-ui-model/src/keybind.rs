@@ -76,6 +76,16 @@ pub enum KeybindAction {
     /// urgency (plan 005). Default `projectMod+shift+o` — Cmd+Shift+O on
     /// macOS (Iced), Alt+Shift+O on Linux.
     AgentPalette,
+    /// Open the "New Project on…" host picker (plan 037 §3.1). Default
+    /// `projectMod+shift+n` — Cmd+Shift+N on macOS (Iced), Alt+Shift+N
+    /// on Linux, i.e. the shifted form of `new_project`.
+    ///
+    /// The unshifted `new_project` follows context (it creates on the
+    /// selected project's host); this is the "ask me first" form. With
+    /// no saved hosts the picker offers only LOCAL, so the shifted key
+    /// is never a dead end — it is the unshifted one with a confirming
+    /// step.
+    NewProjectOnHost,
     /// Unbind a trigger; removes any default action attached to it.
     Unbind,
     /// `switch_project_N` where N is 1..=9.
@@ -110,6 +120,7 @@ impl KeybindAction {
             "command_launcher" => Some(Self::CommandLauncher),
             "custom_palette" => Some(Self::CustomPalette),
             "agent_palette" => Some(Self::AgentPalette),
+            "new_project_on_host" => Some(Self::NewProjectOnHost),
             "unbind" => Some(Self::Unbind),
             other => {
                 if let Some(n) = other.strip_prefix("switch_project_") {
@@ -156,6 +167,7 @@ impl KeybindAction {
             Self::CommandLauncher => "command_launcher".into(),
             Self::CustomPalette => "custom_palette".into(),
             Self::AgentPalette => "agent_palette".into(),
+            Self::NewProjectOnHost => "new_project_on_host".into(),
             Self::Unbind => "unbind".into(),
             Self::SwitchProject(n) => format!("switch_project_{n}"),
             Self::SwitchTab(n) => format!("switch_tab_{n}"),
@@ -421,6 +433,15 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::AgentPalette,
     );
 
+    // "New Project on…" host picker: Cmd+Shift+N on macOS (Iced),
+    // Alt+Shift+N on Linux — the shifted form of new_project, which is
+    // the mnemonic. `…+shift+n` is unclaimed by every other default.
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+n"),
+        KeybindAction::NewProjectOnHost,
+    );
+
     // Browser-style font sizing on the active terminal. `Cmd-+` on
     // US layouts is really `Cmd-Shift-=`, and many users hit `Cmd-=`
     // without shift; bind both for FontIncrease.
@@ -591,6 +612,7 @@ mod tests {
             KeybindAction::CommandLauncher,
             KeybindAction::CustomPalette,
             KeybindAction::AgentPalette,
+            KeybindAction::NewProjectOnHost,
             KeybindAction::Unbind,
         ];
         actions.extend((1..=9u8).map(KeybindAction::SwitchProject));

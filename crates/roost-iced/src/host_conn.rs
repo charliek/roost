@@ -205,27 +205,12 @@ impl HostIdMinter {
     }
 }
 
-/// The `target` spelling that means "this machine's own session".
-///
-/// Everything else is a socket path — including, in HS-2, the local end
-/// of an `ssh -L` forward, which is what makes a remote machine
-/// reachable with no SSH code on this side (HS-3 makes `ssh://` targets
-/// first-class).
-pub(crate) const LOCALHOST_TARGET: &str = "localhost";
-
-/// Resolve a saved host's `target` to a socket path, and say whether it
-/// is this machine's own session.
-///
-/// The localhost/remote answer is load-bearing twice over: it is the
-/// only host this client may spawn, and the only one whose drops
-/// auto-retry.
-pub(crate) fn resolve_target(target: &str) -> anyhow::Result<(PathBuf, bool)> {
-    if target == LOCALHOST_TARGET {
-        let profile = roost_ipc::paths::BundleProfile::session()?;
-        return Ok((profile.socket_path, true));
-    }
-    Ok((PathBuf::from(target), false))
-}
+/// The sentinel and the resolver both live in `roost_ipc`, beside the
+/// spawn ladder that acts on the answer: `roostctl host add --verify`
+/// resolves the same targets this does, and a target that meant two
+/// different sockets depending on which binary read it would be a bug
+/// nothing could see.
+pub(crate) use roost_ipc::session_launch::{resolve_target, LOCALHOST_TARGET};
 
 /// The client's terminal palette in the wire's spelling.
 ///
@@ -274,6 +259,27 @@ impl Drop for HostConn {
     }
 }
 
+/// What an explicitly disconnected host leaves behind: the rows its last
+/// connection published, kept so the section renders dimmed rather than
+/// empty (plan 037 §3.1 — "rows stay listed at reduced opacity", because
+/// the session still holds those shells).
+///
+/// A *dropped* connection needs none of this: its `HostConn` is still in
+/// the set, so [`HostConnSet::section`] finds the mirror the ordinary
+/// way. Only an explicit disconnect removes the connection, and this is
+/// what stands in for it until a reconnect (which purges and rebuilds
+/// from a fresh `tab.list`) or a `host.remove` (which drops it with the
+/// host).
+struct RetainedSection {
+    label: String,
+    incarnation: HostId,
+    mirror: Arc<SharedMirror>,
+    /// Fixed at `Disconnected`: nothing drives a retained section, so it
+    /// can never be anything else. Stored rather than synthesized
+    /// because [`HostSectionView`] borrows it.
+    state: HostConnState,
+}
+
 /// One saved host's live facts, as the sidebar reads them.
 pub(crate) struct HostSectionView<'a> {
     pub(crate) label: &'a str,
@@ -297,6 +303,9 @@ pub(crate) struct HostConnSet {
     /// Keyed on the saved host's stable id (`HostSnapshot.id`).
     conns: HashMap<String, HostConn>,
     mirrors: HashMap<HostId, Arc<SharedMirror>>,
+    /// Keyed on the saved host's id, like [`Self::conns`], and never
+    /// holding an entry for a host that has one there.
+    retained: HashMap<String, RetainedSection>,
     /// Handed out by [`HostConnSet::connect`], never reused. See
     /// [`Registration`].
     next_generation: u64,
@@ -316,6 +325,7 @@ impl HostConnSet {
             client_build: roost_vt::libghostty_build(),
             conns: HashMap::new(),
             mirrors: HashMap::new(),
+            retained: HashMap::new(),
             next_generation: 0,
         }
     }
@@ -395,18 +405,65 @@ impl HostConnSet {
 
     /// Stop driving a host. Disconnect is never Stop: the session keeps
     /// running, and its tabs with it.
+    ///
     /// Returns the incarnation that was live, so the caller can purge
     /// the app state keyed on it (attach machinery, client terminals,
     /// inbox rows) — a disconnect with no reconnect never publishes a
     /// `Connecting { previous }` for consumers to purge off. C7's
     /// disconnect verb is the caller.
+    ///
+    /// The **rows** are the one thing that does not go: the shells they
+    /// name are still running over there, so the last mirror is retained
+    /// and the section renders dimmed rather than empty (§3.1). That is
+    /// the same rule a *dropped* connection already follows; an explicit
+    /// disconnect only has to say it out loud, because it is the path
+    /// that removes the `HostConn` the rows would otherwise hang off.
     pub(crate) fn disconnect(&mut self, host: &str) -> Option<HostId> {
-        let incarnation = self.conns.get(host).and_then(|conn| conn.incarnation);
-        self.forget(host);
+        let Some(conn) = self.conns.remove(host) else {
+            self.minter.forget_host(host);
+            return None;
+        };
+        let incarnation = conn.incarnation;
+        // A host that never finished connecting published no rows, so
+        // there is nothing to keep and its section lists none.
+        if let Some((incarnation, mirror)) = incarnation
+            .and_then(|incarnation| Some((incarnation, self.mirrors.remove(&incarnation)?)))
+        {
+            self.retained.insert(
+                host.to_string(),
+                RetainedSection {
+                    label: conn.label.clone(),
+                    incarnation,
+                    mirror,
+                    state: HostConnState::Disconnected(state::Disconnected {
+                        reason: "disconnected".into(),
+                        retry_in: None,
+                    }),
+                },
+            );
+        }
+        // `Drop` signals the task's own shutdown, which closes its queue
+        // and answers everything still on it with `Disconnected`.
+        drop(conn);
+        self.minter.forget_host(host);
         incarnation
     }
 
-    /// Drop the connection and everything keyed on its incarnation.
+    /// Forget a host entirely — the connection, and the rows it left
+    /// behind. `host.remove`'s half of the disconnect (the registry
+    /// entry is the app's to drop).
+    pub(crate) fn remove(&mut self, host: &str) -> Option<HostId> {
+        let incarnation = self.disconnect(host);
+        self.retained.remove(host);
+        incarnation
+    }
+
+    /// Drop the connection and everything keyed on its incarnation,
+    /// retained rows included.
+    ///
+    /// This is the reconnect path, and it purges rather than retains on
+    /// purpose: the fresh `tab.list` is authoritative, so a reconnect is
+    /// purge-then-rebuild and never a merge (§3.2).
     fn forget(&mut self, host: &str) {
         if let Some(conn) = self.conns.remove(host) {
             if let Some(incarnation) = conn.incarnation {
@@ -414,6 +471,7 @@ impl HostConnSet {
             }
             // `Drop` notifies and aborts.
         }
+        self.retained.remove(host);
         self.minter.forget_host(host);
     }
 
@@ -488,24 +546,33 @@ impl HostConnSet {
 
     /// What one saved host's sidebar section renders from.
     ///
-    /// `None` for a host this set is not driving at all (never
-    /// connected, or explicitly disconnected) — its section renders as
-    /// disconnected with no rows.
+    /// `None` only for a host that has never published anything — never
+    /// connected, or removed — whose section renders as disconnected
+    /// with no rows.
     ///
-    /// The mirror deliberately outlives a *drop*: those shells are still
-    /// running on the host, so the section keeps listing them dimmed
-    /// until the connection is back. It does not outlive a *reconnect* —
-    /// `Connecting { previous }` purges it and the fresh `tab.list`
-    /// rebuilds, which is §3.2's purge-then-rebuild.
+    /// The mirror deliberately outlives both a *drop* and an explicit
+    /// *disconnect*: those shells are still running on the host, so the
+    /// section keeps listing them dimmed until the connection is back.
+    /// It does not outlive a *reconnect* — `Connecting { previous }`
+    /// purges it and the fresh `tab.list` rebuilds, which is §3.2's
+    /// purge-then-rebuild.
     pub(crate) fn section(&self, host: &str) -> Option<HostSectionView<'_>> {
-        let conn = self.conns.get(host)?;
+        if let Some(conn) = self.conns.get(host) {
+            return Some(HostSectionView {
+                label: conn.label.as_str(),
+                state: &conn.state,
+                incarnation: conn.incarnation,
+                mirror: conn
+                    .incarnation
+                    .and_then(|incarnation| self.mirrors.get(&incarnation)),
+            });
+        }
+        let retained = self.retained.get(host)?;
         Some(HostSectionView {
-            label: conn.label.as_str(),
-            state: &conn.state,
-            incarnation: conn.incarnation,
-            mirror: conn
-                .incarnation
-                .and_then(|incarnation| self.mirrors.get(&incarnation)),
+            label: retained.label.as_str(),
+            state: &retained.state,
+            incarnation: Some(retained.incarnation),
+            mirror: Some(&retained.mirror),
         })
     }
 
@@ -968,6 +1035,64 @@ mod tests {
         assert!(
             section.mirror.is_none(),
             "a reconnect purges rather than merging (plan 037 §3.2)"
+        );
+    }
+
+    /// An **explicit** disconnect follows the same rule as a dropped
+    /// connection: the rows stay listed (dimmed), because the session
+    /// still holds those shells (plan 037 §3.1). It is the path that
+    /// removes the `HostConn` the rows normally hang off, so it is the
+    /// one that can silently empty the section — the regression this
+    /// pins. Reconnect still replaces them; remove still clears them.
+    #[tokio::test]
+    async fn an_explicit_disconnect_keeps_the_rows_a_reconnect_replaces_and_remove_clears() {
+        let (mut set, _feed) = a_set();
+        use roost_ui_model::host_sidebar::SectionState;
+        let socket = PathBuf::from("/nonexistent/roost-set-disconnect-rows.sock");
+
+        set.connect("h1", "pop-os", socket.clone(), false, ConnectMode::Dial);
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.apply_workspace(incarnation, HostWorkspaceEvent::Reset(Arc::default()));
+
+        assert_eq!(set.disconnect("h1"), Some(incarnation));
+        let section = set
+            .section("h1")
+            .expect("a disconnected host still has a section to dim");
+        assert_eq!(section.label, "pop-os");
+        assert_eq!(section.state.section_state(), SectionState::Disconnected);
+        assert_eq!(section.incarnation, Some(incarnation));
+        assert!(
+            section.mirror.is_some(),
+            "the rows outlive an explicit disconnect, exactly as they \
+             outlive a dropped connection"
+        );
+        // Retained means *rendered*, never *actionable*: nothing about a
+        // dimmed section may still accept ops or be resurrected by a
+        // straggler from the connection that published it.
+        assert!(set.is_empty());
+        assert!(set.ops("h1").is_none());
+        assert!(set.ops_for(incarnation).is_none());
+        assert_eq!(set.apply_state(incarnation, HostConnState::Connected), None);
+        assert_eq!(set.connected().count(), 0);
+
+        // Reconnect: purge-then-rebuild, so the retained rows go with the
+        // incarnation that published them.
+        set.connect("h1", "pop-os", socket.clone(), false, ConnectMode::Dial);
+        let section = set.section("h1").expect("connecting hosts have sections");
+        assert!(
+            section.mirror.is_none(),
+            "a reconnect rebuilds from a fresh tab.list (plan 037 §3.2)"
+        );
+
+        // Remove: the rows go with the host.
+        let live = set.mint_for("h1");
+        set.apply_state(live, HostConnState::Connected);
+        set.apply_workspace(live, HostWorkspaceEvent::Reset(Arc::default()));
+        assert_eq!(set.remove("h1"), Some(live));
+        assert!(
+            set.section("h1").is_none(),
+            "a forgotten host has no section to keep rows in"
         );
     }
 

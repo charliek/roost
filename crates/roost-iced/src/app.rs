@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{
-    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Space,
+    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Column,
+    Row, Space,
 };
 use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
 use roost_engine::git_metrics;
@@ -31,8 +32,8 @@ use roost_engine::{
 use roost_ipc::agent;
 use roost_ipc::messages::{
     AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
-    PaletteItemView, PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow,
-    SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
+    HostConnectionResult, PaletteItemView, PalettePresentResult, PaletteStateResult, Project,
+    SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;
@@ -41,7 +42,7 @@ use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
-    custom_command, host_sidebar,
+    custom_command, host_sidebar, host_verbs,
     keybind::{self, Accel, AccelMods, KeybindAction},
     keys::{HostId, ProjectKey, TabKey},
     notification_inbox, palette, provider,
@@ -72,6 +73,7 @@ use crate::{chrome, input};
 // `mod palette` would collide with the `roost_ui_model::palette` import in
 // this module's namespace, so the palette-overlay half of App lives in
 // `palettes` (it hosts the command/agent/provider/notification palettes).
+mod host_dialog;
 pub(crate) mod host_tab;
 mod interactions;
 mod palettes;
@@ -170,16 +172,18 @@ struct ConfirmDeleteProject {
     tab_count: usize,
 }
 
+/// `projects` is whichever instance's rows `project` names — the local
+/// snapshot for a local key, a host's mirrored rows for a host key
+/// (`App::project_rows` picks). Matching on the bare id against the
+/// wrong instance's rows is what the key's `host` half exists to
+/// prevent, so the choice is made once, at the caller.
 fn confirm_delete_target(
     projects: &[Project],
     project: ProjectKey,
 ) -> Option<ConfirmDeleteProject> {
-    // The snapshot is the local workspace's, so only a local key can name
-    // a row in it.
-    let project_id = project.local_project()?;
     projects
         .iter()
-        .find(|candidate| candidate.id == project_id)
+        .find(|candidate| candidate.id == project.project)
         .map(|candidate| ConfirmDeleteProject {
             project,
             name: candidate.name.clone(),
@@ -198,6 +202,185 @@ fn reconcile_confirm_delete(confirm: &mut Option<ConfirmDeleteProject>, projects
         // and quoting a count the project no longer has would be a lie.
         *confirm = confirm_delete_target(projects, open.project);
     }
+}
+
+/// Where a creation lands (plan 037 §3.1's "creation follows context").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationTarget {
+    Local,
+    Host(HostId),
+}
+
+/// Resolve a creation's instance.
+///
+/// Trivial by design, and that is the claim worth pinning: ⌘N and "+ New
+/// Project" ask about the selected project's host, ⌘T and the tab bar's
+/// "+" ask about the host the tab's project lives on, and the ⌘⇧N picker
+/// hands one in directly — all three arrive as a single `HostId`, so
+/// "a tab never lands on a different host than its project" holds by
+/// construction rather than by a check somewhere that could be missed.
+fn creation_target(host: HostId) -> CreationTarget {
+    if host.is_local() {
+        CreationTarget::Local
+    } else {
+        CreationTarget::Host(host)
+    }
+}
+
+/// How long a creation on a host may wait for that host's mirror to
+/// list its new row.
+///
+/// Generous by two orders of magnitude for the localhost round trip this
+/// normally is (sub-millisecond, per the HS-1b measurements) and still
+/// short enough that nothing waits on a row which is never coming.
+const PENDING_HOST_SELECTION_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A creation on a host, parked until the mirror lists it (plan 037
+/// §3.9).
+#[derive(Debug, Clone, Copy)]
+struct PendingHostSelection {
+    tab: TabKey,
+    /// When the wait started.
+    ///
+    /// The wait has to be bounded, because "the row will appear" is an
+    /// assumption and not a guarantee: a tab whose command exits the
+    /// instant it spawns is closed again before any batch lists it, and
+    /// a creation that fails after its intent was enqueued never
+    /// produces one at all. Neither ends the connection, so nothing else
+    /// here would ever clear the entry.
+    armed: Instant,
+}
+
+impl PendingHostSelection {
+    /// Whether this wait has run out. Terminal: an expired entry is
+    /// abandoned, never re-armed.
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.armed) >= PENDING_HOST_SELECTION_DEADLINE
+    }
+}
+
+/// The Mac gate applied where a connection is *started*, rather than
+/// only where verbs are listed (plan 037 §3.1).
+///
+/// The palette hides a localhost host's Connect row on macOS, but the
+/// palette is not the only way in: a `localhost` target can already be
+/// in `state.json`, `roostctl host add` can save one, and either then
+/// gets a live "↻ Reconnect" row in the sidebar. Every one of those
+/// lands on the same connect entry, so the platform policy belongs here
+/// — one place, whatever the surface.
+///
+/// Only *spawning* is refused. `IfPresent` still probes and still
+/// connects to a session that is already listening (one started by hand,
+/// or reached over an `ssh -L` forward); it just declines to run the
+/// launch ladder for a `roost-session` this platform does not package,
+/// and says "no session is running at …" instead.
+fn spawn_gate(
+    mode: crate::host_conn::ConnectMode,
+    policy: host_verbs::VerbPolicy,
+) -> crate::host_conn::ConnectMode {
+    use crate::host_conn::ConnectMode;
+    match mode {
+        ConnectMode::SpawnIfMissing if !policy.localhost_surface => ConnectMode::IfPresent,
+        mode => mode,
+    }
+}
+
+/// One modal overlay: the card, the message a press on the card sends
+/// (swallowed, so it does not reach the backdrop underneath), and the
+/// message the backdrop sends.
+///
+/// The three modals — delete confirmation, Add Host, Stop Session —
+/// differ only in those three values, so the stacking, the backdrop and
+/// the panel chrome are written once.
+struct Modal<'a> {
+    card: Element<'a, Message>,
+    card_pressed: Message,
+    dismiss: Message,
+}
+
+fn modal_over<'a>(content: Element<'a, Message>, modal: Modal<'a>) -> Element<'a, Message> {
+    let overlay = container(mouse_area(modal.card).on_press(modal.card_pressed))
+        .padding(16)
+        .center(Fill);
+    let catcher =
+        mouse_area(iced::widget::Space::new().width(Fill).height(Fill)).on_press(modal.dismiss);
+    stack![content, catcher, overlay]
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
+/// The panel every modal is drawn in.
+fn modal_card<'a>(body: Column<'a, Message>) -> Element<'a, Message> {
+    container(body.spacing(16))
+        .width(Fill)
+        .max_width(CONFIRM_PANEL_WIDTH)
+        .height(Shrink)
+        .padding(16)
+        .style(chrome::palette_panel)
+        .into()
+}
+
+/// A modal's title + explanatory paragraph.
+fn modal_heading<'a>(title: String, body: &'a str) -> Column<'a, Message> {
+    column![
+        text(title)
+            .size(15)
+            .font(chrome::chrome_font(font::Weight::Semibold)),
+        text(body).size(12).color(chrome::MUTED_TEXT),
+    ]
+    .spacing(6)
+}
+
+/// A modal's trailing button row: Cancel, then the primary action.
+///
+/// `confirm` is `None` while the action is unavailable (Add Host's dial
+/// in flight), which renders the button disabled rather than removing
+/// it — the card must not resize under the pointer.
+fn modal_buttons<'a>(
+    cancel: Message,
+    confirm_label: &'a str,
+    confirm_style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
+    confirm: Option<Message>,
+) -> Row<'a, Message> {
+    let mut primary = button(text(confirm_label).size(12))
+        .padding([4, 12])
+        .style(confirm_style);
+    if let Some(message) = confirm {
+        primary = primary.on_press(message);
+    }
+    row![
+        iced::widget::Space::new().width(Fill),
+        button(text("Cancel").size(12))
+            .padding([4, 12])
+            .style(chrome::transparent_button)
+            .on_press(cancel),
+        primary,
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+}
+
+/// One labelled text field in the Add Host dialog (the mock's
+/// `label` + `.field` pair).
+fn dialog_field<'a>(
+    label: &'a str,
+    placeholder: &'a str,
+    value: &str,
+    id: Id,
+    on_input: impl Fn(String) -> Message + 'a,
+) -> Column<'a, Message> {
+    column![
+        text(label).size(11).color(chrome::MUTED_TEXT),
+        text_input(placeholder, value)
+            .id(id)
+            .on_input(on_input)
+            .on_submit(Message::AddHostSubmit)
+            .size(12)
+            .padding([5, 8])
+            .style(chrome::palette_input),
+    ]
+    .spacing(3)
 }
 
 /// What a window-focus transition tears down. A table rather than a
@@ -372,6 +555,22 @@ pub enum EngineOpResult {
         ordered_ids: Vec<i64>,
         result: Result<(), String>,
     },
+    /// The Add Host dialog's "Add & Connect" finished dialing (plan 037
+    /// §3.1).
+    ///
+    /// `generation` is the submit this answers, echoed back: the dialog
+    /// is still open and still owns the draft, and a reply it is no
+    /// longer waiting on would otherwise save a host the user has since
+    /// edited past — or, after a cancel and a reopen with the same
+    /// fields, one they are describing for the second time and have not
+    /// confirmed yet. The label and target ride along because the save
+    /// itself needs them.
+    HostVerified {
+        generation: u64,
+        label: String,
+        target: String,
+        result: Result<(), String>,
+    },
 }
 
 /// Build the future behind [`UiTask::EngineOp`]: the op runs on the
@@ -435,9 +634,14 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         // on the op id it carries and not on the result alone, so
         // `engine_op_completed` routes those to the state machine that
         // dispatched them rather than here.
+        // Same rule, one dialog over: a failed verify belongs *in* the
+        // Add Host dialog, next to the field the user has to change —
+        // a banner behind an open modal is the wrong place to say why
+        // the modal did not close.
         EngineOpResult::Renamed { .. }
         | EngineOpResult::TabsReordered { .. }
-        | EngineOpResult::ProjectsReordered { .. } => None,
+        | EngineOpResult::ProjectsReordered { .. }
+        | EngineOpResult::HostVerified { .. } => None,
         EngineOpResult::TabOpened {
             project, result, ..
         } => match result {
@@ -479,7 +683,11 @@ impl EngineOpResult {
             Self::ProjectDeleted { .. }
             | Self::Renamed { .. }
             | Self::TabsReordered { .. }
-            | Self::ProjectsReordered { .. } => None,
+            | Self::ProjectsReordered { .. }
+            // Add Host is a dialog, not a palette row: the palette is
+            // already dismissed by the time the dialog opens, so the
+            // `palette.activate` that opened it was answered then.
+            | Self::HostVerified { .. } => None,
         }
     }
 }
@@ -507,6 +715,134 @@ async fn create_project_flow(client: &LocalClient) -> Result<(i64, i64), String>
         .focus_tab(tab_id)
         .map_err(|error| error.to_string())?;
     Ok((project.id, tab_id))
+}
+
+/// One control-plane op on a host's queue, typed (plan 037 §3.9).
+///
+/// The queue answers every intent, including the ones it refuses, so
+/// this future always resolves — a caller awaiting a creation on a host
+/// that drops mid-flight gets an error, never a hang.
+async fn host_call<T: serde::de::DeserializeOwned>(
+    ops: &crate::host_conn::HostOps,
+    op: &'static str,
+    params: serde_json::Value,
+) -> Result<T, String> {
+    let value = ops
+        .call(op, params, false)
+        .await
+        .map_err(|error| format!("{op}: {error}"))?;
+    serde_json::from_value(value).map_err(|error| format!("{op} answered unexpectedly: {error}"))
+}
+
+/// [`create_project_flow`]'s host twin: the same two ops, in the same
+/// order, on the host's queue instead of the local client.
+///
+/// The cwd is deliberately left empty rather than filled with this
+/// machine's `$HOME`. A remote host's home directory is not ours, and a
+/// path that does not exist over there would spawn a shell in a
+/// directory nobody chose — the session falls back to its own launch cwd
+/// for an empty one, which is the closest thing to "wherever that
+/// machine starts things".
+async fn create_host_project_flow(ops: crate::host_conn::HostOps) -> Result<(i64, i64), String> {
+    use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
+    let created: ProjectCreateResult = host_call(
+        &ops,
+        wire::PROJECT_CREATE,
+        serde_json::json!({ "name": "", "cwd": "" }),
+    )
+    .await?;
+    let project = created.project;
+    let opened: TabOpenResult = host_call(
+        &ops,
+        wire::TAB_OPEN,
+        host_tab_open_params(project.id, &project.cwd),
+    )
+    .await?;
+    Ok((project.id, opened.tab.id))
+}
+
+/// A host op that removes something, where "it is already gone" is the
+/// state the user asked for rather than a failure.
+///
+/// The local twins tolerate exactly this (`close_tab_by_id`,
+/// `delete_project_flow` both fold their not-found into an
+/// `AlreadyGone`), and they have to agree: the same palette row, the
+/// same ✕, and the same confirmation reach both, so a host tab that
+/// closed a moment ago must not raise a banner a local one would not.
+async fn host_remove_call<T>(
+    ops: &crate::host_conn::HostOps,
+    op: &'static str,
+    params: serde_json::Value,
+    removed: T,
+    already_gone: T,
+) -> Result<T, String> {
+    match ops.call(op, params, false).await {
+        Ok(_) => Ok(removed),
+        Err(crate::host_conn::HostOpError::Rejected {
+            code: roost_ipc::client::ServerCode::NotFound,
+            ..
+        }) => Ok(already_gone),
+        Err(error) => Err(format!("{op}: {error}")),
+    }
+}
+
+/// [`close_tab_by_id`]'s host twin. Awaited rather than fired and
+/// forgotten so a refusal reaches the user, on the same status banner an
+/// ordinary validation error uses (plan 037 §3.9's error surfacing).
+async fn close_host_tab_flow(
+    ops: crate::host_conn::HostOps,
+    tab_id: i64,
+) -> Result<CloseTabOutcome, String> {
+    host_remove_call(
+        &ops,
+        roost_ipc::messages::ops::TAB_CLOSE,
+        serde_json::json!({ "tab_id": tab_id.to_string() }),
+        CloseTabOutcome::Closed,
+        CloseTabOutcome::AlreadyGone,
+    )
+    .await
+}
+
+/// [`delete_project_flow`]'s host twin, for the same reason.
+async fn delete_host_project_flow(
+    ops: crate::host_conn::HostOps,
+    project_id: i64,
+) -> Result<DeleteProjectOutcome, String> {
+    host_remove_call(
+        &ops,
+        roost_ipc::messages::ops::PROJECT_DELETE,
+        serde_json::json!({ "project_id": project_id.to_string() }),
+        DeleteProjectOutcome::Deleted,
+        DeleteProjectOutcome::AlreadyGone,
+    )
+    .await
+}
+
+/// Open one tab on a host, in an existing project.
+async fn open_host_tab_flow(
+    ops: crate::host_conn::HostOps,
+    project_id: i64,
+    cwd: String,
+) -> Result<i64, String> {
+    use roost_ipc::messages::{ops as wire, TabOpenResult};
+    let opened: TabOpenResult =
+        host_call(&ops, wire::TAB_OPEN, host_tab_open_params(project_id, &cwd)).await?;
+    Ok(opened.tab.id)
+}
+
+/// `tab.open` params for a host, geometry included.
+///
+/// The same defaults the local path opens with: the tab is resized to
+/// the window's real grid at attach (`tab.attach` carries the geometry
+/// and the server resizes there), so this only has to be a legal
+/// starting size, not the right one.
+fn host_tab_open_params(project_id: i64, cwd: &str) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id.to_string(),
+        "cwd": cwd,
+        "cols": u32::from(DEFAULT_COLS),
+        "rows": u32::from(DEFAULT_ROWS),
+    })
 }
 
 /// The one tab-open op behind every route that opens one: the new-tab
@@ -734,6 +1070,11 @@ fn accel_label(accel: &Accel) -> Option<String> {
 enum KeyboardRoute {
     None,
     Confirm,
+    /// Add Host, or the Stop Session confirmation (plan 037 §3.1).
+    /// Distinct from [`Self::Confirm`] because one of the two owns text
+    /// fields: Enter submits the draft rather than confirming a
+    /// deletion, and Escape closes this dialog rather than that one.
+    HostDialog,
     Editor,
     Palette,
     /// The terminal that owns the keyboard, host-qualified so a
@@ -750,6 +1091,7 @@ fn ime_preedit_target(route: KeyboardRoute) -> Option<TabKey> {
         KeyboardRoute::Terminal(tab) => Some(tab),
         KeyboardRoute::None
         | KeyboardRoute::Confirm
+        | KeyboardRoute::HostDialog
         | KeyboardRoute::Editor
         | KeyboardRoute::Palette => None,
     }
@@ -879,6 +1221,7 @@ fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
 
 fn resolve_keyboard_route(
     confirm_open: bool,
+    host_dialog_open: bool,
     editor_open: bool,
     palette_open: bool,
     active_tab: TabKey,
@@ -886,6 +1229,8 @@ fn resolve_keyboard_route(
 ) -> KeyboardRoute {
     if confirm_open {
         KeyboardRoute::Confirm
+    } else if host_dialog_open {
+        KeyboardRoute::HostDialog
     } else if editor_open {
         KeyboardRoute::Editor
     } else if palette_open {
@@ -1322,6 +1667,24 @@ pub struct App {
     /// creation routing reads the same field to answer "which host does
     /// ⌘N create on?".
     host_selection: Option<HostSelection>,
+    /// The Add Host / Stop Session modal, when one is up (plan 037
+    /// §3.1). One field for both: they are the same kind of thing — an
+    /// answer the user still owes — and only one can be up at a time.
+    host_dialog: Option<host_dialog::HostDialog>,
+    /// The Add Host dialog's Name field, and whether it still owes a
+    /// focus. Same one-shot shape as the rename editor's: the request is
+    /// raised where the dialog opens and drained by whichever route
+    /// returns a task.
+    add_host_name_id: Id,
+    add_host_socket_id: Id,
+    add_host_focus_requested: bool,
+    /// A creation on a host, waiting for the mirror to list it.
+    ///
+    /// Event-confirmed selection (§3.9): the op's reply names the new
+    /// tab, but the event batch that puts it in the mirror is a separate
+    /// message and may land after. The key is parked here and resolved
+    /// by the first reconcile that can see the row.
+    pending_host_selection: Option<PendingHostSelection>,
     /// One entry per saved host, in registry order — the sidebar's host
     /// sections, refreshed by `reconcile`. **Empty with no saved hosts**,
     /// and every host-aware branch in the view is gated on that, which is
@@ -1365,6 +1728,11 @@ struct HostView {
     /// `HostSnapshot.id`, which is what a reconnect verb is addressed to.
     saved_id: String,
     label: String,
+    /// Whether this host's target is this machine's own session. Read
+    /// from the registry rather than from the connection, so it is known
+    /// for a host that has never connected — which is exactly when the
+    /// macOS gate has to decide whether to offer a Connect verb.
+    localhost: bool,
     /// The incarnation these rows are keyed at. `HostId::LOCAL` stands
     /// for "no connection has ever published rows for this host" — the
     /// section is then header-only, and `projects` is empty, so the
@@ -1568,6 +1936,11 @@ impl App {
             host_attach: HashMap::new(),
             host_resume: HashMap::new(),
             host_selection: None,
+            host_dialog: None,
+            add_host_name_id: Id::unique(),
+            add_host_socket_id: Id::unique(),
+            add_host_focus_requested: false,
+            pending_host_selection: None,
             host_views: Vec::new(),
             host_sections: Vec::new(),
             runtime_handle: runtime.handle().clone(),
@@ -1632,6 +2005,7 @@ impl App {
         let Some(mode) = mode(localhost) else {
             return;
         };
+        let mode = spawn_gate(mode, host_verbs::VerbPolicy::current());
         self.hosts
             .connect(&host.id, &host.label, socket, localhost, mode);
     }
@@ -1774,6 +2148,9 @@ impl App {
         // moment it is answered must not race the UI's own fold-in of the
         // action it just heard about.
         let mut deferred_activation = None;
+        // Before the match consumes it: a creation on a host owes the
+        // selection the local path gets for free (plan 037 §3.9).
+        self.arm_pending_host_selection(&result);
         match result {
             simple @ (EngineOpResult::TabClosed { .. }
             | EngineOpResult::ProjectDeleted { .. }
@@ -1803,6 +2180,12 @@ impl App {
                 ordered_ids,
                 result,
             } => self.project_reorder_completed(op, &ordered_ids, result),
+            EngineOpResult::HostVerified {
+                generation,
+                label,
+                target,
+                result,
+            } => self.add_host_verified(generation, &label, &target, result),
         }
         self.reconcile();
         if let Some((op, error)) = deferred_activation {
@@ -1986,6 +2369,36 @@ impl App {
             // thing that leaves here is the confirmed deletion's own task.
             return task;
         }
+        if matches!(self.keyboard_route(), KeyboardRoute::HostDialog) {
+            let mut task = UiTask::None;
+            if let keyboard::Event::KeyPressed { key, repeat, .. } = &event {
+                match (key.as_ref(), repeat) {
+                    (Key::Named(Named::Escape), false) => {
+                        self.rename_completion_key = Some(RenameCompletionKey::Escape);
+                        self.host_dialog_cancel();
+                    }
+                    (Key::Named(Named::Enter), false) => {
+                        self.rename_completion_key = Some(RenameCompletionKey::Enter);
+                        // One key, two dialogs: Add Host's Enter is its
+                        // "Add & Connect", Stop's is its confirming
+                        // button. Both are the panel's primary action,
+                        // which is what Enter means in a dialog.
+                        match self.host_dialog {
+                            Some(host_dialog::HostDialog::Add(_)) => task = self.submit_add_host(),
+                            Some(host_dialog::HostDialog::ConfirmStop { .. }) => {
+                                self.host_stop_confirmed();
+                            }
+                            None => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // The modal owns the keyboard. `TextInput` still sees
+            // printable input through its own widget events; nothing
+            // leaks to an accelerator or the active PTY.
+            return task;
+        }
         if matches!(self.keyboard_route(), KeyboardRoute::Editor) {
             if let keyboard::Event::KeyPressed {
                 key: Key::Named(Named::Escape),
@@ -2119,6 +2532,10 @@ impl App {
                 self.palette_back_or_dismiss();
                 self.take_palette_focus_task()
             }
+            KeyboardRoute::HostDialog => {
+                self.host_dialog_cancel();
+                UiTask::None
+            }
             KeyboardRoute::Confirm => {
                 self.cancel_confirm_delete();
                 UiTask::None
@@ -2142,6 +2559,7 @@ impl App {
             palette_open: self.palette.is_some(),
             text_capture: self.rename_editor.is_some()
                 || self.confirm_delete.is_some()
+                || self.host_dialog.is_some()
                 || self.terminal_composing(),
         }
     }
@@ -2305,6 +2723,12 @@ impl App {
             KeybindAction::CommandLauncher => self.open_bound_palette_result("launcher"),
             KeybindAction::CustomPalette => self.open_bound_palette_result("custom"),
             KeybindAction::AgentPalette => self.open_bound_palette_result("agents"),
+            // ⌘⇧N opens the picker as its own root frame rather than
+            // drilling through the command palette — the shifted form of
+            // ⌘N is "ask me which host", not "go find the row".
+            KeybindAction::NewProjectOnHost => {
+                self.open_bound_palette_result(palettes::HOST_PICKER_FRAME_ID)
+            }
             KeybindAction::Unbind => Ok(UiTask::None),
             KeybindAction::SwitchProject(index) => {
                 self.switch_project_by_index(index)?;
@@ -2320,7 +2744,7 @@ impl App {
     /// A modal owns the pointer while it is up, so neither strip arms a
     /// gesture behind it.
     fn strip_gestures_enabled(&self) -> bool {
-        self.rename_editor.is_none() && self.confirm_delete.is_none()
+        self.rename_editor.is_none() && self.confirm_delete.is_none() && self.host_dialog.is_none()
     }
 
     /// The active project, host-qualified. The workspace's active
@@ -2362,6 +2786,7 @@ impl App {
         let active_tab = self.active_tab_key();
         resolve_keyboard_route(
             self.confirm_delete.is_some(),
+            self.host_dialog.is_some(),
             self.rename_editor.is_some(),
             self.palette.is_some(),
             active_tab,
@@ -2396,10 +2821,24 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let started = Instant::now();
         let content = self.view_body();
-        let Some(confirm) = &self.confirm_delete else {
+        // At most one modal is ever up: each of the three cancels the
+        // others where it opens, so this is a preference order and not a
+        // stack.
+        let Some(modal) = self
+            .confirm_delete_modal()
+            .or_else(|| self.host_dialog_modal())
+        else {
             crate::perf::record_view(started.elapsed());
             return content;
         };
+        let result = modal_over(content, modal);
+        crate::perf::record_view(started.elapsed());
+        result
+    }
+
+    /// The delete-project confirmation, as a modal.
+    fn confirm_delete_modal(&self) -> Option<Modal<'_>> {
+        let confirm = self.confirm_delete.as_ref()?;
         // Copy and structure follow the Mac's `closeActiveProject` NSAlert
         // (App.swift:3145-3182) verbatim, plural "tabs" included.
         let message = column![
@@ -2426,41 +2865,94 @@ impl App {
             .into(),
             None => message.into(),
         };
-        let panel = container(
-            column![
-                heading,
-                row![
-                    iced::widget::Space::new().width(Fill),
-                    button(text("Cancel").size(12))
-                        .padding([4, 12])
-                        .style(chrome::transparent_button)
-                        .on_press(Message::ConfirmDeleteCancel),
-                    button(text("Close Project").size(12))
-                        .padding([4, 12])
-                        .style(chrome::danger_button)
-                        .on_press(Message::ConfirmDeleteConfirm)
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-            ]
-            .spacing(16),
-        )
-        .width(Fill)
-        .max_width(CONFIRM_PANEL_WIDTH)
-        .height(Shrink)
-        .padding(16)
-        .style(chrome::palette_panel);
-        let overlay = container(mouse_area(panel).on_press(Message::ConfirmDeleteCardPressed))
-            .padding(16)
-            .center(Fill);
-        let catcher = mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
-            .on_press(Message::ConfirmDeleteCancel);
-        let result = stack![content, catcher, overlay]
-            .width(Fill)
-            .height(Fill)
-            .into();
-        crate::perf::record_view(started.elapsed());
-        result
+        let card = modal_card(column![
+            heading,
+            modal_buttons(
+                Message::ConfirmDeleteCancel,
+                "Close Project",
+                chrome::danger_button,
+                Some(Message::ConfirmDeleteConfirm),
+            )
+        ]);
+        Some(Modal {
+            card,
+            card_pressed: Message::ConfirmDeleteCardPressed,
+            dismiss: Message::ConfirmDeleteCancel,
+        })
+    }
+
+    /// Add Host, or the Stop Session confirmation (plan 037 §3.1).
+    ///
+    /// One builder for both because they share the panel: the mock's Add
+    /// Host dialog and its "Restart session" confirmation are the same
+    /// card with different contents, and the delete confirmation above
+    /// is the third instance of it.
+    fn host_dialog_modal(&self) -> Option<Modal<'_>> {
+        let body = match self.host_dialog.as_ref()? {
+            host_dialog::HostDialog::Add(draft) => self.add_host_body(draft),
+            host_dialog::HostDialog::ConfirmStop { label, .. } => column![
+                modal_heading(
+                    format!("Stop the session on {label}?"),
+                    "Every shell on that host ends. The layout is saved, so \
+                     starting the session again reopens the same tabs as fresh \
+                     shells.",
+                ),
+                modal_buttons(
+                    Message::HostDialogCancel,
+                    "Stop Session",
+                    chrome::danger_button,
+                    Some(Message::HostStopConfirm),
+                )
+            ],
+        };
+        Some(Modal {
+            card: modal_card(body),
+            card_pressed: Message::HostDialogCardPressed,
+            dismiss: Message::HostDialogCancel,
+        })
+    }
+
+    /// The Add Host dialog's contents: two fields, an inline error, two
+    /// buttons — the approved mock, widget for widget.
+    fn add_host_body(&self, draft: &host_dialog::AddHostDraft) -> Column<'_, Message> {
+        let mut body = column![
+            modal_heading(
+                "Add Host".to_string(),
+                "Point Roost at a running roost-session socket. For a remote \
+                 machine, forward its socket over SSH.",
+            ),
+            dialog_field(
+                "Name",
+                "pop-os",
+                &draft.name,
+                self.add_host_name_id.clone(),
+                Message::AddHostNameChanged,
+            ),
+            dialog_field(
+                "Socket",
+                "/tmp/roost-popos.sock",
+                &draft.socket,
+                self.add_host_socket_id.clone(),
+                Message::AddHostSocketChanged,
+            ),
+        ];
+        if let Some(error) = &draft.error {
+            body = body.push(text(error.clone()).size(11).color(chrome::ERROR_TEXT));
+        }
+        // Inert while the dial is in flight rather than hidden: a button
+        // that vanishes mid-press moves the card under the pointer.
+        let confirm = (!draft.is_verifying()).then_some(Message::AddHostSubmit);
+        let label = if draft.is_verifying() {
+            "Connecting…"
+        } else {
+            "Add & Connect"
+        };
+        body.push(modal_buttons(
+            Message::HostDialogCancel,
+            label,
+            chrome::primary_button,
+            confirm,
+        ))
     }
 
     /// One sidebar project row plus its agent rows — the same widgets
@@ -3390,14 +3882,11 @@ impl App {
     /// and the completion's reconcile is the whole tail. Nothing here
     /// reads `self.tabs` for the new id, so there is no intent to pend.
     fn new_tab_dispatch(&mut self) -> EngineDispatch {
-        // Creation follows context (plan 037 §3.1), and routing it to the
-        // selected project's host is C7's seam. Until that lands, a host
-        // row being shown means the local project below the override is
-        // not what the user asked to open a tab in — and opening one
-        // there would be invisible behind the host terminal.
-        if !self.active_project_key().is_local() {
-            tracing::debug!("new tab on a host project is not routed yet (plan 037 C7)");
-            return EngineDispatch::default();
+        // Creation follows context (plan 037 §3.1): a tab opens on the
+        // host its project lives on, never on a different one.
+        let project = self.active_project_key();
+        if creation_target(project.host) != CreationTarget::Local {
+            return self.open_host_tab_dispatch(project);
         }
         let (project_id, _) = self.workspace.active();
         if project_id == 0 {
@@ -3405,6 +3894,61 @@ impl App {
         }
         let cwd = self.launch_cwd(project_id);
         self.open_tab_dispatch(project_id, cwd, String::new(), Vec::new())
+    }
+
+    /// ⌘T / the tab bar's "+" on a host project (plan 037 §3.1: a tab
+    /// never lands on a different host than its project).
+    ///
+    /// Event-confirmed like every other host mutation: the reply names
+    /// the new id, and the selection waits for the mirror to list it
+    /// (`arm_pending_host_selection`).
+    fn open_host_tab_dispatch(&mut self, project: ProjectKey) -> EngineDispatch {
+        let Some(ops) = self.hosts.ops_for(project.host).cloned() else {
+            self.set_status("that host is not accepting operations".to_string());
+            return EngineDispatch::default();
+        };
+        // The project's own cwd, off the mirror — the host's answer to
+        // "where does a new tab here start", and the only cwd this side
+        // knows that means anything over there.
+        let cwd = self
+            .host_project_row(project)
+            .map(|(_, row)| row.cwd.clone())
+            .unwrap_or_default();
+        let op = self.take_engine_op_id();
+        let project_id = project.project;
+        EngineDispatch {
+            task: self.engine_op(
+                async move { open_host_tab_flow(ops, project_id, cwd).await },
+                move |result| EngineOpResult::TabOpened {
+                    op,
+                    project,
+                    result: result.map(|tab_id| TabKey::new(project.host, tab_id)),
+                },
+            ),
+            op: Some(op),
+        }
+    }
+
+    /// ⌘N / "+ New Project" when the selected project lives on a host,
+    /// and every row of the ⌘⇧N picker but LOCAL.
+    fn create_host_project_dispatch(&mut self, host: HostId) -> EngineDispatch {
+        let Some(ops) = self.hosts.ops_for(host).cloned() else {
+            self.set_status("that host is not accepting operations".to_string());
+            return EngineDispatch::default();
+        };
+        let op = self.take_engine_op_id();
+        EngineDispatch {
+            task: self.engine_op(
+                async move { create_host_project_flow(ops).await },
+                move |result| EngineOpResult::ProjectCreated {
+                    op,
+                    result: result.map(|(project_id, tab_id)| {
+                        (ProjectKey::new(host, project_id), TabKey::new(host, tab_id))
+                    }),
+                },
+            ),
+            op: Some(op),
+        }
     }
 
     fn open_tab_dispatch(
@@ -3441,7 +3985,19 @@ impl App {
     /// the project lands: revealing where the new project will appear is
     /// the user's own gesture answered, not the engine's report.
     fn new_project_dispatch(&mut self) -> EngineDispatch {
+        let host = self.active_project_key().host;
+        self.create_project_on(host)
+    }
+
+    /// The create-project route, host-qualified (plan 037 §3.1's
+    /// "creation follows context"): ⌘N and "+ New Project" pass the
+    /// selected project's host, the ⌘⇧N picker passes whichever host the
+    /// user chose.
+    fn create_project_on(&mut self, host: HostId) -> EngineDispatch {
         self.set_sidebar_collapsed(false);
+        if let CreationTarget::Host(host) = creation_target(host) {
+            return self.create_host_project_dispatch(host);
+        }
         let op = self.take_engine_op_id();
         let client = self.client.clone();
         let host = self.backend.host();
@@ -3459,8 +4015,51 @@ impl App {
         }
     }
 
+    /// The rows an instance owns: the local snapshot for the local
+    /// backend, that host's mirrored rows for a host.
+    ///
+    /// `None` for a host that is not connected — the same gate
+    /// `host_project_row` applies, so a dimmed section's project cannot
+    /// be renamed, closed, or confirmed against from any route. Stated
+    /// once because every route that resolves a key to rows has to apply
+    /// the same gate, or two of them would disagree about whether the
+    /// same section is actionable.
+    pub(super) fn instance_rows(&self, host: HostId) -> Option<&[Project]> {
+        if host.is_local() {
+            return Some(self.projects.as_slice());
+        }
+        self.interactive_host_view(host)
+            .map(|view| view.projects.as_slice())
+    }
+
+    /// [`Self::instance_rows`] for a project key.
+    fn project_rows(&self, project: ProjectKey) -> Option<&[Project]> {
+        self.instance_rows(project.host)
+    }
+
+    /// Re-resolve an open delete confirmation against the rows it names.
+    ///
+    /// The `take` is what lets the row lookup and the write coexist: the
+    /// rows borrow `self`, so the value being rewritten has to be off it
+    /// while they are held.
+    pub(super) fn reconcile_confirm_delete(&mut self) {
+        let mut confirm = self.confirm_delete.take();
+        if let Some(project) = confirm.as_ref().map(|open| open.project) {
+            match self.project_rows(project) {
+                Some(rows) => reconcile_confirm_delete(&mut confirm, rows),
+                // The host dropped while the dialog was up. Closing it
+                // is the same answer a deleted local project gets.
+                None => confirm = None,
+            }
+        }
+        self.confirm_delete = confirm;
+    }
+
     fn confirm_close_project(&mut self, project: ProjectKey) -> Result<(), String> {
-        let Some(target) = confirm_delete_target(&self.projects, project) else {
+        let Some(target) = self
+            .project_rows(project)
+            .and_then(|rows| confirm_delete_target(rows, project))
+        else {
             return Ok(());
         };
         self.cancel_drags();
@@ -3506,11 +4105,21 @@ impl App {
         };
         let project = confirm.project;
         let Some(project_id) = project.local_project() else {
-            tracing::warn!(
-                ?project,
-                "delete confirmed for a project on another instance"
+            // A host's project: the delete goes on that host's queue and
+            // the mirror's event is what retires the section's rows
+            // (plan 037 §3.9, event-confirmed — a refused delete leaves
+            // the sidebar honest). The reply is awaited all the same, so
+            // "refused" is something the user is told rather than
+            // something only the log knows.
+            let Some(ops) = self.hosts.ops_for(project.host).cloned() else {
+                self.set_status("that host is not accepting operations".to_string());
+                return UiTask::None;
+            };
+            let host_project_id = project.project;
+            return self.engine_op(
+                async move { delete_host_project_flow(ops, host_project_id).await },
+                move |result| EngineOpResult::ProjectDeleted { project, result },
             );
-            return UiTask::None;
         };
         let client = self.client.clone();
         self.engine_op(
@@ -3545,18 +4154,25 @@ impl App {
     /// retires the row (plan 037 §3.9 — event-confirmed, never
     /// optimistic, so a refused close leaves the sidebar honest).
     ///
-    /// Fire-and-forget, hence no engine op id: the local op-id fence
-    /// exists to reconcile a local dispatch against the local broadcast,
-    /// and a host's reply carries no local state to settle.
+    /// The reply is awaited exactly as the local close's is, and for the
+    /// same reason: a refusal the user never sees is a row that silently
+    /// did not go away. The op id comes with that — a `palette.activate`
+    /// closing a host tab now hears the host's verdict rather than an
+    /// immediate "fine" the host may be about to contradict.
     fn close_host_tab_dispatch(&mut self, tab: TabKey) -> EngineDispatch {
-        let intent = crate::host_conn::HostIntent::new(
-            roost_ipc::messages::ops::TAB_CLOSE,
-            serde_json::json!({ "tab_id": tab.tab.to_string() }),
-        );
-        if self.hosts.send_at(tab.host, intent).is_err() {
-            tracing::debug!(%tab, "close requested on a host that is not accepting ops");
+        let Some(ops) = self.hosts.ops_for(tab.host).cloned() else {
+            self.set_status("that host is not accepting operations".to_string());
+            return EngineDispatch::default();
+        };
+        let op = self.take_engine_op_id();
+        let tab_id = tab.tab;
+        EngineDispatch {
+            task: self.engine_op(
+                async move { close_host_tab_flow(ops, tab_id).await },
+                move |result| EngineOpResult::TabClosed { op, tab, result },
+            ),
+            op: Some(op),
         }
-        EngineDispatch::default()
     }
 
     /// The tabs the tab bar is showing, in strip order — the selected
@@ -3823,12 +4439,7 @@ impl App {
     /// neither. C7's `Connect Host` verb and the Add Host dialog land on
     /// this same entry.
     pub fn host_reconnect_requested(&mut self, saved_id: &str) {
-        let Some(host) = self
-            .workspace
-            .hosts()
-            .into_iter()
-            .find(|host| host.id == saved_id)
-        else {
+        let Ok(host) = self.saved_host(saved_id) else {
             tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
             return;
         };
@@ -3840,6 +4451,331 @@ impl App {
                 crate::host_conn::ConnectMode::Dial
             })
         });
+    }
+
+    // ── host verbs (plan 037 §3.1/§3.5) ─────────────────────────────
+    //
+    // Every one of these is reachable three ways — a palette row, a
+    // `roostctl host` verb, and (for reconnect) the sidebar's inline ↻ —
+    // and all three land here rather than each doing its own thing.
+
+    /// The saved hosts as the verb policy reads them.
+    fn host_verb_rows(&self) -> Vec<host_verbs::HostRow<'_>> {
+        self.host_views
+            .iter()
+            .map(|view| host_verbs::HostRow {
+                saved_id: view.saved_id.as_str(),
+                label: view.label.as_str(),
+                state: view.state,
+                localhost: view.localhost,
+            })
+            .collect()
+    }
+
+    /// Disconnect a host, and drop everything the connection published.
+    ///
+    /// The incarnation is purged here rather than off a feed item
+    /// because a disconnect with no reconnect never publishes the
+    /// `Connecting { previous }` that consumers purge off — this is that
+    /// message's stand-in (`HostConnSet::disconnect`'s contract).
+    pub(crate) fn host_disconnect_requested(&mut self, saved_id: &str) {
+        let Some(incarnation) = self.hosts.disconnect(saved_id) else {
+            tracing::debug!(host = %saved_id, "disconnect requested for a host with no connection");
+            self.reconcile();
+            return;
+        };
+        self.purge_host_incarnation(incarnation);
+        self.reconcile();
+    }
+
+    /// Forget a saved host. Disconnects it first: Remove is only offered
+    /// while disconnected, but the op set is not the palette and
+    /// `roostctl host remove` can arrive at any moment.
+    pub(crate) fn host_remove_requested(
+        &mut self,
+        saved_id: &str,
+    ) -> Result<(), roost_engine::WorkspaceError> {
+        // `remove`, not `disconnect`: a disconnect keeps the last mirror
+        // so the section can list its shells dimmed, and once the host
+        // is forgotten there is no section left to list them in.
+        if let Some(incarnation) = self.hosts.remove(saved_id) {
+            self.purge_host_incarnation(incarnation);
+        }
+        let removed = self.workspace.remove_host(saved_id);
+        self.reconcile();
+        removed
+    }
+
+    /// Save a host and connect it — the Add Host dialog's tail, and
+    /// `host.add`'s whole body.
+    ///
+    /// `connect` is what separates the two callers: the dialog's button
+    /// says "Add & Connect" and means it, while `roostctl host add` is
+    /// documented as registry-only (a `host connect` follows if you want
+    /// one).
+    pub(crate) fn host_add_requested(
+        &mut self,
+        label: &str,
+        target: &str,
+        connect: bool,
+    ) -> Result<roost_engine::persistence::HostSnapshot, roost_engine::WorkspaceError> {
+        let host = self.workspace.add_host(label, target)?;
+        if connect {
+            self.host_reconnect_requested(&host.id);
+        }
+        self.reconcile();
+        Ok(host)
+    }
+
+    /// Stop the session on a host: every shell over there ends, the
+    /// layout survives for the next start (plan 037 §3.1's Stop ≠
+    /// Disconnect).
+    ///
+    /// Fire-and-forget on the host's own queue. The session answers by
+    /// pushing its `session.stopping` envelope, which is what moves the
+    /// section to "session ended" — waiting on the reply here would
+    /// report the same thing twice, and later.
+    pub(crate) fn host_stop_requested(&mut self, saved_id: &str) {
+        let intent = crate::host_conn::HostIntent::new(
+            roost_ipc::messages::ops::SESSION_STOP,
+            serde_json::json!({}),
+        );
+        if self.hosts.send(saved_id, intent).is_err() {
+            self.set_status(format!("host {saved_id} is not accepting operations"));
+        }
+    }
+
+    // ── the Add Host dialog ─────────────────────────────────────────
+
+    /// Open Add Host. The one free-text flow in the family, so it is the
+    /// one verb that is a dialog rather than a palette row that acts.
+    pub(crate) fn open_add_host_dialog(&mut self) {
+        self.cancel_drags();
+        self.cancel_editor_for_interaction();
+        self.cancel_confirm_delete();
+        self.host_dialog = Some(host_dialog::HostDialog::add());
+        self.add_host_focus_requested = true;
+        self.cancel_ime_composition();
+    }
+
+    /// Open the Stop confirmation for a connected host.
+    fn open_host_stop_dialog(&mut self, saved_id: &str, label: &str) {
+        self.cancel_drags();
+        self.cancel_editor_for_interaction();
+        self.cancel_confirm_delete();
+        self.host_dialog = Some(host_dialog::HostDialog::ConfirmStop {
+            saved_id: saved_id.to_string(),
+            label: label.to_string(),
+        });
+        self.cancel_ime_composition();
+    }
+
+    pub fn host_dialog_cancel(&mut self) {
+        self.host_dialog = None;
+        self.add_host_focus_requested = false;
+    }
+
+    pub fn add_host_name_changed(&mut self, value: String) {
+        self.edit_add_host_draft(|draft| draft.name = value);
+    }
+
+    pub fn add_host_socket_changed(&mut self, value: String) {
+        self.edit_add_host_draft(|draft| draft.socket = value);
+    }
+
+    /// Every field edit, so `AddHostDraft::edited`'s "the error and the
+    /// dial both described the draft as it was" is applied once rather
+    /// than per field.
+    fn edit_add_host_draft(&mut self, edit: impl FnOnce(&mut host_dialog::AddHostDraft)) {
+        if let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) {
+            edit(draft);
+            draft.edited();
+        }
+    }
+
+    /// The Stop confirmation's destructive button.
+    pub fn host_stop_confirmed(&mut self) {
+        let Some(host_dialog::HostDialog::ConfirmStop { saved_id, .. }) = self.host_dialog.take()
+        else {
+            return;
+        };
+        self.host_stop_requested(&saved_id);
+    }
+
+    /// "Add & Connect": validate what can be answered now, then dial.
+    ///
+    /// The dial runs on the engine runtime and reports back as an
+    /// ordinary engine op — never on the UI thread, which is the whole
+    /// reason this is two steps instead of one (CLAUDE.md's threading
+    /// rule; a wedged socket would otherwise freeze the window for the
+    /// IPC budget).
+    pub fn submit_add_host(&mut self) -> UiTask {
+        let Some(host_dialog::HostDialog::Add(draft)) = self.host_dialog.as_ref() else {
+            return UiTask::None;
+        };
+        if draft.is_verifying() {
+            // A second Enter while the first is in flight is refused
+            // rather than queued, same as the rename editor's.
+            return UiTask::None;
+        }
+        let checked = host_dialog::validate_draft(draft, |label| {
+            self.workspace
+                .check_host_label(label)
+                .map_err(|error| error.to_string())
+        });
+        let target = match checked {
+            Ok(target) => target,
+            Err(error) => {
+                if let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) {
+                    draft.error = Some(error);
+                }
+                return UiTask::None;
+            }
+        };
+        // Minted before the dial and echoed back with its answer: this
+        // submit, not "a submit that happened to describe the same
+        // fields".
+        let generation = self.take_engine_op_id();
+        if let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) {
+            draft.begin_verify(generation);
+        }
+        let (label, dial) = (target.label.clone(), target.target.clone());
+        self.engine_op(
+            async move { host_dialog::verify_target(dial).await },
+            move |result| EngineOpResult::HostVerified {
+                generation,
+                label,
+                target: target.target,
+                result,
+            },
+        )
+    }
+
+    /// The dial answered. Save + connect on success; show why in the
+    /// dialog on failure.
+    ///
+    /// A reply the dialog is no longer waiting on is dropped: the user
+    /// cancelled, opened the other dialog, or edited past this submit,
+    /// and saving the host they *were* describing would be a surprise.
+    /// The generation is what decides that — a draft whose fields happen
+    /// to match is not the same question.
+    fn add_host_verified(
+        &mut self,
+        generation: u64,
+        label: &str,
+        target: &str,
+        result: Result<(), String>,
+    ) {
+        let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) else {
+            tracing::debug!(%label, "dropped an Add Host verify for a dialog that is closed");
+            return;
+        };
+        if !draft.claim_verify(generation) {
+            tracing::debug!(%label, generation, "dropped a stale Add Host verify");
+            return;
+        }
+        if let Err(error) = result {
+            draft.error = Some(error);
+            return;
+        }
+        match self.host_add_requested(label, target, true) {
+            Ok(host) => {
+                tracing::info!(host = %host.id, "added a host from the Add Host dialog");
+                self.host_dialog = None;
+                self.add_host_focus_requested = false;
+            }
+            Err(error) => {
+                // The registry re-validates under its own lock, so a
+                // label that raced another add lands here rather than at
+                // the pre-check above.
+                if let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) {
+                    draft.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    /// Hand out the Add Host dialog's pending focus, once.
+    pub(crate) fn take_add_host_focus_task(&mut self) -> UiTask {
+        let open = matches!(self.host_dialog, Some(host_dialog::HostDialog::Add(_)));
+        if std::mem::take(&mut self.add_host_focus_requested) && open {
+            UiTask::FocusWidget(self.add_host_name_id.clone())
+        } else {
+            UiTask::None
+        }
+    }
+
+    // ── event-confirmed creation (plan 037 §3.9) ────────────────────
+
+    /// A creation on a host: remember to select the new tab once the
+    /// mirror lists it.
+    ///
+    /// The local path needs none of this — `Workspace::open_tab` steals
+    /// the selection in the same commit that creates the tab — but a
+    /// host's rows only exist once its event batch lands, which is a
+    /// different message from the op's own reply and may arrive after.
+    fn arm_pending_host_selection(&mut self, result: &EngineOpResult) {
+        let tab = match result {
+            EngineOpResult::TabOpened {
+                result: Ok(tab), ..
+            } => *tab,
+            EngineOpResult::ProjectCreated {
+                result: Ok((_, tab)),
+                ..
+            } => *tab,
+            _ => return,
+        };
+        if !tab.is_local() {
+            self.pending_host_selection = Some(PendingHostSelection {
+                tab,
+                armed: Instant::now(),
+            });
+        }
+    }
+
+    /// Resolve a pending host creation, if the mirror has caught up.
+    ///
+    /// Four outcomes, all terminal-or-wait: the row is listed (select
+    /// it), its host is no longer connected (drop it — a selection
+    /// waiting on a session nothing is attached to would never resolve),
+    /// the wait ran out (drop it — see [`PendingHostSelection::armed`]),
+    /// or none of those yet (wait for the next reconcile).
+    ///
+    /// Deliberately not `focus_host_tab_and_clear`: this runs *inside*
+    /// reconcile, and that helper ends with a reconcile of its own.
+    fn resolve_pending_host_selection(&mut self) {
+        let Some(pending) = self.pending_host_selection else {
+            return;
+        };
+        let tab = pending.tab;
+        // Read off the views this reconcile has already refreshed, so
+        // "still connected" is the same fact the section is drawing.
+        // Anything else — dropped, reconnecting, taken over, gone — can
+        // no longer answer for this row.
+        let connected = self.host_views.iter().any(|view| {
+            view.host == tab.host && view.state == host_sidebar::SectionState::Connected
+        });
+        if !connected {
+            tracing::debug!(%tab, "dropped a pending selection whose host is no longer connected");
+            self.pending_host_selection = None;
+            return;
+        }
+        if pending.expired(Instant::now()) {
+            tracing::debug!(%tab, "abandoned a pending selection the mirror never listed");
+            self.pending_host_selection = None;
+            return;
+        }
+        let Some(project) = self.host_project_of(tab) else {
+            return;
+        };
+        self.pending_host_selection = None;
+        self.set_host_selection(Some(HostSelection {
+            project,
+            tab,
+            local_active: self.workspace.active().1,
+        }));
+        self.set_sidebar_collapsed(false);
+        self.host_focus_tab(tab);
     }
 
     /// The window title, recomposed from live state on every update batch
@@ -4023,6 +4959,12 @@ impl Message {
             Self::NewTab => return app.new_tab(),
             Self::NewProject => return app.new_project(),
             Self::HostReconnect(saved_id) => app.host_reconnect_requested(&saved_id),
+            Self::AddHostNameChanged(value) => app.add_host_name_changed(value),
+            Self::AddHostSocketChanged(value) => app.add_host_socket_changed(value),
+            Self::AddHostSubmit => return app.submit_add_host(),
+            Self::HostDialogCancel => app.host_dialog_cancel(),
+            Self::HostDialogCardPressed => {}
+            Self::HostStopConfirm => app.host_stop_confirmed(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
             _ => {}
@@ -4408,6 +5350,65 @@ mod tests {
             "and there is nothing to release on the way in"
         );
         assert_eq!(host_selection_detach(None, None), None);
+    }
+
+    /// The Mac gate applied where a connection is started, not only
+    /// where verbs are listed. A saved `localhost` host can reach the
+    /// connect entry on macOS without any palette row — persisted in
+    /// `state.json`, added by `roostctl host add`, then reconnected from
+    /// the sidebar's inline ↻ — and none of those may run the spawn
+    /// ladder for a `roost-session` macOS does not package. Dialing a
+    /// session that IS running still has to work: that is the whole
+    /// Mac→Linux payoff case, so only the spawning mode is downgraded.
+    #[test]
+    fn macos_refuses_to_spawn_a_session_but_still_connects_to_one() {
+        use crate::host_conn::ConnectMode;
+        let linux = host_verbs::VerbPolicy {
+            localhost_surface: true,
+        };
+        let mac = host_verbs::VerbPolicy {
+            localhost_surface: false,
+        };
+
+        assert_eq!(
+            spawn_gate(ConnectMode::SpawnIfMissing, mac),
+            ConnectMode::IfPresent,
+            "macOS probes and reports honestly instead of spawning"
+        );
+        assert_eq!(
+            spawn_gate(ConnectMode::SpawnIfMissing, linux),
+            ConnectMode::SpawnIfMissing
+        );
+        // Every other mode is already spawn-free, on both platforms.
+        for mode in [ConnectMode::IfPresent, ConnectMode::Dial] {
+            assert_eq!(spawn_gate(mode, mac), mode);
+            assert_eq!(spawn_gate(mode, linux), mode);
+        }
+    }
+
+    /// The pending-selection wait is bounded. A tab that exits the
+    /// instant it spawns is closed again before any batch lists it, and
+    /// the connection stays up throughout — so without a deadline the
+    /// entry would sit armed for the rest of the session.
+    #[test]
+    fn a_pending_host_selection_gives_up_eventually() {
+        let armed = Instant::now();
+        let pending = PendingHostSelection {
+            tab: TabKey::new(HostId::new(3), 7),
+            armed,
+        };
+        assert!(
+            !pending.expired(armed),
+            "the round trip has not happened yet"
+        );
+        assert!(
+            !pending.expired(armed + PENDING_HOST_SELECTION_DEADLINE - Duration::from_millis(1))
+        );
+        assert!(pending.expired(armed + PENDING_HOST_SELECTION_DEADLINE));
+        assert!(
+            !pending.expired(armed - Duration::from_secs(1)),
+            "a clock that reads backwards waits rather than abandoning"
+        );
     }
 
     /// `switch_project_N` resolves against the navigation ring now, and
@@ -4915,29 +5916,36 @@ mod tests {
     #[test]
     fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, false, false, TabKey::local(7), false),
+            resolve_keyboard_route(false, false, false, false, TabKey::local(7), false),
             KeyboardRoute::None
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, false, false, TabKey::local(7), true),
             KeyboardRoute::Terminal(TabKey::local(7))
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, false, true, TabKey::local(7), true),
             KeyboardRoute::Palette
         );
         assert_eq!(
-            resolve_keyboard_route(false, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, true, true, TabKey::local(7), true),
             KeyboardRoute::Editor
+        );
+        // A host dialog owns the keyboard over the editor and the
+        // palette, both of which it dismisses on the way up (plan 037
+        // §3.1) — and yields only to the delete confirmation.
+        assert_eq!(
+            resolve_keyboard_route(false, true, true, true, TabKey::local(7), true),
+            KeyboardRoute::HostDialog
         );
         // An open confirm outranks every other surface, so no keystroke can
         // reach an accelerator or the active PTY while it is up.
         assert_eq!(
-            resolve_keyboard_route(true, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(true, true, true, true, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
         assert_eq!(
-            resolve_keyboard_route(true, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(true, false, false, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
     }
@@ -5079,6 +6087,58 @@ mod tests {
             confirm_delete_target(&snapshot, ProjectKey::local(project.id + 1)),
             None
         );
+    }
+
+    /// Creation follows context (plan 037 §3.1). The selected project's
+    /// host decides, and the ⌘⇧N picker hands one in the same shape — so
+    /// every route resolves through one function and a tab can never
+    /// land on a host its project does not live on.
+    #[test]
+    fn creation_routes_to_the_instance_the_selection_names() {
+        // ⌘N / ⌘T / "+" with a local project selected.
+        assert_eq!(
+            creation_target(ProjectKey::local(4).host),
+            CreationTarget::Local
+        );
+        // …and with a host project selected.
+        let host = HostId::new(9);
+        assert_eq!(
+            creation_target(ProjectKey::new(host, 4).host),
+            CreationTarget::Host(host)
+        );
+        // A tab's route asks the same question of the same key, which is
+        // what makes "a tab never lands on a different host than its
+        // project" structural.
+        assert_eq!(
+            creation_target(TabKey::new(host, 7).host),
+            CreationTarget::Host(host)
+        );
+        // The picker's LOCAL row resolves to the local backend, whose
+        // host is `HostId::LOCAL` by construction.
+        assert_eq!(creation_target(HostId::LOCAL), CreationTarget::Local);
+    }
+
+    /// A confirmation carries the *key* it was asked about all the way
+    /// to the delete, not the bare id it matched on.
+    ///
+    /// That is what routes the confirmed delete to the right place:
+    /// `execute_confirmed_delete` reads `project.host` to decide between
+    /// the local client and a host's op queue, so a host row's
+    /// confirmation has to arrive there still host-qualified. Which rows
+    /// the id is matched against is the caller's choice
+    /// (`App::project_rows`) — this only pins that the choice survives.
+    #[test]
+    fn a_confirmation_keeps_the_key_it_was_asked_about() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("mirrored", "/tmp").unwrap();
+        workspace.open_tab(project.id, "/tmp", "t").unwrap();
+        let rows = workspace.snapshot();
+
+        let host = HostId::new(3);
+        let target = confirm_delete_target(&rows, ProjectKey::new(host, project.id))
+            .expect("the caller supplied the rows this key names");
+        assert_eq!(target.project, ProjectKey::new(host, project.id));
+        assert_eq!(target.name, "mirrored");
     }
 
     /// The dialog quotes the Mac's `closeActiveProject` alert verbatim

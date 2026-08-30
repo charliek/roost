@@ -1070,8 +1070,12 @@ pub struct ProjectReorderParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabFocusParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
+    /// Bare engine id for a local tab, or the `h<host>.<id>` spelling to
+    /// select (and attach) a connected host's tab — the op form of the
+    /// sidebar click, which is what makes the attach path drivable from
+    /// a test or `roostctl` (plan 037 §3.4's wire spelling, §7's
+    /// ops-parity rule).
+    pub tab_id: WireTabRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1917,6 +1921,48 @@ pub struct HostListResult {
     pub hosts: Vec<Host>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConnectParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDisconnectParams {
+    pub id: String,
+}
+
+/// What `host.connect` / `host.disconnect` answer: the saved host and
+/// the connection state the request left it in.
+///
+/// The state is what the client asked *for*, not the far end's verdict:
+/// `host.connect` starts an attempt and answers `connecting`, because
+/// waiting for a dial, an identify and a lease before replying would
+/// block the caller on a remote round trip it can watch on the events
+/// stream instead. A caller that wants the settled answer polls
+/// `host.list` / the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostConnectionResult {
+    pub host: Host,
+    /// One of [`host_state`]'s spellings.
+    pub state: String,
+}
+
+/// The wire spellings of a host's connection state, shared by
+/// `host.connect`, `host.disconnect`, and anything that reports one.
+///
+/// Kebab-case to match the error codes beside them on this wire
+/// (`taken-over`, `build-mismatch`).
+pub mod host_state {
+    pub const DISCONNECTED: &str = "disconnected";
+    pub const CONNECTING: &str = "connecting";
+    pub const CONNECTED: &str = "connected";
+    pub const TAKEN_OVER: &str = "taken-over";
+    pub const STOPPED: &str = "stopped";
+    pub const NEEDS_RESTART: &str = "needs-restart";
+}
+
 // ============================================================================
 // HS-2 server-side additions: effects envelopes + theme reseed
 // ============================================================================
@@ -2245,12 +2291,21 @@ pub mod ops {
     /// [`crate::messages::TabEffectEvent`] is the payload.
     pub const EVENT_TAB_EFFECT: &str = "tab.effect";
 
-    /// Client-side saved-host registry (host-sessions HS-2, plan 037
-    /// C1). Registry only — no connect/disconnect here (`host.connect`
-    /// / `host.disconnect` land with `HostConn` in a later commit).
+    /// Client-side saved-host registry and its connections
+    /// (host-sessions HS-2, plan 037 §3.5). Every palette host verb has
+    /// its equivalent here, so the UI, `roostctl` and future Lua all
+    /// drive one path.
     pub const HOST_ADD: &str = "host.add";
     pub const HOST_REMOVE: &str = "host.remove";
     pub const HOST_LIST: &str = "host.list";
+    /// Start a connection to a saved host — the palette's
+    /// `Connect Host: <label>` and the sidebar's ↻ Reconnect. An
+    /// explicit connect is unconditional takeover, and may start a
+    /// localhost session that is not running.
+    pub const HOST_CONNECT: &str = "host.connect";
+    /// Drop a saved host's connection. Never Stop: the session keeps
+    /// running and its shells with it (roadmap D8).
+    pub const HOST_DISCONNECT: &str = "host.disconnect";
 }
 
 // ============================================================================
@@ -2461,6 +2516,37 @@ mod tests {
         );
         let params: TabDumpParams = serde_json::from_str(r#"{"tab_id": "h3.7"}"#).unwrap();
         assert_eq!(params.tab_id, WireTabRef::Host { host: 3, tab: 7 });
+    }
+
+    /// Every op that names a tab the UI can render takes the same
+    /// reference type — the dumps, the capture, and `tab.focus`, which
+    /// is what makes attaching a host tab drivable from a test or
+    /// `roostctl` rather than only by clicking (plan 037 §7's
+    /// ops-parity rule).
+    #[test]
+    fn the_tab_naming_ops_share_one_reference_type() {
+        let bare = r#"{"tab_id": "5"}"#;
+        let qualified = r#"{"tab_id": "h3.7"}"#;
+        for raw in [bare, qualified] {
+            let want = serde_json::from_str::<TabDumpParams>(raw).unwrap().tab_id;
+            assert_eq!(
+                serde_json::from_str::<TabFocusParams>(raw).unwrap().tab_id,
+                want,
+                "tab.focus reads {raw}"
+            );
+            assert_eq!(
+                serde_json::from_str::<TabDumpResolvedParams>(raw)
+                    .unwrap()
+                    .tab_id,
+                want
+            );
+            assert_eq!(
+                serde_json::from_str::<TabCapturePtyInputParams>(raw)
+                    .unwrap()
+                    .tab_id,
+                want
+            );
+        }
     }
 
     #[test]

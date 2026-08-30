@@ -229,7 +229,19 @@ impl Engine {
                 Ok(CommandResult::Ack)
             }
             EngineCommand::TabFocus(p) => {
-                let (previous_project_id, previous_tab_id) = self.workspace.focus_tab(p.tab_id)?;
+                // `tab.focus` accepts the host-qualified `h<host>.<id>`
+                // spelling on the UI socket, where a host selection is
+                // something a client holds. The façade is the local
+                // engine and holds none, so it narrows to a bare id
+                // rather than pretending it could act on one.
+                let tab_id = p.tab_id.local().ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "tab {} names a host session; the engine façade drives the local \
+                         workspace only",
+                        p.tab_id
+                    ))
+                })?;
+                let (previous_project_id, previous_tab_id) = self.workspace.focus_tab(tab_id)?;
                 Ok(CommandResult::PreviousSelection {
                     previous_project_id,
                     previous_tab_id,
@@ -394,6 +406,7 @@ impl EngineEventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_ipc::messages::WireTabRef;
 
     #[tokio::test]
     async fn commands_advance_revision_and_emit_in_order() {
@@ -432,11 +445,24 @@ mod tests {
             PathBuf::from("/tmp/roost-engine-test.sock"),
         );
         let error = engine
-            .execute(EngineCommand::TabFocus(TabFocusParams { tab_id: 404 }))
+            .execute(EngineCommand::TabFocus(TabFocusParams {
+                tab_id: WireTabRef::Local(404),
+            }))
             .await
             .unwrap_err();
         assert_eq!(error.code(), "tab_not_found");
         assert_eq!(error.to_string(), "tab 404 not found");
+
+        // A host-qualified ref is refused here rather than narrowed to
+        // the same number's local tab: the façade drives the local
+        // workspace, and a client's host selection is not its to move.
+        let qualified = engine
+            .execute(EngineCommand::TabFocus(TabFocusParams {
+                tab_id: WireTabRef::Host { host: 3, tab: 7 },
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(qualified.code(), "invalid_argument");
 
         let missing_project = engine
             .execute(EngineCommand::TabOpen(TabOpenParams {

@@ -343,6 +343,13 @@ impl App {
         // `Resync` and this rebuild is what heals it: deltas are an
         // optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        // The host sections are the other half of that snapshot, and
+        // they come first for the same reason: everything below re-
+        // resolves a key against the rows of whichever instance owns it,
+        // and a host key resolves against these. (They read only the
+        // registry and the connection set, so nothing below can affect
+        // them.)
+        self.refresh_host_views();
         // Every pill-relevant change (title, active, notification) lands
         // here, so this is where the elision memo is refreshed. Gated on a
         // window: the bootstrap reconcile runs before the chrome fonts are
@@ -352,7 +359,7 @@ impl App {
             self.refresh_pill_labels();
         }
         self.request_exit_if_empty();
-        reconcile_confirm_delete(&mut self.confirm_delete, &self.projects);
+        self.reconcile_confirm_delete();
         self.reconcile_tab_drag_preview();
         self.reconcile_project_drag_preview();
         self.reconcile_rename_editor();
@@ -368,13 +375,17 @@ impl App {
         // covers open, close, rename, reorder and select by construction.
         self.sync_window_menu();
         self.refresh_notification_palette();
-        // Host sections before the agent surfaces: both read the cached
-        // mirror copies, and before the selection check, which decides
-        // whether the window is still showing a row that exists.
-        self.refresh_host_views();
+        // Before the selection check, which decides whether the window
+        // is still showing a row that exists: whatever this selects is
+        // then validated exactly as any other selection would be.
+        self.resolve_pending_host_selection();
         self.reconcile_host_selection();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
+        // Host verbs are live state too: a host that connected while the
+        // palette was open must stop offering Connect and start offering
+        // Stop (plan 037 §3.1's "verbs appear only when applicable").
+        self.refresh_host_palette();
         // The workspace is one backend's id-space, so its ids qualify at
         // that backend's instance — and the prune below is scoped to it
         // for the same reason: a connected host's tabs are pruned by that
@@ -476,7 +487,34 @@ impl App {
                     )
                 };
                 match built {
-                    Ok(tab) => {
+                    Ok(mut tab) => {
+                        // Install renderer metrics before the tab is
+                        // rendered at all: the view draws only a tab with
+                        // `applied_metrics`, and a host tab is created
+                        // between window resizes, so nothing else would
+                        // ever give it any — the terminal would stay
+                        // blank while its snapshot filled up. The local
+                        // attach does exactly this for the same reason.
+                        // The resize half is a no-op on the wire: this
+                        // geometry is what `tab.attach` already asked
+                        // for, and a host handle drops `send_resize`
+                        // anyway (the attach machine owns that).
+                        match tab.apply_geometry(
+                            cols,
+                            rows,
+                            self.terminal_metrics,
+                            self.metric_generation,
+                        ) {
+                            Ok(Some(change)) => tab.commit_geometry(change),
+                            Ok(None) => {
+                                tracing::warn!(%key, "host terminal did not install metrics");
+                                return;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%key, ?error, "host terminal geometry failed");
+                                return;
+                            }
+                        }
                         entry.insert(tab);
                     }
                     Err(error) => {
@@ -515,7 +553,7 @@ impl App {
     /// Drop every piece of app state keyed by a dead connection
     /// incarnation. The fresh mirror is authoritative; purge-then-
     /// re-derive is what prevents duplicates (plan 037 §3.2).
-    fn purge_host_incarnation(&mut self, incarnation: HostId) {
+    pub(super) fn purge_host_incarnation(&mut self, incarnation: HostId) {
         // Every attach and every resume point belongs to a key that also
         // has a `tabs` entry (`host_focus_tab` mints them together), so
         // dropping the incarnation's tabs drops all three. The retain
@@ -531,6 +569,15 @@ impl App {
             self.host_drop_tab(key);
         }
         self.host_resume.retain(|key, _| key.host != incarnation);
+        // A creation still waiting for this incarnation's mirror will
+        // never be answered by it (plan 037 §3.9's "dropped on
+        // disconnect").
+        if self
+            .pending_host_selection
+            .is_some_and(|pending| pending.tab.host == incarnation)
+        {
+            self.pending_host_selection = None;
+        }
     }
 
     /// The tab is over (EXIT, or its whole connection incarnation went):
@@ -940,7 +987,18 @@ impl App {
                         crate::host_conn::HostConnState::Connecting { previous } => *previous,
                         _ => None,
                     };
+                    let connected = matches!(state, crate::host_conn::HostConnState::Connected);
                     if let Some(host) = self.hosts.apply_state(host, state) {
+                        // Stamp the registry the moment a connection
+                        // settles — `last_connected` is what the Add Host
+                        // list and a `roostctl host list` read to tell a
+                        // host that has ever worked from one that never
+                        // has, and nothing else writes it.
+                        if connected {
+                            if let Err(error) = self.workspace.touch_host_connected(&host) {
+                                tracing::debug!(%host, %error, "could not stamp last_connected");
+                            }
+                        }
                         // Attributed (not a stale task's publication): the
                         // app-side purge follows the set's — everything
                         // keyed by the dead incarnation is re-derived from
@@ -1415,6 +1473,10 @@ impl App {
                     // they are the same string, and the registry is the
                     // one that exists before a connection does.
                     label: host.label,
+                    // Same reason the label comes from here: the verb
+                    // policy has to know whether a host is this
+                    // machine's own *before* anything connects to it.
+                    localhost: host.target == crate::host_conn::LOCALHOST_TARGET,
                     host: incarnation.unwrap_or(HostId::LOCAL),
                     state,
                     projects: mirror
@@ -1697,6 +1759,7 @@ impl App {
                         )),
                         KeyboardRoute::None
                         | KeyboardRoute::Confirm
+                        | KeyboardRoute::HostDialog
                         | KeyboardRoute::Editor
                         | KeyboardRoute::Palette => Err(format!(
                             "tab {tab_id} is not the active terminal \
@@ -1878,10 +1941,12 @@ impl App {
                         self.palette_activate_replies.insert(op, reply);
                     }
                 }
-                // The rename rows open the inline editor from here too.
+                // The rename rows open the inline editor from here too,
+                // and `Add Host…` opens its dialog — both owe a focus.
                 task = task
                     .then(activation.task)
-                    .then(self.take_rename_focus_task());
+                    .then(self.take_rename_focus_task())
+                    .then(self.take_add_host_focus_task());
             }
             UiRequest::PaletteDismiss { reply } => {
                 let result = self
@@ -2009,8 +2074,109 @@ impl App {
                 };
                 let _ = reply.send(result);
             }
+            // The host registry + connections, as ops (plan 037 §3.5).
+            // Served here rather than in the engine so a `roostctl host`
+            // verb reconciles the same surfaces the palette row does —
+            // the sidebar section, the connection, the saved list — and
+            // so every verb has exactly one implementation.
+            UiRequest::HostAdd {
+                label,
+                target,
+                reply,
+            } => {
+                // Registry-only, per `roostctl host add`'s documented
+                // semantics; `host.connect` is the second step, and the
+                // Add Host dialog's "Add & Connect" takes both.
+                let _ = reply.send(
+                    self.host_add_requested(&label, &target, false)
+                        .map(Into::into),
+                );
+            }
+            UiRequest::HostRemove { id, reply } => {
+                let _ = reply.send(self.host_remove_requested(&id));
+            }
+            UiRequest::HostTabFocus {
+                host,
+                tab_id,
+                reply,
+            } => {
+                let key = TabKey::new(HostId::new(host), tab_id);
+                // The same two steps the sidebar click takes, in the
+                // same order: the selection first (so the view and the
+                // keyboard route move together), then the attach.
+                let result = self
+                    .focus_host_tab_and_clear(key, false)
+                    .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
+                let _ = reply.send(result);
+            }
+            UiRequest::HostConnect { id, reply } => {
+                let _ = reply.send(self.host_connect_op(&id));
+            }
+            UiRequest::HostDisconnect { id, reply } => {
+                let _ = reply.send(self.host_disconnect_op(&id));
+            }
         }
         task
+    }
+
+    /// `host.connect`, as the op answers it: start the attempt and
+    /// report the state it left the host in.
+    ///
+    /// `connecting` rather than `connected` is the honest answer — the
+    /// dial, the identify and the lease are a round trip this reply does
+    /// not wait for, and a client that wants the settled verdict watches
+    /// the section (or asks again).
+    fn host_connect_op(
+        &mut self,
+        saved_id: &str,
+    ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
+        let host = self.saved_host(saved_id)?;
+        self.host_reconnect_requested(saved_id);
+        Ok(self.host_connection_result(host))
+    }
+
+    fn host_disconnect_op(
+        &mut self,
+        saved_id: &str,
+    ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
+        let host = self.saved_host(saved_id)?;
+        self.host_disconnect_requested(saved_id);
+        Ok(self.host_connection_result(host))
+    }
+
+    /// The saved host with this id, as the registry has it. The one
+    /// spelling of "look a host up by id" on the app side.
+    pub(super) fn saved_host(
+        &self,
+        saved_id: &str,
+    ) -> Result<roost_engine::persistence::HostSnapshot, roost_engine::WorkspaceError> {
+        self.workspace
+            .hosts()
+            .into_iter()
+            .find(|host| host.id == saved_id)
+            .ok_or_else(|| roost_engine::WorkspaceError::HostNotFound(saved_id.to_string()))
+    }
+
+    /// The `{host, state}` both connection ops answer with, read off the
+    /// connection set *after* the verb ran.
+    fn host_connection_result(
+        &self,
+        host: roost_engine::persistence::HostSnapshot,
+    ) -> HostConnectionResult {
+        // Through the section state the sidebar itself reads, so the
+        // reply and the dot drawn beside it can never disagree. A host
+        // this app is not driving at all reads as disconnected, which is
+        // exactly what its section shows.
+        let state = self
+            .hosts
+            .state(&host.id)
+            .map_or(host_sidebar::SectionState::Disconnected, |state| {
+                state.section_state()
+            });
+        HostConnectionResult {
+            host: host.into(),
+            state: state.wire().to_string(),
+        }
     }
 
     pub(super) fn apply_osc_actions(&mut self, key: TabKey, actions: Vec<OscAction>) -> UiTask {
