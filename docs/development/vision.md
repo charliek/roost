@@ -510,6 +510,57 @@ headless tabs have no server VT, so terminal-generated queries (DA/DSR/
 color) go unanswered until HS-1b adds one. Full deviation list in
 [ipc.md](../reference/ipc.md).
 
+### DL-18: hosts UX, attach-on-focus, effects + theme reseed, and the Mac gate (2026-08-29)
+
+Plan 037 (HS-2) is the first user-visible ship of host sessions: the
+iced UI attaches to a `roost-session` daemon as a "host" in the
+sidebar, so closing the app no longer kills what was running in it.
+Four decisions pinned there, each recorded because it proved
+non-obvious enough to relitigate otherwise:
+
+- **Hosts UX.** The single "PROJECTS" sidebar header becomes one band
+  per host once at least one is saved — LOCAL first, then each saved
+  host by label, each with a connection dot and an agent rollup —
+  while zero saved hosts renders exactly today's sidebar (the
+  roadmap's D8 zero-change rule). Every host action lives in the
+  command palette rather than a host menu: one row per (verb, host)
+  pair, appearing only when it applies (Stop only while connected,
+  Remove only while disconnected). Add Host is the one flow that needs
+  free text and is a small modal dialog, validating by dialing
+  `session.identify` before it saves.
+- **Attach-on-focus.** A client attaches a tab's data connection only
+  while it is the focused tab, detaching — never stopping — on
+  switch-away; a background host tab stays current through the events
+  mirror alone (titles, agent state), with its scrollback living
+  server-side. This bounds client memory and live data connections at
+  one per host, nowhere near the server's own 16-token quota, at the
+  cost of a small per-focus round trip that resume makes cheap.
+- **Effects + theme reseed.** The two open questions
+  [DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)
+  left on the server side close as the smallest useful slice: a
+  session forwards a tab's bell and OSC 52 clipboard writes to
+  whichever client holds its lease (`tab.effect` events, 256 KiB
+  clipboard cap), and a connecting client seeds every tab's server
+  `Terminal` with its own palette (`session.set_theme`) so a color
+  query answers with what the client is actually rendering rather than
+  the server's factory default. Both are additive;
+  `SESSION_PROTOCOL_VERSION` stays `2`.
+- **The Mac gate**, refining rather than contradicting the roadmap's
+  "no visible dead end" rule: there is no macOS `roost-session` build,
+  so the Roost-Iced Mac client hides the `localhost` surface entirely
+  — no seeded Connect row, no launch auto-reconnect, no
+  spawn-if-missing. **Add Host stays** on macOS regardless: pointing it
+  at an `ssh -L` forward to a Linux host is the feature's whole
+  Mac→Linux payoff, not a dead end.
+
+See [`guides/host-sessions.md`](../guides/host-sessions.md) for the
+user-facing shape and
+[`development/host-sessions.md`](host-sessions.md) for the
+architecture (component topology, the attach sequence, the
+lease/takeover lifecycle); the roadmap's D11 — Hosts UX
+([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md))
+is the source decision this entry summarizes.
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

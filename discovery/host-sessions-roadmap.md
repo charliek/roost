@@ -290,6 +290,53 @@ revisit only post-HS-4); screen-manifest agent detection (own track);
 Swift host backend; flipping the local default (HS-5 is a placeholder
 decision point, not scheduled work).
 
+### D11 — Hosts UX
+
+Pinned with Charlie in the plan 037 planning session (approved mockups
+archived beside that plan); see `docs/development/vision.md`'s DL-18
+for the summary and `docs/guides/host-sessions.md` for the user-facing
+shape.
+
+- **Sidebar = per-host sections.** Zero saved hosts renders exactly
+  today's single "PROJECTS" sidebar (D8's zero-change rule); the first
+  saved host splits it into one band per host — LOCAL first, then each
+  saved host by label — each with a connection dot (green connected /
+  grey disconnected / amber connecting or needs-restart) and a
+  right-aligned agent rollup. A disconnected host's rows stay listed,
+  dimmed and non-interactive, with an inline "↻ Reconnect" — the
+  session still holds those shells.
+- **Palette owns every host verb.** No host menu: `Add Host…`,
+  `Connect Host: <label>`, `Disconnect Host: <label>`,
+  `Stop Session: <label>` (connected-only, confirmed),
+  `Remove Host: <label>` (disconnected-only), `New Project on… <label>`
+  — one row per (verb, host) pair, appearing only where it applies.
+  Add Host is the one flow needing free text: a small modal dialog
+  (Name + Socket) validating by dialing `session.identify` before it
+  saves.
+- **The Mac gate.** No macOS `roost-session` exists, so the Roost-Iced
+  Mac client hides the `localhost` surface (no seeded connect row, no
+  launch auto-reconnect, no spawn-if-missing) — refining rather than
+  contradicting the "no visible dead end" rule above. `Add Host`
+  **stays** on macOS: an `ssh -L` forward to a Linux host is the
+  feature's Mac→Linux payoff, not a dead end.
+- **Creation follows context.** `⌘N`/`Alt-N` and "+ New Project"
+  create on the selected project's host; `⌘⇧N`/`Alt-Shift-N` opens a
+  "New Project on…" picker (connected hosts + LOCAL); `⌘T`/`Alt-T`
+  never lands a tab on a different host than its project.
+- **Navigation is one global ring**, crossing host boundaries and
+  skipping disconnected sections, with no new bindings; agent surfaces
+  (sidebar rows, the agents palette, notifications) are host-blind —
+  `project · host` is the only tell.
+- **Takeover** freezes the displaced window's last frame under a
+  banner ("Reconnect here" = takeover back); the **upgrade flow** on a
+  build/protocol mismatch offers "Restart session" only where the
+  client can run it (localhost), and a docs pointer otherwise (a
+  remote session restarts on its own machine).
+- **Disconnect ≠ Stop** (restating D8 for the UI layer): closing the
+  window disconnects every host; Stop is explicit and confirmed.
+- **Iced-only.** The Swift app is untouched; `roostctl host *` against
+  its socket answers `unknown-op`, permanently — not a gap.
+
 ---
 
 ## Milestones
@@ -394,6 +441,21 @@ attach-stream contract (fence, READY ordering, no lost/duplicated
 bytes around the fence) proven by the pytest lane.
 
 ### HS-2 — Iced attaches to localhost (first user-visible ship)
+
+**Shipped (plan 037).** The bullets below describe HS-2 as originally
+scoped; see [D11](#d11--hosts-ux) for the UX decisions pinned during
+planning and `docs/development/host-sessions.md` for what actually
+landed (`HostConn`'s three-connection-per-host topology, the
+attach-on-focus data path, `tab.effect` + `session.set_theme` on the
+server side, and the takeover/upgrade lifecycle) — implementation
+deviated from this sketch in a few recorded places (notably: the
+terminal swaps at FINISH rather than READY, and `TabBackend` gained no
+app-scoped `Host` variant — the real seam turned out to be
+`TabHandleKind::Host` plus `HostConnSet`). One gap recorded rather than
+fixed: `roost-session`'s headless workspace defaults
+`window_focused = true` with no op to correct it, so `notification.fired`
+never fires for whichever tab a client has attached to — tracked as
+HS-3 follow-up.
 
 - Palette: Connect host → `localhost`; spawn-if-missing then attach.
   Hidden on the Mac build until a Mac server exists (no visible

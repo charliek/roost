@@ -336,6 +336,20 @@ needs no lease and no attach: a session's terminal is authoritative
 whether or not anybody is watching it. (Before HS-1b a session had no
 terminal at all and answered `internal: no UI attached`.)
 
+On a **UI socket**, `tab_id` also accepts the host-qualified
+`h<host>.<id>` spelling (plan 037 §3.4) — `"h3.7"` reads tab `7` of
+whichever connected host this UI process has minted connection id `3`
+for. It resolves to the **client-side** hydrated
+Terminal of an attached host tab (the same one `TerminalWidget`
+paints), not the session's own copy — so this is how a test or
+`roostctl` observes the client half of an attach independently of the
+server half above. A **session socket** refuses the qualified form
+with `invalid-param` ("host-qualified tab refs are a UI-socket form;
+session tab ids are bare") rather than silently narrowing it to some
+unrelated numbered tab — a session's own ids are one bare id-space by
+design. `roostctl tab dump --tab h3.7` passes the spelling straight
+through.
+
 ### `tab.dump_resolved`
 
 Companion to `tab.dump` — a richer read of the same viewport, but each
@@ -368,7 +382,13 @@ Both sockets run the same resolver — the densifier and `resolve_colors`
 live in `roost-vt` and the iced UI imports them — so a session's answer
 and a UI's cannot drift. A session has no theme, so its default
 foreground/background are the server Terminal's own (white on black
-until a program changes them).
+until a program changes them; see [`session.set_theme`](#sessionset_theme)
+for how an attached client recolors it).
+
+On a **UI socket**, `tab_id` accepts the host-qualified `h<host>.<id>`
+spelling too, resolving to an attached host tab's client-side Terminal
+exactly as [`tab.dump`](#tabdump) does above; a session socket refuses
+it the same way.
 
 ### `tab.feed_pty_bytes` *(test-only — gated)*
 
@@ -433,6 +453,11 @@ task produced them. `drain` is honored identically (consume vs. peek).
 This is how the exactly-once reply rule is asserted headlessly — one
 answer in the capture per query, no matter how many clients are
 attached.
+
+`tab_id` accepts the host-qualified `h<host>.<id>` spelling on a **UI
+socket** too — same rule as [`tab.dump`](#tabdump): it reads an
+attached host tab's client-side terminal-reply buffer, and a session
+socket refuses the qualified form.
 
 ### `tab.feed_ime` *(test-only — gated)*
 
@@ -508,6 +533,16 @@ Sets the active (project, tab) selection.
 
 Request: `{"params": {"tab_id": "3"}}`. Response:
 `{"previous_project_id": "1", "previous_tab_id": "2"}`.
+
+`tab_id` also accepts the host-qualified `h<host>.<id>` spelling on a
+**UI socket** — the plan 037 §3.4 wire spelling `roostctl tab focus`
+and the attach path both drive. Focusing a host tab is client
+selection state, not a workspace mutation, so the response's two
+`previous_*` fields are always `"0"`: the host's own workspace owns its
+active row, and this client only moved which one it is looking at. A
+**session socket** answers `invalid-param` for the qualified form
+("a host-qualified tab.focus needs a UI: host selection is client
+state") — there is no UI there to hold a selection.
 
 ### `tab.set_title`
 
@@ -1082,6 +1117,24 @@ to confirm) could build on. Each op routes through the UI seam
 `UiBridge` protocol on Mac), not the workspace — pasteboard + selection
 state live on the UI side.
 
+### Host registry (`host.*`)
+
+Client-side saved-host bookkeeping for [host sessions](../guides/host-sessions.md) — a UI-only op family, like `palette.*`: it manages `Workspace.hosts` (the `{id, label, target, last_connected}` array persisted in the UI's own `state.json`, plan 037 §3.5), not a session's own workspace. `host.connect` / `host.disconnect` additionally reach into the UI's live connection set, so they answer with the connection state the request left the host in rather than only a registry mutation — and they require a UI to be attached at all (`internal: no UI attached` on a headless engine embedder, the same honest failure every other `UiRequest`-backed op gives).
+
+A session socket answers `unknown-op` for every verb here — the same "no shadow registry in the daemon" rule `host.add --verify`'s own dial depends on. So does the Swift Mac app's socket: **`roostctl host *` against `--target mac` is a documented, permanent `unknown-op`**, not a gap to be filled — host sessions are iced-only (plan 037 §3.1), and the Swift app never grows this surface.
+
+| Op | Request params | Notes |
+|---|---|---|
+| `host.add` | `{"label": "pop-os", "target": "/home/charlie/.local/state/roost/roost-session.sock"}` | Saves a host. Registry-only — this does **not** dial `target`, so a typo'd socket path still saves cleanly (the sidebar's dot reports it at the next connect attempt). `label` is trimmed, must be non-empty, Unicode-case-insensitive unique, and not `"local"` (the reserved LOCAL band). Response: `{"host": <Host>}`. |
+| `host.remove` | `{"id": "3f9a2b7c1d4e4f5a"}` | Forgets a saved host — the registry entry and the dimmed rows its last connection left behind. Never touches the session itself: its shells keep running. Response: `{}`. |
+| `host.list` | `{}` | Response: `{"hosts": [<Host>, ...]}`. |
+| `host.connect` | `{"id": "3f9a2b7c1d4e4f5a"}` | Starts (or restarts) a connection. Unconditional takeover — reconnecting IS takeover on this wire — and on a **localhost** target it spawns the session first if nothing is listening. Answers as soon as the attempt is under way, with the state the request *asked for* (`"connecting"`), not the far end's eventual verdict — watch the sidebar or poll `host.list` for the settled state. Response: `{"host": <Host>, "state": "connecting"}`. |
+| `host.disconnect` | `{"id": "3f9a2b7c1d4e4f5a"}` | Drops the connection. Never stops the session — its shells keep running, and reconnecting picks them back up (disconnect ≠ stop). Response: `{"host": <Host>, "state": "disconnected"}`. |
+
+`Host` is `{"id": "<hex>", "label": "<string>", "target": "<string>", "last_connected"?: "<ISO-8601>"}`. `state` is one of the wire's connection-state spellings: `disconnected` | `connecting` | `connected` | `taken-over` | `stopped` | `needs-restart`.
+
+`host.add` / `host.remove` are `UiRequest`-style when a UI is attached (a `roostctl host add` is visible in the sidebar immediately, no restart needed) and fall back to a direct `Workspace` mutation for a headless embedder (the engine's own tests) — both paths mint the same `WorkspaceError` wire codes, so a caller cannot tell which one answered. `host.connect` / `host.disconnect` have no headless form: connection state is the app's alone.
+
 ### `events.subscribe`
 
 Turn this connection into a one-way event stream. **Served by a
@@ -1305,6 +1358,15 @@ that disagree cannot exchange a snapshot, so `tab.attach` requires an
 screen. Both fields were empty in HS-1a, when there was nothing to
 attach to.
 
+**Test seam:** with `ROOST_TEST_MODE=1` set, a session additionally
+reads `ROOST_SESSION_FAKE_BUILD` and reports *that* string as
+`libghostty_build` instead of its real one — and uses it for
+`tab.attach`'s check #4 too, so the two stay consistent. Reproducing a
+build/protocol mismatch otherwise needs a second binary built against a
+second Ghostty pin, which no CI lane can produce; this makes it a
+one-line fixture (plan 037 §3.7). Ignored entirely outside test mode,
+so a production daemon can never be made to lie about its own build.
+
 ### `session.connect`
 
 Claim the session's **interactive lease** — the authority to drive
@@ -1394,6 +1456,29 @@ keep.
 `session.connect` is a mutating op for stop-latch purposes — it hands
 out authority — so it answers `shutting-down` once
 [`session.stop`](#sessionstop) has latched.
+
+### `session.set_theme`
+
+Seed every tab's server Terminal with the connected client's palette — closes architecture §13's reseed gap (plan 037 §3.6). Lease-gated: only the interactive-lease holder may recolor a session.
+
+Request:
+```json
+{"id": "8", "op": "session.set_theme", "params": {
+  "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+  "osc_colors": {
+    "foreground": "#ffffff", "background": "#1c1c1c", "cursor": "#98989d",
+    "palette": ["#000000", "... 256 entries total ..."]
+  }
+}}
+```
+
+Response: `{"tabs": 3}` — the number of live tabs whose server Terminal was reseeded. `0` is a success: a session with no tabs yet still remembers the theme for the ones it opens next.
+
+`palette` must carry exactly 256 `#rrggbb` entries (lowercase, the same spelling [`tab.dump_resolved`](#tabdump_resolved) uses); a short or long array is `invalid-param` rather than a partial application.
+
+A client sends this **immediately after `session.connect` and before its first `tab.attach`** — attaching before the theme lands would paint the session's factory colors for one frame — and again whenever its own theme changes thereafter. Concurrent callers are last-writer-wins by design: the theme store mints a generation on every apply, so a `set_theme` racing a tab spawn is caught up at promotion rather than silently lost, and interleaved fan-outs converge on the newest theme instead of whichever send landed last.
+
+Like `session.connect`, this answers `shutting-down` once `session.stop` has latched.
 
 ### `tab.attach`
 
@@ -1802,6 +1887,20 @@ batch. It is the connection's own terminal control envelope — see
   what those two projections lose: which lifecycle, whose session, and
   the shell axis underneath. `state` is included pre-derived so a
   subscriber never has to re-run the projection itself.
+* `tab.effect` — `{"tab_id": "<id>", "effect": "bell" | "clipboard-write", "data"?: "<base64>", "target"?: "system" | "selection"}`
+  (plan 037 §3.6). One client-directed side effect the tab's OSC scan
+  produced, for whichever client is attached (§3.4's lease-holder-only
+  contract) to apply — a bell BEL byte outside any escape sequence, or
+  an OSC 52 clipboard write. `data` and `target` are present only for
+  `clipboard-write`: `data` is the decoded payload, base64-encoded like
+  every other bytes field on this wire and capped at 256 KiB decoded
+  (`CLIPBOARD_EFFECT_MAX_BYTES` — an oversized write is dropped and
+  debug-logged by size, **never by content**); `target` distinguishes
+  OSC 52's primary-selection form (`p`/`s`) from the system clipboard
+  (`c` or no selector), defaulting to `system` when absent. HS-2 ships
+  exactly these two effects — every other client-local OSC effect
+  (pointer shape, today) stays dropped + debug-logged in the tab task
+  rather than added to this envelope.
 
 ## Dropped vs. the legacy proto
 
