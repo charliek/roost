@@ -76,6 +76,7 @@ use roost_ui_model::theme::Theme;
 
 pub(crate) mod mirror;
 pub(crate) mod queue;
+pub(crate) mod restart;
 pub(crate) mod state;
 pub(crate) mod task;
 
@@ -673,6 +674,20 @@ impl HostConnSet {
         }
     }
 
+    /// Whether an incarnation is still the live connection for its host
+    /// — [`Self::owner_of`]'s question, asked by a caller that has to
+    /// decide *before* touching anything.
+    ///
+    /// The mirror is attributed inside [`Self::apply_workspace`], but a
+    /// batch also carries envelopes that reach surfaces no later purge
+    /// can take back: a desktop banner, the clipboard, the notification
+    /// inbox. Those are applied by the drain, so the drain needs the
+    /// attribution first — a batch queued by a connection that has since
+    /// been removed or replaced must fire nothing at all.
+    pub(crate) fn owns(&self, incarnation: HostId) -> bool {
+        self.owner_of(incarnation).is_some()
+    }
+
     /// Which live connection an incarnation belongs to. `None` for one
     /// this set no longer holds — the stale-key drop pattern
     /// (`app.rs:2903`), applied to whole connections.
@@ -969,6 +984,33 @@ mod tests {
         assert_eq!(set.apply_state(incarnation, HostConnState::Connected), None);
         assert!(set.ops("h1").is_none());
         assert!(set.ops_for(incarnation).is_none());
+    }
+
+    /// The attribution the *drain* asks before it applies a batch's
+    /// envelopes. Those reach surfaces no purge can take back — a
+    /// desktop banner, the clipboard — so "is this incarnation still
+    /// live?" has to be answerable without applying anything, and it has
+    /// to answer the same way `apply_workspace` does for all three
+    /// staleness cases.
+    #[tokio::test]
+    async fn ownership_is_answerable_before_anything_is_applied() {
+        let (mut set, _feed) = a_set();
+        let socket = PathBuf::from("/nonexistent/roost-set-owns.sock");
+        set.connect("h1", "one", socket.clone(), false, ConnectMode::Dial);
+        let live = set.mint_for("h1");
+        set.apply_state(live, HostConnState::Connected);
+        assert!(set.owns(live));
+
+        // Never minted by this set at all.
+        assert!(!set.owns(HostId::new(9_999)));
+
+        // Replaced: the outgoing task can still publish for a while.
+        let replaced = set.minter.mint("h1", set.conns["h1"].generation - 1);
+        assert!(!set.owns(replaced));
+
+        // Removed: the host is gone, and so is every id it minted.
+        assert_eq!(set.remove("h1"), Some(live));
+        assert!(!set.owns(live));
     }
 
     /// Zero hosts is the zero-change baseline: nothing is spawned, and

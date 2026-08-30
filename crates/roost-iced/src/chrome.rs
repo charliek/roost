@@ -156,6 +156,22 @@ pub const HOST_ROLLUP_SIZE: f32 = 10.0;
 pub const HOST_SECTION_DIM: f32 = 0.45;
 /// The inline "↻ Reconnect" row (mockup `.reconnect`).
 pub const HOST_RECONNECT_TEXT: Color = Color::from_rgb8(0x7f, 0xa8, 0xe8);
+/// The takeover / session-ended banner over a host tab's last frame
+/// (plan 037 §3.1). Sampled from the approved mockup's `.banner` rules —
+/// a warm amber band that is deliberately nothing like the terminal
+/// palette underneath it, because the whole point is that it is not part
+/// of the frame it sits on.
+pub const HOST_BANNER_BG: Color = Color::from_rgb8(0x4a, 0x33, 0x23);
+pub const HOST_BANNER_TEXT: Color = Color::from_rgb8(0xee, 0xcf, 0xa2);
+pub const HOST_BANNER_BORDER: Color = Color::from_rgb8(0x6b, 0x4a, 0x2a);
+pub const HOST_BANNER_BUTTON_BORDER: Color = Color::from_rgb8(0x8a, 0x6a, 0x40);
+pub const HOST_BANNER_TEXT_SIZE: f32 = 12.0;
+pub const HOST_BANNER_ACTION_SIZE: f32 = 11.5;
+/// The scrim over the frozen frame. A layer rather than
+/// [`HOST_SECTION_DIM`]'s alpha scaling: the terminal is drawn by a
+/// custom widget from an owned snapshot, so the only way to dim it
+/// without touching every cell color is to composite over it.
+pub const HOST_FRAME_SCRIM: Color = Color::from_rgba8(0x14, 0x16, 0x18, 0.55);
 pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
 pub const DANGER: Color = Color::from_rgb8(0x8a, 0x2a, 0x2a);
 pub const DANGER_ACCENT: Color = Color::from_rgb8(0xa8, 0x33, 0x33);
@@ -400,6 +416,48 @@ pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
         shadow: Shadow::default(),
         snap: true,
     }
+}
+
+/// The banner strip itself: a filled band with a hairline along its
+/// bottom edge, so it reads as chrome laid over the frame rather than as
+/// something the terminal drew.
+pub fn host_banner(_: &Theme) -> container::Style {
+    container::Style::default().background(HOST_BANNER_BG)
+}
+
+/// The hairline under the banner. A separate 1px container rather than a
+/// border: iced borders draw on all four edges, and a box around the
+/// full-width strip reads as a framed callout instead of a band.
+pub fn host_banner_edge(_: &Theme) -> container::Style {
+    container::Style::default().background(HOST_BANNER_BORDER)
+}
+
+/// The banner's one action ("Reconnect here"). Outlined in the band's
+/// own border shade — a filled accent button here would compete with the
+/// message for the eye, and the mockup's `.banner .btn` does not.
+pub fn host_banner_button(_: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => Some(Background::Color(
+            HOST_BANNER_BUTTON_BORDER.scale_alpha(0.4),
+        )),
+        button::Status::Active | button::Status::Disabled => None,
+    };
+    button::Style {
+        background,
+        text_color: HOST_BANNER_TEXT,
+        border: Border {
+            color: HOST_BANNER_BUTTON_BORDER,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// The dimming layer over a frame nothing will update again.
+pub fn host_frame_scrim(_: &Theme) -> container::Style {
+    container::Style::default().background(HOST_FRAME_SCRIM)
 }
 
 pub fn palette_panel(_: &Theme) -> container::Style {

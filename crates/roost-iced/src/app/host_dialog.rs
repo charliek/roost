@@ -1,8 +1,9 @@
-//! The two host modals: **Add Host** and the **Stop Session**
-//! confirmation (plan 037 §3.1).
+//! The three host modals: **Add Host**, the **Stop Session**
+//! confirmation (plan 037 §3.1), and the **upgrade prompt** a build
+//! mismatch raises (§3.7).
 //!
-//! One field on `App` holds either, because they are the same kind of
-//! thing: a question the user still owes an answer to, drawn over the
+//! One field on `App` holds any of them, because they are the same kind
+//! of thing: a question the user still owes an answer to, drawn over the
 //! chrome, owning the pointer and the keyboard while it is up. The
 //! delete-project confirmation next door has the same shape and the
 //! same panel style — Stop deliberately reuses its copy structure so
@@ -88,6 +89,17 @@ pub(super) enum HostDialog {
         saved_id: String,
         label: String,
     },
+    /// The upgrade prompt (plan 037 §3.7): this host's session was
+    /// started by a Roost this client cannot talk to.
+    ///
+    /// The composed copy is carried rather than the raw mismatch, for
+    /// the same reason `ConfirmStop` carries its label: the dialog says
+    /// what was true when it opened, and a reconnect attempt landing
+    /// underneath it must not rewrite the question mid-read.
+    ConfirmRestart {
+        saved_id: String,
+        prompt: super::host_notice::RestartPrompt,
+    },
 }
 
 impl HostDialog {
@@ -98,7 +110,7 @@ impl HostDialog {
     pub(super) fn draft_mut(&mut self) -> Option<&mut AddHostDraft> {
         match self {
             Self::Add(draft) => Some(draft),
-            Self::ConfirmStop { .. } => None,
+            Self::ConfirmStop { .. } | Self::ConfirmRestart { .. } => None,
         }
     }
 }

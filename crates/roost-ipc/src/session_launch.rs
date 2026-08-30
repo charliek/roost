@@ -35,6 +35,14 @@
 //! the CLI does, and two implementations of "which `roost-session` is
 //! this user's" is one more than the contract can survive.
 //!
+//! # The stop ladder
+//!
+//! Its mirror image lives here for the same reason: `roostctl session
+//! stop` and the UI's upgrade/restart flow (plan 037 §3.7 — stop, wait
+//! for the socket to go, spawn, reconnect) both need "ask the session to
+//! stop, then wait until it really left", and the waiting half has
+//! fail-safe rules ([`stop_completed`]) that must not be written twice.
+//!
 //! The budgets stay with the caller: every entry point takes its
 //! `Duration` rather than reading a constant of its own, so a CLI
 //! invocation and a UI's background connect can want different
@@ -55,7 +63,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
-use crate::messages::{ops, SessionIdentify, SessionIdentifyParams};
+use crate::messages::{
+    ops, SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
+};
+use crate::socket_state::{self, SocketState};
 use crate::IpcClient;
 
 /// Consumed-once hint naming the directory the user ran `roostctl
@@ -569,6 +580,13 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// caller.
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// [`IPC_TIMEOUT`] under the ambient scale — what one leg of a poll
+/// round actually gets. The polls here spend several legs inside an
+/// outer deadline, so they read it once per call rather than per round.
+pub fn leg_budget() -> Duration {
+    IPC_TIMEOUT.mul_f64(timeout_scale())
+}
+
 /// Dial a session socket, bounded.
 pub async fn dial(socket: &Path, timeout: Duration) -> Result<IpcClient> {
     tokio::time::timeout(timeout, IpcClient::connect(socket))
@@ -606,7 +624,7 @@ pub async fn confirm_serving(socket: &Path, budget: Duration) -> Result<SessionI
     let deadline = Instant::now() + budget;
     // The caller scaled `budget`; the legs inside must widen with it or
     // a loaded runner spends the whole budget on one timed-out dial.
-    let leg = IPC_TIMEOUT.mul_f64(timeout_scale());
+    let leg = leg_budget();
     let polling = async {
         loop {
             let error = match identify(socket, leg).await {
@@ -630,6 +648,185 @@ pub async fn confirm_serving(socket: &Path, budget: Duration) -> Result<SessionI
                 budget.as_secs().max(1)
             ))
         })
+}
+
+// ============================================================================
+// Stopping a session, and waiting for it to go
+// ============================================================================
+
+/// How long a stop waits for the reap report. Generous: the reply does
+/// not come back until every child is accounted for, which is the
+/// engine's 5s soft deadline plus the post-SIGKILL tail.
+pub const DEFAULT_STOP_CALL_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long a stop waits, after the reap report, for the socket to
+/// actually go away. The session unlinks it in a detached finalizer that
+/// runs *after* the reply, so "stopped" is only true once the poll below
+/// says so.
+pub const DEFAULT_STOP_GONE_BUDGET: Duration = Duration::from_secs(30);
+
+/// The two socket states that prove nothing can be listening. Same pair
+/// [`socket_state`] calls safe-to-unlink, read here as "not running" —
+/// every other state, including `Indeterminate`, means assume-live.
+fn socket_gone(state: &SocketState) -> bool {
+    matches!(state, SocketState::Missing | SocketState::Stale)
+}
+
+/// Probe once and read off whether nothing is listening.
+pub async fn probe_gone(socket: &Path) -> bool {
+    socket_gone(&socket_state::probe(socket, socket_state::PROBE_TIMEOUT).await)
+}
+
+/// One round of the post-stop poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollObservation<'a> {
+    /// The socket is gone or refuses connections — nothing is listening.
+    Unreachable,
+    /// A session answered `session.identify` with this id.
+    Identified(&'a str),
+    /// Something is at the path but it could not be asked (a full accept
+    /// backlog, a permission error, a timeout).
+    Indeterminate,
+}
+
+/// Has the session we asked to stop finished stopping?
+///
+/// A *different* session id counts as stopped: between our reap report
+/// and this poll, something (a spawn-if-missing client, a supervisor)
+/// may have started a fresh session on the same socket. Ours is gone,
+/// which is what was asked — reporting a failure there would be a lie.
+///
+/// [`PollObservation::Indeterminate`] keeps waiting, mirroring
+/// [`socket_state`]'s fail-safe rule: the one thing we must never do is
+/// call a live session dead.
+fn stop_completed(observation: PollObservation<'_>, stopping: &str) -> bool {
+    match observation {
+        PollObservation::Unreachable => true,
+        PollObservation::Identified(id) => id != stopping,
+        PollObservation::Indeterminate => false,
+    }
+}
+
+/// A stop that reached a live session: who answered, and what it reaped.
+///
+/// The identity is not a courtesy — [`await_stopped`] needs it to tell
+/// "our session left" from "a fresh one took the socket".
+#[derive(Debug, Clone)]
+pub struct StopReport {
+    pub identity: SessionIdentify,
+    pub reap: SessionStopResult,
+}
+
+/// Ask the session at `socket` to stop, and hand back its reap report.
+///
+/// `Ok(None)` means nothing was listening — a success in the
+/// `systemctl stop` sense: the caller asked for a state and it already
+/// holds. The session is identified *before* the stop so the caller can
+/// wait for the right process to leave.
+///
+/// This and [`await_stopped`] are the two rungs of a stop, split so a
+/// caller can report the reap before spending the socket-gone budget.
+/// `roostctl session stop` and the UI's client-side restart composition
+/// (plan 037 §3.7) climb the same pair.
+pub async fn stop_session(socket: &Path, budget: Duration) -> Result<Option<StopReport>> {
+    if probe_gone(socket).await {
+        return Ok(None);
+    }
+    // `budget` is the *reap* budget and is deliberately generous; the two
+    // legs before it are ordinary control-plane calls and get the
+    // ordinary leg budget, so a wedged socket fails in seconds rather
+    // than holding the whole minute a reap is allowed.
+    let leg = leg_budget();
+    let mut client = dial(socket, leg).await?;
+    let identity = identify_on(&mut client, leg).await.with_context(|| {
+        format!(
+            "a socket exists at {} but no session answered {}",
+            socket.display(),
+            ops::SESSION_IDENTIFY
+        )
+    })?;
+    let reap: SessionStopResult =
+        tokio::time::timeout(budget, client.call(ops::SESSION_STOP, SessionStopParams {}))
+            .await
+            .map_err(|_| anyhow!("{} did not answer within {budget:?}", ops::SESSION_STOP))?
+            .context(ops::SESSION_STOP)?;
+    Ok(Some(StopReport { identity, reap }))
+}
+
+/// Wait for the stopped session to actually leave, bounded by `budget`.
+///
+/// Bounded the same way [`confirm_serving`] is, and for the same reason:
+/// one round can spend two [`IPC_TIMEOUT`]s plus a probe, so only the
+/// outer `timeout_at` makes the advertised budget true.
+pub async fn await_stopped(socket: &Path, stopping: &str, budget: Duration) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    // What the last completed round saw — the timeout message has to
+    // say which of the two very different failures happened.
+    let mut last = LastSeen::StillAnswering;
+    let leg = leg_budget();
+    let polling = async {
+        loop {
+            // `None` = nothing is listening; `Some(None)` = a socket
+            // that would not answer, which is the ambiguous case.
+            let answered = if probe_gone(socket).await {
+                None
+            } else {
+                Some(identify(socket, leg).await.ok().map(|i| i.session_id))
+            };
+            let observation = match &answered {
+                None => PollObservation::Unreachable,
+                Some(None) => PollObservation::Indeterminate,
+                Some(Some(id)) => PollObservation::Identified(id),
+            };
+            last = match observation {
+                PollObservation::Indeterminate => LastSeen::SocketWontAnswer,
+                _ => LastSeen::StillAnswering,
+            };
+            if stop_completed(observation, stopping) {
+                return Ok(());
+            }
+            if Instant::now() + POLL_INTERVAL >= deadline {
+                return Err(last);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    };
+    // An outer expiry means the round in flight never finished, which is
+    // the unanswerable case by definition.
+    match tokio::time::timeout_at(deadline, polling).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(last)) => Err(last.into_error(socket, stopping, budget)),
+        Err(_) => Err(LastSeen::SocketWontAnswer.into_error(socket, stopping, budget)),
+    }
+}
+
+/// How the last poll round saw the socket. Only exists so the timeout
+/// error says something true: "still answering as the same session" and
+/// "left a socket that will not answer" are different faults, and
+/// reporting the first for the second sends the reader hunting a process
+/// that is already gone.
+#[derive(Debug, Clone, Copy)]
+enum LastSeen {
+    StillAnswering,
+    SocketWontAnswer,
+}
+
+impl LastSeen {
+    fn into_error(self, socket: &Path, stopping: &str, budget: Duration) -> anyhow::Error {
+        let seconds = budget.as_secs().max(1);
+        match self {
+            Self::StillAnswering => anyhow!(
+                "session {stopping} reported its reap but was still answering at {} \
+                 after {seconds}s",
+                socket.display()
+            ),
+            Self::SocketWontAnswer => anyhow!(
+                "session {stopping} reported its reap but left a socket at {} that \
+                 would not answer session.identify after {seconds}s",
+                socket.display()
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -792,5 +989,68 @@ mod tests {
             let scaled = budget.mul_f64(parse_timeout_scale(Some(raw)));
             assert!(!scaled.is_zero(), "{raw} rounded the budget to zero");
         }
+    }
+
+    #[test]
+    fn nothing_listening_is_the_only_state_read_as_stopped() {
+        assert!(socket_gone(&SocketState::Missing));
+        assert!(socket_gone(&SocketState::Stale));
+        assert!(!socket_gone(&SocketState::Live));
+        assert!(!socket_gone(&SocketState::Indeterminate("backlog".into())));
+        assert!(!socket_gone(&SocketState::NotASocket("regular file")));
+    }
+
+    /// The poll's whole decision table. The interesting row is the
+    /// third: a *different* session on the socket means ours left, which
+    /// is what was asked for.
+    #[test]
+    fn the_stop_poll_finishes_only_when_our_session_is_the_one_that_left() {
+        assert!(stop_completed(PollObservation::Unreachable, "sess-1"));
+        assert!(stop_completed(
+            PollObservation::Identified("sess-2"),
+            "sess-1"
+        ));
+        assert!(!stop_completed(
+            PollObservation::Identified("sess-1"),
+            "sess-1"
+        ));
+        // Fail-safe: an unanswerable socket is never called dead.
+        assert!(!stop_completed(PollObservation::Indeterminate, "sess-1"));
+    }
+
+    /// Stopping a path nothing is listening at is a success that costs
+    /// no round trip — the rung that lets the UI's restart flow run
+    /// against an already-dead session without special-casing it.
+    #[tokio::test]
+    async fn stopping_a_socket_nobody_is_serving_reports_nothing_to_stop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("absent.sock");
+        assert!(stop_session(&socket, DEFAULT_STOP_CALL_BUDGET)
+            .await
+            .expect("an absent socket is not a failure")
+            .is_none());
+        // And the wait that follows it has nothing to wait for.
+        await_stopped(&socket, "sess-1", DEFAULT_STOP_GONE_BUDGET)
+            .await
+            .expect("an absent socket is already gone");
+    }
+
+    /// A listener that never answers `session.identify` is the
+    /// ambiguous case, and the wait must spend its budget rather than
+    /// calling it stopped.
+    #[tokio::test]
+    async fn a_socket_that_will_not_answer_is_never_called_stopped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("mute.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+
+        let error = await_stopped(&socket, "sess-1", Duration::from_millis(150))
+            .await
+            .expect_err("a live socket is not a stopped session");
+        assert!(
+            format!("{error:#}").contains("would not answer"),
+            "{error:#}"
+        );
+        drop(listener);
     }
 }

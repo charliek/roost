@@ -118,8 +118,17 @@ enum Message {
     NewProject,
     /// The sidebar's inline "↻ Reconnect" row, carrying the saved host's
     /// stable id (plan 037 §3.1). C7's `Connect Host: <label>` palette
-    /// verb lands on the same app entry.
+    /// verb lands on the same app entry — the one that raises the
+    /// upgrade prompt for a mismatched build rather than re-dialing it.
     HostReconnect(String),
+    /// The banner over a frozen host frame (plan 037 §3.1). Separate
+    /// from [`Self::HostReconnect`] because it carries the frame it was
+    /// drawn on: a click that lands after the host moved on is dropped
+    /// rather than aborting the reconnect already under way.
+    HostFrameReconnect {
+        saved_id: String,
+        frame: app::host_notice::FrozenFrame,
+    },
     /// The Add Host dialog's two fields and its confirming button (plan
     /// 037 §3.1) — the one free-text flow in the host verb family.
     AddHostNameChanged(String),
@@ -132,6 +141,9 @@ enum Message {
     HostDialogCardPressed,
     /// The Stop Session confirmation's destructive button.
     HostStopConfirm,
+    /// The upgrade prompt's "Restart session" (plan 037 §3.7). Only a
+    /// host this client could spawn for has the button at all.
+    HostRestartConfirm,
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
@@ -540,12 +552,14 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::NewTab
         | Message::NewProject
         | Message::HostReconnect(_)
+        | Message::HostFrameReconnect { .. }
         | Message::AddHostNameChanged(_)
         | Message::AddHostSocketChanged(_)
         | Message::AddHostSubmit
         | Message::HostDialogCancel
         | Message::HostDialogCardPressed
         | Message::HostStopConfirm
+        | Message::HostRestartConfirm
         | Message::ConfirmDeleteCancel
         | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }

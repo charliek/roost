@@ -1532,7 +1532,10 @@ impl App {
             }
             HostVerb::Connect(saved_id) => {
                 self.clear_palette_state();
-                self.host_reconnect_requested(&saved_id);
+                // The gated entry: a build mismatch answers this verb
+                // with the upgrade prompt rather than a dial that would
+                // fail the same way again (plan 037 §3.7).
+                self.host_connect_requested(&saved_id);
             }
             HostVerb::Disconnect(saved_id) => {
                 self.clear_palette_state();
@@ -1577,7 +1580,7 @@ impl App {
     }
 
     /// A saved host's label, as the registry has it.
-    fn host_label(&self, saved_id: &str) -> Option<String> {
+    pub(super) fn host_label(&self, saved_id: &str) -> Option<String> {
         self.host_views
             .iter()
             .find(|view| view.saved_id == saved_id)
@@ -1960,6 +1963,14 @@ impl App {
         });
     }
 
+    /// What a provider script is told about "where the user is".
+    ///
+    /// Reads the *local* workspace on purpose, even while a host row is
+    /// showing (plan 037 §3.1's title sweep looked at this and left it):
+    /// `socket` is this UI's own socket, and the ids beside it are the
+    /// ids a script would send back through it. A host tab's id belongs
+    /// to another process's id-space — handing it over would name
+    /// whichever local tab happens to share the number.
     fn provider_context(&self, selected_id: Option<String>) -> provider::ProviderContext {
         let (project_id, tab_id) = self.workspace.active();
         let active_title = self

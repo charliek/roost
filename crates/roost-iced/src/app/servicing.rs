@@ -211,6 +211,128 @@ fn notification_activation(
     Some(window_id.map_or(UiTask::None, UiTask::Focus))
 }
 
+/// What one envelope from a connected host's event batch asks this
+/// client to do.
+///
+/// Some of the batch's events are per-commit *facts* the mirror
+/// deliberately does not model (`mirror.rs`'s "workspace facts only"),
+/// and the split is the authority split from architecture §6:
+/// `tab.effect` is something that happened to a tab and the attached
+/// client applies it; `notification.fired` is the same one surface up —
+/// a host agent asking for attention reaches the inbox and the desktop
+/// exactly as a local one does (plan 037 §3.1's host-blind agent
+/// surfaces). The other three ride along for their *retiring* edges,
+/// because an attention row that nothing takes down is worse than one
+/// that never appeared: `tab.notification` clears one tab's marker,
+/// `tab.closed` retires the row and the desktop banner with the tab, and
+/// `project.deleted` sweeps every row under the project — the same three
+/// arms `apply_workspace_event` runs for the local workspace.
+///
+/// They are read off the batch rather than off the mirror because they
+/// are exact per-commit: the mirror may already be further ahead, and a
+/// fire-then-clear pair folded away would leave a banner nobody asked
+/// for. What happened while nothing was attached is **not** replayed —
+/// plan 037 §4's non-goal; a connect mirrors current state, never a
+/// backlog.
+///
+/// XXX: a session's own workspace defaults `window_focused = true`
+/// (`workspace.rs:152`) and nothing pushes the client's focus to it, so
+/// `attention_suppressed_by_focus` drops `notification.fired` for
+/// whichever tab that session considers active — the one host tab whose
+/// agent cannot reach this path. No op exists to push client focus to a
+/// session and plan 037 §3.6 pinned the server additions to effects +
+/// `session.set_theme`, so it is HS-3 work, documented here rather than
+/// papered over client-side.
+#[derive(Debug)]
+enum HostEnvelopeAction {
+    Effect(roost_ipc::messages::TabEffectEvent),
+    Notify(roost_ipc::messages::NotificationFiredEvent),
+    /// A tab's pending flag went false: retire its inbox row.
+    ClearNotification(i64),
+    /// The tab is gone: retire its row and the banner naming it.
+    TabClosed(i64),
+    /// The project is gone: retire every row under it.
+    ProjectDeleted(i64),
+    /// A workspace fact the mirror already folded in, or an event from a
+    /// newer session this client does not know. Both are silent by
+    /// contract (`ipc.md` #versioning: old clients ignore new events).
+    Ignore,
+    Undecodable(serde_json::Error),
+}
+
+fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEnvelopeAction {
+    use roost_ipc::messages::{
+        ops, NotificationFiredEvent, ProjectDeletedEvent, TabClosedEvent, TabNotificationEvent,
+    };
+    use serde::Deserialize;
+    // Read out of the borrowed payload: `serde_json` deserializes from
+    // `&Value`, so the batch's tree is never copied to build the small
+    // owned struct each arm wants.
+    fn decode<'a, T: Deserialize<'a>>(
+        envelope: &'a roost_ipc::messages::EventEnvelope,
+    ) -> Result<T, serde_json::Error> {
+        T::deserialize(&envelope.data)
+    }
+    match envelope.event.as_str() {
+        ops::EVENT_TAB_EFFECT => decode(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, HostEnvelopeAction::Effect),
+        ops::EVENT_NOTIFICATION_FIRED => decode::<NotificationFiredEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, HostEnvelopeAction::Notify),
+        ops::EVENT_TAB_NOTIFICATION => match decode::<TabNotificationEvent>(envelope) {
+            // A *fired* flag is the mirror's — it paints the row's dot,
+            // and the body only ever arrives on `notification.fired`.
+            // Acting on both would upsert a bodyless duplicate beside
+            // the real one.
+            Ok(event) if event.has_pending => HostEnvelopeAction::Ignore,
+            Ok(event) => HostEnvelopeAction::ClearNotification(event.tab_id),
+            Err(error) => HostEnvelopeAction::Undecodable(error),
+        },
+        ops::EVENT_TAB_CLOSED => decode::<TabClosedEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
+                HostEnvelopeAction::TabClosed(event.tab_id)
+            }),
+        ops::EVENT_PROJECT_DELETED => decode::<ProjectDeletedEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
+                HostEnvelopeAction::ProjectDeleted(event.project_id)
+            }),
+        _ => HostEnvelopeAction::Ignore,
+    }
+}
+
+/// The inbox rows one instance's project list currently owes, in
+/// snapshot order.
+///
+/// One function over the local workspace's snapshot and over a host
+/// mirror's rows, because they are the same shape and the same rule:
+/// `has_notification` is the membership edge, and the row's title is
+/// composed identically so a host row cannot read as a different kind of
+/// row in a list that spans every host (plan 037 §3.1's host-blind agent
+/// surfaces).
+fn pending_notification_rows(
+    host: HostId,
+    projects: &[Project],
+) -> Vec<(TabKey, ProjectKey, String)> {
+    projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .tabs
+                .iter()
+                .filter(|tab| tab.has_notification)
+                .map(move |tab| {
+                    (
+                        TabKey::new(host, tab.id),
+                        ProjectKey::new(host, project.id),
+                        notification_inbox::compose_title(
+                            &project.name,
+                            &notification_inbox::tab_title(&tab.title, &tab.cwd),
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
 /// The main-thread marker an IPC-serviced macOS seam call needs. The
 /// IPC drain runs in the iced update loop, so the marker is obtainable;
 /// `None` would be an invariant break, and surfacing it as an op error
@@ -654,6 +776,87 @@ impl App {
         }
     }
 
+    /// Route one host batch's per-commit envelopes to the surfaces that
+    /// own them (plan 037 §3.1). [`host_envelope_action`] says which is
+    /// which and why they are read off the batch rather than the mirror.
+    fn apply_host_envelopes(
+        &mut self,
+        host: HostId,
+        events: &[roost_ipc::messages::EventEnvelope],
+    ) -> UiTask {
+        let mut task = UiTask::None;
+        for envelope in events {
+            match host_envelope_action(envelope) {
+                HostEnvelopeAction::Ignore => {}
+                HostEnvelopeAction::Effect(effect) => {
+                    task = task.then(self.apply_host_effect(host, &effect));
+                }
+                HostEnvelopeAction::Notify(fired) => {
+                    self.fire_notification(TabKey::new(host, fired.tab_id), fired.title, fired.body)
+                }
+                HostEnvelopeAction::ClearNotification(tab_id) => {
+                    // The tab's id is kept, exactly as the local clear
+                    // keeps it: a later re-notify then replaces the
+                    // banner still on the desktop rather than stacking a
+                    // duplicate beside it.
+                    self.notification_inbox.remove(TabKey::new(host, tab_id));
+                }
+                HostEnvelopeAction::TabClosed(tab_id) => {
+                    // Both surfaces, exactly as the local `TabClosed`
+                    // arm does it: the tab is gone, so the banner naming
+                    // it is retired rather than left on the desktop
+                    // pointing at nothing.
+                    let tab = TabKey::new(host, tab_id);
+                    self.notification_inbox.remove(tab);
+                    self.desktop_notifications.retire(tab);
+                }
+                HostEnvelopeAction::ProjectDeleted(project_id) => {
+                    self.retire_project_notifications(ProjectKey::new(host, project_id));
+                }
+                HostEnvelopeAction::Undecodable(error) => tracing::debug!(
+                    ?host, event = %envelope.event, %error,
+                    "a host event envelope did not decode"
+                ),
+            }
+        }
+        task
+    }
+
+    /// An agent asked for attention: one inbox row and one desktop
+    /// banner, wherever the tab lives (plan 037 §3.1's host-blind agent
+    /// surfaces).
+    ///
+    /// The two surfaces are composed here rather than once per event
+    /// stream because the ordering is the contract: the banner fires
+    /// whether or not the row could be composed. A title lookup that
+    /// misses means the rows for that key have not landed yet — the
+    /// notification is true either way, and a banner is the half the
+    /// user is not looking at the window to see. The row is not lost
+    /// with it: the same commit sets the tab's `has_notification`, so
+    /// [`Self::reconcile_notification_inbox`] derives the row (bodyless)
+    /// as soon as the mirror lists that tab.
+    ///
+    /// Only the lookup differs by key-space, and each answers `None` for
+    /// the other's keys: local rows come from this backend's snapshot,
+    /// a host's from that session's mirror.
+    fn fire_notification(&mut self, key: TabKey, title: String, body: String) {
+        let row = if key.is_local() {
+            self.notification_title(key)
+        } else {
+            self.host_notification_title(key)
+        };
+        if let Some((project, row_title)) = row {
+            self.notification_inbox
+                .upsert(notification_inbox::NotificationRecord::new(
+                    key,
+                    project,
+                    row_title,
+                    body.clone(),
+                ));
+        }
+        self.desktop_notifications.fire(key, title, body);
+    }
+
     /// Apply one `tab.effect` envelope from a connected host: bell rings
     /// the notification inbox (the app's attention surface — local tabs
     /// have no bell path, so this is the closest existing one), and an
@@ -949,6 +1152,19 @@ impl App {
                 // C6/C7 render off it; C4 only keeps it current, so with
                 // zero hosts these arms never run.
                 EngineFeed::HostWorkspace(host, event) => {
+                    // Attribution before application, and it has to be
+                    // here rather than only inside `apply_workspace`: the
+                    // envelopes below reach surfaces no later purge can
+                    // take back (a desktop banner, the clipboard), so a
+                    // batch queued by a connection this app has since
+                    // removed or replaced must fire nothing at all.
+                    if !self.hosts.owns(host) {
+                        tracing::debug!(
+                            ?host,
+                            "dropping an event batch from a dead connection incarnation"
+                        );
+                        continue;
+                    }
                     // Effects ride the batch verbatim and are applied
                     // here, before the mirror folds the commit away.
                     // Lease-holder-only is structural: this stream only
@@ -956,20 +1172,7 @@ impl App {
                     // displaced client's events connection is closed at
                     // takeover before the new holder can generate any.
                     if let crate::host_conn::HostWorkspaceEvent::Applied { events, .. } = &event {
-                        for envelope in events {
-                            if envelope.event != roost_ipc::messages::ops::EVENT_TAB_EFFECT {
-                                continue;
-                            }
-                            match serde_json::from_value(envelope.data.clone()) {
-                                Ok(effect) => {
-                                    task = task.then(self.apply_host_effect(host, &effect));
-                                }
-                                Err(error) => tracing::debug!(
-                                    ?host, %error,
-                                    "a tab.effect envelope did not decode"
-                                ),
-                            }
-                        }
+                        task = task.then(self.apply_host_envelopes(host, events));
                     }
                     // The mirror moving leaves the view's copy of it
                     // behind — the tail reconcile is what rebuilds the
@@ -1112,16 +1315,7 @@ impl App {
             } => {
                 // The workspace broadcast is one backend's id-space.
                 let tab = self.backend.tab_key(tab_id);
-                if let Some((project, row_title)) = self.notification_title(tab) {
-                    self.notification_inbox
-                        .upsert(notification_inbox::NotificationRecord::new(
-                            tab,
-                            project,
-                            row_title,
-                            body.clone(),
-                        ));
-                }
-                self.desktop_notifications.fire(tab, title, body);
+                self.fire_notification(tab, title, body);
             }
             WorkspaceEvent::TabNotification {
                 tab_id,
@@ -1148,17 +1342,7 @@ impl App {
             // unconditionally, which is what makes it a reliable seam).
             WorkspaceEvent::ActiveChanged { .. } => self.set_host_selection(None),
             WorkspaceEvent::ProjectDeleted { project_id } => {
-                let project = ProjectKey::new(self.backend.host(), project_id);
-                let stale: Vec<TabKey> = self
-                    .notification_inbox
-                    .snapshot()
-                    .iter()
-                    .filter(|record| record.project == project)
-                    .map(|record| record.tab)
-                    .collect();
-                for tab in stale {
-                    self.notification_inbox.remove(tab);
-                }
+                self.retire_project_notifications(ProjectKey::new(self.backend.host(), project_id));
             }
             // The bridge turns a lagged broadcast into a full-snapshot
             // resync; the batch's reconcile is the recovery, so there is
@@ -1167,6 +1351,27 @@ impl App {
             // reconcile_notification_inbox rebuilds the rows themselves.
             WorkspaceEvent::Resync(_) => {}
             _ => {}
+        }
+    }
+
+    /// A project is gone: sweep the inbox rows that named it.
+    ///
+    /// Deliberately inbox-only, and shared by the local and host paths so
+    /// they cannot drift. The desktop banners are already retired by the
+    /// `tab.closed` events that precede a delete on both sides (the
+    /// engine commits `TabClosed*` then `ProjectDeleted`,
+    /// `workspace.rs:952`); this is the sweep for rows whose tab event
+    /// was missed.
+    fn retire_project_notifications(&mut self, project: ProjectKey) {
+        let stale: Vec<TabKey> = self
+            .notification_inbox
+            .snapshot()
+            .iter()
+            .filter(|record| record.project == project)
+            .map(|record| record.tab)
+            .collect();
+        for tab in stale {
+            self.notification_inbox.remove(tab);
         }
     }
 
@@ -1190,37 +1395,45 @@ impl App {
         })
     }
 
+    /// Rebuild the inbox from the authoritative rows of **every**
+    /// id-space the window can currently see: the local backend's
+    /// snapshot, plus each host section's mirror.
+    ///
+    /// The host half is what makes a reconnect restore that host's
+    /// attention rows — the fresh `tab.list` already says which tabs are
+    /// pending, and §4 forbids replaying the `notification.fired` that
+    /// set them — and it is what makes a `notification.fired` whose tab
+    /// the mirror had not listed yet heal itself on the next pass rather
+    /// than being lost.
     fn reconcile_notification_inbox(&mut self) {
         let host = self.backend.host();
-        let pending_rows: Vec<(TabKey, ProjectKey, String)> = self
-            .projects
-            .iter()
-            .flat_map(|project| {
-                project
-                    .tabs
-                    .iter()
-                    .filter(|tab| tab.has_notification)
-                    .map(move |tab| {
-                        (
-                            TabKey::new(host, tab.id),
-                            ProjectKey::new(host, project.id),
-                            notification_inbox::compose_title(
-                                &project.name,
-                                &notification_inbox::tab_title(&tab.title, &tab.cwd),
-                            ),
-                        )
-                    })
-            })
-            .collect();
+        let mut pending_rows: Vec<(TabKey, ProjectKey, String)> =
+            pending_notification_rows(host, &self.projects);
+        for view in &self.host_views {
+            // A saved host that has never published rows carries
+            // `HostId::LOCAL` as its placeholder (`refresh_host_views`);
+            // deriving from it would mean minting rows in the LOCAL
+            // id-space out of an empty project list.
+            if view.host.is_local() {
+                continue;
+            }
+            pending_rows.extend(pending_notification_rows(view.host, &view.projects));
+        }
         let pending: HashSet<TabKey> = pending_rows.iter().map(|row| row.0).collect();
-        // Scoped to this backend's instance for `retain_live`'s reason: a
-        // connected host's rows are absent from this snapshot because it
-        // is not their snapshot, not because they were cleared.
+        // Unscoped, because the derivation above now covers every
+        // id-space that has rows to show: a key absent from it is either
+        // a tab that stopped being pending, or one keyed at a connection
+        // incarnation no section names any more — a reconnect's dead
+        // epoch, which nothing will ever list, clear or render again.
+        // Both are gone, and §3.2's purge-then-rebuild is exactly the
+        // second case. A *dropped* host is not among them: its section
+        // keeps its last mirror (that is what the dimmed rows are drawn
+        // from), so its pending tabs are still derived here.
         let stale: Vec<TabKey> = self
             .notification_inbox
             .tab_keys()
             .into_iter()
-            .filter(|tab| tab.host == host && !pending.contains(tab))
+            .filter(|tab| !pending.contains(tab))
             .collect();
         for tab in stale {
             self.notification_inbox.remove(tab);
@@ -2225,6 +2438,183 @@ mod tests {
     use roost_ui_model::keys::HostId;
 
     use super::*;
+
+    fn envelope(event: &str, data: serde_json::Value) -> roost_ipc::messages::EventEnvelope {
+        roost_ipc::messages::EventEnvelope {
+            event: event.to_string(),
+            data,
+        }
+    }
+
+    /// A host agent's notification is routed to the notification path,
+    /// carrying the title and body verbatim — the inbox row and the
+    /// desktop banner are then composed exactly as a local tab's are
+    /// (plan 037 §3.1's "notifications from host tabs fire like local
+    /// ones").
+    ///
+    /// The wire spells `tab_id` as a string, so the decode is half the
+    /// point: a host tab id is an `i64` in a foreign id-space, and it
+    /// only becomes addressable once `apply_host_envelopes` qualifies it
+    /// at that host's incarnation.
+    #[test]
+    fn a_hosts_notification_envelope_routes_to_the_notification_path() {
+        let fired = envelope(
+            roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED,
+            serde_json::json!({"tab_id": "7", "title": "Claude", "body": "needs input"}),
+        );
+        let HostEnvelopeAction::Notify(notification) = host_envelope_action(&fired) else {
+            panic!("a notification.fired must reach the notification path");
+        };
+        assert_eq!(notification.tab_id, 7);
+        assert_eq!(notification.title, "Claude");
+        assert_eq!(notification.body, "needs input");
+
+        // And the key it lands under is the host's, never the local
+        // workspace's — the id-collision rule (AC11) at this seam.
+        let host = HostId::new(4);
+        let key = TabKey::new(host, notification.tab_id);
+        assert!(!key.is_local());
+        assert_ne!(key, TabKey::local(7));
+    }
+
+    /// The clearing edge only. A *pending* flag is the mirror's to paint
+    /// and carries no body; acting on it here would upsert a bodyless
+    /// duplicate beside the row `notification.fired` already made.
+    #[test]
+    fn only_the_clearing_edge_of_a_tabs_pending_flag_is_acted_on() {
+        let op = roost_ipc::messages::ops::EVENT_TAB_NOTIFICATION;
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                op,
+                serde_json::json!({"tab_id": "7", "has_pending": false})
+            )),
+            HostEnvelopeAction::ClearNotification(7)
+        ));
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                op,
+                serde_json::json!({"tab_id": "7", "has_pending": true})
+            )),
+            HostEnvelopeAction::Ignore
+        ));
+    }
+
+    /// Effects still route where C5 put them, and everything else is
+    /// silent: a workspace fact the mirror folds in, and an event from a
+    /// newer session this client has never heard of, are both ignored
+    /// rather than logged as faults (`ipc.md` #versioning).
+    #[test]
+    fn effects_route_and_unknown_envelopes_are_silently_ignored() {
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_TAB_EFFECT,
+                serde_json::json!({"tab_id": "3", "effect": "bell"})
+            )),
+            HostEnvelopeAction::Effect(_)
+        ));
+        for event in ["tab.title_changed", "something.from.the.future"] {
+            assert!(
+                matches!(
+                    host_envelope_action(&envelope(event, serde_json::json!({}))),
+                    HostEnvelopeAction::Ignore
+                ),
+                "{event}"
+            );
+        }
+    }
+
+    /// The retiring edges a host owes, and the reason they are here at
+    /// all: an attention row nothing takes down outlives the tab it
+    /// names. The local workspace already retires both surfaces on
+    /// `TabClosed` and sweeps the project on `ProjectDeleted`; a host
+    /// tab closed from anywhere — another window, `roostctl`, the shell
+    /// exiting — must do the same.
+    #[test]
+    fn a_hosts_close_and_delete_retire_what_they_named() {
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_TAB_CLOSED,
+                serde_json::json!({"tab_id": "7"})
+            )),
+            HostEnvelopeAction::TabClosed(7)
+        ));
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_PROJECT_DELETED,
+                serde_json::json!({"project_id": "4"})
+            )),
+            HostEnvelopeAction::ProjectDeleted(4)
+        ));
+    }
+
+    /// The inbox derivation is one rule over both id-spaces, which is
+    /// what makes a reconnect restore a host's attention rows: the
+    /// mirror already says which tabs are pending, so the reconcile
+    /// rebuilds them without a replayed `notification.fired` (plan 037
+    /// §4 forbids the replay).
+    ///
+    /// The keys are the point. The same numeric tab id under a host and
+    /// under the local workspace are two rows, and a host row's title
+    /// reads exactly like a local one so the single cross-host list does
+    /// not look like two kinds of list.
+    #[test]
+    fn pending_rows_derive_identically_for_a_host_and_for_the_local_workspace() {
+        fn tab(id: i64, has_notification: bool) -> roost_ipc::messages::Tab {
+            roost_ipc::messages::Tab {
+                id,
+                project_id: 4,
+                title: format!("tab-{id}"),
+                cwd: "/w/roost".into(),
+                state: roost_ipc::messages::TabState::None,
+                has_notification,
+                is_active: false,
+                user_titled: false,
+                position: 0,
+                created_at: 0,
+                last_active: 0,
+                hook_active: false,
+                shell_state: roost_ipc::agent::ShellState::default(),
+                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
+                ownership: None,
+            }
+        }
+        let projects = vec![Project {
+            id: 4,
+            name: "roost".into(),
+            cwd: "/w/roost".into(),
+            position: 0,
+            created_at: 0,
+            tabs: vec![tab(7, true), tab(8, false)],
+        }];
+
+        let host = HostId::new(3);
+        let remote = pending_notification_rows(host, &projects);
+        let local = pending_notification_rows(HostId::LOCAL, &projects);
+        assert_eq!(remote.len(), 1, "only the pending tab earns a row");
+        assert_eq!(remote[0].0, TabKey::new(host, 7));
+        assert_eq!(remote[0].1, ProjectKey::new(host, 4));
+        assert_ne!(remote[0].0, local[0].0, "one number, two id-spaces");
+        assert_eq!(
+            remote[0].2, local[0].2,
+            "and one composed title, so the list reads as one list"
+        );
+
+        assert!(pending_notification_rows(host, &[]).is_empty());
+    }
+
+    /// A malformed payload is reported as undecodable rather than
+    /// silently dropped — the two are the same on screen and very
+    /// different in a log.
+    #[test]
+    fn a_malformed_payload_is_distinguishable_from_an_unknown_event() {
+        assert!(matches!(
+            host_envelope_action(&envelope(
+                roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED,
+                serde_json::json!({"title": "no tab id"})
+            )),
+            HostEnvelopeAction::Undecodable(_)
+        ));
+    }
 
     /// These tests hand `collect_tab_output` the items a forwarder would
     /// have delivered, so the feed receiver is surplus.

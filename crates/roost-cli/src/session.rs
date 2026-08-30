@@ -22,25 +22,22 @@
 //! means "a session answered", never "a line was printed".
 //!
 //! The split here is the doctor precedent: the decisions
-//! ([`locate_session_binary`], [`classify_verdict`], [`stop_completed`])
-//! are pure and table-tested; the I/O around them is thin.
+//! ([`locate_session_binary`], [`classify_verdict`], and the stop poll's
+//! own `stop_completed` next to it in [`session_launch`]) are pure and
+//! table-tested; the I/O around them is thin.
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
-use tokio::time::Instant;
 
-use roost_ipc::messages::{
-    ops, SessionIdentify, SessionStopParams, SessionStopResult, TabListResult,
-};
+use roost_ipc::messages::{ops, SessionIdentify, SessionStopResult, TabListResult};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::session_launch::{
-    self, confirm_serving, locate_session_binary, spawn_and_read_verdict, timeout_scale, Verdict,
-    BIN_ENV, BIN_NAME, IPC_TIMEOUT, POLL_INTERVAL,
+    self, await_stopped, confirm_serving, locate_session_binary, probe_gone,
+    spawn_and_read_verdict, stop_session, timeout_scale, Verdict, BIN_ENV, BIN_NAME, IPC_TIMEOUT,
 };
-use roost_ipc::socket_state::{self, SocketState};
 use roost_ipc::IpcClient;
 
 /// How long to wait for the spawned `roost-session start` to print its
@@ -50,16 +47,10 @@ use roost_ipc::IpcClient;
 const VERDICT_TIMEOUT: Duration = session_launch::DEFAULT_VERDICT_BUDGET;
 const CONFIRM_TIMEOUT: Duration = session_launch::DEFAULT_CONFIRM_BUDGET;
 
-/// How long `stop` waits for the reap report. Generous: the reply does
-/// not come back until every child is accounted for, which is the
-/// engine's 5s soft deadline plus the post-SIGKILL tail.
-const STOP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How long `stop` waits, after the reap report, for the socket to
-/// actually go away. The session unlinks it in a detached finalizer
-/// that runs *after* the reply, so "stopped" is only true once the poll
-/// below says so.
-const STOP_GONE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The two halves of a stop's patience, read off the daemon's own waits
+/// exactly as the start budgets above are.
+const STOP_CALL_TIMEOUT: Duration = session_launch::DEFAULT_STOP_CALL_BUDGET;
+const STOP_GONE_TIMEOUT: Duration = session_launch::DEFAULT_STOP_GONE_BUDGET;
 
 /// `session status` when nothing is running. Nonzero because that is
 /// what a status verb is *for* — `systemctl status` exits 3 on a
@@ -191,160 +182,31 @@ async fn start() -> Result<i32> {
 // stop
 // ============================================================================
 
-/// One round of the post-stop poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PollObservation<'a> {
-    /// The socket is gone or refuses connections — nothing is listening.
-    Unreachable,
-    /// A session answered `session.identify` with this id.
-    Identified(&'a str),
-    /// Something is at the path but it could not be asked (a full
-    /// accept backlog, a permission error, a timeout).
-    Indeterminate,
-}
-
-/// Has the session we asked to stop finished stopping?
-///
-/// A *different* session id counts as stopped: between our reap report
-/// and this poll, something (a spawn-if-missing client, a supervisor)
-/// may have started a fresh session on the same socket. Ours is gone,
-/// which is what was asked — reporting a failure there would be a lie.
-///
-/// [`PollObservation::Indeterminate`] keeps waiting, mirroring
-/// `socket_state`'s fail-safe rule: the one thing we must never do is
-/// call a live session dead.
-pub fn stop_completed(observation: PollObservation<'_>, stopping: &str) -> bool {
-    match observation {
-        PollObservation::Unreachable => true,
-        PollObservation::Identified(id) => id != stopping,
-        PollObservation::Indeterminate => false,
-    }
-}
-
-/// The two socket states that prove nothing can be listening. Same pair
-/// `socket_state` calls safe-to-unlink, read here as "not running" —
-/// every other state, including `Indeterminate`, means assume-live.
-fn socket_gone(state: &SocketState) -> bool {
-    matches!(state, SocketState::Missing | SocketState::Stale)
-}
-
-/// Probe once and read off whether nothing is listening.
-async fn probe_gone(socket: &Path) -> bool {
-    socket_gone(&socket_state::probe(socket, socket_state::PROBE_TIMEOUT).await)
-}
-
 async fn stop() -> Result<i32> {
     let socket = BundleProfile::session()
         .context("resolve the session socket path")?
         .socket_path;
 
-    if probe_gone(&socket).await {
+    let Some(report) = stop_session(&socket, scaled(STOP_CALL_TIMEOUT)).await? else {
         // Stop of a stopped session is a success, `systemctl stop`
         // style: the caller asked for a state, and it holds.
         println!("not running (no session at {})", socket.display());
         return Ok(0);
-    }
+    };
 
-    let mut client = connect(&socket).await?;
-    let identity = identify_on(&mut client).await.with_context(|| {
-        format!(
-            "a socket exists at {} but no session answered session.identify",
-            socket.display()
-        )
-    })?;
-
-    let stop_budget = scaled(STOP_CALL_TIMEOUT);
-    let report: SessionStopResult = tokio::time::timeout(
-        stop_budget,
-        client.call(ops::SESSION_STOP, SessionStopParams {}),
-    )
-    .await
-    .map_err(|_| anyhow!("session.stop did not answer within {stop_budget:?}"))?
-    .context("session.stop")?;
-
-    println!("stopping session {}", identity.session_id);
-    print_reap_report(&report);
+    println!("stopping session {}", report.identity.session_id);
+    print_reap_report(&report.reap);
 
     // The socket is unlinked by a finalizer that runs *after* the reply
     // above, so the session is only really gone once this poll says so.
-    await_gone(&socket, &identity.session_id, scaled(STOP_GONE_TIMEOUT)).await?;
+    await_stopped(
+        &socket,
+        &report.identity.session_id,
+        scaled(STOP_GONE_TIMEOUT),
+    )
+    .await?;
     println!("stopped");
     Ok(0)
-}
-
-/// Wait for the stopped session to actually leave, bounded by `budget`.
-///
-/// Bounded the same way [`confirm_serving`] is, and for the same reason:
-/// one round can spend two [`IPC_TIMEOUT`]s plus a probe, so only the
-/// outer `timeout_at` makes the advertised budget true.
-async fn await_gone(socket: &Path, stopping: &str, budget: Duration) -> Result<()> {
-    let deadline = Instant::now() + budget;
-    // What the last completed round saw — the timeout message has to
-    // say which of the two very different failures happened.
-    let mut last = LastSeen::StillAnswering;
-    let polling = async {
-        loop {
-            // `None` = nothing is listening; `Some(None)` = a socket
-            // that would not answer, which is the ambiguous case.
-            let answered = if probe_gone(socket).await {
-                None
-            } else {
-                Some(identify(socket).await.ok().map(|i| i.session_id))
-            };
-            let observation = match &answered {
-                None => PollObservation::Unreachable,
-                Some(None) => PollObservation::Indeterminate,
-                Some(Some(id)) => PollObservation::Identified(id),
-            };
-            last = match observation {
-                PollObservation::Indeterminate => LastSeen::SocketWontAnswer,
-                _ => LastSeen::StillAnswering,
-            };
-            if stop_completed(observation, stopping) {
-                return Ok(());
-            }
-            if Instant::now() + POLL_INTERVAL >= deadline {
-                return Err(last);
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    };
-    // An outer expiry means the round in flight never finished, which is
-    // the unanswerable case by definition.
-    match tokio::time::timeout_at(deadline, polling).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(last)) => Err(last.into_error(socket, stopping, budget)),
-        Err(_) => Err(LastSeen::SocketWontAnswer.into_error(socket, stopping, budget)),
-    }
-}
-
-/// How the last poll round saw the socket. Only exists so the timeout
-/// error says something true: "still answering as the same session" and
-/// "left a socket that will not answer" are different faults, and
-/// reporting the first for the second sends the reader hunting a
-/// process that is already gone.
-#[derive(Debug, Clone, Copy)]
-enum LastSeen {
-    StillAnswering,
-    SocketWontAnswer,
-}
-
-impl LastSeen {
-    fn into_error(self, socket: &Path, stopping: &str, budget: Duration) -> anyhow::Error {
-        let seconds = budget.as_secs().max(1);
-        match self {
-            Self::StillAnswering => anyhow!(
-                "session {stopping} reported its reap but was still answering at {} \
-                 after {seconds}s",
-                socket.display()
-            ),
-            Self::SocketWontAnswer => anyhow!(
-                "session {stopping} reported its reap but left a socket at {} that \
-                 would not answer session.identify after {seconds}s",
-                socket.display()
-            ),
-        }
-    }
 }
 
 fn print_reap_report(report: &SessionStopResult) {
@@ -426,7 +288,7 @@ fn print_identity(identity: &SessionIdentify, socket: &Path) {
 // Thin IPC
 // ============================================================================
 
-pub(crate) async fn connect(socket: &Path) -> Result<IpcClient> {
+async fn connect(socket: &Path) -> Result<IpcClient> {
     session_launch::dial(socket, scaled(IPC_TIMEOUT)).await
 }
 
@@ -441,11 +303,7 @@ async fn call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         .map_err(Into::into)
 }
 
-async fn identify(socket: &Path) -> Result<SessionIdentify> {
-    session_launch::identify(socket, scaled(IPC_TIMEOUT)).await
-}
-
-pub(crate) async fn identify_on(client: &mut IpcClient) -> Result<SessionIdentify> {
+async fn identify_on(client: &mut IpcClient) -> Result<SessionIdentify> {
     session_launch::identify_on(client, scaled(IPC_TIMEOUT)).await
 }
 
@@ -758,45 +616,6 @@ mod tests {
         assert!(matches!(step, StartStep::Failed(_)), "{step:?}");
     }
 
-    #[test]
-    fn the_stop_poll_ends_when_nothing_is_listening() {
-        assert!(stop_completed(PollObservation::Unreachable, "sess-1"));
-    }
-
-    #[test]
-    fn a_different_session_id_means_ours_stopped() {
-        // A racing spawn-if-missing bound the socket after our reap.
-        // That is a new session, not a failed stop.
-        assert!(stop_completed(
-            PollObservation::Identified("sess-2"),
-            "sess-1"
-        ));
-    }
-
-    #[test]
-    fn the_same_session_id_keeps_the_poll_running() {
-        assert!(!stop_completed(
-            PollObservation::Identified("sess-1"),
-            "sess-1"
-        ));
-    }
-
-    /// Fail-safe, like `socket_state`: an unanswerable socket is never
-    /// reported as stopped.
-    #[test]
-    fn an_indeterminate_socket_keeps_the_poll_running() {
-        assert!(!stop_completed(PollObservation::Indeterminate, "sess-1"));
-    }
-
-    #[test]
-    fn only_missing_and_stale_read_as_not_running() {
-        assert!(socket_gone(&SocketState::Missing));
-        assert!(socket_gone(&SocketState::Stale));
-        assert!(!socket_gone(&SocketState::Live));
-        assert!(!socket_gone(&SocketState::Indeterminate("backlog".into())));
-        assert!(!socket_gone(&SocketState::NotASocket("regular file")));
-    }
-
     /// `scaled` is the one place this crate's budgets meet the shared
     /// scale reader, and `Duration::mul_f64` panics on a big enough
     /// factor — so drive the real function over the values that used to
@@ -810,7 +629,6 @@ mod tests {
                 CONFIRM_TIMEOUT,
                 STOP_CALL_TIMEOUT,
                 STOP_GONE_TIMEOUT,
-                POLL_INTERVAL,
                 IPC_TIMEOUT,
             ] {
                 assert!(!budget.mul_f64(factor).is_zero(), "{raw} on {budget:?}");
@@ -820,7 +638,12 @@ mod tests {
 
     #[test]
     fn the_ambient_scale_leaves_every_budget_usable() {
-        for budget in [VERDICT_TIMEOUT, CONFIRM_TIMEOUT, POLL_INTERVAL] {
+        for budget in [
+            VERDICT_TIMEOUT,
+            CONFIRM_TIMEOUT,
+            STOP_CALL_TIMEOUT,
+            STOP_GONE_TIMEOUT,
+        ] {
             assert!(!scaled(budget).is_zero(), "{budget:?}");
         }
     }

@@ -74,6 +74,7 @@ use crate::{chrome, input};
 // this module's namespace, so the palette-overlay half of App lives in
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 mod host_dialog;
+pub(crate) mod host_notice;
 pub(crate) mod host_tab;
 mod interactions;
 mod palettes;
@@ -332,33 +333,96 @@ fn modal_heading<'a>(title: String, body: &'a str) -> Column<'a, Message> {
     .spacing(6)
 }
 
-/// A modal's trailing button row: Cancel, then the primary action.
+/// A modal's primary action.
 ///
-/// `confirm` is `None` while the action is unavailable (Add Host's dial
-/// in flight), which renders the button disabled rather than removing
-/// it — the card must not resize under the pointer.
+/// `press` is `None` while the action is unavailable (Add Host's dial in
+/// flight), which renders the button disabled rather than removing it —
+/// the card must not resize under the pointer.
+struct ConfirmButton<'a> {
+    label: &'a str,
+    style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
+    press: Option<Message>,
+}
+
+/// A modal's trailing button row: the dismissing action, then the
+/// primary one.
+///
+/// Both halves are parameters because the four modals genuinely differ:
+/// "Cancel"/"Close Project" and "Not now"/"Restart session" ask
+/// different questions, and the upgrade dialog for a *remote* host has
+/// no primary action at all — `confirm: None` leaves it with only the
+/// dismiss, which is plan 037 §3.1's "no dead button" made literal.
 fn modal_buttons<'a>(
+    cancel_label: &'a str,
     cancel: Message,
-    confirm_label: &'a str,
-    confirm_style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
-    confirm: Option<Message>,
+    confirm: Option<ConfirmButton<'a>>,
 ) -> Row<'a, Message> {
-    let mut primary = button(text(confirm_label).size(12))
-        .padding([4, 12])
-        .style(confirm_style);
-    if let Some(message) = confirm {
-        primary = primary.on_press(message);
-    }
-    row![
+    let mut buttons = row![
         iced::widget::Space::new().width(Fill),
-        button(text("Cancel").size(12))
+        button(text(cancel_label).size(12))
             .padding([4, 12])
             .style(chrome::transparent_button)
             .on_press(cancel),
-        primary,
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
+    ];
+    if let Some(confirm) = confirm {
+        let mut primary = button(text(confirm.label).size(12))
+            .padding([4, 12])
+            .style(confirm.style);
+        if let Some(message) = confirm.press {
+            primary = primary.on_press(message);
+        }
+        buttons = buttons.push(primary);
+    }
+    buttons.spacing(8).align_y(Alignment::Center)
+}
+
+/// A host tab's last frame, kept on screen under a scrim and a banner
+/// (plan 037 §3.1's takeover treatment, reused for "session ended").
+///
+/// Not a modal: the rest of the window stays live, because the user's
+/// local tabs and every other host are unaffected — only *this* frame
+/// stopped being true. The scrim is a layer rather than a recolor
+/// because the terminal draws from an owned snapshot; the banner sits
+/// above it so its own text is not dimmed with the frame it describes.
+fn frozen_frame<'a>(
+    content: Element<'a, Message>,
+    saved_id: &str,
+    frame: host_notice::FrozenFrame,
+    banner: host_notice::HostBanner,
+) -> Element<'a, Message> {
+    let strip = container(
+        row![
+            text(banner.message)
+                .size(chrome::HOST_BANNER_TEXT_SIZE)
+                .color(chrome::HOST_BANNER_TEXT),
+            iced::widget::Space::new().width(Fill),
+            // The frame travels with the press: the button's promise is
+            // this frame's, and honoring it against a host that has
+            // since moved on would mean either aborting a reconnect
+            // already running or quietly starting a new session under a
+            // button that said "reconnect".
+            button(text(banner.action).size(chrome::HOST_BANNER_ACTION_SIZE))
+                .padding([2, 9])
+                .style(chrome::host_banner_button)
+                .on_press(Message::HostFrameReconnect {
+                    saved_id: saved_id.to_string(),
+                    frame,
+                }),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .width(Fill)
+    .padding([6, 12])
+    .style(chrome::host_banner);
+    let edge = container(iced::widget::Space::new().width(Fill).height(1.0))
+        .style(chrome::host_banner_edge);
+    let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
+        .style(chrome::host_frame_scrim);
+    stack![content, scrim, column![strip, edge]]
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 /// One labelled text field in the Add Host dialog (the mock's
@@ -571,6 +635,17 @@ pub enum EngineOpResult {
         target: String,
         result: Result<(), String>,
     },
+    /// The stopping half of an upgrade restart finished (plan 037 §3.7).
+    ///
+    /// No generation guard: unlike the Add Host dial there is nothing
+    /// still open to answer — the dialog closed when the button was
+    /// pressed — and the only consumer is a relaunch addressed to the
+    /// saved host, which is stable across everything but a `host.remove`
+    /// (and that is refused for a host with a live connection).
+    HostRestarted {
+        saved_id: String,
+        result: Result<(), String>,
+    },
 }
 
 /// Build the future behind [`UiTask::EngineOp`]: the op runs on the
@@ -638,10 +713,13 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         // Add Host dialog, next to the field the user has to change —
         // a banner behind an open modal is the wrong place to say why
         // the modal did not close.
+        // And a restart's failure already names the rung it stopped at,
+        // so `host_restart_completed` puts that on the status bar itself.
         EngineOpResult::Renamed { .. }
         | EngineOpResult::TabsReordered { .. }
         | EngineOpResult::ProjectsReordered { .. }
-        | EngineOpResult::HostVerified { .. } => None,
+        | EngineOpResult::HostVerified { .. }
+        | EngineOpResult::HostRestarted { .. } => None,
         EngineOpResult::TabOpened {
             project, result, ..
         } => match result {
@@ -684,10 +762,12 @@ impl EngineOpResult {
             | Self::Renamed { .. }
             | Self::TabsReordered { .. }
             | Self::ProjectsReordered { .. }
-            // Add Host is a dialog, not a palette row: the palette is
-            // already dismissed by the time the dialog opens, so the
-            // `palette.activate` that opened it was answered then.
-            | Self::HostVerified { .. } => None,
+            // Add Host and the upgrade prompt are dialogs, not palette
+            // rows: the palette is already dismissed by the time either
+            // opens, so the `palette.activate` that opened it was
+            // answered then.
+            | Self::HostVerified { .. }
+            | Self::HostRestarted { .. } => None,
         }
     }
 }
@@ -1219,6 +1299,20 @@ fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
     window_focused && matches!(route, KeyboardRoute::Terminal(_))
 }
 
+/// Whether the terminal the window is drawing can take a keystroke: it
+/// has a session, and the frame it is showing is still being updated.
+///
+/// A frozen host frame is a picture of a session this window no longer
+/// drives (plan 037 §3.1) — its input queue is gone with the connection,
+/// so routing keys there swallows them silently, which reads to a user
+/// as a hung terminal. Answering `false` sends the route to
+/// [`KeyboardRoute::None`], where accelerators still fire and the modal
+/// routes above still win, and the banner's button is the only thing the
+/// dead frame offers.
+fn active_terminal_live(has_session: bool, frame_frozen: bool) -> bool {
+    has_session && !frame_frozen
+}
+
 fn resolve_keyboard_route(
     confirm_open: bool,
     host_dialog_open: bool,
@@ -1402,14 +1496,45 @@ fn prepare_window_opened(
 /// Linux *dev* iced profile both announce `Roost-Iced` (matching the bundle's
 /// `CFBundleName`), while the packaged Linux build resolves `Linux` and keeps
 /// the production `Roost` users already see.
+/// Which of a host's projects lists this tab, if any.
+///
+/// The shared half of [`App::host_project_of`] and its non-interactive
+/// twin [`App::host_listed_project_of`] — so the only difference between
+/// them is the one word that is the point: which view lookup they ask.
+fn listed_project_of(view: &HostView, tab: TabKey) -> Option<ProjectKey> {
+    let project = view
+        .projects
+        .iter()
+        .find(|project| project.tabs.iter().any(|row| row.id == tab.tab))?;
+    Some(ProjectKey::new(tab.host, project.id))
+}
+
 /// Pure half of [`App::window_title`]: `project` is the active project's
 /// `(name, effective cwd)`, `None` when no project is active. Split out so
 /// tests can pin that BOTH branches thread the profile-chosen fallback.
-fn compose_window_title(fallback: &str, project: Option<(&str, &str)>, home: &str) -> String {
-    match project {
-        None => fallback.to_string(),
-        Some((name, cwd)) => window_title::window_title_with_fallback(fallback, name, cwd, home),
-    }
+///
+/// `host` is the label of the session that project lives on, `None` for
+/// the local workspace (plan 037 §3.1). It is appended rather than
+/// prefixed so the project name stays where a user's eye already looks
+/// for it, and it is omitted entirely for local rows — the zero-host
+/// title is byte-identical to the one before hosts existed.
+fn compose_window_title(
+    fallback: &str,
+    project: Option<(&str, &str)>,
+    host: Option<&str>,
+    home: &str,
+) -> String {
+    let Some((name, cwd)) = project else {
+        return fallback.to_string();
+    };
+    let Some(host) = host else {
+        return window_title::window_title_with_fallback(fallback, name, cwd, home);
+    };
+    // The fallback is applied here rather than left to the composer:
+    // an unnamed project on a host must still say which host, and
+    // "Roost-Iced (pop-os)" is more use than "Roost-Iced".
+    let named = if name.is_empty() { fallback } else { name };
+    window_title::window_title_with_fallback(fallback, &format!("{named} ({host})"), cwd, home)
 }
 
 fn title_fallback(kind: BundleProfileKind) -> &'static str {
@@ -1671,6 +1796,11 @@ pub struct App {
     /// §3.1). One field for both: they are the same kind of thing — an
     /// answer the user still owes — and only one can be up at a time.
     host_dialog: Option<host_dialog::HostDialog>,
+    /// The upgrade restarts under way (plan 037 §3.7). The prompt stays
+    /// reachable while one runs — the host is still `NeedsRestart` until
+    /// the relaunch connects — so the ladder is claimed here rather than
+    /// left for a second press to start again on the same socket.
+    host_restarts: crate::host_conn::restart::RestartsInFlight,
     /// The Add Host dialog's Name field, and whether it still owes a
     /// focus. Same one-shot shape as the rename editor's: the request is
     /// raised where the dialog opens and drained by whichever route
@@ -1937,6 +2067,7 @@ impl App {
             host_resume: HashMap::new(),
             host_selection: None,
             host_dialog: None,
+            host_restarts: crate::host_conn::restart::RestartsInFlight::default(),
             add_host_name_id: Id::unique(),
             add_host_socket_id: Id::unique(),
             add_host_focus_requested: false,
@@ -2186,6 +2317,9 @@ impl App {
                 target,
                 result,
             } => self.add_host_verified(generation, &label, &target, result),
+            EngineOpResult::HostRestarted { saved_id, result } => {
+                self.host_restart_completed(&saved_id, result)
+            }
         }
         self.reconcile();
         if let Some((op, error)) = deferred_activation {
@@ -2379,14 +2513,20 @@ impl App {
                     }
                     (Key::Named(Named::Enter), false) => {
                         self.rename_completion_key = Some(RenameCompletionKey::Enter);
-                        // One key, two dialogs: Add Host's Enter is its
-                        // "Add & Connect", Stop's is its confirming
-                        // button. Both are the panel's primary action,
-                        // which is what Enter means in a dialog.
-                        match self.host_dialog {
+                        // One key, three dialogs: Add Host's Enter is
+                        // its "Add & Connect", Stop's and Restart's are
+                        // their confirming buttons. Each is that panel's
+                        // primary action, which is what Enter means in a
+                        // dialog — and an upgrade prompt for a host this
+                        // client cannot restart has only "Close", so
+                        // Enter is that.
+                        match &self.host_dialog {
                             Some(host_dialog::HostDialog::Add(_)) => task = self.submit_add_host(),
                             Some(host_dialog::HostDialog::ConfirmStop { .. }) => {
                                 self.host_stop_confirmed();
+                            }
+                            Some(host_dialog::HostDialog::ConfirmRestart { .. }) => {
+                                task = self.host_restart_confirmed();
                             }
                             None => {}
                         }
@@ -2790,7 +2930,10 @@ impl App {
             self.rename_editor.is_some(),
             self.palette.is_some(),
             active_tab,
-            self.tabs.contains_key(&active_tab),
+            active_terminal_live(
+                self.tabs.contains_key(&active_tab),
+                self.frozen_host_frame().is_some(),
+            ),
         )
     }
 
@@ -2868,10 +3011,13 @@ impl App {
         let card = modal_card(column![
             heading,
             modal_buttons(
+                "Cancel",
                 Message::ConfirmDeleteCancel,
-                "Close Project",
-                chrome::danger_button,
-                Some(Message::ConfirmDeleteConfirm),
+                Some(ConfirmButton {
+                    label: "Close Project",
+                    style: chrome::danger_button,
+                    press: Some(Message::ConfirmDeleteConfirm),
+                }),
             )
         ]);
         Some(Modal {
@@ -2881,12 +3027,13 @@ impl App {
         })
     }
 
-    /// Add Host, or the Stop Session confirmation (plan 037 §3.1).
+    /// Add Host, the Stop Session confirmation, or the upgrade prompt
+    /// (plan 037 §3.1, §3.7).
     ///
-    /// One builder for both because they share the panel: the mock's Add
-    /// Host dialog and its "Restart session" confirmation are the same
-    /// card with different contents, and the delete confirmation above
-    /// is the third instance of it.
+    /// One builder for all three because they share the panel: the
+    /// mock's Add Host dialog and its "Restart session" confirmation are
+    /// the same card with different contents, and the delete
+    /// confirmation above is the fourth instance of it.
     fn host_dialog_modal(&self) -> Option<Modal<'_>> {
         let body = match self.host_dialog.as_ref()? {
             host_dialog::HostDialog::Add(draft) => self.add_host_body(draft),
@@ -2898,10 +3045,31 @@ impl App {
                      shells.",
                 ),
                 modal_buttons(
+                    "Cancel",
                     Message::HostDialogCancel,
-                    "Stop Session",
-                    chrome::danger_button,
-                    Some(Message::HostStopConfirm),
+                    Some(ConfirmButton {
+                        label: "Stop Session",
+                        style: chrome::danger_button,
+                        press: Some(Message::HostStopConfirm),
+                    }),
+                )
+            ],
+            host_dialog::HostDialog::ConfirmRestart { prompt, .. } => column![
+                modal_heading(prompt.title.clone(), &prompt.body),
+                // A host this client cannot spawn for gets the state and
+                // the pointer, and no button that would fail (§3.1).
+                modal_buttons(
+                    if prompt.restartable {
+                        "Not now"
+                    } else {
+                        "Close"
+                    },
+                    Message::HostDialogCancel,
+                    prompt.restartable.then_some(ConfirmButton {
+                        label: "Restart session",
+                        style: chrome::danger_button,
+                        press: Some(Message::HostRestartConfirm),
+                    }),
                 )
             ],
         };
@@ -2948,10 +3116,13 @@ impl App {
             "Add & Connect"
         };
         body.push(modal_buttons(
+            "Cancel",
             Message::HostDialogCancel,
-            label,
-            chrome::primary_button,
-            confirm,
+            Some(ConfirmButton {
+                label,
+                style: chrome::primary_button,
+                press: confirm,
+            }),
         ))
     }
 
@@ -3569,6 +3740,13 @@ impl App {
                     })
                     .into()
             }
+        };
+        // A frozen host frame keeps its pixels and says why (plan 037
+        // §3.1). With no host selection this is `None` and the terminal
+        // element goes through untouched.
+        let terminal = match self.host_frame_banner() {
+            Some((saved_id, frame, banner)) => frozen_frame(terminal, saved_id, frame, banner),
+            None => terminal,
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
         let content: Element<'_, Message> = if collapsed {
@@ -4340,9 +4518,29 @@ impl App {
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
         }
+        self.host_clear_notification(tab);
         self.host_focus_tab(tab);
         self.reconcile();
         Ok(())
+    }
+
+    /// The "and clear" half for a host tab — `focus_tab_in_core`'s
+    /// counterpart, which is what the local path gets it from.
+    ///
+    /// Fire-and-forget, and **event-confirmed**: the session answers by
+    /// committing `tab.notification { has_pending: false }`, and that
+    /// envelope is what retires the row and the desktop banner (plan 037
+    /// §3.9's no-optimistic-rows rule). Clearing here as well would take
+    /// the row down before the host agreed, and put it back on the next
+    /// reconcile if the op was refused.
+    fn host_clear_notification(&self, tab: TabKey) {
+        let intent = crate::host_conn::HostIntent::new(
+            roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION,
+            serde_json::json!({ "tab_id": tab.tab.to_string() }),
+        );
+        if self.hosts.send_at(tab.host, intent).is_err() {
+            tracing::debug!(%tab, "could not clear the attention marker on a host tab");
+        }
     }
 
     /// The cached view of the host serving an incarnation, when its rows
@@ -4355,15 +4553,80 @@ impl App {
             .find(|view| view.host == host && view.state.interactive())
     }
 
+    /// The cached view of the host serving an incarnation, whatever
+    /// state its section is in. The ungated lookup, for the questions
+    /// that are about what the window is *showing* rather than what the
+    /// user may act on.
+    fn host_view(&self, host: HostId) -> Option<&HostView> {
+        self.host_views.iter().find(|view| view.host == host)
+    }
+
+    /// The host whose frame the window is showing, when that frame is
+    /// frozen (plan 037 §3.1).
+    ///
+    /// `None` unless a host row is selected *and* that host reached one
+    /// of the two terminal states — so with no host selection, and on
+    /// every ordinary connected frame, this costs one `Option` check.
+    fn frozen_host_frame(&self) -> Option<(&HostView, host_notice::FrozenFrame)> {
+        let selection = self.host_selection?;
+        let view = self.host_view(selection.tab.host)?;
+        let section = self.hosts.section(&view.saved_id)?;
+        Some((view, host_notice::frozen_frame(section.state)?))
+    }
+
+    /// The banner the window owes the frame it is showing, the host its
+    /// button reconnects, and the frame that button is a promise about.
+    /// The wording is composed here, at the draw, so the reconcile can
+    /// ask the same question without it.
+    fn host_frame_banner(
+        &self,
+    ) -> Option<(&str, host_notice::FrozenFrame, host_notice::HostBanner)> {
+        let (view, frozen) = self.frozen_host_frame()?;
+        Some((view.saved_id.as_str(), frozen, frozen.banner(&view.label)))
+    }
+
+    /// The frozen-frame banner's button (plan 037 §3.1).
+    ///
+    /// Re-checked against the host's state **now**, not against the
+    /// frame that was drawn: see [`host_notice::click_still_lands`] for
+    /// the two ways a stale click does damage.
+    pub fn host_frame_reconnect_requested(
+        &mut self,
+        saved_id: &str,
+        frame: host_notice::FrozenFrame,
+    ) {
+        let current = self
+            .hosts
+            .section(saved_id)
+            .and_then(|section| host_notice::frozen_frame(section.state));
+        if !host_notice::click_still_lands(frame, current) {
+            tracing::debug!(
+                host = %saved_id,
+                ?frame,
+                ?current,
+                "banner click ignored: the host is no longer showing that frame"
+            );
+            return;
+        }
+        self.host_connect_requested(saved_id);
+    }
+
+    /// The project a host *lists* a tab under, whatever state its
+    /// section is in.
+    ///
+    /// [`Self::host_project_of`]'s twin for the one question that is not
+    /// about acting on a row: is the window still showing something this
+    /// host told us about? A taken-over or stopped session answers yes —
+    /// its rows are still listed, dimmed — which is what lets the frozen
+    /// frame stay up instead of snapping back to a local tab.
+    fn host_listed_project_of(&self, tab: TabKey) -> Option<ProjectKey> {
+        listed_project_of(self.host_view(tab.host)?, tab)
+    }
+
     /// The project a connected host lists a tab under. `None` for a tab
     /// on a host that is not connected, or one its mirror never listed.
     fn host_project_of(&self, tab: TabKey) -> Option<ProjectKey> {
-        let view = self.interactive_host_view(tab.host)?;
-        let project = view
-            .projects
-            .iter()
-            .find(|project| project.tabs.iter().any(|row| row.id == tab.tab))?;
-        Some(ProjectKey::new(tab.host, project.id))
+        listed_project_of(self.interactive_host_view(tab.host)?, tab)
     }
 
     /// One connected host's project row, as its last mirror listed it.
@@ -4401,13 +4664,25 @@ impl App {
             self.set_host_selection(None);
             return;
         }
-        if self.host_project_of(selection.tab) != Some(selection.project) {
-            tracing::debug!(
-                tab = %selection.tab,
-                "host selection dropped: the tab is no longer listed"
-            );
-            self.set_host_selection(None);
+        if self.host_project_of(selection.tab) == Some(selection.project) {
+            return;
         }
+        // A takeover or a stop leaves a frame nothing will ever update
+        // again — and that frame is the last true thing this window
+        // knows about that session, so it stays (plan 037 §3.1's
+        // "keeps its last frame dimmed") with the banner over it. The
+        // row must still be listed: a tab the mirror dropped before the
+        // connection died has nothing left to show.
+        if self.frozen_host_frame().is_some()
+            && self.host_listed_project_of(selection.tab) == Some(selection.project)
+        {
+            return;
+        }
+        tracing::debug!(
+            tab = %selection.tab,
+            "host selection dropped: the tab is no longer listed"
+        );
+        self.set_host_selection(None);
     }
 
     /// The one writer of [`Self::host_selection`].
@@ -4431,6 +4706,33 @@ impl App {
         }
     }
 
+    /// Every *user-initiated* Connect: the sidebar's ↻ row, the
+    /// `Connect Host` palette verb, and the takeover banner's button.
+    ///
+    /// One gate sits here, and it is plan 037 §3.7's: a host whose
+    /// compatibility check already failed does not get dialed again —
+    /// dialing would reproduce the same refusal — it raises the upgrade
+    /// prompt instead. Everything else connects.
+    pub fn host_connect_requested(&mut self, saved_id: &str) {
+        let mismatch = match self.hosts.state(saved_id) {
+            Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) => mismatch.clone(),
+            _ => return self.host_reconnect_requested(saved_id),
+        };
+        let Some(label) = self.host_label(saved_id) else {
+            tracing::debug!(host = %saved_id, "connect requested for a host that is not saved");
+            return;
+        };
+        // A restart already running leaves the host in `NeedsRestart`
+        // until its relaunch connects, so this door stays open under it —
+        // and re-raising the prompt is how a second ladder gets started.
+        // Say what is happening instead.
+        if self.host_restarts.contains(saved_id) {
+            self.set_status(format!("{label} is already restarting"));
+            return;
+        }
+        self.open_host_restart_dialog(saved_id, host_notice::restart_prompt(&label, &mismatch));
+    }
+
     /// Connect a saved host again, from the sidebar's inline ↻ row.
     ///
     /// An explicit connect is unconditional takeover and may spawn a
@@ -4438,6 +4740,12 @@ impl App {
     /// rule) — the launch-time probe is the only connect that does
     /// neither. C7's `Connect Host` verb and the Add Host dialog land on
     /// this same entry.
+    ///
+    /// Deliberately ungated: [`Self::host_connect_requested`] is the
+    /// user-facing door with the upgrade check on it, and the restart
+    /// flow's own relaunch has to come through *here* — the host is
+    /// still in `NeedsRestart` at that moment, and re-raising the dialog
+    /// the user just answered would be a loop.
     pub fn host_reconnect_requested(&mut self, saved_id: &str) {
         let Ok(host) = self.saved_host(saved_id) else {
             tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
@@ -4550,23 +4858,40 @@ impl App {
     /// Open Add Host. The one free-text flow in the family, so it is the
     /// one verb that is a dialog rather than a palette row that acts.
     pub(crate) fn open_add_host_dialog(&mut self) {
-        self.cancel_drags();
-        self.cancel_editor_for_interaction();
-        self.cancel_confirm_delete();
-        self.host_dialog = Some(host_dialog::HostDialog::add());
+        self.open_host_dialog(host_dialog::HostDialog::add());
         self.add_host_focus_requested = true;
-        self.cancel_ime_composition();
     }
 
     /// Open the Stop confirmation for a connected host.
     fn open_host_stop_dialog(&mut self, saved_id: &str, label: &str) {
-        self.cancel_drags();
-        self.cancel_editor_for_interaction();
-        self.cancel_confirm_delete();
-        self.host_dialog = Some(host_dialog::HostDialog::ConfirmStop {
+        self.open_host_dialog(host_dialog::HostDialog::ConfirmStop {
             saved_id: saved_id.to_string(),
             label: label.to_string(),
         });
+    }
+
+    /// Open the upgrade prompt for a host whose compatibility gate
+    /// refused (plan 037 §3.7).
+    fn open_host_restart_dialog(&mut self, saved_id: &str, prompt: host_notice::RestartPrompt) {
+        self.open_host_dialog(host_dialog::HostDialog::ConfirmRestart {
+            saved_id: saved_id.to_string(),
+            prompt,
+        });
+    }
+
+    /// Raise a host modal, and put down whatever the pointer and the
+    /// keyboard were doing first.
+    ///
+    /// The one place that list of cancels lives: a modal owns both while
+    /// it is up, so anything half-finished underneath it (a drag, an
+    /// inline rename, the delete confirmation, an IME composition) has to
+    /// be resolved before it opens rather than left to surface when it
+    /// closes.
+    fn open_host_dialog(&mut self, dialog: host_dialog::HostDialog) {
+        self.cancel_drags();
+        self.cancel_editor_for_interaction();
+        self.cancel_confirm_delete();
+        self.host_dialog = Some(dialog);
         self.cancel_ime_composition();
     }
 
@@ -4600,6 +4925,94 @@ impl App {
             return;
         };
         self.host_stop_requested(&saved_id);
+    }
+
+    /// "Restart session" — the client-side composition, step by step
+    /// (plan 037 §3.7).
+    ///
+    /// The two waiting rungs run on the engine runtime because they are
+    /// socket work with minute-scale budgets, and the third
+    /// ([`crate::host_conn::restart::RestartStep::Relaunch`]) is an
+    /// ordinary Connect run on the UI thread when they answer.
+    ///
+    /// The socket and the may-I-restart-it answer both come from the
+    /// *connection*, not from the dialog's copy or a second resolve of
+    /// the registry: this stop has to be aimed at the session the prompt
+    /// is about, and "only a localhost session is ours to stop" is a fact
+    /// about the endpoint we are dialing. A remote host never reaches
+    /// here — its dialog has no button — and the live flag is what says
+    /// so rather than a snapshot taken when the dialog opened.
+    ///
+    /// **The state is re-read here too, and that is the load-bearing
+    /// part.** The dialog is modal to the pointer, not to the world: an
+    /// IPC `host connect`, a launch-time retry, or another window's
+    /// takeover can move this host off `NeedsRestart` while the prompt
+    /// is still on screen. Confirming then would reap a session that is
+    /// healthy and attached — every shell on it, for a mismatch that no
+    /// longer exists. So the question is asked again at the moment the
+    /// answer is acted on, and a host that moved on is told so instead.
+    pub fn host_restart_confirmed(&mut self) -> UiTask {
+        let Some(host_dialog::HostDialog::ConfirmRestart { saved_id, .. }) =
+            self.host_dialog.take()
+        else {
+            return UiTask::None;
+        };
+        let label = self
+            .host_label(&saved_id)
+            .unwrap_or_else(|| saved_id.clone());
+        if !matches!(
+            self.hosts.state(&saved_id),
+            Some(crate::host_conn::HostConnState::NeedsRestart(_))
+        ) {
+            tracing::info!(
+                host = %saved_id,
+                "restart abandoned: the host left NeedsRestart while the prompt was up"
+            );
+            self.set_status(format!(
+                "{label} is no longer waiting for a restart — nothing was stopped"
+            ));
+            return UiTask::None;
+        }
+        let Some((socket, localhost)) = self.hosts.endpoint(&saved_id) else {
+            tracing::debug!(host = %saved_id, "restart requested for a host with no connection");
+            return UiTask::None;
+        };
+        if !localhost {
+            return UiTask::None;
+        }
+        let socket = socket.to_path_buf();
+        // One ladder per host: the prompt is re-raisable while this runs
+        // (the host stays `NeedsRestart` until the relaunch connects), and
+        // two stop+spawn ladders racing for one socket is the failure that
+        // makes.
+        if !self.host_restarts.begin(&saved_id) {
+            tracing::debug!(host = %saved_id, "a restart is already running for this host");
+            self.set_status(format!("{label} is already restarting"));
+            return UiTask::None;
+        }
+        tracing::info!(host = %saved_id, socket = %socket.display(), "restarting a host session");
+        self.set_status(format!("restarting the session on {label}…"));
+        self.engine_op(
+            crate::host_conn::restart::stop_and_wait_owned(socket),
+            move |result| EngineOpResult::HostRestarted { saved_id, result },
+        )
+    }
+
+    /// The stop half of a restart answered: relaunch, or say where it
+    /// stopped.
+    ///
+    /// The claim is released on both outcomes and before the relaunch:
+    /// what it guards is the stop+spawn ladder, and the relaunch is an
+    /// ordinary Connect from here on, with the connection state machine's
+    /// own replace-in-flight rules.
+    fn host_restart_completed(&mut self, saved_id: &str, result: Result<(), String>) {
+        self.host_restarts.finish(saved_id);
+        match result {
+            // The session is gone; connecting again spawns a fresh one
+            // through the shared ladder and hydrates the saved layout.
+            Ok(()) => self.host_reconnect_requested(saved_id),
+            Err(error) => self.set_status(error),
+        }
     }
 
     /// "Add & Connect": validate what can be answered now, then dial.
@@ -4789,20 +5202,50 @@ impl App {
     /// consulted here: this runs every batch, and the Mac subtitle tracks
     /// OSC 7 only.
     pub fn window_title(&self, home: &str) -> String {
-        let (project_id, tab_id) = self.workspace.active();
-        let project = self.projects.iter().find(|p| p.id == project_id).map(|p| {
-            let cwd = p
-                .tabs
-                .iter()
-                .find(|tab| tab.id == tab_id)
-                .map(|tab| tab.cwd.as_str())
-                .filter(|cwd| !cwd.is_empty())
-                .unwrap_or(p.cwd.as_str());
-            (p.name.as_str(), cwd)
-        });
-        compose_window_title(self.title_fallback, project, home)
+        // The override-aware selection, not `workspace.active()`: while a
+        // host row is showing, the local workspace's own selection is
+        // still whatever it was, and titling the window with it would
+        // name a project the user cannot see (plan 037 §3.1).
+        let tab = self.active_tab_key();
+        let project = self.active_project_key();
+        // A host's rows come from its mirror, the local workspace's from
+        // this backend's snapshot. The `is_local` guard is load-bearing:
+        // a saved host that has never connected carries `HostId::LOCAL`
+        // as its placeholder, and matching on the id alone would read a
+        // local project out of that host's (empty) rows.
+        let host_view = if project.is_local() {
+            None
+        } else {
+            self.host_view(project.host)
+        };
+        let (rows, host) = match host_view {
+            Some(view) => (view.projects.as_slice(), Some(view.label.as_str())),
+            None => (self.projects.as_slice(), None),
+        };
+        let named = rows
+            .iter()
+            .find(|row| row.id == project.project)
+            .map(|row| {
+                let cwd = row
+                    .tabs
+                    .iter()
+                    .find(|row| row.id == tab.tab)
+                    .map(|row| row.cwd.as_str())
+                    .filter(|cwd| !cwd.is_empty())
+                    .unwrap_or(row.cwd.as_str());
+                (row.name.as_str(), cwd)
+            });
+        compose_window_title(self.title_fallback, named, host, home)
     }
 
+    /// The cwd a new local tab launches in.
+    ///
+    /// Deliberately local-only, and a no-op for a host selection: every
+    /// caller is a *local* open (`new_tab_dispatch` routes a host project
+    /// to the op queue before it gets here, and a custom-command launcher
+    /// row opens on the local workspace by construction). A host tab's
+    /// cwd lives in that session's mirror and is the server's to answer
+    /// when the op queue opens a tab there.
     fn launch_cwd(&self, project_id: i64) -> String {
         let active_tab = self.workspace.active().1;
         if let Some(native) = self.backend.foreground_cwd(active_tab) {
@@ -4958,13 +5401,17 @@ impl Message {
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
             Self::NewTab => return app.new_tab(),
             Self::NewProject => return app.new_project(),
-            Self::HostReconnect(saved_id) => app.host_reconnect_requested(&saved_id),
+            Self::HostReconnect(saved_id) => app.host_connect_requested(&saved_id),
+            Self::HostFrameReconnect { saved_id, frame } => {
+                app.host_frame_reconnect_requested(&saved_id, frame)
+            }
             Self::AddHostNameChanged(value) => app.add_host_name_changed(value),
             Self::AddHostSocketChanged(value) => app.add_host_socket_changed(value),
             Self::AddHostSubmit => return app.submit_add_host(),
             Self::HostDialogCancel => app.host_dialog_cancel(),
             Self::HostDialogCardPressed => {}
             Self::HostStopConfirm => app.host_stop_confirmed(),
+            Self::HostRestartConfirm => return app.host_restart_confirmed(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
             _ => {}
@@ -5024,16 +5471,44 @@ mod tests {
     fn the_iced_fallback_composes_into_the_full_title() {
         let fallback = title_fallback(BundleProfileKind::Iced);
         assert_eq!(
-            compose_window_title(fallback, None, "/Users/me"),
+            compose_window_title(fallback, None, None, "/Users/me"),
             "Roost-Iced"
         );
         assert_eq!(
-            compose_window_title(fallback, Some(("", "/tmp")), "/Users/me"),
+            compose_window_title(fallback, Some(("", "/tmp")), None, "/Users/me"),
             "Roost-Iced – /tmp"
         );
         assert_eq!(
-            compose_window_title(fallback, Some(("strix", "/Users/me/w")), "/Users/me"),
+            compose_window_title(fallback, Some(("strix", "/Users/me/w")), None, "/Users/me"),
             "strix – ~/w"
+        );
+    }
+
+    /// A host row names where it runs (plan 037 §3.1). Two windows on
+    /// two machines can hold projects with the same name, and the
+    /// titlebar is the only place that ever says which is which.
+    #[test]
+    fn a_host_selection_says_which_host_in_the_title() {
+        let fallback = title_fallback(BundleProfileKind::Iced);
+        assert_eq!(
+            compose_window_title(
+                fallback,
+                Some(("strix", "/Users/me/w")),
+                Some("pop-os"),
+                "/Users/me"
+            ),
+            "strix (pop-os) – ~/w"
+        );
+        // An unnamed project on a host still says which host — the
+        // fallback is applied to the name, not to the whole title.
+        assert_eq!(
+            compose_window_title(fallback, Some(("", "/tmp")), Some("pop-os"), "/Users/me"),
+            "Roost-Iced (pop-os) – /tmp"
+        );
+        // And with no project there is nothing to qualify.
+        assert_eq!(
+            compose_window_title(fallback, None, Some("pop-os"), "/Users/me"),
+            "Roost-Iced"
         );
     }
 
@@ -5947,6 +6422,54 @@ mod tests {
         assert_eq!(
             resolve_keyboard_route(true, false, false, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
+        );
+    }
+
+    /// A frozen host frame is not a keyboard target (plan 037 §3.1). The
+    /// tab still has a session object — that is what draws the pixels
+    /// under the scrim — so liveness has to be the *frame's*, not the
+    /// map's, or every keystroke is queued at a connection that is gone
+    /// and the terminal reads as hung.
+    ///
+    /// What it must NOT do is take the keyboard away from the surfaces
+    /// that still need it: accelerators run off `KeyboardRoute::None`,
+    /// and the upgrade dialog's Esc/Enter outrank the terminal route
+    /// either way.
+    #[test]
+    fn a_frozen_host_frame_stops_being_a_keyboard_target() {
+        let host = TabKey::new(HostId::new(3), 7);
+        assert!(active_terminal_live(true, false));
+        assert!(!active_terminal_live(true, true), "the frame is a corpse");
+        assert!(!active_terminal_live(false, false), "and it has no session");
+
+        assert_eq!(
+            resolve_keyboard_route(
+                false,
+                false,
+                false,
+                false,
+                host,
+                active_terminal_live(true, true)
+            ),
+            KeyboardRoute::None,
+            "typing into the dimmed frame reaches no PTY"
+        );
+        assert_eq!(
+            resolve_keyboard_route(
+                false,
+                true,
+                false,
+                false,
+                host,
+                active_terminal_live(true, true)
+            ),
+            KeyboardRoute::HostDialog,
+            "and the upgrade prompt over it still owns Esc and Enter"
+        );
+        assert_eq!(
+            ime_preedit_target(KeyboardRoute::None),
+            None,
+            "a composition has nowhere to land either"
         );
     }
 
