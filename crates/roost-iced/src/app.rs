@@ -1776,6 +1776,16 @@ pub struct App {
     /// the connection incarnation, so a reconnect naturally orphans the
     /// stale entries and the purge drops them.
     host_resume: HashMap<TabKey, host_tab::ResumePoint>,
+    /// Host tabs that have rung since they were last focused.
+    ///
+    /// A bell is an effect, not workspace state (plan 037 §3.6): the
+    /// session reports it once and keeps no flag, so nothing on the
+    /// server side will ever say "this tab is still ringing". This is
+    /// that memory, and it is an *input* to the notification-inbox
+    /// derivation rather than a row written behind the derivation's
+    /// back — which is what stops the next reconcile pruning it.
+    /// Cleared on focus, and swept wherever the tab itself goes.
+    host_bells: HashSet<TabKey>,
     /// Which host row the window is showing, when it is showing one.
     ///
     /// The app's notion of "the active tab" is `workspace.active()`, and
@@ -2065,6 +2075,7 @@ impl App {
             ),
             host_attach: HashMap::new(),
             host_resume: HashMap::new(),
+            host_bells: HashSet::new(),
             host_selection: None,
             host_dialog: None,
             host_restarts: crate::host_conn::restart::RestartsInFlight::default(),
@@ -4533,7 +4544,10 @@ impl App {
     /// §3.9's no-optimistic-rows rule). Clearing here as well would take
     /// the row down before the host agreed, and put it back on the next
     /// reconcile if the op was refused.
-    fn host_clear_notification(&self, tab: TabKey) {
+    fn host_clear_notification(&mut self, tab: TabKey) {
+        // The bell half is ours alone: the session kept no flag for it,
+        // so nothing coming back over the wire would ever retire it.
+        self.host_bells.remove(&tab);
         let intent = crate::host_conn::HostIntent::new(
             roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION,
             serde_json::json!({ "tab_id": tab.tab.to_string() }),

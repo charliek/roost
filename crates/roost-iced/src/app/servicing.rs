@@ -311,6 +311,7 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
 fn pending_notification_rows(
     host: HostId,
     projects: &[Project],
+    rung: &HashSet<TabKey>,
 ) -> Vec<(TabKey, ProjectKey, String)> {
     projects
         .iter()
@@ -318,7 +319,17 @@ fn pending_notification_rows(
             project
                 .tabs
                 .iter()
-                .filter(|tab| tab.has_notification)
+                .filter(|tab| {
+                    // Two sources, one derivation. `has_notification` is
+                    // the server's own attention state; `rung` is a bell
+                    // this client heard, which raises attention without
+                    // any server flag behind it (plan 037 §3.6 — a bell
+                    // is an effect, not workspace state). Folding it in
+                    // here rather than exempting the row from the prune
+                    // is what keeps the inbox purely derived: a row is
+                    // shown exactly while something still says so.
+                    tab.has_notification || rung.contains(&TabKey::new(host, tab.id))
+                })
                 .map(move |tab| {
                     (
                         TabKey::new(host, tab.id),
@@ -691,6 +702,10 @@ impl App {
             self.host_drop_tab(key);
         }
         self.host_resume.retain(|key, _| key.host != incarnation);
+        // Bells belong to the incarnation that heard them: the fresh
+        // mirror is authoritative, and a tab that is still ringing will
+        // ring again.
+        self.host_bells.retain(|key| key.host != incarnation);
         // A creation still waiting for this incarnation's mirror will
         // never be answered by it (plan 037 §3.9's "dropped on
         // disconnect").
@@ -708,6 +723,7 @@ impl App {
     fn host_drop_tab(&mut self, key: TabKey) {
         self.host_detach_tab(key);
         self.host_resume.remove(&key);
+        self.host_bells.remove(&key);
         self.tabs.remove(&key);
         self.notification_inbox.remove(key);
         self.desktop_notifications.retire(key);
@@ -872,13 +888,17 @@ impl App {
         let key = TabKey::new(host, effect.tab_id);
         match effect.effect {
             roost_ipc::messages::TabEffect::Bell => {
-                let Some((project, title)) = self.host_notification_title(key) else {
-                    return UiTask::None;
-                };
-                self.notification_inbox
-                    .upsert(notification_inbox::NotificationRecord::new(
-                        key, project, title, "Bell",
-                    ));
+                // Record that this tab rang, then let the ordinary
+                // reconcile derive the row from it. Upserting the row
+                // here instead would put an undeclared row in a set the
+                // reconcile prunes against the mirror, and the next
+                // reconcile would erase it — which is exactly what a
+                // bell used to do: arrive, and vanish before anyone saw
+                // it. It clears where every attention marker clears, on
+                // focus.
+                if self.host_bells.insert(key) {
+                    self.reconcile_notification_inbox();
+                }
                 UiTask::None
             }
             roost_ipc::messages::TabEffect::ClipboardWrite => {
@@ -1372,6 +1392,7 @@ impl App {
             .collect();
         for tab in stale {
             self.notification_inbox.remove(tab);
+            self.host_bells.remove(&tab);
         }
     }
 
@@ -1408,7 +1429,7 @@ impl App {
     fn reconcile_notification_inbox(&mut self) {
         let host = self.backend.host();
         let mut pending_rows: Vec<(TabKey, ProjectKey, String)> =
-            pending_notification_rows(host, &self.projects);
+            pending_notification_rows(host, &self.projects, &self.host_bells);
         for view in &self.host_views {
             // A saved host that has never published rows carries
             // `HostId::LOCAL` as its placeholder (`refresh_host_views`);
@@ -1417,7 +1438,11 @@ impl App {
             if view.host.is_local() {
                 continue;
             }
-            pending_rows.extend(pending_notification_rows(view.host, &view.projects));
+            pending_rows.extend(pending_notification_rows(
+                view.host,
+                &view.projects,
+                &self.host_bells,
+            ));
         }
         let pending: HashSet<TabKey> = pending_rows.iter().map(|row| row.0).collect();
         // Unscoped, because the derivation above now covers every
@@ -2588,8 +2613,9 @@ mod tests {
         }];
 
         let host = HostId::new(3);
-        let remote = pending_notification_rows(host, &projects);
-        let local = pending_notification_rows(HostId::LOCAL, &projects);
+        let none = HashSet::new();
+        let remote = pending_notification_rows(host, &projects, &none);
+        let local = pending_notification_rows(HostId::LOCAL, &projects, &none);
         assert_eq!(remote.len(), 1, "only the pending tab earns a row");
         assert_eq!(remote[0].0, TabKey::new(host, 7));
         assert_eq!(remote[0].1, ProjectKey::new(host, 4));
@@ -2599,7 +2625,60 @@ mod tests {
             "and one composed title, so the list reads as one list"
         );
 
-        assert!(pending_notification_rows(host, &[]).is_empty());
+        assert!(pending_notification_rows(host, &[], &none).is_empty());
+    }
+
+    /// A bell has no server flag behind it, so unless the derivation
+    /// itself knows about it the very next reconcile prunes its row —
+    /// which is what made a host bell a no-op on screen. It is an input
+    /// here, keyed at the host that rang: a bell on one incarnation must
+    /// not light the same number on another.
+    #[test]
+    fn a_bell_earns_a_row_the_reconcile_will_not_prune() {
+        fn tab(id: i64) -> roost_ipc::messages::Tab {
+            roost_ipc::messages::Tab {
+                id,
+                project_id: 4,
+                title: format!("tab-{id}"),
+                cwd: "/w/roost".into(),
+                state: roost_ipc::messages::TabState::None,
+                has_notification: false,
+                is_active: false,
+                user_titled: false,
+                position: 0,
+                created_at: 0,
+                last_active: 0,
+                hook_active: false,
+                shell_state: roost_ipc::agent::ShellState::default(),
+                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
+                ownership: None,
+            }
+        }
+        let projects = vec![Project {
+            id: 4,
+            name: "roost".into(),
+            cwd: "/w/roost".into(),
+            position: 0,
+            created_at: 0,
+            tabs: vec![tab(7), tab(8)],
+        }];
+        let host = HostId::new(3);
+
+        assert!(
+            pending_notification_rows(host, &projects, &HashSet::new()).is_empty(),
+            "no flags, no bells, no rows"
+        );
+
+        let rung: HashSet<TabKey> = [TabKey::new(host, 7)].into_iter().collect();
+        let rows = pending_notification_rows(host, &projects, &rung);
+        assert_eq!(rows.len(), 1, "the tab that rang earns exactly one row");
+        assert_eq!(rows[0].0, TabKey::new(host, 7));
+
+        // The same bare number on another incarnation is another tab.
+        assert!(
+            pending_notification_rows(HostId::new(9), &projects, &rung).is_empty(),
+            "a bell is keyed at the host that heard it"
+        );
     }
 
     /// A malformed payload is reported as undecodable rather than
