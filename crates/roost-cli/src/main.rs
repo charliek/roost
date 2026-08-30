@@ -25,7 +25,8 @@
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
 //!   roostctl session {start,stop,status}
-//!   roostctl host {add,list,remove} — add: --label, --target, [--verify]
+//!   roostctl host {add,list,remove,connect,disconnect}
+//!     add: --label, --target, [--verify]; the last three: --id
 //!
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
@@ -216,8 +217,8 @@ enum Cmd {
     /// via an explicit `--socket`.
     #[command(subcommand)]
     Session(session::SessionCmd),
-    /// Client-side saved-host registry subcommands: add, list, remove
-    /// (host-sessions HS-2). Unlike `session`, these address the
+    /// Client-side saved-host subcommands: add, list, remove, connect,
+    /// disconnect (host-sessions HS-2). Unlike `session`, these address the
     /// ordinary UI socket target — a saved host is UI state, not the
     /// session daemon's own workspace.
     #[command(subcommand)]
@@ -1507,6 +1508,24 @@ fn order_with_after(ids: &[i64], new: i64, after: i64) -> Vec<i64> {
 mod tests {
     use super::*;
     use roost_ipc::agent::OwnershipAction;
+
+    /// `--tab` is the one flag that can name a tab on another machine,
+    /// so what it accepts is a contract: both spellings parse, and a
+    /// non-canonical one is refused rather than normalized — an
+    /// aliasing parser would let a crafted `--tab` reach a tab its
+    /// literal text never named.
+    #[test]
+    fn an_explicit_tab_ref_takes_both_spellings_and_only_canonical_ones() {
+        assert_eq!(WireTabRef::parse("7"), Some(WireTabRef::Local(7)));
+        assert_eq!(
+            WireTabRef::parse("h2.7"),
+            Some(WireTabRef::Host { host: 2, tab: 7 })
+        );
+        // `h0.*` is the local id-space, which is always spelled bare.
+        for refused in ["h0.7", "007", "+7", "h2.", "", "h.7"] {
+            assert!(WireTabRef::parse(refused).is_none(), "{refused:?}");
+        }
+    }
 
     #[test]
     fn held_argv_wraps_command_and_execs_shell() {

@@ -1712,16 +1712,24 @@ impl App {
             return Err(message);
         }
         self.active_theme_name = name.to_string();
-        // Connected hosts re-seed their server terminals with the same
-        // palette (`session.set_theme` rides each host's op queue), so
-        // the colors a host tab's queries answer with move with the
-        // theme exactly as a local tab's drain state does above.
-        self.hosts.set_theme(&theme);
         Ok(())
     }
 
     fn commit_theme_name(&mut self, name: &str) -> Result<Option<String>, String> {
         self.apply_theme_name(name)?;
+        // Connected hosts re-seed their server terminals with the same
+        // palette (`session.set_theme` rides each host's op queue), so
+        // the colors a host tab's queries answer with move with the
+        // theme exactly as a local tab's drain state does.
+        //
+        // On COMMIT only. `apply_theme_name` is also the preview path —
+        // it runs on every selection move in the theme palette, and
+        // again when the user backs out — so reseeding there would push
+        // a lease-gated op to every connected host on every arrow key,
+        // and a browse-then-cancel would leave hosts recoloured to a
+        // theme the user rejected. A preview is local by nature: it
+        // costs an in-process repaint here and nothing on the wire.
+        self.hosts.set_theme(&Theme::load_bundled(name));
         let path = config::config_path();
         Ok(
             persist_theme_selection_with(&mut self.config, path.as_deref(), name, config::set_key)

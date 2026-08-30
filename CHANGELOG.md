@@ -13,7 +13,7 @@ release workflow asserts they agree).
 
 ### Added
 
-- **The iced UI attaches to host sessions (HS-2, #TBD)** — closing Roost
+- **The iced UI attaches to host sessions (HS-2, #374)** — closing Roost
   no longer has to kill what is running in it. Save a `roost-session`
   socket as a **host** (`roostctl host add` or the palette's **Add
   Host…** dialog, which validates by dialing `session.identify` before

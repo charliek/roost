@@ -15,7 +15,7 @@ Top to bottom, left to right:
 
 Click a project in the sidebar to switch its tab strip into the right pane. Click a tab to swap the terminal surface to that tab's session.
 
-With no [host sessions](../guides/host-sessions.md) saved, the sidebar looks exactly like this — one "PROJECTS" header, no dots. The first saved host splits it into per-host sections instead: a "LOCAL" band for the projects you see above, then one band per saved host, each with a small connection dot and a right-aligned agent count. This is opt-in and Linux-only for now (see the guide's macOS note).
+With no [host sessions](../guides/host-sessions.md) saved, the sidebar looks exactly like this — one "PROJECTS" header, no dots. The first saved host splits it into per-host sections instead: a "LOCAL" band for the projects you see above, then one band per saved host, each with a small connection dot and a right-aligned agent count. This is opt-in. Hosting a session on *this* machine is Linux-only for now; a Mac can still connect to a remote Linux session over an SSH-forwarded socket, and its host sections look the same (see the guide's macOS note).
 
 ## Default state
 

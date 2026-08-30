@@ -165,7 +165,7 @@ These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab 
 
 `tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
 
-`--tab` on `dump` (and the test-only `tab.dump_resolved` / `tab.capture_pty_input` ops) accepts the same host-qualified `h<host>.<id>` spelling `tab focus` does, reading an attached host tab's **client-side** terminal — the UI's own copy, distinct from the session's own `tab dump` served over its socket. See [Host Sessions](../guides/host-sessions.md).
+`--tab` on `dump` (and the `tab.dump_resolved` op, plus the test-only `tab.capture_pty_input`) accepts the same host-qualified `h<host>.<id>` spelling `tab focus` does, reading an attached host tab's **client-side** terminal — the UI's own copy, distinct from the session's own `tab dump` served over its socket. See [Host Sessions](../guides/host-sessions.md).
 
 ## `wait`
 

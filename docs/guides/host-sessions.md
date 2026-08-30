@@ -40,6 +40,8 @@ Back on your Mac or local Linux box, open a persistent forward — this needs to
 
 ```bash
 mkdir -p ~/.roost-hosts
+# Use the socket path the command above printed — the `1000` in
+# `/run/user/1000` is that machine's UID, not necessarily yours.
 ssh -N -L ~/.roost-hosts/pop-os.sock:/run/user/1000/roost-session/roost.sock pop-os
 ```
 
