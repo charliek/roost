@@ -1,14 +1,116 @@
-//! The two values `session.identify` answers with that nothing else in
-//! the process can supply: a random session id and a start timestamp.
+//! Everything this binary answers about *itself*: a random session id
+//! and a start timestamp for a running session, and — separately — this
+//! build's offline identity for `roost-session identify`.
 //!
-//! Both are hand-rolled on purpose. The workspace graph has no date-time
-//! crate and no random-number framework, and neither value justifies
-//! adding one: the id is 16 bytes of OS entropy rendered hex, and the
-//! timestamp is a fixed-shape UTC RFC3339 string with no parsing,
-//! arithmetic, or zone handling behind it.
+//! The session id and timestamp are hand-rolled on purpose. The
+//! workspace graph has no date-time crate and no random-number
+//! framework, and neither value justifies adding one: the id is 16
+//! bytes of OS entropy rendered hex, and the timestamp is a fixed-shape
+//! UTC RFC3339 string with no parsing, arithmetic, or zone handling
+//! behind it.
+//!
+//! [`build_identity`] answers a different question — not "which
+//! process is this" but "which build is this" — and exists here rather
+//! than in a new module because `serve`'s `SessionInfo` construction and
+//! the `identify` subcommand both need it, and a second place to compute
+//! it is exactly how the two would drift. [`test_mode_env`] is the same
+//! argument one layer down: both callers need `ROOST_TEST_MODE` and
+//! `ROOST_SESSION_FAKE_BUILD` read the same way, so there is one reader.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
+
+/// This build's offline identity: what `roost-session identify` prints,
+/// and what `serve`'s `session.identify` answer's `libghostty_build`
+/// field is drawn from.
+///
+/// `fake_libghostty_build` is the already-read `ROOST_SESSION_FAKE_BUILD`
+/// value (or `None`); `test_mode` re-gates it here rather than trusting
+/// the caller's gate alone, mirroring `serve.rs`'s
+/// `.filter(|_| config.test_mode)` — a caller that hand-builds test data
+/// with `test_mode: false` and a fake value set still gets the truth.
+pub fn build_identity(
+    fake_libghostty_build: Option<&str>,
+    test_mode: bool,
+) -> SessionBinaryIdentity {
+    SessionBinaryIdentity {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        session_protocol: SESSION_PROTOCOL_VERSION,
+        libghostty_build: resolve_libghostty_build(fake_libghostty_build, test_mode),
+    }
+}
+
+/// `roost-session identify`: print this build's identity as exactly one
+/// JSON line on stdout and exit 0.
+///
+/// Pure compile-time identity — no socket, no profile, no side effects,
+/// so a binary that has never run can still answer it.
+pub fn run() -> i32 {
+    let (test_mode, fake_libghostty_build) = test_mode_env();
+    let identity = build_identity(fake_libghostty_build.as_deref(), test_mode);
+    let line = match serde_json::to_string(&identity) {
+        Ok(line) => line,
+        Err(error) => {
+            eprintln!("roost-session identify: {error:#}");
+            return 1;
+        }
+    };
+
+    // A locked, fallible writer rather than `println!`: Rust ignores
+    // SIGPIPE by default, so `println!` would panic (and exit 101) if
+    // the ssh reader on the far end of stdout closes early.
+    let mut stdout = std::io::stdout().lock();
+    let write_result = stdout
+        .write_all(line.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush());
+    match write_result {
+        Ok(()) => 0,
+        // The reader is already gone; there is nobody left to tell, and
+        // stderr noise here would be misread by the bootstrap classifier
+        // as a real failure. 0 is defensible — the process did its job,
+        // it just found nobody listening at the end.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => 0,
+        Err(error) => {
+            eprintln!("roost-session identify: {error:#}");
+            1
+        }
+    }
+}
+
+/// Reads `ROOST_TEST_MODE` and, gated on it, `ROOST_SESSION_FAKE_BUILD`
+/// from the environment.
+///
+/// The one place either variable is read directly: [`run`] (the CLI
+/// edge, for a binary that has never started) and `SessionConfig::
+/// from_profile` (the daemon edge, for a running session) both call
+/// this rather than each reading the environment themselves, so the two
+/// cannot drift apart on what "test mode" means.
+pub(crate) fn test_mode_env() -> (bool, Option<String>) {
+    let test_mode = std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1");
+    let fake_libghostty_build = test_mode
+        .then(|| std::env::var(crate::consts::FAKE_BUILD_ENV).ok())
+        .flatten()
+        .filter(|value| !value.is_empty());
+    (test_mode, fake_libghostty_build)
+}
+
+fn resolve_libghostty_build(fake_libghostty_build: Option<&str>, test_mode: bool) -> String {
+    match fake_libghostty_build.filter(|_| test_mode) {
+        Some(fake) => {
+            tracing::warn!(
+                build = %fake,
+                "reporting a fake libghostty build: {} is set in test mode",
+                crate::consts::FAKE_BUILD_ENV
+            );
+            fake.to_string()
+        }
+        None => roost_vt::libghostty_build(),
+    }
+}
 
 /// 128 bits of OS entropy as 32 lowercase hex characters.
 ///
@@ -115,5 +217,32 @@ mod tests {
         assert_eq!(now.len(), 20, "{now}");
         assert!(now.ends_with('Z'), "{now}");
         assert_eq!(now.as_bytes()[10], b'T', "{now}");
+    }
+
+    #[test]
+    fn build_identity_always_carries_the_real_app_version_and_protocol() {
+        let identity = build_identity(Some("fake-build"), true);
+        assert_eq!(identity.app_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(identity.session_protocol, SESSION_PROTOCOL_VERSION);
+    }
+
+    /// The double gate (plan 039 §3.1): a fake build only ever surfaces
+    /// with `test_mode: true`. Exercised on the pure helper rather than
+    /// by mutating `ROOST_TEST_MODE` — env mutation is process-global and
+    /// would race every other test in this binary.
+    #[test]
+    fn a_fake_build_only_applies_under_test_mode() {
+        let faked = build_identity(Some("fake-build-123"), true);
+        assert_eq!(faked.libghostty_build, "fake-build-123");
+
+        let real = build_identity(Some("fake-build-123"), false);
+        assert_eq!(real.libghostty_build, roost_vt::libghostty_build());
+        assert_ne!(real.libghostty_build, "fake-build-123");
+    }
+
+    #[test]
+    fn no_fake_build_set_always_reports_the_real_value() {
+        let identity = build_identity(None, true);
+        assert_eq!(identity.libghostty_build, roost_vt::libghostty_build());
     }
 }

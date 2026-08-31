@@ -1563,6 +1563,31 @@ impl std::fmt::Display for AttachPayloadKind {
     }
 }
 
+/// The offline identity of a `roost-session` **binary** — what
+/// `roost-session identify` prints, before that binary has ever bound a
+/// socket or hydrated a workspace.
+///
+/// Deliberately a different type from [`SessionIdentify`], not a subset
+/// reused via `Default`: `SessionIdentify` describes a *running*
+/// session (six required fields, three of which — `payload_kinds`,
+/// `session_id`, `started_at` — only exist once a process has actually
+/// started serving) and answers `session.identify` over the wire. This
+/// type describes a binary sitting on disk and answers a plain CLI
+/// invocation with no process, no socket, and no side effects; the
+/// bootstrap probe (plan 039) execs a candidate with `identify` and
+/// compares this triple against the client's own before ever streaming
+/// bytes at it. `roost-ipc` stays free of a `roost-vt` dependency
+/// because of this split — it is a plain data carrier, and the
+/// `libghostty_build` value is constructed by producers (`roost-session`
+/// for its own build, `roost-iced` for the client's expected value) that
+/// already depend on `roost-vt` for other reasons.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBinaryIdentity {
+    pub app_version: String,
+    pub session_protocol: u32,
+    pub libghostty_build: String,
+}
+
 /// `session.identify` result — the first thing a client asks a host
 /// session for, so every incompatibility is caught on stable JSON
 /// before any binary frame exists.

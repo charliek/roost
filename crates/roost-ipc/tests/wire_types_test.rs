@@ -15,11 +15,11 @@ use std::path::PathBuf;
 
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ClipboardEffectTarget, EventBatch, EventEnvelope, ResponseError, SessionConnectParams,
-    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetFocusParams,
-    SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
-    SessionStoppingEvent, TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    ClipboardEffectTarget, EventBatch, EventEnvelope, ResponseError, SessionBinaryIdentity,
+    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
+    SessionSetFocusParams, SessionSetThemeParams, SessionSetThemeResult, SessionStopParams,
+    SessionStopResult, SessionStoppingEvent, TabAttachParams, TabAttachResult, TabEffect,
+    TabEffectEvent, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -147,6 +147,44 @@ fn session_identify_matches_its_golden_json() {
     assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
     let decoded: SessionIdentify = serde_json::from_str(GOLDEN).unwrap();
     assert_eq!(decoded, value);
+}
+
+/// `roost-session identify`'s wire shape (plan 039 §3.1) — a binary's
+/// offline identity, not a running session's. Distinct from
+/// `SessionIdentify` above: three required fields, no `payload_kinds` /
+/// `session_id` / `started_at`.
+#[test]
+fn session_binary_identity_matches_its_golden_json() {
+    const GOLDEN: &str = concat!(
+        r#"{"app_version":"0.0.19","session_protocol":2,"#,
+        r#""libghostty_build":"ghostty-abcdef0123456789+snapshot.v1"}"#,
+    );
+
+    let value = SessionBinaryIdentity {
+        app_version: "0.0.19".into(),
+        session_protocol: SESSION_PROTOCOL_VERSION,
+        libghostty_build: "ghostty-abcdef0123456789+snapshot.v1".into(),
+    };
+    round_trip(&value);
+    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
+    let decoded: SessionBinaryIdentity = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(decoded, value);
+
+    // A JSON-value key assertion, not just the golden-string compare
+    // above: an accidental extra `#[serde]` field still produces valid
+    // JSON that a looser check could miss.
+    let as_value = serde_json::to_value(&value).unwrap();
+    let mut keys: Vec<&str> = as_value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["app_version", "libghostty_build", "session_protocol"]
+    );
 }
 
 #[test]

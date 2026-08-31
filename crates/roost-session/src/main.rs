@@ -40,6 +40,14 @@ enum Command {
     /// The far side of the SSH transport, one process per accepted
     /// client connection. stdout carries wire bytes and nothing else.
     ClientBridge,
+    /// Print this build's offline identity and exit.
+    ///
+    /// Prints exactly one `SessionBinaryIdentity` JSON line on stdout
+    /// and exits 0. No socket, no profile, no side effects — answerable
+    /// by a binary that has never run; the bootstrap probe (plan 039
+    /// §3.1) execs this to compare a remote candidate's build against
+    /// the client's before installing or starting anything.
+    Identify,
 }
 
 fn main() -> ! {
@@ -47,8 +55,11 @@ fn main() -> ! {
     let foreground = match cli.command {
         // Exits before `Readiness::Stdout` is installed below, because
         // for the bridge stdout *is* the wire: one stray line on it
-        // corrupts the client's stream.
+        // corrupts the client's stream. `identify` gets the same
+        // early-exit treatment for the same reason — its stdout is a
+        // machine-read contract too.
         Command::ClientBridge => std::process::exit(roost_session::bridge::run()),
+        Command::Identify => std::process::exit(roost_session::identity::run()),
         Command::Start { foreground } => foreground,
     };
 
