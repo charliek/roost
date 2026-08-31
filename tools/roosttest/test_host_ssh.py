@@ -63,6 +63,7 @@ import contextlib
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -245,15 +246,33 @@ def count(predicate) -> int:
     return sum(1 for fields in invocations() if predicate(fields[1:]))
 
 
-def kill_bridge_connections() -> list[int]:
-    """SIGKILL the live far side of every open connection.
+def _descendants(pid: int) -> list[int]:
+    """The pid's live descendants, deepest last, via `pgrep -P`."""
+    out = subprocess.run(
+        ["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False
+    ).stdout
+    children = [int(line) for line in out.split() if line.strip()]
+    tree = []
+    for child in children:
+        tree.append(child)
+        tree.extend(_descendants(child))
+    return tree
 
-    Only *exec* invocations are candidates. The wrapper and the fixture
-    both `exec`, so a logged pid IS the `roost-session client-bridge`
-    process — and an exec's pid lives exactly as long as its connection,
-    which is what makes it safe to signal. A warm-up's pid has long since
-    exited and could have been recycled onto anything, this test's own
-    session daemon included, so those are never touched.
+
+def kill_bridge_connections() -> list[int]:
+    """SIGKILL the live far side of every open connection — the logged
+    pid AND its descendants.
+
+    Only *exec* invocations are candidates; a warm-up's pid has long
+    since exited and could have been recycled onto anything, this test's
+    own session daemon included, so those are never touched. The tree
+    matters: on shells that exec-optimize `sh -c` (macOS bash) the
+    logged pid IS `roost-session client-bridge`, but Ubuntu's dash forks
+    instead, leaving the bridge as a *child* of the logged `sh` — and
+    killing only the parent orphans a bridge that keeps the pipes open,
+    so the UI never sees the connection die (the exact CI hang this
+    guard exists for). Killing the whole tree models the thing being
+    simulated either way: every process of the connection dies.
     """
     killed = []
     for fields in invocations():
@@ -262,9 +281,10 @@ def kill_bridge_connections() -> list[int]:
         pid = int(fields[0].removeprefix("pid="))
         if not sessionlib.pid_alive(pid):
             continue
-        with contextlib.suppress(OSError):
-            os.kill(pid, 9)
-            killed.append(pid)
+        for target in [pid, *_descendants(pid)]:
+            with contextlib.suppress(OSError):
+                os.kill(target, 9)
+        killed.append(pid)
     return killed
 
 
