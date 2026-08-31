@@ -826,11 +826,17 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
     # (test_sparkle.py binds a port at import time, before this launch).
     # It only takes effect in the bundle when ROOST_TEST_MODE=1 was
     # forwarded too — the seam checks both (plan 028 § 3.9).
+    # `ROOST_SSH_BIN` is the HS-3 lane's seam (test_host_ssh.py sets it at
+    # import, before this launch): the UI reads it once per tunnel, out of
+    # its own environment, so a bundle that did not receive it would exec
+    # the real `ssh`. The bare-binary launch above inherits it via
+    # `**os.environ` and needs no entry.
     for name in (
         "ROOST_TEST_MODE",
         "ROOST_TEST_TIMEOUT_SCALE",
         "ICED_BACKEND",
         "ROOST_SPARKLE_FEED_URL",
+        "ROOST_SSH_BIN",
     ):
         _forward_env(argv, name)
     # RUST_LOG is forwarded with a floor: the launch path asserts the
