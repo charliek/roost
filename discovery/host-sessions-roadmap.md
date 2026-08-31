@@ -258,6 +258,9 @@ land (post-HS-3). Lifecycle practices adopted from Herdr:
 
 ### D9 — SSH transport and bootstrap (HS-3)
 
+**Status: the transport slice shipped as plan 038 (PR #377); the
+bootstrap slice below is still open.**
+
 - **Stdio-mux** (Herdr's shape): local UDS bridged to a far-side
   `roost-session client-bridge` process over ssh stdin/stdout — one
   `ssh -T` exec **per accepted connection**, shared over a private
@@ -524,8 +527,9 @@ below).
   remains deferred (unchanged open question below).
 
 **Acceptance:** the automated lanes are the gate — the pipes-based
-bridge lane and a shed-sshd lane (`ssh test1@localhost -p 2222` —
-the existing `linux-test` harness) covering transport, auth/host-key
+bridge lane and a shed-sshd lane (`ssh <shed-name>@localhost -p 2222`
+— the shed platform's own sshd, username = shed name; the existing
+`linux-test` harness) covering transport, auth/host-key
 failure surfaces, connection loss, and bootstrap verify. On top of
 that, the live criterion: Mac iced app connects to the shed VM —
 native tabs drive PTYs running in the VM; quit the Mac app, agents
@@ -591,5 +595,9 @@ default-backend change, not a rewrite.
 - Named sessions per host (`workbox:agents`) → after HS-3, if wanted.
 - `systemd --user` / launchd supervision of `roost-session` (vs
   plain daemon) → HS-2/3 hardening; plain daemon first.
-- Whether the Mac iced app ships host-sessions before general
-  iced-on-Mac parity messaging → product call at HS-2 ship time.
+- ~~Whether the Mac iced app ships host-sessions before general
+  iced-on-Mac parity messaging~~ **Resolved by events**: the Mac iced
+  build shipped the client surface with HS-2 (localhost hidden per
+  D11's Mac gate) and its SSH payoff with HS-3 slice 1 — host
+  sessions ride the experimental Mac app without waiting on parity
+  messaging; the Swift app stays untouched.
