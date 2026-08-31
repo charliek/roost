@@ -42,6 +42,12 @@
 //!   classification, and the [`ssh::SshTunnel`] runtime those add up to
 //!   — a local bridge socket whose every connection gets an `ssh` exec
 //!   over one shared mux.
+//! * [`bootstrap`] — installing `roost-session` onto an ssh host
+//!   (host-sessions HS-3 slice 2): the one candidate ladder both the
+//!   probe and [`ssh`]'s remote command are generated from, the shell
+//!   scripts a probe and an install run over there, the parsers for
+//!   what they answer, the release-asset naming and checksum rules, and
+//!   the failure families with the copy a user acts on.
 //!
 //! The Swift companion lives in `mac/Sources/Roost/IPCServer.swift`
 //! (post-M4). Golden cross-language vectors live under
@@ -50,6 +56,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod agent;
+pub mod bootstrap;
 pub mod dataframe;
 pub mod framing;
 pub mod messages;
