@@ -252,6 +252,12 @@ still a work in progress and does not yet promise binary
 compatibility, so the Roost protocol must version the payload and
 tolerate a Ghostty pin bump.
 
+*(Since resolved: plan 032 landed the pin bump exposing
+`ghostty_snapshot_*`, plan 034 / PR #371 wrapped it in `roost-vt`, and
+the shipped attach path is snapshot-first with no formatter MVP — see
+the roadmap's "What the 2026-08-26 research pass verified." The
+paragraph below is the pre-bump state, kept as rationale.)*
+
 Neither Roost’s current pin nor Herdr’s vendor tree exposes
 `ghostty_snapshot_*` yet. Getting it means the already-planned
 libghostty pin bump (iced-migration E8: 603+ commits behind

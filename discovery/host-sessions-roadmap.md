@@ -1,7 +1,8 @@
 # Host sessions — roadmap
 
-Status: **roadmap** — direction agreed 2026-08-26, milestones not yet
-scheduled. This refines [`host-sessions.md`](host-sessions.md) (the
+Status: **roadmap, in flight** — direction agreed 2026-08-26; HS-0,
+HS-1 (plans 035 + 036), and HS-2 (plan 037, PR #374) have shipped, and
+HS-3 (SSH transport) is next. This refines [`host-sessions.md`](host-sessions.md) (the
 discovery note, which stays the rationale document) into an ordered set
 of milestones with pinned design decisions. Per-milestone implementation
 plans are written when a milestone starts; this file records the
