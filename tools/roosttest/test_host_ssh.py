@@ -413,13 +413,12 @@ def host_key(roost: Roost, tab_id: int, timeout: float = 60.0) -> str:
     return wait_until(probe, timeout, f"the client to list host tab {tab_id}")
 
 
-#: What `host.connect` may answer for an **ssh** host. Unlike a socket
-#: target, an ssh one has no connection object at the moment the op
-#: replies — `open_ssh` spawns an establish and the `HostConn` is created
-#: an engine-feed hop later, so `host_connection_result` reads the set,
-#: finds nothing, and honestly says `disconnected`. The settled verdict is
-#: watched on the palette either way, which is why this is a tolerance
-#: rather than an assertion about which one it is.
+#: What `host.connect` may answer for an **ssh** host. The establish is
+#: in flight when the op replies, which `host_connection_result` reads as
+#: `connecting` (the `HostConn` itself is created an engine-feed hop
+#: later). The settled verdict is watched on the palette either way,
+#: which is why this stays a tolerance rather than an assertion about
+#: which spelling the race lands on.
 CONNECT_STARTED = ("disconnected", "connecting", "connected")
 
 

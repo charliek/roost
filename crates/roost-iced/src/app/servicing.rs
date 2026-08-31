@@ -1701,9 +1701,15 @@ impl App {
                         section.incarnation,
                         section.mirror.map(|mirror| mirror.read()),
                     ),
-                    // Not being driven at all reads as disconnected: the
-                    // section is listed with a ↻, which is the whole of
-                    // the "no daemon is spawned silently" rule on screen.
+                    // Not being driven at all reads as disconnected —
+                    // the section is listed with a ↻, which is the whole
+                    // of the "no daemon is spawned silently" rule on
+                    // screen — unless an ssh establish is in flight,
+                    // which is `connecting` on the band exactly like a
+                    // dial would be.
+                    None if self.hosts.establishing(&host.id) => {
+                        (host_sidebar::SectionState::Connecting, None, None)
+                    }
                     None => (host_sidebar::SectionState::Disconnected, None, None),
                 };
                 // Taken before `host.id` is moved into the view.
@@ -2414,12 +2420,16 @@ impl App {
         // reply and the dot drawn beside it can never disagree. A host
         // this app is not driving at all reads as disconnected, which is
         // exactly what its section shows.
-        let state = self
-            .hosts
-            .state(&host.id)
-            .map_or(host_sidebar::SectionState::Disconnected, |state| {
-                state.section_state()
-            });
+        let state = self.hosts.state(&host.id).map_or_else(
+            || {
+                if self.hosts.establishing(&host.id) {
+                    host_sidebar::SectionState::Connecting
+                } else {
+                    host_sidebar::SectionState::Disconnected
+                }
+            },
+            |state| state.section_state(),
+        );
         HostConnectionResult {
             host: host.into(),
             state: state.wire().to_string(),

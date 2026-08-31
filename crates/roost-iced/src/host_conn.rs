@@ -848,6 +848,19 @@ impl HostConnSet {
         self.conns.get(host).map(|conn| &conn.state)
     }
 
+    /// Whether an ssh establish is still in flight for this host — the
+    /// window where there is no `HostConn` yet but the attempt is very
+    /// much under way. The band and the `host.connect` reply both read
+    /// it as `connecting`; without it that window looks `disconnected`,
+    /// which is a wrong answer to hand a caller who just asked to
+    /// connect.
+    pub(crate) fn establishing(&self, host: &str) -> bool {
+        self.ssh
+            .get(host)
+            .is_some_and(|ssh| ssh.tunnel.is_none() && ssh.failure.is_none())
+            && !self.conns.contains_key(host)
+    }
+
     /// The incarnation currently serving a saved host, if it is
     /// connected.
     pub(crate) fn incarnation(&self, host: &str) -> Option<HostId> {
@@ -1402,6 +1415,25 @@ mod tests {
             }),
         );
         assert_eq!(set.section_reason("h1"), Some("the session closed"));
+    }
+
+    /// The establish window answers `connecting`, not `disconnected`:
+    /// `host.connect` documents that reply, and the attempt is under way
+    /// even though no `HostConn` exists yet.
+    #[tokio::test]
+    async fn an_establish_in_flight_reads_as_connecting() {
+        let (mut set, _feed) = a_set();
+        assert!(!set.establishing("h1"), "nothing asked for yet");
+        set.open_ssh("h1", "one", ssh_target("workbox"), ConnectMode::Dial);
+        let request = set.ssh["h1"].request;
+        assert!(set.establishing("h1"), "the establish is in flight");
+        set.tunnel_ready(failed("h1", request, "workbox refused authentication"));
+        assert!(
+            !set.establishing("h1"),
+            "a settled failure is disconnected, not connecting"
+        );
+        set.disconnect("h1");
+        assert!(!set.establishing("h1"));
     }
 
     /// Disconnecting drops everything keyed on the host, so a late item
