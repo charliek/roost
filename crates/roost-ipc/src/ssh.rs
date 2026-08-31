@@ -372,7 +372,16 @@ const CONFIG_FILE: &str = "ssh_config";
 /// The two file names created under a host's control-socket directory.
 /// Both are `AF_UNIX` paths and both must fit `sun_path`, so the probe
 /// below checks the longer of the two against every candidate.
-const SOCKET_FILE_NAMES: [&str; 2] = [CTL_FILE, BRIDGE_FILE];
+/// What the length probe must measure for the control socket: OpenSSH
+/// binds the ControlPath as a temporary `ctl.XXXXXXXXXXXXXXXX` (sixteen
+/// random characters after a dot) and renames it into place, so the
+/// *bindable* name is 17 bytes longer than the one that ends up on
+/// disk. Measuring bare `ctl` passed directories whose real bind then
+/// failed with ssh's own "path too long for Unix domain socket" —
+/// found live on macOS, whose `$TMPDIR` is deep (plan 038 §8).
+const CTL_BIND_PROBE: &str = "ctl.XXXXXXXXXXXXXXXX";
+
+const SOCKET_FILE_NAMES: [&str; 2] = [CTL_BIND_PROBE, BRIDGE_FILE];
 
 /// The prefix every scratch directory this module creates shares.
 const SCRATCH_PREFIX: &str = "roost-ssh-";
@@ -2014,6 +2023,23 @@ mod tests {
         let dir =
             pick_socket_dir(std::slice::from_ref(&short), name).expect("a short TMPDIR must fit");
         assert_eq!(dir, short.join(name));
+    }
+
+    /// The live-run regression: a directory where `ctl` fits but
+    /// OpenSSH's temporary `ctl.XXXXXXXXXXXXXXXX` bind name does not
+    /// must be rejected — measuring the on-disk name passed a macOS
+    /// `$TMPDIR` whose real ControlMaster bind then failed inside ssh.
+    #[test]
+    fn pick_socket_dir_measures_the_ssh_bind_name_not_the_final_one() {
+        let name = "roost-ssh-workbox-aaaaaaaaaaaaaaaa-4242-0";
+        // Sized so `<dir>/<name>/ctl` fits SUN_PATH_MAX but
+        // `<dir>/<name>/ctl.XXXXXXXXXXXXXXXX` does not.
+        let parent_len = SUN_PATH_MAX - name.len() - "/ctl".len() - 8;
+        let parent = PathBuf::from(format!("/{}", "p".repeat(parent_len - 1)));
+        assert!(parent.join(name).join("ctl").as_os_str().len() <= SUN_PATH_MAX);
+        assert!(parent.join(name).join(CTL_BIND_PROBE).as_os_str().len() > SUN_PATH_MAX);
+        pick_socket_dir(std::slice::from_ref(&parent), name)
+            .expect_err("a dir only the renamed ctl fits in is not usable");
     }
 
     #[test]
