@@ -36,6 +36,10 @@
 //! * [`target`] — CLI-side target selection for `roostctl`.
 //! * [`session_launch`] — the launch-cwd hint and the readiness verdict
 //!   line `roostctl session start` and `roost-session` exchange.
+//! * [`ssh`] — pure classification of a saved host's `target` string
+//!   (host-sessions HS-3), plus the generated `ssh_config`, argv
+//!   builders, `sun_path` sizing, and connection-failure classification
+//!   the SSH tunnel runtime is built from.
 //!
 //! The Swift companion lives in `mac/Sources/Roost/IPCServer.swift`
 //! (post-M4). Golden cross-language vectors live under
@@ -50,6 +54,7 @@ pub mod messages;
 pub mod paths;
 pub mod session_launch;
 pub mod socket_state;
+pub mod ssh;
 pub mod target;
 
 pub mod client;
