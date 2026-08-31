@@ -121,6 +121,30 @@ pub struct SshTarget {
     /// and `user-host` both sanitize to `user-host`), still produce
     /// different tokens.
     pub token: String,
+    /// "The same account on the same machine", as far as the target
+    /// string can say so: `user@host:port` with the scheme dropped, the
+    /// host lowercased and the port defaulted to 22.
+    ///
+    /// [`Self::token`] answers a different question — it identifies one
+    /// *spelling*, because the filesystem slice it names must be
+    /// distinct for every distinct target. This one deliberately
+    /// collapses spellings, because a mutual-exclusion claim over a
+    /// remote `~/.local/bin/roost-session` has to hold whichever way the
+    /// two saved hosts pointing at that box happen to be written
+    /// (`workbox` and `ssh://WorkBox:22` are one machine, one file).
+    ///
+    /// **Not exact, and cannot be.** An `ssh_config` `Host` alias maps
+    /// an arbitrary name onto an arbitrary hostname, user and port, so
+    /// `workbox` and `charlie@10.0.0.4` can be the same account on the
+    /// same machine while no textual normalization could ever say so —
+    /// and the reverse, a bare `workbox` whose config sets `Port 2200`,
+    /// reads here as port 22. Resolving that would mean running `ssh -G`
+    /// per target, which is a subprocess in the connect path this flow
+    /// is specifically built not to have. The residual case is two
+    /// concurrent installs that this key does not merge; the install
+    /// itself is a staged write plus an atomic rename, so the loser
+    /// overwrites rather than tears.
+    pub claim_key: String,
 }
 
 impl SshTarget {
@@ -128,6 +152,7 @@ impl SshTarget {
         Self {
             raw: raw.to_string(),
             token: host_token(raw),
+            claim_key: claim_key(raw),
         }
     }
 }
@@ -209,6 +234,45 @@ fn host_token(raw: &str) -> String {
         })
         .collect();
     format!("{truncated}-{:016x}", fnv1a64(raw.as_bytes()))
+}
+
+/// The port an ssh target with none spelled out is assumed to use.
+/// Assumed rather than resolved — see [`SshTarget::claim_key`].
+const DEFAULT_SSH_PORT: &str = "22";
+
+/// Canonicalize `raw` into [`SshTarget::claim_key`]'s
+/// `user@host:port` — scheme dropped, any path after the authority
+/// dropped, host lowercased, port defaulted.
+fn claim_key(raw: &str) -> String {
+    let rest = if starts_with_ssh_scheme(raw) {
+        &raw[SSH_SCHEME.len()..]
+    } else {
+        raw
+    };
+    // `ssh://host/path` is accepted by `classify`; only the authority
+    // names the machine.
+    let authority = rest.split('/').next().unwrap_or("");
+    // Rightmost `@`: a password-free ssh target has one, and splitting
+    // from the right keeps an `@` inside a user name on the user side.
+    let (user, host_port) = authority.rsplit_once('@').unwrap_or(("", authority));
+    let (host, port) = split_host_port(host_port);
+    format!("{user}@{}:{port}", host.to_ascii_lowercase())
+}
+
+/// Split an ssh authority's `host[:port]`, with `[::1]:22` handled as
+/// its own shape so an IPv6 literal's colons are not read as a port.
+fn split_host_port(authority: &str) -> (&str, &str) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').filter(|p| !p.is_empty());
+            return (host, port.unwrap_or(DEFAULT_SSH_PORT));
+        }
+    }
+    match authority.rsplit_once(':') {
+        // A bare IPv6 literal with no brackets has no port to find.
+        Some((host, port)) if !host.contains(':') && !port.is_empty() => (host, port),
+        _ => (authority, DEFAULT_SSH_PORT),
+    }
 }
 
 /// FNV-1a, 64-bit. Deliberately not `std::hash::DefaultHasher`: that
@@ -535,9 +599,14 @@ impl SshFailure {
                 "{target} is reachable but has no roost session running. Run `roostctl session \
                  start` on that machine, then try again."
             ),
+            // The remedy is deliberately one sentence and one place: the
+            // install is an in-app, consent-gated flow (plan 039 §3.5),
+            // and `roostctl` has no bootstrap surface of its own — so
+            // the CLI's job here is to point at the app rather than to
+            // grow a second door.
             Self::NotFound => format!(
                 "roost-session isn't installed on {target} (or isn't on the non-interactive \
-                 PATH ssh uses there)."
+                 PATH ssh uses there) — connect from the Roost app to install it."
             ),
             Self::Transport(Some(line)) => format!("connecting to {target} failed: {line}"),
             Self::Transport(None) => format!("connecting to {target} failed"),
@@ -1897,6 +1966,70 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
+    /// The claim key collapses the spellings the token deliberately
+    /// keeps apart. Every one of these names one account on one
+    /// machine, and two installs racing onto its single
+    /// `~/.local/bin/roost-session` is exactly what the claim exists to
+    /// stop.
+    #[test]
+    fn equivalent_spellings_of_one_machine_share_a_claim_key() {
+        let plain = SshTarget::new("workbox");
+        for equivalent in [
+            "ssh://workbox",
+            "SSH://workbox",
+            "ssh://WorkBox",
+            "ssh://workbox:22",
+            "ssh://workbox/",
+            "WORKBOX",
+        ] {
+            let other = SshTarget::new(equivalent);
+            assert_eq!(
+                plain.claim_key, other.claim_key,
+                "{equivalent:?} is the same box as workbox"
+            );
+            assert_ne!(
+                plain.token, other.token,
+                "{equivalent:?} still names a filesystem slice of its own"
+            );
+        }
+        assert_eq!(plain.claim_key, "@workbox:22");
+
+        let user = SshTarget::new("charlie@workbox");
+        assert_eq!(user.claim_key, "charlie@workbox:22");
+        assert_eq!(
+            SshTarget::new("ssh://charlie@WORKBOX:22").claim_key,
+            user.claim_key
+        );
+    }
+
+    /// And it keeps apart what actually differs — a second account, a
+    /// second port, a second machine. Merging any of those would let one
+    /// install block an unrelated one.
+    #[test]
+    fn a_different_account_port_or_machine_is_a_different_claim() {
+        let base = SshTarget::new("charlie@workbox").claim_key;
+        for other in [
+            "root@workbox",
+            "workbox",
+            "ssh://charlie@workbox:2200",
+            "charlie@otherbox",
+        ] {
+            assert_ne!(
+                base,
+                SshTarget::new(other).claim_key,
+                "{other:?} is not the same claim as charlie@workbox"
+            );
+        }
+
+        // An IPv6 literal's colons are the address, not a port.
+        assert_eq!(SshTarget::new("ssh://[::1]").claim_key, "@::1:22");
+        assert_eq!(SshTarget::new("ssh://[::1]:2222").claim_key, "@::1:2222");
+        assert_eq!(
+            SshTarget::new("ssh://[::1]:22").claim_key,
+            SshTarget::new("ssh://[::1]").claim_key
+        );
+    }
+
     /// The reason the hash covers the *full* raw string rather than the
     /// truncated prefix: two targets that sanitize to the same short
     /// prefix must not collide on disk.
@@ -2329,6 +2462,14 @@ mod tests {
         assert!(SshFailure::NoSession
             .message("workbox")
             .contains("roostctl session start"));
-        assert!(SshFailure::NotFound.message("workbox").contains("workbox"));
+        let not_found = SshFailure::NotFound.message("workbox");
+        assert!(not_found.contains("workbox"));
+        // The one remedy this family offers, and the only one there is:
+        // `roostctl` gains no install surface (plan 039 §3.5), so the
+        // sentence has to send the reader to the app.
+        assert!(
+            not_found.contains("connect from the Roost app to install it"),
+            "{not_found}"
+        );
     }
 }

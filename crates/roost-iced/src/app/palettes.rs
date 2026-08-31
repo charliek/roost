@@ -840,7 +840,9 @@ impl App {
     /// opens its dialog, so every activation route ends with both focus
     /// tails rather than waiting for a timer to notice the request.
     pub fn palette_activate(&mut self, id: &str) -> UiTask {
-        let (error, task) = self.activate_palette(id).error();
+        let (error, task) = self
+            .activate_palette(id, Self::CLICK_ACTIVATION_ORIGIN)
+            .error();
         if let Some(error) = error {
             self.set_status(error);
         }
@@ -1207,16 +1209,38 @@ impl App {
             .and_then(palette::PaletteState::selected_item)
             .map(|item| item.id);
         match id {
-            Some(id) => self.activate_palette(&id),
+            Some(id) => self.activate_palette(&id, Self::CLICK_ACTIVATION_ORIGIN),
             None => PaletteActivation::ready(Err("no actionable palette row selected".into())),
         }
     }
+
+    /// Who a palette row activated by a click or an Enter is run for,
+    /// and who a `palette.activate` arriving over the IPC socket is.
+    ///
+    /// Named rather than spelled at the call sites for
+    /// [`App::IPC_CONNECT_ORIGIN`]'s reason: `palette.activate` is an
+    /// ungated production op with a shipped `roostctl palette open host`
+    /// in front of it, and the row it runs is the same row a click runs.
+    /// The origin is the only place that difference survives — and a
+    /// modal is never raised at a machine (plan 039 §3.5).
+    pub(super) const CLICK_ACTIVATION_ORIGIN: crate::host_conn::RequestOrigin =
+        crate::host_conn::RequestOrigin::User;
+    pub(super) const IPC_ACTIVATION_ORIGIN: crate::host_conn::RequestOrigin =
+        crate::host_conn::RequestOrigin::Ipc;
 
     /// Run the row `id` and say what its `palette.activate` reply is: the
     /// state the action produced, the operation error it failed with, or
     /// — for the four rows that now mutate the engine off the UI thread —
     /// the op id whose completion owes that answer.
-    pub(super) fn activate_palette(&mut self, id: &str) -> PaletteActivation {
+    ///
+    /// `origin` is who is asking — see [`Self::CLICK_ACTIVATION_ORIGIN`].
+    /// Only the host rows read it, and only to refuse to raise a modal
+    /// at a machine.
+    pub(super) fn activate_palette(
+        &mut self,
+        id: &str,
+        origin: crate::host_conn::RequestOrigin,
+    ) -> PaletteActivation {
         let resolved = self
             .palette
             .as_mut()
@@ -1241,7 +1265,7 @@ impl App {
             return PaletteActivation::ready(Ok(self.palette_state_result()));
         }
 
-        let dispatch = match self.run_palette_row(&frame_id, item) {
+        let dispatch = match self.run_palette_row(&frame_id, item, origin) {
             Ok(dispatch) => dispatch,
             Err(error) => return PaletteActivation::ready(Err(error)),
         };
@@ -1278,6 +1302,7 @@ impl App {
         &mut self,
         frame_id: &str,
         item: palette::PaletteItem,
+        origin: crate::host_conn::RequestOrigin,
     ) -> Result<EngineDispatch, String> {
         let mut dispatch = EngineDispatch::default();
         match frame_id {
@@ -1412,7 +1437,7 @@ impl App {
                             "palette command {command:?} is not implemented by Iced"
                         ));
                     };
-                    dispatch = self.run_host_verb(verb)?;
+                    dispatch = self.run_host_verb(verb, origin)?;
                 }
             },
             "launcher" => {
@@ -1474,7 +1499,7 @@ impl App {
                 let Some(verb) = verb else {
                     return Err(format!("host picker row {:?} cannot be activated", item.id));
                 };
-                dispatch = self.run_host_verb(verb)?;
+                dispatch = self.run_host_verb(verb, origin)?;
             }
             "present" => {
                 if let Some(reply) = self.palette_present_reply.take() {
@@ -1511,7 +1536,16 @@ impl App {
     /// dialog, because one needs free text and the other needs a
     /// confirmation. Both dismiss the palette first — a modal behind a
     /// palette is not a modal.
-    fn run_host_verb(&mut self, verb: host_verbs::HostVerb) -> Result<EngineDispatch, String> {
+    ///
+    /// `origin` is what keeps `Connect` from being a third: it is an
+    /// ordinary dial for most hosts, but on a mismatched one it raises
+    /// the upgrade prompt — whose button now starts a remote install —
+    /// and `palette.activate` is reachable from `roostctl`.
+    fn run_host_verb(
+        &mut self,
+        verb: host_verbs::HostVerb,
+        origin: crate::host_conn::RequestOrigin,
+    ) -> Result<EngineDispatch, String> {
         use host_verbs::HostVerb;
         match verb {
             HostVerb::Add => {
@@ -1534,8 +1568,11 @@ impl App {
                 self.clear_palette_state();
                 // The gated entry: a build mismatch answers this verb
                 // with the upgrade prompt rather than a dial that would
-                // fail the same way again (plan 037 §3.7).
-                self.host_connect_requested(&saved_id);
+                // fail the same way again (plan 037 §3.7) — for a
+                // person. `palette.activate` reaches this same row over
+                // the IPC socket, and a machine gets the dial
+                // `host.connect` already gives it (plan 039 §3.5).
+                self.host_connect_requested(&saved_id, origin);
             }
             HostVerb::Disconnect(saved_id) => {
                 self.clear_palette_state();
@@ -2093,6 +2130,26 @@ mod tests {
         assert_eq!(
             closed.selected_in_view, None,
             "a closed palette reports no geometry, however the last open one measured"
+        );
+    }
+
+    /// The second door onto the host verbs, and the one C5a's
+    /// `IPC_CONNECT_ORIGIN` did not cover: `palette.activate` is an
+    /// ungated production op with `roostctl palette open host` in front
+    /// of it, and its `Connect` row is the very row a click runs. The
+    /// two constants are how the difference survives into
+    /// `host_connect_requested`, and they must agree with the
+    /// `host.connect` door's answer for the same caller.
+    #[test]
+    fn a_palette_activation_over_ipc_is_never_a_users() {
+        use crate::host_conn::RequestOrigin;
+        assert_eq!(App::CLICK_ACTIVATION_ORIGIN, RequestOrigin::User);
+        assert_eq!(App::IPC_ACTIVATION_ORIGIN, RequestOrigin::Ipc);
+        assert_ne!(App::CLICK_ACTIVATION_ORIGIN, App::IPC_ACTIVATION_ORIGIN);
+        assert_eq!(
+            App::IPC_ACTIVATION_ORIGIN,
+            App::IPC_CONNECT_ORIGIN,
+            "both IPC doors onto a Connect answer the same way"
         );
     }
 

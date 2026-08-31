@@ -26,29 +26,29 @@ use std::time::Duration;
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
-    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
-    AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
-    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
-    AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
-    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
-    HostListParams, HostListResult, HostRemoveParams, IdentifyParams, IdentifyResult,
-    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
-    SessionSetFocusParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
+    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppMenuActivateParams,
+    AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams, AppNotificationStatusResult,
+    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
+    AppSetWindowFocusParams, AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult,
+    AttachPayloadKind, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
+    EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams, HostAddResult,
+    HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult,
+    HostRemoveParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
+    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
+    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
+    ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams,
+    SelectionDumpParams, SelectionDumpResult, SelectionSetParams, SessionConnectParams,
+    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetFocusParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
+    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
@@ -405,6 +405,19 @@ pub enum UiRequest {
     /// takes. Gated + macOS-iced-only like `AppDockBadge`.
     AppMenuActivate {
         path: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// `app.dialog_dump` — read which host modal is on screen and the
+    /// strings it is showing. Gated like `TabFeedPtyBytes`; a test seam
+    /// for the ssh bootstrap's consent card, never a surface.
+    AppDialogDump {
+        reply: tokio::sync::oneshot::Sender<Result<AppDialogDumpResult, String>>,
+    },
+    /// `app.dialog_answer` — confirm or cancel the visible host modal,
+    /// through the same routes a click and Enter/Escape take. `action`
+    /// is `"confirm" | "cancel"`. Gated like `AppDialogDump`.
+    AppDialogAnswer {
+        action: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// `app.update_status` — read back the macOS iced UI's Sparkle
@@ -2751,6 +2764,30 @@ async fn dispatch(
             let p: AppMenuActivateParams = decode(params)?;
             h.ui_call(|reply| UiRequest::AppMenuActivate {
                 path: p.path,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::APP_DIALOG_DUMP => {
+            let _: AppDialogDumpParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppDialogDump { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&result)
+        }
+        ops::APP_DIALOG_ANSWER => {
+            let p: AppDialogAnswerParams = decode(params)?;
+            if !matches!(p.action.as_str(), "confirm" | "cancel") {
+                return Err(HandlerError::invalid_param(format!(
+                    "action must be confirm or cancel (got {:?})",
+                    p.action
+                )));
+            }
+            h.ui_call(|reply| UiRequest::AppDialogAnswer {
+                action: p.action,
                 reply,
             })
             .await?

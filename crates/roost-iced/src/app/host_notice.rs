@@ -109,38 +109,77 @@ impl FrozenFrame {
     }
 }
 
-/// The upgrade dialog's contents (plan 037 §3.7).
+/// The upgrade dialog's contents (plan 037 §3.7, plan 039 §3.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RestartPrompt {
     pub(super) title: String,
     pub(super) body: String,
-    /// Whether this client can run the restart itself. `false` renders
-    /// the state and a pointer instead of a button that cannot work —
-    /// a remote session is somebody else's process.
-    pub(super) restartable: bool,
+    /// What this client can do about it. The dialog's primary button —
+    /// which one, and whether there is one at all — falls out of this
+    /// rather than out of a separate boolean that could disagree with
+    /// it.
+    pub(super) action: RestartAction,
+    /// The primary button's label, already naming the host where that
+    /// matters. `None` renders the state and the pointer with no button
+    /// at all, which is plan 037 §3.1's "no dead button" made literal.
+    pub(super) confirm: Option<String>,
+}
+
+impl RestartPrompt {
+    /// The dismissing button. "Not now" only reads right beside an
+    /// action the user is declining; a dialog with nothing to decline
+    /// says "Close".
+    pub(super) fn dismiss_label(&self) -> &'static str {
+        if self.confirm.is_some() {
+            "Not now"
+        } else {
+            "Close"
+        }
+    }
 }
 
 /// Compose the upgrade dialog for a host whose compatibility gate
 /// refused.
+///
+/// Three actions, three prompts. The middle one is plan 039's: a host
+/// reached over ssh can be updated from here, so it gets a body that
+/// says what will happen and a button that does it — the *offer* is
+/// structural (this is an ssh host), and whether a matching build
+/// actually exists to install is resolved when the user confirms.
 pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPrompt {
     let vintage = vintage(mismatch);
     let detail = detail(mismatch);
-    // Three actions, two prompts — for now. C5b gives
-    // `OfferRemoteUpdate` a branch and a button of its own; until then a
-    // host that *could* be updated reads exactly as one that could not,
-    // which is today's copy for both.
-    if mismatch.restart == RestartAction::RestartLocal {
-        RestartPrompt {
+    match mismatch.restart {
+        RestartAction::RestartLocal => RestartPrompt {
             title: format!("Restart the session on {label}?"),
             body: format!(
                 "This session was started by {vintage} ({detail}). Restarting \
                  reopens every tab as a fresh shell in its directory — running \
                  programs end.",
             ),
-            restartable: true,
-        }
-    } else {
-        RestartPrompt {
+            action: mismatch.restart,
+            confirm: Some("Restart session".to_string()),
+        },
+        RestartAction::OfferRemoteUpdate => RestartPrompt {
+            title: format!("The session on {label} needs a restart"),
+            body: format!(
+                "This session was started by {vintage} ({detail}). Roost can \
+                 install the matching roost-session on {label} over ssh and \
+                 restart the session there — it will show you what it would do \
+                 before anything is changed.{}",
+                // Said here as well as on the consent card, because this
+                // is where the user decides whether to look at all.
+                if session_is_newer(mismatch) {
+                    " That session is newer than this Roost, so it would install \
+                     an older build; upgrading this Roost is likely the fix."
+                } else {
+                    ""
+                }
+            ),
+            action: mismatch.restart,
+            confirm: Some(format!("Update roost-session on {label}")),
+        },
+        RestartAction::None => RestartPrompt {
             title: format!("The session on {label} needs a restart"),
             body: format!(
                 "This session was started by {vintage} ({detail}). Only the \
@@ -148,9 +187,57 @@ pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPr
                  there (`roostctl session stop`, then `roostctl session start`). \
                  See the host sessions guide.",
             ),
-            restartable: false,
-        }
+            action: mismatch.restart,
+            confirm: None,
+        },
     }
+}
+
+/// What a Connect on a host whose compatibility gate already refused
+/// actually does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectRoute {
+    /// Dial. Plan 038's behavior, unchanged.
+    Dial,
+    /// Raise the upgrade prompt instead — dialing would reproduce the
+    /// same refusal (plan 037 §3.7).
+    Prompt,
+}
+
+/// The gate on `host_connect_requested`.
+///
+/// **A modal is never raised at a machine** (plan 039 §3.5), and this
+/// verb has two doors onto it: the sidebar's ↻ and a palette row —
+/// which `palette.activate` reaches over the IPC socket, with a shipped
+/// `roostctl palette open host` in front of it. The row is the same row
+/// either way, so the origin is the only thing that separates a person
+/// from `roostctl`, and an unattended UI left holding a modal swallows
+/// keyboard input until somebody dismisses it.
+///
+/// `host.connect` already routes around this prompt entirely, dialing
+/// straight through; this makes the palette's door agree with it rather
+/// than being the one that got missed.
+pub(super) fn connect_route(
+    origin: crate::host_conn::RequestOrigin,
+    needs_restart: bool,
+) -> ConnectRoute {
+    if needs_restart && origin == crate::host_conn::RequestOrigin::User {
+        ConnectRoute::Prompt
+    } else {
+        ConnectRoute::Dial
+    }
+}
+
+/// Whether the *session* is the newer of the two, where that is
+/// knowable at all.
+///
+/// [`vintage`]'s direction, as a predicate: protocol numbers order, so
+/// "newer" is a fact there; two libghostty build strings that disagree
+/// are merely different, and a downgrade warning guessed off one would
+/// be a dialog inventing a direction.
+pub(super) fn session_is_newer(mismatch: &BuildMismatch) -> bool {
+    matches!(mismatch.kind, MismatchKind::Protocol)
+        && mismatch.session_protocol > mismatch.client_protocol
 }
 
 /// Which direction the skew runs, said only where it is actually known.
@@ -308,20 +395,17 @@ mod tests {
         );
     }
 
-    /// A restartable host gets the button and the warning that goes with
-    /// it; a remote one gets neither — no dead button (plan 037 §3.1).
-    ///
-    /// Three actions now, and both remote ones render today's remote
-    /// copy: `OfferRemoteUpdate` says an update *could* be offered, and
-    /// C5b is what offers it. Until then the two are indistinguishable
-    /// here, which is what "no behavior change" means for this commit.
+    /// Three actions, three prompts: the local restart, the ssh update
+    /// offer, and the remote Unix-socket host that gets a pointer at the
+    /// docs and no button — no dead button (plan 037 §3.1).
     #[test]
-    fn only_a_restartable_host_is_offered_a_restart() {
+    fn each_restart_action_gets_the_prompt_it_can_act_on() {
         let local = restart_prompt(
             "localhost",
             &mismatch(MismatchKind::Build, RestartAction::RestartLocal),
         );
-        assert!(local.restartable);
+        assert_eq!(local.confirm.as_deref(), Some("Restart session"));
+        assert_eq!(local.dismiss_label(), "Not now");
         assert!(local.title.starts_with("Restart the session"));
         assert!(
             local.body.contains("running programs end"),
@@ -329,20 +413,109 @@ mod tests {
             local.body
         );
 
-        for action in [RestartAction::OfferRemoteUpdate, RestartAction::None] {
-            let remote = restart_prompt("pop-os", &mismatch(MismatchKind::Build, action));
-            assert!(!remote.restartable, "{action:?}");
-            assert!(remote.title.contains("needs a restart"), "{action:?}");
-            assert!(
-                remote.body.contains("host sessions guide"),
-                "a remote host is pointed at the docs instead: {}",
-                remote.body
-            );
-            assert!(
-                !remote.body.contains("Restarting reopens"),
-                "and is never told what a button it does not have would do"
+        let offer = restart_prompt(
+            "pop-os",
+            &mismatch(MismatchKind::Build, RestartAction::OfferRemoteUpdate),
+        );
+        assert_eq!(
+            offer.confirm.as_deref(),
+            Some("Update roost-session on pop-os"),
+            "the button names the host it would reach"
+        );
+        assert_eq!(offer.dismiss_label(), "Not now");
+        assert!(offer.title.contains("needs a restart"));
+        assert!(offer.body.contains("over ssh"), "{}", offer.body);
+        assert!(
+            offer.body.contains("before anything is changed"),
+            "the offer promises consent first: {}",
+            offer.body
+        );
+        assert!(
+            !offer.body.contains("host sessions guide"),
+            "a host with a button is not sent to the docs instead: {}",
+            offer.body
+        );
+
+        let none = restart_prompt(
+            "remote.sock",
+            &mismatch(MismatchKind::Build, RestartAction::None),
+        );
+        assert_eq!(none.confirm, None);
+        assert_eq!(none.dismiss_label(), "Close");
+        assert!(none.title.contains("needs a restart"));
+        assert!(
+            none.body.contains("host sessions guide"),
+            "a host nothing can be offered for is pointed at the docs: {}",
+            none.body
+        );
+        assert!(
+            !none.body.contains("Restarting reopens"),
+            "and is never told what a button it does not have would do"
+        );
+    }
+
+    /// Only a person is ever answered with a modal.
+    ///
+    /// `palette.activate` is a shipped, ungated IPC op with a
+    /// `roostctl palette open host` in front of it, and its `Connect`
+    /// row is the very row a click runs. Without the origin, a
+    /// machine-driven activation on a `NeedsRestart` ssh host would
+    /// raise this prompt — and its button now starts a remote install —
+    /// on a UI nobody is watching.
+    #[test]
+    fn a_connect_arriving_over_ipc_never_raises_the_upgrade_prompt() {
+        use crate::host_conn::RequestOrigin;
+
+        assert_eq!(
+            connect_route(RequestOrigin::User, true),
+            ConnectRoute::Prompt,
+            "a person on a mismatched host gets the question"
+        );
+        assert_eq!(
+            connect_route(RequestOrigin::Ipc, true),
+            ConnectRoute::Dial,
+            "a machine gets what host.connect already gives it: a dial"
+        );
+        for origin in [RequestOrigin::User, RequestOrigin::Ipc] {
+            assert_eq!(
+                connect_route(origin, false),
+                ConnectRoute::Dial,
+                "a host with no mismatch has nothing to prompt about: {origin:?}"
             );
         }
+    }
+
+    /// The remote offer says which way the skew runs, but only where
+    /// that is knowable — and it keeps its button either way. A
+    /// downgrade the user has a reason for is theirs to make; a
+    /// downgrade they did not notice is not.
+    #[test]
+    fn the_remote_offer_names_a_downgrade_and_still_offers_it() {
+        let mut newer = mismatch(MismatchKind::Protocol, RestartAction::OfferRemoteUpdate);
+        newer.session_protocol = SESSION_PROTOCOL_VERSION + 1;
+        assert!(session_is_newer(&newer));
+        let prompt = restart_prompt("pop-os", &newer);
+        assert!(
+            prompt.body.contains("install an older build"),
+            "{}",
+            prompt.body
+        );
+        assert!(prompt.confirm.is_some(), "the offer stands");
+
+        let mut older = mismatch(MismatchKind::Protocol, RestartAction::OfferRemoteUpdate);
+        older.session_protocol = SESSION_PROTOCOL_VERSION - 1;
+        assert!(!session_is_newer(&older));
+        assert!(!restart_prompt("pop-os", &older)
+            .body
+            .contains("older build"));
+
+        // Two build strings that disagree are merely different, so no
+        // direction is claimed.
+        let build = mismatch(MismatchKind::Build, RestartAction::OfferRemoteUpdate);
+        assert!(!session_is_newer(&build));
+        assert!(!restart_prompt("pop-os", &build)
+            .body
+            .contains("older build"));
     }
 
     /// Direction is claimed only where it is known. Protocol numbers

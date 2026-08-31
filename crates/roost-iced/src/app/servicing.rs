@@ -1228,6 +1228,14 @@ impl App {
                         _ => None,
                     };
                     let connected = matches!(state, crate::host_conn::HostConnState::Connected);
+                    // A connection that *drops* is the second place a
+                    // classified ssh failure lands: the tunnel's own
+                    // per-connection exec is what failed, and
+                    // `overlay_ssh_reason` is what records its family.
+                    // Only a drop, so a Connecting/Connected transition
+                    // cannot re-raise a card for a failure already
+                    // answered.
+                    let dropped = matches!(state, crate::host_conn::HostConnState::Disconnected(_));
                     if let Some(host) = self.hosts.apply_state(host, state) {
                         // Stamp the registry the moment a connection
                         // settles — `last_connected` is what the Add Host
@@ -1254,12 +1262,16 @@ impl App {
                             self.purge_host_incarnation(previous);
                         }
                         tracing::debug!(%host, "host connection state changed");
+                        if dropped {
+                            self.maybe_offer_bootstrap(&host);
+                        }
                     }
                     // The band's dot and rollup are cached with the rows;
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
                 }
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
+                EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -2169,6 +2181,32 @@ impl App {
                 let result = macos_test_gated(self.test_mode, || activate_menu(&path));
                 let _ = reply.send(result);
             }
+            UiRequest::AppDialogDump { reply } => {
+                let result = if self.test_mode {
+                    Ok(self.dialog_dump())
+                } else {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                };
+                let _ = reply.send(result);
+            }
+            UiRequest::AppDialogAnswer { action, reply } => {
+                let result = if self.test_mode {
+                    self.dialog_answer(&action)
+                } else {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                };
+                // The button's own task, chained rather than replacing
+                // whatever this drain already owed — Add Host's confirm
+                // dispatches an engine op, and dropping it would leave
+                // the dialog waiting on a dial nobody started.
+                let _ = reply.send(match result {
+                    Ok(button) => {
+                        task = task.then(button);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                });
+            }
             UiRequest::AppUpdateStatus { reply } => {
                 let result = macos_test_gated(self.test_mode, read_update_status);
                 let _ = reply.send(result);
@@ -2205,7 +2243,9 @@ impl App {
                 let _ = reply.send(self.query_palette(&query));
             }
             UiRequest::PaletteActivate { id, reply } => {
-                let activation = self.activate_palette(&id);
+                // The row is the one a click runs; only the origin says
+                // that nobody is sitting in front of this one.
+                let activation = self.activate_palette(&id, Self::IPC_ACTIVATION_ORIGIN);
                 match activation.reply {
                     PaletteReplyRoute::Ready(result) => {
                         let _ = reply.send(result);
@@ -2402,7 +2442,7 @@ impl App {
     /// for — a modal never opens to answer a machine (plan 039 §3.5) —
     /// is something a test can hold on to. `roostctl host connect` dials
     /// exactly as a click does, so nothing downstream could infer this.
-    const IPC_CONNECT_ORIGIN: crate::host_conn::RequestOrigin =
+    pub(super) const IPC_CONNECT_ORIGIN: crate::host_conn::RequestOrigin =
         crate::host_conn::RequestOrigin::Ipc;
 
     /// `host.connect`, as the op answers it: start the attempt and

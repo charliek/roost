@@ -47,6 +47,17 @@ impl AddHostDraft {
         self.verifying.is_some()
     }
 
+    /// The primary button's label. Inert while a dial is in flight
+    /// rather than hidden — a button that vanishes mid-press moves the
+    /// card under the pointer — so the label is what says so.
+    pub(super) fn confirm_label(&self) -> &'static str {
+        if self.is_verifying() {
+            "Connecting…"
+        } else {
+            "Add & Connect"
+        }
+    }
+
     /// Arm a fresh dial. The error goes with it: the draft is being
     /// asked about again, so whatever was wrong last time is no longer
     /// what the dialog is saying.
@@ -103,6 +114,16 @@ pub(super) enum HostDialog {
         saved_id: String,
         prompt: super::host_notice::RestartPrompt,
     },
+    /// Consent to install, update or start `roost-session` on a host
+    /// reached over ssh (plan 039 §3.5).
+    ///
+    /// The fourth member of the family rather than a surface of its own,
+    /// because it is the same kind of question the other three are: one
+    /// the user still owes an answer to, over chrome that keeps working
+    /// underneath. It carries a snapshot for `ConfirmStop`'s reason —
+    /// the card describes the far side as a *read-only* probe found it,
+    /// and nothing has been touched over there yet.
+    Bootstrap(super::bootstrap::BootstrapDraft),
 }
 
 impl HostDialog {
@@ -113,7 +134,7 @@ impl HostDialog {
     pub(super) fn draft_mut(&mut self) -> Option<&mut AddHostDraft> {
         match self {
             Self::Add(draft) => Some(draft),
-            Self::ConfirmStop { .. } | Self::ConfirmRestart { .. } => None,
+            Self::ConfirmStop { .. } | Self::ConfirmRestart { .. } | Self::Bootstrap(_) => None,
         }
     }
 }

@@ -629,6 +629,21 @@ pub struct ClipboardWriteParams {
 // "why is this row gray." The resolver walk it pins is exactly the
 // one the production paint path runs, so it doubles as the
 // regression net for the bold-color resolver call site (#142).
+//
+// `app.dialog_dump` + `app.dialog_answer` are the same kind of seam
+// one layer up: they read which host modal is on screen and press its
+// buttons. They exist because `tools/roosttest/` drives a real UI over
+// this socket and nothing else, so without them the consent dialog the
+// ssh bootstrap is gated on (plan 039 §3.5) could not be exercised at
+// all — and unlike the upgrade prompt, whose button composes ops a test
+// can send directly, the bootstrap job is deliberately UI-only and has
+// no such back door.
+//
+// They are a **test seam and not a production surface**. Nothing but
+// `ROOST_TEST_MODE=1` can reach them, `roostctl` grows no verb for
+// them, and the rule they exist to protect is the opposite of a
+// remote-control API: a modal must never be raised at — or answered by
+// — a machine.
 
 /// `tab.feed_pty_bytes` request: inject bytes into a tab's PTY-output
 /// drain as if the supervisor had emitted them. Indistinguishable
@@ -690,6 +705,49 @@ pub struct TabFeedImeParams {
     pub cursor_start: Option<usize>,
     #[serde(default)]
     pub cursor_end: Option<usize>,
+}
+
+/// `app.dialog_dump` request: which host modal is on screen, and what
+/// it says. Gated on `ROOST_TEST_MODE=1`; see the section header above
+/// for why this is a test seam rather than a surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppDialogDumpParams {}
+
+/// What `app.dialog_dump` answers.
+///
+/// Deliberately the *rendered* strings rather than the state behind
+/// them: what a test needs to assert is that the user is being told the
+/// right thing, and re-deriving that from a state dump would be the
+/// test writing the copy rule a second time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDialogDumpResult {
+    /// `"add" | "confirm_stop" | "confirm_restart" | "bootstrap"`, or
+    /// `null` when no host modal is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<String>,
+    /// The bootstrap card's variant — `"install" | "update" | "start"`.
+    /// `null` for every other dialog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// Every button on the card, in render order (the dismissing one
+    /// first, as the panel draws it).
+    pub buttons: Vec<String>,
+    /// The saved host the dialog is about, where it is about one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// `app.dialog_answer` request: press the visible host modal's primary
+/// button, or dismiss it. The same routes a click and the Enter/Escape
+/// keys take. Gated on `ROOST_TEST_MODE=1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppDialogAnswerParams {
+    /// `"confirm"` or `"cancel"`.
+    pub action: String,
 }
 
 /// `tab.dump_resolved` request: walk a tab's render state through
@@ -2329,6 +2387,18 @@ pub mod ops {
     /// authorization answer. Same gate and platform restriction as
     /// `app.menu_dump`.
     pub const APP_NOTIFICATION_STATUS: &str = "app.notification_status";
+
+    /// Test-only read of the host modal on screen — which one, what it
+    /// says, and what its buttons are labelled. Same gate as
+    /// `tab.feed_pty_bytes`. It exists so the IPC-only pytest harness
+    /// can assert the ssh bootstrap's consent copy (plan 039 §3.5);
+    /// it is not a production surface and `roostctl` has no verb for it.
+    pub const APP_DIALOG_DUMP: &str = "app.dialog_dump";
+    /// Test-only press of the visible host modal's primary button, or a
+    /// dismiss — the same two routes a click and Enter/Escape take.
+    /// Same gate and the same "test seam, not a surface" rule as
+    /// `app.dialog_dump`.
+    pub const APP_DIALOG_ANSWER: &str = "app.dialog_answer";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";

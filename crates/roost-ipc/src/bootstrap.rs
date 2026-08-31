@@ -1577,6 +1577,73 @@ impl BootstrapOptions {
             overridden,
         })
     }
+
+    /// Which rung [`resolve_source`] will try first for `arch`, and what
+    /// it would fall through to — **without doing any of it**.
+    ///
+    /// The consent dialog has to name where the bytes will come from
+    /// before the user consents, and resolution deliberately does not
+    /// happen until after (plan 039 §3.5: no subprocess, no network in
+    /// the connect path). So this walks the same ladder on the facts
+    /// already in hand — the overrides, whether a sibling was located,
+    /// whether this client could even run over there — and stops short
+    /// of every step that costs something: the sibling's local
+    /// `identify`, the download, the hash.
+    ///
+    /// That last gap is why [`SourcePreview::fallback`] exists rather
+    /// than this returning a bare origin. A located sibling can turn out
+    /// not to be this build and fall through to the asset, and a dialog
+    /// that promised "this Roost's own roost-session" and then downloaded
+    /// one would have said something untrue at the only moment the user
+    /// could act on it. Naming both, in order, is what this can honestly
+    /// claim.
+    pub fn source_preview(&self, arch: RemoteArch) -> Result<SourcePreview, BootstrapError> {
+        let forced = self.source;
+        let wanted = |rung: InstallSource| forced.is_none() || forced == Some(rung);
+        let asset = || {
+            self.asset_plan(arch).map(|plan| SourceOrigin::Asset {
+                base: plan.base,
+                overridden: plan.overridden,
+            })
+        };
+
+        if wanted(InstallSource::Env) {
+            if let Some(path) = &self.install_bin {
+                return Ok(SourcePreview {
+                    first: SourceOrigin::Override,
+                    fallback: None,
+                    override_path: Some(path.clone()),
+                });
+            }
+        }
+        if wanted(InstallSource::Sibling)
+            && self.sibling_bin.is_some()
+            && client_arch() == Some(arch)
+        {
+            return Ok(SourcePreview {
+                first: SourceOrigin::Sibling,
+                // A forced sibling has nowhere to fall through to —
+                // `resolve_source` turns its refusal into an error
+                // instead of trying the next rung.
+                fallback: if forced == Some(InstallSource::Sibling) {
+                    None
+                } else {
+                    asset().ok()
+                },
+                override_path: None,
+            });
+        }
+        if wanted(InstallSource::Asset) {
+            return Ok(SourcePreview {
+                first: asset()?,
+                fallback: None,
+                override_path: None,
+            });
+        }
+        Err(BootstrapError::NoSource {
+            app_version: self.expected.app_version.clone(),
+        })
+    }
 }
 
 // ============================================================================
@@ -1815,6 +1882,68 @@ pub enum SourceOrigin {
     Asset { base: String, overridden: bool },
 }
 
+impl SourceOrigin {
+    /// The "from where" phrase, in the one place both the consent
+    /// dialog's *prediction* ([`SourcePreview::describe`]) and the
+    /// resolved source's *fact* ([`ResolvedSource::describe`]) read it
+    /// from — so a dialog cannot promise one origin in wording the log
+    /// then reports differently.
+    ///
+    /// An overridden asset base is named as itself. Rendering it as
+    /// github.com would be a lie in exactly the situation — a fixture
+    /// server, a mirror — where the user most needs the truth.
+    pub fn describe(&self, override_path: Option<&Path>) -> String {
+        match self {
+            Self::Override => match override_path {
+                Some(path) => format!("{} ({INSTALL_BIN_ENV})", path.display()),
+                None => format!("the file {INSTALL_BIN_ENV} names"),
+            },
+            Self::Sibling => "this Roost's own roost-session".to_string(),
+            Self::Asset { base, overridden } => {
+                let where_from = if *overridden {
+                    format!("{base} ({ASSET_BASE_ENV})")
+                } else {
+                    base.clone()
+                };
+                format!("downloaded from {where_from}, checksum-verified")
+            }
+        }
+    }
+}
+
+/// Where an install's bytes will come from, decided as far as it can be
+/// without running anything. See [`BootstrapOptions::source_preview`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePreview {
+    /// The rung the ladder will try first.
+    pub first: SourceOrigin,
+    /// Where it falls through to if `first` turns out not to be this
+    /// build — only ever a sibling that fails its local `identify`.
+    pub fallback: Option<SourceOrigin>,
+    /// The path [`SourceOrigin::Override`] names, carried so the copy
+    /// can show it without the caller re-reading the options.
+    override_path: Option<PathBuf>,
+}
+
+impl SourcePreview {
+    /// The consent dialog's "from where" line.
+    ///
+    /// A fall-through is stated rather than hidden: "or X if that turns
+    /// out not to be this build" is longer than a single claim and it is
+    /// the only version of the sentence that stays true whichever way the
+    /// resolution goes.
+    pub fn describe(&self) -> String {
+        let first = self.first.describe(self.override_path.as_deref());
+        match &self.fallback {
+            Some(fallback) => format!(
+                "{first} — or {}, if that turns out not to be this build",
+                fallback.describe(None)
+            ),
+            None => first,
+        }
+    }
+}
+
 /// The local file an install will stream, and where it came from.
 ///
 /// **Opaque on purpose**: the only way to get one is [`resolve_source`]
@@ -1871,24 +2000,11 @@ impl ResolvedSource {
         }))
     }
 
-    /// The "from where" line of the consent dialog.
-    ///
-    /// An overridden asset base is named as itself. Rendering it as
-    /// github.com would be a lie in exactly the situation — a fixture
-    /// server, a mirror — where the user most needs the truth.
+    /// Where these bytes actually came from, for the log and the
+    /// completion copy. [`SourceOrigin::describe`] is the shared
+    /// wording.
     pub fn describe(&self) -> String {
-        match &self.origin {
-            SourceOrigin::Override => format!("{} ({INSTALL_BIN_ENV})", self.path.display()),
-            SourceOrigin::Sibling => "this Roost's own roost-session".to_string(),
-            SourceOrigin::Asset { base, overridden } => {
-                let where_from = if *overridden {
-                    format!("{base} ({ASSET_BASE_ENV})")
-                } else {
-                    base.clone()
-                };
-                format!("downloaded from {where_from}, checksum-verified")
-            }
-        }
+        self.origin.describe(Some(&self.path))
     }
 }
 
@@ -4808,6 +4924,123 @@ mod tests {
         prerelease.expected.app_version = "0.0.19-rc1".to_string();
         assert!(matches!(
             prerelease.asset_plan(RemoteArch::Amd64),
+            Err(BootstrapError::NoSource { .. })
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // the source preview (what the consent dialog may claim)
+    // ------------------------------------------------------------------
+
+    /// The rung the preview names is the rung [`resolve_source`] tries
+    /// first, override before sibling before asset.
+    #[test]
+    fn the_preview_walks_the_same_ladder_resolution_does() {
+        let arch = client_arch().unwrap_or(RemoteArch::Amd64);
+
+        let mut env = options();
+        env.install_bin = Some(PathBuf::from("/tmp/roost-session"));
+        env.sibling_bin = Some(PathBuf::from("/usr/bin/roost-session"));
+        let preview = env.source_preview(arch).expect("override rung");
+        assert_eq!(preview.first, SourceOrigin::Override);
+        assert_eq!(preview.fallback, None, "an override is taken or nothing is");
+        assert!(
+            preview.describe().contains("/tmp/roost-session")
+                && preview.describe().contains(INSTALL_BIN_ENV),
+            "{}",
+            preview.describe()
+        );
+
+        // The sibling rung is only reachable where this client could run
+        // over there at all, which is a compile-time fact.
+        let mut sibling = options();
+        sibling.sibling_bin = Some(PathBuf::from("/usr/bin/roost-session"));
+        let preview = sibling.source_preview(arch).expect("some rung");
+        if client_arch() == Some(arch) {
+            assert_eq!(preview.first, SourceOrigin::Sibling);
+            assert!(
+                matches!(preview.fallback, Some(SourceOrigin::Asset { .. })),
+                "a sibling that turns out to be stale falls through: {preview:?}"
+            );
+            let copy = preview.describe();
+            assert!(copy.contains("this Roost's own roost-session"), "{copy}");
+            assert!(
+                copy.contains("if that turns out not to be this build"),
+                "the fall-through is stated, not hidden: {copy}"
+            );
+        } else {
+            assert!(
+                matches!(preview.first, SourceOrigin::Asset { .. }),
+                "a non-Linux client can never stream its own binary: {preview:?}"
+            );
+        }
+
+        let bare = options().source_preview(arch).expect("asset rung");
+        assert!(matches!(bare.first, SourceOrigin::Asset { .. }));
+        assert_eq!(bare.fallback, None);
+    }
+
+    /// The dialog names the *actual* base. An overridden
+    /// `ROOST_SESSION_ASSET_BASE` is never rendered as github.com — a
+    /// fixture server or a mirror is exactly where a user needs to be
+    /// told (plan 039 §3.5).
+    #[test]
+    fn an_overridden_asset_base_is_named_rather_than_masked() {
+        let mut overridden = options();
+        overridden.asset_base = Some("http://127.0.0.1:9/assets".to_string());
+        overridden.source = Some(InstallSource::Asset);
+        let copy = overridden
+            .source_preview(RemoteArch::Amd64)
+            .expect("asset rung")
+            .describe();
+        assert!(copy.contains("http://127.0.0.1:9/assets"), "{copy}");
+        assert!(copy.contains(ASSET_BASE_ENV), "{copy}");
+        assert!(!copy.contains("github.com"), "{copy}");
+
+        let default = options()
+            .source_preview(RemoteArch::Amd64)
+            .expect("asset rung");
+        let copy = default.describe();
+        assert!(copy.contains("github.com"), "{copy}");
+        assert!(copy.contains("checksum-verified"), "{copy}");
+        assert!(!copy.contains(ASSET_BASE_ENV), "{copy}");
+    }
+
+    /// A forced rung is the only rung. Forcing the sibling removes the
+    /// fall-through the unforced ladder has, because `resolve_source`
+    /// turns that rung's refusal into an error rather than trying the
+    /// next one.
+    #[test]
+    fn a_forced_rung_previews_without_a_fall_through() {
+        let arch = client_arch().unwrap_or(RemoteArch::Amd64);
+        let mut forced = options();
+        forced.sibling_bin = Some(PathBuf::from("/usr/bin/roost-session"));
+        forced.source = Some(InstallSource::Sibling);
+        if client_arch() == Some(arch) {
+            let preview = forced.source_preview(arch).expect("forced sibling");
+            assert_eq!(preview.first, SourceOrigin::Sibling);
+            assert_eq!(preview.fallback, None);
+        }
+
+        // Nothing to force onto: no override set, and the asset rung is
+        // excluded by the force.
+        let mut nothing = options();
+        nothing.source = Some(InstallSource::Env);
+        assert!(matches!(
+            nothing.source_preview(arch),
+            Err(BootstrapError::NoSource { .. })
+        ));
+    }
+
+    /// A prerelease client constructs no release URL at all, so there is
+    /// nothing honest to promise and the preview refuses rather than
+    /// naming a tag that does not exist.
+    #[test]
+    fn a_prerelease_client_has_no_asset_to_preview() {
+        let mut prerelease = options();
+        prerelease.expected.app_version = "0.0.19-rc1".to_string();
+        assert!(matches!(
+            prerelease.source_preview(RemoteArch::Amd64),
             Err(BootstrapError::NoSource { .. })
         ));
     }

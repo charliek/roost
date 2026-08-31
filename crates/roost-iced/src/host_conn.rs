@@ -460,6 +460,16 @@ pub(crate) struct HostConnSet {
     ssh: HashMap<String, SshState>,
     /// Handed out by [`HostConnSet::open_ssh`], never reused.
     next_ssh_request: u64,
+    /// What a bootstrap is doing to a host right now, or how it ended —
+    /// keyed like [`Self::conns`].
+    ///
+    /// It sits in front of every other reason [`Self::section_reason`]
+    /// can give, because while a bootstrap runs it is the *most current*
+    /// thing true about the host: the connect failure that started it is
+    /// exactly what the job is answering, and going on showing it would
+    /// leave the band describing a question that is already being dealt
+    /// with.
+    bootstrap_notes: HashMap<String, String>,
 }
 
 /// One saved host's ssh transport, from the moment a connect is asked
@@ -500,6 +510,17 @@ struct SshState {
     /// the band has to render), and [`HostConnSet::overlay_ssh_reason`],
     /// whose family is what C5b routes a bootstrap offer off.
     failure: Option<ConnectFailure>,
+    /// Whether this attempt ever got a working connection.
+    ///
+    /// The bootstrap offer's other gate (plan 039 §3.5). A *first*
+    /// connect and a long-lived session going away underneath the user
+    /// arrive identically — the same `Disconnected` transition, the same
+    /// `NotFound`/`NoSession` family, and the same [`Self::origin`],
+    /// which is the establish's and stays `User` for hours. This is the
+    /// only fact that separates them, and without it `roostctl session
+    /// stop` on the far side would throw a consent card over whatever
+    /// the user was typing locally.
+    reached_connected: bool,
 }
 
 /// One finished establish, on its way back to the main thread.
@@ -534,6 +555,7 @@ impl HostConnSet {
             next_generation: 0,
             ssh: HashMap::new(),
             next_ssh_request: 0,
+            bootstrap_notes: HashMap::new(),
         }
     }
 
@@ -650,6 +672,11 @@ impl HostConnSet {
         mode: ConnectMode,
         origin: RequestOrigin,
     ) {
+        // A fresh attempt supersedes whatever the last bootstrap left on
+        // the band: either it worked and this connect is its sequel, or
+        // it did not and the user is trying again — and in both cases
+        // this attempt's own outcome is the newer answer.
+        self.bootstrap_notes.remove(host);
         let previous = self.take_tunnel(host);
         self.next_ssh_request += 1;
         let request = self.next_ssh_request;
@@ -665,6 +692,9 @@ impl HostConnSet {
                 tunnel: None,
                 seen: 0,
                 failure: None,
+                // Cleared with the entry, not carried: this is a fact
+                // about *this* attempt.
+                reached_connected: false,
             },
         );
 
@@ -740,10 +770,14 @@ impl HostConnSet {
     /// Why this host's band says what it says, when there is a reason
     /// worth naming.
     ///
-    /// Three sources, in the order they can be current: the live
-    /// connection's own state, an establish that never reached one, and
-    /// the retained section a disconnect left behind.
+    /// Four sources, in the order they can be current: a bootstrap
+    /// running (or just finished) for this host, the live connection's
+    /// own state, an establish that never reached one, and the retained
+    /// section a disconnect left behind.
     pub(crate) fn section_reason(&self, host: &str) -> Option<&str> {
+        if let Some(note) = self.bootstrap_notes.get(host) {
+            return Some(note.as_str());
+        }
         if let Some(conn) = self.conns.get(host) {
             return disconnected_reason(&conn.state);
         }
@@ -768,6 +802,31 @@ impl HostConnSet {
     /// Who asked for this host's current ssh attempt.
     pub(crate) fn ssh_origin(&self, host: &str) -> Option<RequestOrigin> {
         self.ssh.get(host).map(|ssh| ssh.origin)
+    }
+
+    /// Whether this host's current ssh attempt ever reached a working
+    /// connection. See [`SshState::reached_connected`] — it is what
+    /// separates a first connect from a session dropping under the user.
+    pub(crate) fn ssh_reached_connected(&self, host: &str) -> bool {
+        self.ssh.get(host).is_some_and(|ssh| ssh.reached_connected)
+    }
+
+    /// Say what a bootstrap is doing to this host, or stop saying it.
+    ///
+    /// Progress *and* the failure copy go through here, because to the
+    /// band they are the same thing — the most recent true sentence
+    /// about a host nothing else is currently explaining. It outlives
+    /// the job on purpose: a classified failure the user has not seen
+    /// yet must not vanish the moment the job's task ends.
+    pub(crate) fn set_bootstrap_note(&mut self, host: &str, note: Option<String>) {
+        match note {
+            Some(note) => {
+                self.bootstrap_notes.insert(host.to_string(), note);
+            }
+            None => {
+                self.bootstrap_notes.remove(host);
+            }
+        }
     }
 
     /// Replace a generic drop reason with the tunnel's own, when the
@@ -910,6 +969,7 @@ impl HostConnSet {
     pub(crate) fn remove(&mut self, host: &str) -> Option<HostId> {
         let incarnation = self.disconnect(host);
         self.retained.remove(host);
+        self.bootstrap_notes.remove(host);
         incarnation
     }
 
@@ -1178,6 +1238,15 @@ impl HostConnSet {
         // must not purge the live one's mirror on its way to being
         // dropped.
         let host = self.owner_of(incarnation)?;
+        // Stamped once and never cleared until the next `open_ssh`: from
+        // here on, every drop for this attempt is a *session going away*
+        // rather than a connect that never worked, and the bootstrap
+        // offer turns on exactly that difference.
+        if next.is_connected() {
+            if let Some(entry) = self.ssh.get_mut(&host) {
+                entry.reached_connected = true;
+            }
+        }
         if let HostConnState::Disconnected(disconnected) = &mut next {
             self.overlay_ssh_reason(&host, disconnected);
             // A tunnel that has served a connection through to
@@ -1705,6 +1774,63 @@ mod tests {
         );
     }
 
+    /// A bootstrap's own line sits in front of the failure that started
+    /// it: while Roost is answering "roost-session isn't installed
+    /// there", the band saying so as well would describe a question
+    /// already being dealt with. And a fresh Connect clears it, because
+    /// this attempt's own outcome is then the newer answer.
+    #[tokio::test]
+    async fn a_running_bootstrap_owns_the_band_until_the_next_connect() {
+        use roost_ipc::ssh::SshFailure;
+        let (mut set, _feed) = a_set();
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+        );
+        let request = set.ssh["h1"].request;
+        set.tunnel_ready(refused("h1", request, SshFailure::NotFound));
+        assert_eq!(
+            set.section_reason("h1"),
+            Some(SshFailure::NotFound.message("workbox").as_str())
+        );
+
+        set.set_bootstrap_note("h1", Some("checking one…".into()));
+        assert_eq!(set.section_reason("h1"), Some("checking one…"));
+
+        // A terminal failure travels the same slot: it is the most
+        // recent true sentence, and it must not vanish the moment the
+        // job's task ends.
+        set.set_bootstrap_note("h1", Some("couldn't reach workbox".into()));
+        assert_eq!(set.section_reason("h1"), Some("couldn't reach workbox"));
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+        );
+        assert_eq!(
+            set.section_reason("h1"),
+            None,
+            "a fresh attempt supersedes whatever the last bootstrap left"
+        );
+
+        // Clearing it explicitly falls back to whatever else is current.
+        let request = set.ssh["h1"].request;
+        set.tunnel_ready(refused("h1", request, SshFailure::NoSession));
+        set.set_bootstrap_note("h1", Some("setting up roost-session…".into()));
+        set.set_bootstrap_note("h1", None);
+        assert_eq!(
+            set.section_reason("h1"),
+            Some(SshFailure::NoSession.message("workbox").as_str())
+        );
+    }
+
     /// An answer has to prove it belongs to the request still waiting.
     /// Ask twice and the first establish's answer must land nowhere —
     /// otherwise a stale failure would overwrite the band while the
@@ -1777,6 +1903,74 @@ mod tests {
             }),
         );
         assert_eq!(set.section_reason("h1"), Some("the session closed"));
+    }
+
+    /// The one fact that separates a first connect from a session
+    /// dropping under the user.
+    ///
+    /// Both surface as a `Disconnected` carrying `NotFound`/`NoSession`
+    /// on a `User`-originated attempt — the origin is the *establish's*,
+    /// and stays `User` for as long as the connection lives — so
+    /// without this flag `roostctl session stop` on the far side would
+    /// throw a consent card over an unrelated local tab.
+    #[tokio::test]
+    async fn a_connection_that_worked_is_marked_and_a_fresh_attempt_is_not() {
+        let (mut set, _feed) = a_set();
+        assert!(!set.ssh_reached_connected("h1"), "nothing asked for yet");
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+        );
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-reached.sock"),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+        );
+        let incarnation = set.mint_for("h1");
+
+        // The first-connect shape: the establish came up, the
+        // per-connection exec is what failed, and nothing ever served.
+        set.apply_state(
+            incarnation,
+            HostConnState::Disconnected(state::Disconnected {
+                reason: "roost-session isn't installed on workbox".into(),
+                retry_in: None,
+            }),
+        );
+        assert!(
+            !set.ssh_reached_connected("h1"),
+            "a connect that never worked is still an offer"
+        );
+
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert!(set.ssh_reached_connected("h1"));
+        set.apply_state(
+            incarnation,
+            HostConnState::Disconnected(state::Disconnected {
+                reason: "the session closed".into(),
+                retry_in: None,
+            }),
+        );
+        assert!(
+            set.ssh_reached_connected("h1"),
+            "a session going away does not un-happen"
+        );
+
+        // A fresh attempt is a fresh question.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+        );
+        assert!(!set.ssh_reached_connected("h1"));
     }
 
     /// The establish window answers `connecting`, not `disconnected`:

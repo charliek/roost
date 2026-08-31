@@ -91,6 +91,18 @@ pub(crate) enum EngineFeed {
     /// `Arc<SshTunnel>` plus its provenance is several times the size of
     /// the next-largest item, and every feed item pays for the largest.
     HostTunnel(Box<crate::host_conn::HostTunnelReady>),
+    /// A bootstrap step finished on the engine runtime — the read-only
+    /// probe that decides which consent card to raise, or the job the
+    /// user agreed to (plan 039 §3.5).
+    ///
+    /// It rides the feed rather than an engine op because both halves
+    /// are started from places that cannot return an Iced task: the
+    /// probe from the drain that observed a failed connect, and the job
+    /// from a modal button whose sibling paths do not. One channel also
+    /// keeps a job's completion ordered against the connect it then
+    /// asks for. Boxed for [`Self::HostTunnel`]'s reason — every feed
+    /// item pays for the largest.
+    HostBootstrap(Box<crate::app::bootstrap::BootstrapEvent>),
 }
 
 /// The only way to put an item on the feed. Raw senders are never handed
@@ -154,6 +166,10 @@ impl EngineFeedReceiver {
                 // A tunnel answer either starts a connection or leaves a
                 // reason on the band; both are what the section renders.
                 | EngineFeed::HostTunnel(..)
+                // A bootstrap step moves the band, raises a modal, or
+                // starts a connect — all three are what the sidebar and
+                // the chrome draw from.
+                | EngineFeed::HostBootstrap(..)
         );
         let tab_bytes = matches!(
             item,
