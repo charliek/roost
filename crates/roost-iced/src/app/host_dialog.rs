@@ -17,6 +17,8 @@
 //! spends a round trip on `session.identify` — over a socket or over
 //! `ssh`, depending on what the target turned out to be.
 
+use crate::host_conn::ConnectFailure;
+
 /// The Add Host dialog's live contents.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct AddHostDraft {
@@ -162,18 +164,24 @@ pub(super) fn validate_draft(
 /// The check itself is [`roost_ipc::ssh::verify_transport`] — one bar
 /// however the target is reached, and the same call `roostctl host add
 /// --verify` makes, so the dialog and the CLI cannot drift apart about
-/// what "verified" means. All this adds is the dialog's own error shape:
-/// a `String` to show under the fields.
+/// what "verified" means. All this adds is the dialog's own error shape.
+///
+/// That shape is a [`ConnectFailure`] rather than a `String`: the
+/// message under the fields is unchanged, but "Add & Connect" is one of
+/// the two doors a bootstrap offer opens from (plan 039 §3.5), and
+/// deciding *this was the not-found family* has to read the family — not
+/// a substring of the sentence shown to the user.
 ///
 /// The classify is a second one (`validate_draft` already ran it), and
 /// deliberately so: this half runs off the main thread, on a target the
 /// dialog only carries as a string.
-pub(super) async fn verify_target(target: String) -> Result<(), String> {
-    let transport = roost_ipc::ssh::classify(&target).map_err(|error| format!("{error:#}"))?;
+pub(super) async fn verify_target(target: String) -> Result<(), ConnectFailure> {
+    let transport = roost_ipc::ssh::classify(&target)
+        .map_err(|error| ConnectFailure::unclassified(format!("{error:#}")))?;
     roost_ipc::ssh::verify_transport(&transport)
         .await
         .map(drop)
-        .map_err(|error| format!("{error:#}"))
+        .map_err(ConnectFailure::from)
 }
 
 #[cfg(test)]

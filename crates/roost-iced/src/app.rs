@@ -633,7 +633,7 @@ pub enum EngineOpResult {
         generation: u64,
         label: String,
         target: String,
-        result: Result<(), String>,
+        result: Result<(), crate::host_conn::ConnectFailure>,
     },
     /// The stopping half of an upgrade restart finished (plan 037 §3.7).
     ///
@@ -654,16 +654,23 @@ pub enum EngineOpResult {
 ///
 /// A join failure — the op panicked, or the runtime is shutting down —
 /// becomes that op's own error rather than a dropped completion: every
-/// dispatch owes the UI exactly one [`EngineOpResult`].
-fn spawn_engine_op<T: Send + 'static>(
+/// dispatch owes the UI exactly one [`EngineOpResult`]. That is the one
+/// thing an op's error type has to be able to express, hence the
+/// `From<String>` bound: most ops fail as a `String`, and the Add Host
+/// dial fails as a classified [`crate::host_conn::ConnectFailure`].
+fn spawn_engine_op<T, E>(
     handle: tokio::runtime::Handle,
-    op: impl Future<Output = Result<T, String>> + Send + 'static,
-    complete: impl FnOnce(Result<T, String>) -> EngineOpResult + Send + 'static,
-) -> EngineOpFuture {
+    op: impl Future<Output = Result<T, E>> + Send + 'static,
+    complete: impl FnOnce(Result<T, E>) -> EngineOpResult + Send + 'static,
+) -> EngineOpFuture
+where
+    T: Send + 'static,
+    E: Send + 'static + From<String>,
+{
     Box::pin(async move {
         let result = match handle.spawn(op).await {
             Ok(result) => result,
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(E::from(error.to_string())),
         };
         complete(result)
     })
@@ -2135,7 +2142,9 @@ impl App {
             return;
         }
         for host in self.workspace.hosts() {
-            self.connect_saved_host(&host, |localhost| {
+            // Launch-time, so nobody asked and nobody is waiting: an
+            // `Ipc` origin, same as `roostctl`'s.
+            self.connect_saved_host(&host, crate::host_conn::RequestOrigin::Ipc, |localhost| {
                 // A remote host is manual-reconnect only, so it is not
                 // even resolved into a connection here.
                 localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
@@ -2160,8 +2169,10 @@ impl App {
     fn connect_saved_host(
         &mut self,
         host: &roost_engine::persistence::HostSnapshot,
+        origin: crate::host_conn::RequestOrigin,
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
     ) {
+        use crate::host_conn::HostTransport;
         use roost_ipc::ssh::ResolvedTransport;
 
         let transport = match roost_ipc::ssh::classify(&host.target) {
@@ -2176,12 +2187,29 @@ impl App {
             return;
         };
         let mode = spawn_gate(mode, host_verbs::VerbPolicy::current());
+        // The one place the transport becomes the connection set's own
+        // vocabulary. Everything downstream that used to ask "is this
+        // localhost?" — the spawn ladder, the auto-retry policy, and now
+        // what a build mismatch can offer — reads it off this value, so
+        // the three answers cannot disagree.
         match transport {
-            ResolvedTransport::LocalSession(socket) | ResolvedTransport::UnixSocket(socket) => self
-                .hosts
-                .connect(&host.id, &host.label, socket, localhost, mode),
+            ResolvedTransport::LocalSession(socket) => self.hosts.connect(
+                &host.id,
+                &host.label,
+                socket,
+                HostTransport::LocalSession,
+                mode,
+            ),
+            ResolvedTransport::UnixSocket(socket) => self.hosts.connect(
+                &host.id,
+                &host.label,
+                socket,
+                HostTransport::UnixSocket,
+                mode,
+            ),
             ResolvedTransport::Ssh(target) => {
-                self.hosts.open_ssh(&host.id, &host.label, target, mode)
+                self.hosts
+                    .open_ssh(&host.id, &host.label, target, mode, origin)
             }
         }
     }
@@ -2304,11 +2332,15 @@ impl App {
     /// (the op panicked, or the runtime is shutting down) surfaces as that
     /// op's own error, so no dispatch can end in a completion that never
     /// arrives.
-    fn engine_op<T: Send + 'static>(
+    fn engine_op<T, E>(
         &self,
-        op: impl Future<Output = Result<T, String>> + Send + 'static,
-        complete: impl FnOnce(Result<T, String>) -> EngineOpResult + Send + 'static,
-    ) -> UiTask {
+        op: impl Future<Output = Result<T, E>> + Send + 'static,
+        complete: impl FnOnce(Result<T, E>) -> EngineOpResult + Send + 'static,
+    ) -> UiTask
+    where
+        T: Send + 'static,
+        E: Send + 'static + From<String>,
+    {
         UiTask::EngineOp(spawn_engine_op(self.runtime_handle.clone(), op, complete))
     }
 
@@ -4797,7 +4829,10 @@ impl App {
     pub fn host_connect_requested(&mut self, saved_id: &str) {
         let mismatch = match self.hosts.state(saved_id) {
             Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) => mismatch.clone(),
-            _ => return self.host_reconnect_requested(saved_id),
+            _ => {
+                return self
+                    .host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User)
+            }
         };
         let Some(label) = self.host_label(saved_id) else {
             tracing::debug!(host = %saved_id, "connect requested for a host that is not saved");
@@ -4827,13 +4862,17 @@ impl App {
     /// flow's own relaunch has to come through *here* — the host is
     /// still in `NeedsRestart` at that moment, and re-raising the dialog
     /// the user just answered would be a loop.
-    pub fn host_reconnect_requested(&mut self, saved_id: &str) {
+    pub fn host_reconnect_requested(
+        &mut self,
+        saved_id: &str,
+        origin: crate::host_conn::RequestOrigin,
+    ) {
         let Ok(host) = self.saved_host(saved_id) else {
             tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
             return;
         };
         tracing::info!(host = %host.id, "connecting a saved host session");
-        self.connect_saved_host(&host, |localhost| {
+        self.connect_saved_host(&host, origin, |localhost| {
             Some(if localhost {
                 crate::host_conn::ConnectMode::SpawnIfMissing
             } else {
@@ -4901,16 +4940,18 @@ impl App {
     /// `connect` is what separates the two callers: the dialog's button
     /// says "Add & Connect" and means it, while `roostctl host add` is
     /// documented as registry-only (a `host connect` follows if you want
-    /// one).
+    /// one). It names *who* is connecting rather than merely whether to,
+    /// so a caller cannot start a connection without saying whether
+    /// there is anybody there to answer for it.
     pub(crate) fn host_add_requested(
         &mut self,
         label: &str,
         target: &str,
-        connect: bool,
+        connect: Option<crate::host_conn::RequestOrigin>,
     ) -> Result<roost_engine::persistence::HostSnapshot, roost_engine::WorkspaceError> {
         let host = self.workspace.add_host(label, target)?;
-        if connect {
-            self.host_reconnect_requested(&host.id);
+        if let Some(origin) = connect {
+            self.host_reconnect_requested(&host.id, origin);
         }
         self.reconcile();
         Ok(host)
@@ -5091,7 +5132,9 @@ impl App {
         match result {
             // The session is gone; connecting again spawns a fresh one
             // through the shared ladder and hydrates the saved layout.
-            Ok(()) => self.host_reconnect_requested(saved_id),
+            Ok(()) => {
+                self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User)
+            }
             Err(error) => self.set_status(error),
         }
     }
@@ -5158,7 +5201,7 @@ impl App {
         generation: u64,
         label: &str,
         target: &str,
-        result: Result<(), String>,
+        result: Result<(), crate::host_conn::ConnectFailure>,
     ) {
         let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) else {
             tracing::debug!(%label, "dropped an Add Host verify for a dialog that is closed");
@@ -5168,11 +5211,13 @@ impl App {
             tracing::debug!(%label, generation, "dropped a stale Add Host verify");
             return;
         }
-        if let Err(error) = result {
-            draft.error = Some(error);
+        if let Err(failure) = result {
+            // The family rides along for C5b's offer; what the dialog
+            // shows is the same line it always showed.
+            draft.error = Some(failure.message);
             return;
         }
-        match self.host_add_requested(label, target, true) {
+        match self.host_add_requested(label, target, Some(crate::host_conn::RequestOrigin::User)) {
             Ok(host) => {
                 tracing::info!(host = %host.id, "added a host from the Add Host dialog");
                 self.host_dialog = None;

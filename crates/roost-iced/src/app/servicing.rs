@@ -2365,7 +2365,7 @@ impl App {
                 // semantics; `host.connect` is the second step, and the
                 // Add Host dialog's "Add & Connect" takes both.
                 let _ = reply.send(
-                    self.host_add_requested(&label, &target, false)
+                    self.host_add_requested(&label, &target, None)
                         .map(Into::into),
                 );
             }
@@ -2396,6 +2396,15 @@ impl App {
         task
     }
 
+    /// Who a connection arriving over the IPC socket is asked for by.
+    ///
+    /// Named rather than spelled at the call site so the rule it stands
+    /// for — a modal never opens to answer a machine (plan 039 §3.5) —
+    /// is something a test can hold on to. `roostctl host connect` dials
+    /// exactly as a click does, so nothing downstream could infer this.
+    const IPC_CONNECT_ORIGIN: crate::host_conn::RequestOrigin =
+        crate::host_conn::RequestOrigin::Ipc;
+
     /// `host.connect`, as the op answers it: start the attempt and
     /// report the state it left the host in.
     ///
@@ -2408,7 +2417,7 @@ impl App {
         saved_id: &str,
     ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
         let host = self.saved_host(saved_id)?;
-        self.host_reconnect_requested(saved_id);
+        self.host_reconnect_requested(saved_id, Self::IPC_CONNECT_ORIGIN);
         Ok(self.host_connection_result(host))
     }
 
@@ -2543,6 +2552,19 @@ mod tests {
         let key = TabKey::new(host, notification.tab_id);
         assert!(!key.is_local());
         assert_ne!(key, TabKey::local(7));
+    }
+
+    /// The one rule the origin field exists for: a connection asked for
+    /// over the IPC socket is never a user's, so nothing downstream can
+    /// decide to open a modal for it (plan 039 §3.5). `roostctl host
+    /// connect` reaches `host_reconnect_requested` with the very same
+    /// `ConnectMode` a click does, so this is the only place the
+    /// difference is stated.
+    #[test]
+    fn a_connect_arriving_over_ipc_is_never_a_users() {
+        use crate::host_conn::RequestOrigin;
+        assert_eq!(App::IPC_CONNECT_ORIGIN, RequestOrigin::Ipc);
+        assert_ne!(App::IPC_CONNECT_ORIGIN, RequestOrigin::User);
     }
 
     /// The clearing edge only. A *pending* flag is the mirror's to paint

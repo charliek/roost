@@ -1449,19 +1449,54 @@ pub const VERIFY_BUDGET: Duration = Duration::from_secs(30);
 /// pay for first. Both are bounded, so an unreachable target fails
 /// rather than hanging the caller.
 ///
-/// An ssh failure is flattened to its own `Display` rather than chained
+/// An ssh failure is rendered by its own `Display` rather than chained
 /// as a source: [`SshTunnelError`] already renders the whole message,
 /// and wrapping it would make `{:#}` print it twice.
-pub async fn verify_transport(transport: &ResolvedTransport) -> Result<SessionIdentify> {
+pub async fn verify_transport(
+    transport: &ResolvedTransport,
+) -> std::result::Result<SessionIdentify, VerifyError> {
     match transport {
         ResolvedTransport::Ssh(target) => {
             verify_ssh_target(target, &SshTunnelOptions::from_env(), VERIFY_BUDGET)
                 .await
-                .map_err(|error| anyhow!("{error}"))
+                .map_err(VerifyError::Ssh)
         }
         ResolvedTransport::LocalSession(socket) | ResolvedTransport::UnixSocket(socket) => {
             let budget = crate::session_launch::IPC_TIMEOUT.mul_f64(timeout_scale());
-            crate::session_launch::verify_socket(socket, budget).await
+            crate::session_launch::verify_socket(socket, budget)
+                .await
+                .map_err(VerifyError::Other)
+        }
+    }
+}
+
+/// Why a target did not verify.
+///
+/// Split by who can act on it, exactly as [`SshTunnelError`] is: an ssh
+/// target's refusal carries the classified [`SshFailure`] a caller can
+/// **branch** on, and every other way of failing is opaque. The families
+/// exist so that routing on one ("the binary is not installed over
+/// there") never means substring-matching the copy a user reads — which
+/// is the mistake the classifier exists to prevent.
+///
+/// Both renderings are the ones the two callers already printed before
+/// this type existed: `{error:#}` on an ssh refusal is
+/// [`SshTunnelError`]'s own message, and on anything else it is the
+/// `anyhow` chain.
+#[derive(Debug, thiserror::Error)]
+pub enum VerifyError {
+    #[error("{0}")]
+    Ssh(SshTunnelError),
+    #[error("{0:#}")]
+    Other(#[from] anyhow::Error),
+}
+
+impl VerifyError {
+    /// The classified family, when the far side is what refused.
+    pub fn failure(&self) -> Option<&SshFailure> {
+        match self {
+            Self::Ssh(error) => error.failure(),
+            Self::Other(_) => None,
         }
     }
 }

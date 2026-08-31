@@ -13,7 +13,9 @@
 //! banner, and a state that needs a decision gets a dialog — and reading
 //! them side by side is how the copy stays consistent.
 
-use crate::host_conn::state::{BuildMismatch, HostConnState, MismatchKind, REQUIRED_PAYLOAD_KIND};
+use crate::host_conn::state::{
+    BuildMismatch, HostConnState, MismatchKind, RestartAction, REQUIRED_PAYLOAD_KIND,
+};
 
 /// The banner drawn over a host tab's last frame.
 ///
@@ -123,7 +125,11 @@ pub(super) struct RestartPrompt {
 pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPrompt {
     let vintage = vintage(mismatch);
     let detail = detail(mismatch);
-    if mismatch.restartable {
+    // Three actions, two prompts — for now. C5b gives
+    // `OfferRemoteUpdate` a branch and a button of its own; until then a
+    // host that *could* be updated reads exactly as one that could not,
+    // which is today's copy for both.
+    if mismatch.restart == RestartAction::RestartLocal {
         RestartPrompt {
             title: format!("Restart the session on {label}?"),
             body: format!(
@@ -192,7 +198,7 @@ mod tests {
     use crate::host_conn::state::Disconnected;
     use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 
-    fn mismatch(kind: MismatchKind, restartable: bool) -> BuildMismatch {
+    fn mismatch(kind: MismatchKind, restart: RestartAction) -> BuildMismatch {
         BuildMismatch {
             kind,
             session_protocol: 1,
@@ -200,7 +206,7 @@ mod tests {
             session_build: "gb-old".into(),
             client_build: "gb-new".into(),
             session_payload_kinds: vec!["vt".into()],
-            restartable,
+            restart,
         }
     }
 
@@ -220,7 +226,7 @@ mod tests {
             HostConnState::Connected,
             HostConnState::TakenOver,
             HostConnState::Stopped,
-            HostConnState::NeedsRestart(mismatch(MismatchKind::Build, true)),
+            HostConnState::NeedsRestart(mismatch(MismatchKind::Build, RestartAction::RestartLocal)),
         ]
     }
 
@@ -304,9 +310,17 @@ mod tests {
 
     /// A restartable host gets the button and the warning that goes with
     /// it; a remote one gets neither — no dead button (plan 037 §3.1).
+    ///
+    /// Three actions now, and both remote ones render today's remote
+    /// copy: `OfferRemoteUpdate` says an update *could* be offered, and
+    /// C5b is what offers it. Until then the two are indistinguishable
+    /// here, which is what "no behavior change" means for this commit.
     #[test]
     fn only_a_restartable_host_is_offered_a_restart() {
-        let local = restart_prompt("localhost", &mismatch(MismatchKind::Build, true));
+        let local = restart_prompt(
+            "localhost",
+            &mismatch(MismatchKind::Build, RestartAction::RestartLocal),
+        );
         assert!(local.restartable);
         assert!(local.title.starts_with("Restart the session"));
         assert!(
@@ -315,18 +329,20 @@ mod tests {
             local.body
         );
 
-        let remote = restart_prompt("pop-os", &mismatch(MismatchKind::Build, false));
-        assert!(!remote.restartable);
-        assert!(remote.title.contains("needs a restart"));
-        assert!(
-            remote.body.contains("host sessions guide"),
-            "a remote host is pointed at the docs instead: {}",
-            remote.body
-        );
-        assert!(
-            !remote.body.contains("Restarting reopens"),
-            "and is never told what a button it does not have would do"
-        );
+        for action in [RestartAction::OfferRemoteUpdate, RestartAction::None] {
+            let remote = restart_prompt("pop-os", &mismatch(MismatchKind::Build, action));
+            assert!(!remote.restartable, "{action:?}");
+            assert!(remote.title.contains("needs a restart"), "{action:?}");
+            assert!(
+                remote.body.contains("host sessions guide"),
+                "a remote host is pointed at the docs instead: {}",
+                remote.body
+            );
+            assert!(
+                !remote.body.contains("Restarting reopens"),
+                "and is never told what a button it does not have would do"
+            );
+        }
     }
 
     /// Direction is claimed only where it is known. Protocol numbers
@@ -334,20 +350,23 @@ mod tests {
     /// different.
     #[test]
     fn the_skews_direction_is_only_claimed_when_it_is_knowable() {
-        let mut older = mismatch(MismatchKind::Protocol, true);
+        let mut older = mismatch(MismatchKind::Protocol, RestartAction::RestartLocal);
         older.session_protocol = SESSION_PROTOCOL_VERSION - 1;
         assert_eq!(vintage(&older), "an older Roost");
 
-        let mut newer = mismatch(MismatchKind::Protocol, true);
+        let mut newer = mismatch(MismatchKind::Protocol, RestartAction::RestartLocal);
         newer.session_protocol = SESSION_PROTOCOL_VERSION + 1;
         assert_eq!(vintage(&newer), "a newer Roost");
 
         assert_eq!(
-            vintage(&mismatch(MismatchKind::Build, true)),
+            vintage(&mismatch(MismatchKind::Build, RestartAction::RestartLocal)),
             "a different Roost build"
         );
         assert_eq!(
-            vintage(&mismatch(MismatchKind::PayloadKind, true)),
+            vintage(&mismatch(
+                MismatchKind::PayloadKind,
+                RestartAction::RestartLocal
+            )),
             "a different Roost build"
         );
     }
@@ -356,17 +375,23 @@ mod tests {
     /// dialog is diagnosable rather than merely apologetic.
     #[test]
     fn every_mismatch_kind_shows_what_disagreed() {
-        let protocol = detail(&mismatch(MismatchKind::Protocol, true));
+        let protocol = detail(&mismatch(
+            MismatchKind::Protocol,
+            RestartAction::RestartLocal,
+        ));
         assert!(protocol.contains('1') && protocol.contains(&SESSION_PROTOCOL_VERSION.to_string()));
 
-        let build = detail(&mismatch(MismatchKind::Build, true));
+        let build = detail(&mismatch(MismatchKind::Build, RestartAction::RestartLocal));
         assert!(build.contains("gb-old") && build.contains("gb-new"));
 
-        let kind = detail(&mismatch(MismatchKind::PayloadKind, true));
+        let kind = detail(&mismatch(
+            MismatchKind::PayloadKind,
+            RestartAction::RestartLocal,
+        ));
         assert!(kind.contains("vt") && kind.contains(REQUIRED_PAYLOAD_KIND));
 
         // A session offering nothing at all still reads as a sentence.
-        let mut empty = mismatch(MismatchKind::PayloadKind, true);
+        let mut empty = mismatch(MismatchKind::PayloadKind, RestartAction::RestartLocal);
         empty.session_payload_kinds.clear();
         assert!(detail(&empty).contains("offers nothing"));
     }

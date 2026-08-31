@@ -1526,7 +1526,7 @@ impl App {
                 self.host_add_requested(
                     host_verbs::SEED_LABEL,
                     crate::host_conn::LOCALHOST_TARGET,
-                    true,
+                    Some(crate::host_conn::RequestOrigin::User),
                 )
                 .map_err(|error| error.to_string())?;
             }

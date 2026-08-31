@@ -41,7 +41,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::mirror::{HostMirror, SharedMirror};
 use super::queue::{self, HostIntent, HostOpError, OpFault};
-use super::state::{check_compatibility, HostConnState, HostStateMachine};
+use super::state::{check_compatibility, HostConnState, HostStateMachine, HostTransport};
 use super::{HostIdMinter, HostWorkspaceEvent};
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 
@@ -110,9 +110,10 @@ pub(crate) struct ConnectionConfig {
     pub(crate) host: String,
     pub(crate) label: String,
     pub(crate) socket: PathBuf,
-    /// Whether this host is this machine's own session. Gates both the
-    /// spawn ladder and the auto-retry policy.
-    pub(crate) localhost: bool,
+    /// How this host is reached. Gates the spawn ladder and the
+    /// auto-retry policy (both localhost-only), and decides what the
+    /// build-mismatch dialog can offer.
+    pub(crate) transport: HostTransport,
     /// Which of the saved host's connections this task is. Every
     /// incarnation it mints is registered under it, so the app can tell
     /// this task's publications from a replaced task's.
@@ -275,7 +276,7 @@ async fn connect_loop(
     feed: &EngineFeedSender,
     shutdown: &Shutdown,
 ) {
-    let mut machine = HostStateMachine::new(config.localhost);
+    let mut machine = HostStateMachine::new(config.transport.is_localhost());
     let mut previous: Option<HostId> = config.supersedes;
     let mut mode = config.mode;
     // The lease this task last held. `Some` means an auto-retry, and an
@@ -455,8 +456,12 @@ async fn connect(config: &ConnectionConfig, mode: ConnectMode) -> Result<Live, A
     .await?;
     let identity: SessionIdentify =
         serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_IDENTIFY, &error))?;
-    check_compatibility(&identity, &config.client_build, config.localhost)
-        .map_err(|mismatch| AttemptError::Incompatible(Box::new(mismatch)))?;
+    check_compatibility(
+        &identity,
+        &config.client_build,
+        config.transport.restart_action(),
+    )
+    .map_err(|mismatch| AttemptError::Incompatible(Box::new(mismatch)))?;
 
     // 2. Claim the lease. Reconnect IS takeover — the lease outlives the
     //    connection it was minted on, so a client that reconnects has to
@@ -531,7 +536,7 @@ async fn ensure_socket(config: &ConnectionConfig, mode: ConnectMode) -> Result<(
 /// shared launch ladder (`roost_ipc::session_launch`, the same rungs
 /// `roostctl session start` uses).
 async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
-    if !config.localhost {
+    if !config.transport.is_localhost() {
         return Err(AttemptError::Transport(format!(
             "no session is running at {} and only a localhost session can be started from here",
             config.socket.display()
@@ -1050,12 +1055,12 @@ mod tests {
 
     /// A config for a host that is not there. Only the three fields the
     /// spawn rules read differ between these cases.
-    fn config(socket: PathBuf, localhost: bool, mode: ConnectMode) -> ConnectionConfig {
+    fn config(socket: PathBuf, transport: HostTransport, mode: ConnectMode) -> ConnectionConfig {
         ConnectionConfig {
             host: "h1".into(),
             label: "local".into(),
             socket,
-            localhost,
+            transport,
             generation: 1,
             supersedes: None,
             mode,
@@ -1070,7 +1075,7 @@ mod tests {
     async fn dial_mode_never_touches_the_spawn_ladder() {
         let config = config(
             PathBuf::from("/nonexistent/roost-host-conn-test.sock"),
-            true,
+            HostTransport::LocalSession,
             ConnectMode::Dial,
         );
         assert!(ensure_socket(&config, ConnectMode::Dial).await.is_ok());
@@ -1086,7 +1091,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&socket);
-        let config = config(socket, true, ConnectMode::IfPresent);
+        let config = config(socket, HostTransport::LocalSession, ConnectMode::IfPresent);
         let error = ensure_socket(&config, ConnectMode::IfPresent)
             .await
             .expect_err("an absent socket is not a connection");
@@ -1102,7 +1107,7 @@ mod tests {
     async fn a_remote_host_is_never_spawned() {
         let config = config(
             PathBuf::from("/nonexistent/roost-host-conn-remote.sock"),
-            false,
+            HostTransport::UnixSocket,
             ConnectMode::SpawnIfMissing,
         );
         let error = spawn_session(&config).await.expect_err("no spawn");
@@ -1221,7 +1226,7 @@ mod tests {
             // is scheduled: the task reaches its epilogue on its own.
             config(
                 PathBuf::from("/nonexistent/roost-host-conn-epilogue.sock"),
-                false,
+                HostTransport::UnixSocket,
                 ConnectMode::Dial,
             ),
             HostIdMinter::new(),

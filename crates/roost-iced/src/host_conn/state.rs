@@ -41,6 +41,61 @@ pub(crate) enum MismatchKind {
     Build,
 }
 
+/// How a saved host is reached — the one structural fact both the
+/// reconnect policy and the mismatch dialog's offer are derived from.
+///
+/// It mirrors [`roost_ipc::ssh::ResolvedTransport`]'s three variants
+/// without their payloads, so the two questions that used to be asked
+/// as one `localhost: bool` ("is this our own session to spawn and
+/// retry?" and "what can we offer when the builds disagree?") cannot
+/// drift apart: there is one value, and each is a function of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostTransport {
+    /// The `"localhost"` sentinel: this machine's own session.
+    LocalSession,
+    /// A Unix socket path — somebody else's process, reached directly.
+    UnixSocket,
+    /// Reached over `ssh`.
+    Ssh,
+}
+
+impl HostTransport {
+    /// Whether this is this machine's own session. Gates the spawn
+    /// ladder and the auto-retry policy.
+    pub(crate) fn is_localhost(self) -> bool {
+        matches!(self, Self::LocalSession)
+    }
+
+    /// What this client can offer when the build gate refuses — decided
+    /// **structurally**, never probed (plan 039 §3.5).
+    pub(crate) fn restart_action(self) -> RestartAction {
+        match self {
+            Self::LocalSession => RestartAction::RestartLocal,
+            Self::Ssh => RestartAction::OfferRemoteUpdate,
+            Self::UnixSocket => RestartAction::None,
+        }
+    }
+}
+
+/// What this client can do about a session it cannot talk to.
+///
+/// Three answers, one per transport, and all three are decided from how
+/// the host is reached rather than from anything on the far side — an
+/// actual install source is resolved later, at confirm time (plan 039
+/// §3.5), so nothing here costs a round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartAction {
+    /// This machine's own session: stop it and start it again from here.
+    RestartLocal,
+    /// Reached over `ssh`, so an update *can* be offered — whether a
+    /// matching build actually exists to install is resolved when the
+    /// user confirms, not now.
+    OfferRemoteUpdate,
+    /// A remote Unix-socket target: somebody else's process, with no
+    /// transport this client could reach the binary over.
+    None,
+}
+
 /// Everything the upgrade dialog (C8) needs to say what is wrong and
 /// what restarting would fix.
 ///
@@ -55,11 +110,9 @@ pub(crate) struct BuildMismatch {
     pub(crate) session_build: String,
     pub(crate) client_build: String,
     pub(crate) session_payload_kinds: Vec<String>,
-    /// Whether this client could restart the session itself. Only a
-    /// localhost host is restartable — a remote session is somebody
-    /// else's process, and the dialog says so instead of offering a
-    /// button that cannot work.
-    pub(crate) restartable: bool,
+    /// What this client can offer about it — a local restart, a remote
+    /// update, or nothing but a pointer at the docs.
+    pub(crate) restart: RestartAction,
 }
 
 /// Run the compatibility gate against a `session.identify` reply.
@@ -69,7 +122,7 @@ pub(crate) struct BuildMismatch {
 pub(crate) fn check_compatibility(
     identity: &SessionIdentify,
     client_build: &str,
-    restartable: bool,
+    restart: RestartAction,
 ) -> Result<(), BuildMismatch> {
     let mismatch = |kind| BuildMismatch {
         kind,
@@ -82,7 +135,7 @@ pub(crate) fn check_compatibility(
             .iter()
             .map(|kind| kind.0.clone())
             .collect(),
-        restartable,
+        restart,
     };
 
     if identity.session_protocol != SESSION_PROTOCOL_VERSION {
@@ -348,7 +401,7 @@ mod tests {
             session_build: "gb-old".into(),
             client_build: "gb-1".into(),
             session_payload_kinds: vec![REQUIRED_PAYLOAD_KIND.to_string()],
-            restartable: true,
+            restart: RestartAction::RestartLocal,
         });
         let cases = [
             (HostConnState::Connected, SectionState::Connected),
@@ -388,7 +441,10 @@ mod tests {
     #[test]
     fn a_matching_session_passes_every_half_of_the_gate() {
         let ok = identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-1");
-        assert_eq!(check_compatibility(&ok, "gb-1", true), Ok(()));
+        assert_eq!(
+            check_compatibility(&ok, "gb-1", RestartAction::RestartLocal),
+            Ok(())
+        );
         // An extra kind the client does not know is not a refusal — the
         // list is open by contract.
         let extra = identity(
@@ -396,14 +452,17 @@ mod tests {
             &["vt", "ghostty-snapshot", "future"],
             "gb-1",
         );
-        assert_eq!(check_compatibility(&extra, "gb-1", true), Ok(()));
+        assert_eq!(
+            check_compatibility(&extra, "gb-1", RestartAction::RestartLocal),
+            Ok(())
+        );
     }
 
     #[test]
     fn each_half_of_the_gate_names_itself() {
         let wrong_protocol = identity(1, &["ghostty-snapshot"], "gb-1");
         assert_eq!(
-            check_compatibility(&wrong_protocol, "gb-1", true)
+            check_compatibility(&wrong_protocol, "gb-1", RestartAction::RestartLocal)
                 .unwrap_err()
                 .kind,
             MismatchKind::Protocol
@@ -411,20 +470,22 @@ mod tests {
 
         let no_kind = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-1");
         assert_eq!(
-            check_compatibility(&no_kind, "gb-1", true)
+            check_compatibility(&no_kind, "gb-1", RestartAction::RestartLocal)
                 .unwrap_err()
                 .kind,
             MismatchKind::PayloadKind
         );
 
         let wrong_build = identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-2");
-        let mismatch = check_compatibility(&wrong_build, "gb-1", false).unwrap_err();
+        let mismatch = check_compatibility(&wrong_build, "gb-1", RestartAction::None).unwrap_err();
         assert_eq!(mismatch.kind, MismatchKind::Build);
         assert_eq!(mismatch.session_build, "gb-2");
         assert_eq!(mismatch.client_build, "gb-1");
-        assert!(
-            !mismatch.restartable,
-            "a remote session is not ours to restart"
+        assert_eq!(
+            mismatch.restart,
+            RestartAction::None,
+            "a remote socket session is not ours to restart, and there is no \
+             transport to update it over either"
         );
     }
 
@@ -434,7 +495,7 @@ mod tests {
     fn the_protocol_check_wins_over_the_build_check() {
         let both_wrong = identity(99, &["vt"], "gb-2");
         assert_eq!(
-            check_compatibility(&both_wrong, "gb-1", true)
+            check_compatibility(&both_wrong, "gb-1", RestartAction::RestartLocal)
                 .unwrap_err()
                 .kind,
             MismatchKind::Protocol
@@ -480,7 +541,7 @@ mod tests {
         let mismatch = check_compatibility(
             &identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-old"),
             "gb-new",
-            true,
+            RestartAction::RestartLocal,
         )
         .unwrap_err();
 
