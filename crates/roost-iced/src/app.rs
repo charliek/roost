@@ -3144,7 +3144,7 @@ impl App {
             modal_heading(
                 "Add Host".to_string(),
                 "Point Roost at a running roost-session: an SSH destination \
-                 (`workbox`, `user@host`, `ssh://host:port`) or a local socket \
+                 (workbox, user@host, ssh://host:port) or a local socket \
                  path.",
             ),
             dialog_field(

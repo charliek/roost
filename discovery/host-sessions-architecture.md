@@ -708,7 +708,9 @@ remote image paste stays deferred (roadmap open questions).
 Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 
 ```text
- client ── UDS ── local bridge ── ssh -T host 'exec roost-session client-bridge'
+ client ── UDS ── local bridge ── ssh -T host 'sh -c "…exec roost-session client-bridge"'
+                                        │ (the shipped remote command prefers
+                                        │  $HOME/.local/bin/roost-session, then PATH)
                                         │ (per accepted connection,
                                         │  shared ControlMaster)
                               far side: connect to local session UDS,
