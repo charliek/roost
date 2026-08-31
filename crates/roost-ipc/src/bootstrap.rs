@@ -4617,6 +4617,13 @@ mod tests {
     // release assets
     // ------------------------------------------------------------------
 
+    // Naming pin (plan 039 §3.7, C4): linux/scripts/stage-session-artifact.sh
+    // hardcodes this same "roost-session-0.0.19-linux-amd64" shape (and its
+    // .sha256 sibling) in its own test,
+    // linux/scripts/stage-session-artifact_test.sh — the release-side script
+    // has no Rust to import this function from, so the two are kept from
+    // drifting by cross-referencing comments instead. If this string moves,
+    // update the shell test too (and vice versa).
     #[test]
     fn asset_names_are_versioned_per_arch_and_github_safe() {
         assert_eq!(

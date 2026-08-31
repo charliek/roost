@@ -26,7 +26,11 @@ That's it. Everything else is automatic.
    - `version-check` — tag matches `[workspace.package].version`
    - `ci-gate` — `ci-success` green on tagged commit
    - `create-release` — extract CHANGELOG section → `gh release create --draft`
-   - `linux` (amd64 + arm64 matrix) — build + upload `roost_X.Y.Z_<arch>.deb`
+   - `linux` (amd64 + arm64 matrix) — build + upload `roost_X.Y.Z_<arch>.deb`,
+     plus (unpacked from the same build, no second cargo invocation) a
+     standalone `roost-session-X.Y.Z-linux-<arch>` binary and its
+     `.sha256` checksum sidecar — the host-sessions bootstrap install rung
+     fetches these directly (`crates/roost-ipc/src/bootstrap.rs`)
    - `mac` — build + sign + notarize + upload `Roost-X.Y.Z.dmg`, then
      EdDSA-sign it and hand `sign.txt` forward as a build artifact. The
      "Append macOS first-launch note" step keeps the Gatekeeper bypass
@@ -37,7 +41,8 @@ That's it. Everything else is automatic.
      `Roost-Iced-X.Y.Z.dmg`, and EdDSA-signs it (its own keypair, never
      the Swift key), handing `sign-iced.txt` forward as a build artifact.
    - **`publish-release`** — asserts the artifact set (both `.deb`s, the
-     Swift DMG, and the iced DMG — four assets, one each, correctly
+     Swift DMG, the iced DMG, both `roost-session` standalone binaries and
+     both of their `.sha256` sidecars — eight assets, one each, correctly
      named and sized), then flips the draft public. **This is the only
      irreversible step in the pipeline.**
    - `appcast` — append the signed Sparkle entry to `docs/appcast.xml` and
@@ -55,10 +60,14 @@ That's it. Everything else is automatic.
 ## Draft-until-complete, and how to recover
 
 The Release is created as a **draft** and stays one until `publish-release`
-has seen an amd64 `.deb`, an arm64 `.deb`, the Swift `.dmg` and the iced
-`.dmg` on it — each present exactly once, at least 1 MiB (a floor that
-catches truncated uploads plain non-emptiness would wave through), and
-named for the tag.
+has seen all **eight** assets on it — an amd64 `.deb`, an arm64 `.deb`, the
+Swift `.dmg`, the iced `.dmg`, a standalone `roost-session` binary per Linux
+arch, and that binary's `.sha256` checksum sidecar per arch — each present
+exactly once, named for the tag, and plausibly sized: the six
+binaries/packages need at least 1 MiB (a floor that catches truncated
+uploads plain non-emptiness would wave through), while the two `.sha256`
+sidecars — tiny by design, a `sha256sum` two-field line — use a much lower
+64-byte floor instead so a real one is never mistaken for a truncated one.
 
 A draft is invisible on the public releases page and API to anyone without
 push access. That is not cosmetic: apt-charliek authenticates with a
