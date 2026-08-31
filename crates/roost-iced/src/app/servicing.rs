@@ -1235,6 +1235,7 @@ impl App {
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
                 }
+                EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -1705,6 +1706,8 @@ impl App {
                     // the "no daemon is spawned silently" rule on screen.
                     None => (host_sidebar::SectionState::Disconnected, None, None),
                 };
+                // Taken before `host.id` is moved into the view.
+                let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 super::HostView {
                     saved_id: host.id,
                     // The registry's label wins over the connection's:
@@ -1714,7 +1717,12 @@ impl App {
                     // Same reason the label comes from here: the verb
                     // policy has to know whether a host is this
                     // machine's own *before* anything connects to it.
-                    localhost: host.target == crate::host_conn::LOCALHOST_TARGET,
+                    // The classifier's own rule rather than a raw `==`:
+                    // the sentinel is trimmed before it is matched, so a
+                    // saved `" localhost"` is the local session
+                    // everywhere or nowhere.
+                    localhost: roost_ipc::ssh::target_is_localhost(&host.target),
+                    reason,
                     host: incarnation.unwrap_or(HostId::LOCAL),
                     state,
                     projects: mirror
@@ -1768,6 +1776,7 @@ impl App {
                     host: view.host,
                     state: view.state,
                     agents: view.agents,
+                    reason: view.reason.as_deref(),
                 })
                 .collect::<Vec<_>>(),
         );

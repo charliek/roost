@@ -80,6 +80,17 @@ pub(crate) enum EngineFeed {
     /// One host's connection lifecycle, for the sidebar headers,
     /// takeover banner and upgrade dialog.
     HostState(HostId, crate::host_conn::HostConnState),
+    /// An ssh-reached host's tunnel finished coming up — or failed to
+    /// (plan 038 §3.4).
+    ///
+    /// It rides the feed for the same reason a host's mirror does: the
+    /// establish is a full TCP + auth handshake on the engine runtime,
+    /// and the dial it authorizes has to happen on the main thread, in
+    /// order against everything else that has moved this host meanwhile
+    /// (a disconnect, a remove, a second Connect). Boxed because a live
+    /// `Arc<SshTunnel>` plus its provenance is several times the size of
+    /// the next-largest item, and every feed item pays for the largest.
+    HostTunnel(Box<crate::host_conn::HostTunnelReady>),
 }
 
 /// The only way to put an item on the feed. Raw senders are never handed
@@ -137,7 +148,12 @@ impl EngineFeedReceiver {
         // contains the host mutation that preceded it.
         let workspace = matches!(
             item,
-            EngineFeed::Workspace(_) | EngineFeed::HostWorkspace(..) | EngineFeed::HostState(..)
+            EngineFeed::Workspace(_)
+                | EngineFeed::HostWorkspace(..)
+                | EngineFeed::HostState(..)
+                // A tunnel answer either starts a connection or leaves a
+                // reason on the band; both are what the section renders.
+                | EngineFeed::HostTunnel(..)
         );
         let tab_bytes = matches!(
             item,

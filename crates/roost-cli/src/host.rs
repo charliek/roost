@@ -23,16 +23,27 @@ use roost_ipc::messages::{
     ops, HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostListResult,
     HostRemoveParams,
 };
-use roost_ipc::{session_launch, IpcClient};
+use roost_ipc::{ssh, IpcClient};
 
 #[derive(Subcommand, Debug)]
 pub enum HostCmd {
-    /// Save a new host. Registry-only by default: this does not dial
-    /// `--target` at all, so a typo'd socket path saves cleanly (the
-    /// Hosts sidebar's dot reflects that at the next connect attempt).
-    /// `--verify` dials `session.identify` against `--target` first and
-    /// refuses to save on an unreachable or incompatible session —
-    /// mirroring the Add Host dialog's "Add & Connect" validation.
+    /// Save a new host. `--target` is an SSH destination (`workbox`,
+    /// `user@host`, `ssh://host:port`), a local socket path
+    /// (`/tmp/roost.sock`, `./roost.sock`), or `localhost` for this
+    /// machine's own session.
+    ///
+    /// Registry-only by default: this does not reach `--target` at all,
+    /// so a host that is merely down saves cleanly (the Hosts sidebar's
+    /// dot reflects that at the next connect attempt). What it always
+    /// checks is that the string *means* something — a target that
+    /// cannot be classified is refused rather than saved as a host
+    /// nothing can ever connect to.
+    ///
+    /// `--verify` goes further and asks `--target` for a
+    /// `session.identify` first — over `ssh` or over the socket,
+    /// whichever it names — refusing to save on an unreachable or
+    /// incompatible session, mirroring the Add Host dialog's
+    /// "Add & Connect" validation.
     Add {
         #[arg(long)]
         label: String,
@@ -93,8 +104,26 @@ pub async fn run(cmd: &HostCmd, client: &mut IpcClient) -> i32 {
 }
 
 async fn add(client: &mut IpcClient, label: &str, target: &str, verify: bool) -> Result<i32> {
+    // Before anything is dialed and before anything is saved: a target
+    // the classifier cannot read is not a host that is merely down, it
+    // is a string nothing will ever connect to. The refusal is its own
+    // message, written for this reader (`host:22`, a leading `-`, an
+    // empty target) — the same one the Add Host dialog shows.
+    let transport = match ssh::classify(target) {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("roostctl host add: {error:#}");
+            return Ok(1);
+        }
+    };
+    // Reached directly — this is the session, not the UI socket the
+    // caller is already connected to. `verify_transport` is the same
+    // call the Add Host dialog's "Add & Connect" makes, so `--verify`
+    // cannot promise a different bar than the dialog does (plan 037
+    // §3.5), and it is bounded either way it goes, so an unreachable
+    // target fails rather than hanging `roostctl`.
     if verify {
-        if let Err(err) = verify_target(target).await {
+        if let Err(err) = ssh::verify_transport(&transport).await {
             eprintln!("roostctl host add: {target} did not verify: {err:#}");
             return Ok(1);
         }
@@ -113,24 +142,6 @@ async fn add(client: &mut IpcClient, label: &str, target: &str, verify: bool) ->
         resp.host.id, resp.host.label, resp.host.target
     );
     Ok(0)
-}
-
-/// Dial `target` directly (it is a session socket path, not the UI
-/// socket the caller is already connected to) and check it answers
-/// `session.identify` with a protocol this build understands.
-///
-/// The check is [`roost_ipc::session_launch::verify_target`], which the
-/// Add Host dialog's "Add & Connect" also calls — including the
-/// `localhost` sentinel resolution, so a target can never mean two
-/// sockets depending on which binary read it, and `--verify` can never
-/// promise a different bar than the dialog does (plan 037 §3.5). The
-/// budget is `session`'s CI-scaled one, so a wedged or unreachable
-/// target fails fast instead of hanging `roostctl`.
-async fn verify_target(target: &str) -> Result<()> {
-    let budget = session_launch::IPC_TIMEOUT.mul_f64(session_launch::timeout_scale());
-    session_launch::verify_target(target, budget)
-        .await
-        .map(drop)
 }
 
 async fn list(client: &mut IpcClient, json: bool) -> Result<i32> {
@@ -235,6 +246,33 @@ mod tests {
         match parse(&["disconnect", "--id", "3f9a2b7c1d4e4f5a"]) {
             HostCmd::Disconnect { id } => assert_eq!(id, "3f9a2b7c1d4e4f5a"),
             other => panic!("expected disconnect, got {other:?}"),
+        }
+    }
+
+    /// Every spelling the help text offers classifies, so the CLI cannot
+    /// advertise a form its own pre-flight rejects. (Which strings the
+    /// pre-flight *refuses*, and what it says about them, is
+    /// `roost_ipc::ssh::classify`'s own contract and is pinned there.)
+    #[test]
+    fn every_target_form_the_help_text_names_classifies() {
+        let help = HostCmd::augment_subcommands(clap::Command::new("host"))
+            .find_subcommand("add")
+            .expect("host add")
+            .clone()
+            .render_long_help()
+            .to_string();
+        for form in ["workbox", "user@host", "ssh://host:port", "localhost"] {
+            assert!(help.contains(form), "the help text must name {form:?}");
+        }
+        for target in [
+            "workbox",
+            "user@host",
+            "ssh://host:2222",
+            "localhost",
+            "/tmp/roost.sock",
+            "./roost.sock",
+        ] {
+            ssh::classify(target).unwrap_or_else(|error| panic!("{target:?}: {error}"));
         }
     }
 

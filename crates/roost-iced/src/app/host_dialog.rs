@@ -12,9 +12,10 @@
 //! Add Host is the one flow in the whole feature that needs free text,
 //! which is why it is a dialog rather than palette steps. Its validation
 //! is split in two on purpose: what can be answered instantly (an empty
-//! field, a label the registry would refuse) is answered instantly, and
-//! only a draft that passes spends a round trip dialing
-//! `session.identify`.
+//! field, a label the registry would refuse, a target string that cannot
+//! mean anything) is answered instantly, and only a draft that passes
+//! spends a round trip on `session.identify` — over a socket or over
+//! `ssh`, depending on what the target turned out to be.
 
 /// The Add Host dialog's live contents.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -141,27 +142,35 @@ pub(super) fn validate_draft(
         return Err("a name is required".into());
     }
     label_check(label)?;
-    if target.is_empty() {
-        return Err("a socket path is required".into());
-    }
+    // The classifier, not an is-empty check: it is the one place that
+    // decides what a target string means, and its refusals are written
+    // for exactly this reader — an empty field, a `-oProxyCommand=…`
+    // that would reach `ssh` as a flag, a `host:22` that is ambiguous
+    // with a socket path. Showing its message verbatim keeps the dialog
+    // and `roostctl host add` saying the same thing about the same
+    // string.
+    roost_ipc::ssh::classify(target).map_err(|error| format!("{error:#}"))?;
     Ok(HostDraftTarget {
         label: label.to_string(),
         target: target.to_string(),
     })
 }
 
-/// Dial a prospective host and check it is a session this client can
+/// Reach a prospective host and check it is a session this client can
 /// talk to at all.
 ///
-/// The check itself is [`roost_ipc::session_launch::verify_target`] —
-/// the same bar `roostctl host add --verify` applies, stated once so the
-/// dialog and the CLI cannot drift apart about what "verified" means.
-/// All this adds is the dialog's own error shape: a `String` to show
-/// under the fields.
+/// The check itself is [`roost_ipc::ssh::verify_transport`] — one bar
+/// however the target is reached, and the same call `roostctl host add
+/// --verify` makes, so the dialog and the CLI cannot drift apart about
+/// what "verified" means. All this adds is the dialog's own error shape:
+/// a `String` to show under the fields.
+///
+/// The classify is a second one (`validate_draft` already ran it), and
+/// deliberately so: this half runs off the main thread, on a target the
+/// dialog only carries as a string.
 pub(super) async fn verify_target(target: String) -> Result<(), String> {
-    let budget =
-        roost_ipc::session_launch::IPC_TIMEOUT.mul_f64(roost_ipc::session_launch::timeout_scale());
-    roost_ipc::session_launch::verify_target(&target, budget)
+    let transport = roost_ipc::ssh::classify(&target).map_err(|error| format!("{error:#}"))?;
+    roost_ipc::ssh::verify_transport(&transport)
         .await
         .map(drop)
         .map_err(|error| format!("{error:#}"))
@@ -202,7 +211,45 @@ mod tests {
         );
         assert_eq!(
             validate_draft(&draft("pop-os", "  "), accept),
-            Err("a socket path is required".into())
+            Err("target is empty".into())
+        );
+    }
+
+    /// Every spelling the helper text offers is one the dialog accepts.
+    #[test]
+    fn ssh_targets_are_accepted_in_every_spelling_the_helper_names() {
+        for target in [
+            "workbox",
+            "user@host",
+            "ssh://host:2222",
+            "ssh://[::1]:22",
+            "localhost",
+            "/tmp/s.sock",
+            "./s.sock",
+        ] {
+            let checked = validate_draft(&draft("pop-os", target), accept)
+                .unwrap_or_else(|error| panic!("{target:?} was refused: {error}"));
+            assert_eq!(checked.target, target);
+        }
+    }
+
+    /// The two refusals the classifier exists for, surfaced verbatim: a
+    /// `host:22` is ambiguous with a socket path, and a leading `-`
+    /// would reach `ssh` as a flag rather than a destination.
+    #[test]
+    fn the_classifiers_refusals_are_what_the_dialog_shows() {
+        let error = validate_draft(&draft("pop-os", "host:22"), accept)
+            .expect_err("host:22 must be refused");
+        assert!(
+            error.contains("ssh://host:port"),
+            "{error} must name the spelling that works"
+        );
+
+        let error = validate_draft(&draft("pop-os", "-oProxyCommand=id"), accept)
+            .expect_err("a leading dash must be refused");
+        assert!(
+            error.contains("looks like an option"),
+            "{error} must say why a dash is not a host"
         );
     }
 
@@ -218,11 +265,11 @@ mod tests {
         );
     }
 
-    /// The label is checked before the socket: a name the registry will
+    /// The label is checked before the target: a name the registry will
     /// never accept is the more useful thing to say first, and it is the
-    /// half the user can fix without knowing a path.
+    /// half the user can fix without knowing a host or a path.
     #[test]
-    fn the_label_is_checked_before_the_socket() {
+    fn the_label_is_checked_before_the_target() {
         let refuse = |_: &str| Err("reserved".to_string());
         assert_eq!(
             validate_draft(&draft("local", ""), refuse),

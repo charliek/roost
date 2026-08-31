@@ -71,6 +71,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use roost_ipc::messages::{ops, EventEnvelope, OscColorsParams};
+use roost_ipc::ssh::SshTunnel;
 use roost_ui_model::keys::HostId;
 use roost_ui_model::theme::Theme;
 
@@ -206,12 +207,17 @@ impl HostIdMinter {
     }
 }
 
-/// The sentinel and the resolver both live in `roost_ipc`, beside the
-/// spawn ladder that acts on the answer: `roostctl host add --verify`
-/// resolves the same targets this does, and a target that meant two
-/// different sockets depending on which binary read it would be a bug
-/// nothing could see.
-pub(crate) use roost_ipc::session_launch::{resolve_target, LOCALHOST_TARGET};
+/// The sentinel lives in `roost_ipc`, beside the classifier that acts on
+/// it: `roostctl host add --verify` reads the same targets this does, and
+/// a target that meant two different things depending on which binary
+/// read it would be a bug nothing could see.
+pub(crate) use roost_ipc::ssh::LOCALHOST_TARGET;
+
+/// One control-plane leg's budget, as the connection task sizes it. Also
+/// what bounds the attach path's data dial (`app::host_tab`) — the two
+/// legs run against the same socket, and a bound one of them can outwait
+/// is not a bound.
+pub(crate) use task::leg as leg_budget;
 
 /// The client's terminal palette in the wire's spelling.
 ///
@@ -226,6 +232,35 @@ pub(crate) fn theme_colors(theme: &Theme) -> OscColorsParams {
         cursor: hex(theme.cursor),
         palette: theme.palette.iter().copied().map(hex).collect(),
     }
+}
+
+/// A disconnected state's one-line reason, when it has one.
+fn disconnected_reason(state: &HostConnState) -> Option<&str> {
+    match state {
+        HostConnState::Disconnected(disconnected) => Some(disconnected.reason.as_str()),
+        _ => None,
+    }
+}
+
+/// Open a tunnel to `target` and warm its mux, as one failable step.
+///
+/// A failed establish is shut down here rather than dropped: `SshTunnel`
+/// tears itself down *blocking* in `Drop`, and dropping it on a runtime
+/// worker would park that worker on a `-O exit`. Shutting it down first
+/// leaves Drop with nothing to do — and retires the scratch directory
+/// this attempt claimed, which is its own and nobody else's.
+async fn establish_tunnel(
+    host: &str,
+    target: &roost_ipc::ssh::SshTarget,
+) -> Result<Arc<SshTunnel>, String> {
+    let tunnel = SshTunnel::open(host, target, roost_ipc::ssh::SshTunnelOptions::from_env())
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = tunnel.establish().await {
+        tunnel.shutdown().await;
+        return Err(error.to_string());
+    }
+    Ok(Arc::new(tunnel))
 }
 
 /// One saved host's connection, as the app holds it.
@@ -310,6 +345,67 @@ pub(crate) struct HostConnSet {
     /// Handed out by [`HostConnSet::connect`], never reused. See
     /// [`Registration`].
     next_generation: u64,
+    /// The ssh transport for each saved host reached over one, keyed on
+    /// the saved host's id like [`Self::conns`].
+    ///
+    /// **This is where the tunnels live, and the seam is deliberate.**
+    /// A tunnel is opened, torn down and read for its last failure at
+    /// exactly the three moments a connection is started, dropped and
+    /// reported — all of which this set already owns — and it already
+    /// holds the runtime handle the establish runs on and the feed the
+    /// answer comes back over. Hanging them off `App` instead would mean
+    /// duplicating `connect`/`disconnect`/`remove`'s lifecycle in a
+    /// second place and threading the runtime and the feed there twice.
+    ssh: HashMap<String, SshState>,
+    /// Handed out by [`HostConnSet::open_ssh`], never reused.
+    next_ssh_request: u64,
+}
+
+/// One saved host's ssh transport, from the moment a connect is asked
+/// for until the host is disconnected or removed.
+///
+/// The entry exists *before* the tunnel does: an establish takes a full
+/// TCP + auth handshake, and the window between asking and answering is
+/// exactly when a user can cancel, disconnect, or ask again. `request`
+/// is what closes it — an answer stamped with anything but the current
+/// request is answering a question this host has moved past.
+struct SshState {
+    /// The target as the registry spells it, for [`SshFailure::message`].
+    target: String,
+    /// Which establish this entry is waiting on, or was last answered
+    /// by.
+    request: u64,
+    label: String,
+    mode: ConnectMode,
+    /// Whether a user asked for this attempt. Only an attended failure
+    /// raises a toast; an unattended one is the band's business alone.
+    attended: bool,
+    /// `None` until the establish answers, and again once the tunnel is
+    /// torn down.
+    tunnel: Option<Arc<SshTunnel>>,
+    /// The highest [`SshTunnel::last_error`] generation already folded
+    /// into a reported reason. A tunnel bumps its generation once per
+    /// `ssh` exec, so this is what separates "the failure the band is
+    /// already showing" from "a new one since".
+    seen: u64,
+    /// Why the last attempt failed, when there is no connection left to
+    /// carry the reason — an establish that never reached
+    /// [`HostConnSet::connect`] publishes no `HostConnState` at all.
+    failure: Option<String>,
+}
+
+/// One finished establish, on its way back to the main thread.
+///
+/// The socket the connection dials cannot be known until the tunnel is
+/// up, so the ssh path is two steps where the other two transports are
+/// one: [`HostConnSet::open_ssh`] spawns the handshake, this lands on
+/// the engine feed, and the drain hands it to
+/// [`HostConnSet::tunnel_ready`] — which is the *only* place a tunnel's
+/// bridge socket becomes a `ConnectionConfig`.
+pub(crate) struct HostTunnelReady {
+    pub(crate) host: String,
+    pub(crate) request: u64,
+    pub(crate) result: Result<Arc<SshTunnel>, String>,
 }
 
 impl HostConnSet {
@@ -328,6 +424,8 @@ impl HostConnSet {
             mirrors: HashMap::new(),
             retained: HashMap::new(),
             next_generation: 0,
+            ssh: HashMap::new(),
+            next_ssh_request: 0,
         }
     }
 
@@ -404,6 +502,215 @@ impl HostConnSet {
         );
     }
 
+    /// Start an ssh-reached host's connection: open its tunnel, warm the
+    /// mux, and only then dial.
+    ///
+    /// Two steps because the socket does not exist yet. The other two
+    /// transports resolve a path and hand it straight to [`Self::connect`];
+    /// an ssh target has no socket until a `bridge.sock` is bound, and
+    /// binding it costs a full TCP + auth handshake. So the handshake runs
+    /// on the engine runtime, its answer comes back over the engine feed
+    /// as [`HostTunnelReady`], and [`Self::tunnel_ready`] is what calls
+    /// `connect`. Nothing about the tunnel is ever awaited on the UI
+    /// thread.
+    ///
+    /// Any tunnel this host already had is torn down first: a Connect is
+    /// an unconditional reconnect on this wire, and reusing a mux whose
+    /// master may already be wedged is exactly how a reconnect fails to
+    /// be one.
+    ///
+    /// The teardown is *awaited by the replacement*, in the same task, so
+    /// one host never has two `ssh` masters at once. That is hygiene
+    /// rather than safety: what keeps a teardown from deleting the
+    /// replacement's files is that every attempt claims a scratch
+    /// directory of its own (`roost_ipc::ssh::scratch_dir_name`), so an
+    /// overlap — a double Connect, an establish that lands late — has
+    /// nothing to collide on.
+    ///
+    /// Attendedness is read off `mode` rather than passed in:
+    /// `IfPresent` is minted by exactly one caller, the launch probe, and
+    /// everything else is a user asking. (The probe declines a remote
+    /// host outright, so no ssh target reaches here unattended today —
+    /// deriving it keeps that true by construction rather than leaving a
+    /// second parameter that could disagree.)
+    pub(crate) fn open_ssh(
+        &mut self,
+        host: &str,
+        label: &str,
+        target: roost_ipc::ssh::SshTarget,
+        mode: ConnectMode,
+    ) {
+        let previous = self.take_tunnel(host);
+        self.next_ssh_request += 1;
+        let request = self.next_ssh_request;
+        self.ssh.insert(
+            host.to_string(),
+            SshState {
+                target: target.raw.clone(),
+                request,
+                label: label.to_string(),
+                mode,
+                attended: mode != ConnectMode::IfPresent,
+                tunnel: None,
+                seen: 0,
+                failure: None,
+            },
+        );
+
+        let feed = self.feed.clone();
+        let host_id = host.to_string();
+        self.runtime.spawn(async move {
+            if let Some(previous) = previous {
+                previous.shutdown().await;
+            }
+            let result = establish_tunnel(&host_id, &target).await;
+            feed.send(crate::engine_feed::EngineFeed::HostTunnel(Box::new(
+                HostTunnelReady {
+                    host: host_id,
+                    request,
+                    result,
+                },
+            )));
+        });
+    }
+
+    /// Fold a finished establish back in, and dial if it came up.
+    ///
+    /// Returns the status line this attempt owes the user: `Some` only
+    /// for a failure the user asked for. An unattended failure is the
+    /// band's business alone, and a success says nothing — the state
+    /// machine's own `Connecting` is already on its way.
+    pub(crate) fn tunnel_ready(&mut self, ready: HostTunnelReady) -> Option<String> {
+        let HostTunnelReady {
+            host,
+            request,
+            result,
+        } = ready;
+        // Both stale paths hand the tunnel to [`Self::discard_tunnel`]
+        // rather than letting it fall out of scope here: dropping one on
+        // the UI thread would run its blocking teardown on the UI thread.
+        match self.ssh.get(&host) {
+            None => {
+                tracing::debug!(%host, "dropped a tunnel establish for a host that is no longer reached over ssh");
+                self.discard_tunnel(result);
+                return None;
+            }
+            Some(entry) if entry.request != request => {
+                tracing::debug!(%host, request, "dropped a superseded tunnel establish");
+                self.discard_tunnel(result);
+                return None;
+            }
+            Some(_) => {}
+        }
+        let entry = self.ssh.get_mut(&host).expect("the entry checked above");
+        match result {
+            Ok(tunnel) => {
+                let socket = tunnel.bridge_socket().to_path_buf();
+                // The generation the band is already square with. A
+                // per-connection exec that fails after this point bumps
+                // past it, and that is what `apply_state` overlays.
+                entry.seen = tunnel.last_error().map_or(0, |(generation, _)| generation);
+                entry.failure = None;
+                entry.tunnel = Some(tunnel);
+                let (label, mode) = (entry.label.clone(), entry.mode);
+                tracing::info!(%host, socket = %socket.display(), "ssh tunnel established");
+                self.connect(&host, &label, socket, false, mode);
+                None
+            }
+            Err(reason) => {
+                tracing::warn!(%host, %reason, "ssh tunnel could not be established");
+                entry.failure = Some(reason.clone());
+                entry.attended.then_some(reason)
+            }
+        }
+    }
+
+    /// Why this host's band says what it says, when there is a reason
+    /// worth naming.
+    ///
+    /// Three sources, in the order they can be current: the live
+    /// connection's own state, an establish that never reached one, and
+    /// the retained section a disconnect left behind.
+    pub(crate) fn section_reason(&self, host: &str) -> Option<&str> {
+        if let Some(conn) = self.conns.get(host) {
+            return disconnected_reason(&conn.state);
+        }
+        if let Some(failure) = self.ssh.get(host).and_then(|ssh| ssh.failure.as_deref()) {
+            return Some(failure);
+        }
+        disconnected_reason(&self.retained.get(host)?.state)
+    }
+
+    /// Replace a generic drop reason with the tunnel's own, when the
+    /// tunnel has hit something newer than what has already been
+    /// reported.
+    ///
+    /// This is what turns "the connection closed" into "the host key for
+    /// box has CHANGED". The connection task only ever sees its end of a
+    /// Unix socket: the `ssh` exec behind that socket is what failed, and
+    /// its stderr is on the tunnel. The generation is what keeps the
+    /// overlay honest — a tunnel bumps it once per exec, so an error from
+    /// *before* this attempt started (already reported, or belonging to a
+    /// connection that has since ended) can never be shown as the reason
+    /// for this one.
+    fn overlay_ssh_reason(&mut self, host: &str, disconnected: &mut state::Disconnected) {
+        let Some(entry) = self.ssh.get_mut(host) else {
+            return;
+        };
+        let Some((generation, failure)) = entry.tunnel.as_ref().and_then(|t| t.last_error()) else {
+            return;
+        };
+        if generation <= entry.seen {
+            return;
+        }
+        entry.seen = generation;
+        disconnected.reason = failure.message(&entry.target);
+    }
+
+    /// Retire a tunnel whose answer nobody is waiting for any more.
+    ///
+    /// An establish that lands after its host was disconnected, or after
+    /// a second Connect superseded it, still came back holding a live
+    /// `ssh` master and a bound `bridge.sock`. Dropping that `Arc` here
+    /// would run [`SshTunnel`]'s *blocking* `Drop` — a `-O exit` round
+    /// trip — on the UI thread. Shutting it down on the engine runtime
+    /// instead leaves `Drop` with nothing to do, and is also what retires
+    /// its scratch directory rather than leaving one behind.
+    ///
+    /// A failed establish carries nothing to clean up: there is no tunnel
+    /// on that arm.
+    fn discard_tunnel(&self, result: Result<Arc<SshTunnel>, String>) {
+        if let Ok(tunnel) = result {
+            self.runtime.spawn(async move { tunnel.shutdown().await });
+        }
+    }
+
+    /// Tear down a host's tunnel, if it has one. The entry stays — its
+    /// `failure` is what the band reads, and its `request` is what a
+    /// still-in-flight establish is dropped against.
+    ///
+    /// The shutdown runs on the engine runtime rather than here: it is a
+    /// `-O exit` round trip plus a drain of in-flight connections, and
+    /// `SshTunnel`'s own `Drop` does that *blocking*. Awaiting it there
+    /// would be the UI thread waiting on ssh; running it here means Drop
+    /// finds the tunnel already closed and returns immediately.
+    fn shutdown_tunnel(&mut self, host: &str) {
+        let Some(tunnel) = self.take_tunnel(host) else {
+            return;
+        };
+        self.runtime.spawn(async move { tunnel.shutdown().await });
+    }
+
+    /// Detach a host's tunnel from the set, leaving the entry behind.
+    /// The caller owns the shutdown from here — either spawned
+    /// ([`Self::shutdown_tunnel`]) or awaited ahead of a replacement
+    /// ([`Self::open_ssh`]).
+    fn take_tunnel(&mut self, host: &str) -> Option<Arc<SshTunnel>> {
+        let tunnel = self.ssh.get_mut(host)?.tunnel.take()?;
+        tracing::debug!(%host, "tearing down an ssh tunnel");
+        Some(tunnel)
+    }
+
     /// Stop driving a host. Disconnect is never Stop: the session keeps
     /// running, and its tabs with it.
     ///
@@ -420,6 +727,15 @@ impl HostConnSet {
     /// disconnect only has to say it out loud, because it is the path
     /// that removes the `HostConn` the rows would otherwise hang off.
     pub(crate) fn disconnect(&mut self, host: &str) -> Option<HostId> {
+        // Before the early return: a host whose establish is still in
+        // flight has no `HostConn` yet, and it is exactly the one whose
+        // tunnel would otherwise be left holding an `ssh` master for a
+        // connection nobody asked for any more. The entry goes with it —
+        // an explicit disconnect ends this transport's life, so the
+        // in-flight establish is dropped when it lands and the next
+        // Connect opens a fresh tunnel.
+        self.shutdown_tunnel(host);
+        self.ssh.remove(host);
         let Some(conn) = self.conns.remove(host) else {
             self.minter.forget_host(host);
             return None;
@@ -636,12 +952,21 @@ impl HostConnSet {
     pub(crate) fn apply_state(
         &mut self,
         incarnation: HostId,
-        next: HostConnState,
+        mut next: HostConnState,
     ) -> Option<String> {
         // Attribution first: a `Connecting` from a replaced connection
         // must not purge the live one's mirror on its way to being
         // dropped.
         let host = self.owner_of(incarnation)?;
+        if let HostConnState::Disconnected(disconnected) = &mut next {
+            self.overlay_ssh_reason(&host, disconnected);
+            // A tunnel that has served a connection through to
+            // Disconnected has nothing left to serve: an ssh host never
+            // auto-retries (only localhost does), so the next attempt is
+            // a Connect, and a Connect is entitled to a mux that was not
+            // wedged by whatever just ended this one.
+            self.shutdown_tunnel(&host);
+        }
         // The reconnect contract: purge the dead incarnation the moment
         // the new attempt starts, so nothing keyed on it survives into
         // the rebuild that follows.
@@ -960,6 +1285,123 @@ mod tests {
                 "a refused intent is answered, never dropped on the floor"
             );
         }
+    }
+
+    /// Every ssh case below drives the *failed* half of an establish,
+    /// which needs no `ssh` at all: the tunnel object only exists on the
+    /// success path, and the process choreography behind it is pinned by
+    /// `roost_ipc`'s own fake-ssh tests. What is C4's to prove is the
+    /// handoff — who the answer belongs to, and what it leaves on the
+    /// band.
+    ///
+    /// **The invariant that keeps that true**: `open_ssh` spawns a task
+    /// that would exec the real `ssh` binary, and these cases rely on it
+    /// never being polled. `#[tokio::test]` is single-threaded by
+    /// default, so a spawned task only runs when the test awaits, and
+    /// none of them awaits after an `open_ssh`. Converting any of them to
+    /// `#[tokio::test(flavor = "multi_thread")]` — or adding an `.await`
+    /// between the `open_ssh` and the `tunnel_ready` that answers it —
+    /// would silently start dialing hosts from the unit suite.
+    fn ssh_target(raw: &str) -> roost_ipc::ssh::SshTarget {
+        match roost_ipc::ssh::classify(raw).expect("classify an ssh target") {
+            roost_ipc::ssh::ResolvedTransport::Ssh(target) => target,
+            other => panic!("{raw:?} is not an ssh target: {other:?}"),
+        }
+    }
+
+    fn failed(host: &str, request: u64, reason: &str) -> HostTunnelReady {
+        HostTunnelReady {
+            host: host.to_string(),
+            request,
+            result: Err(reason.to_string()),
+        }
+    }
+
+    /// A failed establish never enters `HostConn` — there is no socket to
+    /// dial — so the reason it leaves on the entry is the only thing the
+    /// band has to render, and only an attended attempt says it out loud.
+    #[tokio::test]
+    async fn a_failed_establish_leaves_a_reason_and_toasts_only_when_asked_for() {
+        let (mut set, _feed) = a_set();
+
+        set.open_ssh("h1", "one", ssh_target("workbox"), ConnectMode::Dial);
+        let request = set.ssh["h1"].request;
+        assert_eq!(
+            set.tunnel_ready(failed("h1", request, "workbox refused authentication"))
+                .as_deref(),
+            Some("workbox refused authentication"),
+            "a user who asked is told"
+        );
+        assert!(set.is_empty(), "and nothing was dialed");
+        assert_eq!(
+            set.section_reason("h1"),
+            Some("workbox refused authentication")
+        );
+
+        set.open_ssh("h2", "two", ssh_target("user@box"), ConnectMode::IfPresent);
+        let request = set.ssh["h2"].request;
+        assert_eq!(
+            set.tunnel_ready(failed("h2", request, "box is unreachable")),
+            None,
+            "an unattended failure is the band's business alone"
+        );
+        assert_eq!(set.section_reason("h2"), Some("box is unreachable"));
+    }
+
+    /// An answer has to prove it belongs to the request still waiting.
+    /// Ask twice and the first establish's answer must land nowhere —
+    /// otherwise a stale failure would overwrite the band while the
+    /// second attempt is still in flight.
+    #[tokio::test]
+    async fn a_superseded_or_cancelled_establish_answers_nobody() {
+        let (mut set, _feed) = a_set();
+        set.open_ssh("h1", "one", ssh_target("workbox"), ConnectMode::Dial);
+        let first = set.ssh["h1"].request;
+
+        set.open_ssh("h1", "one", ssh_target("workbox"), ConnectMode::Dial);
+        let second = set.ssh["h1"].request;
+        assert_ne!(first, second, "a request id is never reused");
+
+        assert_eq!(set.tunnel_ready(failed("h1", first, "stale")), None);
+        assert_eq!(
+            set.section_reason("h1"),
+            None,
+            "the superseded answer left nothing behind"
+        );
+
+        // And a disconnect while an establish is in flight cancels it:
+        // the entry is gone, so the answer has nowhere to land.
+        set.disconnect("h1");
+        assert_eq!(set.tunnel_ready(failed("h1", second, "cancelled")), None);
+        assert_eq!(set.section_reason("h1"), None);
+    }
+
+    /// The band prefers the live connection's own reason. An ssh failure
+    /// recorded before this connection existed must not outrank what the
+    /// connection is saying now.
+    #[tokio::test]
+    async fn a_live_connections_reason_outranks_a_previous_establish_failure() {
+        let (mut set, _feed) = a_set();
+        set.open_ssh("h1", "one", ssh_target("workbox"), ConnectMode::Dial);
+        let request = set.ssh["h1"].request;
+        set.tunnel_ready(failed("h1", request, "workbox refused authentication"));
+
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-ssh.sock"),
+            false,
+            ConnectMode::Dial,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(
+            incarnation,
+            HostConnState::Disconnected(state::Disconnected {
+                reason: "the session closed".into(),
+                retry_in: None,
+            }),
+        );
+        assert_eq!(set.section_reason("h1"), Some("the session closed"));
     }
 
     /// Disconnecting drops everything keyed on the host, so a late item

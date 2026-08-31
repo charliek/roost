@@ -141,7 +141,7 @@ fn scale() -> f64 {
 }
 
 /// A single control-plane leg's budget.
-fn leg() -> Duration {
+pub(crate) fn leg() -> Duration {
     session_launch::IPC_TIMEOUT.mul_f64(scale())
 }
 

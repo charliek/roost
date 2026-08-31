@@ -275,7 +275,15 @@ pub fn resolve_target(target: &str) -> Result<(PathBuf, bool)> {
 /// copy would be the one nobody updated.
 pub async fn verify_target(target: &str, budget: Duration) -> Result<SessionIdentify> {
     let (socket, _localhost) = resolve_target(target)?;
-    let identity = identify(&socket, budget)
+    verify_socket(&socket, budget).await
+}
+
+/// [`verify_target`]'s second half, for a caller that has already
+/// resolved the socket — [`crate::ssh::verify_transport`] classifies
+/// once and dispatches on the answer, and re-deriving the path from the
+/// raw string would be the second resolve this module exists to prevent.
+pub async fn verify_socket(socket: &Path, budget: Duration) -> Result<SessionIdentify> {
+    let identity = identify(socket, budget)
         .await
         .with_context(|| format!("{} did not answer", socket.display()))?;
     if identity.session_protocol != crate::messages::SESSION_PROTOCOL_VERSION {

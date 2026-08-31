@@ -168,6 +168,18 @@ pub fn classify(target: &str) -> Result<ResolvedTransport> {
     Ok(ResolvedTransport::UnixSocket(PathBuf::from(trimmed)))
 }
 
+/// Whether `target` names this machine's own session — [`classify`]'s
+/// rule 2, answered on its own.
+///
+/// Deliberately not `classify(target).map(|t| t.is_localhost())`: rule 2
+/// resolves the session profile's socket path, which allocates, can
+/// fail, and answers a question this caller did not ask. The sidebar
+/// asks this once per saved host on every view refresh, and the honest
+/// cheap answer is the string comparison rule 2 is defined as.
+pub fn target_is_localhost(target: &str) -> bool {
+    target.trim() == LOCALHOST_TARGET
+}
+
 const SSH_SCHEME: &str = "ssh://";
 
 /// `s` starts with `ssh://`, matched byte-for-byte ASCII
@@ -362,24 +374,75 @@ const CONFIG_FILE: &str = "ssh_config";
 /// below checks the longer of the two against every candidate.
 const SOCKET_FILE_NAMES: [&str; 2] = [CTL_FILE, BRIDGE_FILE];
 
+/// The prefix every scratch directory this module creates shares.
+const SCRATCH_PREFIX: &str = "roost-ssh-";
+
+/// Separates two scratch directories this process minted for the same
+/// host. Process-global and never reset: a name has to stay unique for
+/// the life of the process, not merely of one tunnel.
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The leaf directory name one attempt claims:
+/// `roost-ssh-<host_id>-<pid>-<seq>`.
+///
+/// Per *attempt*, not per host, and that is the whole point. A name
+/// derived from the saved host alone means every overlapping lifecycle
+/// path for that host — a double Connect, a disconnect racing the
+/// reconnect behind it, a superseded establish landing late — writes and
+/// removes the *same* directory, so the loser's cleanup takes the
+/// winner's files with it. Uniqueness turns "who owns this directory"
+/// into "which of these directories is still owned", which
+/// [`sweep_scratch_dirs`] answers before a new one is created.
+pub fn scratch_dir_name(host_id: &str) -> String {
+    format!(
+        "{SCRATCH_PREFIX}{host_id}-{}-{}",
+        std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Read a leaf directory name back as `(host_id, pid, seq)`, or `None`
+/// when it is not one this module minted for a host.
+///
+/// Parsed from the *right*: a saved host's id is opaque here and a `-`
+/// inside it must not shift the fields, so the last two `-`-separated
+/// segments are the pid and the sequence and everything between the
+/// prefix and them is the host id. Both numbers have to parse, which is
+/// also what keeps a verify directory
+/// (`roost-ssh-verify-<pid>-<nanos>-<n>`) from ever reading as a host's.
+pub fn parse_scratch_dir_name(name: &str) -> Option<(&str, u32, u64)> {
+    let rest = name.strip_prefix(SCRATCH_PREFIX)?;
+    let (rest, seq) = rest.rsplit_once('-')?;
+    let (host_id, pid) = rest.rsplit_once('-')?;
+    if host_id.is_empty() {
+        return None;
+    }
+    Some((host_id, pid.parse().ok()?, seq.parse().ok()?))
+}
+
 /// The historical BSD/Linux/macOS `sockaddr_un.sun_path` size: 104
 /// bytes total, one of which is the mandatory NUL terminator, leaving
 /// 103 usable path bytes.
 pub const SUN_PATH_MAX: usize = 103;
 
 /// Find the first of `candidate_dirs` under which
-/// `<dir>/roost-ssh-<host_token>/<file>` fits [`SUN_PATH_MAX`] for
-/// every name in [`SOCKET_FILE_NAMES`] — checking the longer file name
-/// is sufficient since both live at the same depth.
+/// `<dir>/<dir_name>/<file>` fits [`SUN_PATH_MAX`] for every name in
+/// [`SOCKET_FILE_NAMES`] — checking the longer file name is sufficient
+/// since both live at the same depth.
+///
+/// `dir_name` is the *final* leaf name, pid and sequence included
+/// ([`scratch_dir_name`] builds it), so what is length-checked here is
+/// exactly what will be bound later. A caller that measured a shorter
+/// stand-in would have measured a path nothing uses.
 ///
 /// Directory creation is C3's job; this only picks *where*. Candidates
 /// are tried in order (typically `$TMPDIR` then `/tmp`) because a
 /// shorter fallback is only worth using when the preferred one does
 /// not fit — `/tmp` is shared and less private than a per-user
 /// `$TMPDIR`.
-pub fn pick_socket_dir(candidate_dirs: &[PathBuf], host_token: &str) -> Result<PathBuf> {
+pub fn pick_socket_dir(candidate_dirs: &[PathBuf], dir_name: &str) -> Result<PathBuf> {
     for dir in candidate_dirs {
-        let base = dir.join(format!("roost-ssh-{host_token}"));
+        let base = dir.join(dir_name);
         let longest = SOCKET_FILE_NAMES
             .iter()
             .map(|name| base.join(name))
@@ -391,7 +454,7 @@ pub fn pick_socket_dir(candidate_dirs: &[PathBuf], host_token: &str) -> Result<P
     }
     Err(anyhow!(
         "no candidate directory leaves room for a {SUN_PATH_MAX}-byte AF_UNIX socket path \
-         under roost-ssh-{host_token}; tried: {}",
+         under {dir_name}; tried: {}",
         candidate_dirs
             .iter()
             .map(|p| p.display().to_string())
@@ -663,8 +726,10 @@ impl SshTunnelError {
 /// shared `ssh` mux behind it, and one `ssh` exec per accepted
 /// connection.
 ///
-/// One per saved-host id, named on disk by that id so a crashed client's
-/// leftovers are found rather than accumulated — see [`Self::open`].
+/// One per saved-host id at a time, in a scratch directory named for
+/// that id *plus this attempt* — so a crashed client's leftovers are
+/// still findable, without two attempts ever sharing a directory. See
+/// [`Self::open`].
 ///
 /// **Spawn-per-connection is the pinned shape.** Every accepted
 /// connection gets its own task and its own `ssh` exec over the shared
@@ -698,50 +763,56 @@ struct TunnelState {
 }
 
 impl SshTunnel {
-    /// Claim this host's scratch directory and write its generated
-    /// config. Binds nothing and connects nothing — that is
-    /// [`Self::establish`].
+    /// Sweep this host's older scratch directories away, claim a fresh
+    /// one of this attempt's own, and write its generated config. Binds
+    /// nothing and connects nothing — that is [`Self::establish`].
     ///
-    /// The directory name is deterministic (`roost-ssh-<host_id>`), which
-    /// is what makes a crashed client's leftovers findable instead of
-    /// merely orphaned. Finding them, the rule is fail-safe in exactly
-    /// the way [`crate::socket_state`] is: a `bridge.sock` that answers,
-    /// or that cannot be classified at all, means another Roost owns
-    /// this target and this one refuses. Only a socket that is provably
-    /// dead — or absent — authorizes a reclaim.
+    /// The name this attempt claims is unique
+    /// ([`scratch_dir_name`] — host id, pid, sequence), so no two
+    /// attempts can ever write or remove each other's files. What makes a
+    /// crashed client's leftovers findable rather than merely orphaned is
+    /// the *sweep*: every `roost-ssh-<this host id>-*` directory under the
+    /// chosen parent is examined before the new one is created.
     ///
-    /// A reclaim runs `-O exit` against the *old* control socket before
-    /// removing anything. The crashed client is gone but its `ssh`
-    /// master is not: `ControlPersist` keeps it alive for its own
-    /// timeout, and removing the control socket out from under it would
-    /// strand a process nothing can address any more.
+    /// Two rules, by whose leftovers they are:
     ///
-    /// The probe-then-reclaim sequence assumes one live owner per host
-    /// id, which is what the caller above it guarantees: a UI holds one
-    /// tunnel per saved host and opens them one at a time. Two processes
-    /// racing to open the *same* host id would be the TOCTOU
-    /// [`crate::socket_state`]'s module docs describe, and would need the
-    /// same answer — a lock held across the whole sequence.
+    /// * **This process's** — superseded by construction, since the
+    ///   caller above opens one tunnel per saved host at a time — are
+    ///   reclaimed with no probe at all.
+    /// * **Another process's** are fail-safe in exactly the way
+    ///   [`crate::socket_state`] is: a `bridge.sock` that answers, or
+    ///   that cannot be classified at all, means another Roost owns this
+    ///   target and this one refuses. Only a socket that is provably dead
+    ///   — or absent — authorizes a reclaim.
+    ///
+    /// Either reclaim runs `-O exit` against the *old* control socket
+    /// before removing anything. That client is gone but its `ssh` master
+    /// is not: `ControlPersist` keeps it alive for its own timeout, and
+    /// removing the control socket out from under it would strand a
+    /// process nothing can address any more.
     pub async fn open(
         host_id: &str,
         target: &SshTarget,
         options: SshTunnelOptions,
     ) -> Result<Self, SshTunnelError> {
-        let dir = pick_socket_dir(&options.scratch_parents, host_id)?;
+        let dir = pick_socket_dir(&options.scratch_parents, &scratch_dir_name(host_id))?;
         let bridge_path = dir.join(BRIDGE_FILE);
         let ctl_path = dir.join(CTL_FILE);
         let config_path = dir.join(CONFIG_FILE);
 
-        if let Err(error) = create_private_dir(&dir) {
-            if error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(SshTunnelError::Local(anyhow::Error::from(error).context(
-                    format!("create the scratch directory {}", dir.display()),
-                )));
-            }
-            reclaim_dir(&options.ssh_bin, &target.raw, &dir, &bridge_path, &ctl_path).await?;
-            create_private_dir(&dir)
-                .with_context(|| format!("recreate the scratch directory {}", dir.display()))?;
-        }
+        // Only the parent this attempt landed in is swept: an orphan
+        // under the *other* candidate was sized against a different
+        // `sun_path` budget, holds no socket this one can collide with,
+        // and its master reaps itself on `ControlPersist`.
+        let parent = dir
+            .parent()
+            .expect("pick_socket_dir joins a leaf name onto a candidate");
+        sweep_scratch_dirs(&options.ssh_bin, &target.raw, parent, host_id).await?;
+
+        // `create_new` semantics: the name carries a pid and a sequence,
+        // so a collision is a real error rather than something to reclaim.
+        create_private_dir(&dir)
+            .with_context(|| format!("create the scratch directory {}", dir.display()))?;
 
         write_private_file(&config_path, options.config_paths.render().as_bytes())
             .with_context(|| format!("write {}", config_path.display()))?;
@@ -901,7 +972,15 @@ impl SshTunnel {
         )
         .await;
         if let Err(error) = tokio::fs::remove_dir_all(&self.dir).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
+            // Already gone is ordinary, not a fault: a superseded
+            // tunnel's shutdown lands after its replacement's sweep has
+            // reclaimed this directory (same pid, no probe).
+            if error.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    dir = %self.dir.display(),
+                    "ssh tunnel: the scratch directory was already reclaimed"
+                );
+            } else {
                 tracing::warn!(
                     dir = %self.dir.display(),
                     %error,
@@ -943,6 +1022,9 @@ impl Drop for SshTunnel {
             &self.state.ctl_path,
             &self.state.target,
         );
+        // Ignored rather than reported: this directory is this tunnel's
+        // alone, and the only way it is already gone is a replacement's
+        // sweep having reclaimed it.
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -1241,39 +1323,77 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The existing-directory half of [`SshTunnel::open`].
-async fn reclaim_dir(
+/// The reclaim half of [`SshTunnel::open`]: every scratch directory
+/// `parent` still holds for `host_id`, examined and dealt with before a
+/// fresh one is claimed. See [`SshTunnel::open`] for the two rules.
+async fn sweep_scratch_dirs(
     ssh_bin: &Path,
     target: &str,
-    dir: &Path,
-    bridge_path: &Path,
-    ctl_path: &Path,
+    parent: &Path,
+    host_id: &str,
 ) -> Result<(), SshTunnelError> {
-    match socket_state::probe(bridge_path, PROBE_TIMEOUT).await {
-        SocketState::Missing | SocketState::Stale => {}
-        SocketState::NotASocket(kind) => {
-            return Err(SshTunnelError::Local(anyhow!(
-                "{} is a {kind}, not a socket; remove {} by hand",
-                bridge_path.display(),
-                dir.display()
-            )))
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        // A parent that does not exist holds nothing to reclaim, and the
+        // directory creation behind this is what reports it as a problem.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(SshTunnelError::Local(
+                anyhow::Error::from(error)
+                    .context(format!("read the scratch parent {}", parent.display())),
+            ))
         }
-        // Live, and anything that cannot be classified: fail-safe, the
-        // same rule `socket_state` unlinks under.
-        state => {
-            return Err(SshTunnelError::Local(anyhow!(
-                "another Roost is connected to {target} (its bridge socket is {state:?} at {})",
-                dir.display()
-            )))
+    };
+
+    let ours = std::process::id();
+    let mut leftovers: Vec<(PathBuf, u32)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((entry_host, pid, _seq)) = name.to_str().and_then(parse_scratch_dir_name) else {
+            continue;
+        };
+        if entry_host == host_id {
+            leftovers.push((entry.path(), pid));
         }
     }
+    // Directory order is whatever the filesystem hands back; sorting
+    // makes a sweep that refuses refuse on the same directory every time.
+    leftovers.sort();
 
-    exit_master(ssh_bin, &dir.join(CONFIG_FILE), ctl_path, target).await;
+    for (dir, pid) in leftovers {
+        if pid != ours {
+            let bridge_path = dir.join(BRIDGE_FILE);
+            match socket_state::probe(&bridge_path, PROBE_TIMEOUT).await {
+                SocketState::Missing | SocketState::Stale => {}
+                SocketState::NotASocket(kind) => {
+                    return Err(SshTunnelError::Local(anyhow!(
+                        "{} is a {kind}, not a socket; remove {} by hand",
+                        bridge_path.display(),
+                        dir.display()
+                    )))
+                }
+                // Live, and anything that cannot be classified: fail-safe,
+                // the same rule `socket_state` unlinks under.
+                state => {
+                    return Err(SshTunnelError::Local(anyhow!(
+                        "another Roost is connected to {target} (its bridge socket is \
+                         {state:?} at {})",
+                        dir.display()
+                    )))
+                }
+            }
+        }
 
-    tokio::fs::remove_dir_all(dir)
-        .await
-        .with_context(|| format!("remove the stale scratch directory {}", dir.display()))
-        .map_err(SshTunnelError::Local)
+        exit_master(ssh_bin, &dir.join(CONFIG_FILE), &dir.join(CTL_FILE), target).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(SshTunnelError::Local(anyhow::Error::from(error).context(
+                    format!("remove the stale scratch directory {}", dir.display()),
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1282,6 +1402,43 @@ async fn reclaim_dir(
 
 /// Default budget for [`verify_ssh_target`], before the ambient scale.
 pub const VERIFY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Ask a classified target for `session.identify`, over whichever
+/// transport it named.
+///
+/// One bar, two ways of getting there. A socket target dials it
+/// ([`crate::session_launch::verify_socket`]); an ssh target runs
+/// [`verify_ssh_target`], a throwaway `ssh` exec outside any mux that
+/// speaks the same exchange over the child's own stdio and leaves no
+/// master behind.
+///
+/// **Both `roostctl host add --verify` and the Add Host dialog's
+/// "Add & Connect" call exactly this**, so the two can never promise a
+/// different bar than each other (plan 037 §3.5) — the promise is one
+/// function rather than two copies of a rule.
+///
+/// The budgets differ because the work does: a socket dial gets the
+/// CI-scaled IPC leg, an ssh verify gets [`VERIFY_BUDGET`] (which
+/// `verify_ssh_target` scales itself) — it has a TCP + auth handshake to
+/// pay for first. Both are bounded, so an unreachable target fails
+/// rather than hanging the caller.
+///
+/// An ssh failure is flattened to its own `Display` rather than chained
+/// as a source: [`SshTunnelError`] already renders the whole message,
+/// and wrapping it would make `{:#}` print it twice.
+pub async fn verify_transport(transport: &ResolvedTransport) -> Result<SessionIdentify> {
+    match transport {
+        ResolvedTransport::Ssh(target) => {
+            verify_ssh_target(target, &SshTunnelOptions::from_env(), VERIFY_BUDGET)
+                .await
+                .map_err(|error| anyhow!("{error}"))
+        }
+        ResolvedTransport::LocalSession(socket) | ResolvedTransport::UnixSocket(socket) => {
+            let budget = crate::session_launch::IPC_TIMEOUT.mul_f64(timeout_scale());
+            crate::session_launch::verify_socket(socket, budget).await
+        }
+    }
+}
 
 /// Does this ssh target answer, and does it speak a protocol this build
 /// can talk to?
@@ -1308,7 +1465,7 @@ pub async fn verify_ssh_target(
     options: &SshTunnelOptions,
     budget: Duration,
 ) -> Result<SessionIdentify, SshTunnelError> {
-    let dir = pick_socket_dir(&options.scratch_parents, &verify_token())?;
+    let dir = pick_socket_dir(&options.scratch_parents, &verify_dir_name())?;
     create_private_dir(&dir)
         .with_context(|| format!("create the verify scratch directory {}", dir.display()))?;
     let outcome = verify_in(&dir, target, options, budget).await;
@@ -1319,7 +1476,12 @@ pub async fn verify_ssh_target(
 /// A directory name no concurrent verify can collide on: this process,
 /// this instant, and a counter for two verifies inside the same
 /// nanosecond.
-fn verify_token() -> String {
+///
+/// Deliberately *not* [`scratch_dir_name`]'s shape — a verify belongs to
+/// no saved host, and the hex instant in the middle is what stops
+/// [`parse_scratch_dir_name`] from ever reading one of these as a host's
+/// leftovers for a sweep to reclaim.
+fn verify_dir_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let nanos = std::time::SystemTime::now()
@@ -1327,7 +1489,7 @@ fn verify_token() -> String {
         .map(|since| since.as_nanos())
         .unwrap_or_default();
     format!(
-        "verify-{}-{nanos:x}-{:x}",
+        "{SCRATCH_PREFIX}verify-{}-{nanos:x}-{:x}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
@@ -1528,6 +1690,32 @@ mod tests {
                 ResolvedTransport::Ssh(t) => assert_eq!(t.raw, target, "casing must be preserved"),
                 other => panic!("{target:?}: expected Ssh, got {other:?}"),
             }
+        }
+    }
+
+    /// The cheap boolean and the full classification must never
+    /// disagree — the sidebar reads one and the connect path reads the
+    /// other, about the same saved host.
+    #[test]
+    fn the_cheap_localhost_answer_matches_the_classifier() {
+        assert!(target_is_localhost(LOCALHOST_TARGET));
+        assert!(target_is_localhost("  localhost \n"), "trimmed like rule 2");
+        for target in [
+            "ssh://localhost",
+            "user@localhost",
+            "Localhost",
+            "localhost.sock",
+            "/tmp/localhost",
+            "",
+        ] {
+            assert!(
+                !target_is_localhost(target),
+                "{target:?} is not the sentinel"
+            );
+            assert!(
+                !classify(target).map(|t| t.is_localhost()).unwrap_or(false),
+                "{target:?} must not classify as the local session either"
+            );
         }
     }
 
@@ -1822,40 +2010,94 @@ mod tests {
     #[test]
     fn pick_socket_dir_prefers_the_first_candidate_that_fits() {
         let short = PathBuf::from("/tmp");
-        let dir = pick_socket_dir(std::slice::from_ref(&short), "workbox-aaaaaaaaaaaaaaaa")
-            .expect("a short TMPDIR must fit");
-        assert_eq!(dir, short.join("roost-ssh-workbox-aaaaaaaaaaaaaaaa"));
+        let name = "roost-ssh-workbox-aaaaaaaaaaaaaaaa-4242-0";
+        let dir =
+            pick_socket_dir(std::slice::from_ref(&short), name).expect("a short TMPDIR must fit");
+        assert_eq!(dir, short.join(name));
     }
 
     #[test]
     fn pick_socket_dir_falls_back_past_a_candidate_that_does_not_fit() {
         // A macOS-style deep per-user TMPDIR, long enough that
-        // `<dir>/roost-ssh-<token>/bridge.sock` overruns `SUN_PATH_MAX`.
+        // `<dir>/<name>/bridge.sock` overruns `SUN_PATH_MAX`.
         let long_tmpdir = PathBuf::from(
             "/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/deeply/nested/tmp/dir/that/is/long",
         );
         let short = PathBuf::from("/tmp");
-        let token = "workbox-aaaaaaaaaaaaaaaa";
+        let name = "roost-ssh-workbox-aaaaaaaaaaaaaaaa-4242-0";
         assert!(
-            long_tmpdir
-                .join(format!("roost-ssh-{token}"))
-                .join("bridge.sock")
-                .as_os_str()
-                .len()
-                > SUN_PATH_MAX,
+            long_tmpdir.join(name).join("bridge.sock").as_os_str().len() > SUN_PATH_MAX,
             "precondition: the long TMPDIR candidate must not fit"
         );
-        let dir = pick_socket_dir(&[long_tmpdir, short.clone()], token)
+        let dir = pick_socket_dir(&[long_tmpdir, short.clone()], name)
             .expect("the /tmp fallback must fit");
-        assert_eq!(dir, short.join(format!("roost-ssh-{token}")));
+        assert_eq!(dir, short.join(name));
     }
 
     #[test]
     fn pick_socket_dir_errors_when_nothing_fits() {
-        let token = "a".repeat(32) + "-0123456789abcdef";
+        let name = scratch_dir_name(&("a".repeat(32) + "-0123456789abcdef"));
         let huge = PathBuf::from("/".to_string() + &"x".repeat(200));
-        let error = pick_socket_dir(&[huge], &token).expect_err("nothing should fit");
+        let error = pick_socket_dir(&[huge], &name).expect_err("nothing should fit");
         assert!(error.to_string().contains("103"));
+    }
+
+    /// The whole length check is only honest if what it measures is what
+    /// gets bound: the pid and sequence are part of the name, so they
+    /// have to be part of what was sized.
+    #[test]
+    fn pick_socket_dir_sizes_the_name_the_tunnel_actually_claims() {
+        let name = scratch_dir_name("aabbccdd");
+        let dir = pick_socket_dir(&[PathBuf::from("/tmp")], &name).expect("fits");
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(name.as_str())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scratch directory names
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_scratch_name_carries_this_process_and_a_fresh_sequence() {
+        let first = scratch_dir_name("aabbccdd");
+        let second = scratch_dir_name("aabbccdd");
+        assert_ne!(first, second, "two attempts never share a directory");
+
+        let (host, pid, first_seq) =
+            parse_scratch_dir_name(&first).expect("a minted name must parse");
+        assert_eq!(host, "aabbccdd");
+        assert_eq!(pid, std::process::id());
+        let (_, _, second_seq) = parse_scratch_dir_name(&second).expect("parse");
+        assert!(second_seq > first_seq, "{first_seq} -> {second_seq}");
+    }
+
+    /// Parsed from the right, so a host id with a `-` in it survives the
+    /// round trip rather than shifting the pid and sequence fields.
+    #[test]
+    fn a_scratch_name_round_trips_a_host_id_containing_dashes() {
+        let name = scratch_dir_name("host-with-dashes");
+        let (host, _, _) = parse_scratch_dir_name(&name).expect("parse");
+        assert_eq!(host, "host-with-dashes");
+    }
+
+    #[test]
+    fn names_that_are_not_a_hosts_scratch_directory_do_not_parse() {
+        for name in [
+            "roost-ssh-aabbccdd",              // the old deterministic shape
+            "roost-ssh-aabbccdd-4242",         // no sequence
+            "roost-ssh--4242-0",               // no host id
+            "roost-ssh-aabbccdd-notapid-0",    // a pid that is not a number
+            "roost-ssh-aabbccdd-4242-notaseq", // a sequence that is not a number
+            "roost-session-aabbccdd-4242-0",   // not our prefix
+            &verify_dir_name(),                // a verify's own directory
+        ] {
+            assert!(
+                parse_scratch_dir_name(name).is_none(),
+                "{name:?} must not read as a host's scratch directory"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

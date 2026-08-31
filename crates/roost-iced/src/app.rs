@@ -1879,6 +1879,10 @@ struct HostView {
     /// placeholder can never collide with a real local key.
     host: HostId,
     state: host_sidebar::SectionState,
+    /// The connection's own one-line reason for the state it is in, when
+    /// it has one — an ssh failure, a transport drop. Folded into the
+    /// band's rollup; `None` renders the bare word.
+    reason: Option<String>,
     /// The last rows this host's connection published. Kept across a
     /// drop: those shells are still running over there, so the section
     /// lists them dimmed rather than pretending they are gone.
@@ -2128,28 +2132,52 @@ impl App {
         }
     }
 
-    /// Resolve a saved host's target and hand it to the connection set.
+    /// Classify a saved host's target and hand it to the connection set.
     /// `mode` answers what to do with a resolved target, and `None`
     /// declines the connection — which is how the launch probe skips a
-    /// remote host without duplicating the resolve.
+    /// remote host without duplicating the classification.
+    ///
+    /// Three transports, two shapes. A local session and a socket path
+    /// both resolve to a socket that already exists, so they dial
+    /// straight away. An ssh target has no socket until a tunnel binds
+    /// one, so it goes through [`crate::host_conn::HostConnSet::open_ssh`]
+    /// and reaches `connect` one feed item later — see
+    /// [`crate::engine_feed::EngineFeed::HostTunnel`].
     fn connect_saved_host(
         &mut self,
         host: &roost_engine::persistence::HostSnapshot,
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
     ) {
-        let (socket, localhost) = match crate::host_conn::resolve_target(&host.target) {
-            Ok(resolved) => resolved,
+        use roost_ipc::ssh::ResolvedTransport;
+
+        let transport = match roost_ipc::ssh::classify(&host.target) {
+            Ok(transport) => transport,
             Err(error) => {
                 tracing::warn!(host = %host.id, ?error, "cannot resolve a saved host's target");
                 return;
             }
         };
+        let localhost = transport.is_localhost();
         let Some(mode) = mode(localhost) else {
             return;
         };
         let mode = spawn_gate(mode, host_verbs::VerbPolicy::current());
-        self.hosts
-            .connect(&host.id, &host.label, socket, localhost, mode);
+        match transport {
+            ResolvedTransport::LocalSession(socket) | ResolvedTransport::UnixSocket(socket) => self
+                .hosts
+                .connect(&host.id, &host.label, socket, localhost, mode),
+            ResolvedTransport::Ssh(target) => {
+                self.hosts.open_ssh(&host.id, &host.label, target, mode)
+            }
+        }
+    }
+
+    /// An ssh tunnel finished coming up, or failed to. Dialing is the
+    /// set's; the toast is the app's.
+    fn host_tunnel_ready(&mut self, ready: crate::host_conn::HostTunnelReady) {
+        if let Some(reason) = self.hosts.tunnel_ready(ready) {
+            self.set_status(reason);
+        }
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
@@ -3097,8 +3125,9 @@ impl App {
         let mut body = column![
             modal_heading(
                 "Add Host".to_string(),
-                "Point Roost at a running roost-session socket. For a remote \
-                 machine, forward its socket over SSH.",
+                "Point Roost at a running roost-session: an SSH destination \
+                 (`workbox`, `user@host`, `ssh://host:port`) or a local socket \
+                 path.",
             ),
             dialog_field(
                 "Name",
@@ -3108,8 +3137,8 @@ impl App {
                 Message::AddHostNameChanged,
             ),
             dialog_field(
-                "Socket",
-                "/tmp/roost-popos.sock",
+                "Target",
+                "workbox, user@host, or /path/to.sock",
                 &draft.socket,
                 self.add_host_socket_id.clone(),
                 Message::AddHostSocketChanged,

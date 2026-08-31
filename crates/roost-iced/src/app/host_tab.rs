@@ -853,10 +853,29 @@ async fn run_attempt(
         }
     };
     let handshake = choose_handshake(&result, resume);
-    let (accepted, conn) = match DataConnection::dial(&socket, &handshake).await {
-        Ok(accepted) => accepted,
-        Err(error) => return fail(classify_failure(&error), &feed),
-    };
+    // Bounded, on the same budget a control leg gets. `DataConnection::dial`
+    // has no timeout of its own, and the socket it dials is not always a
+    // local one: over the ssh transport it is a bridge whose accept is a
+    // remote `ssh` exec, so an unreachable host would otherwise park this
+    // attempt forever with the tab showing "attaching…" and no retry. A
+    // timeout is a failed dial like any other — retryable, and the
+    // re-attach backoff decides what happens next.
+    let budget = crate::host_conn::leg_budget();
+    let (accepted, conn) =
+        match tokio::time::timeout(budget, DataConnection::dial(&socket, &handshake)).await {
+            Ok(Ok(accepted)) => accepted,
+            Ok(Err(error)) => return fail(classify_failure(&error), &feed),
+            Err(_elapsed) => {
+                return fail(
+                    FailReason::Retryable(format!(
+                        "attaching to {} timed out after {}s",
+                        socket.display(),
+                        budget.as_secs().max(1)
+                    )),
+                    &feed,
+                )
+            }
+        };
     feed.send(EngineFeed::HostTab(
         key,
         HostTabFrame::Accepted {

@@ -96,8 +96,35 @@ impl Harness {
         }
     }
 
-    fn scratch_dir(&self, host_id: &str) -> PathBuf {
-        self.parent.join(format!("roost-ssh-{host_id}"))
+    /// Every scratch directory this host currently has under the
+    /// harness's parent. A directory name carries the attempt's pid and
+    /// sequence, so a test that wants "did anything survive" globs
+    /// `roost-ssh-<host>-*` rather than naming one path.
+    fn scratch_dirs(&self, host_id: &str) -> Vec<PathBuf> {
+        let prefix = format!("roost-ssh-{host_id}-");
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&self.parent)
+            .expect("read the scratch parent")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_str()?
+                    .starts_with(&prefix)
+                    .then(|| entry.path())
+            })
+            .collect();
+        dirs.sort();
+        dirs
+    }
+
+    /// A scratch directory as some *other* attempt would have named it.
+    /// `seq` is `u64::MAX` in every caller: the sequence a live tunnel
+    /// claims comes from a counter that starts at zero, so nothing this
+    /// process mints can ever collide with one of these.
+    fn leftover_dir(&self, host_id: &str, pid: u32, seq: u64) -> PathBuf {
+        let dir = self.parent.join(format!("roost-ssh-{host_id}-{pid}-{seq}"));
+        std::fs::create_dir(&dir).expect("pre-create a leftover scratch directory");
+        dir
     }
 
     /// Every invocation so far: the argv, with the fixture's leading
@@ -328,6 +355,12 @@ async fn the_master_exit_runs_last_and_while_the_control_socket_still_exists() {
     assert_eq!(harness.count(is_master_exit), 1);
 }
 
+/// A pid no attempt of this process ever wrote. The sweep never asks
+/// whether a pid is alive — its liveness question is put to
+/// `bridge.sock` and nothing else — so this only has to differ from ours,
+/// which is what makes the cross-process rule the one under test.
+const OTHER_PID: u32 = u32::MAX - 1;
+
 /// A crashed client leaves a directory behind but its `ssh` master
 /// outlives it on `ControlPersist`. Reclaiming means exiting that master
 /// first — removing its control socket underneath it would strand a
@@ -336,8 +369,7 @@ async fn the_master_exit_runs_last_and_while_the_control_socket_still_exists() {
 async fn a_stale_directory_is_reclaimed_after_exiting_the_old_master() {
     let harness = Harness::new("ok", "cat");
     let host_id = "00000005";
-    let stale = harness.scratch_dir(host_id);
-    std::fs::create_dir(&stale).expect("pre-create the stale directory");
+    let stale = harness.leftover_dir(host_id, OTHER_PID, u64::MAX);
     // A socket file whose listener is gone — what a SIGKILL leaves.
     let corpse_path = stale.join("bridge.sock");
     let corpse = std::os::unix::net::UnixListener::bind(&corpse_path).expect("bind");
@@ -365,9 +397,15 @@ async fn a_stale_directory_is_reclaimed_after_exiting_the_old_master() {
         "the old master must be exited before its socket is removed: {:?}",
         invocations[0]
     );
-    assert!(
-        !stale.join("ctl").exists(),
-        "the reclaimed directory must be recreated fresh"
+    assert!(!stale.exists(), "the stale directory must be swept away");
+    assert_eq!(
+        harness.scratch_dirs(host_id),
+        vec![tunnel
+            .bridge_socket()
+            .parent()
+            .expect("a scratch dir")
+            .to_path_buf()],
+        "and the only one left is this attempt's own"
     );
 
     tunnel.establish().await.expect("establish after a reclaim");
@@ -379,8 +417,7 @@ async fn a_stale_directory_is_reclaimed_after_exiting_the_old_master() {
 async fn a_live_bridge_socket_refuses_a_second_tunnel() {
     let harness = Harness::new("ok", "cat");
     let host_id = "00000006";
-    let occupied = harness.scratch_dir(host_id);
-    std::fs::create_dir(&occupied).expect("pre-create the occupied directory");
+    let occupied = harness.leftover_dir(host_id, OTHER_PID, u64::MAX);
     let live = tokio::net::UnixListener::bind(occupied.join("bridge.sock")).expect("bind");
 
     let error = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
@@ -393,8 +430,96 @@ async fn a_live_bridge_socket_refuses_a_second_tunnel() {
         harness.invocations().is_empty(),
         "refusing must not run any ssh"
     );
+    assert!(
+        occupied.exists(),
+        "and the other Roost's directory is left exactly as it was"
+    );
 
     drop(live);
+}
+
+/// The same-process rule, and the guard against a rapid double Connect:
+/// this app opens one tunnel per saved host at a time, so a directory
+/// *this pid* left behind is superseded by construction. It is reclaimed
+/// with no probe at all — probing it would find the previous attempt's
+/// own live bridge socket and refuse the replacement, which is exactly
+/// the deadlock a second Connect must not hit.
+#[tokio::test]
+async fn a_leftover_directory_from_this_process_is_superseded_not_refused() {
+    let harness = Harness::new("ok", "cat");
+    let host_id = "0000000a";
+    let superseded = harness.leftover_dir(host_id, std::process::id(), u64::MAX);
+    let live = tokio::net::UnixListener::bind(superseded.join("bridge.sock")).expect("bind");
+    std::fs::write(superseded.join("ctl"), b"").expect("pre-create the control socket");
+
+    let tunnel = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
+        .await
+        .expect("this process's own leftovers must never refuse it");
+
+    let invocations = harness.invocations();
+    assert_eq!(invocations.len(), 1, "{invocations:?}");
+    assert!(is_master_exit(&invocations[0]), "{:?}", invocations[0]);
+    assert!(
+        invocations[0].contains(&"ctl-exists=1".to_string()),
+        "a superseded master is exited before its socket goes: {:?}",
+        invocations[0]
+    );
+    assert!(
+        !superseded.exists(),
+        "the superseded directory is reclaimed"
+    );
+    assert_eq!(
+        harness.scratch_dirs(host_id),
+        vec![tunnel
+            .bridge_socket()
+            .parent()
+            .expect("a scratch dir")
+            .to_path_buf()],
+        "the replacement owns a directory of its own"
+    );
+
+    tunnel
+        .establish()
+        .await
+        .expect("establish after superseding");
+    drop(echo_through(tunnel.bridge_socket(), b"fresh\n").await);
+    drop(live);
+}
+
+/// Two overlapping opens for one host — a rapid double Connect, whose
+/// establishes are in flight at the same time — never share a directory,
+/// so neither one's teardown can delete the other's files.
+#[tokio::test]
+async fn two_overlapping_tunnels_for_one_host_never_share_a_directory() {
+    let harness = Harness::new("ok", "cat");
+    let host_id = "0000000b";
+
+    let first = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
+        .await
+        .expect("first open");
+    let first_dir = first.bridge_socket().parent().expect("a dir").to_path_buf();
+    first.establish().await.expect("first establish");
+
+    // The second open sweeps the first away (same pid, superseded) and
+    // takes a directory of its own.
+    let second = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
+        .await
+        .expect("second open");
+    let second_dir = second
+        .bridge_socket()
+        .parent()
+        .expect("a dir")
+        .to_path_buf();
+    assert_ne!(first_dir, second_dir);
+    second.establish().await.expect("second establish");
+    drop(echo_through(second.bridge_socket(), b"live\n").await);
+
+    // The loser's teardown lands late, and must take nothing of the
+    // winner's with it.
+    first.shutdown().await;
+    assert!(second.bridge_socket().exists(), "the live bridge survives");
+    drop(echo_through(second.bridge_socket(), b"still here\n").await);
+    assert_eq!(harness.scratch_dirs(host_id), vec![second_dir]);
 }
 
 #[tokio::test]
@@ -417,7 +542,11 @@ async fn shutdown_leaves_no_scratch_directory_and_no_ssh_children() {
     assert!(pids.len() >= 2, "{pids:?}");
     tunnel.shutdown().await;
 
-    assert!(!harness.scratch_dir(host_id).exists());
+    assert!(
+        harness.scratch_dirs(host_id).is_empty(),
+        "{:?}",
+        harness.scratch_dirs(host_id)
+    );
     wait_for("every fake ssh to be gone", || {
         pids.iter().all(|pid| !alive(*pid))
     })
@@ -436,16 +565,18 @@ async fn shutdown_leaves_no_scratch_directory_and_no_ssh_children() {
 async fn dropping_a_tunnel_still_exits_the_master_and_removes_the_directory() {
     let harness = Harness::new("ok", "cat");
     let host_id = "00000008";
-    let scratch = harness.scratch_dir(host_id);
     {
         let tunnel = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
             .await
             .expect("open");
         tunnel.establish().await.expect("establish");
-        assert!(scratch.exists());
+        assert_eq!(harness.scratch_dirs(host_id).len(), 1);
     }
 
-    assert!(!scratch.exists(), "Drop must remove the scratch directory");
+    assert!(
+        harness.scratch_dirs(host_id).is_empty(),
+        "Drop must remove the scratch directory"
+    );
     let last = harness
         .invocations()
         .last()
