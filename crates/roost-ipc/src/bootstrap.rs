@@ -144,6 +144,32 @@ pub const FS_ROOT_ENV: &str = "ROOST_BOOTSTRAP_FS_ROOT";
 /// The [`FS_ROOT_ENV`] expansion, as it appears inside double quotes.
 const FS_ROOT_EXPANSION: &str = "${ROOST_BOOTSTRAP_FS_ROOT:-}";
 
+/// Whether **this** process is a test lane: `ROOST_TEST_MODE=1` in our
+/// own environment, and nothing else.
+///
+/// The one reader of that variable in this module, shared by the two
+/// options bundles that carry the flag onward:
+/// [`BootstrapOptions::from_env`] — which the probe and the install run
+/// off — and [`crate::ssh::SshTunnelOptions::from_env`], whose
+/// `jail_fs_root` reaches [`crate::ssh::remote_command_for`]. Below
+/// those two constructors the flag is a **value**, never another
+/// lookup, because the two answers must never differ: a probe that
+/// reports
+/// `Compatible { path: <jail>/usr/bin/roost-session }` beside a
+/// transport that execs a bare `/usr/bin/roost-session` disagree about
+/// which binary the host has, and the connect fails `NotFound` on a rung
+/// the probe just called good.
+///
+/// **A client-side gate on purpose.** The [`FS_ROOT_ENV`] prefix it
+/// enables is an expansion evaluated on the *far* side, so the decision
+/// to emit it at all has to come from state a remote cannot reach. Our
+/// process environment is exactly that: `ROOST_BOOTSTRAP_FS_ROOT` set
+/// over there means nothing to a build that never writes the expansion
+/// into a script in the first place.
+pub(crate) fn test_mode_env() -> bool {
+    std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1")
+}
+
 /// One rung of [`CANDIDATES`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -340,12 +366,19 @@ fn guarded(requires: &[&str], body: String) -> String {
     format!("if {test}; then {body}; fi")
 }
 
-/// The read-only discovery script: what platform is this, and which
-/// rungs of the ladder are actually there?
+/// The read-only discovery script: what platform is this, where is its
+/// `$HOME`, and which rungs of the ladder are actually there?
 ///
 /// Fed to `/bin/sh -s` on stdin, it writes NUL-delimited fields —
-/// `uname -s`, `uname -m`, then one field per rung that exists and is
-/// executable — and exits 0 whatever it found. Deliberately **not**
+/// `uname -s`, `uname -m`, `$HOME`, then one field per rung that exists
+/// and is executable — and exits 0 whatever it found.
+///
+/// `$HOME` is emitted (possibly empty) because the install destination
+/// is `$HOME` + [`INSTALL_DEST_SUFFIX`], expanded on the *far* side:
+/// without the remote's own answer this side cannot tell whether the
+/// rung the probe found **is** the file an install would overwrite, and
+/// a consent card that cannot tell says the wrong thing about the one
+/// case that matters. Deliberately **not**
 /// `set -eu`: a host with no `$HOME` (or no `uname`) still has an
 /// answer, and the answer is "nothing here", not a failed exec.
 ///
@@ -361,6 +394,7 @@ pub fn discovery_script(jailed: bool) -> String {
     let mut out = String::new();
     out.push_str("printf '%s\\0' \"$(uname -s 2>/dev/null)\"\n");
     out.push_str("printf '%s\\0' \"$(uname -m 2>/dev/null)\"\n");
+    out.push_str("printf '%s\\0' \"${HOME:-}\"\n");
     for candidate in CANDIDATES {
         out.push_str(&candidate.step("printf '%s\\0' \"$p\"", jailed));
         out.push('\n');
@@ -403,7 +437,9 @@ pub fn discovery_script(jailed: bool) -> String {
 /// two-ladder drift §3.2 exists to prevent.
 ///
 /// `jailed` is [`BootstrapOptions::jail_fs_root`]; see [`FS_ROOT_ENV`].
-/// [`crate::ssh::remote_command`] passes `false`, always.
+/// [`crate::ssh::remote_command_for`] is handed the same flag off
+/// [`crate::ssh::SshTunnelOptions::jail_fs_root`] — the transport and
+/// the probe have to land on one rung, not two.
 pub fn exec_chain_command(jailed: bool) -> String {
     let action = format!("exec \"$p\" {BRIDGE_SUBCOMMAND}");
     let mut steps: Vec<String> = CANDIDATES
@@ -771,6 +807,15 @@ pub struct Discovery {
     pub os: String,
     /// `uname -m`, trimmed.
     pub arch: String,
+    /// The remote's `$HOME`, verbatim — empty when it has none.
+    ///
+    /// Not a path this side ever opens or splices: its one job is to
+    /// expand [`INSTALL_DEST_SUFFIX`] into the destination an install
+    /// would write, so a card can tell "the rung I found is the file I
+    /// am about to overwrite" from "a different file that will be
+    /// shadowed". Untrimmed for the same reason the candidates are: a
+    /// `$HOME` with a trailing space is a real directory.
+    pub home: String,
     /// Every ladder rung that exists and is executable, in ladder
     /// order.
     pub candidates: Vec<String>,
@@ -789,7 +834,10 @@ pub struct Discovery {
 /// about which file they mean.
 pub fn parse_discovery(bytes: &[u8]) -> Result<Discovery, BootstrapError> {
     let fields = parse_nul_fields(bytes)?;
-    if fields.len() < 2 {
+    // Three, not two: the script emits `$HOME` unconditionally (empty
+    // when the remote has none), so an answer that stops short of it is
+    // truncated rather than merely home-less.
+    if fields.len() < 3 {
         return Err(BootstrapError::Probe(
             "it answered with no platform line".to_string(),
         ));
@@ -804,7 +852,8 @@ pub fn parse_discovery(bytes: &[u8]) -> Result<Discovery, BootstrapError> {
     Ok(Discovery {
         os,
         arch,
-        candidates: fields[2..]
+        home: fields[2].clone(),
+        candidates: fields[3..]
             .iter()
             .filter(|field| field.starts_with('/'))
             .cloned()
@@ -1523,7 +1572,7 @@ impl BootstrapOptions {
     /// [`FS_ROOT_ENV`] jail rides the identical gate, for a sharper
     /// reason: it decides which binary gets `exec`ed.
     pub fn from_env(expected: SessionBinaryIdentity) -> Self {
-        let test_mode = std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1");
+        let test_mode = test_mode_env();
         Self {
             expected,
             asset_base: std::env::var(ASSET_BASE_ENV)
@@ -1700,7 +1749,8 @@ const ALREADY_RUNNING_BUDGET: Duration = Duration::from_secs(5);
 const IDENTIFY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Cap on a probe exec's stdout (plan 039 §3.2). Discovery emits two
-/// `uname` fields and at most one path per ladder rung.
+/// `uname` fields, the remote `$HOME`, and at most one path per ladder
+/// rung.
 const PROBE_STDOUT_CAP: usize = 64 * 1024;
 
 /// Cap on the identity exec's stdout: the candidate paths it was asked
@@ -1828,6 +1878,10 @@ pub struct Probe {
     pub outcome: ProbeOutcome,
     /// The remote's architecture, for the source ladder.
     pub arch: RemoteArch,
+    /// [`Discovery::home`] — the remote's `$HOME`, so a caller can
+    /// expand the install destination the far side would write and
+    /// compare it against [`ProbeOutcome`]'s path.
+    pub home: String,
     /// Every candidate the discovery step found, in ladder order.
     /// Carried for logs and for the copy that names *where* a start-only
     /// flow would start from.
@@ -2230,6 +2284,7 @@ impl BootstrapJob {
         Ok(Probe {
             outcome,
             arch,
+            home: found.home,
             candidates,
         })
     }
@@ -3904,11 +3959,7 @@ mod tests {
     /// file the install compares itself against.
     #[test]
     fn a_shipped_ladder_carries_no_filesystem_root_seam_at_all() {
-        for script in [
-            discovery_script(false),
-            exec_chain_command(false),
-            crate::ssh::remote_command(),
-        ] {
+        for script in [discovery_script(false), exec_chain_command(false)] {
             assert!(
                 !script.contains(FS_ROOT_ENV),
                 "a shipped script must never expand {FS_ROOT_ENV}: {script}"
@@ -3918,6 +3969,109 @@ mod tests {
                     script.contains(&format!("p=\"{absolute}\"")),
                     "{absolute} must be named bare in {script}"
                 );
+            }
+        }
+        // The transport's shipped command is one of those two, and it is
+        // spelled as a *value* — `remote_command_for(false)` — rather
+        // than read back through `remote_command()`'s ambient gate,
+        // because a `cargo test` run may itself inherit
+        // `ROOST_TEST_MODE=1` and that would make this vacuous.
+        assert_eq!(
+            crate::ssh::remote_command_for(false),
+            exec_chain_command(false)
+        );
+        assert!(!crate::ssh::remote_command_for(false).contains(FS_ROOT_ENV));
+    }
+
+    /// **The probe and the transport must never disagree about the
+    /// jail.**
+    ///
+    /// They did: `ssh::remote_command` hardcoded `false` while
+    /// `BootstrapOptions::from_env` gated the same flag on
+    /// `ROOST_TEST_MODE`, so a jailed lane's probe answered
+    /// `Compatible { path: <jail>/usr/bin/roost-session }` and the
+    /// connect behind it — and the post-install reconnect, which goes
+    /// through the same command — looked at a bare
+    /// `/usr/bin/roost-session` and failed `NotFound`. Only rungs whose
+    /// winning path is absolute could show it; the `$HOME`-relative ones
+    /// are jailed by the fake `$HOME` and agreed by accident.
+    ///
+    /// **Pinned as a value, not as a gate.** Reading the flag off this
+    /// process's ambient `ROOST_TEST_MODE` is exactly how the old
+    /// version of this test could not fail: CI runs `cargo test` with no
+    /// such variable, so `false` was the only answer exercised and the
+    /// buggy `exec_chain_command(false)` satisfied it. Here the pairing
+    /// is asserted for **both** answers a
+    /// [`BootstrapOptions::jail_fs_root`] can hold — including the one a
+    /// hardcoded `false` gets wrong — and the two ladders are asserted
+    /// genuinely different, so nothing that ignores the flag survives.
+    /// This is also the fence on the other half of that bug: anything
+    /// that builds a `BootstrapOptions` by hand (the `jail_fs_root:
+    /// true` harness in `tests/bootstrap_test.rs`) pairs with a
+    /// `SshTunnelOptions` carrying the same flag, and both are checked
+    /// here rather than trusted to `from_env`.
+    #[test]
+    fn the_transport_and_the_probe_resolve_the_same_rung_in_both_modes() {
+        for jailed in [false, true] {
+            let probe_options = BootstrapOptions {
+                jail_fs_root: jailed,
+                ..BootstrapOptions::from_env(identity("0.0.19", "ghostty-abc+snapshot.v1"))
+            };
+            let tunnel_options = crate::ssh::SshTunnelOptions {
+                jail_fs_root: jailed,
+                ..crate::ssh::SshTunnelOptions::from_env()
+            };
+            assert_eq!(
+                probe_options.jail_fs_root, tunnel_options.jail_fs_root,
+                "the job and the tunnel must be handed one flag"
+            );
+            assert_eq!(
+                crate::ssh::remote_command_for(tunnel_options.jail_fs_root),
+                exec_chain_command(probe_options.jail_fs_root),
+                "the transport execs a different ladder than the probe searched \
+                 (jailed={jailed})"
+            );
+        }
+        // The anti-vacuity clause: the two ladders really do differ, so
+        // the loop above cannot be satisfied by ignoring the flag.
+        assert_ne!(
+            crate::ssh::remote_command_for(false),
+            crate::ssh::remote_command_for(true)
+        );
+        assert!(crate::ssh::remote_command_for(true).contains(FS_ROOT_ENV));
+        assert!(!crate::ssh::remote_command_for(false).contains(FS_ROOT_ENV));
+        // And the environment edge is still the gate it claims to be.
+        assert_eq!(
+            BootstrapOptions::from_env(identity("0.0.19", "ghostty-abc+snapshot.v1")).jail_fs_root,
+            test_mode_env(),
+        );
+        assert_eq!(
+            crate::ssh::SshTunnelOptions::from_env().jail_fs_root,
+            test_mode_env(),
+        );
+
+        for jailed in [false, true] {
+            let discovery = discovery_script(jailed);
+            let exec_chain = exec_chain_command(jailed);
+            for candidate in CANDIDATES {
+                let guard = candidate.guard(jailed);
+                assert!(
+                    discovery.contains(&guard),
+                    "probe (jailed={jailed}): {guard}"
+                );
+                assert!(
+                    exec_chain.contains(&guard),
+                    "transport (jailed={jailed}): {guard}"
+                );
+            }
+            for absolute in ABSOLUTE_RUNGS {
+                let rung = if jailed {
+                    format!("p=\"{FS_ROOT_EXPANSION}{absolute}\"")
+                } else {
+                    format!("p=\"{absolute}\"")
+                };
+                assert!(discovery.contains(&rung), "probe: {rung}");
+                assert!(exec_chain.contains(&rung), "transport: {rung}");
             }
         }
     }
@@ -4273,13 +4427,14 @@ mod tests {
     }
 
     #[test]
-    fn discovery_reads_the_platform_then_the_candidates() {
+    fn discovery_reads_the_platform_then_the_home_then_the_candidates() {
         let discovery = parse_discovery(
-            b"Linux\0x86_64\0/home/u/.local/bin/roost-session\0/usr/bin/roost-session\0",
+            b"Linux\0x86_64\0/home/u\0/home/u/.local/bin/roost-session\0/usr/bin/roost-session\0",
         )
         .expect("parse");
         assert_eq!(discovery.os, "Linux");
         assert_eq!(discovery.arch, "x86_64");
+        assert_eq!(discovery.home, "/home/u");
         assert_eq!(
             discovery.candidates,
             ["/home/u/.local/bin/roost-session", "/usr/bin/roost-session"]
@@ -4288,7 +4443,18 @@ mod tests {
 
     #[test]
     fn discovery_with_no_candidates_is_a_clean_empty_answer() {
-        let discovery = parse_discovery(b"Linux\0aarch64\0").expect("parse");
+        let discovery = parse_discovery(b"Linux\0aarch64\0/home/u\0").expect("parse");
+        assert!(discovery.candidates.is_empty());
+        assert_eq!(discovery.home, "/home/u");
+    }
+
+    /// A remote with no `$HOME` is a real host, not a truncated answer:
+    /// the ladder's `$HOME` rungs are skipped over there and the field
+    /// arrives empty. The trailing-NUL pop must not eat it.
+    #[test]
+    fn discovery_accepts_a_home_less_remote() {
+        let discovery = parse_discovery(b"Linux\0x86_64\0\0").expect("parse");
+        assert_eq!(discovery.home, "");
         assert!(discovery.candidates.is_empty());
     }
 
@@ -4299,7 +4465,8 @@ mod tests {
     #[test]
     fn discovery_keeps_only_the_absolute_paths_the_probe_can_emit() {
         let discovery = parse_discovery(
-            b"Linux\0x86_64\0-t\0relative/roost-session\0\0roost-session\0/usr/bin/roost-session\0",
+            b"Linux\0x86_64\0/home/u\0-t\0relative/roost-session\0\0roost-session\0\
+              /usr/bin/roost-session\0",
         )
         .expect("parse");
         assert_eq!(discovery.candidates, ["/usr/bin/roost-session"]);
@@ -4312,9 +4479,11 @@ mod tests {
     #[test]
     fn discovery_trims_uname_but_never_a_path() {
         let discovery =
-            parse_discovery(b" Linux \0 x86_64 \0/home/trailing /roost-session\0").expect("parse");
+            parse_discovery(b" Linux \0 x86_64 \0/home/trailing \0/home/trailing /roost-session\0")
+                .expect("parse");
         assert_eq!(discovery.os, "Linux");
         assert_eq!(discovery.arch, "x86_64");
+        assert_eq!(discovery.home, "/home/trailing ");
         assert_eq!(discovery.candidates, ["/home/trailing /roost-session"]);
     }
 
@@ -4323,8 +4492,11 @@ mod tests {
         for bytes in [
             &b""[..],
             &b"Linux\0"[..],
-            &b"\0x86_64\0"[..],
-            &b"Linux\0\0"[..],
+            // Two fields and no `$HOME` field at all: the script always
+            // emits one, so this answer was cut off.
+            &b"Linux\0x86_64\0"[..],
+            &b"\0x86_64\0/home/u\0"[..],
+            &b"Linux\0\0/home/u\0"[..],
         ] {
             let error = parse_discovery(bytes).expect_err("must be refused");
             assert!(matches!(error, BootstrapError::Probe(_)), "{error:?}");
@@ -5312,6 +5484,9 @@ mod tests {
             // Never spawned by these tests; the choreography that does
             // spawn it is `tests/bootstrap_test.rs`, against a fake ssh.
             ssh_bin: PathBuf::from("/nonexistent/ssh"),
+            // Paired with `options()`'s own flag — the tunnel and the
+            // job must never be jailed differently.
+            jail_fs_root: options().jail_fs_root,
         };
         BootstrapJob::open(&target, &ssh, options())
             .await

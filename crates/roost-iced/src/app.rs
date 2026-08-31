@@ -5625,6 +5625,7 @@ impl App {
             label: &label,
             identity: &bootstrap::client_identity(),
             dest: &bootstrap::card_dest(&plan),
+            dest_on_disk: &bootstrap::dest_on_disk(&plan, &probed.probe.home),
             source: &source,
             plan: &plan,
             session_is_newer: offer.session_is_newer,
@@ -5813,7 +5814,12 @@ impl App {
                     message.push_str(" — ");
                     message.push_str(&warning);
                 }
-                tracing::info!(host = %saved_id, "roost-session is set up; reconnecting");
+                // `%message` mirrors `report_bootstrap_failure`'s own
+                // `tracing::warn!(%message, ...)`: the toast is
+                // ephemeral and carries no op, so the log is the only
+                // place a test (or a developer) can read the PATH
+                // warning this success line may be carrying.
+                tracing::info!(host = %saved_id, %message, "roost-session is set up; reconnecting");
                 self.set_status(message);
                 self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User);
             }

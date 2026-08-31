@@ -264,6 +264,23 @@ pub(crate) fn card_dest(plan: &BootstrapPlan) -> String {
     }
 }
 
+/// [`card_dest`]'s far-side spelling: the same destination with `$HOME`
+/// expanded to the answer the probe brought back
+/// ([`roost_ipc::bootstrap::Probe::home`]).
+///
+/// The one thing [`BootstrapPlan::found`] can be *compared* against.
+/// The probe reports a shell-expanded absolute path — rung 1 comes back
+/// as `/home/u/.local/bin/roost-session` — so comparing it to
+/// [`card_dest`]'s reader-facing `~/.local/bin/roost-session` never
+/// matched, and every in-place upgrade told the user the file it was
+/// about to overwrite (and back up) was "left where it is".
+pub(crate) fn dest_on_disk(plan: &BootstrapPlan, home: &str) -> String {
+    match &plan.start {
+        StartFrom::Probed(path) => path.clone(),
+        StartFrom::Installed => format!("{home}{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX),
+    }
+}
+
 /// The action matrix (plan 039 §3.5), as one function.
 ///
 /// Two inputs, six rows, and the interesting ones are the asymmetries:
@@ -336,8 +353,12 @@ pub(crate) struct CopyInputs<'a> {
     pub(crate) label: &'a str,
     pub(crate) identity: &'a SessionBinaryIdentity,
     /// Where the binary will be, after: the install destination, or the
-    /// rung a start-only flow found.
+    /// rung a start-only flow found. Written for a person, so `~`.
     pub(crate) dest: &'a str,
+    /// The same destination as the *far side* spells it
+    /// ([`dest_on_disk`]) — never shown, only compared against
+    /// [`BootstrapPlan::found`], which is a shell-expanded path.
+    pub(crate) dest_on_disk: &'a str,
     /// [`roost_ipc::bootstrap::SourcePreview::describe`]'s answer.
     pub(crate) source: &'a str,
     pub(crate) plan: &'a BootstrapPlan,
@@ -373,6 +394,7 @@ pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
         label,
         identity,
         dest,
+        dest_on_disk,
         source,
         plan,
         session_is_newer,
@@ -391,8 +413,11 @@ pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
             format!("Update roost-session on {label}?"),
             match plan.found.as_deref() {
                 // The destination is what the probe found: a genuine
-                // overwrite, and the only case that may say so.
-                Some(found) if found == dest => {
+                // overwrite, and the only case that may say so. Compared
+                // against the far side's spelling of the destination —
+                // `dest` itself is `~`-folded for the reader and would
+                // never equal a probe's expanded path.
+                Some(found) if found == dest_on_disk => {
                     format!("{build} will replace what is at {dest} on {label}, from {source}.")
                 }
                 // A different rung — `/usr/bin/roost-session` from a
@@ -770,11 +795,17 @@ mod tests {
         }
     }
 
+    /// The remote `$HOME` the probe reports back, as every real one
+    /// arrives: shell-expanded and absolute. Spelling it `~` here — as
+    /// this fixture used to — is what let the dead `found == dest` arm
+    /// look covered; the probe never emits that.
+    const REMOTE_HOME: &str = "/home/u";
+
     /// The other Mismatch: a stale copy at the very destination, which
     /// is the only shape a card may call a replacement.
     fn mismatch_at_dest() -> ProbeOutcome {
         ProbeOutcome::Mismatch {
-            path: format!("~{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX),
+            path: format!("{REMOTE_HOME}{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX),
             identity: None,
         }
     }
@@ -1096,10 +1127,28 @@ mod tests {
             label: "pop-os",
             identity: &identity(),
             dest: &card_dest(plan),
+            dest_on_disk: &dest_on_disk(plan, REMOTE_HOME),
             source,
             plan,
             session_is_newer: newer,
         })
+    }
+
+    /// The two spellings of one destination, and the reason the copy
+    /// needs both: a probe's path can only ever equal the expanded one.
+    #[test]
+    fn the_install_destination_has_a_reader_spelling_and_a_far_side_spelling() {
+        let plan = plan_bootstrap(&mismatch_at_dest(), SessionState::NoSession);
+        assert_eq!(card_dest(&plan), install_dest());
+        assert_eq!(
+            dest_on_disk(&plan, REMOTE_HOME),
+            format!("{REMOTE_HOME}{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX)
+        );
+        assert_ne!(card_dest(&plan), dest_on_disk(&plan, REMOTE_HOME));
+        // A start-only plan writes nothing, so both spellings are the
+        // rung the probe found, verbatim.
+        let start = plan_bootstrap(&compatible(), SessionState::NoSession);
+        assert_eq!(card_dest(&start), dest_on_disk(&start, REMOTE_HOME));
     }
 
     /// The mapping the adapter uses, both branches. A flow that writes
@@ -1131,6 +1180,13 @@ mod tests {
     /// `/usr/bin/roost-session` while the install writes
     /// `~/.local/bin/roost-session` — two different files — and the
     /// stale one survives, shadowed in the exec chain (plan 039 §9).
+    ///
+    /// The `same` half below is the arm that was **dead in production**:
+    /// its fixture used to spell the probe's path `~/…`, which no probe
+    /// emits, so an in-place upgrade always took the "goes ahead of"
+    /// branch and told the user the file it was about to overwrite was
+    /// left alone. [`REMOTE_HOME`] is what a real probe answers with,
+    /// and [`dest_on_disk`] is what makes the two comparable.
     #[test]
     fn an_update_says_replace_only_where_it_actually_replaces() {
         let elsewhere = copy(

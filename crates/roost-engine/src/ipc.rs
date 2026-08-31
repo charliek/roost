@@ -473,6 +473,9 @@ pub enum UiRequest {
     /// localhost session that is not running.
     HostConnect {
         id: String,
+        /// `HostConnectParams::test_user_origin`, carried through
+        /// verbatim — see that field's doc for what it is and why.
+        test_user_origin: bool,
         reply: HostReply<HostConnectionResult>,
     },
     /// `host.disconnect` — drop the connection, leave the session
@@ -2872,16 +2875,21 @@ async fn dispatch(
             // Connection state is the app's alone — there is no headless
             // fallback to give, and `no UI attached` is the honest
             // answer for a socket with no window behind it.
-            let id = if op == ops::HOST_CONNECT {
-                decode::<HostConnectParams>(params)?.id
+            let (id, test_user_origin) = if op == ops::HOST_CONNECT {
+                let p = decode::<HostConnectParams>(params)?;
+                (p.id, p.test_user_origin)
             } else {
-                decode::<HostDisconnectParams>(params)?.id
+                (decode::<HostDisconnectParams>(params)?.id, false)
             };
             let connect = op == ops::HOST_CONNECT;
             let result = h
                 .ui_call(move |reply| {
                     if connect {
-                        UiRequest::HostConnect { id, reply }
+                        UiRequest::HostConnect {
+                            id,
+                            test_user_origin,
+                            reply,
+                        }
                     } else {
                         UiRequest::HostDisconnect { id, reply }
                     }

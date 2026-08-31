@@ -2008,6 +2008,25 @@ pub struct HostListResult {
 #[serde(deny_unknown_fields)]
 pub struct HostConnectParams {
     pub id: String,
+    /// `ROOST_TEST_MODE=1` only: route this connect through the same
+    /// `RequestOrigin::User` a sidebar or palette click carries, instead
+    /// of `host.connect`'s ordinary `Ipc` origin (plan 039 §3.5's
+    /// never-a-modal-at-a-machine rule). Ignored outside test mode, so
+    /// it can never let a real `roostctl`/IPC caller raise a consent
+    /// dialog. The `tools/roosttest` harness is IPC-only and has no
+    /// other way to reach the bootstrap offer or the remote-restart
+    /// prompt, which are both gated on a *person* having asked.
+    ///
+    /// `skip_serializing_if` rather than a bare default: this is a test
+    /// seam, and a production `host.connect` frame should not carry it
+    /// at all. (It is no longer load-bearing for `roostctl host
+    /// disconnect` — that op is sent its own `HostDisconnectParams`.)
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub test_user_origin: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

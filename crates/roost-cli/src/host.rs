@@ -20,8 +20,8 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use roost_ipc::messages::{
-    ops, HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostListResult,
-    HostRemoveParams,
+    ops, HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult,
+    HostDisconnectParams, HostListResult, HostRemoveParams,
 };
 use roost_ipc::{ssh, IpcClient};
 
@@ -190,12 +190,30 @@ fn op_for(cmd: &HostCmd) -> &'static str {
 }
 
 /// `connect` and `disconnect` differ only in the op they name and the
-/// state they report back, so they share one body — the wire shapes are
-/// identical by design (`{id}` in, `{host, state}` out).
+/// state they report back, so they share one body — `{id}` in,
+/// `{host, state}` out.
+///
+/// Each op is sent its **own** params type even though both are `{id}`
+/// today. They are not the same struct: `HostConnectParams` carries a
+/// test-only field, `HostDisconnectParams` is `deny_unknown_fields`, and
+/// serializing the former for the latter made `host disconnect` work
+/// only for as long as that field kept a `skip_serializing_if`.
 async fn connection(client: &mut IpcClient, op: &str, id: &str) -> Result<i32> {
-    let resp: HostConnectionResult = client
-        .call(op, HostConnectParams { id: id.to_string() })
-        .await?;
+    let resp: HostConnectionResult = if op == ops::HOST_DISCONNECT {
+        client
+            .call(op, HostDisconnectParams { id: id.to_string() })
+            .await?
+    } else {
+        client
+            .call(
+                op,
+                HostConnectParams {
+                    id: id.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?
+    };
     println!("{}  {}  {}", resp.host.id, resp.host.label, resp.state);
     Ok(0)
 }

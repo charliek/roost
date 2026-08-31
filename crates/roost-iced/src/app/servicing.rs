@@ -2426,8 +2426,12 @@ impl App {
                     .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
                 let _ = reply.send(result);
             }
-            UiRequest::HostConnect { id, reply } => {
-                let _ = reply.send(self.host_connect_op(&id));
+            UiRequest::HostConnect {
+                id,
+                test_user_origin,
+                reply,
+            } => {
+                let _ = reply.send(self.host_connect_op(&id, test_user_origin));
             }
             UiRequest::HostDisconnect { id, reply } => {
                 let _ = reply.send(self.host_disconnect_op(&id));
@@ -2452,12 +2456,28 @@ impl App {
     /// dial, the identify and the lease are a round trip this reply does
     /// not wait for, and a client that wants the settled verdict watches
     /// the section (or asks again).
+    ///
+    /// `test_user_origin` is `HostConnectParams::test_user_origin`,
+    /// already gated in `roost-engine` on nothing — the test-mode check
+    /// lives here, next to every other `self.test_mode` gate, so a
+    /// production build ignores the flag outright rather than trusting
+    /// a decode-time gate two crates away. When it is honored, the
+    /// request routes through `host_connect_requested` — the same
+    /// NeedsRestart-aware entry a click uses — instead of the plain
+    /// dial `host.connect` otherwise gives a machine, which is the only
+    /// way `tools/roosttest` can reach the bootstrap offer or the
+    /// remote-restart prompt at all (plan 039 §3.5).
     fn host_connect_op(
         &mut self,
         saved_id: &str,
+        test_user_origin: bool,
     ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
         let host = self.saved_host(saved_id)?;
-        self.host_reconnect_requested(saved_id, Self::IPC_CONNECT_ORIGIN);
+        if test_user_origin && self.test_mode {
+            self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
+        } else {
+            self.host_reconnect_requested(saved_id, Self::IPC_CONNECT_ORIGIN);
+        }
         Ok(self.host_connection_result(host))
     }
 

@@ -342,12 +342,45 @@ pub fn generate_ssh_config(user_config: Option<&Path>, system_config: Option<&Pa
 /// good `roost-session` the probe saw and the transport could not
 /// reach, and the resulting dialog offered to install a binary that was
 /// already installed, forever.
-/// `false`, always: the [`crate::bootstrap::FS_ROOT_ENV`] jail is a test
-/// seam, and a shipped transport that let a variable on the *far* side
-/// choose which binary it `exec`s would hand a hostile remote the
-/// steering wheel.
+///
+/// `jailed` is [`SshTunnelOptions::jail_fs_root`] — the same value
+/// [`crate::bootstrap::BootstrapOptions::jail_fs_root`] carries, because
+/// the probe and this command have to resolve *the same rung*.
+/// Hardcoding `false` here — which this did — left a test-lane probe
+/// answering `Compatible { path: <jail>/usr/bin/roost-session }` while
+/// the connect behind it looked at a bare `/usr/bin/roost-session` and
+/// failed `NotFound`, on every flow whose winning rung is absolute
+/// rather than `$HOME`-relative.
+///
+/// **The flag is a value here, never a lookup.** Only [`remote_command`]
+/// reads the environment, at the outermost edge, so every caller that
+/// already holds an options bundle passes the flag it is actually
+/// running under — and the transport's ladder and the probe's can be
+/// pinned equal by a test that touches no process state at all.
+pub fn remote_command_for(jailed: bool) -> String {
+    crate::bootstrap::exec_chain_command(jailed)
+}
+
+/// [`remote_command_for`] under **this process's** own
+/// `ROOST_TEST_MODE`, for a caller holding no options bundle.
+///
+/// Everything inside the transport has one — a tunnel and a verify both
+/// take the flag off [`SshTunnelOptions::jail_fs_root`], which
+/// [`SshTunnelOptions::from_env`] set at *its* edge — so this is the
+/// spelling for the outside: the one-liner a diagnostic or a test wants
+/// when it is asking "what would a shipped process exec here".
+///
+/// The security property that motivated the old hardcoded `false`
+/// survives, because the gate reads **our own** process environment: a
+/// variable set on the far side cannot turn the seam on, and a shipped
+/// build never writes the expansion into the script at all. What that is
+/// *not* is a guarantee once this client is itself in test mode: from
+/// there the far side's own `ROOST_BOOTSTRAP_FS_ROOT` fully steers which
+/// binary the emitted chain `exec`s — which is precisely what the
+/// hardcoded `false` prevented even then, and precisely what a jailed
+/// lane needs. See `crate::bootstrap::test_mode_env`.
 pub fn remote_command() -> String {
-    crate::bootstrap::exec_chain_command(false)
+    remote_command_for(crate::bootstrap::test_mode_env())
 }
 
 /// The `-F`/`-S`/mux-option/`-T` prefix shared by [`exec_argv`] and
@@ -375,9 +408,13 @@ pub(crate) fn mux_connect_argv(config_path: &Path, ctl_path: &Path, target: &str
 
 /// Argv for the per-connection exec: opens (or reuses) the shared mux
 /// and execs the remote bridge with a fresh stdio pipe of its own.
-pub fn exec_argv(config_path: &Path, ctl_path: &Path, target: &str) -> Vec<String> {
+///
+/// `jailed` is [`SshTunnelOptions::jail_fs_root`], carried down from the
+/// tunnel's own options rather than re-read here — see
+/// [`remote_command_for`].
+pub fn exec_argv(config_path: &Path, ctl_path: &Path, target: &str, jailed: bool) -> Vec<String> {
     let mut argv = mux_connect_argv(config_path, ctl_path, target);
-    argv.push(remote_command());
+    argv.push(remote_command_for(jailed));
     argv
 }
 
@@ -755,11 +792,20 @@ pub struct SshTunnelOptions {
     /// order — the first one that leaves room for a `sun_path` wins.
     pub scratch_parents: Vec<PathBuf>,
     pub ssh_bin: PathBuf,
+    /// Whether the remote command this tunnel `exec`s prefixes its
+    /// absolute rungs with [`crate::bootstrap::FS_ROOT_ENV`] — the same
+    /// value [`crate::bootstrap::BootstrapOptions::jail_fs_root`]
+    /// carries, and for the same reason. A tunnel and the bootstrap job
+    /// beside it must search and exec **one** ladder; a hardcoded answer
+    /// on either side is the `NotFound`-on-a-good-rung bug plan 039 §3.2
+    /// exists to prevent.
+    pub jail_fs_root: bool,
 }
 
 impl SshTunnelOptions {
-    /// `$TMPDIR` then `/tmp`, `$ROOST_SSH_BIN` or `ssh`, and the
-    /// standard config pair.
+    /// `$TMPDIR` then `/tmp`, `$ROOST_SSH_BIN` or `ssh`, the standard
+    /// config pair — and the one `ROOST_TEST_MODE` read the transport
+    /// makes, here at the edge rather than down where the argv is built.
     pub fn from_env() -> Self {
         let mut scratch_parents: Vec<PathBuf> = Vec::new();
         if let Some(tmpdir) = std::env::var_os("TMPDIR").filter(|value| !value.is_empty()) {
@@ -776,6 +822,7 @@ impl SshTunnelOptions {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("ssh")),
+            jail_fs_root: crate::bootstrap::test_mode_env(),
         }
     }
 }
@@ -841,6 +888,10 @@ struct TunnelState {
     ssh_bin: PathBuf,
     config_path: PathBuf,
     ctl_path: PathBuf,
+    /// [`SshTunnelOptions::jail_fs_root`], carried so every
+    /// per-connection [`exec_argv`] emits the ladder this tunnel was
+    /// opened for rather than re-reading the environment mid-flight.
+    jail_fs_root: bool,
     /// Bumped once per `ssh` exec, so a caller can tell "the failure I
     /// already reported" from "a new one since".
     generation: AtomicU64,
@@ -913,6 +964,7 @@ impl SshTunnel {
                 ssh_bin: options.ssh_bin,
                 config_path,
                 ctl_path,
+                jail_fs_root: options.jail_fs_root,
                 generation: AtomicU64::new(0),
                 last_error: Mutex::new(None),
                 closed: AtomicBool::new(false),
@@ -1123,7 +1175,12 @@ impl TunnelState {
     /// Serve one accepted connection over its own `ssh` exec.
     async fn serve(self: Arc<Self>, stream: UnixStream) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let argv = exec_argv(&self.config_path, &self.ctl_path, &self.target);
+        let argv = exec_argv(
+            &self.config_path,
+            &self.ctl_path,
+            &self.target,
+            self.jail_fs_root,
+        );
         let mut child = match spawn_ssh_command(
             &self.ssh_bin,
             &argv,
@@ -1640,7 +1697,11 @@ async fn verify_in(
     write_private_file(&config_path, options.config_paths.render().as_bytes())
         .with_context(|| format!("write {}", config_path.display()))?;
 
-    let argv = verify_argv(&config_path, &target.raw, &remote_command());
+    let argv = verify_argv(
+        &config_path,
+        &target.raw,
+        &remote_command_for(options.jail_fs_root),
+    );
     let mut child = spawn_ssh_command(
         &options.ssh_bin,
         &argv,
@@ -2118,7 +2179,7 @@ mod tests {
     fn exec_argv_is_the_exact_vector() {
         let cfg = PathBuf::from("/home/charlie/.config/roost/ssh_config");
         let ctl = PathBuf::from("/tmp/roost-ssh-workbox/ctl");
-        let argv = exec_argv(&cfg, &ctl, "workbox");
+        let argv = exec_argv(&cfg, &ctl, "workbox", false);
         assert_eq!(
             argv,
             vec![
@@ -2136,9 +2197,26 @@ mod tests {
                 "BatchMode=yes",
                 "-T",
                 "workbox",
-                &remote_command(),
+                &remote_command_for(false),
             ]
         );
+    }
+
+    /// The tunnel's own flag reaches the argv. Pure: no environment, and
+    /// the two answers are asserted *different*, so an `exec_argv` that
+    /// ignored the flag (the shape the bug had) cannot pass.
+    #[test]
+    fn exec_argv_carries_the_tunnels_own_jail_flag() {
+        let cfg = PathBuf::from("/home/charlie/.config/roost/ssh_config");
+        let ctl = PathBuf::from("/tmp/roost-ssh-workbox/ctl");
+        for jailed in [false, true] {
+            assert_eq!(
+                exec_argv(&cfg, &ctl, "workbox", jailed).last().unwrap(),
+                &remote_command_for(jailed),
+                "jailed={jailed}"
+            );
+        }
+        assert_ne!(remote_command_for(false), remote_command_for(true));
     }
 
     #[test]
@@ -2193,7 +2271,7 @@ mod tests {
     #[test]
     fn verify_argv_is_the_exact_vector() {
         let cfg = PathBuf::from("/home/charlie/.config/roost/ssh_config");
-        let argv = verify_argv(&cfg, "workbox", &remote_command());
+        let argv = verify_argv(&cfg, "workbox", &remote_command_for(false));
         assert_eq!(
             argv,
             vec![
@@ -2207,7 +2285,7 @@ mod tests {
                 "BatchMode=yes",
                 "-T",
                 "workbox",
-                &remote_command(),
+                &remote_command_for(false),
             ]
         );
         assert!(!argv.contains(&"-S".to_string()));
@@ -2221,15 +2299,14 @@ mod tests {
     /// that would hide a rung being dropped.
     #[test]
     fn the_remote_command_is_the_bootstrap_exec_chain() {
-        let command = remote_command();
+        // The shipped ladder, spelled as a *value* rather than read off
+        // whatever `ROOST_TEST_MODE` this `cargo test` inherited — which
+        // is what makes the seam assertion below mean something.
+        let command = remote_command_for(false);
         assert_eq!(command, crate::bootstrap::exec_chain_command(false));
-        // The `false` above is the whole point: the jail seam is a test
-        // lane's, and a shipped transport that expanded a variable the
-        // far side controls would let a hostile host choose which binary
-        // gets exec'd.
         assert!(
             !command.contains(crate::bootstrap::FS_ROOT_ENV),
-            "{command}"
+            "a shipped transport never writes the jail expansion: {command}"
         );
         // sshd hands this to the user's login shell, which may be csh —
         // where `'\''` is not an escape. The literal this replaced had

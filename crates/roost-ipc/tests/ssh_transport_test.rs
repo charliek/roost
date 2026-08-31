@@ -23,7 +23,7 @@ use std::time::Duration;
 use roost_ipc::bootstrap::shell_quote;
 use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 use roost_ipc::ssh::{
-    classify, remote_command, verify_ssh_target, ResolvedTransport, SshConfigPaths, SshFailure,
+    classify, remote_command_for, verify_ssh_target, ResolvedTransport, SshConfigPaths, SshFailure,
     SshTarget, SshTunnel, SshTunnelOptions,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -94,6 +94,10 @@ impl Harness {
             },
             scratch_parents: vec![self.parent.clone()],
             ssh_bin: self.ssh_bin.clone(),
+            // This harness fakes `ssh` itself and never runs the remote
+            // command, so it wants the *shipped* ladder — the same one
+            // `is_exec` below recognizes.
+            jail_fs_root: false,
         }
     }
 
@@ -175,7 +179,8 @@ fn is_establish(argv: &[String]) -> bool {
 
 /// A per-connection exec: its remote command is the bridge one-liner.
 fn is_exec(argv: &[String]) -> bool {
-    argv.last().is_some_and(|last| *last == remote_command())
+    argv.last()
+        .is_some_and(|last| *last == remote_command_for(false))
 }
 
 fn is_master_exit(argv: &[String]) -> bool {

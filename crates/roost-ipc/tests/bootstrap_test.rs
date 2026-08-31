@@ -548,6 +548,12 @@ impl Harness {
             },
             scratch_parents: vec![self.parent.clone()],
             ssh_bin: self.ssh_bin.clone(),
+            // The same flag `options()` sets below, and it has to be the
+            // same one: the transport's exec chain and the probe's
+            // ladder are generated from it, and a harness that jailed
+            // one but not the other would have the far side answer about
+            // a binary the connect could never reach.
+            jail_fs_root: true,
         }
     }
 
@@ -2252,6 +2258,12 @@ async fn the_far_side_sees_the_fixture_and_never_this_machine() {
         probe.arch,
         RemoteArch::Amd64,
         "the arch comes from the fixture's uname, whatever this machine is"
+    );
+    assert_eq!(
+        probe.home,
+        harness.home.display().to_string(),
+        "the `$HOME` the probe reports is the far side's, and it is what expands the \
+         install destination the consent card compares its find against"
     );
     assert_eq!(
         probe.outcome,
