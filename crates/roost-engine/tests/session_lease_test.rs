@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
-use roost_engine::{PtySupervisor, Workspace};
+use roost_engine::{AttentionSource, PtySupervisor, Workspace};
 use roost_ipc::messages::{ops, SessionConnectResult};
 use roost_ipc::{CloseReason, ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome};
 use tempfile::TempDir;
@@ -350,4 +350,213 @@ async fn a_ui_socket_does_not_know_session_connect() {
         .await
         .expect_err("a UI socket must not serve session.connect");
     assert_eq!(err.code, "unknown-op");
+}
+
+// ---------------------------------------------------------------------------
+// session.set_focus, and the two edges that forget it (plan 038 C6)
+// ---------------------------------------------------------------------------
+
+/// One tab in a fresh project.
+fn a_tab(f: &Fixture) -> i64 {
+    let project = f.workspace.create_project("p", "/tmp").unwrap().id;
+    f.workspace.open_tab(project, "/tmp", "sh").unwrap().id
+}
+
+async fn set_focus(f: &Fixture, c: &Conn, lease: &str, tab: Option<i64>) -> Result<(), String> {
+    let params = serde_json::json!({
+        "lease": lease,
+        "focused_tab_id": tab.map(|id| id.to_string()),
+    });
+    match f
+        .handler
+        .handle(&c.ctx, ops::SESSION_SET_FOCUS, params)
+        .await
+    {
+        Ok(outcome) => {
+            assert_eq!(reply(outcome), serde_json::json!({}));
+            Ok(())
+        }
+        Err(e) => {
+            assert!(
+                !e.message.contains(lease) || lease.is_empty(),
+                "a lease is a credential and must not be echoed back: {}",
+                e.message
+            );
+            Err(e.code)
+        }
+    }
+}
+
+/// Whether a structured notification for `tab` gets through — the only
+/// externally visible reading of the session's focus state, and the one
+/// the whole op exists to move.
+fn attention_fires(f: &Fixture, tab: i64) -> bool {
+    f.workspace
+        .raise_attention(tab, "Roost", "body", AttentionSource::Structured)
+        .expect("the tab exists")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_focus_needs_the_lease_and_a_tab_that_exists() {
+    let f = fixture();
+    let tab = a_tab(&f);
+    let holder = conn(1);
+
+    assert_eq!(
+        set_focus(&f, &conn(2), &"0".repeat(32), Some(tab))
+            .await
+            .unwrap_err(),
+        "connect-required",
+        "focus is the driving client's to state"
+    );
+
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+    assert_eq!(
+        set_focus(&f, &holder, &lease, Some(tab + 999))
+            .await
+            .unwrap_err(),
+        "not-found"
+    );
+    set_focus(&f, &holder, &lease, Some(tab))
+        .await
+        .expect("the client states what it is looking at");
+    assert!(!attention_fires(&f, tab), "the focused tab is suppressed");
+}
+
+/// The lease turning over forgets the focus the previous holder
+/// reported: it was a statement about *its* window, and carried over it
+/// would mute a tab for a client that never said anything — the exact
+/// headless-default bug this op exists to fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_lease_forgets_the_previous_clients_focus() {
+    let f = fixture();
+    let tab = a_tab(&f);
+    let first = conn(1);
+    let lease = connect(&f, &first, false).await.expect("connect").lease;
+    set_focus(&f, &first, &lease, Some(tab))
+        .await
+        .expect("focus");
+    assert!(!attention_fires(&f, tab));
+
+    connect(&f, &conn(2), true).await.expect("takeover");
+    assert!(
+        attention_fires(&f, tab),
+        "a taken-over session must not keep muting the displaced client's tab"
+    );
+}
+
+/// The other edge: the lease outlives its connections by design, but a
+/// focus does not. When the last connection under the live lease goes
+/// away nobody is looking at this session, so the flag drops — while the
+/// selection it moved stays put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_connection_closing_forgets_the_focus_but_not_the_selection() {
+    let f = fixture();
+    let tab = a_tab(&f);
+    let control = conn(1);
+    let lease = connect(&f, &control, false).await.expect("connect").lease;
+    let stream = conn(2);
+    let _push = subscribe(&f, &stream, &lease).await.expect("subscribe");
+    set_focus(&f, &control, &lease, Some(tab))
+        .await
+        .expect("focus");
+
+    // The subscriber going away is neither the last connection nor the
+    // one that stated the focus: the client is still there, still
+    // looking.
+    f.handler.connection_ended(stream.ctx.conn_id);
+    assert!(
+        !attention_fires(&f, tab),
+        "the client still holds the connection it spoke on"
+    );
+
+    f.handler.connection_ended(control.ctx.conn_id);
+    assert!(attention_fires(&f, tab), "nobody is attached any more");
+    assert_eq!(
+        f.workspace.active().1,
+        tab,
+        "the selection stays where the departed client left it"
+    );
+
+    // The lease itself survives — a client can come back on it and
+    // re-assert, which is what a reconnecting UI does at `Connected`.
+    let back = conn(3);
+    set_focus(&f, &back, &lease, Some(tab))
+        .await
+        .expect("the same lease still works");
+    assert!(!attention_fires(&f, tab));
+}
+
+/// And it must not depend on the order the server notices things. A
+/// client re-dialing on the same lease can register before the departed
+/// one's close is processed; counting live connections alone would then
+/// leave the gone client's focus standing, which is the mute all over
+/// again. The focus is retired by its *author* going away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_focus_dies_with_its_author_even_when_someone_registered_first() {
+    let f = fixture();
+    let tab = a_tab(&f);
+    let author = conn(1);
+    let lease = connect(&f, &author, false).await.expect("connect").lease;
+    set_focus(&f, &author, &lease, Some(tab))
+        .await
+        .expect("focus");
+    assert!(!attention_fires(&f, tab));
+
+    let late = conn(2);
+    let _push = subscribe(&f, &late, &lease).await.expect("subscribe");
+    f.handler.connection_ended(author.ctx.conn_id);
+
+    assert!(
+        attention_fires(&f, tab),
+        "the client that stated the focus is gone"
+    );
+}
+
+/// A null focus is nobody's claim: the connection that sent it closing
+/// leaves nothing to retire, and the flag is already down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_null_focus_leaves_no_claim_behind() {
+    let f = fixture();
+    let tab = a_tab(&f);
+    let holder = conn(1);
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+    set_focus(&f, &holder, &lease, Some(tab))
+        .await
+        .expect("focus");
+    set_focus(&f, &holder, &lease, None)
+        .await
+        .expect("and then nothing");
+
+    let other = conn(2);
+    let _push = subscribe(&f, &other, &lease).await.expect("subscribe");
+    f.handler.connection_ended(holder.ctx.conn_id);
+    assert!(attention_fires(&f, tab));
+}
+
+/// A connection ending on a socket with no session touches nothing — the
+/// hook is a session's business alone, and a UI reports its own focus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ui_sockets_connection_ending_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(Workspace::open(dir.path().join("state.json")));
+    let handler = IpcHandler::new(
+        Arc::clone(&workspace),
+        Arc::new(PtySupervisor::new()),
+        dir.path().join("roost.sock"),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    let tab = workspace.open_tab(project, "/tmp", "sh").unwrap().id;
+    workspace.focus_tab(tab).unwrap();
+
+    handler.connection_ended(1);
+
+    assert!(
+        !workspace
+            .raise_attention(tab, "Roost", "body", AttentionSource::Structured)
+            .unwrap(),
+        "a UI's own focus is the UI's to report, not this hook's to clear"
+    );
 }

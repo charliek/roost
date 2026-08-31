@@ -1051,6 +1051,20 @@ fn host_selection_detach(
     Some(previous.tab)
 }
 
+/// Which host tab this client is *looking at*, as `session.set_focus`
+/// states it: the selected host tab when the window has focus, and
+/// nothing otherwise.
+///
+/// The whole edge computation, split out from [`App`] because it is the
+/// part worth pinning: a session mutes the tab it believes is focused,
+/// so "the window is unfocused" and "the selection moved to another
+/// host" both have to read as *no* claim rather than as a stale one.
+/// Only host tabs appear here — a local selection is `None`, which is
+/// how every connected host hears null.
+fn host_focus_claim(window_focused: bool, selection: Option<HostSelection>) -> Option<TabKey> {
+    selection.filter(|_| window_focused).map(|it| it.tab)
+}
+
 fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> {
     if len == 0 || current >= len {
         return None;
@@ -2995,6 +3009,10 @@ impl App {
         }
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
+        // The same statement the local workspace just took, for whichever
+        // session owns the selected tab: unfocusing releases the claim,
+        // refocusing re-states it.
+        self.push_host_focus();
         if let Some(tab) = self.tabs.get(&self.active_tab_key()) {
             tab.set_window_focus(focused);
         }
@@ -4747,6 +4765,26 @@ impl App {
         if let Some(tab) = released {
             self.host_detach_tab(tab);
         }
+        // Every selection move is a focus move as far as a session is
+        // concerned: the host that lost the selection hears null and the
+        // one that gained it hears the tab, so exactly one session
+        // believes it is being looked at.
+        self.push_host_focus();
+    }
+
+    /// State this client's focus to every connected host — the one
+    /// caller of [`HostConnSet::set_focus`], so the value a session
+    /// holds is always derived from the same two fields rather than
+    /// assembled at each edge.
+    ///
+    /// Called at the three edges that can move it: a host reaching
+    /// `Connected` (a fresh session believes its own headless default
+    /// until told), the selection moving, and the window gaining or
+    /// losing focus. The set dedups, so calling it on a change that
+    /// turns out not to move anything costs nothing.
+    fn push_host_focus(&mut self) {
+        self.hosts
+            .set_focus(host_focus_claim(self.window_focused, self.host_selection));
     }
 
     /// Every *user-initiated* Connect: the sidebar's ↻ row, the
@@ -5868,6 +5906,32 @@ mod tests {
             "and there is nothing to release on the way in"
         );
         assert_eq!(host_selection_detach(None, None), None);
+    }
+
+    /// What each connected session is told it owns. A session mutes the
+    /// tab it believes is focused, so an unfocused window and a
+    /// selection on another host both have to read as *no* claim — the
+    /// per-host null falls out of that at the send site.
+    #[test]
+    fn only_a_selected_host_tab_in_a_focused_window_claims_focus() {
+        let host = HostId::new(4);
+        let showing = a_host_selection(host, 1, 7);
+
+        assert_eq!(
+            host_focus_claim(true, Some(showing)),
+            Some(TabKey::new(host, 7))
+        );
+        assert_eq!(
+            host_focus_claim(false, Some(showing)),
+            None,
+            "an unfocused window is looking at nothing, whatever is selected"
+        );
+        assert_eq!(
+            host_focus_claim(true, None),
+            None,
+            "a local selection claims nothing on any host"
+        );
+        assert_eq!(host_focus_claim(false, None), None);
     }
 
     /// The Mac gate applied where a connection is started, not only

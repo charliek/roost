@@ -67,6 +67,11 @@ pub(crate) struct HostIntent {
     /// (`tab.open`, `project.*`, the dumps) do not — the lease is the
     /// interactive-authority boundary, not an authentication header.
     pub(crate) needs_lease: bool,
+    /// Suppress the "nobody listening" warning on failure. For the ops
+    /// whose refusal is an expected answer rather than a fault — a
+    /// session one release older refusing `session.set_focus` — where
+    /// the worker says it once per incarnation instead.
+    pub(crate) quiet: bool,
     pub(crate) reply: Option<HostOpReply>,
 }
 
@@ -77,6 +82,7 @@ impl HostIntent {
             op: op.into(),
             params,
             needs_lease: false,
+            quiet: false,
             reply: None,
         }
     }
@@ -84,6 +90,12 @@ impl HostIntent {
     /// This op presents the lease.
     pub(crate) fn with_lease(mut self) -> Self {
         self.needs_lease = true;
+        self
+    }
+
+    /// A failure on this op is not news. See [`Self::quiet`].
+    pub(crate) fn quiet(mut self) -> Self {
+        self.quiet = true;
         self
     }
 
@@ -104,7 +116,11 @@ impl HostIntent {
             }
             None => {
                 if let Err(error) = outcome {
-                    tracing::warn!(%op, %error, "host op failed with nobody listening");
+                    if self.quiet {
+                        tracing::debug!(%op, %error, "host op failed with nobody listening");
+                    } else {
+                        tracing::warn!(%op, %error, "host op failed with nobody listening");
+                    }
                 }
             }
         }

@@ -1169,10 +1169,12 @@ def test_closing_a_host_tab_or_its_project_retires_the_inbox_row(host, roost):
         second = session.create_project(name="doomed", cwd=str(host.env.launch_cwd))
         doomed = quiet_tab(session, second, host.env.launch_cwd)
         # Opening a tab makes it the session's active row, and a session
-        # suppresses attention for whichever row IT considers active
-        # (there is no op to push client focus to a session — HS-3). Move
-        # its selection off the tab this half is about, or the
-        # notification below is dropped at the source.
+        # suppresses attention for whichever row it considers active.
+        # `session.set_focus` (HS-3) makes that row follow the client's
+        # selection, but only at the client's own edges — a tab this test
+        # opens on the session moves the session's active row underneath
+        # it. Move the selection back off the tab this half is about, or
+        # the notification below is dropped at the source.
         session.focus(parked)
         session.notify(doomed, "attention", "please")
         wait_until(lambda: host_rows(), 30.0, "the doomed project's row to reach the inbox")

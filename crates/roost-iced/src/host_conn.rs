@@ -72,7 +72,7 @@ use std::sync::{Arc, Mutex};
 
 use roost_ipc::messages::{ops, EventEnvelope, OscColorsParams};
 use roost_ipc::ssh::SshTunnel;
-use roost_ui_model::keys::HostId;
+use roost_ui_model::keys::{HostId, TabKey};
 use roost_ui_model::theme::Theme;
 
 pub(crate) mod mirror;
@@ -278,6 +278,15 @@ struct HostConn {
     /// has been drained off the feed.
     incarnation: Option<HostId>,
     state: HostConnState,
+    /// The last client focus this connection was told, so an unchanged
+    /// one is not resent (`Some(None)` is "told: nothing here is
+    /// focused"; the outer `None` is "never told").
+    ///
+    /// Reset whenever the incarnation changes or the connection leaves
+    /// `Connected`, because a session that just came up believes its own
+    /// headless default — the dedup must never be what stops a fresh
+    /// incarnation from hearing the truth.
+    focus_sent: Option<Option<i64>>,
 }
 
 impl Drop for HostConn {
@@ -493,6 +502,7 @@ impl HostConnSet {
                 ops,
                 shutdown,
                 incarnation: None,
+                focus_sent: None,
                 // What the task is actually doing the moment it is
                 // spawned. The feed's first `Connecting` replaces it —
                 // this is only what a frame drawn in between reads, so
@@ -959,6 +969,75 @@ impl HostConnSet {
         }
     }
 
+    /// Tell every connected host which of its tabs this client is
+    /// looking at — `claim` is the one host tab that is on screen in a
+    /// focused window, if any, so at most one host hears a tab and every
+    /// other hears null.
+    ///
+    /// Null is not silence: a session defaults to believing itself
+    /// focused on its own restored tab, so a host that is never told
+    /// keeps muting that tab's notifications. The dedup below is
+    /// therefore only about the *repeat* — the first statement to each
+    /// incarnation always goes out (`focus_sent` starts empty and is
+    /// cleared with the incarnation).
+    ///
+    /// Fire-and-forget and quiet: a session one release older answers
+    /// `unknown-op`, which the connection tolerates, and the task logs
+    /// once per incarnation rather than warning per call.
+    pub(crate) fn set_focus(&mut self, claim: Option<TabKey>) {
+        for conn in self.conns.values_mut() {
+            let Some(incarnation) = conn.incarnation.filter(|_| conn.state.is_connected()) else {
+                continue;
+            };
+            let focused = claim
+                .filter(|tab| tab.host == incarnation)
+                .map(|tab| tab.tab);
+            if conn.focus_sent == Some(focused) {
+                continue;
+            }
+            let sent = conn.ops.send(
+                queue::HostIntent::new(
+                    ops::SESSION_SET_FOCUS,
+                    // A string id or JSON null — the field is required
+                    // on the wire, so an absent one would be refused.
+                    serde_json::json!({ "focused_tab_id": focused.map(|id| id.to_string()) }),
+                )
+                .with_lease()
+                .quiet(),
+            );
+            // Recorded only once it is actually on the queue: an intent
+            // refused at the enqueue never reaches the session, and
+            // remembering it as sent would leave that host muted.
+            if sent.is_ok() {
+                conn.focus_sent = Some(focused);
+            }
+        }
+    }
+
+    /// Whether the session's active row moved away from what this client
+    /// claimed. A lease-less third party (`tab.focus`, `tab.open`) can
+    /// park the selection on a tab nobody watches — with the claim's
+    /// `window_focused` still standing, that tab would be muted at the
+    /// source until this client's next natural edge. A disagreement
+    /// clears the dedup so the caller's re-push actually goes out; the
+    /// echo of this client's own `set_focus` matches the claim and
+    /// changes nothing.
+    pub(crate) fn focus_claim_disagrees(&mut self, incarnation: HostId, tab_id: i64) -> bool {
+        let Some(host) = self.owner_of(incarnation) else {
+            return false;
+        };
+        let Some(conn) = self.conns.get_mut(&host) else {
+            return false;
+        };
+        match conn.focus_sent {
+            Some(claim) if claim != Some(tab_id) => {
+                conn.focus_sent = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Drain one `EngineFeed::HostState`. Returns the saved host it
     /// belongs to, or `None` when the incarnation is stale — an item
     /// minted by a connection this set has since dropped.
@@ -991,6 +1070,14 @@ impl HostConnSet {
         }
 
         let conn = self.conns.get_mut(&host)?;
+        // A different incarnation, or one that is no longer connected,
+        // knows nothing about what it was told before: the queue behind
+        // it was flushed, and a session that comes back is back on its
+        // headless default. Clearing here is what makes a reconnect
+        // re-assert the client's focus instead of deduping it away.
+        if conn.incarnation != Some(incarnation) || !next.is_connected() {
+            conn.focus_sent = None;
+        }
         conn.incarnation = Some(incarnation);
         conn.state = next;
         Some(host)
@@ -1434,6 +1521,40 @@ mod tests {
         );
         set.disconnect("h1");
         assert!(!set.establishing("h1"));
+    }
+
+    /// A third party moving the session's active row must clear the
+    /// focus dedup — and only a genuine disagreement does; the echo of
+    /// this client's own claim changes nothing.
+    #[tokio::test]
+    async fn an_active_move_away_from_the_claim_clears_the_dedup() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-focus.sock"),
+            false,
+            ConnectMode::Dial,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.conns.get_mut("h1").expect("conn").focus_sent = Some(Some(5));
+
+        assert!(
+            !set.focus_claim_disagrees(incarnation, 5),
+            "the claim's own echo is not a disagreement"
+        );
+        assert_eq!(set.conns["h1"].focus_sent, Some(Some(5)));
+
+        assert!(set.focus_claim_disagrees(incarnation, 9));
+        assert_eq!(
+            set.conns["h1"].focus_sent, None,
+            "a disagreement clears the dedup so the re-push goes out"
+        );
+        assert!(
+            !set.focus_claim_disagrees(incarnation, 9),
+            "nothing claimed, nothing to disagree with"
+        );
     }
 
     /// Disconnecting drops everything keyed on the host, so a late item

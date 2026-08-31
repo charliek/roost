@@ -1,7 +1,7 @@
-"""HS-2's server-side additions, end to end against a real
-`roost-session` (plan 037 §3.6 + §3.7).
+"""The daemon's client-facing additions, end to end against a real
+`roost-session` (plan 037 §3.6 + §3.7, plan 038 C6).
 
-Three things the daemon gained so an attached client can be a faithful
+Four things the daemon gained so an attached client can be a faithful
 terminal without owning the terminal:
 
 * **`tab.effect` events** — a bell and an OSC 52 clipboard write are
@@ -14,6 +14,12 @@ terminal without owning the terminal:
   terminal answers itself carry the colors the user is actually looking
   at. It applies to the tabs that exist and is remembered for the ones
   opened next.
+* **`session.set_focus`** — the attached client's real focus, so the
+  session suppresses notifications for the tab the user is actually
+  looking at instead of for whichever tab its headless workspace
+  defaulted to. Forgotten when the lease turns over, and when the
+  connection that reported it (or the lease's last one) closes: a focus
+  is a statement about a window that may no longer exist.
 * **`ROOST_SESSION_FAKE_BUILD`** — the test seam that makes
   `tab.attach`'s build-mismatch refusal reproducible without building a
   second binary against a second Ghostty pin. Strictly test-mode.
@@ -379,4 +385,187 @@ def test_the_fake_build_override_is_ignored_outside_test_mode(env):
         identity = client.call("session.identify")
         assert identity["libghostty_build"] != FAKE_BUILD, identity
         assert identity["libghostty_build"], "a session always states its build"
+        client.call("session.stop")
+
+
+# ---------------------------------------------------------------------------
+# 4. session.set_focus (HS-3)
+# ---------------------------------------------------------------------------
+
+
+def set_focus(client: Roost, lease: str, tab: int | None) -> None:
+    """State what the attached client is looking at. `None` is an
+    explicit JSON null — the field is required, and null is a statement
+    ("nothing here") rather than an omission."""
+    result = client.call(
+        "session.set_focus",
+        {"lease": lease, "focused_tab_id": None if tab is None else str(tab)},
+    )
+    assert result == {}, result
+
+
+def next_fired(stream: EventStream, timeout: float = 30.0) -> dict:
+    """The next `notification.fired` envelope's data."""
+    _batches, envelope = stream.recv_until("notification.fired", timeout=timeout)
+    return envelope["data"]
+
+
+def wait_until_fires(stream: EventStream, client: Roost, tab: int) -> None:
+    """Raise on `tab` until one gets through.
+
+    The condition wait for a server-side edge nothing on the wire
+    announces: a closed socket is noticed by that connection's own task,
+    so the focus reset it triggers has no happens-before against the next
+    request. Re-raising is free (a suppressed raise emits nothing at all,
+    not even a pending bit) and the first one through ends the wait.
+    """
+
+    def fired() -> dict | None:
+        client.notify(tab, "waiting for the reset")
+        try:
+            return next_fired(stream, timeout=1.0)
+        except TimeoutError:
+            return None
+
+    data = sessionlib.wait_until(
+        fired, 30.0, "the session to forget the departed client's focus", interval=0.0
+    )
+    assert data["tab_id"] == str(tab), data
+
+
+def assert_muted(stream: EventStream, client: Roost, muted: int, heard: int) -> None:
+    """`muted` is suppressed and `heard` is not — asserted positively.
+
+    A suppressed raise emits **nothing at all** (no pending bit, no
+    events), so the only sound way to see it is to raise on both tabs and
+    watch which one arrives: reading until the sentinel is a positive
+    assertion about the dropped one rather than a timeout.
+    """
+    client.notify(muted, "muted")
+    client.notify(heard, "heard")
+    data = next_fired(stream)
+    assert data["tab_id"] == str(heard), (
+        f"tab {muted} was expected to be suppressed, but {data} arrived first"
+    )
+
+
+def test_set_focus_moves_which_tab_a_session_mutes(env):
+    """The gap HS-2 recorded, closed.
+
+    A session's workspace has no window: it defaults to focused, on
+    whichever tab its layout selected, so its suppression predicate reads
+    as permanently satisfied for that one tab and its agent can never
+    raise anything. The attached client is the only thing that knows
+    better, and this is how it says so.
+    """
+    started(env)
+
+    with env.client() as client:
+        lease = connect_lease(client)
+        project = first_project(client)
+        watched = quiet_tab(client, project, env.launch_cwd)
+        other = quiet_tab(client, project, env.launch_cwd)
+
+        with EventStream(env.socket, lease=lease) as stream:
+            stream.subscribe()
+
+            set_focus(client, lease, watched)
+            assert_muted(stream, client, muted=watched, heard=other)
+
+            # Null is the other half of the statement: the window lost
+            # focus, or the selection moved off this session, and the tab
+            # that was muted goes back to raising.
+            set_focus(client, lease, None)
+            client.notify(watched, "unmuted")
+            assert next_fired(stream)["tab_id"] == str(watched)
+
+            # The focus follows the selection, tab for tab.
+            set_focus(client, lease, other)
+            assert_muted(stream, client, muted=other, heard=watched)
+
+        client.call("session.stop")
+
+
+def test_a_reported_focus_does_not_outlive_the_client_that_reported_it(env):
+    """The load-bearing half: focus is forgotten when the lease's last
+    connection goes.
+
+    A lease deliberately outlives its connections (reconnecting is a
+    takeover), but a *focus* must not — it was a statement about a window
+    that no longer exists. Left standing, one `set_focus` would mute a
+    tab for every client that comes after, which is exactly the bug this
+    op exists to fix, rebuilt out of stale state.
+    """
+    started(env)
+
+    with env.client() as client:
+        lease = connect_lease(client)
+        project = first_project(client)
+        watched = quiet_tab(client, project, env.launch_cwd)
+        other = quiet_tab(client, project, env.launch_cwd)
+
+        with EventStream(env.socket, lease=lease) as stream:
+            stream.subscribe()
+            set_focus(client, lease, watched)
+            assert_muted(stream, client, muted=watched, heard=other)
+
+    # Both connections registered under the lease are closed now: the
+    # control one (it presented the lease at `set_focus`) and the
+    # subscriber. Nobody is looking at this session any more.
+    with env.client() as client:
+        with EventStream(env.socket, lease=lease) as stream:
+            stream.subscribe()
+
+            # The reset lands when the server notices the closed sockets,
+            # which nothing on this connection can be ordered against —
+            # hence the condition wait rather than one raise and a hope.
+            wait_until_fires(stream, client, watched)
+
+            # The lease itself survived, and re-asserting on it is what a
+            # reconnecting UI does the moment it reaches Connected.
+            set_focus(client, lease, watched)
+            assert_muted(stream, client, muted=watched, heard=other)
+
+        client.call("session.stop")
+
+
+def test_set_focus_is_lease_gated_and_needs_a_tab_that_exists(env):
+    """Interactive authority, and a required-but-nullable field.
+
+    `focused_tab_id` may be null but may not be missing: an omitted field
+    is a client that never said, and answering it with a guess is how the
+    mute comes back.
+    """
+    started(env)
+
+    with env.client() as stranger:
+        with pytest.raises(RoostError) as refused:
+            stranger.call(
+                "session.set_focus", {"lease": "0" * 32, "focused_tab_id": None}
+            )
+        assert refused.value.code == "connect-required", refused.value
+
+    with env.client() as client:
+        lease = connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
+        with pytest.raises(RoostError) as missing:
+            client.call("session.set_focus", {"lease": lease})
+        assert missing.value.code == "missing-param", missing.value
+
+        with pytest.raises(RoostError) as gone:
+            client.call(
+                "session.set_focus", {"lease": lease, "focused_tab_id": str(tab + 9999)}
+            )
+        assert gone.value.code == "not-found", gone.value
+
+        # And the refusal applied nothing: the tab that was already there
+        # still raises, which it would not if the flag had moved ahead of
+        # the validation.
+        with EventStream(env.socket, lease=lease) as stream:
+            stream.subscribe()
+            client.notify(tab, "after a refused focus")
+            assert next_fired(stream)["tab_id"] == str(tab)
+
         client.call("session.stop")

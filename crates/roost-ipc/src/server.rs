@@ -57,6 +57,23 @@ pub trait Handler: Send + Sync + 'static {
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>>;
 
+    /// One connection this handler served has ended, for any reason —
+    /// the peer hung up, the read loop failed, the server closed it, or
+    /// it spent its life as a data connection.
+    ///
+    /// Called exactly once per connection, after nothing more can arrive
+    /// on it, and never for a connection that was refused before it was
+    /// served (a foreign uid). Synchronous and on the connection's own
+    /// task: whatever a handler does here must not block.
+    ///
+    /// The default does nothing. A host session overrides it because
+    /// "the last connection under the lease went away" is a fact about
+    /// authority that no request can report — the client that would have
+    /// sent it is the one that vanished.
+    fn connection_ended(&self, conn_id: u64) {
+        let _ = conn_id;
+    }
+
     /// Serve a connection whose first line was an attach handshake
     /// rather than a request envelope — the connection has already
     /// stopped being a request/response socket by the time this is
@@ -594,7 +611,7 @@ impl<H: Handler> IpcServer<H> {
             tokio::spawn(async move {
                 let _keep_sender_alive = keep_sender_alive;
                 tokio::select! {
-                    served = serve_connection(conn, handler, conn_id) => {
+                    served = serve_connection(conn, Arc::clone(&handler), conn_id) => {
                         if let Err(e) = served {
                             debug!(error = %e, "ipc connection ended");
                         }
@@ -606,6 +623,10 @@ impl<H: Handler> IpcServer<H> {
                         debug!("ipc connection cancelled by server shutdown");
                     }
                 }
+                // Both arms, because both mean the connection is over:
+                // a handler that tracks connections must not be left
+                // holding one that a server shutdown cancelled.
+                handler.connection_ended(conn_id);
             });
         }
     }

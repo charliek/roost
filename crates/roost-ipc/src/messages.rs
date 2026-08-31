@@ -2072,6 +2072,37 @@ pub struct SessionSetThemeResult {
     pub tabs: u32,
 }
 
+/// [`ops::SESSION_SET_FOCUS`] params: what the attached client is
+/// actually looking at.
+///
+/// A session's own workspace has no window, so its `window_focused`
+/// defaults to true and its active tab is whatever its restored layout
+/// selected — which makes the notification-suppression predicate
+/// (`window focused AND this is the active tab`) permanently true for
+/// one tab per session, muting exactly the tab an agent is most likely
+/// to be working in. This op is how the client that *does* have a window
+/// states the truth.
+///
+/// Lease-gated, like every other interactive session op: focus is a
+/// property of the client driving the session, so a client that does not
+/// drive it does not get to state one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSetFocusParams {
+    pub lease: String,
+    /// The session tab the client is looking at, or `null` for "nothing
+    /// on this session is being looked at" (the window lost focus, or
+    /// the selection moved to another host or to a local tab).
+    ///
+    /// **Required, and null is not the same as absent.** An omitted
+    /// field is a client that forgot to say, and guessing on its behalf
+    /// is how the mute this op exists to fix would come back; it is
+    /// refused instead ([`option_string_int64`] has no serde default, so
+    /// the missing field fails the decode).
+    #[serde(with = "option_string_int64")]
+    pub focused_tab_id: Option<i64>,
+}
+
 // ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
@@ -2121,6 +2152,13 @@ pub mod ops {
     /// theme palette, and remember it for the tabs opened next. Lease-
     /// gated; last-writer-wins between concurrent clients.
     pub const SESSION_SET_THEME: &str = "session.set_theme";
+    /// Push the attached client's real focus — which of this session's
+    /// tabs it is looking at, or none — so the session's own
+    /// notification-suppression predicate reads the client's window
+    /// instead of a headless default. Lease-gated, and forgotten when
+    /// the lease is (a new lease, or the last connection under it
+    /// closing, reverts the session to "nobody is looking").
+    pub const SESSION_SET_FOCUS: &str = "session.set_focus";
     /// Ask for a ticket to open a data connection for one tab. The
     /// control-plane half of an attach: it negotiates payload kind,
     /// build identity, and geometry on stable JSON, and hands back a
@@ -2325,6 +2363,36 @@ pub mod string_int64 {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
         let raw = String::deserialize(de)?;
         raw.parse::<i64>()
+            .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
+    }
+}
+
+/// [`string_int64`] for a field that is **required but nullable**:
+/// `"5"` or `null`, never absent.
+///
+/// The distinction is the point. `Option<i64>` with the usual
+/// `#[serde(default)]` would decode an omitted field and an explicit
+/// `null` to the same `None`, and for a field whose null carries meaning
+/// ("nothing is focused") that silently promotes a client's omission
+/// into a statement it never made. Used through `#[serde(with = ...)]`
+/// **without** a `default`, so serde's own missing-field error is what
+/// refuses the omission.
+pub mod option_string_int64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<i64>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => ser.serialize_str(&value.to_string()),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<i64>, D::Error> {
+        let Some(raw) = Option::<String>::deserialize(de)? else {
+            return Ok(None);
+        };
+        raw.parse::<i64>()
+            .map(Some)
             .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
     }
 }

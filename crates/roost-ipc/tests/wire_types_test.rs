@@ -16,10 +16,10 @@ use std::path::PathBuf;
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
     ClipboardEffectTarget, EventBatch, EventEnvelope, ResponseError, SessionConnectParams,
-    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetThemeParams,
-    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent,
-    TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, SESSION_PROTOCOL_VERSION,
-    SESSION_STOPPING_EVENT,
+    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetFocusParams,
+    SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
+    SessionStoppingEvent, TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -702,6 +702,108 @@ fn session_set_theme_params_reject_unknown_fields() {
             "lease": LEASE,
             "osc_colors": colors,
             "tab_id": "5",
+        }))
+        .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// session.set_focus (plan 038 C6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_set_focus_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("session.set_focus.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_SET_FOCUS);
+    let params: SessionSetFocusParams =
+        serde_json::from_value(request.params).expect("decode set_focus params");
+    assert_eq!(params.lease, LEASE);
+    // The wire spelling is `string_int64`, like every other tab id.
+    assert_eq!(params.focused_tab_id, Some(5));
+    round_trip(&params);
+
+    let raw = read_vector("session.set_focus.none.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    let params: SessionSetFocusParams =
+        serde_json::from_value(request.params).expect("decode a null focus");
+    assert_eq!(params.focused_tab_id, None);
+    round_trip(&params);
+
+    // The result is an empty object, not `null`: the op reports nothing
+    // beyond "applied".
+    let raw = read_vector("session.set_focus.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    assert_eq!(resp.result, Some(serde_json::json!({})));
+}
+
+/// `focused_tab_id` is REQUIRED and nullable, and the two are not the
+/// same thing: `null` says "nothing on this session is focused", while
+/// an omitted field is a client that never said — and defaulting that to
+/// either answer would silently re-create the mute this op exists to
+/// fix.
+#[test]
+fn session_set_focus_requires_the_field_it_lets_be_null() {
+    let null: SessionSetFocusParams = serde_json::from_value(serde_json::json!({
+        "lease": LEASE,
+        "focused_tab_id": null,
+    }))
+    .expect("an explicit null is a statement");
+    assert_eq!(null.focused_tab_id, None);
+
+    let missing = serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
+        "lease": LEASE,
+    }))
+    .expect_err("an omitted focused_tab_id must not decode");
+    assert!(
+        missing.to_string().contains("missing field"),
+        "the refusal has to name the missing field so the server answers \
+         `missing-param`: {missing}"
+    );
+
+    // Serialization keeps the field present in both shapes, so a client
+    // built from this type cannot emit the omission either.
+    assert_eq!(
+        serde_json::to_value(&null).expect("serialize"),
+        serde_json::json!({"lease": LEASE, "focused_tab_id": null}),
+    );
+    let some = SessionSetFocusParams {
+        lease: LEASE.into(),
+        focused_tab_id: Some(7),
+    };
+    assert_eq!(
+        serde_json::to_value(&some).expect("serialize"),
+        serde_json::json!({"lease": LEASE, "focused_tab_id": "7"}),
+    );
+}
+
+/// Strict like its siblings, and a non-numeric id is a refusal rather
+/// than a zero.
+#[test]
+fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
+    assert!(
+        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
+            "lease": LEASE,
+            "focused_tab_id": "5",
+            "project_id": "1",
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
+            "lease": LEASE,
+            "focused_tab_id": "h3.7",
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
+            "lease": LEASE,
+            "focused_tab_id": 5,
         }))
         .is_err()
     );

@@ -1488,19 +1488,11 @@ impl Workspace {
 
     pub fn focus_tab(&self, tab_id: i64) -> Result<(i64, i64), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
-        let row = inner
-            .tabs
-            .get(&tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?
-            .clone();
-        let prev = (inner.active_project_id, inner.active_tab_id);
-        inner.active_project_id = row.project_id;
-        inner.active_tab_id = row.id;
-        inner.active_tabs_by_project.insert(row.project_id, row.id);
+        let (prev, now) = inner.select_tab(tab_id)?;
         // Persist the active selection so it survives a relaunch
         // (restored by position). Skip when unchanged — focusing the
         // already-active tab shouldn't churn the file.
-        let persist = if prev != (row.project_id, row.id) {
+        let persist = if prev != now {
             Persist::Write
         } else {
             Persist::Skip
@@ -1508,12 +1500,71 @@ impl Workspace {
         self.commit(
             inner,
             vec![WorkspaceEvent::ActiveChanged {
-                project_id: row.project_id,
-                tab_id: row.id,
+                project_id: now.0,
+                tab_id: now.1,
             }],
             persist,
         );
         Ok(prev)
+    }
+
+    /// An attached client stating what it is looking at (host sessions,
+    /// HS-3's `session.set_focus`).
+    ///
+    /// `Some(tab)` means "my window is focused and this session's tab is
+    /// the one on screen": the session takes both halves of the
+    /// suppression predicate from the client — the window flag *and* the
+    /// selection, which follows through the ordinary focus path so the
+    /// session's own active tab and its persisted selection agree with
+    /// what the user is actually looking at. `None` means nothing here is
+    /// being looked at (the window lost focus, or the selection moved
+    /// elsewhere) and moves only the flag: the selection is where the
+    /// client left it, and forgetting it would re-open the tab that the
+    /// next reconnect restores to.
+    ///
+    /// Atomic in the sense the caller needs: an unknown tab is refused
+    /// with **nothing** applied, so a client that names a tab which just
+    /// closed does not silently flip the session to "focused" against
+    /// whatever tab happened to be active.
+    pub fn set_client_focus(&self, focused_tab_id: Option<i64>) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(tab_id) = focused_tab_id else {
+            inner.window_focused = false;
+            return Ok(());
+        };
+        // Before the flag moves: a refusal must leave the session
+        // exactly as it was.
+        let (prev, now) = inner.select_tab(tab_id)?;
+        inner.window_focused = true;
+        if prev == now {
+            // The selection did not move, so there is nothing to
+            // announce and nothing to write — and announcing anyway
+            // would make every window-focus change a workspace commit
+            // that every attached client re-renders on. The flag itself
+            // is never persisted and no event carries it.
+            return Ok(());
+        }
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::ActiveChanged {
+                project_id: now.0,
+                tab_id: now.1,
+            }],
+            Persist::Write,
+        );
+        Ok(())
+    }
+
+    /// The attached client is gone: nobody is looking at this session.
+    ///
+    /// Called when the interactive lease turns over and when the last
+    /// connection holding it closes. Only the flag moves — the selection
+    /// stays where the departed client left it, so a reconnect restores
+    /// the same tab. Without this, one `session.set_focus` would outlive
+    /// the client that sent it and mute a tab for whoever comes next,
+    /// which is the exact bug the op exists to fix.
+    pub fn release_client_focus(&self) {
+        self.inner.lock().unwrap().window_focused = false;
     }
 
     pub fn reorder_tabs(&self, project_id: i64, tab_ids: &[i64]) -> Result<(), WorkspaceError> {
@@ -1747,7 +1798,33 @@ impl Default for Workspace {
     }
 }
 
+/// The active selection: `(project id, tab id)` — the pair
+/// [`Workspace::active`] answers with and [`Workspace::focus_tab`]
+/// returns the previous value of.
+type Selection = (i64, i64);
+
 impl Inner {
+    /// Move the active selection onto one tab, reporting where it was
+    /// and where it landed. The mutation half of [`Workspace::focus_tab`],
+    /// split out so [`Workspace::set_client_focus`] applies the same
+    /// selection move inside its own transaction rather than taking the
+    /// lock twice around it.
+    ///
+    /// Validation comes first and mutates nothing on the way out: an
+    /// unknown tab leaves the selection exactly as it was.
+    fn select_tab(&mut self, tab_id: i64) -> Result<(Selection, Selection), WorkspaceError> {
+        let row = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?
+            .clone();
+        let prev = (self.active_project_id, self.active_tab_id);
+        self.active_project_id = row.project_id;
+        self.active_tab_id = row.id;
+        self.active_tabs_by_project.insert(row.project_id, row.id);
+        Ok((prev, (row.project_id, row.id)))
+    }
+
     /// Plan §3.5's suppression predicate: a notification for the tab the
     /// user is actively looking at is considered seen, so it raises no
     /// banner, no badge, and no inbox row.
@@ -2632,6 +2709,110 @@ mod tests {
         let (_, tab) = ws.agent_report(&attention_report(tid)).unwrap();
         assert!(tab.has_notification);
         assert!(has_attention_events(&drain(&mut rx)));
+    }
+
+    // ------------------------------------------------------------------
+    // Client-reported focus (host sessions, plan 038 C6)
+    // ------------------------------------------------------------------
+
+    /// A two-tab workspace standing in for a session's: no window of its
+    /// own, so it starts on the headless default (focused, on the tab
+    /// its layout selected) — which is exactly the state
+    /// `set_client_focus` exists to correct.
+    fn session_like_ws() -> (Workspace, i64, i64) {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let first = ws.open_tab(pid, "/", "").unwrap().id;
+        let second = ws.open_tab(pid, "/", "").unwrap().id;
+        ws.focus_tab(first).unwrap();
+        (ws, first, second)
+    }
+
+    /// The whole point of the op: the client says what it is looking at,
+    /// and the session suppresses that tab and only that tab.
+    #[test]
+    fn client_focus_moves_the_suppressed_tab_with_the_selection() {
+        let (ws, first, second) = session_like_ws();
+
+        ws.set_client_focus(Some(second)).unwrap();
+        assert_eq!(ws.active(), (ws.tab(second).unwrap().project_id, second));
+        assert!(!ws
+            .raise_attention(second, "Roost", "", AttentionSource::Structured)
+            .unwrap());
+        assert!(ws
+            .raise_attention(first, "Roost", "", AttentionSource::Structured)
+            .unwrap());
+    }
+
+    /// A null focus moves the flag and nothing else: the selection is
+    /// where the client left it, so a reconnect restores the same tab.
+    #[test]
+    fn a_null_client_focus_unmutes_without_moving_the_selection() {
+        let (ws, first, _second) = session_like_ws();
+        ws.set_client_focus(Some(first)).unwrap();
+
+        ws.set_client_focus(None).unwrap();
+        assert_eq!(ws.active().1, first, "the selection must not move");
+        assert!(ws
+            .raise_attention(first, "Roost", "", AttentionSource::Structured)
+            .unwrap());
+    }
+
+    /// Atomic: an unknown tab is refused with nothing applied. A partial
+    /// apply here would flip the session to "focused" against whatever
+    /// tab happened to be active and mute it.
+    #[test]
+    fn an_unknown_tab_leaves_the_reported_focus_untouched() {
+        let (ws, first, _second) = session_like_ws();
+        ws.set_client_focus(None).unwrap();
+
+        let refused = ws.set_client_focus(Some(9_999)).unwrap_err();
+        assert!(matches!(refused, WorkspaceError::TabNotFound(9_999)));
+        assert_eq!(ws.active().1, first, "the selection must not have moved");
+        assert!(
+            ws.raise_attention(first, "Roost", "", AttentionSource::Structured)
+                .unwrap(),
+            "the window flag must not have moved either"
+        );
+    }
+
+    /// Re-stating the same focus is a no-op on the event stream: a
+    /// client that re-asserts on reconnect must not make every attached
+    /// client re-render, and `ActiveChanged` is what they re-render on.
+    #[test]
+    fn re_stating_the_same_client_focus_emits_nothing() {
+        let (ws, first, second) = session_like_ws();
+        ws.set_client_focus(Some(second)).unwrap();
+        let mut rx = ws.subscribe();
+
+        ws.set_client_focus(Some(second)).unwrap();
+        assert!(drain(&mut rx).is_empty());
+
+        // Including the flag-only edge: unfocus, then re-state the same
+        // tab. The selection never moved, so still nothing.
+        ws.set_client_focus(None).unwrap();
+        ws.set_client_focus(Some(second)).unwrap();
+        assert!(drain(&mut rx).is_empty());
+
+        // …but a move still announces itself, exactly like `tab.focus`.
+        ws.set_client_focus(Some(first)).unwrap();
+        assert!(drain(&mut rx).iter().any(
+            |e| matches!(e, WorkspaceEvent::ActiveChanged { tab_id, .. } if *tab_id == first)
+        ));
+    }
+
+    /// `release_client_focus` is the lease-loss reset: the flag drops,
+    /// the selection stays.
+    #[test]
+    fn releasing_client_focus_unmutes_and_keeps_the_selection() {
+        let (ws, _first, second) = session_like_ws();
+        ws.set_client_focus(Some(second)).unwrap();
+
+        ws.release_client_focus();
+        assert_eq!(ws.active().1, second);
+        assert!(ws
+            .raise_attention(second, "Roost", "", AttentionSource::Structured)
+            .unwrap());
     }
 
     /// Structured attention is NEVER gated on agent ownership (plan
