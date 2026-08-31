@@ -1,21 +1,40 @@
-//! Pure classification, config, and argv shaping for the SSH transport
-//! (host-sessions HS-3, plan 038).
+//! The SSH transport (host-sessions HS-3, plan 038): a local Unix
+//! socket that reaches a remote session over `ssh`.
 //!
-//! Nothing in this module spawns a process, writes a file, or binds a
-//! socket — that is C3's job (the tunnel runtime) and, downstream of
-//! it, C4's (wiring the UI/`roostctl` onto it). What lives here is the
-//! part that has no side effects and therefore has no excuse not to be
-//! unit-tested exhaustively: deciding what kind of target a string
-//! names, building the generated `ssh_config` bytes, building the argv
-//! for each of the four `ssh` invocations the tunnel needs, sizing the
+//! The module is in two halves, and the split is deliberate.
+//!
+//! The first half has no side effects at all — deciding what kind of
+//! target a string names, building the generated `ssh_config` bytes,
+//! building the argv for each of the four `ssh` invocations, sizing the
 //! control-socket directory so `sun_path` fits, and turning a failed
-//! connection's exit code + stderr into copy a user can act on.
+//! connection's exit code + stderr into copy a user can act on. It is
+//! therefore unit-tested exhaustively, right here.
+//!
+//! The second half is [`SshTunnel`], the runtime built out of those
+//! pieces: one per saved host, owning a scratch directory, a shared
+//! `ssh` mux, and a local `bridge.sock` whose every accepted connection
+//! gets an `ssh` exec of its own. Its tests live in
+//! `tests/ssh_transport_test.rs`, driven by a fake `ssh` — the only way
+//! to pin process choreography without a real host on the other end.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
+use crate::framing::{write_frame, FrameReader};
+use crate::messages::{ops, RawRequest, Response, SessionIdentify, SESSION_PROTOCOL_VERSION};
 use crate::paths::BundleProfile;
+use crate::session_launch::{reap_by, timeout_scale};
+use crate::socket_state::{self, SocketState, PROBE_TIMEOUT};
 
 // ============================================================================
 // Classifying a target
@@ -329,12 +348,19 @@ pub fn verify_argv(config_path: &Path, target: &str, remote_command: &str) -> Ve
 // Sizing the control-socket directory
 // ============================================================================
 
+/// The `-S` mux control socket, created by `ssh` itself.
+const CTL_FILE: &str = "ctl";
+/// The local bridge's own listening socket — the path a client dials to
+/// reach the remote session.
+const BRIDGE_FILE: &str = "bridge.sock";
+/// The generated `ssh_config` every invocation is pointed at with `-F`.
+/// Not a socket, so it is not part of the `sun_path` probe.
+const CONFIG_FILE: &str = "ssh_config";
+
 /// The two file names created under a host's control-socket directory.
-/// `ctl` is the `-S` mux control socket; `bridge.sock` is the local
-/// bridge's own listening socket. Both are `AF_UNIX` paths and both
-/// must fit `sun_path`, so the probe below checks the longer of the
-/// two against every candidate.
-const SOCKET_FILE_NAMES: [&str; 2] = ["ctl", "bridge.sock"];
+/// Both are `AF_UNIX` paths and both must fit `sun_path`, so the probe
+/// below checks the longer of the two against every candidate.
+const SOCKET_FILE_NAMES: [&str; 2] = [CTL_FILE, BRIDGE_FILE];
 
 /// The historical BSD/Linux/macOS `sockaddr_un.sun_path` size: 104
 /// bytes total, one of which is the mandatory NUL terminator, leaving
@@ -477,6 +503,955 @@ pub fn classify_ssh_failure(exit_code: Option<i32>, stderr_tail: &str) -> SshFai
         .rfind(|line| !line.is_empty())
         .map(str::to_string);
     SshFailure::Transport(last_line)
+}
+
+// ============================================================================
+// The tunnel runtime
+// ============================================================================
+
+/// Override naming the `ssh` binary the tunnel execs. Read once, at
+/// construction — a tunnel that resolved it per invocation could exec
+/// two different programs over the life of one connection.
+pub const SSH_BIN_ENV: &str = "ROOST_SSH_BIN";
+
+/// How long the warm-up connection gets to open the mux. Wide, because
+/// it covers a full TCP + auth handshake on a cold link, and the config
+/// this module generates already caps `ConnectTimeout` at 15s.
+const ESTABLISH_BUDGET: Duration = Duration::from_secs(30);
+
+/// How long a `-O exit` gets. It is a local round trip to the master's
+/// control socket; anything past this means the master is wedged, and
+/// the directory removal behind it must not wait on that.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long [`SshTunnel::shutdown`] lets in-flight connections finish
+/// before aborting them.
+const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a finished connection's `ssh` child gets to exit on its own
+/// before it is killed.
+const REAP_BUDGET: Duration = Duration::from_secs(2);
+
+/// Poll interval for [`Drop`]'s blocking wait. Only ever spent on a
+/// `-O exit` that is already on its way out.
+const DROP_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How much of a failed invocation's stderr is kept. `ssh`'s
+/// changed-host-key blob is the longest thing that has to survive
+/// intact, and it is well under this.
+const STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+/// One read's worth of wire bytes, matched to the far-side bridge's own
+/// chunk so a snapshot stream is not chopped into a syscall per frame.
+const CHUNK: usize = 64 * 1024;
+
+/// Every budget in this module goes through the ambient test scale.
+fn scaled(budget: Duration) -> Duration {
+    budget.mul_f64(timeout_scale())
+}
+
+const ACCEPT_MUTEX: &str = "ssh tunnel accept mutex";
+const CONNECTIONS_MUTEX: &str = "ssh tunnel connections mutex";
+const LAST_ERROR_MUTEX: &str = "ssh tunnel last_error mutex";
+
+/// The two `ssh_config` files the generated config includes.
+///
+/// Both are `Option` because neither is guaranteed to exist: a user
+/// with no `~/.ssh/config`, or no `$HOME` at all, is ordinary. Existence
+/// is checked at write time — [`generate_ssh_config`] only ever sees a
+/// path that is really there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshConfigPaths {
+    pub user: Option<PathBuf>,
+    pub system: Option<PathBuf>,
+}
+
+impl SshConfigPaths {
+    /// `$HOME/.ssh/config` plus `/etc/ssh/ssh_config`.
+    pub fn from_env() -> Self {
+        Self {
+            user: std::env::var_os("HOME").map(|home| {
+                let mut path = PathBuf::from(home);
+                path.push(".ssh");
+                path.push("config");
+                path
+            }),
+            system: Some(PathBuf::from("/etc/ssh/ssh_config")),
+        }
+    }
+
+    fn render(&self) -> String {
+        fn existing(candidate: &Option<PathBuf>) -> Option<&Path> {
+            candidate.as_deref().filter(|path| path.exists())
+        }
+        generate_ssh_config(existing(&self.user), existing(&self.system))
+    }
+}
+
+/// Everything a tunnel reads from its environment, in one injectable
+/// place.
+///
+/// Every field is a value rather than a lookup so a test can point a
+/// whole tunnel at a fake `ssh` and a scratch directory of its own
+/// without mutating process-global environment that every other test in
+/// the same binary also reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTunnelOptions {
+    pub config_paths: SshConfigPaths,
+    /// Candidate parents for the scratch directory, in preference
+    /// order — the first one that leaves room for a `sun_path` wins.
+    pub scratch_parents: Vec<PathBuf>,
+    pub ssh_bin: PathBuf,
+}
+
+impl SshTunnelOptions {
+    /// `$TMPDIR` then `/tmp`, `$ROOST_SSH_BIN` or `ssh`, and the
+    /// standard config pair.
+    pub fn from_env() -> Self {
+        let mut scratch_parents: Vec<PathBuf> = Vec::new();
+        if let Some(tmpdir) = std::env::var_os("TMPDIR").filter(|value| !value.is_empty()) {
+            scratch_parents.push(PathBuf::from(tmpdir));
+        }
+        let fallback = PathBuf::from("/tmp");
+        if !scratch_parents.contains(&fallback) {
+            scratch_parents.push(fallback);
+        }
+        Self {
+            config_paths: SshConfigPaths::from_env(),
+            scratch_parents,
+            ssh_bin: std::env::var_os(SSH_BIN_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("ssh")),
+        }
+    }
+}
+
+/// What went wrong reaching a target.
+///
+/// The split is by who can act on it: [`Self::Ssh`] carries a classified
+/// [`SshFailure`] a caller can branch on (and whose `message` is written
+/// for a user), while [`Self::Local`] is this side's own failure — a
+/// scratch directory that could not be created, a socket that could not
+/// be bound — which has no family and no remedy on the far host.
+#[derive(Debug, thiserror::Error)]
+pub enum SshTunnelError {
+    #[error("{}", .failure.message(.target))]
+    Ssh { target: String, failure: SshFailure },
+    #[error("{0:#}")]
+    Local(#[from] anyhow::Error),
+}
+
+impl SshTunnelError {
+    fn ssh(target: &str, failure: SshFailure) -> Self {
+        Self::Ssh {
+            target: target.to_string(),
+            failure,
+        }
+    }
+
+    /// The classified family, when the failure was the far side's.
+    pub fn failure(&self) -> Option<&SshFailure> {
+        match self {
+            Self::Ssh { failure, .. } => Some(failure),
+            Self::Local(_) => None,
+        }
+    }
+}
+
+/// A live SSH transport to one saved host: a local `bridge.sock`, a
+/// shared `ssh` mux behind it, and one `ssh` exec per accepted
+/// connection.
+///
+/// One per saved-host id, named on disk by that id so a crashed client's
+/// leftovers are found rather than accumulated — see [`Self::open`].
+///
+/// **Spawn-per-connection is the pinned shape.** Every accepted
+/// connection gets its own task and its own `ssh` exec over the shared
+/// master, so a client that opens an events connection and holds it for
+/// the session's lifetime cannot keep the next `tab.attach` waiting.
+/// Serializing connections through one task would deadlock exactly
+/// there, and that is the failure mode this design exists to avoid.
+pub struct SshTunnel {
+    state: Arc<TunnelState>,
+    dir: PathBuf,
+    bridge_path: PathBuf,
+    accept: Mutex<Option<JoinHandle<()>>>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+/// The half of a tunnel every connection task needs a handle on.
+struct TunnelState {
+    target: String,
+    ssh_bin: PathBuf,
+    config_path: PathBuf,
+    ctl_path: PathBuf,
+    /// Bumped once per `ssh` exec, so a caller can tell "the failure I
+    /// already reported" from "a new one since".
+    generation: AtomicU64,
+    last_error: Mutex<Option<(u64, SshFailure)>>,
+    /// Set by `shutdown`/`Drop`. The accept loop reads it so a
+    /// connection accepted in the window between the abort request and
+    /// the task actually stopping is dropped rather than left running
+    /// with nothing tracking it.
+    closed: AtomicBool,
+}
+
+impl SshTunnel {
+    /// Claim this host's scratch directory and write its generated
+    /// config. Binds nothing and connects nothing — that is
+    /// [`Self::establish`].
+    ///
+    /// The directory name is deterministic (`roost-ssh-<host_id>`), which
+    /// is what makes a crashed client's leftovers findable instead of
+    /// merely orphaned. Finding them, the rule is fail-safe in exactly
+    /// the way [`crate::socket_state`] is: a `bridge.sock` that answers,
+    /// or that cannot be classified at all, means another Roost owns
+    /// this target and this one refuses. Only a socket that is provably
+    /// dead — or absent — authorizes a reclaim.
+    ///
+    /// A reclaim runs `-O exit` against the *old* control socket before
+    /// removing anything. The crashed client is gone but its `ssh`
+    /// master is not: `ControlPersist` keeps it alive for its own
+    /// timeout, and removing the control socket out from under it would
+    /// strand a process nothing can address any more.
+    ///
+    /// The probe-then-reclaim sequence assumes one live owner per host
+    /// id, which is what the caller above it guarantees: a UI holds one
+    /// tunnel per saved host and opens them one at a time. Two processes
+    /// racing to open the *same* host id would be the TOCTOU
+    /// [`crate::socket_state`]'s module docs describe, and would need the
+    /// same answer — a lock held across the whole sequence.
+    pub async fn open(
+        host_id: &str,
+        target: &SshTarget,
+        options: SshTunnelOptions,
+    ) -> Result<Self, SshTunnelError> {
+        let dir = pick_socket_dir(&options.scratch_parents, host_id)?;
+        let bridge_path = dir.join(BRIDGE_FILE);
+        let ctl_path = dir.join(CTL_FILE);
+        let config_path = dir.join(CONFIG_FILE);
+
+        if let Err(error) = create_private_dir(&dir) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(SshTunnelError::Local(anyhow::Error::from(error).context(
+                    format!("create the scratch directory {}", dir.display()),
+                )));
+            }
+            reclaim_dir(&options.ssh_bin, &target.raw, &dir, &bridge_path, &ctl_path).await?;
+            create_private_dir(&dir)
+                .with_context(|| format!("recreate the scratch directory {}", dir.display()))?;
+        }
+
+        write_private_file(&config_path, options.config_paths.render().as_bytes())
+            .with_context(|| format!("write {}", config_path.display()))?;
+
+        Ok(Self {
+            state: Arc::new(TunnelState {
+                target: target.raw.clone(),
+                ssh_bin: options.ssh_bin,
+                config_path,
+                ctl_path,
+                generation: AtomicU64::new(0),
+                last_error: Mutex::new(None),
+                closed: AtomicBool::new(false),
+            }),
+            dir,
+            bridge_path,
+            accept: Mutex::new(None),
+            connections: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// The path a client dials. Only bound once [`Self::establish`] has
+    /// succeeded.
+    pub fn bridge_socket(&self) -> &Path {
+        &self.bridge_path
+    }
+
+    /// The most recent connection failure, with the generation of the
+    /// exec that hit it.
+    pub fn last_error(&self) -> Option<(u64, SshFailure)> {
+        self.state
+            .last_error
+            .lock()
+            .expect(LAST_ERROR_MUTEX)
+            .clone()
+    }
+
+    /// Open the shared mux, then bind `bridge.sock` and start accepting.
+    ///
+    /// The warm-up exec runs `true` remotely: the point is to pay for
+    /// the TCP + auth handshake once, here, where a failure can still be
+    /// classified and reported as itself. Without it the first tab a
+    /// user opens pays for the handshake *and* the bridge spawn
+    /// serially, and an auth failure surfaces as a terminal that closed.
+    ///
+    /// A failure never leaves `bridge.sock` bound — the listener is only
+    /// created once the warm-up has come back clean — so a caller that
+    /// retries is not racing its own corpse.
+    pub async fn establish(&self) -> Result<(), SshTunnelError> {
+        if self.state.closed.load(Ordering::SeqCst) {
+            return Err(SshTunnelError::Local(anyhow!(
+                "this tunnel to {} is shut down",
+                self.state.target
+            )));
+        }
+        if self.accept.lock().expect(ACCEPT_MUTEX).is_some() {
+            return Err(SshTunnelError::Local(anyhow!(
+                "this tunnel to {} is already established",
+                self.state.target
+            )));
+        }
+
+        let budget = scaled(ESTABLISH_BUDGET);
+        let deadline = Instant::now() + budget;
+        let argv = establish_argv(
+            &self.state.config_path,
+            &self.state.ctl_path,
+            &self.state.target,
+        );
+        let mut child = spawn_ssh_command(
+            &self.state.ssh_bin,
+            &argv,
+            Stdio::null(),
+            Stdio::null(),
+            Stdio::piped(),
+        )?;
+        let tail = spawn_stderr_tail(&mut child);
+
+        match tokio::time::timeout_at(deadline, child.wait()).await {
+            Err(_elapsed) => {
+                // Nothing is left of the budget, so the reap deadline is
+                // now: kill it and take the corpse.
+                reap_by(&mut child, Instant::now()).await;
+                let _ = tail.await;
+                Err(SshTunnelError::ssh(
+                    &self.state.target,
+                    SshFailure::Transport(Some(format!(
+                        "timed out after {}s",
+                        budget.as_secs().max(1)
+                    ))),
+                ))
+            }
+            Ok(Err(error)) => Err(SshTunnelError::Local(
+                anyhow::Error::from(error).context("wait for the ssh warm-up connection"),
+            )),
+            Ok(Ok(status)) if !status.success() => Err(SshTunnelError::ssh(
+                &self.state.target,
+                classify_ssh_failure(status.code(), &tail.await.unwrap_or_default()),
+            )),
+            Ok(Ok(_)) => {
+                // Bind and register under the accept lock, with a closed
+                // re-check inside it: a shutdown that ran during the
+                // warm-up has already taken (and will never re-take)
+                // this lock, so the loop either registers where shutdown
+                // can abort it, or never starts.
+                let mut accept = self.accept.lock().expect(ACCEPT_MUTEX);
+                if self.state.closed.load(Ordering::SeqCst) {
+                    return Err(SshTunnelError::Local(anyhow!(
+                        "this tunnel to {} is shut down",
+                        self.state.target
+                    )));
+                }
+                let listener = bind_bridge(&self.bridge_path)?;
+                *accept = Some(tokio::spawn(accept_loop(
+                    listener,
+                    self.state.clone(),
+                    self.connections.clone(),
+                )));
+                Ok(())
+            }
+        }
+    }
+
+    /// Stop accepting, let in-flight connections finish, close the mux,
+    /// and remove the scratch directory. Idempotent.
+    ///
+    /// Ordered, not merely thorough: `-O exit` has to run while the
+    /// control socket is still on disk (it is the only address the
+    /// master has), and the directory can only go once it has.
+    pub async fn shutdown(&self) {
+        if self.state.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.stop_accepting();
+
+        let handles = self.take_connections();
+        let aborts: Vec<_> = handles.iter().map(JoinHandle::abort_handle).collect();
+        let drained = tokio::time::timeout(scaled(DRAIN_BUDGET), async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+        if drained.is_err() {
+            // Each task's child is `kill_on_drop`, so aborting is what
+            // kills the `ssh` behind a connection that will not end.
+            for abort in aborts {
+                abort.abort();
+            }
+        }
+
+        exit_master(
+            &self.state.ssh_bin,
+            &self.state.config_path,
+            &self.state.ctl_path,
+            &self.state.target,
+        )
+        .await;
+        if let Err(error) = tokio::fs::remove_dir_all(&self.dir).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    %error,
+                    "ssh tunnel: could not remove the scratch directory"
+                );
+            }
+        }
+    }
+
+    fn stop_accepting(&self) {
+        if let Some(accept) = self.accept.lock().expect(ACCEPT_MUTEX).take() {
+            accept.abort();
+        }
+    }
+
+    fn take_connections(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut *self.connections.lock().expect(CONNECTIONS_MUTEX))
+    }
+}
+
+/// The teardown a tunnel that was never shut down still owes.
+///
+/// Blocking on purpose: `Drop` has no runtime to await on and may well
+/// be running as one shuts down. The alternative — spawning the exit —
+/// is a task that reliably never runs. The wait is bounded, and what it
+/// is waiting for is a local round trip to a control socket.
+impl Drop for SshTunnel {
+    fn drop(&mut self) {
+        if self.state.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.stop_accepting();
+        for handle in self.take_connections() {
+            handle.abort();
+        }
+        blocking_exit_master(
+            &self.state.ssh_bin,
+            &self.state.config_path,
+            &self.state.ctl_path,
+            &self.state.target,
+        );
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl TunnelState {
+    /// Serve one accepted connection over its own `ssh` exec.
+    async fn serve(self: Arc<Self>, stream: UnixStream) {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let argv = exec_argv(&self.config_path, &self.ctl_path, &self.target);
+        let mut child = match spawn_ssh_command(
+            &self.ssh_bin,
+            &argv,
+            Stdio::piped(),
+            Stdio::piped(),
+            Stdio::piped(),
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                self.record(
+                    generation,
+                    SshFailure::Transport(Some(format!("{error:#}"))),
+                );
+                return;
+            }
+        };
+        let tail = spawn_stderr_tail(&mut child);
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let (mut socket_read, mut socket_write) = stream.into_split();
+
+        // Upstream runs as its own task: a client that holds its write
+        // half open for the connection's life (an events subscriber)
+        // must not pin this exec after the wire is finished.
+        let upstream = tokio::spawn(async move {
+            if let Some(mut stdin) = stdin {
+                pump(&mut socket_read, &mut stdin, "client to ssh").await;
+                // Dropping the handle here is the half-close: the far
+                // side's bridge must read a real EOF, not a connection
+                // that merely went quiet.
+            }
+        });
+        if let Some(mut stdout) = stdout {
+            pump(&mut stdout, &mut socket_write, "ssh to client").await;
+        }
+        let _ = socket_write.shutdown().await;
+
+        // Child stdout has EOFed, so the exec is done or dying; the
+        // client may never close its half, so the wire's end is what
+        // ends the upstream pump.
+        let exit = match tokio::time::timeout_at(Instant::now() + scaled(REAP_BUDGET), child.wait())
+            .await
+        {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(_)) => None,
+            Err(_elapsed) => {
+                let _ = child.kill().await;
+                None
+            }
+        };
+        upstream.abort();
+        let _ = upstream.await;
+
+        // Only the exec's own verdict is a failure: a connection that
+        // opened and closed without traffic (a probe) is not one.
+        if exit.is_none_or(|status| !status.success()) {
+            let tail = tail.await.unwrap_or_default();
+            self.record(
+                generation,
+                classify_ssh_failure(exit.and_then(|status| status.code()), &tail),
+            );
+        }
+    }
+
+    /// Record a connection failure, unless a *newer* exec already
+    /// reported one. Connections overlap, so completion order does not
+    /// follow generation order, and the last writer would otherwise be
+    /// able to overwrite fresher news with staler.
+    fn record(&self, generation: u64, failure: SshFailure) {
+        tracing::warn!(
+            host = %self.target,
+            generation,
+            failure = %failure.message(&self.target),
+            "ssh tunnel connection failed"
+        );
+        let mut last = self.last_error.lock().expect(LAST_ERROR_MUTEX);
+        if last.as_ref().is_none_or(|(seen, _)| *seen <= generation) {
+            *last = Some((generation, failure));
+        }
+    }
+}
+
+/// `-O exit`, bounded, status ignored. Only ever worth running while the
+/// control socket exists — without it there is no master to address, and
+/// `ssh` would go open a fresh connection to say so.
+async fn exit_master(ssh_bin: &Path, config_path: &Path, ctl_path: &Path, target: &str) {
+    if !ctl_path.exists() {
+        return;
+    }
+    let argv = teardown_argv(config_path, ctl_path, target);
+    match spawn_ssh_command(ssh_bin, &argv, Stdio::null(), Stdio::null(), Stdio::null()) {
+        Ok(mut child) => reap_by(&mut child, Instant::now() + scaled(TEARDOWN_BUDGET)).await,
+        Err(error) => tracing::debug!(host = %target, %error, "ssh tunnel: -O exit"),
+    }
+}
+
+/// [`exit_master`] without a runtime, for [`Drop`].
+fn blocking_exit_master(ssh_bin: &Path, config_path: &Path, ctl_path: &Path, target: &str) {
+    if !ctl_path.exists() {
+        return;
+    }
+    let argv = teardown_argv(config_path, ctl_path, target);
+    let Ok(mut child) =
+        ssh_command(ssh_bin, &argv, Stdio::null(), Stdio::null(), Stdio::null()).spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + scaled(TEARDOWN_BUDGET);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(DROP_POLL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+async fn accept_loop(
+    listener: UnixListener,
+    state: Arc<TunnelState>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _addr)) => stream,
+            Err(error) => {
+                tracing::warn!(
+                    host = %state.target,
+                    %error,
+                    "ssh tunnel: accept failed; no longer accepting connections"
+                );
+                return;
+            }
+        };
+        let served = state.clone();
+        let handle = tokio::spawn(async move { served.serve(stream).await });
+        let mut tracked = connections.lock().expect(CONNECTIONS_MUTEX);
+        if state.closed.load(Ordering::SeqCst) {
+            handle.abort();
+            return;
+        }
+        // Finished tasks are already reaped; keeping their handles would
+        // grow the vector for the life of the tunnel.
+        tracked.retain(|handle| !handle.is_finished());
+        tracked.push(handle);
+    }
+}
+
+/// One direction of a connection's byte pump. Returns how many bytes it
+/// moved.
+///
+/// A pump error is not returned because it is not a verdict: a client
+/// hanging up mid-stream and a transport that died look identical from
+/// here, and only the child's exit status can tell them apart. The
+/// caller reads that status; this logs the detail and stops.
+async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    from: &mut R,
+    to: &mut W,
+    direction: &'static str,
+) -> u64 {
+    let mut buf = vec![0u8; CHUNK];
+    let mut total = 0u64;
+    loop {
+        let read = match from.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                tracing::debug!(direction, %error, "ssh tunnel pump: read ended");
+                break;
+            }
+        };
+        if let Err(error) = to.write_all(&buf[..read]).await {
+            tracing::debug!(direction, %error, "ssh tunnel pump: write ended");
+            break;
+        }
+        total += read as u64;
+    }
+    let _ = to.flush().await;
+    total
+}
+
+/// Every `ssh` this module runs, shaped the same way — including the one
+/// [`blocking_exit_master`] has to spawn without a runtime.
+fn ssh_command(
+    ssh_bin: &Path,
+    argv: &[String],
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(ssh_bin);
+    command
+        .args(argv)
+        // `ssh`'s stderr is a classification input, and a localized
+        // build would spell "Permission denied" in whatever the user's
+        // locale is. Pinning the locale keeps the failure table honest.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
+    command
+}
+
+fn spawn_ssh_command(
+    ssh_bin: &Path,
+    argv: &[String],
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<Child, SshTunnelError> {
+    Command::from(ssh_command(ssh_bin, argv, stdin, stdout, stderr))
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawn {}", ssh_bin.display()))
+        .map_err(SshTunnelError::Local)
+}
+
+/// Drain a child's stderr into a task holding at most the last
+/// [`STDERR_TAIL_BYTES`].
+///
+/// A task rather than a read after `wait()`, because an unread stderr
+/// pipe fills and blocks the child that is being waited on.
+fn spawn_stderr_tail(child: &mut Child) -> JoinHandle<String> {
+    let stderr = child.stderr.take();
+    tokio::spawn(async move {
+        match stderr {
+            Some(stderr) => read_tail(stderr).await,
+            None => String::new(),
+        }
+    })
+}
+
+async fn read_tail<R: AsyncRead + Unpin>(mut reader: R) -> String {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                tail.extend_from_slice(&buf[..read]);
+                if tail.len() > STDERR_TAIL_BYTES {
+                    tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+fn bind_bridge(path: &Path) -> Result<UnixListener, SshTunnelError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("bind {}", path.display()))
+        .map_err(SshTunnelError::Local)?;
+    // Same rule the session socket binds under: the bridge reaches a
+    // whole remote workspace, so nobody else on this machine gets to
+    // dial it.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))
+        .map_err(SshTunnelError::Local)?;
+    Ok(listener)
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
+/// The existing-directory half of [`SshTunnel::open`].
+async fn reclaim_dir(
+    ssh_bin: &Path,
+    target: &str,
+    dir: &Path,
+    bridge_path: &Path,
+    ctl_path: &Path,
+) -> Result<(), SshTunnelError> {
+    match socket_state::probe(bridge_path, PROBE_TIMEOUT).await {
+        SocketState::Missing | SocketState::Stale => {}
+        SocketState::NotASocket(kind) => {
+            return Err(SshTunnelError::Local(anyhow!(
+                "{} is a {kind}, not a socket; remove {} by hand",
+                bridge_path.display(),
+                dir.display()
+            )))
+        }
+        // Live, and anything that cannot be classified: fail-safe, the
+        // same rule `socket_state` unlinks under.
+        state => {
+            return Err(SshTunnelError::Local(anyhow!(
+                "another Roost is connected to {target} (its bridge socket is {state:?} at {})",
+                dir.display()
+            )))
+        }
+    }
+
+    exit_master(ssh_bin, &dir.join(CONFIG_FILE), ctl_path, target).await;
+
+    tokio::fs::remove_dir_all(dir)
+        .await
+        .with_context(|| format!("remove the stale scratch directory {}", dir.display()))
+        .map_err(SshTunnelError::Local)
+}
+
+// ============================================================================
+// One-shot verification
+// ============================================================================
+
+/// Default budget for [`verify_ssh_target`], before the ambient scale.
+pub const VERIFY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Does this ssh target answer, and does it speak a protocol this build
+/// can talk to?
+///
+/// Deliberately leaves nothing behind: one `ssh` exec outside any mux
+/// ([`verify_argv`] — `ControlMaster=no`, no `-S`), a config in a
+/// throwaway directory, and no master to persist afterwards. That is
+/// what makes it safe to offer from an Add Host dialog, where the user
+/// has not committed to the host yet and a wedged `ControlPersist`
+/// master for a target they typed wrong is not a thing to leave them
+/// with.
+///
+/// It speaks `session.identify` over the child's own stdio rather than
+/// through [`crate::IpcClient`], because there is no socket to dial: the
+/// remote bridge *is* the pipe. Same frames, same envelope, no
+/// transport.
+///
+/// The compatibility bar matches
+/// [`crate::session_launch::verify_target`]'s exactly — "something
+/// answered, and it speaks this protocol" — so a host verifies to the
+/// same standard however it is reached.
+pub async fn verify_ssh_target(
+    target: &SshTarget,
+    options: &SshTunnelOptions,
+    budget: Duration,
+) -> Result<SessionIdentify, SshTunnelError> {
+    let dir = pick_socket_dir(&options.scratch_parents, &verify_token())?;
+    create_private_dir(&dir)
+        .with_context(|| format!("create the verify scratch directory {}", dir.display()))?;
+    let outcome = verify_in(&dir, target, options, budget).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
+/// A directory name no concurrent verify can collide on: this process,
+/// this instant, and a counter for two verifies inside the same
+/// nanosecond.
+fn verify_token() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "verify-{}-{nanos:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+async fn verify_in(
+    dir: &Path,
+    target: &SshTarget,
+    options: &SshTunnelOptions,
+    budget: Duration,
+) -> Result<SessionIdentify, SshTunnelError> {
+    let config_path = dir.join(CONFIG_FILE);
+    write_private_file(&config_path, options.config_paths.render().as_bytes())
+        .with_context(|| format!("write {}", config_path.display()))?;
+
+    let argv = verify_argv(&config_path, &target.raw, &remote_command());
+    let mut child = spawn_ssh_command(
+        &options.ssh_bin,
+        &argv,
+        Stdio::piped(),
+        Stdio::piped(),
+        Stdio::piped(),
+    )?;
+    let tail = spawn_stderr_tail(&mut child);
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| SshTunnelError::Local(anyhow!("no stdin pipe on the verify connection")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SshTunnelError::Local(anyhow!("no stdout pipe on the verify connection")))?;
+
+    let deadline = Instant::now() + scaled(budget);
+    let exchange = tokio::time::timeout_at(deadline, identify_over(&mut stdin, stdout)).await;
+    // The far side is done being asked; letting it see EOF is what lets
+    // it exit on its own rather than be killed.
+    drop(stdin);
+
+    let exchanged = match exchange {
+        Ok(inner) => inner,
+        Err(_elapsed) => Err(anyhow!("timed out after {}s", budget.as_secs().max(1))),
+    };
+    let identity = match exchanged {
+        Ok(identity) => identity,
+        Err(error) => {
+            reap_by(&mut child, Instant::now()).await;
+            let tail = tail.await.unwrap_or_default();
+            let code = child
+                .try_wait()
+                .ok()
+                .flatten()
+                .and_then(|status| status.code());
+            // A child that exited cleanly and said nothing on stderr did
+            // not fail as a *transport* — the fault is in what came back
+            // over the pipe, and reporting it as a connection failure
+            // would send the reader hunting the network.
+            return Err(if code == Some(0) && tail.trim().is_empty() {
+                SshTunnelError::Local(error.context(format!("verifying {}", target.raw)))
+            } else {
+                SshTunnelError::ssh(&target.raw, classify_ssh_failure(code, &tail))
+            });
+        }
+    };
+    reap_by(&mut child, deadline).await;
+
+    if identity.session_protocol != SESSION_PROTOCOL_VERSION {
+        return Err(SshTunnelError::Local(anyhow!(
+            "that session speaks protocol {}, this build speaks {SESSION_PROTOCOL_VERSION}",
+            identity.session_protocol
+        )));
+    }
+    Ok(identity)
+}
+
+/// One `session.identify` request/response over a child's stdio, in the
+/// same envelope [`crate::IpcClient`] would have written.
+async fn identify_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    stdin: &mut W,
+    stdout: R,
+) -> Result<SessionIdentify> {
+    const ID: i64 = 1;
+
+    let request = RawRequest {
+        id: ID,
+        op: ops::SESSION_IDENTIFY.to_string(),
+        params: serde_json::json!({}),
+    };
+    write_frame(stdin, &serde_json::to_vec(&request)?).await?;
+
+    let mut reader = FrameReader::new(stdout);
+    loop {
+        let Some(frame) = reader.read_line().await? else {
+            return Err(anyhow!(
+                "the remote bridge closed without answering {}",
+                ops::SESSION_IDENTIFY
+            ));
+        };
+        let value: serde_json::Value = serde_json::from_slice(&frame)?;
+        // A session may push events at a connection it never subscribed;
+        // they are not this request's answer.
+        if value.get("event").is_some() {
+            continue;
+        }
+        let response: Response = serde_json::from_value(value)?;
+        if response.id != ID {
+            return Err(anyhow!("answer carried id {}, not {ID}", response.id));
+        }
+        if !response.ok {
+            let error = response.error.unwrap_or(crate::messages::ResponseError {
+                code: "internal".into(),
+                message: "ok=false with no error body".into(),
+            });
+            return Err(anyhow!(
+                "{}: {} ({})",
+                ops::SESSION_IDENTIFY,
+                error.message,
+                error.code
+            ));
+        }
+        return Ok(serde_json::from_value(
+            response.result.unwrap_or(serde_json::Value::Null),
+        )?);
+    }
 }
 
 #[cfg(test)]

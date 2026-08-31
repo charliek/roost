@@ -569,7 +569,11 @@ pub async fn spawn_and_read_verdict(bin: &Path, cwd: &Path, budget: Duration) ->
 /// Wait for the launcher to exit, but no later than `deadline`; kill and
 /// reap it if it outlives that. Never returns a zombie and never
 /// outlives the budget.
-async fn reap_by(child: &mut Child, deadline: Instant) {
+///
+/// `pub(crate)` for [`crate::ssh`]'s tunnel runtime, which reaps its
+/// `ssh` children under exactly this discipline — the shape of "bounded
+/// wait, then SIGKILL" is not worth having two of.
+pub(crate) async fn reap_by(child: &mut Child, deadline: Instant) {
     if tokio::time::timeout_at(deadline, child.wait())
         .await
         .is_err()
