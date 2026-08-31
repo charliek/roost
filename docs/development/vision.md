@@ -499,7 +499,12 @@ byte-identical to before this landed. See
 [ipc.md](../reference/ipc.md#session-sockets) for the wire contract.
 
 **Three deviations from the architecture doc are provisional, not
-final**, and tracked to close in HS-1b
+final**, and tracked to close in HS-1b *(since closed — HS-1b shipped
+all three, including the lease as the anticipated breaking wire change;
+the list below is the deviation state as recorded on 2026-08-28, kept
+for the historical record. See
+[ipc.md](../reference/ipc.md#session-sockets) for the shipped contract
+and DL-18 below for the HS-2 client built on it)*
 ([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)):
 `events.subscribe` ships leaseless, ahead of the `session.connect` lease
 [the architecture doc](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md)

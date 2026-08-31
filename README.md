@@ -8,7 +8,10 @@ attention.
 
 Two native UIs — **Swift + AppKit on macOS** (`Roost.app`) and **Rust + iced
 on Linux** (`roost`) — each embed the workspace + PTY supervisor + a JSON-IPC
-server **in-process** (no daemon). macOS also gets an experimental
+server **in-process** (no daemon by default; the one opt-in exception is
+`roost-session`, a headless daemon for
+[host sessions](docs/guides/host-sessions.md) — shells that keep running
+after the window closes). macOS also gets an experimental
 **Roost-Iced.dmg**, the same iced UI built for Mac, installed side by side
 with `Roost.app` — see the
 [latest release](https://github.com/charliek/roost/releases/latest). External
@@ -67,6 +70,7 @@ The full site lives under `docs/` and builds with [Zensical](https://zensical.or
 - [Working Directory Tracking](docs/guides/cwd-tracking.md) — header + tab labels follow `cd` (auto-loaded for zsh + modern bash)
 - [Notifications](docs/guides/notifications.md) — how `roostctl` + OSC fallbacks surface in the UI
 - [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
+- [Host Sessions](docs/guides/host-sessions.md) — the opt-in `roost-session` daemon: shells that survive closing the window
 - [Architecture](docs/reference/architecture.md) — package layout + threading contract
 - [Vision & Principles](docs/development/vision.md) — direction, decision log, and the two-implementation architecture
 - [IPC Reference](docs/reference/ipc.md) — the JSON wire format `roostctl` and Claude hooks speak

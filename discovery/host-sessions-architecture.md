@@ -1,15 +1,20 @@
 # Host sessions — architecture
 
-Status: **design, with the whole of HS-1 shipped** — HS-1a (plan 035,
+Status: **design, with HS-1 and HS-2 shipped** — HS-1a (plan 035,
 PR #372) for `roost-session`'s lifecycle and control plane per §8/§4.1,
 HS-1b (plan 036) for the data plane: per-tab server Terminals and the
 tab-task pipeline (§3), the binary attach stream (§4.3), the wrapper
 wiring §5 specifies, the one-authority reply rule (§6), and
 `session.connect` leases + takeover (§4.1). All three of HS-1a's
-documented deviations are closed. What remains design is HS-2 and
-beyond: the client side (§5's UI integration, §9), effect envelopes to
-a client (§6), and SSH (§10). This file is the technical design the HS
-milestone plans implement, and stays normative for HS-2/HS-3; status
+documented deviations are closed. HS-2 (plan 037, PR #374) shipped the
+client side — the iced Hosts UX, `HostConn`, the attach-on-focus data
+path — plus the effect envelopes (`tab.effect` for bell + OSC 52
+writes) and theme reseed (`session.set_theme`) that were still design
+in §6; see
+[`docs/development/host-sessions.md`](../docs/development/host-sessions.md)
+for how the client actually landed (§9 deviated — noted in place).
+What remains design is SSH (§10). This file is the technical design
+the HS milestone plans implement, and stays normative for HS-3; status
 annotations below mark what shipped when. Companion docs:
 [`host-sessions-roadmap.md`](host-sessions-roadmap.md) (milestones,
 pinned direction, the HS-1a/HS-1b split) and
@@ -490,11 +495,13 @@ detached — `tab.capture_pty_input` on a session socket reads that
 buffer, which is how the exactly-once rule is asserted headlessly, and
 the Rust integration client proves the other half by showing the
 decoded client Terminal's own reply buffer is non-empty and
-verifiably discarded. Effects are the part that did **not** ship:
+verifiably discarded. Effects were the part HS-1b did **not** ship:
 `OscAction::Workspace` is applied server-side as specified, but
-client-local effects (OSC 52 write, bell, notifications, pointer
-shape) are dropped and debug-logged rather than sent as envelopes,
-with the seam commented for HS-2. OSC 52 read stays default-deny.
+client-local effects were dropped and debug-logged, with the seam
+commented for HS-2. **HS-2 (plan 037) closed that**: `tab.effect`
+envelopes now carry bell and OSC 52 clipboard writes to the attached
+client, and `session.set_theme` reseeds the server palette from the
+client's theme. OSC 52 read stays default-deny (revisit at HS-3).
 
 Both VTs parse the same byte stream, and libghostty generates reply
 bytes (DA, DSR, color queries, XTGETTCAP) into a buffer the embedder
@@ -620,6 +627,14 @@ deviation is the client-notification step of Stop, noted inline.
   scoped to the host.
 
 ## 9. Client architecture (iced)
+
+> **Shipped in HS-2 (plan 037), with a recorded deviation**: the seam
+> did not become an app-scoped `TabBackend::Host` variant — the real
+> cut turned out to be `TabHandleKind::Host` plus `HostConnSet`; see
+> the roadmap's HS-2 section and
+> [`docs/development/host-sessions.md`](../docs/development/host-sessions.md)
+> for what actually landed. The policy list below (reply handling,
+> OSC-scan mode, theme reseed, test hooks) held as specified.
 
 - `TabBackend` (HS-0): the enum/trait behind which `TerminalTab`
   does `attach / send_input / send_resize / has / foreground_cwd`
@@ -834,10 +849,11 @@ hosts → HS-2 (needs two hosts and a client).
   shipped in HS-1a**: atomic `{revision, events: [...]}` batches, one
   per commit including empty ones — see
   [ipc.md's `events.subscribe`](../docs/reference/ipc.md#eventssubscribe).
-- Whether `session.connect` carries the client theme seed or a
-  separate op does (§6). Still open — HS-1b's `session.connect` takes
-  `{takeover}` only, and the server terminal's palette is seeded from
-  its own defaults at spawn with no reseed op.
+- ~~Whether `session.connect` carries the client theme seed or a
+  separate op does (§6)~~ **Resolved, shipped in HS-2**: a separate
+  `session.set_theme` op — `session.connect` still takes `{takeover}`
+  only, and the client sends its theme after connect (and on theme
+  commit).
 - ~~Data-plane priority implementation detail (two queues vs one with
   priority) and the exact forwarder/ring byte budgets~~ **Resolved,
   shipped in HS-1b**: one pump, no second queue — the snapshot and the
