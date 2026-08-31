@@ -1,8 +1,10 @@
 # Host sessions — roadmap
 
 Status: **roadmap, in flight** — direction agreed 2026-08-26; HS-0,
-HS-1 (plans 035 + 036), and HS-2 (plan 037, PR #374) have shipped, and
-HS-3 (SSH transport) is next. This refines [`host-sessions.md`](host-sessions.md) (the
+HS-1 (plans 035 + 036), and HS-2 (plan 037, PR #374) have shipped;
+HS-3's transport slice (plan 038, C1-C6) has shipped too, and its
+bootstrap slice (detect/install/verify a remote `roost-session`) is
+next. This refines [`host-sessions.md`](host-sessions.md) (the
 discovery note, which stays the rationale document) into an ordered set
 of milestones with pinned design decisions. Per-milestone implementation
 plans are written when a milestone starts; this file records the
@@ -456,7 +458,9 @@ app-scoped `Host` variant — the real seam turned out to be
 fixed: `roost-session`'s headless workspace defaults
 `window_focused = true` with no op to correct it, so `notification.fired`
 never fires for whichever tab a client has attached to — tracked as
-HS-3 follow-up.
+HS-3 follow-up. **Closed by HS-3's transport slice**
+(`session.set_focus`, plan 038 C6) — see the open-questions entry
+below.
 
 - Palette: Connect host → `localhost`; spawn-if-missing then attach.
   Hidden on the Mac build until a Mac server exists (no visible
@@ -484,12 +488,40 @@ its first live use is HS-3.
 
 ### HS-3 — SSH remote host (the target payoff)
 
+**Transport slice shipped (plan 038, C1-C6).** The bullets below
+describe HS-3 as originally scoped; see
+[`docs/development/host-sessions.md` → Transport: SSH hosts](../docs/development/host-sessions.md#transport-ssh-hosts)
+for what actually landed and
+[`docs/guides/host-sessions.md`](../docs/guides/host-sessions.md#adding-a-remote-host-over-ssh)
+for the user-facing shape. What shipped: D9's stdio-mux transport (a
+per-connection `ssh -T` exec over a shared private `ControlMaster`,
+`BatchMode=yes` — key/agent auth only, no password/2FA this slice),
+the target classifier (`workbox` / `user@host` / `ssh://user@host:port`
+in the palette's Add Host dialog and `roostctl host add --target`), the
+six-family classified-failure surface (changed/unknown host key, auth,
+no session, `roost-session` not found, transport — reaching the sidebar
+band and an attended attempt's toast), `--verify`'s mux-less probe over
+SSH, and `session.set_focus` (closing the HS-2 "session doesn't know
+what a client is looking at" gap, folded into this plan as C6). What
+did **not** ship in this slice: the **bootstrap** half of D9
+(auto-detect/install/verify a remote `roost-session` binary — a target
+still has to have `roost-session` reachable on its non-interactive PATH
+already) and SSH auto-reconnect (still manual, as originally scoped
+below).
+
 - Palette accepts `workbox` / `user@host` / `ssh://…`; D9 transport
-  and bootstrap.
+  and bootstrap. **Transport shipped; bootstrap not yet built** — see
+  above.
 - Disconnect vs Stop unchanged over SSH; reattach command surfaced
   on disconnect.
 - Remote clipboard policy decided (OSC 52 to the attached client's
-  machine; image paste deferred if needed).
+  machine; image paste deferred if needed). **Shipped as scoped**:
+  OSC 52 writes forward to whichever client holds the tab's lease,
+  applied under that client's own `clipboard-write` setting; OSC 52
+  *reads* stay parser-level default-deny on every path, local or
+  remote — reading is the more sensitive direction over SSH, not
+  less, so there's no SSH-specific carve-out. Remote image paste
+  remains deferred (unchanged open question below).
 
 **Acceptance:** the automated lanes are the gate — the pipes-based
 bridge lane and a shed-sshd lane (`ssh test1@localhost -p 2222` —
@@ -498,7 +530,13 @@ failure surfaces, connection loss, and bootstrap verify. On top of
 that, the live criterion: Mac iced app connects to the shed VM —
 native tabs drive PTYs running in the VM; quit the Mac app, agents
 in the VM keep running; reconnect shows the same shells. A real
-Linux box run is supporting evidence, not the acceptance.
+Linux box run is supporting evidence, not the acceptance. **The
+automated lanes are met by the transport slice** — the pipes-based
+bridge lane in the required `session-e2e` job plus a fake-ssh UI
+lane in the Linux iced e2e cells (plan 038 C5); CI still has no
+sshd, so the shed-sshd checklist and the live Mac-to-shed criterion
+are exercised as plan 038's manual verification, and bootstrap
+verify waits on the bootstrap slice above.
 
 ### HS-4 — Make the primitive feel inevitable
 
@@ -536,7 +574,20 @@ default-backend change, not a rewrite.
 
 ## Open questions (deferred, with owners)
 
-- Remote image paste + OSC 52 *read* over SSH → HS-3 plan.
+- Remote image paste + OSC 52 *read* over SSH → **partially resolved by
+  the HS-3 transport slice (plan 038)**: OSC 52 *read* stays
+  parser-level default-deny on every path (settled, not deferred —
+  reading is the more sensitive direction over SSH, if anything).
+  Remote image paste remains genuinely deferred — still open, tracked
+  as a follow-on to HS-3.
+- A session's own attention not reaching an attached client
+  (`window_focused` always `true`, no way to correct it — HS-2's
+  recorded gap) → **resolved by the HS-3 transport slice**:
+  `session.set_focus` (plan 038 C6) closes it for a current session; it
+  remains true only against a session too old to serve the op, which
+  degrades harmlessly to HS-2's behavior. See
+  [`docs/reference/ipc.md`](../docs/reference/ipc.md#sessionset_focus)
+  and [Known limitations](../docs/development/host-sessions.md#known-limitations).
 - Named sessions per host (`workbox:agents`) → after HS-3, if wanted.
 - `systemd --user` / launchd supervision of `roost-session` (vs
   plain daemon) → HS-2/3 hardening; plain daemon first.

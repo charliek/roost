@@ -133,6 +133,19 @@ does. `validate_runtime_dir` rejects rather than repairs a socket
 directory some other mode or owner already created, so a session's
 lock-acquisition step never silently inherits a loosened directory.
 
+### SSH scratch directories
+
+A saved host reached over SSH (host-sessions HS-3 — see [Host sessions (development) → Transport: SSH hosts](../development/host-sessions.md#transport-ssh-hosts)) does not use the session profile's paths above; the client owns a per-*attempt* scratch directory of its own, one per connect attempt rather than one per host, under whichever of the following candidates leaves room for a 103-byte `AF_UNIX` `sun_path`:
+
+```text
+$TMPDIR/roost-ssh-<host_id>-<pid>-<seq>/     (preferred)
+/tmp/roost-ssh-<host_id>-<pid>-<seq>/        (fallback, if $TMPDIR doesn't fit)
+```
+
+`<host_id>` is the saved host's own id, `<pid>` the client process's, `<seq>` a per-process counter — the combination is unique per attempt, so a double Connect, a disconnect racing its own reconnect, or a superseded establish landing late each own a directory nothing else is touching. Each holds a generated `ssh_config`, the `ssh` `ControlMaster`'s control socket (`ctl`), and the local bridge's own listening socket (`bridge.sock`, `0600`, the address a client dials to reach the remote session). The directory (`0700`) and everything in it are removed on disconnect (`ssh -O exit` first, then the directory) or reclaimed by the next connect attempt's sweep; a one-shot `host add --verify` / Add Host dialog probe against an SSH target uses the same candidates under a `roost-ssh-verify-<pid>-<nanos>-<n>` name instead, which a sweep never mistakes for a host's own leftovers.
+
+`ROOST_SSH_BIN` overrides the `ssh` binary these directories' invocations exec (default: `ssh` on `PATH`) — see [`cli.md`](cli.md#environment).
+
 ### Two single-instance locks
 
 A running UI holds **two** flocks, because the two things a single
@@ -295,6 +308,7 @@ opt-out (`no-ssh-env`).
 |---|---|
 | `ROOST_SOCKET` | Override the socket the CLI dials |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
+| `ROOST_SSH_BIN` | Override the `ssh` binary a host's SSH transport execs (default: `ssh` on `PATH`) — see [SSH scratch directories](#ssh-scratch-directories) above. Read by both `roostctl host add --verify` and the UI's own tunnel. |
 
 `roostctl` also honours `ROOST_BUNDLE_PROFILE=mac|linux|iced` (the env form of
 `--target`; an unrecognized value is a hard error, not a fallback). With no
