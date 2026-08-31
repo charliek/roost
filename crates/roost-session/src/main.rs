@@ -35,11 +35,22 @@ enum Command {
         #[arg(long)]
         foreground: bool,
     },
+    /// Bridge stdin/stdout to this machine's session socket.
+    ///
+    /// The far side of the SSH transport, one process per accepted
+    /// client connection. stdout carries wire bytes and nothing else.
+    ClientBridge,
 }
 
 fn main() -> ! {
     let cli = Cli::parse();
-    let Command::Start { foreground } = cli.command;
+    let foreground = match cli.command {
+        // Exits before `Readiness::Stdout` is installed below, because
+        // for the bridge stdout *is* the wire: one stray line on it
+        // corrupts the client's stream.
+        Command::ClientBridge => std::process::exit(roost_session::bridge::run()),
+        Command::Start { foreground } => foreground,
+    };
 
     // Stdout in *both* modes, and set before the first fallible step.
     //

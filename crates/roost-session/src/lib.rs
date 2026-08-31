@@ -30,9 +30,12 @@
 //!   fork-free, so tests drive it directly.
 //! * [`hydrate`] — the saved layout back into live shells.
 //! * [`socket_guard`] — unlink our socket, never a successor's.
+//! * [`bridge`] — the far side of the SSH transport: stdio ↔ this
+//!   machine's session socket, one process per accepted connection.
 //! * [`identity`], [`logging`], [`consts`] — session id + timestamp, the
 //!   file appender, and every named constant.
 
+pub mod bridge;
 pub mod consts;
 pub mod daemonize;
 pub mod hydrate;

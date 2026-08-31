@@ -685,7 +685,7 @@ deviation is the client-notification step of Stop, noted inline.
 Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 
 ```text
- client ── UDS ── local bridge ── ssh -T host 'exec roost-session bridge'
+ client ── UDS ── local bridge ── ssh -T host 'exec roost-session client-bridge'
                                         │ (per accepted connection,
                                         │  shared ControlMaster)
                               far side: connect to local session UDS,
