@@ -20,6 +20,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use roost_ipc::bootstrap::shell_quote;
 use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 use roost_ipc::ssh::{
     classify, remote_command, verify_ssh_target, ResolvedTransport, SshConfigPaths, SshFailure,
@@ -64,10 +65,10 @@ impl Harness {
             format!(
                 "#!/bin/sh\nFAKE_SSH_LOG={log}\nFAKE_SSH_MODE={mode}\nFAKE_SSH_EXEC={exec}\n\
                  export FAKE_SSH_LOG FAKE_SSH_MODE FAKE_SSH_EXEC\nexec {fixture} \"$@\"\n",
-                log = sh_quote(&log.display().to_string()),
-                mode = sh_quote(mode),
-                exec = sh_quote(exec),
-                fixture = sh_quote(&fixture_path().display().to_string()),
+                log = shell_quote(&log.display().to_string()),
+                mode = shell_quote(mode),
+                exec = shell_quote(exec),
+                fixture = shell_quote(&fixture_path().display().to_string()),
             ),
         )
         .expect("write the ssh wrapper");
@@ -165,10 +166,6 @@ fn fixture_path() -> PathBuf {
         .join("../../tools/roosttest/fixtures/fake-ssh.sh")
         .canonicalize()
         .expect("the fake-ssh fixture must exist")
-}
-
-fn sh_quote(raw: &str) -> String {
-    format!("'{}'", raw.replace('\'', r"'\''"))
 }
 
 /// The mux warm-up: its remote command is the literal `true`.
@@ -675,7 +672,10 @@ async fn verify_speaks_identify_over_a_one_shot_exec_outside_the_mux() {
     let response = format!(r#"{{"id":"1","ok":true,"result":{result}}}"#);
     let harness = Harness::new(
         "ok",
-        &format!("read -r _request; printf '%s\\n' {}", sh_quote(&response)),
+        &format!(
+            "read -r _request; printf '%s\\n' {}",
+            shell_quote(&response)
+        ),
     );
 
     let identity = verify_ssh_target(

@@ -22,13 +22,18 @@
 #   FAKE_SSH_MODE         what this invocation does. Default `ok`.
 #   FAKE_SSH_EXEC         shell source run (via `sh -c`) as the remote
 #                         command in the modes that get that far.
-#   FAKE_SSH_SESSION_ENV  optional file sourced before FAKE_SSH_EXEC, so
-#                         a test can hand the remote command variables of
-#                         its own.
+#   FAKE_SSH_SESSION_ENV  optional file naming the variables the remote
+#                         command runs with — the *whole* environment,
+#                         not an addition to this process's. In
+#                         `run-remote` it is how the far side gets its
+#                         `HOME`, its `PATH` and its filesystem jail
+#                         (see below).
 #
 # Modes:
 #
 #   ok                 run FAKE_SSH_EXEC (see the `true` rule below).
+#   run-remote         run the *actual* remote command off the argv —
+#                      see below.
 #   auth-fail          `Permission denied (publickey).`, exit 255.
 #   hostkey-fail       `Host key verification failed.`, exit 255.
 #   hostkey-changed    the full REMOTE HOST IDENTIFICATION HAS CHANGED
@@ -37,6 +42,48 @@
 #   exit-127           `sh: roost-session: command not found`, exit 127.
 #   drop-after:<n>     run FAKE_SSH_EXEC but cut its output after <n>
 #                      bytes, then exit 1.
+#
+# `run-remote` in detail. `ok` runs one fixed FAKE_SSH_EXEC whatever it
+# was asked to run, which is all a byte-pump transport test needs.
+# The bootstrap tests (plan 039) need the opposite: the remote command
+# *is* the thing under test — a generated `/bin/sh -s` script, a
+# `tee -- <tmp>` the binary is streamed into, an exec of a discovered
+# binary — so this mode runs the last argv element through `sh -c` with
+# stdin and stdout wired straight through, exactly as sshd would.
+#
+# Which means the scripts run on **this** machine, and a fixture that
+# leaks this machine's state is not a fixture. So `run-remote` runs the
+# command under `env -i` with exactly the four variables below and
+# nothing else — sourcing FAKE_SSH_SESSION_ENV only *adds* to what the
+# test runner exported, and a developer's own ROOST_BOOTSTRAP_FS_ROOT
+# reaching the far side would decide which binary the ladder resolves.
+# Setting them is the caller's half of the contract, carried in
+# FAKE_SSH_SESSION_ENV, and it is what the Rust suite writes there:
+#
+#   HOME=<tempdir>                 a fake home the install writes into.
+#   PATH=<stub bin>                one directory, holding a fake `uname`
+#                                  (which reports the OS and machine the
+#                                  test wants) and symlinks to the
+#                                  handful of coreutils the scripts
+#                                  need — and no `roost-session`, so a
+#                                  `command -v` finds nothing real.
+#   USER=<name>                    what the ladder's per-user nix rung
+#                                  interpolates.
+#   ROOST_BOOTSTRAP_FS_ROOT=<dir>  the prefix a **test-mode** candidate
+#                                  ladder puts in front of its absolute
+#                                  rungs, so a `/usr/bin/roost-session`
+#                                  probe lands inside the tempdir. A
+#                                  shipped ladder never expands it at
+#                                  all.
+#
+# Without all three the suite would pass or fail according to whether
+# the developer's own box is a Mac and whether it has the deb
+# installed. With them it is the same test everywhere.
+#
+# The mux flags a job passes (`-S <ctl>`, `-o ControlMaster=auto`,
+# `-o ControlPersist=60s`) are accepted and ignored here, as they are in
+# every other mode: they are logged, the `-S` path still gets the
+# control-socket simulation below, and `-O exit` still removes it.
 #
 # Two rules that keep the fake faithful rather than merely configurable:
 #
@@ -58,7 +105,10 @@
 # (remote → client) direction. Cutting the upstream direction would need
 # a second pipeline the shell cannot express portably, and no test needs
 # it — a half-cut stream already produces the EOF-plus-nonzero-exit the
-# client classifies on.
+# client classifies on. So an *upload* cut mid-stream — a `tee` that
+# stops half way through a binary — has no seam here either; the
+# bootstrap suite reaches that case from the ends instead, with a remote
+# `tee` that dies and with a local source that stops being readable.
 
 set -u
 
@@ -140,12 +190,40 @@ if [ "$remote" = "true" ]; then
     exit 0
 fi
 
+# Resolved before the session env is sourced, because sourcing replaces
+# PATH with the far side's — which is a jail holding a handful of
+# coreutils and deliberately not this.
+fake_env=$(command -v env 2>/dev/null || true)
+
 if [ -n "${FAKE_SSH_SESSION_ENV:-}" ]; then
     # shellcheck disable=SC1090
     . "$FAKE_SSH_SESSION_ENV"
 fi
 
 case "$FAKE_SSH_MODE" in
+run-remote)
+    # The real remote command, with this process's stdin and stdout as
+    # its own — which is what carries a `/bin/sh -s` script in and a
+    # streamed binary through `tee`.
+    #
+    # `env -i` and not the inherited environment: sourcing the session
+    # env *adds* to what cargo exported, so without this the far side
+    # would still see the whole of a developer's shell — including
+    # their own ROOST_BOOTSTRAP_FS_ROOT, which decides which binary the
+    # ladder resolves. The four names below are exactly the ones the
+    # hermeticity contract above enumerates; anything else the remote
+    # command needs, it does not get, which is the point.
+    if [ -z "$fake_env" ]; then
+        printf '%s\n' "fake-ssh: run-remote needs env(1) and could not find it" >&2
+        exit 1
+    fi
+    exec "$fake_env" -i \
+        HOME="${HOME:-}" \
+        PATH="${PATH:-}" \
+        USER="${USER:-}" \
+        ROOST_BOOTSTRAP_FS_ROOT="${ROOST_BOOTSTRAP_FS_ROOT:-}" \
+        sh -c "$remote"
+    ;;
 drop-after:*)
     bytes="${FAKE_SSH_MODE#drop-after:}"
     sh -c "$FAKE_SSH_EXEC" | head -c "$bytes"

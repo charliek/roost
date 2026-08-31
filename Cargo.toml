@@ -79,6 +79,9 @@ clap = { version = "4.5", features = ["derive", "env"] }
 bindgen = "0.70"
 cc      = "1.0"
 
+# Hashing (release-asset checksums, roost-ipc's bootstrap download)
+sha2      = "0.10"
+
 # Misc
 getrandom        = "0.4"
 percent-encoding = "2.3"
