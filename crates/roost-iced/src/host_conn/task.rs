@@ -141,7 +141,7 @@ fn scale() -> f64 {
 }
 
 /// A single control-plane leg's budget.
-fn leg() -> Duration {
+pub(crate) fn leg() -> Duration {
     session_launch::IPC_TIMEOUT.mul_f64(scale())
 }
 
@@ -214,6 +214,12 @@ struct Live {
     /// Shared with the UI: written here, read there. Never copied onto
     /// the feed.
     mirror: Arc<SharedMirror>,
+    /// This session answered `unknown-op` to `session.set_focus`, and
+    /// has been told about once. HS-2 sessions predate the op: the
+    /// client keeps sending it (the UI has no other way to know, and the
+    /// refusal costs one round trip), but one line per connection is the
+    /// whole story — a line per selection change is noise.
+    focus_unsupported: bool,
 }
 
 impl Drop for Live {
@@ -502,6 +508,7 @@ async fn connect(config: &ConnectionConfig, mode: ConnectMode) -> Result<Live, A
         events,
         pump,
         mirror: Arc::new(SharedMirror::new(mirror)),
+        focus_unsupported: false,
     })
 }
 
@@ -778,6 +785,25 @@ async fn run_intent(live: &mut Live, mut intent: HostIntent) -> Option<ConnEnd> 
         }
         Ok(Err(error)) => {
             let (fault, surfaced) = queue::classify(&error);
+            // An older session refusing the op it never had is an
+            // ordinary `Surfaced` refusal — the connection is fine, and
+            // the client is not going to stop having focus to report —
+            // so it is said once and then let be.
+            if op == ops::SESSION_SET_FOCUS
+                && matches!(
+                    &surfaced,
+                    HostOpError::Rejected {
+                        code: ServerCode::UnknownOp,
+                        ..
+                    }
+                )
+                && !std::mem::replace(&mut live.focus_unsupported, true)
+            {
+                tracing::info!(
+                    "this host session predates session.set_focus; its attached \
+                     tab suppresses its own notifications"
+                );
+            }
             intent.answer(Err(surfaced));
             match fault {
                 OpFault::Surfaced => None,

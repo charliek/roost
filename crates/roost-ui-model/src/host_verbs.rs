@@ -172,7 +172,7 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
     let mut items = vec![VerbItem::new(
         ADD_ID,
         "Add Host…",
-        "register a session socket",
+        "point Roost at an SSH host or a session socket",
     )];
 
     if hosts.is_empty() && policy.localhost_surface {

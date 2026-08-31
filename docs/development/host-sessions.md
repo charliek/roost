@@ -101,9 +101,46 @@ Two small additions ride the existing events stream as new event types — addit
 
 See [`reference/ipc.md`](../reference/ipc.md#events) for the full event catalog and [`session.set_theme`](../reference/ipc.md#sessionset_theme)'s wire shape.
 
+HS-3 adds one more in the same spirit — [`session.set_focus`](../reference/ipc.md#sessionset_focus), the client's real focus (window focus + which tab is selected), pushed down so the session suppresses notifications for the tab the user is actually looking at rather than for whichever tab its headless workspace defaulted to. It is lease-gated like `set_theme`, and deliberately short-lived: a new lease, the connection that reported it closing, or the live lease's last connection closing all revert the session to "nobody is looking", because a focus is a statement about a window that may no longer exist. An older session answers `unknown-op` and keeps the HS-2 behavior described under [Known limitations](#known-limitations).
+
+## Transport: SSH hosts
+
+A saved host whose target classifies as an SSH destination (`workbox`, `user@host`, `ssh://user@host:port` — the rule table lives on `crates/roost-ipc/src/ssh.rs`'s `classify`) is not a socket forward. The client drives a local Unix-domain-socket bridge of its own — one per connected host — that reaches the remote session over `ssh` directly:
+
+```text
+client (roost-iced)                                    remote machine
+  │
+  ├─ local bridge.sock  ◄── control / events / data connections (per-tab)
+  │        │
+  │        ▼
+  │   ssh -T <target> "sh -c '...exec roost-session client-bridge'"
+  │        (one exec per accepted connection, over a shared private
+  │         ControlMaster — control, events, and each attached tab)
+  │
+  └──────────────────────────────────────────────► roost-session client-bridge
+                                                        │
+                                                        ▼
+                                                 the session's own UDS
+                                                 (stdio pumped ↔ socket,
+                                                  byte for byte)
+```
+
+- **Per-attempt scratch dir, not per-host.** Every connect attempt claims its own directory — `roost-ssh-<host_id>-<pid>-<seq>` under `$TMPDIR` (falling back to `/tmp`; see [`paths.md`](../reference/paths.md#ssh-scratch-directories)) — holding the generated `ssh_config`, the `ControlMaster` control socket, and `bridge.sock`. Naming it per *attempt* rather than per *host* is what lets a double Connect, a disconnect racing the reconnect behind it, or a superseded establish landing late each own a directory nothing else is touching. A fresh attempt sweeps its host's older directories first: this process's own are reclaimed with no probe, and another process's are only reclaimed once its `bridge.sock` probes dead — anything live, or anything that can't be classified, is left alone (fail-safe, the same rule `socket_state` unlinks under).
+- **Establish-then-connect.** Opening a tunnel is two steps: a warm-up `ssh` exec (running the remote no-op `true`) pays for the TCP + auth handshake once, up front, where a failure can be classified and reported as itself — `host.connect` answers `connecting`, not the eventual verdict, exactly as it does for a socket target. Only once the warm-up succeeds does the local `bridge.sock` get bound and start accepting. Every connection accepted after that gets its own `ssh -T … exec roost-session client-bridge` over the same shared master, so a long-lived events connection can never block the next `tab.attach`'s exec behind it — spawn-per-connection is the pinned shape specifically to avoid that deadlock.
+- **One `ssh` binary is trusted the whole way, and it never prompts.** The generated `ssh_config` `Include`s the user's own `~/.ssh/config` and `/etc/ssh/ssh_config` **first** — their settings, including any keepalive of their own, win over Roost's fallback — then appends a `Host *` block (`ServerAliveInterval 15`, `ServerAliveCountMax 4`, `ConnectTimeout 15`). Every invocation runs with `BatchMode=yes`: key/agent auth only, no password and no interactive 2FA prompt, this slice. `ROOST_SSH_BIN` overrides the `ssh` binary (the test suite points it at a fake — `tools/roosttest/fixtures/fake-ssh.sh`).
+- **Teardown is explicit.** Disconnecting runs `ssh -O exit` against the control socket, tearing the shared master down (and every multiplexed connection riding it) before the scratch directory is removed. `SshTunnel`'s `Drop` owes the same teardown synchronously if `shutdown` was never called.
+- **The reason overlay.** A failed connection attempt is classified into one of six families (`SshFailure` — changed/unknown host key, auth, no session, `roost-session` not found, or an opaque transport failure) with copy written for a user to act on. It reaches the sidebar band as `disconnected — <reason>` and the log; an attempt the user asked for additionally raises a toast. See the [user guide's troubleshooting table](../guides/host-sessions.md#troubleshooting) for the full set and remedies.
+- **The wire itself doesn't know it crossed a network.** The bridge is a pure byte pump — the same ROOSTDP2 control/events/data protocol reaches a session over SSH byte-identical to a local socket dial (see [`ipc.md`](../reference/ipc.md#session-sockets)).
+
+**Concurrency depends on the one-attach policy.** A connected host realistically holds on the order of 4-5 concurrent `ssh` channels over the shared master at once — the sequential connect prologue (control, then events) plus one attached tab's data connection, with headroom for an in-flight reconnect — comfortably under sshd's default `MaxSessions 10`. That estimate assumes today's [one-attached-tab-per-host policy](#known-limitations); a future multi-attach slice has to re-check it against `MaxSessions` before it can promise more than one live tab per host.
+
+**Target classification is Rust-only.** `roost-ipc::ssh::classify` — the rule table that decides whether a saved host's `target` string is an SSH destination, a socket path, or the `localhost` sentinel — has no Swift twin. The Swift Mac app treats a host's `target` as an opaque display string (it round-trips the field through its `state.json` mirror per the HS-0 schema-twin rule, but never interprets it); `roostctl host *` against the Swift socket answers `unknown-op` regardless. A future Swift host-client surface needs the classifier's rule table (`ResolvedTransport`'s doc comment in `crates/roost-ipc/src/ssh.rs`) ported or shared, not re-derived from scratch.
+
+For the design rationale, the bootstrap slice (not yet built — install/verify a remote `roost-session`; see the [roadmap](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md#hs-3--ssh-remote-host-the-target-payoff)), and the full failure-mode table, see [`discovery/host-sessions-architecture.md` §10](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md#10-ssh-transport-hs-3).
+
 ## Known limitations
 
-- **A host tab's own attention doesn't reach an attached client.** `roost-session`'s workspace is headless and defaults `window_focused = true` at construction (there's no window to report otherwise), and no op yet exists to push an attached client's real focus state down to it. The regular focus-suppression rule (`suppress := window is active AND the target tab is the active tab`, [Notifications → Focus policy](../guides/notifications.md#focus-policy)) therefore reads as permanently satisfied for whichever tab a client has attached to, so `notification.fired` never fires for that one tab — every other tab on the host is unaffected. Recorded at C8 of plan 037; closing it is HS-3 work (it needs a client-focus op on the session wire, which doesn't exist today).
+- **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten when the lease turns over or its last connection closes. It remains true against a session too old to serve the op — that refusal is harmless (`unknown-op`, logged once per connection) and leaves HS-2's behavior: `notification.fired` never fires for whichever tab that session considers active.
 - **Kitty images render blank after attach.** The snapshot payload doesn't currently carry Kitty graphics protocol state (architecture §5).
 - **Missed-while-detached effects and notifications are not replayed.** The mirror and the attach path both reflect *current* state on (re)connect; a bell or clipboard write that fired while nobody was attached is gone, by design (non-goal, not a bug).
 - **One data connection per tab, one attached tab per host at a time from this client.** Multi-attach / warm pools are explicit future work, not a current constraint anyone hits by accident — the server's own per-session token quota (16 outstanding) is nowhere close to being pressured by a single client's one-tab-at-a-time policy.

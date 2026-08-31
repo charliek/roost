@@ -12,6 +12,7 @@
 //! [`sections`] answers empty, and the sidebar keeps exactly the chrome
 //! it has today.
 
+use crate::agent_palette::truncate_chars;
 use crate::keys::{HostId, ProjectKey};
 
 /// The LOCAL band's label. Reserved as a host label too — a saved host
@@ -77,6 +78,32 @@ impl SectionState {
         }
     }
 
+    /// [`Self::status_text`] with the connection's own one-line reason
+    /// folded in: `disconnected — the host key for box has CHANGED…`.
+    ///
+    /// Only the disconnected word takes a reason, and only one that adds
+    /// something. An explicit disconnect's reason is the word itself
+    /// (`"disconnected"`), and `disconnected — disconnected` says less
+    /// than the bare word does — so a reason that merely repeats the
+    /// word, or is blank once trimmed, renders bare.
+    ///
+    /// The result is capped at [`ROLLUP_MAX_CHARS`] *including* the
+    /// ellipsis, by the same rule `agent_palette` ellipsizes its rows
+    /// with: an ssh failure's copy is a sentence written for a status
+    /// banner, and the band is a right-aligned slot in a sidebar. The
+    /// full text is what the toast and the log carry.
+    pub fn status_text_with_reason(self, reason: Option<&str>) -> Option<String> {
+        let word = self.status_text()?;
+        let reason = reason
+            .filter(|_| self == Self::Disconnected)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty() && !reason.eq_ignore_ascii_case(word));
+        Some(match reason {
+            Some(reason) => truncate_chars(&format!("{word} — {reason}"), ROLLUP_MAX_CHARS),
+            None => word.to_string(),
+        })
+    }
+
     /// Whether an inline "↻ Reconnect" row sits under the section.
     /// Everything that is not connected offers it — including
     /// `NeedsRestart`, where connecting again is how the upgrade dialog
@@ -109,6 +136,9 @@ impl SectionState {
     }
 }
 
+/// The widest rollup the band draws, ellipsis included.
+pub const ROLLUP_MAX_CHARS: usize = 60;
+
 /// One saved host, as the sidebar assembly reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostInput<'a> {
@@ -122,6 +152,11 @@ pub struct HostInput<'a> {
     pub state: SectionState,
     /// How many agent rows this host contributes, for the rollup.
     pub agents: usize,
+    /// The connection's own one-line reason, when it has one worth
+    /// naming — an ssh failure, a transport drop. Folded into the rollup
+    /// by [`SectionState::status_text_with_reason`]; `None` is the bare
+    /// word.
+    pub reason: Option<&'a str>,
 }
 
 /// One rendered section header, in sidebar order.
@@ -172,8 +207,7 @@ pub fn sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
             state: host.state,
             rollup: host
                 .state
-                .status_text()
-                .map(str::to_string)
+                .status_text_with_reason(host.reason)
                 .or_else(|| agent_rollup(host.agents)),
         });
     }
@@ -277,6 +311,18 @@ mod tests {
             host: HostId::new(1),
             state,
             agents,
+            reason: None,
+        }
+    }
+
+    fn host_because(
+        saved_id: &'static str,
+        state: SectionState,
+        reason: &'static str,
+    ) -> HostInput<'static> {
+        HostInput {
+            reason: Some(reason),
+            ..host(saved_id, state, 0)
         }
     }
 
@@ -333,6 +379,104 @@ mod tests {
                 Some("taken over"),
             ]
         );
+    }
+
+    /// The bare word is what a host with nothing to add renders — the
+    /// pre-HS-3 rollup, unchanged.
+    #[test]
+    fn a_reasonless_disconnect_still_renders_the_bare_word() {
+        assert_eq!(
+            SectionState::Disconnected
+                .status_text_with_reason(None)
+                .as_deref(),
+            Some("disconnected")
+        );
+        for blank in ["", "   ", "\n"] {
+            assert_eq!(
+                SectionState::Disconnected
+                    .status_text_with_reason(Some(blank))
+                    .as_deref(),
+                Some("disconnected"),
+                "{blank:?}"
+            );
+        }
+        // An explicit disconnect's own reason IS the word; saying it
+        // twice is less informative than saying it once.
+        assert_eq!(
+            SectionState::Disconnected
+                .status_text_with_reason(Some("disconnected"))
+                .as_deref(),
+            Some("disconnected")
+        );
+    }
+
+    #[test]
+    fn a_reason_is_appended_to_the_disconnected_word() {
+        assert_eq!(
+            SectionState::Disconnected
+                .status_text_with_reason(Some("  the session closed  "))
+                .as_deref(),
+            Some("disconnected — the session closed"),
+            "and the reason is trimmed on the way in"
+        );
+    }
+
+    /// Long copy is the normal case for an ssh failure — the messages are
+    /// written for a status banner, and the band is a narrow slot.
+    #[test]
+    fn a_long_reason_is_ellipsized_to_the_cap() {
+        let rollup = SectionState::Disconnected
+            .status_text_with_reason(Some(&"x".repeat(200)))
+            .expect("a disconnected section has a rollup");
+        assert_eq!(rollup.chars().count(), ROLLUP_MAX_CHARS);
+        assert!(rollup.ends_with('…'));
+        assert!(rollup.starts_with("disconnected — "));
+
+        // The boundary: exactly the cap is not truncated.
+        let exact = "y".repeat(ROLLUP_MAX_CHARS - "disconnected — ".chars().count());
+        let rollup = SectionState::Disconnected
+            .status_text_with_reason(Some(&exact))
+            .expect("a disconnected section has a rollup");
+        assert_eq!(rollup.chars().count(), ROLLUP_MAX_CHARS);
+        assert!(!rollup.ends_with('…'));
+    }
+
+    /// Only `disconnected` takes a reason. The other words already name
+    /// a specific outcome, and a transport line beside "taken over" would
+    /// describe the connection that ended rather than the state.
+    #[test]
+    fn only_the_disconnected_word_takes_a_reason() {
+        for state in [
+            SectionState::Connecting,
+            SectionState::NeedsRestart,
+            SectionState::TakenOver,
+            SectionState::Stopped,
+        ] {
+            assert_eq!(
+                state.status_text_with_reason(Some("a reason")).as_deref(),
+                state.status_text(),
+                "{state:?}"
+            );
+        }
+        for state in [SectionState::Local, SectionState::Connected] {
+            assert_eq!(state.status_text_with_reason(Some("a reason")), None);
+        }
+    }
+
+    /// A reason reaches the band through `sections`, and the agent count
+    /// still loses to it — a host that cannot be reached cannot vouch for
+    /// a count.
+    #[test]
+    fn the_bands_rollup_carries_the_reason() {
+        let sections = sections(&[
+            host_because("a", SectionState::Disconnected, "ssh: connection refused"),
+            host("b", SectionState::Disconnected, 3),
+        ]);
+        assert_eq!(
+            sections[1].rollup.as_deref(),
+            Some("disconnected — ssh: connection refused")
+        );
+        assert_eq!(sections[2].rollup.as_deref(), Some("disconnected"));
     }
 
     #[test]

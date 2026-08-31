@@ -13,9 +13,12 @@ writes) and theme reseed (`session.set_theme`) that were still design
 in §6; see
 [`docs/development/host-sessions.md`](../docs/development/host-sessions.md)
 for how the client actually landed (§9 deviated — noted in place).
-What remains design is SSH (§10). This file is the technical design
-the HS milestone plans implement, and stays normative for HS-3; status
-annotations below mark what shipped when. Companion docs:
+SSH transport slice 1 (plan 038, C1-C6) has since shipped too — §10
+below is now shipped design, annotated in place; the bootstrap slice
+(auto-install/verify a remote `roost-session`) remains design. This
+file is the technical design the HS milestone plans implement, and
+stays normative for the rest of HS-3; status annotations below mark
+what shipped when. Companion docs:
 [`host-sessions-roadmap.md`](host-sessions-roadmap.md) (milestones,
 pinned direction, the HS-1a/HS-1b split) and
 [`host-sessions.md`](host-sessions.md) (rationale). For the shipped
@@ -682,10 +685,32 @@ deviation is the client-notification step of Stop, noted inline.
 
 ## 10. SSH transport (HS-3)
 
+**Shipped in HS-3 slice 1 (plan 038).** The transport described below
+landed as designed, with one detail sharper than sketched here: the
+scratch directory holding the generated `ssh_config`, the
+`ControlMaster` control socket, and the local bridge socket is claimed
+per connect **attempt** (`roost-ssh-<host_id>-<pid>-<seq>`), not per
+saved host — a fresh attempt sweeps its host's older directories first
+(reclaiming this process's own outright, probing another process's
+`bridge.sock` before touching it, fail-safe on anything live or
+unclassifiable) rather than one directory being reused or fought over
+across overlapping lifecycle paths. See
+[`docs/development/host-sessions.md` → Transport: SSH hosts](../docs/development/host-sessions.md#transport-ssh-hosts)
+for the shipped shape and
+[`docs/reference/paths.md`](../docs/reference/paths.md#ssh-scratch-directories)
+for the exact paths. What remains design here is the **bootstrap**
+half below (detect/install/verify a remote `roost-session` — not yet
+built). OSC 52 clipboard policy over SSH is settled (writes forward to
+the attached client's own machine under its `clipboard-write` setting;
+reads stay dropped everywhere, SSH included — [`config.md`](../docs/reference/config.md#clipboard-write));
+remote image paste stays deferred (roadmap open questions).
+
 Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 
 ```text
- client ── UDS ── local bridge ── ssh -T host 'exec roost-session bridge'
+ client ── UDS ── local bridge ── ssh -T host 'sh -c "…exec roost-session client-bridge"'
+                                        │ (the shipped remote command prefers
+                                        │  $HOME/.local/bin/roost-session, then PATH)
                                         │ (per accepted connection,
                                         │  shared ControlMaster)
                               far side: connect to local session UDS,

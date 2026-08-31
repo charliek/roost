@@ -493,7 +493,11 @@ fn normalize_line(text: &str) -> String {
 }
 
 /// Tail-ellipsize to at most `max` characters *including* the ellipsis.
-fn truncate_chars(text: &str, max: usize) -> String {
+///
+/// Shared with `host_sidebar`'s band rollup: the two slots sit in the
+/// same sidebar and an ellipsis that meant two different widths
+/// depending on which one drew it would read as a bug.
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }

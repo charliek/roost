@@ -1,0 +1,8 @@
+{
+  "id": "9",
+  "op": "session.set_focus",
+  "params": {
+    "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+    "focused_tab_id": "5"
+  }
+}

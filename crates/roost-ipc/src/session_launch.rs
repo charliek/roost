@@ -223,11 +223,13 @@ fn one_line(reason: &str, budget: usize) -> String {
 
 /// The `target` spelling that means "this machine's own session".
 ///
-/// Everything else is a socket path — including, in HS-2, the local end
-/// of an `ssh -L` forward, which is what makes a remote machine
-/// reachable with no SSH code on this side (HS-3 makes `ssh://` targets
-/// first-class).
-pub const LOCALHOST_TARGET: &str = "localhost";
+/// Re-exported from [`crate::ssh`], where [`crate::ssh::classify`]
+/// documents the full rule table this sentinel is rule 2 of — that
+/// module is the pure classification layer `resolve_target` is now
+/// built on, so the constant's canonical home moved with it. Kept as a
+/// re-export here so every existing `session_launch::LOCALHOST_TARGET`
+/// import keeps compiling unchanged.
+pub use crate::ssh::LOCALHOST_TARGET;
 
 /// Resolve a saved host's `target` to a socket path, and say whether it
 /// is this machine's own session.
@@ -238,11 +240,23 @@ pub const LOCALHOST_TARGET: &str = "localhost";
 /// UI (`host_conn`) and `roostctl host add --verify` resolve through
 /// here so a target can never mean two different sockets depending on
 /// which binary read it.
+///
+/// A thin front door onto [`crate::ssh::classify`], kept at this
+/// `(PathBuf, bool)` shape so every existing caller compiles untouched.
+/// It cannot keep that shape for an ssh target — there is no socket
+/// path to hand back until C3's tunnel runtime dials one — so an ssh
+/// target is a hard error here. [`crate::ssh::classify`] is the new
+/// front door for a caller that needs to branch on all three kinds of
+/// target; this one stays for the two kinds it can still answer.
 pub fn resolve_target(target: &str) -> Result<(PathBuf, bool)> {
-    if target == LOCALHOST_TARGET {
-        return Ok((crate::paths::BundleProfile::session()?.socket_path, true));
+    match crate::ssh::classify(target)? {
+        crate::ssh::ResolvedTransport::LocalSession(path) => Ok((path, true)),
+        crate::ssh::ResolvedTransport::UnixSocket(path) => Ok((path, false)),
+        crate::ssh::ResolvedTransport::Ssh(ssh_target) => Err(anyhow!(
+            "{:?} resolves through the ssh tunnel, not a socket path — HS-3",
+            ssh_target.raw
+        )),
     }
-    Ok((PathBuf::from(target), false))
 }
 
 /// Resolve a prospective host's target, dial it, and check it is a
@@ -261,7 +275,15 @@ pub fn resolve_target(target: &str) -> Result<(PathBuf, bool)> {
 /// copy would be the one nobody updated.
 pub async fn verify_target(target: &str, budget: Duration) -> Result<SessionIdentify> {
     let (socket, _localhost) = resolve_target(target)?;
-    let identity = identify(&socket, budget)
+    verify_socket(&socket, budget).await
+}
+
+/// [`verify_target`]'s second half, for a caller that has already
+/// resolved the socket — [`crate::ssh::verify_transport`] classifies
+/// once and dispatches on the answer, and re-deriving the path from the
+/// raw string would be the second resolve this module exists to prevent.
+pub async fn verify_socket(socket: &Path, budget: Duration) -> Result<SessionIdentify> {
+    let identity = identify(socket, budget)
         .await
         .with_context(|| format!("{} did not answer", socket.display()))?;
     if identity.session_protocol != crate::messages::SESSION_PROTOCOL_VERSION {
@@ -555,7 +577,11 @@ pub async fn spawn_and_read_verdict(bin: &Path, cwd: &Path, budget: Duration) ->
 /// Wait for the launcher to exit, but no later than `deadline`; kill and
 /// reap it if it outlives that. Never returns a zombie and never
 /// outlives the budget.
-async fn reap_by(child: &mut Child, deadline: Instant) {
+///
+/// `pub(crate)` for [`crate::ssh`]'s tunnel runtime, which reaps its
+/// `ssh` children under exactly this discipline — the shape of "bounded
+/// wait, then SIGKILL" is not worth having two of.
+pub(crate) async fn reap_by(child: &mut Child, deadline: Instant) {
     if tokio::time::timeout_at(deadline, child.wait())
         .await
         .is_err()
@@ -848,16 +874,21 @@ mod tests {
                 .socket_path
         );
 
-        for target in [
-            "/tmp/roost-popos.sock",
-            "/var/run/localhost/roost.sock",
-            "localhost.sock",
-            "Localhost",
-            "",
-        ] {
+        for target in ["/tmp/roost-popos.sock", "/var/run/localhost/roost.sock"] {
             let (socket, localhost) = resolve_target(target).expect("resolve a path target");
             assert!(!localhost, "{target:?} is a socket path, not the sentinel");
             assert_eq!(socket, PathBuf::from(target));
+        }
+
+        // HS-3: a bare token with no path separator is now classified
+        // as an ssh target (`crate::ssh::classify` rule 6), not a
+        // same-directory socket path — `resolve_target` cannot produce
+        // a `PathBuf` for one and errors instead of silently treating
+        // it as a filename. Empty targets are likewise now a hard
+        // error (classify rule 1) rather than an empty-string path.
+        for target in ["localhost.sock", "Localhost", ""] {
+            resolve_target(target)
+                .expect_err(&format!("{target:?} must not resolve to a socket path"));
         }
     }
 

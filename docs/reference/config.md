@@ -151,6 +151,17 @@ the clipboard from a remote process is the more sensitive direction
 (shoulder-surfing a password manager value). This will become its own
 `clipboard-read = allow | ask | deny` setting in phase 2.
 
+This posture is unconditional across a host session's SSH transport too:
+a read request is parsed and dropped identically whether the terminal
+it arrived on is local or attached over SSH to a remote host — reading
+is *more* sensitive, not less, when the process asking runs on a
+machine you don't sit at, so there's no separate carve-out for it. A
+**write** from a program on a remote host still lands on **this**
+machine's clipboard, subject to the same `clipboard-write` setting
+above — the session forwards the OSC 52 write to whichever client
+currently holds the tab, and that client's own `clipboard-write`
+config decides whether it's applied.
+
 ### Targets
 
 OSC 52 carries a `Ps` selector indicating which clipboard to write:

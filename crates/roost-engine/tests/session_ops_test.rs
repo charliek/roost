@@ -120,7 +120,11 @@ fn accounted(report: &SessionStopResult) -> Vec<i64> {
 async fn a_ui_socket_does_not_know_the_session_ops() {
     let f = fixture(false);
 
-    for op in [ops::SESSION_IDENTIFY, ops::SESSION_STOP] {
+    for op in [
+        ops::SESSION_IDENTIFY,
+        ops::SESSION_STOP,
+        ops::SESSION_SET_FOCUS,
+    ] {
         let err = call(&f.handler, op, serde_json::json!({}))
             .await
             .expect_err("a UI socket must not serve session ops");
@@ -256,6 +260,18 @@ async fn session_stop_reaps_latches_and_finalizes() {
     )
     .await
     .expect_err("project.create after stop");
+    assert_eq!(err.code, "shutting-down");
+
+    // The latch is checked before the lease gate, so a stopping session
+    // says what is actually wrong rather than sending a client off to
+    // re-`session.connect` into a session that is going away.
+    let err = call(
+        &f.handler,
+        ops::SESSION_SET_FOCUS,
+        serde_json::json!({"lease": "0".repeat(32), "focused_tab_id": null}),
+    )
+    .await
+    .expect_err("session.set_focus after stop");
     assert_eq!(err.code, "shutting-down");
 
     // Idempotent-reject: a second stop gets the same answer, and never

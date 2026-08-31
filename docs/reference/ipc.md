@@ -1125,7 +1125,7 @@ A session socket answers `unknown-op` for every verb here — the same "no shado
 
 | Op | Request params | Notes |
 |---|---|---|
-| `host.add` | `{"label": "pop-os", "target": "/home/charlie/.local/state/roost/roost-session.sock"}` | Saves a host. Registry-only — this does **not** dial `target`, so a typo'd socket path still saves cleanly (the sidebar's dot reports it at the next connect attempt). `label` is trimmed, must be non-empty, Unicode-case-insensitive unique, and not `"local"` (the reserved LOCAL band). Response: `{"host": <Host>}`. |
+| `host.add` | `{"label": "pop-os", "target": "/home/charlie/.local/state/roost/roost-session.sock"}` | Saves a host. `target` is carried **opaquely by this op** — the workspace stores whatever string it's given, unvalidated — so classifying it (`roost_ipc::ssh::classify`: an SSH destination like `workbox` / `user@host` / `ssh://user@host:port`, only the `ssh://` spelling carrying a port; a Unix socket path, containing `/`; or the `localhost` sentinel) and refusing an unclassifiable string (empty, a leading `-`, a bare `host:port` with no scheme) is each **caller's** job, done client-side before this op is ever sent — `roostctl host add` and the Add Host dialog both classify first and never call this op on a target that fails. Registry-only beyond that — this does **not** dial `target`, so a typo'd-but-classifiable target still saves cleanly (the sidebar's dot reports it at the next connect attempt). `label` is trimmed, must be non-empty, Unicode-case-insensitive unique, and not `"local"` (the reserved LOCAL band). Response: `{"host": <Host>}`. |
 | `host.remove` | `{"id": "3f9a2b7c1d4e4f5a"}` | Forgets a saved host — the registry entry and the dimmed rows its last connection left behind. Never touches the session itself: its shells keep running. Response: `{}`. |
 | `host.list` | `{}` | Response: `{"hosts": [<Host>, ...]}`. |
 | `host.connect` | `{"id": "3f9a2b7c1d4e4f5a"}` | Starts (or restarts) a connection. Unconditional takeover — reconnecting IS takeover on this wire — and on a **localhost** target it spawns the session first if nothing is listening. Answers as soon as the attempt is under way, with the state the request *asked for* (`"connecting"`), not the far end's eventual verdict — watch the sidebar or poll `host.list` for the settled state. Response: `{"host": <Host>, "state": "connecting"}`. |
@@ -1230,10 +1230,14 @@ session-only op — which is how a client tells the two kinds of socket
 apart.
 
 The order a client runs them in is `session.identify` →
-`session.connect` → `events.subscribe` / `tab.attach`. Only the second
-half of that is enforced: `identify` is a stateless read and nothing
-requires it first, but the lease *is* required, and the ops that need
-it say so by name.
+`session.connect` → `session.set_theme` / `session.set_focus` →
+`events.subscribe` / `tab.attach`. Only the lease part of that is
+enforced: `identify` is a stateless read and nothing requires it first,
+but the lease *is* required, and the ops that need it say so by name.
+The two `set_*` ops are placed where they are because both state
+something the session would otherwise guess wrong — its palette and
+whose window is looking at it — and both are re-stated whenever the
+client's own answer changes.
 
 ### Session sockets
 
@@ -1258,6 +1262,8 @@ silently inherits a loosened directory. On shutdown the session unlinks
 its socket only if the path still resolves to the `(dev, ino)` it bound
 — a guard against removing a different, later session's live socket at
 the same path.
+
+**The wire is byte-identical over SSH.** A host session reached over an SSH target (host-sessions HS-3) is not a distinct protocol — the client's local bridge socket and the far side's `roost-session client-bridge` are a pure byte pump between this socket and the client's control/events/data connections, so every op and frame on this page crosses SSH exactly as written here. See [Host sessions (development) → Transport: SSH hosts](../development/host-sessions.md#transport-ssh-hosts) for the transport itself (per-connection `ssh` exec over a shared `ControlMaster`, the classified-failure surface); the classifier deciding whether a saved host's `target` is an SSH destination, a socket path, or `localhost` is [`host.add`'s](#host-registry-host) concern, not this socket's.
 
 `roostctl session start|stop|status` address this socket directly; they
 are a pre-connect carve-out (`session start` has to work when nothing is
@@ -1479,6 +1485,44 @@ Response: `{"tabs": 3}` — the number of live tabs whose server Terminal was re
 A client sends this **immediately after `session.connect` and before its first `tab.attach`** — attaching before the theme lands would paint the session's factory colors for one frame — and again whenever its own theme changes thereafter. Concurrent callers are last-writer-wins by design: the theme store mints a generation on every apply, so a `set_theme` racing a tab spawn is caught up at promotion rather than silently lost, and interleaved fan-outs converge on the newest theme instead of whichever send landed last.
 
 Like `session.connect`, this answers `shutting-down` once `session.stop` has latched.
+
+### `session.set_focus`
+
+Tell the session which of its tabs the attached client is actually looking at. Lease-gated: focus is a property of the client driving the session, so a client that does not drive it does not get to state one.
+
+Request:
+```json
+{"id": "9", "op": "session.set_focus", "params": {
+  "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+  "focused_tab_id": "5"
+}}
+```
+
+Response: `{}` — nothing to report beyond "applied".
+
+**Why it exists.** A session is headless: it has no window, so its workspace defaults to *focused*, and its active tab is whatever its restored layout selected. The [focus-suppression rule](../guides/notifications.md#focus-policy) — `suppress := the window is focused AND this is the active tab` — is therefore permanently satisfied for one tab per session, and a **suppressed raise emits nothing at all** (no pending bit, no `notification.fired`, no badge). Without this op, that one tab's agent can never reach an attached client. With it, the client that *does* have a window states the truth and the session suppresses the tab the user is really looking at.
+
+**`focused_tab_id` is required, and nullable.** `null` means "nothing on this session is being looked at" — the client's window lost focus, or its selection moved to another host or to a local tab. An **omitted** field is not the same statement and is refused with `missing-param`: a client that forgot to say is exactly the one that must not be guessed for, since guessing "focused" re-creates the mute this op exists to fix.
+
+**Validation order**, for the same reason `tab.attach` pins one — each failure names a different thing to fix:
+
+1. `missing-param` / `invalid-param` — the field is absent, or is neither a decimal-string tab id nor null. Decode comes first of necessity: the lease itself rides inside the params, so an envelope that does not decode cannot present one.
+2. `connect-required` / `taken-over` — the lease gate.
+3. `not-found` — a tab id this session does not have.
+
+The apply is one workspace transaction and `not-found` leaves **nothing** applied: a client naming a tab that just closed must not flip the session to "focused" against whatever tab happened to be active. On success with an id, the session both marks itself focused and moves its own active selection (and its persisted selection) onto that tab, exactly as [`tab.focus`](#tabfocus) would; re-stating a focus that is already current emits no `active.changed`, so a reconnecting client's re-assert costs other clients no re-render. `null` moves the flag alone and leaves the selection where it is, so a reconnect restores the same tab.
+
+**A focus does not outlive the client that reported it.** The lease deliberately outlives its connections, but the focus does not: the session reverts to "nobody is looking" (the flag only — the selection stays) when
+
+* a new lease is minted, `session.connect` takeover included;
+* the connection that sent the `session.set_focus` closes; and
+* the last connection registered under the live lease closes.
+
+The middle one is what keeps the reset independent of ordering: a client re-dialing on the same lease can register before the departed client's close is noticed, and counting live connections alone would then leave a gone client's focus standing.
+
+A client therefore re-states its focus right after `session.connect`, and again whenever its window focus or selection moves — including when the session's own `active.changed` reports a move away from the stated focus (a lease-free `tab.focus` from a script would otherwise park the suppressed slot on a tab nobody is watching until the client's next natural edge). A session one release older answers `unknown-op`, which is a refusal like any other: the connection is unaffected and the client keeps HS-2's behavior (the attached tab suppresses its own notifications). The reverse pairing — a session with this op driven by an older client that never sends it — errs the loud way: the connect-time reset leaves the session unfocused, so nothing is suppressed and the attached tab's notifications fire rather than vanish.
+
+Like `session.connect`, this answers `shutting-down` once `session.stop` has latched — the latch is checked *before* the lease gate, so a stopping session says so rather than sending a client off to reconnect.
 
 ### `tab.attach`
 

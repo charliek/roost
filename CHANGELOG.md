@@ -13,6 +13,48 @@ release workflow asserts they agree).
 
 ### Added
 
+- **Host sessions reach a remote machine over SSH directly (HS-3 transport
+  slice, plan 038)** — a saved host's target can now be an SSH destination
+  (`workbox`, `user@host`, `ssh://user@host:port` — only the `ssh://`
+  spelling carries an explicit port) as well as a Unix socket path, in
+  both the palette's **Add Host…** dialog (its Target field) and
+  `roostctl host add --target`. Roost drives its own `ssh` — one `ssh -T
+  … exec roost-session client-bridge` per accepted connection (control,
+  events, each attached tab), multiplexed over a private, per-host
+  `ControlMaster` so a long-lived events stream can never block the next
+  tab's exec behind it. The generated `ssh_config` includes the user's
+  own `~/.ssh/config` first, so their own keepalives win, falling back to
+  a `ServerAliveInterval`/`ConnectTimeout` pair only where the user has
+  none; every invocation runs `BatchMode=yes` — key/agent auth only, this
+  slice, no password or interactive 2FA prompt. A failed connection is
+  classified into one of six families — changed host key (never offers
+  to accept it), unknown host key, auth refused, no session running,
+  `roost-session` not found (the non-interactive-PATH gotcha), or an
+  opaque transport failure — each with copy written for a user to act on,
+  surfacing in the sidebar band as `disconnected — <reason>` and, for an
+  attended attempt, a toast. `--verify` (`host add` and the dialog's "Add
+  & Connect") probes an SSH target with a one-shot, mux-less `ssh` exec
+  before saving, so a typo or an unreachable host is caught immediately
+  and nothing is left running either way. `ROOST_SSH_BIN` overrides the
+  `ssh` binary. See the [Host Sessions guide](docs/guides/host-sessions.md#adding-a-remote-host-over-ssh)
+  and [`docs/development/host-sessions.md`](docs/development/host-sessions.md#transport-ssh-hosts)
+  for the shape, and [`docs/reference/ipc.md`](docs/reference/ipc.md) for
+  the wire (byte-identical over SSH — the far side is a pure byte pump).
+  The bootstrap half of this milestone (auto-detect/install/verify a
+  remote `roost-session` binary) is not part of this slice — a target
+  needs `roost-session` already reachable on its non-interactive `PATH`.
+- **`session.set_focus` closes the HS-2 attention gap** — a session now
+  learns the client's real focus (window focus + which tab is selected),
+  pushed right after `session.connect` and on every edge that moves it,
+  so the [focus-suppression rule](docs/guides/notifications.md#focus-policy)
+  applies to the tab a client is actually looking at instead of
+  whichever tab a headless session's `window_focused = true` default
+  happened to pick. The stated focus is deliberately short-lived — a new
+  lease, the reporting connection closing, or the lease's last
+  connection closing all revert the session to "nobody is looking" — so
+  a stale claim can never linger past the client that made it. A session
+  one release older answers `unknown-op` and keeps HS-2's behavior. See
+  [`docs/reference/ipc.md`](docs/reference/ipc.md#sessionset_focus).
 - **The iced UI attaches to host sessions (HS-2, #374)** — closing Roost
   no longer has to kill what is running in it. Save a `roost-session`
   socket as a **host** (`roostctl host add` or the palette's **Add
@@ -127,6 +169,16 @@ release workflow asserts they agree).
 
 ### Changed
 
+- **A saved host's `target` string is classified differently (host-sessions
+  HS-3, plan 038)** — now that a target can mean an SSH destination as well
+  as a socket path, the rules changed to keep the two unambiguous: the
+  string is **trimmed** before it's read; a target with no `/` in it (a
+  bare word like `roost.sock`, or a relative filename) used to resolve as
+  a same-directory socket path and now reads as an SSH hostname instead —
+  spell a relative socket path `./roost.sock` to keep the old meaning;
+  and an **empty** target (after trimming) is now refused outright rather
+  than saved as a host nothing could ever reach. Absolute paths, `~`-paths,
+  and explicit `./`/`../`-paths are unaffected.
 - **`roostctl --target linux` replaces `--target gtk`**, and
   `ROOST_BUNDLE_PROFILE=linux` replaces `=gtk`. There is no `gtk` alias: a
   stale `ROOST_BUNDLE_PROFILE=gtk` makes `roostctl` fail loudly with

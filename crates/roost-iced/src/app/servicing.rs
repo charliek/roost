@@ -235,14 +235,13 @@ fn notification_activation(
 /// plan 037 §4's non-goal; a connect mirrors current state, never a
 /// backlog.
 ///
-/// XXX: a session's own workspace defaults `window_focused = true`
-/// (`workspace.rs:152`) and nothing pushes the client's focus to it, so
-/// `attention_suppressed_by_focus` drops `notification.fired` for
-/// whichever tab that session considers active — the one host tab whose
-/// agent cannot reach this path. No op exists to push client focus to a
-/// session and plan 037 §3.6 pinned the server additions to effects +
-/// `session.set_theme`, so it is HS-3 work, documented here rather than
-/// papered over client-side.
+/// A session's own workspace has no window, so what it suppresses is
+/// decided by what this client tells it: `session.set_focus` (plan 038
+/// §C6) pushes the selection + window-focus truth down at every edge
+/// that moves it, and the session's `attention_suppressed_by_focus`
+/// then reads the same focus the user has. A session too old to serve
+/// that op refuses it harmlessly and keeps HS-2's behavior — its
+/// attached tab suppresses its own `notification.fired`.
 #[derive(Debug)]
 enum HostEnvelopeAction {
     Effect(roost_ipc::messages::TabEffectEvent),
@@ -253,6 +252,13 @@ enum HostEnvelopeAction {
     TabClosed(i64),
     /// The project is gone: retire every row under it.
     ProjectDeleted(i64),
+    /// The session's active row moved. Only interesting when it moved
+    /// *away* from this client's focus claim — a lease-less third party
+    /// (`tab.focus`, `tab.open`) can park the session's selection on a
+    /// tab nobody is watching, which the suppression predicate would
+    /// then mute at the source until this client's next natural edge.
+    /// Re-asserting the claim closes that window.
+    ActiveMoved(i64),
     /// A workspace fact the mirror already folded in, or an event from a
     /// newer session this client does not know. Both are silent by
     /// contract (`ipc.md` #versioning: old clients ignore new events).
@@ -294,6 +300,10 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
         ops::EVENT_PROJECT_DELETED => decode::<ProjectDeletedEvent>(envelope)
             .map_or_else(HostEnvelopeAction::Undecodable, |event| {
                 HostEnvelopeAction::ProjectDeleted(event.project_id)
+            }),
+        ops::EVENT_ACTIVE_CHANGED => decode::<roost_ipc::messages::ActiveChangedEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
+                HostEnvelopeAction::ActiveMoved(event.tab_id)
             }),
         _ => HostEnvelopeAction::Ignore,
     }
@@ -829,6 +839,13 @@ impl App {
                 HostEnvelopeAction::ProjectDeleted(project_id) => {
                     self.retire_project_notifications(ProjectKey::new(host, project_id));
                 }
+                HostEnvelopeAction::ActiveMoved(tab_id) => {
+                    // Our own set_focus echoes back as a move that
+                    // matches the claim, so this cannot ping-pong.
+                    if self.hosts.focus_claim_disagrees(host, tab_id) {
+                        self.push_host_focus();
+                    }
+                }
                 HostEnvelopeAction::Undecodable(error) => tracing::debug!(
                     ?host, event = %envelope.event, %error,
                     "a host event envelope did not decode"
@@ -1221,6 +1238,13 @@ impl App {
                             if let Err(error) = self.workspace.touch_host_connected(&host) {
                                 tracing::debug!(%host, %error, "could not stamp last_connected");
                             }
+                            // A session that just came up believes it is
+                            // focused on its own restored tab, and the
+                            // connect task cannot know better — the
+                            // selection is the UI's. Told here, on the
+                            // edge where the lease exists and the queue
+                            // is draining.
+                            self.push_host_focus();
                         }
                         // Attributed (not a stale task's publication): the
                         // app-side purge follows the set's — everything
@@ -1235,6 +1259,7 @@ impl App {
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
                 }
+                EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -1700,11 +1725,19 @@ impl App {
                         section.incarnation,
                         section.mirror.map(|mirror| mirror.read()),
                     ),
-                    // Not being driven at all reads as disconnected: the
-                    // section is listed with a ↻, which is the whole of
-                    // the "no daemon is spawned silently" rule on screen.
+                    // Not being driven at all reads as disconnected —
+                    // the section is listed with a ↻, which is the whole
+                    // of the "no daemon is spawned silently" rule on
+                    // screen — unless an ssh establish is in flight,
+                    // which is `connecting` on the band exactly like a
+                    // dial would be.
+                    None if self.hosts.establishing(&host.id) => {
+                        (host_sidebar::SectionState::Connecting, None, None)
+                    }
                     None => (host_sidebar::SectionState::Disconnected, None, None),
                 };
+                // Taken before `host.id` is moved into the view.
+                let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 super::HostView {
                     saved_id: host.id,
                     // The registry's label wins over the connection's:
@@ -1714,7 +1747,12 @@ impl App {
                     // Same reason the label comes from here: the verb
                     // policy has to know whether a host is this
                     // machine's own *before* anything connects to it.
-                    localhost: host.target == crate::host_conn::LOCALHOST_TARGET,
+                    // The classifier's own rule rather than a raw `==`:
+                    // the sentinel is trimmed before it is matched, so a
+                    // saved `" localhost"` is the local session
+                    // everywhere or nowhere.
+                    localhost: roost_ipc::ssh::target_is_localhost(&host.target),
+                    reason,
                     host: incarnation.unwrap_or(HostId::LOCAL),
                     state,
                     projects: mirror
@@ -1768,6 +1806,7 @@ impl App {
                     host: view.host,
                     state: view.state,
                     agents: view.agents,
+                    reason: view.reason.as_deref(),
                 })
                 .collect::<Vec<_>>(),
         );
@@ -2405,12 +2444,16 @@ impl App {
         // reply and the dot drawn beside it can never disagree. A host
         // this app is not driving at all reads as disconnected, which is
         // exactly what its section shows.
-        let state = self
-            .hosts
-            .state(&host.id)
-            .map_or(host_sidebar::SectionState::Disconnected, |state| {
-                state.section_state()
-            });
+        let state = self.hosts.state(&host.id).map_or_else(
+            || {
+                if self.hosts.establishing(&host.id) {
+                    host_sidebar::SectionState::Connecting
+                } else {
+                    host_sidebar::SectionState::Disconnected
+                }
+            },
+            |state| state.section_state(),
+        );
         HostConnectionResult {
             host: host.into(),
             state: state.wire().to_string(),

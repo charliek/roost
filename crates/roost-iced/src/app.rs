@@ -1051,6 +1051,20 @@ fn host_selection_detach(
     Some(previous.tab)
 }
 
+/// Which host tab this client is *looking at*, as `session.set_focus`
+/// states it: the selected host tab when the window has focus, and
+/// nothing otherwise.
+///
+/// The whole edge computation, split out from [`App`] because it is the
+/// part worth pinning: a session mutes the tab it believes is focused,
+/// so "the window is unfocused" and "the selection moved to another
+/// host" both have to read as *no* claim rather than as a stale one.
+/// Only host tabs appear here — a local selection is `None`, which is
+/// how every connected host hears null.
+fn host_focus_claim(window_focused: bool, selection: Option<HostSelection>) -> Option<TabKey> {
+    selection.filter(|_| window_focused).map(|it| it.tab)
+}
+
 fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> {
     if len == 0 || current >= len {
         return None;
@@ -1879,6 +1893,10 @@ struct HostView {
     /// placeholder can never collide with a real local key.
     host: HostId,
     state: host_sidebar::SectionState,
+    /// The connection's own one-line reason for the state it is in, when
+    /// it has one — an ssh failure, a transport drop. Folded into the
+    /// band's rollup; `None` renders the bare word.
+    reason: Option<String>,
     /// The last rows this host's connection published. Kept across a
     /// drop: those shells are still running over there, so the section
     /// lists them dimmed rather than pretending they are gone.
@@ -2128,28 +2146,52 @@ impl App {
         }
     }
 
-    /// Resolve a saved host's target and hand it to the connection set.
+    /// Classify a saved host's target and hand it to the connection set.
     /// `mode` answers what to do with a resolved target, and `None`
     /// declines the connection — which is how the launch probe skips a
-    /// remote host without duplicating the resolve.
+    /// remote host without duplicating the classification.
+    ///
+    /// Three transports, two shapes. A local session and a socket path
+    /// both resolve to a socket that already exists, so they dial
+    /// straight away. An ssh target has no socket until a tunnel binds
+    /// one, so it goes through [`crate::host_conn::HostConnSet::open_ssh`]
+    /// and reaches `connect` one feed item later — see
+    /// [`crate::engine_feed::EngineFeed::HostTunnel`].
     fn connect_saved_host(
         &mut self,
         host: &roost_engine::persistence::HostSnapshot,
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
     ) {
-        let (socket, localhost) = match crate::host_conn::resolve_target(&host.target) {
-            Ok(resolved) => resolved,
+        use roost_ipc::ssh::ResolvedTransport;
+
+        let transport = match roost_ipc::ssh::classify(&host.target) {
+            Ok(transport) => transport,
             Err(error) => {
                 tracing::warn!(host = %host.id, ?error, "cannot resolve a saved host's target");
                 return;
             }
         };
+        let localhost = transport.is_localhost();
         let Some(mode) = mode(localhost) else {
             return;
         };
         let mode = spawn_gate(mode, host_verbs::VerbPolicy::current());
-        self.hosts
-            .connect(&host.id, &host.label, socket, localhost, mode);
+        match transport {
+            ResolvedTransport::LocalSession(socket) | ResolvedTransport::UnixSocket(socket) => self
+                .hosts
+                .connect(&host.id, &host.label, socket, localhost, mode),
+            ResolvedTransport::Ssh(target) => {
+                self.hosts.open_ssh(&host.id, &host.label, target, mode)
+            }
+        }
+    }
+
+    /// An ssh tunnel finished coming up, or failed to. Dialing is the
+    /// set's; the toast is the app's.
+    fn host_tunnel_ready(&mut self, ready: crate::host_conn::HostTunnelReady) {
+        if let Some(reason) = self.hosts.tunnel_ready(ready) {
+            self.set_status(reason);
+        }
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
@@ -2967,6 +3009,10 @@ impl App {
         }
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
+        // The same statement the local workspace just took, for whichever
+        // session owns the selected tab: unfocusing releases the claim,
+        // refocusing re-states it.
+        self.push_host_focus();
         if let Some(tab) = self.tabs.get(&self.active_tab_key()) {
             tab.set_window_focus(focused);
         }
@@ -3097,8 +3143,9 @@ impl App {
         let mut body = column![
             modal_heading(
                 "Add Host".to_string(),
-                "Point Roost at a running roost-session socket. For a remote \
-                 machine, forward its socket over SSH.",
+                "Point Roost at a running roost-session: an SSH destination \
+                 (workbox, user@host, ssh://host:port) or a local socket \
+                 path.",
             ),
             dialog_field(
                 "Name",
@@ -3108,8 +3155,8 @@ impl App {
                 Message::AddHostNameChanged,
             ),
             dialog_field(
-                "Socket",
-                "/tmp/roost-popos.sock",
+                "Target",
+                "workbox, user@host, or /path/to.sock",
                 &draft.socket,
                 self.add_host_socket_id.clone(),
                 Message::AddHostSocketChanged,
@@ -4718,6 +4765,26 @@ impl App {
         if let Some(tab) = released {
             self.host_detach_tab(tab);
         }
+        // Every selection move is a focus move as far as a session is
+        // concerned: the host that lost the selection hears null and the
+        // one that gained it hears the tab, so exactly one session
+        // believes it is being looked at.
+        self.push_host_focus();
+    }
+
+    /// State this client's focus to every connected host — the one
+    /// caller of [`HostConnSet::set_focus`], so the value a session
+    /// holds is always derived from the same two fields rather than
+    /// assembled at each edge.
+    ///
+    /// Called at the three edges that can move it: a host reaching
+    /// `Connected` (a fresh session believes its own headless default
+    /// until told), the selection moving, and the window gaining or
+    /// losing focus. The set dedups, so calling it on a change that
+    /// turns out not to move anything costs nothing.
+    fn push_host_focus(&mut self) {
+        self.hosts
+            .set_focus(host_focus_claim(self.window_focused, self.host_selection));
     }
 
     /// Every *user-initiated* Connect: the sidebar's ↻ row, the
@@ -5839,6 +5906,32 @@ mod tests {
             "and there is nothing to release on the way in"
         );
         assert_eq!(host_selection_detach(None, None), None);
+    }
+
+    /// What each connected session is told it owns. A session mutes the
+    /// tab it believes is focused, so an unfocused window and a
+    /// selection on another host both have to read as *no* claim — the
+    /// per-host null falls out of that at the send site.
+    #[test]
+    fn only_a_selected_host_tab_in_a_focused_window_claims_focus() {
+        let host = HostId::new(4);
+        let showing = a_host_selection(host, 1, 7);
+
+        assert_eq!(
+            host_focus_claim(true, Some(showing)),
+            Some(TabKey::new(host, 7))
+        );
+        assert_eq!(
+            host_focus_claim(false, Some(showing)),
+            None,
+            "an unfocused window is looking at nothing, whatever is selected"
+        );
+        assert_eq!(
+            host_focus_claim(true, None),
+            None,
+            "a local selection claims nothing on any host"
+        );
+        assert_eq!(host_focus_claim(false, None), None);
     }
 
     /// The Mac gate applied where a connection is started, not only

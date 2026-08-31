@@ -24,7 +24,10 @@ roost-ipc    = { path = "../roost-ipc" }
 # advertises and `tab.attach` matches against.
 roost-vt     = { path = "../roost-vt", features = ["ffi"] }
 
-tokio   = { workspace = true }
+# `io-std` on top of the workspace set: the client bridge pumps the
+# process's own stdin/stdout, which is the one place in the workspace
+# that needs tokio's stdio handles.
+tokio   = { workspace = true, features = ["io-std"] }
 anyhow  = { workspace = true }
 clap    = { workspace = true }
 tracing = { workspace = true }

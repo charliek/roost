@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_sparkle.py`'s two classes split by lane: the bare-binary class
@@ -105,7 +105,11 @@ ICED_RELEASE_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_ice
 # drives no UI at all — it spawns `roost-session` daemons against
 # throwaway profiles — so it needs neither a display nor the shared
 # UI-session fixture, and it gets its own target + CI job.
-SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py tools/roosttest/test_session_effects.py
+#
+# `test_ssh_transport.py` is a member for the same reasons: it drives a
+# daemon plus the far side of the SSH transport (`roost-session
+# client-bridge`, spawned by the test itself), and no UI at all.
+SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py tools/roosttest/test_session_effects.py tools/roosttest/test_ssh_transport.py
 # The HS-2 host-client lane (plan 037 C9). It drives BOTH a `roost-session`
 # daemon and the harness UI, so it is neither a member of SESSION_E2E_TESTS
 # (which runs headless and would stand the UI down) nor of ICED_E2E_TESTS
@@ -114,6 +118,14 @@ SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_sessio
 # arrangement `e2e-session` has, and for the same reason: a daemon lifecycle
 # the shared UI lane knows nothing about.
 HOST_CLIENT_E2E_TESTS := tools/roosttest/test_host_client.py
+# HS-3's UI-side ssh lane (plan 038 C5): the same two processes as
+# HOST_CLIENT_E2E_TESTS plus a real `SshTunnel` between them, over the
+# `fake-ssh.sh` fixture. Marked `host_client` (it needs both processes,
+# and the same deselects apply) but kept in its own list and its own
+# target: it points the UI's `$ROOST_SSH_BIN` at a wrapper of its own,
+# and the incarnation probe both lanes use cannot tell two connected
+# hosts' tabs apart — so these two must never run at the same time.
+SSH_HOST_E2E_TESTS := tools/roosttest/test_host_ssh.py
 # Every whole-directory pytest run must deselect BOTH daemon lanes: those
 # runs drive a UI, nothing in them builds `roost-session`, and the first
 # session or host-client case would therefore `cargo build` mid-test on a
@@ -216,6 +228,18 @@ e2e-host-client: $(GHOSTTY_LIB)  ## HS-2 host-client E2E (a roost-session daemon
 e2e-host-client-ci: $(GHOSTTY_LIB)  ## HS-2 host-client E2E at CI parity. DESTRUCTIVE: force-quits a running Iced UI
 	cargo build -p roost-iced -p roost-cli -p roost-session
 	ROOST_TEST_MODE=1 uv run --group test pytest $(HOST_CLIENT_E2E_TESTS) --roost-target iced --roost-fresh
+
+# The same three binaries `e2e-host-client` needs — the UI dials the
+# session through a tunnel it runs itself, and the far side of that
+# tunnel is the `roost-session` binary. Never run beside
+# `e2e-host-client`: see SSH_HOST_E2E_TESTS.
+e2e-host-ssh: $(GHOSTTY_LIB)  ## HS-3 SSH-transport E2E (the Iced UI reaching a session over a fake ssh)
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(SSH_HOST_E2E_TESTS) --roost-target iced
+
+e2e-host-ssh-ci: $(GHOSTTY_LIB)  ## HS-3 SSH-transport E2E at CI parity. DESTRUCTIVE: force-quits a running Iced UI
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(SSH_HOST_E2E_TESTS) --roost-target iced --roost-fresh
 
 e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
 	@tests='$(ICED_E2E_TESTS)'; \

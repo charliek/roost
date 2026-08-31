@@ -716,6 +716,27 @@ jobs:
           tools/roosttest/test_host_client.py
           --roost-target iced --roost-fresh -v
 
+      # HS-3's SSH-transport lane (plan 038 C5): the same two processes
+      # with a real `SshTunnel` between them, over the `fake-ssh.sh`
+      # fixture. AFTER the host-client step and never beside it — both
+      # find a host tab by probing incarnations, and that probe cannot
+      # tell two connected hosts' tabs apart (`make e2e-host-ssh` carries
+      # the same warning).
+      - name: Run SSH-transport E2E (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-ssh-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-ssh-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_host_ssh.py
+          --roost-target iced --roost-fresh -v
+
       - name: Run Iced real-input clipboard (Linux X11)
         if: runner.os == 'Linux'
         env:
@@ -819,6 +840,23 @@ jobs:
           tools/wayland/weston-run.sh
           uv run --group test pytest
           tools/roosttest/test_host_client.py
+          --roost-target iced --roost-fresh -v
+
+      # The Wayland twin of the X11 SSH-transport step. Same ordering
+      # rule: after the host-client step, never beside it.
+      - name: Run SSH-transport E2E (Linux Wayland)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-ssh-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-ssh-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_host_ssh.py
           --roost-target iced --roost-fresh -v
 
       # The three macOS iced cells (this one, the bundle smoke and the
