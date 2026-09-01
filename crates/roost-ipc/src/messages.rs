@@ -750,6 +750,27 @@ pub struct AppDialogAnswerParams {
     pub action: String,
 }
 
+/// `app.keybind_dispatch` request: run the paste accelerator through the
+/// same dispatch a real key event or native menu click takes. Gated on
+/// `ROOST_TEST_MODE=1`. Exists because paste has no other IPC back door:
+/// unlike a palette row, it is reachable only from a real key event, so
+/// nothing in this harness could otherwise drive it (and, since C9, its
+/// frozen-host-frame refusal per issue #376).
+///
+/// **Not a general keybind dispatcher.** `action` accepts only the
+/// literal `"paste"` — every other `KeybindAction::from_name` spelling
+/// (`"close_tab"`, `"new_tab"`, `"close_project"`, `"copy"`, …) is
+/// rejected, because an arbitrary IPC client is not trustworthy with a
+/// route that can close a live terminal, mutate workspace state, or
+/// write the system clipboard. Widen this allowlist only alongside a
+/// concrete test need, one name at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppKeybindDispatchParams {
+    /// Must be `"paste"` — the only action this op will dispatch.
+    pub action: String,
+}
+
 /// `tab.dump_resolved` request: walk a tab's render state through
 /// the same resolver the production paint path uses (including the
 /// theme's bold-color override).
@@ -2418,6 +2439,12 @@ pub mod ops {
     /// Same gate and the same "test seam, not a surface" rule as
     /// `app.dialog_dump`.
     pub const APP_DIALOG_ANSWER: &str = "app.dialog_answer";
+
+    /// Test-only dispatch of a named keybind-table action through the
+    /// production dispatcher. Same gate and "test seam, not a surface"
+    /// rule as `app.dialog_dump` — it exists because the paste
+    /// accelerator (issue #376's regression) has no other IPC seam.
+    pub const APP_KEYBIND_DISPATCH: &str = "app.keybind_dispatch";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";

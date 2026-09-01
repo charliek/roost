@@ -1259,36 +1259,20 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "plan 039 C9 (§3.11) has not landed: paste_into_active "
-        "(crates/roost-iced/src/app/interactions.rs:2021-2028) still returns a bare "
-        "UiTask with no frozen-frame guard, and no test-mode op exists yet to drive "
-        "the paste keybind from this IPC-only harness. C9 lands both; remove this "
-        "xfail once it does."
-    ),
-)
 def test_paste_into_a_frozen_host_frame_is_refused(roost: Roost, target):
     """The regression test for plan 039 C9 (§3.11), landing here per the
     plan's own instruction ("whichever lands second wires it").
 
-    C9 has NOT landed as of this commit, in two ways: `paste_into_active`
-    still returns a bare `UiTask` rather than `Result<UiTask, String>`
-    and never checks `frozen_frame` at all, and — the deeper gap —
-    nothing in this IPC-only harness can *drive* the paste keybind
-    today. `KeybindAction::Paste` (`app.rs:2894`/`:2964`) is reachable
-    only from a real key event; every other otherwise-input-only
-    behavior this plan touched got a `ROOST_TEST_MODE=1` test-mode op
-    seam (`app.dialog_answer`, `tab.feed_pty_bytes`, …) and this one
-    still has none. `app.keybind_dispatch` below is this test's guess at
-    what that seam will be named — C9's implementer is expected to wire
-    it up (or rename this call to match whatever it actually adds) —
-    and the assertion is the pinned observable from §3.11 itself: the
-    host-client lane drives the paste keybind against a frozen frame and
-    reads the refusal line off `UiLog`. Today `app.keybind_dispatch`
-    does not exist, so the very first call below raises `unknown-op` and
-    the test fails outright — which is what `xfail(strict=True)` is for.
+    `paste_into_active` (`crates/roost-iced/src/app/interactions.rs`)
+    now returns `Result<UiTask, String>` and refuses before the
+    clipboard is ever read when the active tab's host is frozen
+    (`TakenOver`/`Stopped`). `app.keybind_dispatch` is the test-mode IPC
+    op that drives `KeybindAction::Paste` through the same dispatcher a
+    real key event or native menu click reaches
+    (`crates/roost-iced/src/app.rs`), since the accelerator has no other
+    IPC back door. The assertion is the pinned observable from §3.11:
+    the host-client lane drives the paste keybind against a frozen frame
+    and reads the refusal line off `UiLog`.
     """
     session_env = sessionlib.make_env()
     try:

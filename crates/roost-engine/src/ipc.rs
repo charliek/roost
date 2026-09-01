@@ -27,28 +27,29 @@ use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
-    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppMenuActivateParams,
-    AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams, AppNotificationStatusResult,
-    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
-    AppSetWindowFocusParams, AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult,
-    AttachPayloadKind, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
-    EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams, HostAddResult,
-    HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult,
-    HostRemoveParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
-    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
-    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams,
-    SelectionDumpParams, SelectionDumpResult, SelectionSetParams, SessionConnectParams,
-    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetFocusParams,
-    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
-    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
-    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeybindDispatchParams,
+    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
+    AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
+    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
+    AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
+    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
+    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
+    HostListParams, HostListResult, HostRemoveParams, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
+    SessionSetFocusParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
@@ -417,6 +418,16 @@ pub enum UiRequest {
     /// through the same routes a click and Enter/Escape take. `action`
     /// is `"confirm" | "cancel"`. Gated like `AppDialogDump`.
     AppDialogAnswer {
+        action: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// `app.keybind_dispatch` — run the paste accelerator through the
+    /// production dispatcher, the same one a real key event or native
+    /// menu click reaches. Gated like `AppDialogDump`; exists because
+    /// paste (issue #376) has no other IPC seam. `action` must be
+    /// `"paste"` — every other `KeybindAction` spelling is refused (see
+    /// `AppKeybindDispatchParams`'s doc comment in `roost-ipc`).
+    AppKeybindDispatch {
         action: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
@@ -2797,6 +2808,16 @@ async fn dispatch(
             .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::APP_KEYBIND_DISPATCH => {
+            let p: AppKeybindDispatchParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::AppKeybindDispatch {
+                action: p.action,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
         ops::APP_UPDATE_STATUS => {
             let _: AppUpdateStatusParams = decode(params)?;
             let result = h
@@ -2987,6 +3008,7 @@ fn map_test_op_err(err: String) -> HandlerError {
         || err.contains("is disabled")
         || err.contains("has no submenu to descend into")
         || err.contains("must not be empty")
+        || err.contains("unknown keybind action")
     {
         HandlerError::invalid_param(err)
     } else if err.contains("not supported on this UI") {

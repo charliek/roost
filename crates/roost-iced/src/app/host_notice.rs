@@ -107,6 +107,17 @@ impl FrozenFrame {
             },
         }
     }
+
+    /// Why a paste into this frame is refused (issue #376), named per
+    /// state and paired with the remedy — the same two-message shape as
+    /// [`Self::banner`], because it is the same fork: somebody else has
+    /// the session, or it is gone.
+    pub(super) fn paste_refusal(self) -> &'static str {
+        match self {
+            Self::TakenOver => "this session was taken over — reconnect to paste",
+            Self::Stopped => "this session ended — start a new session to paste",
+        }
+    }
 }
 
 /// The upgrade dialog's contents (plan 037 §3.7, plan 039 §3.5).
@@ -393,6 +404,19 @@ mod tests {
             !click_still_lands(FrozenFrame::TakenOver, None),
             "a reconnect is already under way; a second press must not abort it"
         );
+    }
+
+    /// The paste-refusal copy (issue #376) names the state and the
+    /// remedy, and — like the banner it rides beside — the two states
+    /// must not read alike: `TakenOver` promises a reconnect, `Stopped`
+    /// does not.
+    #[test]
+    fn paste_refusal_names_state_and_remedy_distinctly() {
+        let taken = FrozenFrame::TakenOver.paste_refusal();
+        let stopped = FrozenFrame::Stopped.paste_refusal();
+        assert_ne!(taken, stopped);
+        assert!(taken.contains("taken over") && taken.contains("reconnect"));
+        assert!(stopped.contains("ended") && stopped.contains("new session"));
     }
 
     /// Three actions, three prompts: the local restart, the ssh update

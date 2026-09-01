@@ -479,6 +479,24 @@ fn macos_test_gated<T>(
     }
 }
 
+/// `app.keybind_dispatch`'s namespace restriction. The op exists solely
+/// so `ROOST_TEST_MODE=1` can drive the paste accelerator — nothing else
+/// in that table has another IPC seam — so `"paste"` is the only name it
+/// may resolve. Every other `KeybindAction::from_name` spelling
+/// (`close_tab`, `new_tab`, `close_project`, `copy`, …) would hand an
+/// arbitrary IPC client a way to close a live terminal, mutate workspace
+/// state, or write the system clipboard, and is refused before
+/// `dispatch_keybind_action` ever sees it.
+fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
+    if action != "paste" {
+        return Err(format!(
+            "invalid-param: action must be \"paste\", got {action:?}"
+        ));
+    }
+    KeybindAction::from_name(action)
+        .ok_or_else(|| "invalid-param: \"paste\" did not resolve to a KeybindAction".to_string())
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // A full authoritative snapshot on every reconcile is the recovery
@@ -2207,6 +2225,20 @@ impl App {
                     Err(error) => Err(error),
                 });
             }
+            UiRequest::AppKeybindDispatch { action, reply } => {
+                let result = if !self.test_mode {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                } else {
+                    match paste_only_keybind(&action) {
+                        Ok(keybind) => {
+                            task = task.then(self.dispatch_keybind_action(keybind, false));
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                let _ = reply.send(result);
+            }
             UiRequest::AppUpdateStatus { reply } => {
                 let result = macos_test_gated(self.test_mode, read_update_status);
                 let _ = reply.send(result);
@@ -2581,6 +2613,30 @@ mod tests {
             event: event.to_string(),
             data,
         }
+    }
+
+    /// `app.keybind_dispatch` is a paste-only seam, not a general
+    /// dispatcher: every other spelling `KeybindAction::from_name`
+    /// would otherwise resolve — including destructive/state-mutating
+    /// ones like `close_tab` and `close_project`, and the
+    /// clipboard-writing `copy` — must be refused, and refused with a
+    /// message that names the one action this op actually accepts.
+    #[test]
+    fn keybind_dispatch_test_op_accepts_only_paste() {
+        assert_eq!(paste_only_keybind("paste"), Ok(KeybindAction::Paste));
+
+        for other in ["close_tab", "new_tab", "close_project", "copy", "unbind"] {
+            let error =
+                paste_only_keybind(other).expect_err("a non-paste action name must be refused");
+            assert!(
+                error.contains("paste"),
+                "refusal for {other:?} must name the allowed action: {error}"
+            );
+        }
+
+        let error =
+            paste_only_keybind("not_a_real_action").expect_err("an unknown name is refused too");
+        assert!(error.contains("paste"));
     }
 
     /// A host agent's notification is routed to the notification path,

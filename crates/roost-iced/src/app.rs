@@ -2905,6 +2905,11 @@ impl App {
         match result {
             Ok(task) => task,
             Err(error) => {
+                // The toast alone is silent to anything outside the
+                // window (a test harness reading the log, a bug report
+                // after the fact) — this is the one boundary every
+                // keybind refusal passes through.
+                tracing::info!(%error, "keybind action refused");
                 self.set_status(error);
                 UiTask::None
             }
@@ -2961,7 +2966,7 @@ impl App {
                 Ok(UiTask::None)
             }
             KeybindAction::Copy => Ok(self.copy_active_selection()),
-            KeybindAction::Paste => Ok(self.paste_into_active(ClipboardOp::System)),
+            KeybindAction::Paste => self.paste_into_active(ClipboardOp::System),
             KeybindAction::ToggleSidebar => {
                 self.toggle_sidebar();
                 Ok(UiTask::None)
@@ -4702,6 +4707,22 @@ impl App {
         let view = self.host_view(selection.tab.host)?;
         let section = self.hosts.section(&view.saved_id)?;
         Some((view, host_notice::frozen_frame(section.state)?))
+    }
+
+    /// [`Self::frozen_host_frame`]'s twin for a specific tab rather than
+    /// whichever host row is currently selected — what a keybind dispatch
+    /// that already resolved its own [`TabKey`] (paste, most notably) has
+    /// to ask instead. `is_local` short-circuits before the lookup: a
+    /// never-connected saved host's [`HostView::host`] is also
+    /// `HostId::LOCAL` as a placeholder, and a local tab must never match
+    /// that entry.
+    fn frozen_host_frame_for(&self, tab: TabKey) -> Option<host_notice::FrozenFrame> {
+        if tab.is_local() {
+            return None;
+        }
+        let view = self.host_view(tab.host)?;
+        let section = self.hosts.section(&view.saved_id)?;
+        host_notice::frozen_frame(section.state)
     }
 
     /// The banner the window owes the frame it is showing, the host its

@@ -1513,8 +1513,14 @@ impl App {
         );
         #[cfg(target_os = "linux")]
         if outcome.paste_selection {
-            self.clipboard
-                .enqueue_paste_read(ClipboardOp::Selection, key);
+            // Middle-click paste doesn't sit in the `Result`-returning
+            // keybind dispatcher (`dispatch_keybind_action`), so a
+            // refusal is reported the same way that dispatcher's Err arm
+            // does: log, then toast.
+            if let Err(error) = self.enqueue_tab_paste(ClipboardOp::Selection, key) {
+                tracing::info!(%error, "middle-click paste refused");
+                self.set_status(error);
+            }
         }
         let clipboard = self.clipboard.start_next();
         match outcome.open_url {
@@ -1789,6 +1795,10 @@ impl ClipboardQueue {
         request_id
     }
 
+    // Private on purpose: this is the unguarded primitive. Every caller
+    // outside this queue's own tests must go through
+    // `App::enqueue_tab_paste`, which checks `frozen_host_frame_for`
+    // before a single byte of the clipboard is read (issue #376).
     fn enqueue_paste_read(&mut self, target: ClipboardOp, tab: TabKey) -> u64 {
         let request_id = self.allocate_request_id();
         self.pending_reads
@@ -2018,13 +2028,37 @@ impl App {
         self.clipboard.start_next()
     }
 
-    pub(super) fn paste_into_active(&mut self, target: ClipboardOp) -> UiTask {
+    pub(super) fn paste_into_active(&mut self, target: ClipboardOp) -> Result<UiTask, String> {
         let tab = self.active_tab_key();
         if !self.tabs.contains_key(&tab) {
-            return UiTask::None;
+            return Ok(UiTask::None);
+        }
+        self.enqueue_tab_paste(target, tab)?;
+        Ok(self.clipboard.start_next())
+    }
+
+    /// The one place a paste read gets enqueued for a specific tab —
+    /// `paste_into_active` (keybind/menu paste) and the Linux
+    /// primary-selection middle-click route both funnel through this,
+    /// so a future third caller can't forget the check.
+    ///
+    /// Checked before the clipboard is touched at all: a frozen host
+    /// frame (taken over, or stopped) is still in `self.tabs` — that's
+    /// deliberate, it's what lets the last frame keep rendering — but
+    /// nothing on the other end will ever read what gets sent to it.
+    /// Reading the clipboard first and then discovering that would
+    /// consume the user's paste for nothing (issue #376); refusing here
+    /// means the clipboard is never touched.
+    pub(super) fn enqueue_tab_paste(
+        &mut self,
+        target: ClipboardOp,
+        tab: TabKey,
+    ) -> Result<(), String> {
+        if let Some(frozen) = self.frozen_host_frame_for(tab) {
+            return Err(frozen.paste_refusal().to_string());
         }
         self.clipboard.enqueue_paste_read(target, tab);
-        self.clipboard.start_next()
+        Ok(())
     }
 }
 
