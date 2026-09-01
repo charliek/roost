@@ -946,7 +946,7 @@ fn undecodable(op: &str, error: &serde_json::Error) -> AttemptError {
 /// A jitter source with no `rand` dependency: the low bits of the
 /// monotonic clock are plenty of spread for staggering reconnects, and
 /// this is not a security decision.
-fn jitter() -> f64 {
+pub(super) fn jitter() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

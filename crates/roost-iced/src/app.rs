@@ -2401,6 +2401,18 @@ impl App {
     /// An ssh tunnel finished coming up, or failed to. Dialing is the
     /// set's; the toast and the offer are the app's.
     fn host_tunnel_ready(&mut self, ready: crate::host_conn::HostTunnelReady) {
+        // The same guard `host_reconnect_due` carries, for the window it
+        // cannot see (plan 040 §3.4): `EngineFeed::Quit` only latches the
+        // exit, so an establish that lands behind it in the same drain
+        // would otherwise dial a session while the app is shutting down
+        // — and `abandon_reconnects`, which runs after the drain, has
+        // nothing left to abort by then. The tunnel is still retired
+        // properly rather than dropped.
+        if self.exit_state != ExitState::Running {
+            tracing::debug!(host = %ready.host, "not connecting a host during shutdown");
+            self.hosts.discard_ready(ready);
+            return;
+        }
         let saved_id = ready.host.clone();
         if let Some(reason) = self.hosts.tunnel_ready(ready) {
             self.set_status(reason);
@@ -2664,8 +2676,16 @@ impl App {
     }
 
     /// Hand out the exit request `reconcile()` latched, once.
+    ///
+    /// The once-only edge is also where the host set is told to stop
+    /// dialing (plan 040 §3.4). Here rather than in `Drop for App`,
+    /// which is the other candidate: this is the edge where the
+    /// *decision* to exit is made, so the abort lands before the run
+    /// loop unwinds rather than in the middle of it — and the two of
+    /// them are the same latch, so it cannot fire twice.
     pub fn take_exit_task(&mut self) -> UiTask {
         if self.exit_state.take() {
+            self.hosts.abandon_reconnects();
             UiTask::Exit
         } else {
             UiTask::None
@@ -5124,6 +5144,28 @@ impl App {
             },
             cause,
         );
+    }
+
+    /// An armed auto-reconnect came due (plan 040 §3.4).
+    ///
+    /// It re-enters through [`Self::host_reconnect_requested`] rather
+    /// than calling `open_ssh`, which is the whole point of the door:
+    /// the saved-host lookup catches a host removed between arm and
+    /// fire, `connect_saved_host`'s `cancel_bootstrap_probe` closes the
+    /// consent path a raw re-entry would leave open, and its
+    /// re-classification catches a host edited to a non-ssh target.
+    fn host_reconnect_due(&mut self, saved_id: &str, request: u64) {
+        // `EngineFeed::Quit` does not stop the drain, so a due message
+        // sitting behind one would re-enter the connect path after the
+        // user asked to quit.
+        if self.exit_state != ExitState::Running {
+            tracing::debug!(host = %saved_id, "not reconnecting a host during shutdown");
+            return;
+        }
+        let Some((origin, cause)) = self.hosts.reconnect_due(saved_id, request) else {
+            return;
+        };
+        self.host_reconnect_requested(saved_id, origin, cause);
     }
 
     // ── host verbs (plan 037 §3.1/§3.5) ─────────────────────────────

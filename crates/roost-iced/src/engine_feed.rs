@@ -89,6 +89,19 @@ pub(crate) enum EngineFeed {
     /// attempt over a dead ssh transport, which is a fresh task, can ask
     /// whether the session is still ours before taking it back.
     HostLease(HostId, String),
+    /// An ssh host's armed auto-reconnect came due (plan 040 §3.4).
+    ///
+    /// A one-shot timer on the engine runtime, because the dial it
+    /// authorizes has to happen on the main thread in order against
+    /// everything else that may have moved this host meanwhile — a
+    /// disconnect, a remove, a Connect the user made instead. `request`
+    /// is the `SshState.request` read when the timer was armed: an
+    /// attempt that started in between bumped it, and this message is
+    /// then answering a question the host has moved past.
+    ReconnectDue {
+        host: String,
+        request: u64,
+    },
     /// An ssh-reached host's tunnel finished coming up — or failed to
     /// (plan 038 §3.4).
     ///
@@ -187,6 +200,10 @@ impl EngineFeedReceiver {
                 // reconcile pulled forward mid-drain lands after one
                 // connection's arrival rather than inside it.
                 | EngineFeed::HostLease(..)
+                // A due retry either dials or writes the give-up copy
+                // onto the band. Classified here so the second does not
+                // wait for an unrelated redraw.
+                | EngineFeed::ReconnectDue { .. }
                 // A tunnel answer either starts a connection or leaves a
                 // reason on the band; both are what the section renders.
                 | EngineFeed::HostTunnel(..)

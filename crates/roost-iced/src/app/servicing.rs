@@ -1283,6 +1283,14 @@ impl App {
                         }
                         tracing::debug!(%host, "host connection state changed");
                         if dropped {
+                            // The world the probe was asked about is
+                            // gone, whoever asked (plan 040 §3.6): the
+                            // confirmed-upgrade probe never consults
+                            // `offer_for` at all, so one still out at a
+                            // drop can land a card over a host that is
+                            // mid-ladder — and write a `bootstrap_note`
+                            // the band prefers over the reconnect copy.
+                            self.cancel_bootstrap_probe(&host);
                             self.maybe_offer_bootstrap(&host);
                         }
                     }
@@ -1293,6 +1301,9 @@ impl App {
                 // Nothing renders off it — it is kept for the outage a
                 // later drop opens (plan 040 §3.7).
                 EngineFeed::HostLease(host, lease) => self.hosts.apply_lease(host, lease),
+                EngineFeed::ReconnectDue { host, request } => {
+                    self.host_reconnect_due(&host, request)
+                }
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
                 // A signal reached the process (plan 039 §3.9). Same
