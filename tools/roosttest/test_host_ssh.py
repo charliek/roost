@@ -408,10 +408,11 @@ def ssh_host(roost: Roost, session_env):
 # ---------------------------------------------------------------------------
 
 
-# `test_host_client.host_key` (the 64-wide window rescanned inside
-# `wait_until`, floor advancing on every hit) is exactly this lane's
-# shape too — same `tab.focus` probe, same discovery-is-attach story,
-# same reason a narrow window beats a wide single-pass scan: over ssh a
+# `host_probe.host_key` (a 64-wide first pass, each retry inside
+# `wait_until` re-scanning from the floor with double the span, floor
+# advancing on every hit) is exactly this lane's shape too — same
+# `tab.focus` probe, same discovery-is-attach story, same reason a
+# narrow first pass beats a wide single-pass scan: over ssh a
 # tab reaching the client's mirror a moment *after* it is created is the
 # common case, not the exception (the `tab.opened` event crosses two
 # extra pumps and a remote process before the mirror has it), so a miss
