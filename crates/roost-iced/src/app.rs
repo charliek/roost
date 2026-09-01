@@ -5,6 +5,7 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1481,6 +1482,145 @@ impl ExitState {
     }
 }
 
+/// What a delivered SIGTERM/SIGINT should do — request the same graceful
+/// quit a menu Quit would, or (a repeat, meaning the graceful path is
+/// wedged) force the process down immediately. A pure decision over a
+/// shared latch, so it is testable without tokio or a real `App`.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitSignalAction {
+    RequestQuit,
+    Escalate,
+}
+
+/// `handled` is shared across every signal listener `spawn_quit_signals`
+/// installs, so a repeat of the *same* signal and a *different* one both
+/// escalate — "already handled one" is what matters, not which.
+fn observe_quit_signal(handled: &AtomicBool) -> QuitSignalAction {
+    if handled.swap(true, Ordering::SeqCst) {
+        QuitSignalAction::Escalate
+    } else {
+        QuitSignalAction::RequestQuit
+    }
+}
+
+/// Route SIGTERM and SIGINT into the same exit request a menu Quit makes
+/// (plan 039 §3.9) — closing plan 038's known gap, where a bare SIGTERM
+/// behaved exactly like a crash (no `Drop for App`, so no workspace flush
+/// and no tunnel `-O exit`; an ssh ControlMaster would strand until its
+/// `ControlPersist` window expired). A second signal past the first
+/// escalates to `process::exit(1)`: insurance against a wedged graceful
+/// path, which is the very freeze this exists to prevent.
+///
+/// Mirrors `roost-session`'s `spawn_signal_stops` (`serve.rs`), adapted to
+/// this app's own runtime and its own drain instead of a wire call.
+///
+/// Unlike that sibling, both streams are registered **synchronously**,
+/// before either listener task is spawned — under `runtime.enter()` so
+/// `signal()` has the reactor context it needs (`bootstrap()` is
+/// synchronous, pre-run-loop code that isn't itself executing on the
+/// runtime; `Handle::current()` panics with "no reactor running" without
+/// the guard). Registering from *inside* the spawned task, as an earlier
+/// version of this did to route around that panic, left a window between
+/// `spawn` returning and the task's first poll where the signal still had
+/// its OS default disposition — a SIGTERM/SIGINT landing in that window
+/// killed the process with no flush and no tunnel `-O exit`, the exact
+/// gap this function exists to close. Registering synchronously here
+/// closes it: by the time this returns, both signals are already routed
+/// through `observe_quit_signal`, before the caller can be interrupted.
+///
+/// Failure to register is treated as fatal to startup, like every other
+/// fallible step in `bootstrap()` (`?` throughout) — this call is *the*
+/// safety net C7 adds; starting anyway and logging-and-continuing would
+/// silently ship the app back into the pre-C7 bare-kill behavior with no
+/// visible signal that the protection is missing. `signal()` registration
+/// realistically only fails on a broken environment (e.g. the process is
+/// already out of OS signal-handling resources), so refusing to start is
+/// the defensible choice: the failure is surfaced immediately in the
+/// startup error rather than discovered later as a shutdown that dropped
+/// state.
+fn spawn_quit_signals(runtime: &tokio::runtime::Runtime, feed_tx: &EngineFeedSender) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let streams = {
+        let _guard = runtime.enter();
+        let term = signal(SignalKind::terminate()).context("install a SIGTERM handler")?;
+        let int = signal(SignalKind::interrupt()).context("install a SIGINT handler")?;
+        [("SIGTERM", term), ("SIGINT", int)]
+    };
+
+    let handled = Arc::new(AtomicBool::new(false));
+    for (name, mut stream) in streams {
+        let handled = Arc::clone(&handled);
+        let feed_tx = feed_tx.clone();
+        runtime.spawn(async move {
+            loop {
+                if stream.recv().await.is_none() {
+                    return;
+                }
+                match observe_quit_signal(&handled) {
+                    QuitSignalAction::RequestQuit => {
+                        tracing::info!(
+                            signal = name,
+                            "signal received; requesting a graceful quit"
+                        );
+                        if !feed_tx.send(EngineFeed::Quit) {
+                            return;
+                        }
+                    }
+                    QuitSignalAction::Escalate => {
+                        tracing::warn!(
+                            signal = name,
+                            "second signal received before the graceful quit finished; forcing exit"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Restores SIGTERM/SIGINT to `SIG_DFL` when dropped. An `App` field of
+/// this type, placed immediately before `runtime` in the struct so it
+/// drops immediately before it, is what keeps a wedged shutdown killable.
+///
+/// Tokio never unregisters the libc handlers `spawn_quit_signals` installs
+/// — it just stops polling the streams once the runtime that ran them is
+/// gone. Left alone, that means: `Runtime::drop` cancels the listener
+/// tasks (no more `observe_quit_signal`/escalate), but the OS-level
+/// handler is still armed, so a signal arriving *during* runtime shutdown
+/// is consumed and silently dropped — neither escalated nor left to the
+/// default disposition that would kill the process. If teardown itself
+/// hangs there, no further SIGTERM/SIGINT can force it down: the inverse
+/// of the freeze `spawn_quit_signals` exists to prevent.
+///
+/// Field placement makes the ordering explicit without extra plumbing:
+/// every field declared above `runtime` — including `hosts`, whose
+/// `SshTunnel` Drop blocks on `-O exit` — has already finished dropping
+/// by the time this one is reached, so the graceful path has always had
+/// its chance before defaults are restored; `runtime` itself hasn't
+/// started dropping yet, so `process::exit(1)` escalation is still live
+/// for the entire window this guard is protecting.
+///
+/// A signal delivered after this restore terminates the process by its
+/// own default disposition (143 for SIGTERM, 130 for SIGINT) rather than
+/// the escalate path's `exit(1)` — that's an accepted, arguably more
+/// correct, difference: the exit status then reflects that the process
+/// was killed by a signal rather than choosing to exit(1) on its own.
+struct RestoreDefaultQuitSignalsOnDrop;
+
+impl Drop for RestoreDefaultQuitSignalsOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: SIG_DFL is always a valid disposition, and libc::signal
+        // has no preconditions beyond a valid (signum, handler) pair.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+    }
+}
+
 /// A dispatched engine mutation: the Iced task that will deliver its
 /// completion, plus the id that completion will carry.
 ///
@@ -1896,6 +2036,9 @@ pub struct App {
     // order — one field here, so no ordering trap at this seam.
     feed_rx: EngineFeedReceiver,
     feed_tx: EngineFeedSender,
+    /// Drops immediately before `runtime` — see
+    /// [`RestoreDefaultQuitSignalsOnDrop`] for why that position matters.
+    _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
     runtime: tokio::runtime::Runtime,
     _locks: InstanceLocks,
 }
@@ -2017,6 +2160,7 @@ impl App {
         ));
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
         runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
+        spawn_quit_signals(&runtime, &feed_tx)?;
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -2136,6 +2280,7 @@ impl App {
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
+            _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
             runtime,
             _locks: locks,
         };
@@ -6354,6 +6499,17 @@ mod tests {
         assert!(!state.observe(false));
         assert!(!state.take());
         assert_eq!(state, ExitState::Running);
+    }
+
+    #[test]
+    fn the_first_quit_signal_requests_and_every_later_one_escalates() {
+        let handled = AtomicBool::new(false);
+        assert_eq!(observe_quit_signal(&handled), QuitSignalAction::RequestQuit);
+        // A repeat of the same signal escalates...
+        assert_eq!(observe_quit_signal(&handled), QuitSignalAction::Escalate);
+        // ...and so does a *different* one arriving after the first: the
+        // latch is "already handled one", not "already saw this kind".
+        assert_eq!(observe_quit_signal(&handled), QuitSignalAction::Escalate);
     }
 
     #[test]

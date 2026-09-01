@@ -103,6 +103,16 @@ pub(crate) enum EngineFeed {
     /// asks for. Boxed for [`Self::HostTunnel`]'s reason — every feed
     /// item pays for the largest.
     HostBootstrap(Box<crate::app::bootstrap::BootstrapEvent>),
+    /// A SIGTERM or SIGINT reached the process (plan 039 §3.9). Smaller
+    /// than routing through a `UiRequest` — which would drag
+    /// `roost-engine`'s ipc module into a signal handler for no benefit —
+    /// and it rides the same feed as the macOS menu's Quit item for the
+    /// same reason: the drain is the one place that already turns a raw
+    /// request into `ExitState::request()`, and the existing
+    /// `Message::Exit` → `iced::exit()` → `Drop for App` chain (workspace
+    /// flush, instance locks, blocking tunnel `-O exit`) needs no change
+    /// at all to serve it.
+    Quit,
 }
 
 /// The only way to put an item on the feed. Raw senders are never handed

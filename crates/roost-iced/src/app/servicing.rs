@@ -1290,6 +1290,16 @@ impl App {
                 }
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
+                // A signal reached the process (plan 039 §3.9). Same
+                // latch the macOS menu's Quit item uses — `take_exit_task`
+                // (called every `update()`) is what turns this into
+                // `UiTask::Exit` on the next message, which is guaranteed
+                // to be soon: the send that put this item here also woke
+                // the subscription that delivers it.
+                EngineFeed::Quit => {
+                    tracing::info!("signal requested a graceful quit");
+                    self.exit_state.request();
+                }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
