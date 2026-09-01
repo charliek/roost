@@ -75,14 +75,15 @@ pytestmark = pytest.mark.host_client
 # expectation.
 COLS, ROWS = 80, 24
 
-# How many consecutive incarnations [`host_key`] scans before concluding
-# the host is not connected. Generous because the minter is the *app's*,
-# not this run's: a UI that a developer has been driving all afternoon is
-# already hundreds of connects in, and a ceiling tuned to one pytest run
-# would turn "connected, incarnation 300" into a timeout. The scan is a
-# one-off — [`_incarnation_floor`] makes every probe after the first
-# start where the last one landed.
-INCARNATION_SCAN_SPAN = 4096
+# How many consecutive incarnations [`host_key`] scans per pass. Small on
+# purpose: `wait_until` calls the probe repeatedly, so a fast miss is a
+# genuine retry rather than the whole wait budget being burned on one
+# scan. A 4096-wide single pass (the old shape here) did the opposite —
+# a miss cost tens of seconds, leaving `wait_until` effectively one shot.
+# [`_incarnation_floor`] is what keeps a narrow window enough: it tracks
+# forward on every hit, and a call whose target lands past this window
+# widens *its own* search across `wait_until`'s retries (see `host_key`).
+HOST_INCARNATION_WINDOW = 64
 
 # Plan 037 §7.10: a focused-tab attach on localhost reaches a rendered
 # frame in under half a second, end to end through the UI. Scaled like
@@ -344,10 +345,21 @@ def inbox_ids(roost: Roost) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-# Where the next scan starts. Incarnations only ever go up (`keys.rs`
-# mints, never reuses), so the last one that answered is a valid floor
-# for the next probe — that is what keeps a 4096-wide scan a once-per-run
-# cost instead of a per-call one.
+# Where the next call's first pass starts. Incarnations only ever go up
+# (`keys.rs` mints, never reuses), so the last one that answered is a
+# valid floor for the next probe — that is what keeps a run of many
+# connects cheap: each call after the first starts right where the last
+# one landed instead of re-scanning from 1.
+#
+# Only ever moved on a HIT, inside `probe()`. A miss never advances it:
+# this lane's UI is not necessarily fresh (`make e2e-host-client`, unlike
+# the ssh lane, does not force `--roost-fresh` — it is fine reusing a
+# developer's already-running instance, hundreds of connects in), so at
+# the moment of a miss the incarnation this call is looking for may not
+# be minted yet (`host.connect` returns before the engine-feed hop that
+# actually creates the `HostConn` — see the module docstring). Advancing
+# the shared floor past a target that does not exist yet would strand it
+# there for every later call in the run, not just this one.
 _incarnation_floor = 1
 
 
@@ -364,14 +376,24 @@ def host_key(roost: Roost, tab_id: int, timeout: float = 30.0) -> str:
 
     Focusing is the discovery because focusing is also the attach
     (§3.4's attach-on-focus): the same call a sidebar click makes.
+
+    Each pass only looks at [`HOST_INCARNATION_WINDOW`] incarnations
+    starting at [`_incarnation_floor`], so a miss is cheap and
+    `wait_until`'s retries are genuine retries rather than the whole
+    budget spent on one scan. A target beyond that first window (a big
+    jump — several connects happened since the floor last moved) is
+    still found: on every miss this call's own search window slides
+    forward by its width, purely locally, so it never touches the shared
+    floor and can never strand it. The floor itself only moves on a hit,
+    so the *next* call starts narrow again.
     """
     global _incarnation_floor
+    window_start = _incarnation_floor
 
     def probe() -> str | None:
+        nonlocal window_start
         global _incarnation_floor
-        for incarnation in range(
-            _incarnation_floor, _incarnation_floor + INCARNATION_SCAN_SPAN
-        ):
+        for incarnation in range(window_start, window_start + HOST_INCARNATION_WINDOW):
             key = f"h{incarnation}.{tab_id}"
             try:
                 roost.call("tab.focus", {"tab_id": key})
@@ -379,6 +401,7 @@ def host_key(roost: Roost, tab_id: int, timeout: float = 30.0) -> str:
                 continue
             _incarnation_floor = incarnation
             return key
+        window_start += HOST_INCARNATION_WINDOW
         return None
 
     return wait_until(probe, timeout, f"a connected host to list tab {tab_id}")

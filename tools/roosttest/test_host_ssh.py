@@ -77,7 +77,6 @@ from util import runs_alone
 
 # The host lane's vocabulary, unchanged: same fixtures' shape, same
 # palette reads, same incarnation probe. Only the transport differs.
-from client import RoostError
 from test_host_client import (
     HostUnderTest,
     first_project,
@@ -88,6 +87,7 @@ from test_host_client import (
     wait_dump_contains,
     wait_until,
 )
+from test_host_client import host_key as _host_key
 
 pytestmark = pytest.mark.host_client
 
@@ -408,41 +408,19 @@ def ssh_host(roost: Roost, session_env):
 # ---------------------------------------------------------------------------
 
 
-# How many incarnations [`host_key`] scans per pass. Small on purpose,
-# and safe here for a reason `test_host_client` cannot rely on: this lane
-# only ever drives a UI it launched itself (see `_harness_owned_ui`), so
-# the app's minter is a handful of connects in, not hundreds.
-#
-# Deliberately NOT that module's 4096-wide single-pass scan. A miss there
-# costs 4096 IPC round trips — tens of seconds, i.e. the whole wait
-# budget — so a tab that reaches the client's mirror a moment *after* it
-# is created never gets a second pass. Over ssh that moment is real: the
-# `tab.opened` event crosses two extra pumps and a remote process before
-# the mirror has it.
-HOST_INCARNATION_WINDOW = 64
-
-
+# `test_host_client.host_key` (the 64-wide window rescanned inside
+# `wait_until`, floor advancing on every hit) is exactly this lane's
+# shape too — same `tab.focus` probe, same discovery-is-attach story,
+# same reason a narrow window beats a wide single-pass scan: over ssh a
+# tab reaching the client's mirror a moment *after* it is created is the
+# common case, not the exception (the `tab.opened` event crosses two
+# extra pumps and a remote process before the mirror has it), so a miss
+# has to be cheap enough for `wait_until` to genuinely retry. Only this
+# lane's longer default budget is worth keeping local: ssh adds a tunnel
+# dial and a remote exec before the incarnation this call is watching
+# for even exists.
 def host_key(roost: Roost, tab_id: int, timeout: float = 60.0) -> str:
-    """Focus a host tab and return the `h<host>.<id>` spelling that
-    reached it.
-
-    The incarnation is minted per connect attempt and no op reports it,
-    so it is discovered by probing — and focusing is the discovery
-    because focusing is also the attach. A stale incarnation names
-    nothing, so a wrong guess is a clean `not-found` rather than a wrong
-    tab.
-    """
-
-    def probe() -> str | None:
-        for incarnation in range(1, HOST_INCARNATION_WINDOW + 1):
-            try:
-                roost.call("tab.focus", {"tab_id": f"h{incarnation}.{tab_id}"})
-            except RoostError:
-                continue
-            return f"h{incarnation}.{tab_id}"
-        return None
-
-    return wait_until(probe, timeout, f"the client to list host tab {tab_id}")
+    return _host_key(roost, tab_id, timeout=timeout)
 
 
 #: What `host.connect` may answer for an **ssh** host. The establish is
