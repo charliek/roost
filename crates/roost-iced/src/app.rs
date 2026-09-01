@@ -2311,12 +2311,18 @@ impl App {
         }
         for host in self.workspace.hosts() {
             // Launch-time, so nobody asked and nobody is waiting: an
-            // `Ipc` origin, same as `roostctl`'s.
-            self.connect_saved_host(&host, crate::host_conn::RequestOrigin::Ipc, |localhost| {
-                // A remote host is manual-reconnect only, so it is not
-                // even resolved into a connection here.
-                localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
-            });
+            // `Ipc` origin, same as `roostctl`'s, and an attempt no
+            // person caused — which is what `AutoReconnect` says.
+            self.connect_saved_host(
+                &host,
+                crate::host_conn::RequestOrigin::Ipc,
+                |localhost| {
+                    // A remote host is manual-reconnect only, so it is
+                    // not even resolved into a connection here.
+                    localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
+                },
+                crate::host_conn::AttemptCause::AutoReconnect,
+            );
         }
         if !self.hosts.is_empty() {
             tracing::info!("probing saved host sessions");
@@ -2334,15 +2340,28 @@ impl App {
     /// one, so it goes through [`crate::host_conn::HostConnSet::open_ssh`]
     /// and reaches `connect` one feed item later — see
     /// [`crate::engine_feed::EngineFeed::HostTunnel`].
+    ///
+    /// Every dial route ends here, which is why the shutdown gate is here
+    /// too. `abandon_reconnects` rides the `ExitState` latch and so sweeps
+    /// exactly once; a bootstrap job whose success arm asks for a
+    /// reconnect, or an IPC `host.connect` serviced in a later `update`,
+    /// would otherwise establish a fresh `ControlPersist` master that
+    /// outlives the app. The two earlier guards stay where they are —
+    /// they short-circuit before doing other work.
     fn connect_saved_host(
         &mut self,
         host: &roost_engine::persistence::HostSnapshot,
         origin: crate::host_conn::RequestOrigin,
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
+        cause: crate::host_conn::AttemptCause,
     ) {
         use crate::host_conn::HostTransport;
         use roost_ipc::ssh::ResolvedTransport;
 
+        if self.exit_state != ExitState::Running {
+            tracing::debug!(host = %host.id, "not connecting a host during shutdown");
+            return;
+        }
         // A new attempt replaces the origin and the failure an in-flight
         // probe's question was built on, so that probe is now asking
         // about something that is no longer happening: user Connect →
@@ -2374,6 +2393,7 @@ impl App {
                 socket,
                 HostTransport::LocalSession,
                 mode,
+                cause,
             ),
             ResolvedTransport::UnixSocket(socket) => self.hosts.connect(
                 &host.id,
@@ -2381,10 +2401,11 @@ impl App {
                 socket,
                 HostTransport::UnixSocket,
                 mode,
+                cause,
             ),
             ResolvedTransport::Ssh(target) => {
                 self.hosts
-                    .open_ssh(&host.id, &host.label, target, mode, origin)
+                    .open_ssh(&host.id, &host.label, target, mode, origin, cause)
             }
         }
     }
@@ -2392,6 +2413,18 @@ impl App {
     /// An ssh tunnel finished coming up, or failed to. Dialing is the
     /// set's; the toast and the offer are the app's.
     fn host_tunnel_ready(&mut self, ready: crate::host_conn::HostTunnelReady) {
+        // The same guard `host_reconnect_due` carries, for the window it
+        // cannot see (plan 040 §3.4): `EngineFeed::Quit` only latches the
+        // exit, so an establish that lands behind it in the same drain
+        // would otherwise dial a session while the app is shutting down
+        // — and `abandon_reconnects`, which runs after the drain, has
+        // nothing left to abort by then. The tunnel is still retired
+        // properly rather than dropped.
+        if self.exit_state != ExitState::Running {
+            tracing::debug!(host = %ready.host, "not connecting a host during shutdown");
+            self.hosts.discard_ready(ready);
+            return;
+        }
         let saved_id = ready.host.clone();
         if let Some(reason) = self.hosts.tunnel_ready(ready) {
             self.set_status(reason);
@@ -2655,8 +2688,16 @@ impl App {
     }
 
     /// Hand out the exit request `reconcile()` latched, once.
+    ///
+    /// The once-only edge is also where the host set is told to stop
+    /// dialing (plan 040 §3.4). Here rather than in `Drop for App`,
+    /// which is the other candidate: this is the edge where the
+    /// *decision* to exit is made, so the abort lands before the run
+    /// loop unwinds rather than in the middle of it — and the two of
+    /// them are the same latch, so it cannot fire twice.
     pub fn take_exit_task(&mut self) -> UiTask {
         if self.exit_state.take() {
+            self.hosts.abandon_reconnects();
             UiTask::Exit
         } else {
             UiTask::None
@@ -5046,7 +5087,11 @@ impl App {
             Some(crate::host_conn::HostConnState::NeedsRestart(_))
         );
         if host_notice::connect_route(origin, needs_restart) == host_notice::ConnectRoute::Dial {
-            return self.host_reconnect_requested(saved_id, origin);
+            return self.host_reconnect_requested(
+                saved_id,
+                origin,
+                crate::host_conn::AttemptCause::Explicit,
+            );
         }
         let Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) =
             self.hosts.state(saved_id)
@@ -5082,23 +5127,57 @@ impl App {
     /// flow's own relaunch has to come through *here* — the host is
     /// still in `NeedsRestart` at that moment, and re-raising the dialog
     /// the user just answered would be a loop.
+    ///
+    /// It is also the door a scheduled reconnect is meant to re-enter
+    /// through (plan 040 §3.4), which is why the attempt says why it
+    /// exists: the guards this door supplies — the saved-host lookup,
+    /// the bootstrap-probe cancel, the target re-classification — are
+    /// exactly the ones a raw `open_ssh` re-entry would skip.
     pub fn host_reconnect_requested(
         &mut self,
         saved_id: &str,
         origin: crate::host_conn::RequestOrigin,
+        cause: crate::host_conn::AttemptCause,
     ) {
         let Ok(host) = self.saved_host(saved_id) else {
             tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
             return;
         };
         tracing::info!(host = %host.id, "connecting a saved host session");
-        self.connect_saved_host(&host, origin, |localhost| {
-            Some(if localhost {
-                crate::host_conn::ConnectMode::SpawnIfMissing
-            } else {
-                crate::host_conn::ConnectMode::Dial
-            })
-        });
+        self.connect_saved_host(
+            &host,
+            origin,
+            |localhost| {
+                Some(if localhost {
+                    crate::host_conn::ConnectMode::SpawnIfMissing
+                } else {
+                    crate::host_conn::ConnectMode::Dial
+                })
+            },
+            cause,
+        );
+    }
+
+    /// An armed auto-reconnect came due (plan 040 §3.4).
+    ///
+    /// It re-enters through [`Self::host_reconnect_requested`] rather
+    /// than calling `open_ssh`, which is the whole point of the door:
+    /// the saved-host lookup catches a host removed between arm and
+    /// fire, `connect_saved_host`'s `cancel_bootstrap_probe` closes the
+    /// consent path a raw re-entry would leave open, and its
+    /// re-classification catches a host edited to a non-ssh target.
+    fn host_reconnect_due(&mut self, saved_id: &str, request: u64) {
+        // `EngineFeed::Quit` does not stop the drain, so a due message
+        // sitting behind one would re-enter the connect path after the
+        // user asked to quit.
+        if self.exit_state != ExitState::Running {
+            tracing::debug!(host = %saved_id, "not reconnecting a host during shutdown");
+            return;
+        }
+        let Some((origin, cause)) = self.hosts.reconnect_due(saved_id, request) else {
+            return;
+        };
+        self.host_reconnect_requested(saved_id, origin, cause);
     }
 
     // ── host verbs (plan 037 §3.1/§3.5) ─────────────────────────────
@@ -5173,7 +5252,11 @@ impl App {
     ) -> Result<roost_engine::persistence::HostSnapshot, roost_engine::WorkspaceError> {
         let host = self.workspace.add_host(label, target)?;
         if let Some(origin) = connect {
-            self.host_reconnect_requested(&host.id, origin);
+            self.host_reconnect_requested(
+                &host.id,
+                origin,
+                crate::host_conn::AttemptCause::Explicit,
+            );
         }
         self.reconcile();
         Ok(host)
@@ -5372,9 +5455,11 @@ impl App {
         match result {
             // The session is gone; connecting again spawns a fresh one
             // through the shared ladder and hydrates the saved layout.
-            Ok(()) => {
-                self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User)
-            }
+            Ok(()) => self.host_reconnect_requested(
+                saved_id,
+                crate::host_conn::RequestOrigin::User,
+                crate::host_conn::AttemptCause::Explicit,
+            ),
             Err(error) => self.set_status(error),
         }
     }
@@ -5987,7 +6072,11 @@ impl App {
                 // warning this success line may be carrying.
                 tracing::info!(host = %saved_id, %message, "roost-session is set up; reconnecting");
                 self.set_status(message);
-                self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User);
+                self.host_reconnect_requested(
+                    saved_id,
+                    crate::host_conn::RequestOrigin::User,
+                    crate::host_conn::AttemptCause::Explicit,
+                );
             }
             Err(error) => self.report_bootstrap_failure(saved_id, &target, &error),
         }

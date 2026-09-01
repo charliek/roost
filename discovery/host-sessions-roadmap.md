@@ -44,6 +44,16 @@ toolchain move — putting the snapshot API in reach.
    require an explicit Connect each launch (revisit in HS-4). Users
    who never connect a host see zero change (Hosts section hidden
    until the first connect).
+   **Revisited by HS-4 slice 1 (plan 040, shipped):** the rule above
+   stands exactly as written, narrowed to *launch* — an SSH host still
+   never auto-connects when Roost opens. What HS-4 slice 1 changed is
+   the *mid-session drop*: a saved SSH host that has actually reached
+   `Connected` once now auto-retries on its own capped backoff (1s
+   base, 30s ceiling, giving up and settling after 10 attempts) before
+   ↻ Reconnect becomes the only path back — the same shape `localhost`
+   already had for a drop. See
+   [`docs/development/host-sessions.md`](../docs/development/host-sessions.md#the-leasetakeover-lifecycle)
+   for the shipped rule.
 5. **Roost.app (Swift) is untouched.** The Mac client for host
    sessions is the iced Mac app. Whether the Swift app ever grows a
    host backend is downstream of the mac-iced direction question in
@@ -250,6 +260,13 @@ land (post-HS-3). Lifecycle practices adopted from Herdr:
   cleanly (architecture §4.1). Independent per-client viewports are
   HS-4.
 - Localhost auto-reconnects on launch once opted in; SSH is explicit.
+  **Narrowed to launch, and stands there unchanged** — an SSH host
+  still never auto-connects when Roost opens. **HS-4 slice 1 (plan
+  040, shipped)** revisited the *mid-session drop* instead: a saved
+  SSH host that reached `Connected` at least once now auto-retries a
+  drop on its own capped backoff, settling after 10 attempts, exactly
+  as localhost already did. See
+  [`docs/development/host-sessions.md`](../docs/development/host-sessions.md#the-leasetakeover-lifecycle).
 - Local in-process tabs and host tabs are separate worlds; no
   migration in the MVP.
 - Saved hosts (`{id, label, target, last_connected}`) live in the
@@ -565,11 +582,23 @@ manual verification for both plans.
 Only after HS-3 is boring — and explicitly a *bucket of separate
 follow-on plans*, not one milestone (each item below has its own
 architecture and risk): independent per-client viewports (replacing
-takeover); auto-reconnect for chosen SSH hosts; "Move tab to host";
+takeover); auto-reconnect for chosen SSH hosts (**slice 1 shipped as
+plan 040** — every SSH host gets it once connected, not a per-host
+opt-in; see D8); "Move tab to host";
 a Mac `roost-session` build for Mac-local persist (cheap in code,
 real packaging scope); second-window-as-second-client if the
 multi-window question becomes live. Porcelain-heavy; sequenced by
 usage, not up front.
+
+Slice 1's own follow-ups — the ones that outlived it rather than the
+ones it deferred by design — are filed and split pre/post initial
+release under [Tracked follow-ups](#tracked-follow-ups-pre--post-initial-release).
+The one that shapes this milestone: independent per-client viewports is
+listed above as *replacing* takeover, and
+[#381](https://github.com/charliek/roost/issues/381) is the narrower
+fix for takeover itself. They are alternatives to weigh together, not a
+sequence — a viewports design that removes takeover would close #381 by
+construction.
 
 ### HS-5 — Local default flip (decision point, not scheduled)
 
@@ -577,6 +606,70 @@ Launch iced as a client of a local session always, with
 `--ephemeral` as the escape hatch. Explicitly a product decision to
 be made after living with HS-2/3; the HS-0 seams exist so it is a
 default-backend change, not a rewrite.
+
+---
+
+## Tracked follow-ups (pre / post initial release)
+
+Everything below is a **filed GitHub issue**, so this list stays a map
+rather than a second backlog. The split is what has to be true before
+the first public release versus what is a real improvement we are
+deliberately not blocking on. Correctness and the testing that protects
+it are pre; maintainability, deferred product decisions and contained
+workarounds are post.
+
+Only items surfaced by shipped host-session work are categorised so
+far — the rest of the issue tracker predates this split and is
+uncategorised, not implicitly "post".
+
+### Pre initial release
+
+- **[#381](https://github.com/charliek/roost/issues/381) Session takeover is best-effort; needs an atomic
+  conditional-connect on the wire.** Reconnect *is* takeover
+  (`session.connect { takeover: true }`), and the guard in front of it
+  can miss a real takeover, while the server keeps only the
+  most-recently-displaced tombstone — so a third client's takeover
+  erases the record of the second's. HS-4 slice 1 shipped **parity with
+  localhost's best-effort guard, explicitly not "cannot steal"** (plan
+  040 §3.7). A real guarantee is a `session_protocol` change and its own
+  plan. Multi-client is the point of host sessions, so this is a
+  correctness issue with a wrong outcome in both directions.
+- **[#382](https://github.com/charliek/roost/issues/382) No IPC op reports host connection state or the retry
+  schedule.** The functional lane asserts on `tracing` message
+  substrings, and the sidebar band copy (`reconnecting in 8s (3/10)`)
+  is reachable only by rendering the window and reading the PNG. Both
+  are one refactor away from passing while the feature is broken.
+- **[#383](https://github.com/charliek/roost/issues/383) `App` is not constructible in a unit test.** `App::bootstrap`
+  measures fonts, builds a runtime, hydrates the workspace and binds the
+  socket, so every `App`-level guard gets e2e coverage or none — and
+  that is exactly where plan 040's late bugs lived.
+- **[#384](https://github.com/charliek/roost/issues/384) The live SSH-reconnect harness lives outside the repo.** Only
+  a real `sshd` exercises `ControlPersist`, a black-holed route hitting
+  `ConnectTimeout`, and a daemonised master outliving the app. It found
+  real bugs, and it encodes three traps that each made a lane report
+  PASS while proving nothing.
+
+### Post initial release
+
+- **[#385](https://github.com/charliek/roost/issues/385) No seam to inject a tunnel failure**, so a session-drop
+  family is unreachable from a unit test and the fire-time re-check
+  needs a `#[cfg(test)]` enum arm. Contained and documented.
+- **[#386](https://github.com/charliek/roost/issues/386) `HostConnSet`'s six parallel `HashMap`s want one
+  `HostEntry`.** Deferred on purpose so the consolidation lands *after*
+  the call sites exist; a lifecycle-clarity investment, not growth.
+- **[#387](https://github.com/charliek/roost/issues/387) `NoSession` settles immediately**, so a far side that is
+  merely restarting costs a manual ↻. Consistent with localhost,
+  documented, and mitigated by running `roost-session` as a lingering
+  `systemd --user` unit.
+- **[#388](https://github.com/charliek/roost/issues/388) Per-host settings: convention pinned, no toggle ships.** A
+  settling ladder needs no off-switch; filed so the convention
+  (additive `#[serde(default)]` field, surfaced as a palette verb per
+  D11, never a dialog) survives.
+
+**Closed by shipped work:** [#379](https://github.com/charliek/roost/issues/379) (six unbounded stderr drains in
+`ssh.rs`) is fixed by plan 040 C1 — bounded drains plus a truncation
+flag, so a failure classified from evidence we could not fully read is
+never retried.
 
 ---
 

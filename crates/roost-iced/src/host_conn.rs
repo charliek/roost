@@ -69,22 +69,42 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use roost_ipc::messages::{ops, EventEnvelope, OscColorsParams};
-use roost_ipc::ssh::SshTunnel;
+use roost_ipc::ssh::{SshFailure, SshTunnel};
 use roost_ui_model::keys::{HostId, TabKey};
 use roost_ui_model::theme::Theme;
+use tokio::task::AbortHandle;
 
 pub(crate) mod mirror;
 pub(crate) mod queue;
+pub(crate) mod reconnect;
 pub(crate) mod restart;
 pub(crate) mod state;
 pub(crate) mod task;
 
 pub(crate) use mirror::SharedMirror;
 pub(crate) use queue::{HostIntent, HostOpError, HostOps};
+pub(crate) use reconnect::{Decision, DropInput};
 pub(crate) use state::{HostConnState, HostTransport};
 pub(crate) use task::{ConnectMode, Shutdown};
+
+/// How far wall-clock time may run past an armed delay before the
+/// handler reads it as a suspend rather than a busy event loop.
+///
+/// tokio's timer is `Instant`-based and the platforms Roost ships on
+/// exclude suspend from `CLOCK_MONOTONIC`, so a lid closed one second
+/// after a drop wakes with the timer firing at once and attempts 2–10
+/// burning while the radio is still associating. `SystemTime` is the
+/// right clock to catch that precisely because it *does* advance across
+/// suspend.
+///
+/// Thirty seconds because no scheduling overshoot on a loaded UI thread
+/// comes near it, so the only thing that trips this is a machine that
+/// was actually asleep — or a forward NTP step, which costs one extra
+/// base-delay wait and nothing else.
+const SUSPEND_SKEW: Duration = Duration::from_secs(30);
 
 /// Who asked for a connection.
 ///
@@ -96,9 +116,11 @@ pub(crate) use task::{ConnectMode, Shutdown};
 /// that must never happen is a modal opening to ask a machine a
 /// question (plan 039 §3.5).
 ///
-/// Today nothing branches on it: the toast/band decisions still turn on
-/// attendedness as they always have. It exists so C5b's bootstrap
-/// consent dialog has an honest answer to "is there somebody there?".
+/// The bootstrap consent gate is what branches on it
+/// (`app::bootstrap::offer_for`), and it is the *only* thing that does:
+/// a card is offered to `User` and to nobody else. The toast and the
+/// band still turn on attendedness, which is a different question —
+/// "who hears about this?" rather than "who could answer a modal?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestOrigin {
     /// A person: a palette row, the sidebar's ↻, a banner, a dialog.
@@ -109,6 +131,25 @@ pub(crate) enum RequestOrigin {
     Ipc,
 }
 
+/// Why this attempt exists.
+///
+/// [`RequestOrigin`] cannot answer it: `roostctl host connect` is an
+/// explicit machine-driven connect and arrives as exactly the same
+/// origin and mode an auto-reconnect would. So the two questions are
+/// separate — "is there somebody there?" and "did anybody ask for *this*
+/// attempt?" — and the second is the one a retry ladder turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptCause {
+    /// Somebody asked for this one: the sidebar's ↻, a palette row, the
+    /// Add Host dialog, `roostctl host connect`. It supersedes whatever
+    /// a schedule had in mind, so it clears the outage entry outright.
+    Explicit,
+    /// The schedule asked. It leaves the outage alone — the attempt
+    /// counter, and the lease [`Outage`] carries, are what bound the
+    /// ladder and keep it from stealing a session back.
+    AutoReconnect,
+}
+
 /// Why reaching a host failed: the classified family when the far side
 /// is what refused, and the line the band and the toast render.
 ///
@@ -116,9 +157,11 @@ pub(crate) enum RequestOrigin {
 /// ([`roost_ipc::ssh::classify_ssh_failure`]) exists precisely so a
 /// caller can route on "the binary is not installed over there" without
 /// matching substrings of user-facing copy — but the copy is what the
-/// UI shows, so collapsing to one or the other loses something. C5b
-/// branches on [`Self::family`]; every surface today reads
-/// [`Self::message`] and is unchanged.
+/// UI shows, so collapsing to one or the other loses something. The
+/// bootstrap offer and the retry ladder both branch on
+/// [`Self::family`] — the ladder on [`Self::truncated`] as well, which
+/// is why the two travel together — while the band and the toast render
+/// [`Self::message`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConnectFailure {
     /// `None` when the failure was this side's — a scratch directory
@@ -126,6 +169,13 @@ pub(crate) struct ConnectFailure {
     /// socket that would not answer — which has no family and no remedy
     /// on the far host.
     pub(crate) family: Option<roost_ipc::ssh::SshFailure>,
+    /// Whether the stderr [`Self::family`] was classified from was
+    /// incomplete — a drain that ran out of time, or a byte cap that
+    /// discarded the leading bytes. `false` for a failure whose verdict
+    /// was not read out of a tail at all (this side's own failure, an
+    /// establish that timed out). It is here so a retry policy can
+    /// refuse to act on evidence it did not fully see.
+    pub(crate) truncated: bool,
     pub(crate) message: String,
 }
 
@@ -135,6 +185,7 @@ impl ConnectFailure {
     pub(crate) fn unclassified(message: impl Into<String>) -> Self {
         Self {
             family: None,
+            truncated: false,
             message: message.into(),
         }
     }
@@ -144,6 +195,7 @@ impl ConnectFailure {
         Self {
             message: failure.message(target),
             family: Some(failure),
+            truncated: false,
         }
     }
 }
@@ -161,6 +213,7 @@ impl From<roost_ipc::ssh::SshTunnelError> for ConnectFailure {
     fn from(error: roost_ipc::ssh::SshTunnelError) -> Self {
         Self {
             family: error.failure().cloned(),
+            truncated: error.truncated(),
             message: error.to_string(),
         }
     }
@@ -170,6 +223,7 @@ impl From<roost_ipc::ssh::VerifyError> for ConnectFailure {
     fn from(error: roost_ipc::ssh::VerifyError) -> Self {
         Self {
             family: error.failure().cloned(),
+            truncated: error.truncated(),
             // `{:#}` is what both callers printed before this type
             // existed — the anyhow chain on the socket arm, the ssh
             // error's own message on the other.
@@ -326,6 +380,32 @@ pub(crate) fn theme_colors(theme: &Theme) -> OscColorsParams {
     }
 }
 
+/// §3.8's band line for an armed retry: `reconnecting in 8s (3/10)`.
+///
+/// Written once, when the retry is armed, and stating the delay rather
+/// than counting down — a live countdown needs a per-second ticker and a
+/// sidebar redraw per host in backoff, for a number nobody acts on. The
+/// `(3/10)` is what makes the give-up legible before it happens.
+///
+/// The seconds round *up*, so the first jittered delay off a one-second
+/// base reads `1s` rather than `0s`.
+fn retry_line(delay: Duration, attempt: u32, budget: u32) -> state::Disconnected {
+    let seconds = delay.as_millis().div_ceil(1_000).max(1);
+    state::Disconnected {
+        reason: format!("reconnecting in {seconds}s ({attempt}/{budget})"),
+        retry_in: Some(delay),
+    }
+}
+
+/// §3.8's line for a ladder that spent its budget. The ↻ Reconnect row
+/// never left the screen, so this says what stopped, not what is lost.
+fn gave_up_copy(attempts: u32, family_copy: Option<&str>) -> String {
+    match family_copy {
+        Some(copy) => format!("reconnect gave up after {attempts} tries — {copy}"),
+        None => format!("reconnect gave up after {attempts} tries"),
+    }
+}
+
 /// A disconnected state's one-line reason, when it has one.
 fn disconnected_reason(state: &HostConnState) -> Option<&str> {
     match state {
@@ -460,6 +540,28 @@ pub(crate) struct HostConnSet {
     ssh: HashMap<String, SshState>,
     /// Handed out by [`HostConnSet::open_ssh`], never reused.
     next_ssh_request: u64,
+    /// In-flight establishes whose [`SshState`] is gone — displaced by a
+    /// second [`HostConnSet::open_ssh`] or removed by a
+    /// [`HostConnSet::disconnect`].
+    ///
+    /// Dropping an `AbortHandle` does not abort its task, and while the
+    /// app is running that is exactly right: a displaced establish is
+    /// deliberately left to land, so [`Self::tunnel_ready`] can drop its
+    /// answer against [`SshState::request`] and hand the tunnel to
+    /// [`Self::discard_tunnel`] — the only thing that sends `-O exit`
+    /// and removes the scratch directory. Aborting one mid-flight would
+    /// instead run [`SshTunnel`]'s *blocking* `Drop` on a runtime
+    /// worker.
+    ///
+    /// This exists purely so the exit path can still reach them, because
+    /// at exit nothing will ever drain their answer: a
+    /// just-daemonized `ControlPersist=60s` master would outlive the
+    /// app. [`Self::abandon_reconnects`] is the only place they are
+    /// aborted.
+    displaced: Vec<AbortHandle>,
+    /// What an ssh host's retry ladder must carry across its own
+    /// attempts, keyed like [`Self::conns`]. See [`Outage`].
+    outages: HashMap<String, Outage>,
     /// What a bootstrap is doing to a host right now, or how it ended —
     /// keyed like [`Self::conns`].
     ///
@@ -470,6 +572,94 @@ pub(crate) struct HostConnSet {
     /// leave the band describing a question that is already being dealt
     /// with.
     bootstrap_notes: HashMap<String, String>,
+}
+
+/// One ssh host's outage: everything a retry ladder has to carry that
+/// the retry itself would otherwise destroy (plan 040 §3.4).
+///
+/// It exists because the two natural homes are both wiped by the very
+/// call that needs them. [`HostConnSet::open_ssh`] inserts a *fresh*
+/// [`SshState`] on every attempt, and [`HostConnSet::connect`] calls
+/// `forget` before it builds the config, destroying the old
+/// [`HostConn`]. So the ladder's depth and the lease it must present
+/// live here, in a store neither of them touches.
+///
+/// Created at the first drop of an outage and destroyed by anything
+/// that ends one: a successful connect, an explicit attempt, a
+/// disconnect, a remove, a give-up, a terminal settle.
+pub(crate) struct Outage {
+    ladder: reconnect::ReconnectLadder,
+    /// The lease the connection that just died held, copied off
+    /// [`SshState::lease`] on every drop that has one (§3.7). What the
+    /// next attempt presents before taking the session back.
+    lease: Option<String>,
+    /// The retry waiting to fire, if one is. Deliberately without a
+    /// request stamp beside it — see [`HostConnSet::arm_reconnect`].
+    armed: Option<Armed>,
+    /// The tunnel the drop left behind, kept for its `last_error` alone.
+    dead_tunnel: Option<DeadTunnel>,
+}
+
+/// One armed retry: the timer, when it was armed, and for how long.
+///
+/// The two clock fields are §3.5's suspend detection. They are stored
+/// rather than derived because the comparison is wall-clock against a
+/// monotonic sleep, and only the arming side knows both halves.
+struct Armed {
+    handle: AbortHandle,
+    at: SystemTime,
+    delay: Duration,
+}
+
+/// A dead tunnel's failure slot, re-read once more when the timer fires.
+///
+/// C1 made `serve` record before the client-visible EOF, which is the
+/// primary closure of the record-vs-EOF race; this is the belt. One
+/// client runs several concurrent execs, so a *different* exec can
+/// still record a graver family after the one whose EOF the connection
+/// task saw — and dialing ten times into a changed host key is exactly
+/// what §3.3 refuses. `shutdown()` has already run on this tunnel by the
+/// time it lands here, so holding the `Arc` costs nothing and its
+/// eventual `Drop` is a no-op.
+enum DeadTunnel {
+    /// The tunnel itself, with the generation already folded into the
+    /// reason the band is showing.
+    Tunnel { tunnel: Arc<SshTunnel>, seen: u64 },
+    /// The same slot, injected. `SshTunnel::record` is private to
+    /// `roost-ipc` and only that crate's own exec paths call it, so a
+    /// unit test cannot move a real tunnel's `last_error` — this is the
+    /// only way the fire-time re-check is reachable from one.
+    #[cfg(test)]
+    Recorded {
+        generation: u64,
+        failure: SshFailure,
+        truncated: bool,
+        seen: u64,
+    },
+}
+
+impl DeadTunnel {
+    /// A failure recorded since the drop, if there is one and it is
+    /// news: `(generation, family, truncated)`.
+    fn late_failure(&self) -> Option<(u64, SshFailure, bool)> {
+        match self {
+            Self::Tunnel { tunnel, seen } => {
+                let recorded = tunnel.last_error()?;
+                (recorded.generation > *seen).then_some((
+                    recorded.generation,
+                    recorded.failure,
+                    recorded.truncated,
+                ))
+            }
+            #[cfg(test)]
+            Self::Recorded {
+                generation,
+                failure,
+                truncated,
+                seen,
+            } => (generation > seen).then(|| (*generation, failure.clone(), *truncated)),
+        }
+    }
 }
 
 /// One saved host's ssh transport, from the moment a connect is asked
@@ -488,17 +678,56 @@ struct SshState {
     request: u64,
     label: String,
     mode: ConnectMode,
-    /// Whether a user asked for this attempt. Only an attended failure
-    /// raises a toast; an unattended one is the band's business alone.
+    /// Whether somebody is waiting on this attempt's answer. Only an
+    /// attended failure raises a status line; an unattended one is the
+    /// band's business alone.
+    ///
+    /// Derived from [`Self::cause`] *and* the mode: somebody asked for
+    /// this particular attempt, and it is not the launch probe. Origin
+    /// would be the wrong input — `roostctl host connect`'s reply
+    /// carries no outcome, so that status line is its only failure
+    /// surface and an `origin == User` rule would silence it.
     attended: bool,
-    /// Who asked. Nothing reads it yet — [`Self::attended`] still
-    /// decides the toast exactly as it did — but an IPC dial and a
+    /// Who asked, for the bootstrap consent gate: an IPC dial and a
     /// user's click are both `Dial`, so this is the only place the
-    /// difference survives.
+    /// difference survives. Every auto-reconnect stamps `Ipc`, which is
+    /// what keeps a ladder from raising a card.
     origin: RequestOrigin,
+    /// Whether anybody asked for *this* attempt, as opposed to who
+    /// would hear about it. It is what an explicit connect clears an
+    /// outage off, and what decides whether the next dial carries
+    /// [`Outage::lease`].
+    cause: AttemptCause,
+    /// Which connection this attempt produced, stamped by
+    /// [`HostConnSet::connect`]. `None` until the tunnel is up and that
+    /// call has run — an establish that never answers never has one.
+    ///
+    /// It is what makes [`Self::lease`] attributable: a feed item is
+    /// tagged with an incarnation, and the connection an incarnation
+    /// belongs to is only half the question here.
+    generation: Option<u64>,
+    /// The lease the connection under this attempt was granted, once it
+    /// reached `Connected`.
+    ///
+    /// It lands here rather than on the [`Outage`] because of when it
+    /// arrives (§3.7): at `Connected` no outage exists yet — one is
+    /// created at the first drop — and a successful auto-reconnect
+    /// *clears* the outage at exactly the moment the new lease is
+    /// published. This entry, by contrast, is created at `open_ssh`,
+    /// stamped here, and still untouched at the drop that copies it out.
+    lease: Option<String>,
     /// `None` until the establish answers, and again once the tunnel is
     /// torn down.
     tunnel: Option<Arc<SshTunnel>>,
+    /// The handshake this attempt spawned, while it is still running.
+    ///
+    /// Retained for exactly one caller, the exit path's
+    /// [`HostConnSet::abandon_reconnects`]. A *superseded* establish is
+    /// deliberately left to finish — its answer is dropped against
+    /// [`Self::request`], and aborting it mid-flight would run
+    /// [`SshTunnel`]'s blocking teardown on a runtime worker for no
+    /// gain.
+    establish: Option<AbortHandle>,
     /// The highest [`SshTunnel::last_error`] generation already folded
     /// into a reported reason. A tunnel bumps its generation once per
     /// `ssh` exec, so this is what separates "the failure the band is
@@ -555,6 +784,8 @@ impl HostConnSet {
             next_generation: 0,
             ssh: HashMap::new(),
             next_ssh_request: 0,
+            displaced: Vec::new(),
+            outages: HashMap::new(),
             bootstrap_notes: HashMap::new(),
         }
     }
@@ -569,6 +800,9 @@ impl HostConnSet {
     /// its task is aborted and its incarnation forgotten — so "Connect"
     /// on an already-connected host is a deliberate reconnect, which on
     /// this wire is a takeover.
+    ///
+    /// `cause` decides one thing here: whether the task starts holding
+    /// the previous connection's lease — see [`Self::carried_lease`].
     pub(crate) fn connect(
         &mut self,
         host: &str,
@@ -576,6 +810,7 @@ impl HostConnSet {
         socket: PathBuf,
         transport: HostTransport,
         mode: ConnectMode,
+        cause: AttemptCause,
     ) {
         // The incarnation this reconnect displaces, threaded into the
         // replacement task so its FIRST `Connecting` carries it — that
@@ -584,9 +819,16 @@ impl HostConnSet {
         // old connection's tabs left behind (attach state, terminals,
         // inbox rows).
         let supersedes = self.conns.get(host).and_then(|conn| conn.incarnation);
+        let held_lease = self.carried_lease(host, cause);
         self.forget(host);
         self.next_generation += 1;
         let generation = self.next_generation;
+        // Only the ssh path has an entry to stamp, and stamping it is
+        // what lets a lease publication be traced back to the attempt
+        // that opened the connection — see [`Self::apply_lease`].
+        if let Some(entry) = self.ssh.get_mut(host) {
+            entry.generation = Some(generation);
+        }
 
         let (ops, ops_rx) = HostOps::channel();
         let shutdown = Arc::new(Shutdown::default());
@@ -598,6 +840,7 @@ impl HostConnSet {
             generation,
             supersedes,
             mode,
+            held_lease,
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
         };
@@ -658,12 +901,17 @@ impl HostConnSet {
     /// overlap — a double Connect, an establish that lands late — has
     /// nothing to collide on.
     ///
-    /// Attendedness is still read off `mode` — `IfPresent` is minted by
-    /// exactly one caller, the launch probe, and everything else waits
-    /// for an answer. `origin` is the *other* question, and it is passed
-    /// in because it cannot be derived: an IPC `host.connect` arrives as
-    /// `Dial`, indistinguishable from a click, so a modal opened off the
-    /// mode would be asking `roostctl` a question (plan 039 §3.5).
+    /// `origin` is passed in because it cannot be derived: an IPC
+    /// `host.connect` arrives as `Dial`, indistinguishable from a click,
+    /// so a modal opened off the mode would be asking `roostctl` a
+    /// question (plan 039 §3.5).
+    ///
+    /// `cause` decides the other two things: whether this attempt clears
+    /// the [`Outage`] a schedule was working through, and whether
+    /// anybody is waiting to hear how it went. Attendedness is `cause`
+    /// *and* mode rather than mode alone — a ladder mints ten `Dial`s
+    /// nobody asked for, and each of them would otherwise raise a status
+    /// line.
     pub(crate) fn open_ssh(
         &mut self,
         host: &str,
@@ -671,36 +919,24 @@ impl HostConnSet {
         target: roost_ipc::ssh::SshTarget,
         mode: ConnectMode,
         origin: RequestOrigin,
+        cause: AttemptCause,
     ) {
         // A fresh attempt supersedes whatever the last bootstrap left on
         // the band: either it worked and this connect is its sequel, or
         // it did not and the user is trying again — and in both cases
         // this attempt's own outcome is the newer answer.
         self.bootstrap_notes.remove(host);
+        if cause == AttemptCause::Explicit {
+            self.clear_outage(host);
+        }
         let previous = self.take_tunnel(host);
         self.next_ssh_request += 1;
         let request = self.next_ssh_request;
-        self.ssh.insert(
-            host.to_string(),
-            SshState {
-                target: target.raw.clone(),
-                request,
-                label: label.to_string(),
-                mode,
-                attended: mode != ConnectMode::IfPresent,
-                origin,
-                tunnel: None,
-                seen: 0,
-                failure: None,
-                // Cleared with the entry, not carried: this is a fact
-                // about *this* attempt.
-                reached_connected: false,
-            },
-        );
+        let raw_target = target.raw.clone();
 
         let feed = self.feed.clone();
         let host_id = host.to_string();
-        self.runtime.spawn(async move {
+        let establish = self.runtime.spawn(async move {
             if let Some(previous) = previous {
                 previous.shutdown().await;
             }
@@ -713,6 +949,46 @@ impl HostConnSet {
                 },
             )));
         });
+
+        let superseded = self.ssh.insert(
+            host.to_string(),
+            SshState {
+                target: raw_target,
+                request,
+                label: label.to_string(),
+                mode,
+                attended: cause == AttemptCause::Explicit && mode != ConnectMode::IfPresent,
+                origin,
+                cause,
+                generation: None,
+                lease: None,
+                tunnel: None,
+                establish: Some(establish.abort_handle()),
+                seen: 0,
+                failure: None,
+                // Cleared with the entry, not carried: this is a fact
+                // about *this* attempt.
+                reached_connected: false,
+            },
+        );
+        self.park_displaced(superseded);
+    }
+
+    /// Keep hold of an establish whose entry has just gone, so the exit
+    /// path can still reach it — see [`Self::displaced`]. Nothing here
+    /// aborts anything: while the app runs, a displaced establish is
+    /// left to land and be discarded.
+    ///
+    /// Finished handles are pruned on the way in, so a session that
+    /// reconnects all day cannot grow this list.
+    fn park_displaced(&mut self, entry: Option<SshState>) {
+        let Some(establish) = entry.and_then(|entry| entry.establish) else {
+            return;
+        };
+        self.displaced.retain(|handle| !handle.is_finished());
+        if !establish.is_finished() {
+            self.displaced.push(establish);
+        }
     }
 
     /// Fold a finished establish back in, and dial if it came up.
@@ -743,24 +1019,45 @@ impl HostConnSet {
             }
             Some(_) => {}
         }
-        let entry = self.ssh.get_mut(&host).expect("the entry checked above");
         match result {
             Ok(tunnel) => {
+                let entry = self.ssh.get_mut(&host).expect("the entry checked above");
                 let socket = tunnel.bridge_socket().to_path_buf();
                 // The generation the band is already square with. A
                 // per-connection exec that fails after this point bumps
                 // past it, and that is what `apply_state` overlays.
-                entry.seen = tunnel.last_error().map_or(0, |(generation, _)| generation);
+                entry.seen = tunnel
+                    .last_error()
+                    .map_or(0, |recorded| recorded.generation);
                 entry.failure = None;
                 entry.tunnel = Some(tunnel);
-                let (label, mode) = (entry.label.clone(), entry.mode);
+                entry.establish = None;
+                let (label, mode, cause) = (entry.label.clone(), entry.mode, entry.cause);
                 tracing::info!(%host, socket = %socket.display(), "ssh tunnel established");
-                self.connect(&host, &label, socket, HostTransport::Ssh, mode);
+                self.connect(&host, &label, socket, HostTransport::Ssh, mode, cause);
                 None
             }
             Err(failure) => {
                 let reason = failure.message.clone();
                 tracing::warn!(%host, %reason, "ssh tunnel could not be established");
+                let mut disconnected = state::Disconnected {
+                    reason: reason.clone(),
+                    retry_in: None,
+                };
+                self.schedule_reconnect(
+                    &host,
+                    DropInput::Establish(&failure),
+                    failure.truncated,
+                    &mut disconnected,
+                );
+                // A failed *establish* publishes no `HostConnState` at
+                // all, and `section_reason` prefers the live connection's
+                // own — so without this the band would show attempt
+                // one's reason for the whole ladder and neither `(2/10)`
+                // nor the give-up copy would ever appear (§3.8).
+                self.write_disconnected(&host, disconnected);
+                let entry = self.ssh.get_mut(&host).expect("the entry checked above");
+                entry.establish = None;
                 entry.failure = Some(failure);
                 entry.attended.then_some(reason)
             }
@@ -811,6 +1108,85 @@ impl HostConnSet {
         self.ssh.get(host).is_some_and(|ssh| ssh.reached_connected)
     }
 
+    /// This host's outage, created if this is the drop that starts one.
+    ///
+    /// This is where the lease moves house: [`SshState::lease`] is still
+    /// the one the connection that just died held — `open_ssh` has not
+    /// run again yet — so this is the last moment it can be copied
+    /// somewhere the next attempt's `open_ssh` will not wipe (§3.7).
+    pub(crate) fn begin_outage(&mut self, host: &str) -> &mut Outage {
+        let lease = self.ssh.get(host).and_then(|ssh| ssh.lease.clone());
+        let outage = self
+            .outages
+            .entry(host.to_string())
+            .or_insert_with(|| Outage {
+                ladder: reconnect::ReconnectLadder::default(),
+                lease: None,
+                armed: None,
+                dead_tunnel: None,
+            });
+        // Every drop, not only the first: an entry holding a lease is by
+        // construction the connection that just died, so it supersedes
+        // whatever the outage carries. `None` does not clear, because
+        // that is what a retry which never reached `Connected` leaves
+        // behind — and the outage's own lease is still the one to
+        // present.
+        if lease.is_some() {
+            outage.lease = lease;
+        }
+        outage
+    }
+
+    /// The lease one attempt starts holding, which is the whole takeover
+    /// guard (§3.7).
+    ///
+    /// A fresh task's `held_lease` is `None`, so an auto-reconnect that
+    /// carried nothing would reconnect with `takeover: true` and no
+    /// probe — silently taking the session back from another client
+    /// whenever the drop *was* a takeover whose `session.stopping`
+    /// envelope was lost. An explicit Connect carries nothing on
+    /// purpose: taking the session back is exactly what that button
+    /// means.
+    fn carried_lease(&self, host: &str, cause: AttemptCause) -> Option<String> {
+        match cause {
+            AttemptCause::Explicit => None,
+            AttemptCause::AutoReconnect => self.outages.get(host)?.lease.clone(),
+        }
+    }
+
+    /// Drain one `EngineFeed::HostLease`: the lease a connection was
+    /// granted, on its way to the entry that outlives the connection.
+    ///
+    /// Attributed through [`Self::owner_of`] like every other feed item
+    /// — a lease minted by a connection this set has since replaced
+    /// would otherwise become the one the *next* outage presents, which
+    /// is a lease two connections old. Hosts not reached over ssh keep
+    /// nothing: their task holds its own lease across its own retries,
+    /// which is the case this entry exists to cover for ssh.
+    ///
+    /// The stamped generation is a *second* question, and the ssh path
+    /// is where the two come apart: [`Self::open_ssh`] installs a fresh
+    /// [`SshState`] while the old [`HostConn`] is still in `conns` — an
+    /// ssh connect does not reach [`Self::connect`], and so does not
+    /// `forget`, until its tunnel is up an establish later. So "is this
+    /// connection still current?" can be yes while "is this the attempt
+    /// that opened it?" is no, and only the second keeps a lease from
+    /// landing on the attempt an explicit connect just installed.
+    pub(crate) fn apply_lease(&mut self, incarnation: HostId, lease: String) {
+        let Some(host) = self.owner_of(incarnation) else {
+            return;
+        };
+        let Some(minted) = self.minter.registration(incarnation) else {
+            return;
+        };
+        let Some(entry) = self.ssh.get_mut(&host) else {
+            return;
+        };
+        if entry.generation == Some(minted.generation) {
+            entry.lease = Some(lease);
+        }
+    }
+
     /// Say what a bootstrap is doing to this host, or stop saying it.
     ///
     /// Progress *and* the failure copy go through here, because to the
@@ -841,27 +1217,401 @@ impl HostConnSet {
     /// *before* this attempt started (already reported, or belonging to a
     /// connection that has since ended) can never be shown as the reason
     /// for this one.
-    fn overlay_ssh_reason(&mut self, host: &str, disconnected: &mut state::Disconnected) {
+    ///
+    /// **Returns the family it folded in**, owned, because the retry
+    /// decision is taken *around* this call rather than inside it: all
+    /// three early returns below are ordinary outcomes, and the middle
+    /// one — a tunnel with nothing recorded — is precisely the bare
+    /// bridge EOF that is the headline retryable case (§3.4). A decision
+    /// taken in here would never fire for the most common drop.
+    fn overlay_ssh_reason(
+        &mut self,
+        host: &str,
+        disconnected: &mut state::Disconnected,
+    ) -> Option<(SshFailure, bool)> {
+        let entry = self.ssh.get_mut(host)?;
+        let recorded = entry.tunnel.as_ref().and_then(|t| t.last_error())?;
+        if recorded.generation <= entry.seen {
+            return None;
+        }
+        entry.seen = recorded.generation;
+        let folded = (recorded.failure.clone(), recorded.truncated);
+        let failure = ConnectFailure {
+            truncated: recorded.truncated,
+            ..ConnectFailure::classified(&entry.target, recorded.failure)
+        };
+        disconnected.reason = failure.message.clone();
+        // Recorded as well as rendered: this is the *only* place a
+        // per-connection exec's family — and whether it was read out of
+        // complete evidence — reaches the app layer. It is the family a
+        // NotFound/NoSession offer routes off (plan 039 §3.5), and the
+        // one the retry ladder refuses to spend attempts on (plan 040
+        // §3.3).
+        entry.failure = Some(failure);
+        Some(folded)
+    }
+
+    /// Decide what one drop means for this host's retry ladder, arm the
+    /// timer when it means another attempt, and write §3.8's line.
+    ///
+    /// Two callers, one for each shape a drop has: `apply_state`'s
+    /// `Disconnected` arm with the family [`Self::overlay_ssh_reason`]
+    /// just folded in, and `tunnel_ready`'s `Err` arm with the whole
+    /// [`ConnectFailure`]. The second is not optional — without it the
+    /// ladder stalls on its first failed retry, which is the common
+    /// case, because the network is usually still down.
+    fn schedule_reconnect(
+        &mut self,
+        host: &str,
+        input: DropInput<'_>,
+        truncated: bool,
+        disconnected: &mut state::Disconnected,
+    ) {
+        // What a give-up appends, when the failure had a family worth
+        // naming. A bare EOF has none, and "gave up — the connection
+        // closed" says nothing the first half did not.
+        let family_copy = match input {
+            DropInput::Session(Some(_)) => Some(disconnected.reason.clone()),
+            DropInput::Establish(failure) if failure.family.is_some() => {
+                Some(failure.message.clone())
+            }
+            _ => None,
+        };
+
+        if !self.outages.contains_key(host) {
+            // §3.2's gates 1 and 2, read once here and never again:
+            // `open_ssh` installs a fresh `SshState` with
+            // `reached_connected: false` on every attempt, so re-reading
+            // them on the second failure would find `false` and refuse —
+            // the ladder would stop dead after one retry. From this point
+            // the existence of the outage entry *is* the record of
+            // eligibility.
+            let eligible = self
+                .ssh
+                .get(host)
+                .is_some_and(|entry| entry.reached_connected);
+            if !eligible || !reconnect::retryable(input, truncated) {
+                return;
+            }
+        }
+        // Outside the gate, not inside it: this creates the entry on the
+        // drop that starts an outage *and* refreshes the lease it carries
+        // on every later one. Called only under the gate the refresh is
+        // dead code, and the case it exists for is real — an attempt
+        // whose `session.connect` was granted a lease and whose prologue
+        // then failed publishes that lease without ever reaching
+        // `Connected`, so nothing clears the outage and its lease is a
+        // tombstone from that moment on (§3.7).
+        self.begin_outage(host);
+        // `HostConn::drop` publishes its own `disconnect_requested()`,
+        // and a late `Dropped` can still arrive under the *same*
+        // generation — which `owner_of` does not filter. So a second
+        // decision must not stack a second timer on the first, and must
+        // not let `apply_state`'s own `conn.state = next` overwrite the
+        // armed retry's line with the bare reason it carried.
+        if let Some(outage) = self.outages.get(host) {
+            if let Some(armed) = &outage.armed {
+                *disconnected = retry_line(
+                    armed.delay,
+                    outage.ladder.attempts(),
+                    outage.ladder.budget(),
+                );
+                return;
+            }
+        }
+        // Cloned before `apply_state` hands the tunnel to
+        // `shutdown_tunnel`: this is the last moment its failure slot is
+        // reachable, and the timer re-reads it before it dials.
+        let dead = self.ssh.get(host).and_then(|entry| {
+            Some(DeadTunnel::Tunnel {
+                tunnel: Arc::clone(entry.tunnel.as_ref()?),
+                seen: entry.seen,
+            })
+        });
+        let Some(outage) = self.outages.get_mut(host) else {
+            return;
+        };
+        if dead.is_some() {
+            outage.dead_tunnel = dead;
+        }
+        let decision = outage.ladder.next(input, truncated, task::jitter());
+        let budget = outage.ladder.budget();
+        match decision {
+            Decision::Retry { delay, attempt } => {
+                *disconnected = self.arm_retry(host, delay, attempt, budget);
+            }
+            Decision::Exhausted { attempts } => {
+                tracing::info!(%host, attempts, "ssh host reconnect gave up");
+                disconnected.reason = gave_up_copy(attempts, family_copy.as_deref());
+                disconnected.retry_in = None;
+                // Nothing is armed in this state, so nothing else would
+                // ever clean the entry — and the lease it holds belongs
+                // to an outage that is over (§3.7).
+                self.clear_outage(host);
+            }
+            // The band keeps the family's own copy: "must not be tried"
+            // and "gave up trying" are different things to tell somebody
+            // about a possible machine-in-the-middle.
+            Decision::NonRetryable => self.clear_outage(host),
+        }
+    }
+
+    /// Take a [`Decision::Retry`]: say so in the log, arm its timer, and
+    /// hand back §3.8's band line.
+    ///
+    /// Both schedulers end here — the drop's own decision and the
+    /// suspend reset's — so the event C5's lane asserts on is emitted in
+    /// one place.
+    fn arm_retry(
+        &mut self,
+        host: &str,
+        delay: Duration,
+        attempt: u32,
+        budget: u32,
+    ) -> state::Disconnected {
+        tracing::info!(
+            %host,
+            attempt,
+            delay_ms = delay.as_millis() as u64,
+            "ssh host reconnect scheduled"
+        );
+        self.arm_reconnect(host, delay);
+        retry_line(delay, attempt, budget)
+    }
+
+    /// Put one `ReconnectDue` on the feed after `delay`, replacing (and
+    /// aborting) whatever this host had armed.
+    ///
+    /// The stamp is [`SshState::request`] read **now**. Reading it at
+    /// arm time rather than storing it on the [`Outage`] is what lets
+    /// the ladder survive its own re-entry: every `open_ssh` bumps the
+    /// counter, so a stamp taken at outage creation could never match
+    /// again (§3.4).
+    fn arm_reconnect(&mut self, host: &str, delay: Duration) {
+        let Some(request) = self.ssh.get(host).map(|entry| entry.request) else {
+            return;
+        };
+        let feed = self.feed.clone();
+        let due = host.to_string();
+        let timer = self.runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            feed.send(crate::engine_feed::EngineFeed::ReconnectDue { host: due, request });
+        });
+        let Some(outage) = self.outages.get_mut(host) else {
+            timer.abort();
+            return;
+        };
+        if let Some(previous) = outage.armed.replace(Armed {
+            handle: timer.abort_handle(),
+            at: SystemTime::now(),
+            delay,
+        }) {
+            previous.handle.abort();
+        }
+    }
+
+    /// An armed retry came due. `Some` means dial — and *as what*: the
+    /// caller re-enters through `App::host_reconnect_requested` with
+    /// exactly this pair, which is the only door an auto-reconnect may
+    /// use (§3.4).
+    ///
+    /// The pair is answered here rather than at the call site because
+    /// both halves are this scheduler's own facts. The origin is the
+    /// load-bearing consent gate (§3.6) — `Ipc`, because nobody asked —
+    /// and the cause is what keeps the ladder from clearing the outage
+    /// it is walking.
+    pub(crate) fn reconnect_due(
+        &mut self,
+        host: &str,
+        stamped: u64,
+    ) -> Option<(RequestOrigin, AttemptCause)> {
+        // `is_some_and`, never `is_none_or`: `disconnect` removes the
+        // whole entry, and an `is_none_or` spelling would let a fired
+        // timer resurrect a host the user just disconnected.
+        if !self
+            .ssh
+            .get(host)
+            .is_some_and(|entry| entry.request == stamped)
+        {
+            tracing::debug!(%host, stamped, "dropped a superseded reconnect timer");
+            return None;
+        }
+        // Consumption takes the handle, so no dead one lingers behind a
+        // later "is a retry pending?" read.
+        let Some(armed) = self.outages.get_mut(host).and_then(|o| o.armed.take()) else {
+            tracing::debug!(%host, "a reconnect came due with nothing armed for it");
+            return None;
+        };
+        // [`SUSPEND_SKEW`] is what this measures. `duration_since` errors
+        // on a backward clock step, which is not a suspend and must not
+        // panic — this runs on the UI thread, where a panic is the crash
+        // report.
+        let slept = SystemTime::now()
+            .duration_since(armed.at)
+            .unwrap_or(armed.delay);
+        if slept.saturating_sub(armed.delay) > SUSPEND_SKEW {
+            tracing::info!(
+                %host,
+                slept_ms = slept.as_millis() as u64,
+                "an ssh host's retry ladder woke into a new outage"
+            );
+            // Reset and re-arm at the base delay rather than dialing: a
+            // reset-then-dial spends a full `ConnectTimeout 15`
+            // establish against a radio that is still associating, which
+            // is precisely the attempt the reset exists to protect.
+            self.restart_ladder(host);
+            return None;
+        }
+        // The belt to C1's braces — see [`DeadTunnel`].
+        if let Some((generation, family, truncated)) = self.late_family(host) {
+            if !reconnect::retryable(DropInput::Session(Some(&family)), truncated) {
+                self.settle_late(host, generation, family, truncated);
+                return None;
+            }
+        }
+        Some((RequestOrigin::Ipc, AttemptCause::AutoReconnect))
+    }
+
+    /// A failure the dead tunnel recorded since the drop, if it is news.
+    fn late_family(&self, host: &str) -> Option<(u64, SshFailure, bool)> {
+        self.outages.get(host)?.dead_tunnel.as_ref()?.late_failure()
+    }
+
+    /// A family found at fire time that no retry may be spent on: the
+    /// host settles on that family's own copy instead of dialing.
+    fn settle_late(&mut self, host: &str, generation: u64, family: SshFailure, truncated: bool) {
         let Some(entry) = self.ssh.get_mut(host) else {
             return;
         };
-        let Some((generation, failure)) = entry.tunnel.as_ref().and_then(|t| t.last_error()) else {
+        let failure = ConnectFailure {
+            truncated,
+            ..ConnectFailure::classified(&entry.target, family)
+        };
+        tracing::warn!(
+            %host,
+            reason = %failure.message,
+            "an ssh failure landed after the drop; the retry ladder settles instead of dialing"
+        );
+        entry.seen = generation;
+        let reason = failure.message.clone();
+        entry.failure = Some(failure);
+        self.write_disconnected(
+            host,
+            state::Disconnected {
+                reason,
+                retry_in: None,
+            },
+        );
+        self.clear_outage(host);
+    }
+
+    /// Treat a woken ladder as a new outage: back to attempt one, at the
+    /// base delay, with a fresh stamp — and no dial.
+    fn restart_ladder(&mut self, host: &str) {
+        let Some(outage) = self.outages.get_mut(host) else {
             return;
         };
-        if generation <= entry.seen {
+        outage.ladder.reset();
+        // `Session(None)` is the bare-EOF row, which is always
+        // retryable: the only question here is how long until the next
+        // attempt, and the ladder has just been reset to answer it with
+        // the base delay.
+        let decision = outage
+            .ladder
+            .next(DropInput::Session(None), false, task::jitter());
+        let budget = outage.ladder.budget();
+        let Decision::Retry { delay, attempt } = decision else {
             return;
+        };
+        let line = self.arm_retry(host, delay, attempt, budget);
+        self.write_disconnected(host, line);
+    }
+
+    /// Write a disconnected line onto the connection the band reads.
+    ///
+    /// Only over one that is already disconnected. The dead `HostConn` a
+    /// drop leaves in `conns` is what `section_reason` prefers and what
+    /// the ladder has to keep current; a connection that is still
+    /// *serving* is a different thing, and an establish failing beside
+    /// it (a ↻ on a connected host) is its own task's news to publish.
+    fn write_disconnected(&mut self, host: &str, disconnected: state::Disconnected) {
+        if let Some(conn) = self.conns.get_mut(host) {
+            if matches!(conn.state, HostConnState::Disconnected(_)) {
+                conn.state = HostConnState::Disconnected(disconnected);
+            }
         }
-        entry.seen = generation;
-        let failure = ConnectFailure::classified(&entry.target, failure);
-        disconnected.reason = failure.message.clone();
-        // Recorded as well as rendered: this is the *only* place a
-        // per-connection exec's family reaches the app layer, and it is
-        // the family a NotFound/NoSession offer routes off (plan 039
-        // §3.5). Nothing reads it today, and the band is unchanged —
-        // `section_reason` prefers a live connection's own reason, so
-        // this slot is only ever consulted when there is no `HostConn`
-        // at all.
-        entry.failure = Some(failure);
+    }
+
+    /// End this host's outage: the ladder, the lease, the dead tunnel
+    /// and any armed timer go together.
+    fn clear_outage(&mut self, host: &str) {
+        if let Some(Outage {
+            armed: Some(armed), ..
+        }) = self.outages.remove(host)
+        {
+            armed.handle.abort();
+        }
+    }
+
+    /// Stop everything this set has in flight that could still dial.
+    ///
+    /// The exit path's, and it needs both halves (§3.4). Aborting the
+    /// armed handles covers the waiting window; the establish
+    /// [`Self::open_ssh`] spawned is the other one — a quit timed into
+    /// it would leave a just-daemonized `ControlPersist=60s` master
+    /// outliving the app, which is exactly what the lane's
+    /// zero-`ssh`-children check measures.
+    ///
+    /// [`Self::displaced`] is part of that second half: an establish
+    /// whose entry has gone is invisible to the walk over [`Self::ssh`],
+    /// and nothing will drain its answer once the app is on its way out.
+    pub(crate) fn abandon_reconnects(&mut self) {
+        for (host, outage) in self.outages.drain() {
+            if let Some(armed) = outage.armed {
+                tracing::debug!(%host, "aborting an armed reconnect on the way out");
+                armed.handle.abort();
+            }
+        }
+        for (host, entry) in self.ssh.iter_mut() {
+            if let Some(establish) = entry.establish.take() {
+                tracing::debug!(%host, "aborting an in-flight ssh establish on the way out");
+                establish.abort();
+            }
+        }
+        for establish in self.displaced.drain(..) {
+            if !establish.is_finished() {
+                tracing::debug!("aborting a displaced ssh establish on the way out");
+                establish.abort();
+            }
+        }
+    }
+
+    /// Retire an establish's answer because the app is on its way out.
+    ///
+    /// [`crate::engine_feed::EngineFeed::Quit`] only latches the exit —
+    /// the drain keeps running — so an answer queued behind it still
+    /// reaches the UI thread. Handing it to [`Self::tunnel_ready`] there
+    /// would dial a fresh connection while the app tears down, and
+    /// [`Self::abandon_reconnects`] cannot undo that: the establish
+    /// handle is already spent, and the connection task `connect` spawns
+    /// is not one this set tracks.
+    ///
+    /// Discarding rather than aborting is the same rule
+    /// [`Self::discard_tunnel`] carries: a tunnel that *did* come up
+    /// holds a live `ssh` master and a scratch directory, and only
+    /// `shutdown` retires both.
+    pub(crate) fn discard_ready(&mut self, ready: HostTunnelReady) {
+        tracing::debug!(
+            host = %ready.host,
+            request = ready.request,
+            "discarding a tunnel establish that answered during shutdown"
+        );
+        if let Some(entry) = self.ssh.get_mut(&ready.host) {
+            if entry.request == ready.request {
+                entry.establish = None;
+            }
+        }
+        self.discard_tunnel(ready.result);
     }
 
     /// Retire a tunnel whose answer nobody is waiting for any more.
@@ -932,7 +1682,12 @@ impl HostConnSet {
         // in-flight establish is dropped when it lands and the next
         // Connect opens a fresh tunnel.
         self.shutdown_tunnel(host);
-        self.ssh.remove(host);
+        let removed = self.ssh.remove(host);
+        self.park_displaced(removed);
+        // Being reconnected eight seconds after asking to disconnect is
+        // the one outcome nobody wants, and the lease the entry holds
+        // has no owner left either.
+        self.clear_outage(host);
         let Some(conn) = self.conns.remove(host) else {
             self.minter.forget_host(host);
             return None;
@@ -1247,13 +2002,31 @@ impl HostConnSet {
                 entry.reached_connected = true;
             }
         }
+        match &next {
+            // The outage is over, so the next one starts at the base
+            // delay — and the lease this one carried has been superseded
+            // by the one the fresh connection is about to publish.
+            HostConnState::Connected
+            // Terminal in the machine, and nothing is armed in any of
+            // them: if the entry did not go here, nothing would ever
+            // clean it up (§3.4).
+            | HostConnState::TakenOver
+            | HostConnState::Stopped
+            | HostConnState::NeedsRestart(_) => self.clear_outage(&host),
+            HostConnState::Connecting { .. } | HostConnState::Disconnected(_) => {}
+        }
         if let HostConnState::Disconnected(disconnected) = &mut next {
-            self.overlay_ssh_reason(&host, disconnected);
+            let folded = self.overlay_ssh_reason(&host, disconnected);
+            let truncated = folded.as_ref().is_some_and(|(_, truncated)| *truncated);
+            let family = folded.as_ref().map(|(family, _)| family);
+            // Around the overlay, not inside it (§3.4), and before the
+            // teardown below — which is what takes the tunnel the
+            // decision clones for its fire-time re-check.
+            self.schedule_reconnect(&host, DropInput::Session(family), truncated, disconnected);
             // A tunnel that has served a connection through to
-            // Disconnected has nothing left to serve: an ssh host never
-            // auto-retries (only localhost does), so the next attempt is
-            // a Connect, and a Connect is entitled to a mux that was not
-            // wedged by whatever just ended this one.
+            // Disconnected has nothing left to serve: an auto-reconnect
+            // re-enters at `open_ssh` and opens a fresh one, so this
+            // mux — which may be exactly what wedged — is retired here.
             self.shutdown_tunnel(&host);
         }
         // The reconnect contract: purge the dead incarnation the moment
@@ -1417,6 +2190,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-one.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         set.connect(
             "h2",
@@ -1424,6 +2198,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-two.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
 
         let first = set.mint_for("h1");
@@ -1453,6 +2228,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-purge.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
 
         let old = set.mint_for("h1");
@@ -1503,6 +2279,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let outgoing = set.conns["h1"].generation;
 
@@ -1514,6 +2291,7 @@ mod tests {
             socket,
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -1561,6 +2339,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-send-at.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -1648,6 +2427,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         assert_eq!(
@@ -1668,6 +2448,7 @@ mod tests {
             ssh_target("user@box"),
             ConnectMode::IfPresent,
             RequestOrigin::Ipc,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h2"].request;
         assert_eq!(
@@ -1693,6 +2474,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::Ipc,
+            AttemptCause::Explicit,
         );
         assert_eq!(set.ssh_origin("h1"), Some(RequestOrigin::Ipc));
         assert_ne!(
@@ -1718,6 +2500,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         assert_eq!(set.ssh_origin("h2"), Some(RequestOrigin::User));
         assert_eq!(set.ssh_origin("nobody"), None);
@@ -1740,6 +2523,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         let toast = set
@@ -1760,6 +2544,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h2"].request;
         set.tunnel_ready(failed(
@@ -1790,6 +2575,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         set.tunnel_ready(refused("h1", request, SshFailure::NotFound));
@@ -1813,6 +2599,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         assert_eq!(
             set.section_reason("h1"),
@@ -1844,6 +2631,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let first = set.ssh["h1"].request;
 
@@ -1853,6 +2641,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let second = set.ssh["h1"].request;
         assert_ne!(first, second, "a request id is never reused");
@@ -1883,6 +2672,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         set.tunnel_ready(failed("h1", request, "workbox refused authentication"));
@@ -1893,6 +2683,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-ssh.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(
@@ -1924,6 +2715,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         set.connect(
             "h1",
@@ -1931,6 +2723,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-reached.sock"),
             HostTransport::Ssh,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
 
@@ -1969,8 +2762,1239 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         assert!(!set.ssh_reached_connected("h1"));
+    }
+
+    fn dropped(reason: &str) -> HostConnState {
+        HostConnState::Disconnected(state::Disconnected {
+            reason: reason.into(),
+            retry_in: None,
+        })
+    }
+
+    /// An ssh host walked to `Connected` by an explicit connect — the
+    /// only state that mints a lease, and where each case below starts.
+    /// The cause a case turns on is the one it passes *after* this.
+    fn a_connected_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from(socket),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        incarnation
+    }
+
+    /// The lease's whole life, walked rather than seeded.
+    ///
+    /// Every step of it is somewhere the previous store would have been
+    /// wiped, which is why none of them may be short-circuited: it is
+    /// published at `Connected`, when **no outage exists yet**; the
+    /// outage that copies it out is not created until the drop; and the
+    /// entry it was stamped on is replaced wholesale by the very
+    /// `open_ssh` the ladder re-enters through. A test that seeded any
+    /// one of those by hand would stay green while the guard was dead.
+    #[tokio::test]
+    async fn a_lease_published_at_connected_reaches_the_attempt_after_the_drop() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease.sock");
+        set.apply_lease(incarnation, "lease-1".into());
+        assert_eq!(
+            set.ssh["h1"].lease.as_deref(),
+            Some("lease-1"),
+            "the lease lands on the entry the connection was opened under"
+        );
+        assert!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .is_none(),
+            "and nowhere else yet — there is no outage to hold it"
+        );
+
+        set.apply_state(incarnation, dropped("the connection closed"));
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1"),
+            "the outage copies it out of the entry that is about to go"
+        );
+
+        // The re-entry: a fresh entry, and the lease still reaches the
+        // dial it authorizes.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        assert_eq!(
+            set.ssh["h1"].lease, None,
+            "the fresh entry knows nothing about the connection that died"
+        );
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1"),
+            "but the outage does, which is the whole reason it exists"
+        );
+    }
+
+    /// A second drop inside one outage carries the *second* attempt's
+    /// lease.
+    ///
+    /// The shape is the one `connect_loop` publishes a lease for without
+    /// ever reaching `Connected`: `session.connect` granted a lease — so
+    /// ownership moved on the wire and everything older is a tombstone —
+    /// and the prologue then failed. Nothing clears the outage on that
+    /// path (`Connected` is what does), so the entry survives to the next
+    /// drop and [`HostConnSet::begin_outage`] has to refresh what it
+    /// carries. Called from inside the entry-creation gate it never runs
+    /// for that drop, and the ladder goes on presenting a lease the far
+    /// side has already tombstoned: `taken-over`, terminal, with no other
+    /// client involved (plan 040 §3.7).
+    #[tokio::test]
+    async fn a_second_drop_refreshes_the_lease_the_outage_carries() {
+        let (mut set, _feed) = a_set();
+        let socket = "/nonexistent/roost-set-refresh.sock";
+        let first = a_connected_ssh_host(&mut set, socket);
+        set.apply_lease(first, "lease-1".into());
+        set.apply_state(first, dropped("the connection closed"));
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1"),
+            "the drop that started the outage copied the lease out"
+        );
+
+        // The retry's tunnel comes up and its prologue is granted a lease
+        // before failing — no `Connected`, so the outage is still the
+        // same one.
+        assert!(retry_once(&mut set));
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from(socket),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        let second = set.mint_for("h1");
+        set.apply_lease(second, "lease-2".into());
+        set.apply_state(second, dropped("and the prologue failed"));
+
+        assert!(
+            set.outages.contains_key("h1"),
+            "the ladder is still walking the outage it started"
+        );
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-2"),
+            "and the next attempt presents the lease the last one was granted"
+        );
+    }
+
+    /// What an attempt's cause decides, at both ends of the two-step ssh
+    /// connect: `open_ssh` records it on the entry `tunnel_ready` reads
+    /// to build the dial, and `connect` turns it into the lease the task
+    /// starts holding.
+    ///
+    /// An explicit attempt clears the outage outright — the user's
+    /// attempt supersedes the schedule, and a lease minted two
+    /// connections ago must not be presented by the next ladder. A
+    /// scheduled one leaves it alone: without that, every retry would
+    /// zero its own attempt counter and the ladder would never end.
+    #[tokio::test]
+    async fn an_attempts_cause_decides_the_outage_and_the_lease_it_carries() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-cause.sock");
+        set.apply_lease(incarnation, "lease-1".into());
+        set.apply_state(incarnation, dropped("the connection closed"));
+        set.begin_outage("h1");
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        assert_eq!(set.ssh["h1"].cause, AttemptCause::AutoReconnect);
+        assert!(
+            set.outages.contains_key("h1"),
+            "a scheduled attempt leaves the ladder it belongs to alone"
+        );
+        assert_eq!(
+            set.carried_lease("h1", set.ssh["h1"].cause).as_deref(),
+            Some("lease-1")
+        );
+
+        // The user clicks ↻ mid-ladder.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        assert_eq!(set.ssh["h1"].cause, AttemptCause::Explicit);
+        assert!(
+            !set.outages.contains_key("h1"),
+            "an explicit attempt supersedes the schedule outright"
+        );
+        assert_eq!(
+            set.carried_lease("h1", set.ssh["h1"].cause),
+            None,
+            "cleared, not merely not-passed: the lease went with the outage"
+        );
+        assert!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .is_none(),
+            "so a ladder started after it cannot present the old lease either"
+        );
+    }
+
+    /// A lease publication is attributed like every other feed item. One
+    /// from a connection this set has since replaced must land nowhere:
+    /// stored, it would become the lease the *next* outage presents —
+    /// a lease two connections old, offered to a session that never
+    /// issued it.
+    #[tokio::test]
+    async fn a_lease_from_a_replaced_connection_is_dropped() {
+        let (mut set, _feed) = a_set();
+        let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-stale.sock");
+        set.apply_lease(live, "lease-live".into());
+
+        let replaced = set.minter.mint("h1", set.conns["h1"].generation - 1);
+        set.apply_lease(replaced, "lease-from-the-connection-before".into());
+        assert_eq!(
+            set.ssh["h1"].lease.as_deref(),
+            Some("lease-live"),
+            "a replaced connection cannot overwrite the live one's lease"
+        );
+
+        // And an incarnation this set never minted at all.
+        set.apply_lease(HostId::new(9_999), "invented".into());
+        assert_eq!(set.ssh["h1"].lease.as_deref(), Some("lease-live"));
+
+        // A disconnect ends the outage the lease would have been kept
+        // for, so nothing survives to be presented.
+        set.begin_outage("h1");
+        set.disconnect("h1");
+        assert!(set
+            .carried_lease("h1", AttemptCause::AutoReconnect)
+            .is_none());
+    }
+
+    /// A lease still in flight when an explicit connect installs a fresh
+    /// attempt must not land on that attempt.
+    ///
+    /// The window is the ssh path's alone, and it is why "is this
+    /// connection current?" cannot answer this on its own: `open_ssh`
+    /// replaces [`SshState`] immediately, while the [`HostConn`] the
+    /// lease was minted under stays in `conns` until the *next* tunnel
+    /// comes up — so [`HostConnSet::owner_of`] accepts an item the
+    /// explicit connect was supposed to have cleared. Stored, it would
+    /// be copied onto the first outage of a connection that never
+    /// issued it, undoing §3.7's "cleared, not merely not-passed".
+    #[tokio::test]
+    async fn a_lease_does_not_land_on_the_attempt_that_superseded_it() {
+        let (mut set, _feed) = a_set();
+        let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-superseded.sock");
+
+        // The user clicks Connect. A fresh entry is in place at once;
+        // the old connection is not forgotten until its replacement's
+        // tunnel answers.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        assert!(
+            set.owner_of(live).is_some(),
+            "the connection the lease belongs to is still held — that is the window"
+        );
+
+        set.apply_lease(live, "lease-1".into());
+        assert_eq!(
+            set.ssh["h1"].lease, None,
+            "but the attempt that replaced it never held that lease"
+        );
+        set.begin_outage("h1");
+        assert!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .is_none(),
+            "so no ladder off this attempt can present it"
+        );
+    }
+
+    /// An outage carries the *freshest* lease, not the first one it ever
+    /// saw.
+    ///
+    /// A reconnect that reaches `Connected` mints a new lease and
+    /// tombstones the old one, so an outage still holding the old one
+    /// would present a tombstone on the next drop — the far side answers
+    /// `taken-over` and the host settles as somebody else's with nobody
+    /// else involved. A retry that only failed its establish holds no
+    /// lease at all, and there the outage's own is still the one to
+    /// present.
+    #[tokio::test]
+    async fn an_outage_carries_the_lease_of_the_connection_that_just_died() {
+        let (mut set, _feed) = a_set();
+        let first = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-refresh.sock");
+        set.apply_lease(first, "lease-1".into());
+        set.apply_state(first, dropped("the connection closed"));
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1")
+        );
+
+        // A retry that gets all the way to `Connected` again.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-lease-refresh.sock"),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        let second = set.mint_for("h1");
+        set.apply_state(second, HostConnState::Connected);
+        set.apply_lease(second, "lease-2".into());
+        set.apply_state(second, dropped("and it dropped again"));
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-2"),
+            "the second drop presents the second connection's lease"
+        );
+
+        // A retry that never gets a connection at all: its entry has no
+        // lease, and the outage keeps the one it has.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-2"),
+            "a failed establish has no lease of its own to supersede it with"
+        );
+    }
+
+    // ── the retry ladder (plan 040 §3.4) ────────────────────────────
+    //
+    // What these cases can and cannot reach, stated once. The **session**
+    // arm's family (`DropInput::Session(Some(_))`) comes from
+    // `overlay_ssh_reason`, which reads a live `SshTunnel`'s
+    // `last_error` — and `SshTunnel::record` is private to `roost-ipc`,
+    // reachable only by that crate's own exec paths. So the cases below
+    // drive families through the **establish** arm, which carries its
+    // own `ConnectFailure`, and through `DeadTunnel::Recorded` for the
+    // fire-time re-check. The per-family verdicts themselves are
+    // `reconnect.rs`'s table tests.
+
+    /// The whole `Disconnected` a host's band reads, whichever of the
+    /// three writers put it there.
+    fn band_state(set: &HostConnSet, host: &str) -> state::Disconnected {
+        match set.state(host) {
+            Some(HostConnState::Disconnected(disconnected)) => disconnected.clone(),
+            other => panic!("{host} is {other:?}, not disconnected"),
+        }
+    }
+
+    fn band_reason(set: &HostConnSet, host: &str) -> String {
+        set.section_reason(host)
+            .expect("a disconnected host has a reason")
+            .to_string()
+    }
+
+    /// The budget this outage was built with, so a case reads `(2/N)`
+    /// rather than pinning the shipped ten — the constant has a
+    /// `ROOST_TEST_MODE` override, and a suite run under it must not
+    /// start failing.
+    fn budget(set: &HostConnSet) -> u32 {
+        set.outages["h1"].ladder.budget()
+    }
+
+    /// One turn of the ladder exactly as the app drives it: the armed
+    /// timer comes due, and the re-entry
+    /// `App::host_reconnect_requested` performs lands here as the same
+    /// `open_ssh` that call would reach. Returns whether the due message
+    /// authorized a dial.
+    fn retry_once(set: &mut HostConnSet) -> bool {
+        let request = set.ssh["h1"].request;
+        // The origin and the cause are the set's own answer, not the
+        // test's: `App::host_reconnect_due` passes back exactly what it
+        // is handed, and the origin is the load-bearing consent gate.
+        let Some((origin, cause)) = set.reconnect_due("h1", request) else {
+            return false;
+        };
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            origin,
+            cause,
+        );
+        true
+    }
+
+    /// A working ssh host whose link has just dropped: the ladder is at
+    /// attempt one with a timer armed. Where every case below starts
+    /// that is not itself about that first decision.
+    fn a_dropped_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
+        let incarnation = a_connected_ssh_host(set, socket);
+        set.apply_state(incarnation, dropped("the connection closed"));
+        incarnation
+    }
+
+    /// A transport failure, which is the retryable establish shape.
+    fn unreachable() -> SshFailure {
+        SshFailure::Transport(Some("no route to host".into()))
+    }
+
+    /// Answer this host's in-flight establish with a classified failure,
+    /// as the transport hands one back.
+    fn refuse(set: &mut HostConnSet, failure: SshFailure) {
+        let ready = refused("h1", set.ssh["h1"].request, failure);
+        set.tunnel_ready(ready);
+    }
+
+    /// The headline case: a working ssh connection drops, and the host
+    /// schedules its own way back without anybody clicking anything.
+    ///
+    /// A bare bridge EOF is the shape — no `last_error` on the tunnel at
+    /// all — which is exactly the case `overlay_ssh_reason` early-returns
+    /// on. A decision taken inside the overlay would never fire here.
+    #[tokio::test]
+    async fn a_retryable_drop_arms_a_retry_and_says_how_long() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-arm.sock");
+        set.apply_state(incarnation, dropped("the connection closed"));
+
+        assert!(
+            set.outages["h1"].armed.is_some(),
+            "a retryable drop leaves a timer waiting"
+        );
+        let band = band_state(&set, "h1");
+        assert!(
+            band.retry_in.is_some(),
+            "and says so on the wire the UI reads"
+        );
+        assert_eq!(
+            band.reason,
+            format!("reconnecting in 1s (1/{})", budget(&set))
+        );
+
+        // The second `Dropped` a `HostConn::drop` can produce under the
+        // same generation: no second timer, and the line the armed retry
+        // wrote survives `apply_state` writing the raw reason back.
+        set.apply_state(incarnation, dropped("the connection closed"));
+        assert_eq!(set.outages["h1"].ladder.attempts(), 1);
+        assert_eq!(band_state(&set, "h1"), band);
+    }
+
+    /// Eligibility is the *outage*, and a host that never worked has no
+    /// outage to inherit. A first connect that fails is a question for
+    /// the person who asked, not a ladder.
+    #[tokio::test]
+    async fn a_connection_that_never_worked_schedules_nothing() {
+        let (mut set, _feed) = a_set();
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        refuse(&mut set, unreachable());
+        assert!(
+            !set.outages.contains_key("h1"),
+            "nothing about this host has ever worked, so nothing is owed a retry"
+        );
+    }
+
+    /// A changed host key is never retried, at either end of a ladder's
+    /// life: not as the first drop, and not as the answer to a retry
+    /// that was already scheduled — where it also *ends* the outage
+    /// rather than leaving a dead entry behind.
+    ///
+    /// The band keeps the family's own copy. "Must not be tried" and
+    /// "gave up trying" are different things to tell somebody about a
+    /// possible machine-in-the-middle.
+    #[tokio::test]
+    async fn a_changed_host_key_arms_nothing_and_settles_a_ladder_that_had_started() {
+        let (mut set, _feed) = a_set();
+
+        // A first connect, before anything ever worked.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        refuse(&mut set, SshFailure::ChangedHostKey);
+        assert!(!set.outages.contains_key("h1"));
+
+        // And mid-ladder, on a host that had been working.
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-key.sock");
+        assert!(set.outages.contains_key("h1"), "the drop started a ladder");
+
+        assert!(retry_once(&mut set), "and its first retry dialed");
+        refuse(&mut set, SshFailure::ChangedHostKey);
+        assert!(
+            !set.outages.contains_key("h1"),
+            "a family no retry may be spent on ends the outage"
+        );
+        assert_eq!(
+            band_reason(&set, "h1"),
+            SshFailure::ChangedHostKey.message("workbox"),
+            "and the band keeps the family's own copy, not a give-up line"
+        );
+    }
+
+    /// **The §3.2 regression.** `open_ssh` installs a fresh `SshState`
+    /// with `reached_connected: false` on every attempt, so an
+    /// eligibility check re-read at the second failure finds `false` and
+    /// refuses — the ladder stops dead after one retry, and every
+    /// budget, give-up and copy rule below it becomes unreachable. The
+    /// outage entry's *existence* is the record of eligibility, and this
+    /// is what proves it survives the retry's own `open_ssh`.
+    #[tokio::test]
+    async fn a_ladder_survives_its_own_retrys_open_ssh() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-survive.sock");
+        assert_eq!(set.outages["h1"].ladder.attempts(), 1);
+
+        assert!(retry_once(&mut set));
+        assert!(
+            !set.ssh["h1"].reached_connected,
+            "the fresh entry knows nothing — which is the trap"
+        );
+
+        // The retry's tunnel comes up and its connection drops again.
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-survive.sock"),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        let second = set.mint_for("h1");
+        set.apply_state(second, dropped("and it dropped again"));
+
+        assert_eq!(
+            set.outages["h1"].ladder.attempts(),
+            2,
+            "the ladder continued instead of refusing a host that had worked"
+        );
+        assert!(set.outages["h1"].armed.is_some());
+    }
+
+    /// **The K1.1 regression, and the give-up.** A retry whose
+    /// *establish* fails is the common case — the network is usually
+    /// still down — so `tunnel_ready`'s `Err` arm is the second schedule
+    /// entry point, and the second failed retry has to re-arm exactly
+    /// like the first. A ladder that stalls there never reaches its
+    /// budget, and the give-up copy never renders.
+    ///
+    /// It also pins the two things that end an outage: the entry goes at
+    /// `Exhausted`, lease included, since no timer is armed in that
+    /// state and nothing else would ever clean it.
+    #[tokio::test]
+    async fn repeated_establish_failures_run_the_ladder_to_its_budget() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-budget.sock");
+        set.apply_lease(incarnation, "lease-1".into());
+        set.apply_state(incarnation, dropped("the connection closed"));
+        let budget = budget(&set);
+
+        for attempt in 1..=budget {
+            assert!(
+                retry_once(&mut set),
+                "attempt {attempt} of {budget} must be dialed"
+            );
+            refuse(&mut set, unreachable());
+            if attempt < budget {
+                assert_eq!(
+                    set.outages["h1"].ladder.attempts(),
+                    attempt + 1,
+                    "the failed retry re-arms rather than stalling"
+                );
+                assert!(set.outages["h1"].armed.is_some());
+            }
+        }
+
+        assert!(
+            !set.outages.contains_key("h1"),
+            "the ladder settles when its budget is spent"
+        );
+        assert_eq!(
+            band_reason(&set, "h1"),
+            format!(
+                "reconnect gave up after {budget} tries — {}",
+                unreachable().message("workbox")
+            ),
+            "and says so through the band, not only in a field"
+        );
+        assert_eq!(band_state(&set, "h1").retry_in, None);
+        assert!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .is_none(),
+            "the lease went with the outage it belonged to"
+        );
+    }
+
+    /// The band has to *move*. `section_reason` prefers the live
+    /// connection's own reason, and the dead conn from the first drop
+    /// stays in `conns` until a successful establish reaches `connect` →
+    /// `forget` — so a ladder that wrote only `SshState.failure` would
+    /// show attempt one's line forever and neither `(2/N)` nor the
+    /// give-up copy would ever appear.
+    #[tokio::test]
+    async fn the_band_reason_advances_with_the_attempt() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-copy.sock");
+        let budget = budget(&set);
+        let mut seen = vec![band_reason(&set, "h1")];
+
+        for _ in 0..2 {
+            assert!(retry_once(&mut set));
+            refuse(&mut set, unreachable());
+            seen.push(band_reason(&set, "h1"));
+        }
+
+        assert!(seen[0].ends_with(&format!("(1/{budget})")), "{seen:?}");
+        assert!(seen[1].ends_with(&format!("(2/{budget})")), "{seen:?}");
+        assert!(seen[2].ends_with(&format!("(3/{budget})")), "{seen:?}");
+    }
+
+    /// The staleness stamp rides the timer's **own message**, read off
+    /// the entry at arm time — and it has to still match when the timer
+    /// fires, or the ladder stalls at its first failed retry. Every
+    /// other case here recomputes the stamp; this is the one that lets
+    /// the timer actually run and reads what the arm really put on the
+    /// wire.
+    #[tokio::test(start_paused = true)]
+    async fn an_armed_timer_carries_a_stamp_the_entry_still_recognizes() {
+        let (mut set, mut feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-stamp.sock");
+
+        // Nothing in this suite may dial a real host, and this is the
+        // one case that lets the runtime run: stop the handshake
+        // `open_ssh` spawned before anything is polled.
+        for entry in set.ssh.values_mut() {
+            if let Some(establish) = entry.establish.take() {
+                establish.abort();
+            }
+        }
+        let delay = set.outages["h1"].armed.as_ref().expect("armed").delay;
+        // The clock is paused, so this is instant.
+        tokio::time::sleep(delay + Duration::from_secs(1)).await;
+
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        let mut due = None;
+        while let Some(item) = feed.try_next(&mut batch) {
+            if let crate::engine_feed::EngineFeed::ReconnectDue { host, request } = item {
+                due = Some((host, request));
+            }
+        }
+        let (host, request) = due.expect("the armed timer put a due message on the feed");
+        assert_eq!(host, "h1");
+        assert!(
+            set.reconnect_due(&host, request).is_some(),
+            "the stamp the timer carried is the one the entry recognizes"
+        );
+    }
+
+    /// A due message has to prove the host is still where it was when
+    /// the timer was armed. Three ways it can fail to: the user
+    /// disconnected (the entry is gone — which is why the test is
+    /// `is_some_and` and not `is_none_or`, or a fired timer would
+    /// resurrect the host), the user connected instead (the request
+    /// moved on), or the connection came back on its own (the outage is
+    /// over).
+    #[tokio::test]
+    async fn a_due_retry_that_lost_its_race_dials_nothing() {
+        let (mut set, _feed) = a_set();
+
+        // Disconnected in between.
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-race-a.sock");
+        let armed = set.ssh["h1"].request;
+        set.disconnect("h1");
+        assert!(
+            set.reconnect_due("h1", armed).is_none(),
+            "a fired timer must not resurrect a host the user just disconnected"
+        );
+
+        // An explicit connect in between.
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-race-b.sock");
+        let armed = set.ssh["h1"].request;
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        assert!(set.reconnect_due("h1", armed).is_none());
+
+        // Connected again in between: the request is untouched, and the
+        // outage is what is gone.
+        let incarnation = a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-race-c.sock");
+        let armed = set.ssh["h1"].request;
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert!(!set.outages.contains_key("h1"), "a success ends the outage");
+        assert!(set.reconnect_due("h1", armed).is_none());
+    }
+
+    /// §3.4's why-safe walk, pinned as a test rather than as a gate.
+    ///
+    /// An explicit reconnect of a still-*connected* host leaves the old
+    /// task alive for a moment, and that task publishes `Disconnected`
+    /// when its tunnel is torn down underneath it — under the same
+    /// generation, which `owner_of` does not filter. Nothing re-arms,
+    /// because the *creation* gate reads `reached_connected` off the
+    /// fresh `SshState` the explicit connect just installed, and that is
+    /// `false` by construction.
+    #[tokio::test]
+    async fn a_superseded_tasks_late_drop_does_not_arm_a_ladder() {
+        let (mut set, _feed) = a_set();
+        let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-late.sock");
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        assert!(
+            set.owner_of(live).is_some(),
+            "the old connection is still held — that is the window"
+        );
+
+        set.apply_state(live, dropped("the connection closed"));
+        assert!(
+            !set.outages.contains_key("h1"),
+            "the user's own attempt is the schedule now"
+        );
+        assert_eq!(band_state(&set, "h1").retry_in, None);
+    }
+
+    /// The fire-time re-check (§3.4), which is the belt to C1's braces.
+    ///
+    /// One client runs several concurrent `ssh` execs, so a graver
+    /// family can be recorded *after* the EOF the connection task saw.
+    /// The armed timer re-reads the dead tunnel's slot before it dials:
+    /// a family no retry may be spent on settles the outage on its own
+    /// copy instead.
+    #[tokio::test]
+    async fn a_graver_family_found_at_fire_time_settles_instead_of_dialing() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-late-family.sock");
+        let armed = set.ssh["h1"].request;
+
+        // A retryable one still dials: the re-check refuses, it does not
+        // simply distrust anything it finds.
+        set.outages.get_mut("h1").expect("an outage").dead_tunnel = Some(DeadTunnel::Recorded {
+            generation: 9,
+            failure: SshFailure::Transport(Some("broken pipe".into())),
+            truncated: false,
+            seen: 4,
+        });
+        assert!(set.reconnect_due("h1", armed).is_some());
+
+        // Re-arm, then let a changed host key land in the same slot.
+        set.apply_state(incarnation, dropped("the connection closed"));
+        let armed = set.ssh["h1"].request;
+        set.outages.get_mut("h1").expect("an outage").dead_tunnel = Some(DeadTunnel::Recorded {
+            generation: 9,
+            failure: SshFailure::ChangedHostKey,
+            truncated: false,
+            seen: 4,
+        });
+        assert!(
+            set.reconnect_due("h1", armed).is_none(),
+            "a possible machine-in-the-middle is not dialed again"
+        );
+        assert!(!set.outages.contains_key("h1"));
+        assert_eq!(
+            band_reason(&set, "h1"),
+            SshFailure::ChangedHostKey.message("workbox")
+        );
+        assert_eq!(
+            set.ssh_failure("h1"),
+            Some(&SshFailure::ChangedHostKey),
+            "and the family is recorded, not only rendered"
+        );
+    }
+
+    /// §3.5's suspend reset. A lid closed a second after the drop wakes
+    /// with the timer firing at once, and attempts 2–10 would burn while
+    /// the radio is still associating — settling the host exactly as the
+    /// network comes back.
+    ///
+    /// It re-arms at the base delay and does **not** dial: a
+    /// reset-then-dial spends a full `ConnectTimeout 15` establish
+    /// against a radio that has no route yet, which is precisely the
+    /// attempt the reset exists to protect.
+    #[tokio::test]
+    async fn a_suspend_shaped_skew_restarts_the_ladder_without_dialing() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-suspend.sock");
+        for _ in 0..2 {
+            assert!(retry_once(&mut set));
+            refuse(&mut set, unreachable());
+        }
+        assert_eq!(
+            set.outages["h1"].ladder.attempts(),
+            3,
+            "deep enough to tell"
+        );
+        let deep = set.outages["h1"].armed.as_ref().expect("armed").delay;
+        assert!(deep > Duration::from_secs(1), "{deep:?} is off the base");
+
+        // The machine slept.
+        let armed = set
+            .outages
+            .get_mut("h1")
+            .expect("an outage")
+            .armed
+            .as_mut()
+            .expect("armed");
+        armed.at = SystemTime::now() - Duration::from_secs(3_600);
+        let stamp = set.ssh["h1"].request;
+
+        assert!(
+            set.reconnect_due("h1", stamp).is_none(),
+            "a woken ladder gives the network its beat before dialing"
+        );
+        assert_eq!(set.outages["h1"].ladder.attempts(), 1, "a new outage");
+        let rearmed = set.outages["h1"].armed.as_ref().expect("re-armed");
+        assert!(
+            rearmed.delay <= Duration::from_secs(1),
+            "{:?} is not the base delay",
+            rearmed.delay
+        );
+        assert_eq!(
+            band_reason(&set, "h1"),
+            format!("reconnecting in 1s (1/{})", budget(&set))
+        );
+    }
+
+    /// A terminal settle ends the outage, lease and all. Nothing is
+    /// armed in `TakenOver`, so if the entry did not go here nothing
+    /// would ever clean it — and the lease it holds belongs to a
+    /// connection somebody else now owns.
+    #[tokio::test]
+    async fn a_terminal_settle_takes_the_outage_with_it() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-terminal.sock");
+        set.apply_lease(incarnation, "lease-1".into());
+        set.apply_state(incarnation, dropped("the connection closed"));
+        assert!(set.outages.contains_key("h1"));
+
+        set.apply_state(incarnation, HostConnState::TakenOver);
+        assert!(!set.outages.contains_key("h1"));
+        assert!(set
+            .carried_lease("h1", AttemptCause::AutoReconnect)
+            .is_none());
+    }
+
+    /// The exit teardown, both windows (§3.4). An armed timer firing
+    /// during the teardown would spawn a fresh `ssh` master; a quit
+    /// timed into an establish already running would leave a
+    /// just-daemonized `ControlPersist=60s` one behind. Neither is
+    /// covered by the other.
+    #[tokio::test]
+    async fn the_exit_teardown_stops_both_a_waiting_retry_and_a_running_establish() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-exit.sock");
+
+        let timer = set.outages["h1"]
+            .armed
+            .as_ref()
+            .expect("a retry is waiting")
+            .handle
+            .clone();
+        let establish = set.ssh["h1"]
+            .establish
+            .clone()
+            .expect("an establish is in flight");
+        assert!(!timer.is_finished() && !establish.is_finished());
+
+        set.abandon_reconnects();
+        // Both are aborted before anything is polled, which is what
+        // keeps this case from dialing a real host.
+        tokio::task::yield_now().await;
+
+        assert!(timer.is_finished(), "the armed retry never fires");
+        assert!(
+            establish.is_finished(),
+            "and the handshake stops where it is"
+        );
+        assert!(set.outages.is_empty());
+        assert!(set.ssh["h1"].establish.is_none());
+    }
+
+    /// The half of the teardown the walk over `ssh` cannot see.
+    ///
+    /// Dropping an `AbortHandle` does not abort its task, and both
+    /// places an `SshState` is displaced used to drop one: `open_ssh`
+    /// replaces the entry, `disconnect` removes it. While the app runs
+    /// that is the design — the establish lands and `tunnel_ready`
+    /// discards it — but at exit nothing will ever drain its answer, so
+    /// a just-daemonized `ControlPersist=60s` master would outlive the
+    /// app with nothing left holding its handle.
+    #[tokio::test]
+    async fn the_exit_teardown_reaches_establishes_whose_entry_has_gone() {
+        let (mut set, _feed) = a_set();
+
+        // Displaced by a second attempt on the same host.
+        ask_ssh(&mut set, "h1");
+        let superseded = in_flight(&set, "h1");
+        ask_ssh(&mut set, "h1");
+        let current = in_flight(&set, "h1");
+
+        // Displaced by an explicit disconnect.
+        ask_ssh(&mut set, "h2");
+        let disconnected = in_flight(&set, "h2");
+        set.disconnect("h2");
+
+        assert!(!superseded.is_finished() && !disconnected.is_finished());
+        assert!(!set.ssh.contains_key("h2"), "the entry went with the host");
+
+        set.abandon_reconnects();
+        // Every handle is aborted before anything is polled, which is
+        // what keeps this case from dialing a real host.
+        tokio::task::yield_now().await;
+
+        assert!(
+            superseded.is_finished(),
+            "the establish a second Connect displaced is not left running"
+        );
+        assert!(
+            disconnected.is_finished(),
+            "and neither is the one whose host was disconnected"
+        );
+        assert!(current.is_finished(), "nor the one still on its entry");
+        assert!(set.displaced.is_empty());
+    }
+
+    /// A displaced establish is parked, never aborted, while the app is
+    /// running: aborting one mid-flight drops a half-built `SshTunnel`
+    /// inside the aborted task, which runs its *blocking* `Drop` on a
+    /// runtime worker — the very thing `discard_tunnel` exists to avoid.
+    /// And the parking may not accumulate across a long session.
+    #[tokio::test]
+    async fn parking_a_displaced_establish_neither_aborts_it_nor_grows_forever() {
+        let (mut set, _feed) = a_set();
+
+        ask_ssh(&mut set, "h1");
+        let superseded = in_flight(&set, "h1");
+        ask_ssh(&mut set, "h1");
+        ask_ssh(&mut set, "h2");
+        let orphaned = in_flight(&set, "h2");
+        set.disconnect("h2");
+        assert!(
+            !superseded.is_finished() && !orphaned.is_finished(),
+            "a displaced establish is left to land and be discarded"
+        );
+        assert_eq!(set.displaced.len(), 2);
+
+        // Both parked handles have answered now. Nothing sweeps them on
+        // a timer — the next displacement does, so the list measures
+        // what is in flight rather than every attempt this session made.
+        superseded.abort();
+        orphaned.abort();
+        in_flight(&set, "h1").abort();
+        tokio::task::yield_now().await;
+
+        ask_ssh(&mut set, "h1");
+        assert!(
+            set.displaced.is_empty(),
+            "finished handles are swept on the way in, not accumulated"
+        );
+        set.abandon_reconnects();
+    }
+
+    /// The window `abandon_reconnects` cannot close (§3.4).
+    /// `EngineFeed::Quit` only latches the exit — the drain keeps
+    /// running — so an establish that answers behind it still reaches
+    /// the UI thread, where `tunnel_ready` would dial a session while
+    /// the app tears down. The exit path routes it here instead, and a
+    /// tunnel that *did* come up is retired rather than connected or
+    /// leaked: its scratch directory goes with it.
+    ///
+    /// (The `exit_state` branch that chooses this path lives on `App`,
+    /// which a unit test cannot build; C5's lane covers that leg.)
+    #[tokio::test]
+    async fn an_establish_answering_during_shutdown_is_discarded_rather_than_dialed() {
+        let (mut set, _feed) = a_set();
+        ask_ssh(&mut set, "h1");
+        let request = set.ssh["h1"].request;
+        // Nothing in this suite may dial a real host, and this case has
+        // to let the runtime run: stop the handshake `open_ssh` spawned
+        // before anything is polled. The spent handle stays on the
+        // entry, which is what a real answer finds.
+        in_flight(&set, "h1").abort();
+
+        let parent = tempfile::Builder::new()
+            .prefix("roost-set-discard")
+            .tempdir()
+            .expect("a scratch parent");
+        let tunnel = an_unestablished_tunnel(parent.path().to_path_buf()).await;
+        let scratch = tunnel
+            .bridge_socket()
+            .parent()
+            .expect("a tunnel's socket sits in its scratch directory")
+            .to_path_buf();
+        assert!(scratch.is_dir(), "{}", scratch.display());
+
+        set.discard_ready(HostTunnelReady {
+            host: "h1".to_string(),
+            request,
+            result: Ok(tunnel),
+        });
+
+        assert!(
+            !set.conns.contains_key("h1"),
+            "a tunnel that lands during shutdown must not dial a session"
+        );
+        assert!(
+            set.ssh["h1"].establish.is_none(),
+            "and the spent handle comes off the entry"
+        );
+        // Retired on the engine runtime rather than dropped here — the
+        // `-O exit` and this removal are the difference between a
+        // discard and a leak.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while scratch.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the discarded tunnel's scratch directory is removed");
+    }
+
+    /// A real `SshTunnel` with nothing behind it: `open` claims a
+    /// scratch directory and writes a config, and binds and connects
+    /// nothing. So a discard can be *measured* — the directory is gone
+    /// afterwards — with no `ssh` anywhere near the suite.
+    async fn an_unestablished_tunnel(parent: PathBuf) -> Arc<SshTunnel> {
+        Arc::new(
+            SshTunnel::open(
+                "discardcase",
+                &ssh_target("workbox"),
+                roost_ipc::ssh::SshTunnelOptions {
+                    config_paths: roost_ipc::ssh::SshConfigPaths {
+                        user: None,
+                        system: None,
+                    },
+                    // A macOS `$TMPDIR` can be too deep for a `sun_path`;
+                    // the fallback is what `from_env` would pick too.
+                    scratch_parents: vec![parent, PathBuf::from("/tmp")],
+                    // Never spawned: the teardown's `-O exit` is skipped
+                    // for a control socket that was never bound.
+                    ssh_bin: PathBuf::from("/nonexistent/ssh"),
+                    jail_fs_root: false,
+                },
+            )
+            .await
+            .expect("claim a scratch directory"),
+        )
+    }
+
+    /// One `open_ssh` as the app drives it, with nothing riding on the
+    /// origin or the cause.
+    fn ask_ssh(set: &mut HostConnSet, host: &str) {
+        set.open_ssh(
+            host,
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+    }
+
+    fn in_flight(set: &HostConnSet, host: &str) -> AbortHandle {
+        set.ssh[host]
+            .establish
+            .clone()
+            .expect("an establish is in flight")
+    }
+
+    /// Attendedness is the cause, not the origin. `roostctl host
+    /// connect` arrives as `Ipc` + `Dial` — exactly what an
+    /// auto-reconnect looks like — and the status line raised here is
+    /// its **only** failure surface, because `host.connect`'s reply
+    /// carries no outcome. An origin rule would silence it; the cause
+    /// rule keeps it while making every ladder attempt quiet.
+    #[tokio::test]
+    async fn a_ladder_is_quiet_while_roostctls_own_connect_still_speaks() {
+        let (mut set, _feed) = a_set();
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::Explicit,
+        );
+        let request = set.ssh["h1"].request;
+        assert!(set.ssh["h1"].attended);
+        assert_eq!(
+            set.tunnel_ready(failed("h1", request, "workbox is unreachable"))
+                .as_deref(),
+            Some("workbox is unreachable"),
+            "roostctl host connect hears why it failed"
+        );
+
+        set.open_ssh(
+            "h2",
+            "two",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        let request = set.ssh["h2"].request;
+        assert!(!set.ssh["h2"].attended);
+        assert_eq!(
+            set.tunnel_ready(failed("h2", request, "workbox is unreachable")),
+            None,
+            "and a ladder says nothing, ten times over"
+        );
+    }
+
+    /// §3.6's fifth path. A bootstrap note sits in front of every other
+    /// reason the band can give — deliberately, while a bootstrap is
+    /// running — so a probe still outstanding when the link dies hides
+    /// the reconnect copy behind a question about a world that is gone.
+    /// Cancelling the probe on the drop is what clears it.
+    #[tokio::test]
+    async fn an_outstanding_probes_note_hides_the_reconnect_copy_until_the_drop_cancels_it() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-probe.sock");
+        // The confirmed-upgrade probe's note: `SessionState::Running`,
+        // and it never consulted `offer_for` at all.
+        set.set_bootstrap_note("h1", Some("checking one…".into()));
+        set.apply_state(incarnation, dropped("the connection closed"));
+
+        assert!(set.outages.contains_key("h1"), "the ladder started anyway");
+        assert_eq!(
+            band_reason(&set, "h1"),
+            "checking one…",
+            "the hazard: the probe's line outranks the reconnect copy"
+        );
+
+        // What `cancel_bootstrap_probe` does on every `Disconnected`.
+        set.set_bootstrap_note("h1", None);
+        assert!(band_reason(&set, "h1").starts_with("reconnecting in "));
+    }
+
+    /// **The consent property, over the values a real ladder leaves
+    /// behind** — not `offer_for` on hand-made arguments. Every
+    /// auto-reconnect stamps `RequestOrigin::Ipc`, and that is the one
+    /// gate that holds on every attempt: `reached_connected` is `false`
+    /// from the second attempt on (its own `open_ssh` cleared it), and
+    /// attempt *k* can carry a family attempt one never had.
+    #[tokio::test]
+    async fn no_attempt_of_a_ladder_can_raise_a_consent_card() {
+        use crate::app::bootstrap::offer_for;
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-consent.sock");
+
+        // An offer-able family on the *first* retry. It is a family
+        // attempt zero never had — the drop was a bare EOF — which is
+        // the case the withdrawn "offer-able families are not retryable"
+        // proof missed.
+        assert!(retry_once(&mut set));
+        refuse(&mut set, SshFailure::NoSession);
+        assert_eq!(set.ssh_failure("h1"), Some(&SshFailure::NoSession));
+        assert_eq!(
+            offer_for(
+                set.ssh_origin("h1"),
+                set.ssh_failure("h1"),
+                set.ssh_reached_connected("h1")
+            ),
+            None,
+            "a machine asked for this attempt, so no card"
+        );
+
+        // And again at the bottom of a full ladder, where
+        // `reached_connected` has been `false` for nine attempts and the
+        // origin is the only gate still standing.
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-consent.sock");
+        let budget = budget(&set);
+        while set.outages["h1"].ladder.attempts() < budget - 1 {
+            assert!(retry_once(&mut set));
+            assert!(
+                !set.ssh_reached_connected("h1"),
+                "the flag `offer_for` refuses on is already false"
+            );
+            refuse(&mut set, unreachable());
+        }
+        assert!(retry_once(&mut set));
+        refuse(&mut set, SshFailure::NoSession);
+        assert_eq!(
+            offer_for(
+                set.ssh_origin("h1"),
+                set.ssh_failure("h1"),
+                set.ssh_reached_connected("h1")
+            ),
+            None,
+            "the last attempt cannot raise a card either"
+        );
     }
 
     /// The establish window answers `connecting`, not `disconnected`:
@@ -1986,6 +4010,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         assert!(set.establishing("h1"), "the establish is in flight");
@@ -2010,6 +4035,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-focus.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2043,6 +4069,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-drop.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2072,6 +4099,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -2116,6 +4144,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-section.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2174,6 +4203,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2208,6 +4238,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let section = set.section("h1").expect("connecting hosts have sections");
         assert!(

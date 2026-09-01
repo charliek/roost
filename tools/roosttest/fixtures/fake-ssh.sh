@@ -40,8 +40,35 @@
 #                      block, ending in `Host key verification failed.`,
 #                      exit 255.
 #   exit-127           `sh: roost-session: command not found`, exit 127.
+#   unreachable        `No route to host`, exit 255 — a failure the
+#                      classifier deliberately has no rule for, so it
+#                      falls through to `Transport`. The only mode here
+#                      that fails an establish *retryably*: every other
+#                      one names a family the retry ladder refuses to
+#                      spend an attempt on (a key to review, a password
+#                      nobody can type under `BatchMode=yes`, a binary
+#                      that is not there), which is exactly why a lane
+#                      about giving up needed a mode of its own.
 #   drop-after:<n>     run FAKE_SSH_EXEC but cut its output after <n>
 #                      bytes, then exit 1.
+#   slow-stderr-changed-key:<secs>
+#                      the same block `hostkey-changed` writes and the
+#                      same exit 255 — but first it backgrounds a
+#                      `sleep <secs>` that inherits this stderr, so the
+#                      pipe stays open for <secs> after the process that
+#                      wrote to it is gone.
+#   slow-stderr-hang:<secs>
+#                      the same held-open stderr, and then this
+#                      invocation hangs until it is killed. What a
+#                      black-holed route looks like to a caller whose
+#                      budget runs out.
+#
+# The two `slow-stderr-*` modes exist for one thing: reaping a child does
+# not close a stderr pipe a *grandchild* inherited (a `ProxyCommand`
+# helper, a remote `sh -c` that forked), so a drain that waits for EOF
+# after the kill waits for the grandchild instead of for its own budget
+# — issue #379. They are in this first dispatch block deliberately, so
+# they fail the establish rather than a per-connection exec.
 #
 # `run-remote` in detail. `ok` runs one fixed FAKE_SSH_EXEC whatever it
 # was asked to run, which is all a byte-pump transport test needs.
@@ -112,6 +139,21 @@
 
 set -u
 
+# A caller that cannot set this process's environment — every caller,
+# since the environment is process-global and the Rust suite runs its
+# tests in parallel threads — configures us through a file named for the
+# path it invoked us by. Symlink `<dir>/ssh` here, write `<dir>/ssh.conf`
+# beside it, and each caller gets its own configuration with **no
+# executable of its own to write**: writing a script while sibling
+# threads are forking races `execve`, which answers ETXTBSY for a file
+# any process still holds open for writing. Sourcing a plain data file
+# has no such window. Callers that can write their wrapper once, before
+# anything forks, do that instead and never create this file.
+if [ -f "$0.conf" ]; then
+    # shellcheck disable=SC1090
+    . "$0.conf"
+fi
+
 : "${FAKE_SSH_LOG:?fake-ssh: FAKE_SSH_LOG must name an invocation log}"
 FAKE_SSH_MODE="${FAKE_SSH_MODE:-ok}"
 FAKE_SSH_EXEC="${FAKE_SSH_EXEC:-true}"
@@ -152,6 +194,29 @@ fi
 
 printf '%s\n' "$line" >>"$FAKE_SSH_LOG"
 
+changed_key_block() {
+    cat >&2 <<'EOF'
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+It is also possible that a host key has just been changed.
+Host key verification failed.
+EOF
+}
+
+# Background a process that inherits this stderr and outlives us, so the
+# write end of the pipe stays open after this invocation is gone or
+# killed. `sh -c` rather than a bare `sleep` because the point is the
+# *grandchild*: it is what a `ProxyCommand` helper leaves on the pipe.
+#
+# Only stderr: holding the *other* two open would stall a caller's
+# stdout pump on a process this is not asking anything of.
+hold_stderr_open() {
+    sh -c "sleep $1" </dev/null >/dev/null &
+}
+
 case "$FAKE_SSH_MODE" in
 auth-fail)
     printf '%s\n' "$(id -un)@host: Permission denied (publickey)." >&2
@@ -162,20 +227,32 @@ hostkey-fail)
     exit 255
     ;;
 hostkey-changed)
-    cat >&2 <<'EOF'
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
-Someone could be eavesdropping on you right now (man-in-the-middle attack)!
-It is also possible that a host key has just been changed.
-Host key verification failed.
-EOF
+    changed_key_block
     exit 255
+    ;;
+slow-stderr-changed-key:*)
+    hold_stderr_open "${FAKE_SSH_MODE#slow-stderr-changed-key:}"
+    changed_key_block
+    exit 255
+    ;;
+slow-stderr-hang:*)
+    hold_stderr_open "${FAKE_SSH_MODE#slow-stderr-hang:}"
+    # `exec`, so the caller's kill lands on the thing that is hanging
+    # rather than orphaning it behind a shell.
+    exec sleep 3600
     ;;
 exit-127)
     printf '%s\n' "sh: roost-session: command not found" >&2
     exit 127
+    ;;
+unreachable)
+    # Nothing here may match a `classify_ssh_failure` rule: no changed-key
+    # banner, no "Host key verification failed", no "Permission denied",
+    # no "client-bridge: no session", no "command not found" — and an
+    # exit that is not 127. What is left is the fallthrough, `Transport`,
+    # which is the one family a drop is allowed to retry.
+    printf '%s\n' "ssh: connect to host workbox port 22: No route to host" >&2
+    exit 255
     ;;
 esac
 

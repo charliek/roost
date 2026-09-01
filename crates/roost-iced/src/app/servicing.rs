@@ -1283,12 +1283,26 @@ impl App {
                         }
                         tracing::debug!(%host, "host connection state changed");
                         if dropped {
+                            // The world the probe was asked about is
+                            // gone, whoever asked (plan 040 §3.6): the
+                            // confirmed-upgrade probe never consults
+                            // `offer_for` at all, so one still out at a
+                            // drop can land a card over a host that is
+                            // mid-ladder — and write a `bootstrap_note`
+                            // the band prefers over the reconnect copy.
+                            self.cancel_bootstrap_probe(&host);
                             self.maybe_offer_bootstrap(&host);
                         }
                     }
                     // The band's dot and rollup are cached with the rows;
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
+                }
+                // Nothing renders off it — it is kept for the outage a
+                // later drop opens (plan 040 §3.7).
+                EngineFeed::HostLease(host, lease) => self.hosts.apply_lease(host, lease),
+                EngineFeed::ReconnectDue { host, request } => {
+                    self.host_reconnect_due(&host, request)
                 }
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
@@ -2520,7 +2534,11 @@ impl App {
         if test_user_origin && self.test_mode {
             self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
         } else {
-            self.host_reconnect_requested(saved_id, Self::IPC_CONNECT_ORIGIN);
+            self.host_reconnect_requested(
+                saved_id,
+                Self::IPC_CONNECT_ORIGIN,
+                crate::host_conn::AttemptCause::Explicit,
+            );
         }
         Ok(self.host_connection_result(host))
     }

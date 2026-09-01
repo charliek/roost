@@ -11,12 +11,13 @@
 //! scratch parent directory, handed to the tunnel through
 //! [`SshTunnelOptions`] rather than through `$TMPDIR` — process-global
 //! env is shared by every test in this binary. And the fixture's own
-//! configuration reaches it through a per-test wrapper script that
-//! `exec`s it with the right variables, for the same reason.
+//! configuration reaches it through a per-test conf file sourced beside
+//! the symlink that named it, for the same reason — a *written* wrapper
+//! would race `execve` against a sibling thread's fork (see
+//! [`Harness::new`]).
 //!
 //! There are no sleeps: everything that has to settle is polled for.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -59,21 +60,27 @@ impl Harness {
         let log = root.path().join("invocations.log");
         std::fs::write(&log, b"").expect("invocation log");
 
+        // A symlink to the committed fixture plus a plain conf file
+        // beside it, rather than a per-test wrapper script. The tests in
+        // this binary run in parallel threads, and a script written here
+        // while a sibling is forking races `execve`: the fork inherits
+        // our still-open write descriptor, and the exec that follows
+        // answers ETXTBSY ("Text file busy") on Linux. Nothing exec'd is
+        // ever written, so there is no such window — see the fixture's
+        // own note on `$0.conf`.
         let ssh_bin = root.path().join("ssh");
         std::fs::write(
-            &ssh_bin,
+            root.path().join("ssh.conf"),
             format!(
-                "#!/bin/sh\nFAKE_SSH_LOG={log}\nFAKE_SSH_MODE={mode}\nFAKE_SSH_EXEC={exec}\n\
-                 export FAKE_SSH_LOG FAKE_SSH_MODE FAKE_SSH_EXEC\nexec {fixture} \"$@\"\n",
+                "FAKE_SSH_LOG={log}\nFAKE_SSH_MODE={mode}\nFAKE_SSH_EXEC={exec}\n\
+                 export FAKE_SSH_LOG FAKE_SSH_MODE FAKE_SSH_EXEC\n",
                 log = shell_quote(&log.display().to_string()),
                 mode = shell_quote(mode),
                 exec = shell_quote(exec),
-                fixture = shell_quote(&fixture_path().display().to_string()),
             ),
         )
-        .expect("write the ssh wrapper");
-        std::fs::set_permissions(&ssh_bin, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod the ssh wrapper");
+        .expect("write the fake ssh config");
+        std::os::unix::fs::symlink(fixture_path(), &ssh_bin).expect("link the ssh wrapper");
 
         Self {
             _root: root,
@@ -195,12 +202,22 @@ fn ssh_target(raw: &str) -> SshTarget {
     }
 }
 
+fn scaled(budget: Duration) -> Duration {
+    budget.mul_f64(roost_ipc::session_launch::timeout_scale())
+}
+
+/// How long the grandchild left holding a stderr pipe must sleep, sized
+/// off the already-scaled budget it has to outlive: on a 3x runner an
+/// unscaled sleeper would be dead before the budget expired and the test
+/// would pass while proving nothing.
+fn sleeper_secs(budget: Duration) -> u64 {
+    (budget.as_secs_f64() + 15.0).ceil() as u64
+}
+
 async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let scale = std::env::var("ROOST_TEST_TIMEOUT_SCALE")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|scale| *scale >= 1.0)
-        .unwrap_or(1.0);
+    // A poll ceiling only ever grows: a scale below 1 is for shrinking
+    // budgets under test, not for shortening how long we wait on one.
+    let scale = roost_ipc::session_launch::timeout_scale().max(1.0);
     let deadline = std::time::Instant::now() + Duration::from_secs(20).mul_f64(scale);
     loop {
         if ready() {
@@ -221,6 +238,18 @@ fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 sends nothing; it only asks whether the pid can
     // be signalled.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Dial the bridge and read that one connection out to EOF. For a
+/// failing exec the EOF is the moment `serve` has finished recording its
+/// verdict, so `last_error` is readable straight after with no polling.
+async fn read_bridge_to_eof(tunnel: &SshTunnel) -> Vec<u8> {
+    let mut stream = UnixStream::connect(tunnel.bridge_socket())
+        .await
+        .expect("dial the bridge");
+    let mut back = Vec::new();
+    stream.read_to_end(&mut back).await.expect("read to EOF");
+    back
 }
 
 async fn echo_through(bridge: &Path, payload: &[u8]) -> UnixStream {
@@ -308,6 +337,91 @@ async fn a_changed_host_key_outranks_the_unknown_key_substring_it_contains() {
         "{error}"
     );
     assert!(error.to_string().to_lowercase().contains("do not accept"));
+}
+
+// ============================================================================
+// Bounded stderr drains (#379)
+// ============================================================================
+
+// Everything in this section is timed against a **grandchild** holding
+// the stderr pipe open — `hold_stderr_open` in the fixture, which is
+// what an `ssh` `ProxyCommand` helper does in production. Reaping our
+// own child does not close that pipe, so a drain that waits for EOF
+// waits for the grandchild instead of for its own budget.
+
+/// `SshTunnel::establish`'s own warm-up budget, mirrored — the module
+/// keeps it private and there is no seam to shrink it, so a test of the
+/// timeout arm has to spend it.
+const ESTABLISH_BUDGET: Duration = Duration::from_secs(30);
+
+/// #379 and §3.3 C's scoping, on one run of the arm they share: the
+/// establish that spends its budget kills its child, and the drain
+/// behind that kill is bounded by the grace floor rather than by the
+/// lifetime of a grandchild still holding the pipe — *and* the failure
+/// it returns is never marked truncated, however that drain went. The
+/// timeout is its own verdict; the tail would only have sharpened the
+/// copy. That negative is the load-bearing half: a black-holed
+/// establish behind a `ProxyCommand` is exactly the case auto-reconnect
+/// must keep retrying, and a uniform truncation veto would refuse it.
+///
+/// One test rather than two because reaching this arm costs a full
+/// [`ESTABLISH_BUDGET`] of wall clock and leaves a sleeper behind; both
+/// facts are read off the same failure.
+#[tokio::test]
+async fn a_timed_out_establish_returns_on_its_budget_and_is_never_marked_truncated() {
+    let budget = scaled(ESTABLISH_BUDGET);
+    let sleeper = sleeper_secs(budget);
+    let harness = Harness::new(&format!("slow-stderr-hang:{sleeper}"), "cat");
+    let tunnel = SshTunnel::open("0000000d", &ssh_target("workbox"), harness.options())
+        .await
+        .expect("open");
+
+    let started = std::time::Instant::now();
+    let error = tunnel
+        .establish()
+        .await
+        .expect_err("a hung warm-up must fail");
+    let elapsed = started.elapsed();
+
+    // Tight against the budget, not merely under the sleeper: the grace
+    // floor is 200ms, so anything past a couple of seconds means the
+    // drain is waiting on the grandchild again.
+    assert!(
+        elapsed < budget + Duration::from_secs(3),
+        "establish took {elapsed:?} against a {budget:?} budget and a {sleeper}s sleeper: {error}"
+    );
+    assert!(
+        matches!(error.failure(), Some(SshFailure::Transport(Some(line))) if line.contains("timed out")),
+        "{error:?}"
+    );
+    assert!(
+        !error.truncated(),
+        "the timeout is its own evidence: {error}"
+    );
+}
+
+/// The other half of the same rule: the non-zero-exit arm gets the
+/// *real* deadline, which still has slack because the child exited
+/// early — so a far side whose stderr arrives late still classifies as
+/// itself instead of degrading to the `Transport` fallthrough. This is
+/// the arm a changed host key is decided on.
+#[tokio::test]
+async fn a_slow_stderr_non_zero_exit_still_classifies_as_a_changed_host_key() {
+    let harness = Harness::new("slow-stderr-changed-key:2", "cat");
+    let tunnel = SshTunnel::open("0000000f", &ssh_target("workbox"), harness.options())
+        .await
+        .expect("open");
+
+    let error = tunnel
+        .establish()
+        .await
+        .expect_err("a changed key must fail");
+    assert_eq!(
+        error.failure(),
+        Some(&SshFailure::ChangedHostKey),
+        "{error}"
+    );
+    assert!(!error.truncated(), "the evidence did arrive: {error}");
 }
 
 #[tokio::test]
@@ -619,11 +733,12 @@ async fn a_stream_cut_mid_connection_records_a_transport_failure() {
         tunnel.last_error().is_some()
     })
     .await;
-    let (generation, failure) = tunnel.last_error().expect("a recorded failure");
-    assert_eq!(generation, 1, "the first exec of this tunnel");
+    let recorded = tunnel.last_error().expect("a recorded failure");
+    assert_eq!(recorded.generation, 1, "the first exec of this tunnel");
     assert!(
-        matches!(failure, SshFailure::Transport(_)),
-        "an unclassifiable non-zero exit is a transport failure, got {failure:?}"
+        matches!(recorded.failure, SshFailure::Transport(_)),
+        "an unclassifiable non-zero exit is a transport failure, got {:?}",
+        recorded.failure
     );
 }
 
@@ -660,6 +775,132 @@ async fn a_silent_probe_connection_records_no_failure() {
         "a zero-byte clean connection is not a failure"
     );
     tunnel.shutdown().await;
+}
+
+/// `serve`'s own reap budget, mirrored — private to the module, and the
+/// bound both tests below are written against.
+const REAP_BUDGET: Duration = Duration::from_secs(2);
+
+/// A remote command that fails with something classifiable on stderr and
+/// then leaves a grandchild holding that pipe open for `sleeper`
+/// seconds. Only stderr is held: holding stdout would stall the exec's
+/// own pump and prove nothing about the drain.
+fn slow_stderr_exec(sleeper: u64) -> String {
+    format!(
+        "sh -c 'sleep {sleeper}' </dev/null >/dev/null & printf 'Permission denied\\n' >&2; exit 1"
+    )
+}
+
+/// #379 at the per-connection exec: the drain behind `serve`'s reap is
+/// bounded by that reap's budget, so a connection whose stderr a
+/// grandchild still holds open ends on the budget rather than on the
+/// grandchild's lifetime.
+#[tokio::test]
+async fn a_connection_whose_stderr_is_held_open_ends_on_the_reap_budget() {
+    let budget = scaled(REAP_BUDGET);
+    let sleeper = sleeper_secs(budget);
+    let harness = Harness::new("ok", &slow_stderr_exec(sleeper));
+    let tunnel = SshTunnel::open("00000010", &ssh_target("workbox"), harness.options())
+        .await
+        .expect("open");
+    tunnel.establish().await.expect("establish");
+
+    let started = std::time::Instant::now();
+    read_bridge_to_eof(&tunnel).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < budget + Duration::from_secs(4),
+        "the connection took {elapsed:?} against a {budget:?} budget and a {sleeper}s sleeper"
+    );
+}
+
+/// §3.3 C's first truncation path, at the site where the tail **is** the
+/// evidence: the far side said `Permission denied`, the drain expired
+/// before it could be read, and the family fell through to `Transport`.
+/// The flag is what stops a retry policy from trusting that fallthrough.
+#[tokio::test]
+async fn a_drain_that_expires_marks_the_recorded_failure_truncated() {
+    let sleeper = sleeper_secs(scaled(REAP_BUDGET));
+    let harness = Harness::new("ok", &slow_stderr_exec(sleeper));
+    let tunnel = SshTunnel::open("00000011", &ssh_target("workbox"), harness.options())
+        .await
+        .expect("open");
+    tunnel.establish().await.expect("establish");
+
+    read_bridge_to_eof(&tunnel).await;
+
+    let recorded = tunnel.last_error().expect("a recorded failure");
+    assert!(
+        recorded.truncated,
+        "an expired drain must say so: {recorded:?}"
+    );
+    assert!(
+        matches!(recorded.failure, SshFailure::Transport(_)),
+        "and it degraded to the fallthrough, which is the hazard: {recorded:?}"
+    );
+}
+
+/// §3.3 C's second truncation path, Kimi's: `read_tail` keeps only the
+/// last 4 KiB. Here the family marker is in the surviving window — a
+/// chatty `ProxyCommand` that scrolled *earlier* output out — so the
+/// classification is right and only the flag records that anything was
+/// dropped. The same eviction one line later would have taken the
+/// marker with it, which is why the flag is set on eviction rather than
+/// on a failed match.
+#[tokio::test]
+async fn a_tail_whose_byte_cap_evicted_leading_output_is_marked_truncated() {
+    let harness = Harness::new(
+        "ok",
+        "yes chatter | head -c 6000 >&2; printf 'Permission denied\\n' >&2; exit 1",
+    );
+    let tunnel = SshTunnel::open("00000012", &ssh_target("workbox"), harness.options())
+        .await
+        .expect("open");
+    tunnel.establish().await.expect("establish");
+
+    read_bridge_to_eof(&tunnel).await;
+
+    let recorded = tunnel.last_error().expect("a recorded failure");
+    assert_eq!(
+        recorded.failure,
+        SshFailure::Auth,
+        "the marker survived the cap: {recorded:?}"
+    );
+    assert!(
+        recorded.truncated,
+        "but the cap discarded what came before it: {recorded:?}"
+    );
+}
+
+/// The `serve` reorder (§3.9, Kimi): the client-visible EOF is what
+/// wakes the app thread's drop handling, so the verdict has to be
+/// recorded *before* it. Asserted with no polling at all — the read
+/// returning is the moment under test, and a `last_error` that is still
+/// `None` here is a changed host key seen as a bare EOF.
+///
+/// The exec closes its stdout and only *then* takes a second to die, so
+/// the window between the wire ending and the verdict landing is real
+/// rather than a scheduling accident: under the old ordering the client
+/// saw the EOF a whole second before the family was recorded.
+#[tokio::test]
+async fn a_failed_exec_records_its_family_before_the_client_sees_eof() {
+    let harness = Harness::new(
+        "ok",
+        "printf 'bye'; printf 'Permission denied\\n' >&2; exec 1>&-; sleep 1; exit 1",
+    );
+    let tunnel = SshTunnel::open("00000013", &ssh_target("workbox"), harness.options())
+        .await
+        .expect("open");
+    tunnel.establish().await.expect("establish");
+
+    assert_eq!(read_bridge_to_eof(&tunnel).await, b"bye");
+
+    let recorded = tunnel
+        .last_error()
+        .expect("the family must be recorded by the time the client can see the EOF");
+    assert_eq!(recorded.failure, SshFailure::Auth, "{recorded:?}");
+    assert!(!recorded.truncated, "{recorded:?}");
 }
 
 // ============================================================================
@@ -720,4 +961,30 @@ async fn verify_speaks_identify_over_a_one_shot_exec_outside_the_mux() {
         pids.iter().all(|pid| !alive(*pid))
     })
     .await;
+}
+
+/// #379 at the verify: a far side that never answers spends the whole
+/// budget, and the drain behind the kill that ends it must be the grace
+/// floor — not the lifetime of a grandchild still holding the stderr
+/// pipe. This is the shape plan 039 measured before the fix: a 1s budget
+/// against a 10s sleeper took 10s.
+#[tokio::test]
+async fn a_verify_that_times_out_returns_on_its_budget_not_the_grandchilds_lifetime() {
+    let budget = Duration::from_secs(1);
+    let sleeper = sleeper_secs(scaled(budget));
+    let harness = Harness::new(
+        "ok",
+        &format!("sh -c 'sleep {sleeper}' </dev/null >/dev/null & exec sleep 3600"),
+    );
+
+    let started = std::time::Instant::now();
+    let error = verify_ssh_target(&ssh_target("workbox"), &harness.options(), budget)
+        .await
+        .expect_err("a far side that never answers must fail");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < scaled(budget) + Duration::from_secs(4),
+        "verify took {elapsed:?} against a {budget:?} budget and a {sleeper}s sleeper: {error}"
+    );
 }

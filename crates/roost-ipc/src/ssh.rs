@@ -33,7 +33,7 @@ use tokio::time::Instant;
 use crate::framing::{write_frame, FrameReader};
 use crate::messages::{ops, RawRequest, Response, SessionIdentify, SESSION_PROTOCOL_VERSION};
 use crate::paths::BundleProfile;
-use crate::session_launch::{reap_by, timeout_scale};
+use crate::session_launch::{drain_tail, reap_by, timeout_scale, Tail};
 use crate::socket_state::{self, SocketState, PROBE_TIMEOUT};
 
 // ============================================================================
@@ -837,16 +837,26 @@ impl SshTunnelOptions {
 #[derive(Debug, thiserror::Error)]
 pub enum SshTunnelError {
     #[error("{}", .failure.message(.target))]
-    Ssh { target: String, failure: SshFailure },
+    Ssh {
+        target: String,
+        failure: SshFailure,
+        /// Whether the stderr this family was read out of was
+        /// incomplete — a drain that ran out of time, or a byte cap that
+        /// discarded the leading bytes. Only the arms that classify
+        /// *from* a tail set it; a failure whose verdict is its own (a
+        /// timeout) reports `false` however its post-kill drain went.
+        truncated: bool,
+    },
     #[error("{0:#}")]
     Local(#[from] anyhow::Error),
 }
 
 impl SshTunnelError {
-    fn ssh(target: &str, failure: SshFailure) -> Self {
+    fn ssh(target: &str, failure: SshFailure, truncated: bool) -> Self {
         Self::Ssh {
             target: target.to_string(),
             failure,
+            truncated,
         }
     }
 
@@ -857,6 +867,39 @@ impl SshTunnelError {
             Self::Local(_) => None,
         }
     }
+
+    /// Whether the evidence this family was classified from was
+    /// incomplete.
+    pub fn truncated(&self) -> bool {
+        match self {
+            Self::Ssh { truncated, .. } => *truncated,
+            Self::Local(_) => false,
+        }
+    }
+}
+
+/// What one tunnel connection's failure amounted to, as
+/// [`SshTunnel::last_error`] reports it.
+///
+/// A struct rather than a tuple because the third field is not a
+/// coordinate: `truncated` says whether `failure` was read out of
+/// complete evidence, and a caller routing on the family has to see the
+/// two together or it will trust a fallthrough it should not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedFailure {
+    /// The highest exec generation that has reported a failure — the
+    /// watermark a caller compares its own `seen` against to ask "has
+    /// anything failed since the last thing I showed?".
+    ///
+    /// Not necessarily the exec [`Self::failure`] came from: a
+    /// fallthrough `Transport` advances this without displacing a
+    /// classified family. See [`TunnelState::record`].
+    pub generation: u64,
+    /// Which exec [`Self::failure`] and [`Self::truncated`] describe.
+    /// Private because it answers `record`'s question, not a reader's.
+    pub(crate) family_generation: u64,
+    pub failure: SshFailure,
+    pub truncated: bool,
 }
 
 /// A live SSH transport to one saved host: a local `bridge.sock`, a
@@ -895,7 +938,7 @@ struct TunnelState {
     /// Bumped once per `ssh` exec, so a caller can tell "the failure I
     /// already reported" from "a new one since".
     generation: AtomicU64,
-    last_error: Mutex<Option<(u64, SshFailure)>>,
+    last_error: Mutex<Option<RecordedFailure>>,
     /// Set by `shutdown`/`Drop`. The accept loop reads it so a
     /// connection accepted in the window between the abort request and
     /// the task actually stopping is dropped rather than left running
@@ -984,7 +1027,7 @@ impl SshTunnel {
 
     /// The most recent connection failure, with the generation of the
     /// exec that hit it.
-    pub fn last_error(&self) -> Option<(u64, SshFailure)> {
+    pub fn last_error(&self) -> Option<RecordedFailure> {
         self.state
             .last_error
             .lock()
@@ -1038,23 +1081,45 @@ impl SshTunnel {
                 // Nothing is left of the budget, so the reap deadline is
                 // now: kill it and take the corpse.
                 reap_by(&mut child, Instant::now()).await;
-                let _ = tail.await;
+                // The tail is *not* the evidence here. The timeout is
+                // the verdict and the tail would only have sharpened the
+                // copy, so this arm never reports truncation however the
+                // drain went (plan 040 §3.3 C): a black-holed establish
+                // behind a `ProxyCommand` is exactly the case that must
+                // stay retryable.
+                let _ = drain_tail(tail, Instant::now()).await;
                 Err(SshTunnelError::ssh(
                     &self.state.target,
                     SshFailure::Transport(Some(format!(
                         "timed out after {}s",
                         budget.as_secs().max(1)
                     ))),
+                    false,
                 ))
             }
-            Ok(Err(error)) => Err(SshTunnelError::Local(
-                anyhow::Error::from(error).context("wait for the ssh warm-up connection"),
-            )),
-            Ok(Ok(status)) if !status.success() => Err(SshTunnelError::ssh(
-                &self.state.target,
-                classify_ssh_failure(status.code(), &tail.await.unwrap_or_default()),
-            )),
+            Ok(Err(error)) => {
+                // Nobody is going to read this tail.
+                tail.abort();
+                Err(SshTunnelError::Local(
+                    anyhow::Error::from(error).context("wait for the ssh warm-up connection"),
+                ))
+            }
+            Ok(Ok(status)) if !status.success() => {
+                // The real deadline, not a bare grace floor: the child
+                // exited early, so the budget still has slack, and this
+                // is the arm where ChangedHostKey / Auth / NotFound are
+                // classified — the one that must not truncate its own
+                // evidence.
+                let tail = drain_tail(tail, deadline).await;
+                Err(SshTunnelError::ssh(
+                    &self.state.target,
+                    classify_ssh_failure(status.code(), &tail.text),
+                    tail.truncated,
+                ))
+            }
             Ok(Ok(_)) => {
+                // A clean warm-up has nothing to say on stderr.
+                tail.abort();
                 // Bind and register under the accept lock, with a closed
                 // re-check inside it: a shutdown that ran during the
                 // warm-up has already taken (and will never re-take)
@@ -1193,6 +1258,7 @@ impl TunnelState {
                 self.record(
                     generation,
                     SshFailure::Transport(Some(format!("{error:#}"))),
+                    false,
                 );
                 return;
             }
@@ -1216,14 +1282,16 @@ impl TunnelState {
         if let Some(mut stdout) = stdout {
             pump(&mut stdout, &mut socket_write, "ssh to client").await;
         }
-        let _ = socket_write.shutdown().await;
 
         // Child stdout has EOFed, so the exec is done or dying; the
         // client may never close its half, so the wire's end is what
         // ends the upstream pump.
-        let exit = match tokio::time::timeout_at(Instant::now() + scaled(REAP_BUDGET), child.wait())
-            .await
-        {
+        //
+        // One budget for the reap and the drain behind it: what the
+        // corpse does not spend is what the tail gets — in practice
+        // nothing, so the drain falls back to its grace floor.
+        let reap_deadline = Instant::now() + scaled(REAP_BUDGET);
+        let exit = match tokio::time::timeout_at(reap_deadline, child.wait()).await {
             Ok(Ok(status)) => Some(status),
             Ok(Err(_)) => None,
             Err(_elapsed) => {
@@ -1237,28 +1305,89 @@ impl TunnelState {
         // Only the exec's own verdict is a failure: a connection that
         // opened and closed without traffic (a probe) is not one.
         if exit.is_none_or(|status| !status.success()) {
-            let tail = tail.await.unwrap_or_default();
+            let tail = drain_tail(tail, reap_deadline).await;
             self.record(
                 generation,
-                classify_ssh_failure(exit.and_then(|status| status.code()), &tail),
+                classify_ssh_failure(exit.and_then(|status| status.code()), &tail.text),
+                tail.truncated,
             );
+        } else {
+            tail.abort();
         }
+
+        // *After* the verdict is recorded, not before it. The client's
+        // EOF is what wakes the app thread's drop handling, and it must
+        // not arrive while `last_error` still says nothing — a changed
+        // host key read as a bare EOF is a retry against a possible
+        // machine-in-the-middle (plan 040 §3.9). The cost is that a
+        // *failed* connection's end reaches the client up to the reap
+        // budget plus the drain grace later; a clean one records nothing
+        // and is unaffected.
+        let _ = socket_write.shutdown().await;
     }
 
-    /// Record a connection failure, unless a *newer* exec already
-    /// reported one. Connections overlap, so completion order does not
-    /// follow generation order, and the last writer would otherwise be
-    /// able to overwrite fresher news with staler.
-    fn record(&self, generation: u64, failure: SshFailure) {
+    /// Record a connection failure. Two questions, and they are not the
+    /// same question — which is why [`RecordedFailure`] carries two
+    /// generations.
+    ///
+    /// **Is this news?** The watermark ([`RecordedFailure::generation`])
+    /// always advances to the highest exec that has reported, because
+    /// that is what a reader compares its own `seen` against: "has
+    /// anything failed since the last thing I showed?"
+    ///
+    /// **Is this the failure worth showing?** Specificity first, then
+    /// recency. `Transport` is [`classify_ssh_failure`]'s fallthrough —
+    /// "no rule matched" — so it never displaces a classified family,
+    /// whichever order the two arrive in. One client runs several execs
+    /// at once (control, events, a lease probe) and they die together:
+    /// an events exec's `Transport` would otherwise erase a control
+    /// exec's `ChangedHostKey` before anyone had read it. Between two
+    /// families of equal specificity, the newer exec wins, and a
+    /// straggler never overwrites fresher news with staler.
+    ///
+    /// Keeping those two apart is load-bearing. Folding them into one
+    /// field lets a retained family's provenance be overwritten by the
+    /// watermark, and a genuinely newer classified family then reads as
+    /// stale: classified@7, `Transport`@9, classified@8 completing in
+    /// that order would report @7's family and drop @8's.
+    ///
+    /// **And `truncated` is not merely along for the ride.** Two
+    /// `Transport`s are of equal specificity, so a clean one settles
+    /// newest-wins over a truncated one and clears the flag that says
+    /// "the evidence was cut" — turning a tail that may have held a
+    /// `ChangedHostKey` back into a retryable drop (plan 040 §3.3 C). So
+    /// the fallthrough may not *clear* the flag; only a classified
+    /// family, which carries its own evidence, replaces it outright. Not
+    /// a blanket sticky bit: `last_error` is never reset for a tunnel's
+    /// life, so `|=` would make one cut tail refuse every later failure
+    /// on that tunnel for good.
+    fn record(&self, generation: u64, failure: SshFailure, truncated: bool) {
         tracing::warn!(
             host = %self.target,
             generation,
+            truncated,
             failure = %failure.message(&self.target),
             "ssh tunnel connection failed"
         );
         let mut last = self.last_error.lock().expect(LAST_ERROR_MUTEX);
-        if last.as_ref().is_none_or(|(seen, _)| *seen <= generation) {
-            *last = Some((generation, failure));
+        let Some(recorded) = last.as_mut() else {
+            *last = Some(RecordedFailure {
+                generation,
+                family_generation: generation,
+                failure,
+                truncated,
+            });
+            return;
+        };
+        recorded.generation = recorded.generation.max(generation);
+        let incoming_is_fallthrough = matches!(failure, SshFailure::Transport(_));
+        let stored_is_fallthrough = matches!(recorded.failure, SshFailure::Transport(_));
+        let more_specific = !incoming_is_fallthrough && stored_is_fallthrough;
+        let same_specificity = incoming_is_fallthrough == stored_is_fallthrough;
+        if more_specific || (same_specificity && generation > recorded.family_generation) {
+            recorded.family_generation = generation;
+            recorded.failure = failure;
+            recorded.truncated = truncated || (incoming_is_fallthrough && recorded.truncated);
         }
     }
 }
@@ -1414,19 +1543,33 @@ pub(crate) fn spawn_ssh_command(
 ///
 /// A task rather than a read after `wait()`, because an unread stderr
 /// pipe fills and blocks the child that is being waited on.
-pub(crate) fn spawn_stderr_tail(child: &mut Child) -> JoinHandle<String> {
+///
+/// Every handle is either drained ([`drain_tail`]) or aborted — never
+/// dropped. Dropping leaves the reader detached on our end of a pipe
+/// whose write end a grandchild (an `ssh` `ProxyCommand` helper, a
+/// remote `sh -c` that forked) can hold open for its own lifetime.
+pub(crate) fn spawn_stderr_tail(child: &mut Child) -> JoinHandle<Tail> {
     let stderr = child.stderr.take();
     tokio::spawn(async move {
         match stderr {
             Some(stderr) => read_tail(stderr).await,
-            None => String::new(),
+            None => Tail::default(),
         }
     })
 }
 
-async fn read_tail<R: AsyncRead + Unpin>(mut reader: R) -> String {
+/// The last [`STDERR_TAIL_BYTES`] of a stream, and whether keeping only
+/// those meant dropping anything in front of them.
+///
+/// The flag is the second truncation path a classified family can be
+/// wrong through: a chatty `ProxyCommand` (or a verbose remote shell)
+/// that outtalks the cap scrolls the marker `classify_ssh_failure`
+/// routes on out of the window, and the family degrades to the
+/// fallthrough with nothing to say it happened.
+async fn read_tail<R: AsyncRead + Unpin>(mut reader: R) -> Tail {
     let mut tail: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 8 * 1024];
+    let mut evicted = false;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -1434,11 +1577,15 @@ async fn read_tail<R: AsyncRead + Unpin>(mut reader: R) -> String {
                 tail.extend_from_slice(&buf[..read]);
                 if tail.len() > STDERR_TAIL_BYTES {
                     tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+                    evicted = true;
                 }
             }
         }
     }
-    String::from_utf8_lossy(&tail).into_owned()
+    Tail {
+        text: String::from_utf8_lossy(&tail).into_owned(),
+        truncated: evicted,
+    }
 }
 
 fn bind_bridge(path: &Path) -> Result<UnixListener, SshTunnelError> {
@@ -1625,6 +1772,15 @@ impl VerifyError {
             Self::Other(_) => None,
         }
     }
+
+    /// Whether the evidence that family was classified from was
+    /// incomplete.
+    pub fn truncated(&self) -> bool {
+        match self {
+            Self::Ssh(error) => error.truncated(),
+            Self::Other(_) => false,
+        }
+    }
 }
 
 /// Does this ssh target answer, and does it speak a protocol this build
@@ -1733,7 +1889,10 @@ async fn verify_in(
         Ok(identity) => identity,
         Err(error) => {
             reap_by(&mut child, Instant::now()).await;
-            let tail = tail.await.unwrap_or_default();
+            // The verify's own deadline, not a bare grace floor: a child
+            // that failed early leaves slack for its stderr to arrive,
+            // and this is where the family is classified from it.
+            let tail = drain_tail(tail, deadline).await;
             let code = child
                 .try_wait()
                 .ok()
@@ -1743,14 +1902,21 @@ async fn verify_in(
             // not fail as a *transport* — the fault is in what came back
             // over the pipe, and reporting it as a connection failure
             // would send the reader hunting the network.
-            return Err(if code == Some(0) && tail.trim().is_empty() {
+            return Err(if code == Some(0) && tail.text.trim().is_empty() {
                 SshTunnelError::Local(error.context(format!("verifying {}", target.raw)))
             } else {
-                SshTunnelError::ssh(&target.raw, classify_ssh_failure(code, &tail))
+                SshTunnelError::ssh(
+                    &target.raw,
+                    classify_ssh_failure(code, &tail.text),
+                    tail.truncated,
+                )
             });
         }
     };
     reap_by(&mut child, deadline).await;
+    // The exchange answered, so nothing left on stderr is evidence of
+    // anything.
+    tail.abort();
 
     if identity.session_protocol != SESSION_PROTOCOL_VERSION {
         return Err(SshTunnelError::Local(anyhow!(
@@ -2548,5 +2714,160 @@ mod tests {
             not_found.contains("connect from the Roost app to install it"),
             "{not_found}"
         );
+    }
+    // ------------------------------------------------------------------
+    // record
+    // ------------------------------------------------------------------
+
+    /// The slot `record` writes into. `SshTunnel::last_error` is the
+    /// production reader and there is no tunnel here.
+    fn recorded(state: &TunnelState) -> Option<RecordedFailure> {
+        state.last_error.lock().expect(LAST_ERROR_MUTEX).clone()
+    }
+
+    /// A tunnel state with nothing spawned behind it: `record` reads
+    /// only the target and the slot it writes into.
+    fn recording_state() -> TunnelState {
+        TunnelState {
+            target: "workbox".to_string(),
+            ssh_bin: PathBuf::from("ssh"),
+            config_path: PathBuf::from("config"),
+            ctl_path: PathBuf::from("ctl"),
+            jail_fs_root: false,
+            generation: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// One client runs several execs at once — control, events, a lease
+    /// probe — and a dying link kills them together. The fallthrough
+    /// family must not erase a first-match hit inside one unseen window:
+    /// a changed host key read as a bare `Transport` is a retry against
+    /// a possible machine-in-the-middle. The generation still advances,
+    /// so "is this newer than what I reported?" keeps working.
+    #[test]
+    fn a_transport_never_replaces_a_classified_family() {
+        let state = recording_state();
+        state.record(7, SshFailure::ChangedHostKey, false);
+        state.record(8, SshFailure::Transport(Some("broken pipe".into())), true);
+
+        let recorded = recorded(&state).expect("a recorded failure");
+        assert_eq!(recorded.failure, SshFailure::ChangedHostKey);
+        assert_eq!(recorded.generation, 8, "the generation still advances");
+        assert!(
+            !recorded.truncated,
+            "and the kept family keeps its own evidence: {recorded:?}"
+        );
+    }
+
+    /// Three execs, and the fallthrough completes in the middle. The
+    /// `Transport` at 9 advances the watermark without displacing 7's
+    /// family — and 8's classified family, which really is newer than
+    /// 7's, must still land. Folding the watermark and the family's own
+    /// provenance into one field loses it: 8 reads as stale against a
+    /// watermark 9 only ever carried because a *less* specific failure
+    /// arrived. Found by the codex review of this commit.
+    #[test]
+    fn a_late_classified_family_still_lands_after_a_newer_transport_advanced_the_watermark() {
+        let state = recording_state();
+        state.record(7, SshFailure::ChangedHostKey, false);
+        state.record(9, SshFailure::Transport(Some("broken pipe".into())), true);
+        state.record(8, SshFailure::Auth, false);
+
+        let recorded = recorded(&state).expect("a recorded failure");
+        assert_eq!(
+            recorded.failure,
+            SshFailure::Auth,
+            "8 is newer than 7 and just as specific: {recorded:?}"
+        );
+        assert_eq!(
+            recorded.generation, 9,
+            "the watermark is still the highest exec that reported"
+        );
+    }
+
+    /// Specificity does not depend on arrival order: a classified family
+    /// that lands *after* a newer `Transport` has already been stored
+    /// still displaces it, for the same reason the reverse order keeps
+    /// the classified one — a fallthrough is "no rule matched", not
+    /// news.
+    #[test]
+    fn a_classified_family_displaces_a_stored_transport_whichever_order_they_arrive_in() {
+        let state = recording_state();
+        state.record(5, SshFailure::Transport(None), true);
+        state.record(3, SshFailure::ChangedHostKey, false);
+
+        let recorded = recorded(&state).expect("a recorded failure");
+        assert_eq!(recorded.failure, SshFailure::ChangedHostKey, "{recorded:?}");
+        assert_eq!(recorded.generation, 5, "the watermark never goes backwards");
+        assert!(!recorded.truncated, "the kept family's own evidence");
+    }
+
+    /// The rule is about specificity, not about never overwriting: a
+    /// newer classified family is still the news, and two `Transport`s
+    /// still settle newest-wins.
+    #[test]
+    fn newest_wins_between_two_classified_families_and_between_two_transports() {
+        let state = recording_state();
+        state.record(1, SshFailure::NoSession, false);
+        state.record(2, SshFailure::Auth, false);
+        assert_eq!(
+            recorded(&state).expect("recorded").failure,
+            SshFailure::Auth
+        );
+
+        let state = recording_state();
+        state.record(1, SshFailure::Transport(None), false);
+        state.record(2, SshFailure::Transport(Some("late".into())), true);
+        let recorded = recorded(&state).expect("recorded");
+        assert_eq!(recorded.failure, SshFailure::Transport(Some("late".into())));
+        assert!(recorded.truncated);
+    }
+
+    /// The fallthrough may advance the family and still not clear
+    /// `truncated`.
+    ///
+    /// Two `Transport`s are of equal specificity, so a clean concurrent
+    /// exec settles newest-wins over one whose tail was cut — and the cut
+    /// tail may have held a `ChangedHostKey` nobody could read. Clearing
+    /// the flag there hands the ladder a ten-attempt retry against
+    /// evidence that was never seen (plan 040 §3.3 C). A classified
+    /// family is different: it carries its own evidence, so its flag
+    /// replaces the stored one outright.
+    #[test]
+    fn a_transport_never_clears_a_truncation_a_classified_family_does() {
+        let state = recording_state();
+        state.record(7, SshFailure::Transport(None), true);
+        state.record(8, SshFailure::Transport(Some("reset".into())), false);
+        let cut = recorded(&state).expect("a recorded failure");
+        assert_eq!(cut.failure, SshFailure::Transport(Some("reset".into())));
+        assert!(
+            cut.truncated,
+            "a fallthrough carries no evidence of its own: {cut:?}"
+        );
+
+        let classified = recording_state();
+        classified.record(7, SshFailure::Transport(None), true);
+        classified.record(8, SshFailure::Auth, false);
+        let recorded = recorded(&classified).expect("a recorded failure");
+        assert_eq!(recorded.failure, SshFailure::Auth);
+        assert!(
+            !recorded.truncated,
+            "the classified family was read out of a whole tail: {recorded:?}"
+        );
+    }
+
+    /// The pre-existing rule, unchanged: connections overlap, so
+    /// completion order does not follow generation order, and a straggler
+    /// must not overwrite fresher news with staler.
+    #[test]
+    fn a_stale_generation_never_overwrites_a_newer_one() {
+        let state = recording_state();
+        state.record(9, SshFailure::Auth, false);
+        state.record(4, SshFailure::NotFound, false);
+        let recorded = recorded(&state).expect("recorded");
+        assert_eq!(recorded.generation, 9);
+        assert_eq!(recorded.failure, SshFailure::Auth);
     }
 }

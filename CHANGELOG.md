@@ -13,6 +13,39 @@ release workflow asserts they agree).
 
 ### Added
 
+- **A saved SSH host reconnects itself after a drop (HS-4 slice 1, plan
+  040)** — once a host has actually connected, Roost now treats a
+  mid-session drop the way it always treated `localhost`: the sidebar
+  dot goes grey and the band shows `reconnecting in Ns (k/10)` while it
+  retries on its own, starting at a 1-second delay, doubling with
+  jitter, capped at 30 seconds between tries. Ten attempts without
+  success and it settles — `reconnect gave up after 10 tries` — with
+  ↻ Reconnect, which never left the screen, as the recovery. No new
+  setting: the choice is the Connect you already made. Launch is
+  unchanged — a saved SSH host still never auto-connects when Roost
+  opens, and auto-reconnect still never spawns a session on the far
+  side, so a rebooted remote with nothing listening settles on "no
+  session" immediately rather than retrying (running `roost-session`
+  as a lingering `systemd --user` unit is the fix for a host that
+  should survive its own reboots). Not every drop gets a ladder: a
+  changed host key is never retried (retrying a possible
+  machine-in-the-middle in a loop would be a bug, not a feature), an
+  unknown host key or a refused login need a person to do something
+  Roost can't do non-interactively, and a session that's genuinely
+  gone settles rather than spins. An explicit Disconnect clears any
+  scheduled retry, a laptop sleeping through a drop spends no attempts
+  while it's closed, and a resume that looks like a long sleep
+  restarts the ladder at its base delay instead of burning attempts
+  while the radio reassociates. Riding along: six previously-unbounded
+  stderr drains in the SSH transport (#379) are now bounded, and a
+  drain that couldn't finish reading in time is treated as
+  unclassifiable rather than silently downgraded into a retryable
+  failure — the fix that keeps the ladder from ever turning a changed
+  host key into a security hole. See the [Host Sessions
+  guide](docs/guides/host-sessions.md#adding-a-remote-host-over-ssh)
+  and
+  [`docs/development/host-sessions.md`](docs/development/host-sessions.md#the-leasetakeover-lifecycle)
+  for the shape.
 - **Roost can install and upgrade `roost-session` on a remote host itself
   (HS-3 bootstrap slice, plan 039)** — the SSH transport (plan 038, below)
   still needed `roost-session` already installed, at the exact right build,

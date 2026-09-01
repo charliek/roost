@@ -171,3 +171,8 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 [dev-dependencies]
 swash = "=0.2.10"
 tempfile = "3"
+# `start_paused` only. One case has to let the reconnect timer actually
+# fire so it reads the staleness stamp off the wire rather than
+# recomputing it, and a suite that sleeps for a jittered backoff is a
+# suite that flakes.
+tokio = { workspace = true, features = ["test-util"] }
