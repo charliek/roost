@@ -315,8 +315,11 @@ pub const BIN_ENV: &str = "ROOST_SESSION_BIN";
 pub enum BinOrigin {
     /// `ROOST_SESSION_BIN`.
     Env,
-    /// Next to the running `roostctl` — the packaged layout, where both
-    /// binaries land in the same directory.
+    /// Next to whichever program is climbing the ladder — the packaged
+    /// layout, where the daemon ships beside its caller. Two programs
+    /// spawn it and a Mac bundle gives them different directories
+    /// (`Contents/MacOS/` for the UI, `Contents/Resources/bin/` for
+    /// `roostctl`), so this rung names the caller, not one binary.
     Sibling,
     /// Found on `PATH`.
     Path,
@@ -326,7 +329,7 @@ impl BinOrigin {
     pub fn describe(self) -> &'static str {
         match self {
             Self::Env => "$ROOST_SESSION_BIN",
-            Self::Sibling => "next to roostctl",
+            Self::Sibling => "next to this program",
             Self::Path => "$PATH",
         }
     }
@@ -340,15 +343,19 @@ pub struct LocatedBin {
 }
 
 /// First hit *this user can actually run* wins: `ROOST_SESSION_BIN`,
-/// then a sibling of the running `roostctl`, then `PATH`.
+/// then a sibling of `caller_exe`, then `PATH`.
+///
+/// `caller_exe` is whichever program is climbing the ladder — the UI's
+/// own connect path and `roostctl session start` both do, and a packaged
+/// build ships the daemon beside each of them.
 ///
 /// The inputs arrive as arguments rather than being read here so the
 /// precedence is testable without mutating process-global env that
 /// every other test in this binary also reads.
 ///
 /// The two rungs that are guesses — sibling and `PATH` — fall through
-/// anything unusable: a root-owned `0700` `roost-session` next to
-/// `roostctl` is not this user's program, and stopping the search on it
+/// anything unusable: a root-owned `0700` `roost-session` next to the
+/// caller is not this user's program, and stopping the search on it
 /// would trade a working `PATH` hit for an `EACCES` at spawn.
 ///
 /// The rung that is not a guess behaves the other way: an explicit
@@ -357,7 +364,7 @@ pub struct LocatedBin {
 /// would look like success while pointing at the wrong session.
 pub fn locate_session_binary(
     env_override: Option<&OsStr>,
-    roostctl_exe: Option<&Path>,
+    caller_exe: Option<&Path>,
     path_env: Option<&OsStr>,
 ) -> Result<LocatedBin> {
     let env_override = env_override.filter(|v| !v.is_empty());
@@ -375,7 +382,7 @@ pub fn locate_session_binary(
         ));
     }
 
-    let sibling = roostctl_exe
+    let sibling = caller_exe
         .and_then(Path::parent)
         .map(|dir| dir.join(BIN_NAME));
     if let Some(path) = sibling.clone().filter(|p| is_executable_file(p)) {
@@ -952,6 +959,37 @@ mod tests {
             resolve_target(target)
                 .expect_err(&format!("{target:?} must not resolve to a socket path"));
         }
+    }
+
+    /// The Mac bundle's shape (plan 041 §3.2): the real Mach-O lives in
+    /// `Contents/MacOS/` beside the UI, and `Contents/Resources/bin/`
+    /// holds a *relative* symlink to it beside the bundled `roostctl`.
+    /// The sibling rung has to follow that link, or `roostctl session
+    /// start` from inside a bundle misses the daemon two directories
+    /// away — and a relative link is what survives the bundle being
+    /// moved or mounted from a DMG.
+    #[test]
+    fn the_sibling_rung_follows_a_relative_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let macos = root.path().join("Contents/MacOS");
+        let resources_bin = root.path().join("Contents/Resources/bin");
+        std::fs::create_dir_all(&macos).expect("create Contents/MacOS");
+        std::fs::create_dir_all(&resources_bin).expect("create Contents/Resources/bin");
+
+        let real = macos.join(BIN_NAME);
+        std::fs::write(&real, b"#!/bin/sh\nexit 0\n").expect("write the daemon");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("make the daemon executable");
+        let link = resources_bin.join(BIN_NAME);
+        std::os::unix::fs::symlink(format!("../../MacOS/{BIN_NAME}"), &link).expect("symlink");
+
+        // No `PATH` rung to fall back on: only the sibling can answer.
+        let found = locate_session_binary(None, Some(&resources_bin.join("roostctl")), None)
+            .expect("the bundled roostctl must find its sibling symlink");
+        assert_eq!(found.origin, BinOrigin::Sibling);
+        assert_eq!(found.path, link);
     }
 
     #[test]

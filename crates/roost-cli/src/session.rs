@@ -537,7 +537,7 @@ mod tests {
             locate_session_binary(None, Some(&empty.join("roostctl")), Some(empty.as_os_str()))
                 .expect_err("no candidate exists");
         let message = error.to_string();
-        for expected in ["$ROOST_SESSION_BIN", "next to roostctl", "$PATH"] {
+        for expected in ["$ROOST_SESSION_BIN", "next to this program", "$PATH"] {
             assert!(
                 message.contains(expected),
                 "{expected} missing from:\n{message}"

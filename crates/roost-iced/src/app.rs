@@ -262,21 +262,20 @@ impl PendingHostSelection {
     }
 }
 
-/// The Mac gate applied where a connection is *started*, rather than
-/// only where verbs are listed (plan 037 §3.1).
+/// The localhost policy applied where a connection is *started*, rather
+/// than only where verbs are listed (plan 037 §3.1, plan 041 §3.1).
 ///
-/// The palette hides a localhost host's Connect row on macOS, but the
-/// palette is not the only way in: a `localhost` target can already be
-/// in `state.json`, `roostctl host add` can save one, and either then
-/// gets a live "↻ Reconnect" row in the sidebar. Every one of those
-/// lands on the same connect entry, so the platform policy belongs here
+/// A build that withholds the surface hides a localhost host's Connect
+/// row, but the palette is not the only way in: a `localhost` target can
+/// already be in `state.json`, `roostctl host add` can save one, and
+/// either then gets a live "↻ Reconnect" row in the sidebar. Every one
+/// of those lands on the same connect entry, so the policy belongs here
 /// — one place, whatever the surface.
 ///
 /// Only *spawning* is refused. `IfPresent` still probes and still
 /// connects to a session that is already listening (one started by hand,
 /// or reached over an `ssh -L` forward); it just declines to run the
-/// launch ladder for a `roost-session` this platform does not package,
-/// and says "no session is running at …" instead.
+/// launch ladder, and says "no session is running at …" instead.
 fn spawn_gate(
     mode: crate::host_conn::ConnectMode,
     policy: host_verbs::VerbPolicy,
@@ -286,6 +285,21 @@ fn spawn_gate(
         ConnectMode::SpawnIfMissing if !policy.localhost_surface => ConnectMode::IfPresent,
         mode => mode,
     }
+}
+
+/// What launch-time auto-reconnect does with one saved host: dial an
+/// already-listening localhost session, or nothing at all.
+///
+/// Reading the policy here rather than dialing unconditionally is what
+/// keeps the two halves in agreement — [`host_verbs::verbs`] withholds
+/// Disconnect and Stop for a localhost host under the same flag, so a
+/// build that auto-connected one anyway would hold a connection it
+/// offers no verb to leave.
+fn reconnect_mode(
+    policy: host_verbs::VerbPolicy,
+    localhost: bool,
+) -> Option<crate::host_conn::ConnectMode> {
+    (policy.localhost_surface && localhost).then_some(crate::host_conn::ConnectMode::IfPresent)
 }
 
 /// One modal overlay: the card, the message a press on the card sends
@@ -2299,16 +2313,13 @@ impl App {
     /// silent start on every launch is not something an app should do.
     /// Only a localhost host is dialed — a remote host is
     /// manual-reconnect only (D8), and an `ssh -L` forward that is not up
-    /// would otherwise make every launch wait on a dial. And on macOS
-    /// nothing happens at all: no `roost-session` is packaged there, so
-    /// the localhost surface is hidden (§3.1's Mac gate).
+    /// would otherwise make every launch wait on a dial. And the dial
+    /// happens only where the build offers the localhost surface at all,
+    /// which is [`reconnect_mode`]'s whole job (plan 041 §3.1).
     ///
     /// With no saved hosts this is a no-op over an empty list, which is
     /// the zero-change baseline.
     fn reconnect_saved_hosts(&mut self) {
-        if cfg!(target_os = "macos") {
-            return;
-        }
         for host in self.workspace.hosts() {
             // Launch-time, so nobody asked and nobody is waiting: an
             // `Ipc` origin, same as `roostctl`'s, and an attempt no
@@ -2316,11 +2327,7 @@ impl App {
             self.connect_saved_host(
                 &host,
                 crate::host_conn::RequestOrigin::Ipc,
-                |localhost| {
-                    // A remote host is manual-reconnect only, so it is
-                    // not even resolved into a connection here.
-                    localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
-                },
+                |localhost| reconnect_mode(host_verbs::VerbPolicy::current(), localhost),
                 crate::host_conn::AttemptCause::AutoReconnect,
             );
         }
@@ -7007,38 +7014,59 @@ mod tests {
         assert_eq!(host_focus_claim(false, None), None);
     }
 
-    /// The Mac gate applied where a connection is started, not only
-    /// where verbs are listed. A saved `localhost` host can reach the
-    /// connect entry on macOS without any palette row — persisted in
-    /// `state.json`, added by `roostctl host add`, then reconnected from
-    /// the sidebar's inline ↻ — and none of those may run the spawn
-    /// ladder for a `roost-session` macOS does not package. Dialing a
-    /// session that IS running still has to work: that is the whole
-    /// Mac→Linux payoff case, so only the spawning mode is downgraded.
+    /// What every shipping build answers, and the withheld answer no
+    /// build produces today — the two values `spawn_gate` and
+    /// [`reconnect_mode`] are written against.
+    const FULL_POLICY: host_verbs::VerbPolicy = host_verbs::VerbPolicy {
+        localhost_surface: true,
+    };
+    const GATED_POLICY: host_verbs::VerbPolicy = host_verbs::VerbPolicy {
+        localhost_surface: false,
+    };
+
+    /// The policy applied where a connection is started, not only where
+    /// verbs are listed. A saved `localhost` host can reach the connect
+    /// entry with no palette row at all — persisted in `state.json`,
+    /// added by `roostctl host add`, then reconnected from the sidebar's
+    /// inline ↻ — so a build withholding the surface must refuse the
+    /// spawn ladder there too. Dialing a session that IS running still
+    /// has to work: only the spawning mode is downgraded.
     #[test]
-    fn macos_refuses_to_spawn_a_session_but_still_connects_to_one() {
+    fn a_gated_policy_refuses_to_spawn_a_session_but_still_connects_to_one() {
         use crate::host_conn::ConnectMode;
-        let linux = host_verbs::VerbPolicy {
-            localhost_surface: true,
-        };
-        let mac = host_verbs::VerbPolicy {
-            localhost_surface: false,
-        };
 
         assert_eq!(
-            spawn_gate(ConnectMode::SpawnIfMissing, mac),
+            spawn_gate(ConnectMode::SpawnIfMissing, GATED_POLICY),
             ConnectMode::IfPresent,
-            "macOS probes and reports honestly instead of spawning"
+            "a client without the surface probes and reports honestly instead of spawning"
         );
         assert_eq!(
-            spawn_gate(ConnectMode::SpawnIfMissing, linux),
+            spawn_gate(ConnectMode::SpawnIfMissing, FULL_POLICY),
             ConnectMode::SpawnIfMissing
         );
-        // Every other mode is already spawn-free, on both platforms.
+        // Every other mode is already spawn-free, under both answers.
         for mode in [ConnectMode::IfPresent, ConnectMode::Dial] {
-            assert_eq!(spawn_gate(mode, mac), mode);
-            assert_eq!(spawn_gate(mode, linux), mode);
+            assert_eq!(spawn_gate(mode, GATED_POLICY), mode);
+            assert_eq!(spawn_gate(mode, FULL_POLICY), mode);
         }
+    }
+
+    /// Launch auto-reconnect reads the same policy the palette does. A
+    /// withholding build declines the dial outright rather than holding
+    /// a localhost connection `verbs()` offers no way to leave; a remote
+    /// host is never dialed at launch under either answer (D8).
+    #[test]
+    fn launch_reconnect_dials_only_a_localhost_host_the_policy_offers() {
+        use crate::host_conn::ConnectMode;
+
+        assert_eq!(
+            reconnect_mode(FULL_POLICY, true),
+            Some(ConnectMode::IfPresent),
+            "connect-if-present, never a spawn"
+        );
+        assert_eq!(reconnect_mode(GATED_POLICY, true), None);
+        assert_eq!(reconnect_mode(FULL_POLICY, false), None);
+        assert_eq!(reconnect_mode(GATED_POLICY, false), None);
     }
 
     /// The pending-selection wait is bounded. A tab that exits the
