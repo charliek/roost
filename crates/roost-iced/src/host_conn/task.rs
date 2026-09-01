@@ -124,6 +124,11 @@ pub(crate) struct ConnectionConfig {
     /// own later retries.
     pub(crate) supersedes: Option<HostId>,
     pub(crate) mode: ConnectMode,
+    /// The lease the previous connection held, when this task is one the
+    /// reconnect schedule asked for (plan 040 §3.7). It seeds
+    /// [`connect_loop`]'s own `held_lease`, which [`attempt`] presents.
+    /// `None` for every explicit Connect.
+    pub(crate) held_lease: Option<String>,
     /// This session's pinned libghostty identity, compared exactly.
     pub(crate) client_build: String,
     /// The client's terminal palette, re-read on every (re)connect so a
@@ -279,10 +284,11 @@ async fn connect_loop(
     let mut machine = HostStateMachine::new(config.transport.is_localhost());
     let mut previous: Option<HostId> = config.supersedes;
     let mut mode = config.mode;
-    // The lease this task last held. `Some` means an auto-retry, and an
-    // auto-retry has to ask before it takes the session back — see
-    // [`attempt`].
-    let mut held_lease: Option<String> = None;
+    // The lease this task last held — or, seeded from the config, the
+    // one the connection this task replaces held. `Some` means an
+    // attempt nobody asked for, and such an attempt has to ask before
+    // it takes the session back — see [`attempt`].
+    let mut held_lease: Option<String> = config.held_lease.clone();
 
     loop {
         // Mint (and therefore register the ownership) before anything is
@@ -297,7 +303,7 @@ async fn connect_loop(
         let dialed = tokio::select! {
             biased;
             () = shutdown.requested() => None,
-            outcome = attempt(config, mode, held_lease.as_deref()) => Some(outcome),
+            outcome = attempt(config, mode, &mut held_lease) => Some(outcome),
         };
         // Only the first attempt may spawn or probe; a retry dials.
         mode = ConnectMode::Dial;
@@ -306,12 +312,17 @@ async fn connect_loop(
             None => ConnEnd::Shutdown,
             Some(Err(error)) => error.into(),
             Some(Ok(live)) => {
-                held_lease = Some(live.lease.clone());
-                if !publish_workspace(
-                    feed,
-                    incarnation,
-                    HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
-                ) || !publish_state(feed, incarnation, machine.connected())
+                // Published as well as kept — [`attempt`] has already
+                // recorded it as ours. This task dies with the link, and
+                // the app side is the only place a lease can outlive the
+                // connection that minted it (plan 040 §3.7).
+                if !publish_lease(feed, incarnation, live.lease.clone())
+                    || !publish_workspace(
+                        feed,
+                        incarnation,
+                        HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
+                    )
+                    || !publish_state(feed, incarnation, machine.connected())
                 {
                     ConnEnd::FeedClosed
                 } else {
@@ -381,19 +392,29 @@ async fn connect_loop(
 /// settles it: `taken-over` is the session saying somebody else drives
 /// it now, and that is terminal.
 ///
+/// A lease also arrives a second way: [`ConnectionConfig::held_lease`],
+/// which the app sets when this whole *task* is the retry (plan 040
+/// §3.7 — an ssh drop tears the tunnel down, so its ladder re-enters at
+/// `open_ssh` and every attempt is a fresh task). A task seeded that way
+/// runs this guard on its **first** attempt, which is the same probe a
+/// localhost auto-retry runs on its second, for the same reason.
+///
 /// An explicit Connect never comes through here with a lease. Taking
 /// the session back on purpose is exactly what that button means.
+///
+/// `held_lease` is also where this attempt's *own* lease is written
+/// back, which is why it is `&mut` — see [`connect`].
 async fn attempt(
     config: &ConnectionConfig,
     mode: ConnectMode,
-    held_lease: Option<&str>,
+    held_lease: &mut Option<String>,
 ) -> Result<Live, AttemptError> {
-    if let Some(lease) = held_lease {
+    if let Some(lease) = held_lease.as_deref() {
         if lease_was_taken(&config.socket, lease).await {
             return Err(AttemptError::Stopping("taken-over".into()));
         }
     }
-    connect(config, mode).await
+    connect(config, mode, held_lease).await
 }
 
 /// Present the old lease and see whether the session still recognizes
@@ -433,7 +454,15 @@ fn proves_takeover(error: Option<&ClientError>) -> bool {
 }
 
 /// One connect attempt: the wire prologue, in the order `ipc.md` fixes.
-async fn connect(config: &ConnectionConfig, mode: ConnectMode) -> Result<Live, AttemptError> {
+///
+/// `held_lease` is an out-parameter as much as an in-one: step 2 is
+/// where ownership actually moves, so that is where the caller starts
+/// holding the new lease — see the comment there.
+async fn connect(
+    config: &ConnectionConfig,
+    mode: ConnectMode,
+    held_lease: &mut Option<String>,
+) -> Result<Live, AttemptError> {
     ensure_socket(config, mode).await?;
 
     // Bounded like every other leg. A peer that accepts the connection
@@ -476,6 +505,14 @@ async fn connect(config: &ConnectionConfig, mode: ConnectMode) -> Result<Live, A
     let connected: SessionConnectResult =
         serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_CONNECT, &error))?;
     let lease = connected.lease;
+    // Ownership moved on the wire in the call above, which is why the
+    // write is here and not on the success path: it tombstoned whatever
+    // lease we held before, so from this line on *this* is the one we
+    // hold. A step below that fails must not leave the caller presenting
+    // a tombstone to its next attempt — the far side would answer
+    // `taken-over` and the host would settle as somebody else's, with
+    // nobody else ever involved (plan 040 §3.7).
+    *held_lease = Some(lease.clone());
 
     // 3. Seed the session's palette before anything is attached, so a
     //    query answered while hydrating already carries our colors.
@@ -884,6 +921,10 @@ fn publish_workspace(feed: &EngineFeedSender, host: HostId, event: HostWorkspace
     feed.send(EngineFeed::HostWorkspace(host, event))
 }
 
+fn publish_lease(feed: &EngineFeedSender, host: HostId, lease: String) -> bool {
+    feed.send(EngineFeed::HostLease(host, lease))
+}
+
 async fn call(
     client: &mut IpcClient,
     op: &str,
@@ -1064,6 +1105,7 @@ mod tests {
             generation: 1,
             supersedes: None,
             mode,
+            held_lease: None,
             client_build: "gb".into(),
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
         }
@@ -1115,6 +1157,249 @@ mod tests {
             panic!("expected a transport outcome");
         };
         assert!(reason.contains("localhost"), "{reason}");
+    }
+
+    /// A session socket that answers exactly one request, reports which
+    /// op it was, and refuses it.
+    ///
+    /// `taken-over` is reserved for `events.subscribe` so the two shapes
+    /// the case below tells apart end differently: a task that ran the
+    /// lease guard settles as `TakenOver`, and one that went straight to
+    /// the wire prologue drops.
+    fn one_request_session(socket: &Path) -> tokio::sync::oneshot::Receiver<String> {
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind a fake session");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reader));
+            let Ok(Some(line)) = lines.next_line().await else {
+                return;
+            };
+            let request: serde_json::Value = serde_json::from_str(&line).expect("a request");
+            let op = request["op"].as_str().unwrap_or_default().to_string();
+            let code = if op == ops::EVENTS_SUBSCRIBE {
+                "taken-over"
+            } else {
+                "internal"
+            };
+            let mut body = serde_json::to_vec(&serde_json::json!({
+                "id": request["id"],
+                "ok": false,
+                "error": { "code": code, "message": "refused" },
+            }))
+            .expect("encode a response");
+            body.push(b'\n');
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &body).await;
+            let _ = tx.send(op);
+        });
+        rx
+    }
+
+    /// Run one whole task against [`one_request_session`], and report
+    /// the op that session saw first alongside the state the task
+    /// settled in.
+    async fn first_op_and_final_state(
+        socket: PathBuf,
+        held_lease: Option<String>,
+    ) -> (String, HostConnState) {
+        let seen = one_request_session(&socket);
+        let mut config = config(socket, HostTransport::Ssh, ConnectMode::Dial);
+        config.held_lease = held_lease;
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let (_ops, ops_rx) = super::super::HostOps::channel();
+        run(
+            config,
+            HostIdMinter::new(),
+            ops_rx,
+            feed,
+            Arc::new(Shutdown::default()),
+        )
+        .await;
+        let op = seen.await.expect("the session read a request");
+        let final_state = feed_items(&mut rx)
+            .into_iter()
+            .filter_map(|item| match item {
+                EngineFeed::HostState(_, state) => Some(state),
+                _ => None,
+            })
+            .next_back()
+            .expect("a task publishes at least one state");
+        (op, final_state)
+    }
+
+    /// A lease that arrives on the **config** is presented before the
+    /// first dial, not after it.
+    ///
+    /// This is what makes an ssh auto-reconnect as safe as a localhost
+    /// auto-retry: an ssh drop tears its tunnel down, so the retry is a
+    /// *fresh task* whose own `held_lease` starts empty — and a fresh
+    /// task that simply reconnected would take the session back from
+    /// another client with no probe at all, `takeover: true` being the
+    /// wire contract. The control case is the same task with no lease:
+    /// it opens with the prologue, exactly as an explicit Connect does.
+    #[tokio::test]
+    async fn a_config_seeded_lease_is_presented_before_the_first_dial() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let (op, state) = first_op_and_final_state(
+            dir.path().join("carried.sock"),
+            Some("lease-from-the-last-connection".into()),
+        )
+        .await;
+        assert_eq!(
+            op,
+            ops::EVENTS_SUBSCRIBE,
+            "the first attempt asks about the lease before dialing"
+        );
+        assert_eq!(
+            state,
+            HostConnState::TakenOver,
+            "and a session that says somebody else drives it is terminal"
+        );
+
+        let (op, state) = first_op_and_final_state(dir.path().join("bare.sock"), None).await;
+        assert_eq!(
+            op,
+            ops::SESSION_IDENTIFY,
+            "with no lease there is nothing to ask about"
+        );
+        assert!(matches!(state, HostConnState::Disconnected(_)), "{state:?}");
+    }
+
+    /// A session that grants a lease and then refuses everything after
+    /// it, reporting the lease of every `events.subscribe` it is shown.
+    ///
+    /// So the prologue fails at step 3, `session.set_theme` — after the
+    /// `session.connect` that actually moved ownership — and each
+    /// attempt's probe reports which lease that attempt believes it
+    /// holds. The first probe is answered `connect-required` so the
+    /// attempt behind it proceeds (that answer proves nothing); the
+    /// second is answered `taken-over`, which is terminal and is what
+    /// ends the task.
+    ///
+    /// One connection at a time is enough, and deliberate: a failed
+    /// prologue drops its control client, so the next accept is the
+    /// retry's.
+    fn a_session_that_grants_a_lease_then_fails(
+        socket: &Path,
+        granted: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind a fake session");
+        let granted = granted.to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut probes = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines =
+                    tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reader));
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: serde_json::Value =
+                        serde_json::from_str(&line).expect("a request");
+                    let id = request["id"].clone();
+                    let response = match request["op"].as_str().unwrap_or_default() {
+                        ops::SESSION_IDENTIFY => serde_json::json!({
+                            "id": id,
+                            "ok": true,
+                            "result": {
+                                "app_version": "test",
+                                "session_protocol":
+                                    roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+                                "payload_kinds": [super::super::state::REQUIRED_PAYLOAD_KIND],
+                                "libghostty_build": "gb",
+                                "session_id": "s1",
+                                "started_at": "2026-01-01T00:00:00Z",
+                            },
+                        }),
+                        ops::SESSION_CONNECT => serde_json::json!({
+                            "id": id,
+                            "ok": true,
+                            "result": { "lease": granted, "revision": 1 },
+                        }),
+                        ops::EVENTS_SUBSCRIBE => {
+                            let _ = tx.send(
+                                request["params"]["lease"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                            probes += 1;
+                            let code = if probes == 1 {
+                                "connect-required"
+                            } else {
+                                "taken-over"
+                            };
+                            serde_json::json!({
+                                "id": id,
+                                "ok": false,
+                                "error": { "code": code, "message": "refused" },
+                            })
+                        }
+                        _ => serde_json::json!({
+                            "id": id,
+                            "ok": false,
+                            "error": { "code": "internal", "message": "refused" },
+                        }),
+                    };
+                    let mut body = serde_json::to_vec(&response).expect("encode a response");
+                    body.push(b'\n');
+                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &body)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        rx
+    }
+
+    /// A lease minted by a `session.connect` whose prologue then failed
+    /// is still the lease this task holds.
+    ///
+    /// Step 2 is where ownership moves on the wire: the session grants
+    /// the new lease and tombstones the one it replaced. A step after it
+    /// failing does not undo that — so a task that went on presenting
+    /// the lease it started with would probe with a tombstone, be told
+    /// `taken-over`, and settle terminally as somebody else's session
+    /// with no other client ever involved (plan 040 §3.7).
+    #[tokio::test]
+    async fn a_lease_minted_before_a_failed_prologue_is_the_one_presented_next() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("granting.sock");
+        let mut probed = a_session_that_grants_a_lease_then_fails(&socket, "lease-minted-here");
+
+        // Localhost, so the failed attempt is retried by this same task
+        // and the second attempt's probe is what the session sees next.
+        let mut config = config(socket, HostTransport::LocalSession, ConnectMode::Dial);
+        config.held_lease = Some("lease-the-connect-replaced".into());
+        let (feed, _rx) = crate::engine_feed::channel();
+        let (_ops, ops_rx) = super::super::HostOps::channel();
+        run(
+            config,
+            HostIdMinter::new(),
+            ops_rx,
+            feed,
+            Arc::new(Shutdown::default()),
+        )
+        .await;
+
+        let mut presented = Vec::new();
+        while let Ok(lease) = probed.try_recv() {
+            presented.push(lease);
+        }
+        assert_eq!(
+            presented,
+            vec![
+                "lease-the-connect-replaced".to_string(),
+                "lease-minted-here".to_string()
+            ],
+            "the retry presents the lease the failed prologue minted, not the one it started with"
+        );
     }
 
     /// The takeover-ping-pong guard. A bare EOF cannot tell a dead wire

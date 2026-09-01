@@ -2311,12 +2311,18 @@ impl App {
         }
         for host in self.workspace.hosts() {
             // Launch-time, so nobody asked and nobody is waiting: an
-            // `Ipc` origin, same as `roostctl`'s.
-            self.connect_saved_host(&host, crate::host_conn::RequestOrigin::Ipc, |localhost| {
-                // A remote host is manual-reconnect only, so it is not
-                // even resolved into a connection here.
-                localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
-            });
+            // `Ipc` origin, same as `roostctl`'s, and an attempt no
+            // person caused — which is what `AutoReconnect` says.
+            self.connect_saved_host(
+                &host,
+                crate::host_conn::RequestOrigin::Ipc,
+                |localhost| {
+                    // A remote host is manual-reconnect only, so it is
+                    // not even resolved into a connection here.
+                    localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
+                },
+                crate::host_conn::AttemptCause::AutoReconnect,
+            );
         }
         if !self.hosts.is_empty() {
             tracing::info!("probing saved host sessions");
@@ -2339,6 +2345,7 @@ impl App {
         host: &roost_engine::persistence::HostSnapshot,
         origin: crate::host_conn::RequestOrigin,
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
+        cause: crate::host_conn::AttemptCause,
     ) {
         use crate::host_conn::HostTransport;
         use roost_ipc::ssh::ResolvedTransport;
@@ -2374,6 +2381,7 @@ impl App {
                 socket,
                 HostTransport::LocalSession,
                 mode,
+                cause,
             ),
             ResolvedTransport::UnixSocket(socket) => self.hosts.connect(
                 &host.id,
@@ -2381,10 +2389,11 @@ impl App {
                 socket,
                 HostTransport::UnixSocket,
                 mode,
+                cause,
             ),
             ResolvedTransport::Ssh(target) => {
                 self.hosts
-                    .open_ssh(&host.id, &host.label, target, mode, origin)
+                    .open_ssh(&host.id, &host.label, target, mode, origin, cause)
             }
         }
     }
@@ -5046,7 +5055,11 @@ impl App {
             Some(crate::host_conn::HostConnState::NeedsRestart(_))
         );
         if host_notice::connect_route(origin, needs_restart) == host_notice::ConnectRoute::Dial {
-            return self.host_reconnect_requested(saved_id, origin);
+            return self.host_reconnect_requested(
+                saved_id,
+                origin,
+                crate::host_conn::AttemptCause::Explicit,
+            );
         }
         let Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) =
             self.hosts.state(saved_id)
@@ -5082,23 +5095,35 @@ impl App {
     /// flow's own relaunch has to come through *here* — the host is
     /// still in `NeedsRestart` at that moment, and re-raising the dialog
     /// the user just answered would be a loop.
+    ///
+    /// It is also the door a scheduled reconnect is meant to re-enter
+    /// through (plan 040 §3.4), which is why the attempt says why it
+    /// exists: the guards this door supplies — the saved-host lookup,
+    /// the bootstrap-probe cancel, the target re-classification — are
+    /// exactly the ones a raw `open_ssh` re-entry would skip.
     pub fn host_reconnect_requested(
         &mut self,
         saved_id: &str,
         origin: crate::host_conn::RequestOrigin,
+        cause: crate::host_conn::AttemptCause,
     ) {
         let Ok(host) = self.saved_host(saved_id) else {
             tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
             return;
         };
         tracing::info!(host = %host.id, "connecting a saved host session");
-        self.connect_saved_host(&host, origin, |localhost| {
-            Some(if localhost {
-                crate::host_conn::ConnectMode::SpawnIfMissing
-            } else {
-                crate::host_conn::ConnectMode::Dial
-            })
-        });
+        self.connect_saved_host(
+            &host,
+            origin,
+            |localhost| {
+                Some(if localhost {
+                    crate::host_conn::ConnectMode::SpawnIfMissing
+                } else {
+                    crate::host_conn::ConnectMode::Dial
+                })
+            },
+            cause,
+        );
     }
 
     // ── host verbs (plan 037 §3.1/§3.5) ─────────────────────────────
@@ -5173,7 +5198,11 @@ impl App {
     ) -> Result<roost_engine::persistence::HostSnapshot, roost_engine::WorkspaceError> {
         let host = self.workspace.add_host(label, target)?;
         if let Some(origin) = connect {
-            self.host_reconnect_requested(&host.id, origin);
+            self.host_reconnect_requested(
+                &host.id,
+                origin,
+                crate::host_conn::AttemptCause::Explicit,
+            );
         }
         self.reconcile();
         Ok(host)
@@ -5372,9 +5401,11 @@ impl App {
         match result {
             // The session is gone; connecting again spawns a fresh one
             // through the shared ladder and hydrates the saved layout.
-            Ok(()) => {
-                self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User)
-            }
+            Ok(()) => self.host_reconnect_requested(
+                saved_id,
+                crate::host_conn::RequestOrigin::User,
+                crate::host_conn::AttemptCause::Explicit,
+            ),
             Err(error) => self.set_status(error),
         }
     }
@@ -5987,7 +6018,11 @@ impl App {
                 // warning this success line may be carrying.
                 tracing::info!(host = %saved_id, %message, "roost-session is set up; reconnecting");
                 self.set_status(message);
-                self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User);
+                self.host_reconnect_requested(
+                    saved_id,
+                    crate::host_conn::RequestOrigin::User,
+                    crate::host_conn::AttemptCause::Explicit,
+                );
             }
             Err(error) => self.report_bootstrap_failure(saved_id, &target, &error),
         }

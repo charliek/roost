@@ -80,6 +80,15 @@ pub(crate) enum EngineFeed {
     /// One host's connection lifecycle, for the sidebar headers,
     /// takeover banner and upgrade dialog.
     HostState(HostId, crate::host_conn::HostConnState),
+    /// The lease a host connection was granted, published once as it
+    /// reaches `Connected` (plan 040 §3.7).
+    ///
+    /// It rides the feed rather than sitting on [`Self::HostState`]
+    /// because that state is what the UI *renders*, and a lease is not
+    /// something to render — it is a fact the app keeps so that the next
+    /// attempt over a dead ssh transport, which is a fresh task, can ask
+    /// whether the session is still ours before taking it back.
+    HostLease(HostId, String),
     /// An ssh-reached host's tunnel finished coming up — or failed to
     /// (plan 038 §3.4).
     ///
@@ -173,6 +182,11 @@ impl EngineFeedReceiver {
             EngineFeed::Workspace(_)
                 | EngineFeed::HostWorkspace(..)
                 | EngineFeed::HostState(..)
+                // Host-connection state like the two above, and it
+                // arrives between them: classified with them so a
+                // reconcile pulled forward mid-drain lands after one
+                // connection's arrival rather than inside it.
+                | EngineFeed::HostLease(..)
                 // A tunnel answer either starts a connection or leaves a
                 // reason on the band; both are what the section renders.
                 | EngineFeed::HostTunnel(..)

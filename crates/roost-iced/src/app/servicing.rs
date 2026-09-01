@@ -1290,6 +1290,9 @@ impl App {
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
                 }
+                // Nothing renders off it — it is kept for the outage a
+                // later drop opens (plan 040 §3.7).
+                EngineFeed::HostLease(host, lease) => self.hosts.apply_lease(host, lease),
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
                 // A signal reached the process (plan 039 §3.9). Same
@@ -2520,7 +2523,11 @@ impl App {
         if test_user_origin && self.test_mode {
             self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
         } else {
-            self.host_reconnect_requested(saved_id, Self::IPC_CONNECT_ORIGIN);
+            self.host_reconnect_requested(
+                saved_id,
+                Self::IPC_CONNECT_ORIGIN,
+                crate::host_conn::AttemptCause::Explicit,
+            );
         }
         Ok(self.host_connection_result(host))
     }

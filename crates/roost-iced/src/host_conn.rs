@@ -110,6 +110,25 @@ pub(crate) enum RequestOrigin {
     Ipc,
 }
 
+/// Why this attempt exists.
+///
+/// [`RequestOrigin`] cannot answer it: `roostctl host connect` is an
+/// explicit machine-driven connect and arrives as exactly the same
+/// origin and mode an auto-reconnect would. So the two questions are
+/// separate — "is there somebody there?" and "did anybody ask for *this*
+/// attempt?" — and the second is the one a retry ladder turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptCause {
+    /// Somebody asked for this one: the sidebar's ↻, a palette row, the
+    /// Add Host dialog, `roostctl host connect`. It supersedes whatever
+    /// a schedule had in mind, so it clears the outage entry outright.
+    Explicit,
+    /// The schedule asked. It leaves the outage alone — the attempt
+    /// counter, and the lease [`Outage`] carries, are what bound the
+    /// ladder and keep it from stealing a session back.
+    AutoReconnect,
+}
+
 /// Why reaching a host failed: the classified family when the far side
 /// is what refused, and the line the band and the toast render.
 ///
@@ -472,6 +491,9 @@ pub(crate) struct HostConnSet {
     ssh: HashMap<String, SshState>,
     /// Handed out by [`HostConnSet::open_ssh`], never reused.
     next_ssh_request: u64,
+    /// What an ssh host's retry ladder must carry across its own
+    /// attempts, keyed like [`Self::conns`]. See [`Outage`].
+    outages: HashMap<String, Outage>,
     /// What a bootstrap is doing to a host right now, or how it ended —
     /// keyed like [`Self::conns`].
     ///
@@ -482,6 +504,27 @@ pub(crate) struct HostConnSet {
     /// leave the band describing a question that is already being dealt
     /// with.
     bootstrap_notes: HashMap<String, String>,
+}
+
+/// One ssh host's outage: everything a retry ladder has to carry that
+/// the retry itself would otherwise destroy (plan 040 §3.4).
+///
+/// It exists because the two natural homes are both wiped by the very
+/// call that needs them. [`HostConnSet::open_ssh`] inserts a *fresh*
+/// [`SshState`] on every attempt, and [`HostConnSet::connect`] calls
+/// `forget` before it builds the config, destroying the old
+/// [`HostConn`]. So the ladder's depth and the lease it must present
+/// live here, in a store neither of them touches.
+///
+/// Created at the first drop of an outage and destroyed by anything
+/// that ends one: a successful connect, an explicit attempt, a
+/// disconnect, a remove, a give-up, a terminal settle.
+pub(crate) struct Outage {
+    ladder: reconnect::ReconnectLadder,
+    /// The lease the connection that just died held, copied off
+    /// [`SshState::lease`] on every drop that has one (§3.7). What the
+    /// next attempt presents before taking the session back.
+    lease: Option<String>,
 }
 
 /// One saved host's ssh transport, from the moment a connect is asked
@@ -502,12 +545,40 @@ struct SshState {
     mode: ConnectMode,
     /// Whether a user asked for this attempt. Only an attended failure
     /// raises a toast; an unattended one is the band's business alone.
+    ///
+    /// Still derived from the mode alone, which is today's rule
+    /// unchanged. [`Self::cause`] is the fact that actually answers
+    /// "did anybody ask for this attempt?", and nothing yet mints an
+    /// unattended `Dial`, so the two answers still agree.
     attended: bool,
     /// Who asked. Nothing reads it yet — [`Self::attended`] still
     /// decides the toast exactly as it did — but an IPC dial and a
     /// user's click are both `Dial`, so this is the only place the
     /// difference survives.
     origin: RequestOrigin,
+    /// Whether anybody asked for *this* attempt, as opposed to who
+    /// would hear about it. It is what an explicit connect clears an
+    /// outage off, and what decides whether the next dial carries
+    /// [`Outage::lease`].
+    cause: AttemptCause,
+    /// Which connection this attempt produced, stamped by
+    /// [`HostConnSet::connect`]. `None` until the tunnel is up and that
+    /// call has run — an establish that never answers never has one.
+    ///
+    /// It is what makes [`Self::lease`] attributable: a feed item is
+    /// tagged with an incarnation, and the connection an incarnation
+    /// belongs to is only half the question here.
+    generation: Option<u64>,
+    /// The lease the connection under this attempt was granted, once it
+    /// reached `Connected`.
+    ///
+    /// It lands here rather than on the [`Outage`] because of when it
+    /// arrives (§3.7): at `Connected` no outage exists yet — one is
+    /// created at the first drop — and a successful auto-reconnect
+    /// *clears* the outage at exactly the moment the new lease is
+    /// published. This entry, by contrast, is created at `open_ssh`,
+    /// stamped here, and still untouched at the drop that copies it out.
+    lease: Option<String>,
     /// `None` until the establish answers, and again once the tunnel is
     /// torn down.
     tunnel: Option<Arc<SshTunnel>>,
@@ -567,6 +638,7 @@ impl HostConnSet {
             next_generation: 0,
             ssh: HashMap::new(),
             next_ssh_request: 0,
+            outages: HashMap::new(),
             bootstrap_notes: HashMap::new(),
         }
     }
@@ -581,6 +653,9 @@ impl HostConnSet {
     /// its task is aborted and its incarnation forgotten — so "Connect"
     /// on an already-connected host is a deliberate reconnect, which on
     /// this wire is a takeover.
+    ///
+    /// `cause` decides one thing here: whether the task starts holding
+    /// the previous connection's lease — see [`Self::carried_lease`].
     pub(crate) fn connect(
         &mut self,
         host: &str,
@@ -588,6 +663,7 @@ impl HostConnSet {
         socket: PathBuf,
         transport: HostTransport,
         mode: ConnectMode,
+        cause: AttemptCause,
     ) {
         // The incarnation this reconnect displaces, threaded into the
         // replacement task so its FIRST `Connecting` carries it — that
@@ -596,9 +672,16 @@ impl HostConnSet {
         // old connection's tabs left behind (attach state, terminals,
         // inbox rows).
         let supersedes = self.conns.get(host).and_then(|conn| conn.incarnation);
+        let held_lease = self.carried_lease(host, cause);
         self.forget(host);
         self.next_generation += 1;
         let generation = self.next_generation;
+        // Only the ssh path has an entry to stamp, and stamping it is
+        // what lets a lease publication be traced back to the attempt
+        // that opened the connection — see [`Self::apply_lease`].
+        if let Some(entry) = self.ssh.get_mut(host) {
+            entry.generation = Some(generation);
+        }
 
         let (ops, ops_rx) = HostOps::channel();
         let shutdown = Arc::new(Shutdown::default());
@@ -610,6 +693,7 @@ impl HostConnSet {
             generation,
             supersedes,
             mode,
+            held_lease,
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
         };
@@ -676,6 +760,10 @@ impl HostConnSet {
     /// in because it cannot be derived: an IPC `host.connect` arrives as
     /// `Dial`, indistinguishable from a click, so a modal opened off the
     /// mode would be asking `roostctl` a question (plan 039 §3.5).
+    ///
+    /// `cause` is the third, and this is the call that acts on it: it is
+    /// where an explicit attempt clears the [`Outage`] a schedule was
+    /// working through.
     pub(crate) fn open_ssh(
         &mut self,
         host: &str,
@@ -683,12 +771,16 @@ impl HostConnSet {
         target: roost_ipc::ssh::SshTarget,
         mode: ConnectMode,
         origin: RequestOrigin,
+        cause: AttemptCause,
     ) {
         // A fresh attempt supersedes whatever the last bootstrap left on
         // the band: either it worked and this connect is its sequel, or
         // it did not and the user is trying again — and in both cases
         // this attempt's own outcome is the newer answer.
         self.bootstrap_notes.remove(host);
+        if cause == AttemptCause::Explicit {
+            self.outages.remove(host);
+        }
         let previous = self.take_tunnel(host);
         self.next_ssh_request += 1;
         let request = self.next_ssh_request;
@@ -701,6 +793,9 @@ impl HostConnSet {
                 mode,
                 attended: mode != ConnectMode::IfPresent,
                 origin,
+                cause,
+                generation: None,
+                lease: None,
                 tunnel: None,
                 seen: 0,
                 failure: None,
@@ -767,9 +862,9 @@ impl HostConnSet {
                     .map_or(0, |recorded| recorded.generation);
                 entry.failure = None;
                 entry.tunnel = Some(tunnel);
-                let (label, mode) = (entry.label.clone(), entry.mode);
+                let (label, mode, cause) = (entry.label.clone(), entry.mode, entry.cause);
                 tracing::info!(%host, socket = %socket.display(), "ssh tunnel established");
-                self.connect(&host, &label, socket, HostTransport::Ssh, mode);
+                self.connect(&host, &label, socket, HostTransport::Ssh, mode, cause);
                 None
             }
             Err(failure) => {
@@ -823,6 +918,83 @@ impl HostConnSet {
     /// separates a first connect from a session dropping under the user.
     pub(crate) fn ssh_reached_connected(&self, host: &str) -> bool {
         self.ssh.get(host).is_some_and(|ssh| ssh.reached_connected)
+    }
+
+    /// This host's outage, created if this is the drop that starts one.
+    ///
+    /// This is where the lease moves house: [`SshState::lease`] is still
+    /// the one the connection that just died held — `open_ssh` has not
+    /// run again yet — so this is the last moment it can be copied
+    /// somewhere the next attempt's `open_ssh` will not wipe (§3.7).
+    pub(crate) fn begin_outage(&mut self, host: &str) -> &mut Outage {
+        let lease = self.ssh.get(host).and_then(|ssh| ssh.lease.clone());
+        let outage = self
+            .outages
+            .entry(host.to_string())
+            .or_insert_with(|| Outage {
+                ladder: reconnect::ReconnectLadder::default(),
+                lease: None,
+            });
+        // Every drop, not only the first: an entry holding a lease is by
+        // construction the connection that just died, so it supersedes
+        // whatever the outage carries. `None` does not clear, because
+        // that is what a retry which never reached `Connected` leaves
+        // behind — and the outage's own lease is still the one to
+        // present.
+        if lease.is_some() {
+            outage.lease = lease;
+        }
+        outage
+    }
+
+    /// The lease one attempt starts holding, which is the whole takeover
+    /// guard (§3.7).
+    ///
+    /// A fresh task's `held_lease` is `None`, so an auto-reconnect that
+    /// carried nothing would reconnect with `takeover: true` and no
+    /// probe — silently taking the session back from another client
+    /// whenever the drop *was* a takeover whose `session.stopping`
+    /// envelope was lost. An explicit Connect carries nothing on
+    /// purpose: taking the session back is exactly what that button
+    /// means.
+    fn carried_lease(&self, host: &str, cause: AttemptCause) -> Option<String> {
+        match cause {
+            AttemptCause::Explicit => None,
+            AttemptCause::AutoReconnect => self.outages.get(host)?.lease.clone(),
+        }
+    }
+
+    /// Drain one `EngineFeed::HostLease`: the lease a connection was
+    /// granted, on its way to the entry that outlives the connection.
+    ///
+    /// Attributed through [`Self::owner_of`] like every other feed item
+    /// — a lease minted by a connection this set has since replaced
+    /// would otherwise become the one the *next* outage presents, which
+    /// is a lease two connections old. Hosts not reached over ssh keep
+    /// nothing: their task holds its own lease across its own retries,
+    /// which is the case this entry exists to cover for ssh.
+    ///
+    /// The stamped generation is a *second* question, and the ssh path
+    /// is where the two come apart: [`Self::open_ssh`] installs a fresh
+    /// [`SshState`] while the old [`HostConn`] is still in `conns` — an
+    /// ssh connect does not reach [`Self::connect`], and so does not
+    /// `forget`, until its tunnel is up an establish later. So "is this
+    /// connection still current?" can be yes while "is this the attempt
+    /// that opened it?" is no, and only the second keeps a lease from
+    /// landing on the attempt an explicit connect just installed.
+    pub(crate) fn apply_lease(&mut self, incarnation: HostId, lease: String) {
+        let Some(host) = self.owner_of(incarnation) else {
+            return;
+        };
+        let Some(minted) = self.minter.registration(incarnation) else {
+            return;
+        };
+        let Some(entry) = self.ssh.get_mut(&host) else {
+            return;
+        };
+        if entry.generation == Some(minted.generation) {
+            entry.lease = Some(lease);
+        }
     }
 
     /// Say what a bootstrap is doing to this host, or stop saying it.
@@ -951,6 +1123,10 @@ impl HostConnSet {
         // Connect opens a fresh tunnel.
         self.shutdown_tunnel(host);
         self.ssh.remove(host);
+        // Being reconnected eight seconds after asking to disconnect is
+        // the one outcome nobody wants, and the lease the entry holds
+        // has no owner left either.
+        self.outages.remove(host);
         let Some(conn) = self.conns.remove(host) else {
             self.minter.forget_host(host);
             return None;
@@ -1435,6 +1611,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-one.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         set.connect(
             "h2",
@@ -1442,6 +1619,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-two.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
 
         let first = set.mint_for("h1");
@@ -1471,6 +1649,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-purge.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
 
         let old = set.mint_for("h1");
@@ -1521,6 +1700,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let outgoing = set.conns["h1"].generation;
 
@@ -1532,6 +1712,7 @@ mod tests {
             socket,
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -1579,6 +1760,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-send-at.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -1666,6 +1848,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         assert_eq!(
@@ -1686,6 +1869,7 @@ mod tests {
             ssh_target("user@box"),
             ConnectMode::IfPresent,
             RequestOrigin::Ipc,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h2"].request;
         assert_eq!(
@@ -1711,6 +1895,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::Ipc,
+            AttemptCause::Explicit,
         );
         assert_eq!(set.ssh_origin("h1"), Some(RequestOrigin::Ipc));
         assert_ne!(
@@ -1736,6 +1921,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         assert_eq!(set.ssh_origin("h2"), Some(RequestOrigin::User));
         assert_eq!(set.ssh_origin("nobody"), None);
@@ -1758,6 +1944,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         let toast = set
@@ -1778,6 +1965,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h2"].request;
         set.tunnel_ready(failed(
@@ -1808,6 +1996,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         set.tunnel_ready(refused("h1", request, SshFailure::NotFound));
@@ -1831,6 +2020,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         assert_eq!(
             set.section_reason("h1"),
@@ -1862,6 +2052,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let first = set.ssh["h1"].request;
 
@@ -1871,6 +2062,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let second = set.ssh["h1"].request;
         assert_ne!(first, second, "a request id is never reused");
@@ -1901,6 +2093,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         set.tunnel_ready(failed("h1", request, "workbox refused authentication"));
@@ -1911,6 +2104,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-ssh.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(
@@ -1942,6 +2136,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         set.connect(
             "h1",
@@ -1949,6 +2144,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-reached.sock"),
             HostTransport::Ssh,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
 
@@ -1987,8 +2183,307 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         assert!(!set.ssh_reached_connected("h1"));
+    }
+
+    fn dropped(reason: &str) -> HostConnState {
+        HostConnState::Disconnected(state::Disconnected {
+            reason: reason.into(),
+            retry_in: None,
+        })
+    }
+
+    /// An ssh host walked to `Connected` by an explicit connect — the
+    /// only state that mints a lease, and where each case below starts.
+    /// The cause a case turns on is the one it passes *after* this.
+    fn a_connected_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from(socket),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        incarnation
+    }
+
+    /// The lease's whole life, walked rather than seeded.
+    ///
+    /// Every step of it is somewhere the previous store would have been
+    /// wiped, which is why none of them may be short-circuited: it is
+    /// published at `Connected`, when **no outage exists yet**; the
+    /// outage that copies it out is not created until the drop; and the
+    /// entry it was stamped on is replaced wholesale by the very
+    /// `open_ssh` the ladder re-enters through. A test that seeded any
+    /// one of those by hand would stay green while the guard was dead.
+    #[tokio::test]
+    async fn a_lease_published_at_connected_reaches_the_attempt_after_the_drop() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease.sock");
+        set.apply_lease(incarnation, "lease-1".into());
+        assert_eq!(
+            set.ssh["h1"].lease.as_deref(),
+            Some("lease-1"),
+            "the lease lands on the entry the connection was opened under"
+        );
+        assert!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .is_none(),
+            "and nowhere else yet — there is no outage to hold it"
+        );
+
+        set.apply_state(incarnation, dropped("the connection closed"));
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1"),
+            "the outage copies it out of the entry that is about to go"
+        );
+
+        // The re-entry: a fresh entry, and the lease still reaches the
+        // dial it authorizes.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        assert_eq!(
+            set.ssh["h1"].lease, None,
+            "the fresh entry knows nothing about the connection that died"
+        );
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1"),
+            "but the outage does, which is the whole reason it exists"
+        );
+    }
+
+    /// What an attempt's cause decides, at both ends of the two-step ssh
+    /// connect: `open_ssh` records it on the entry `tunnel_ready` reads
+    /// to build the dial, and `connect` turns it into the lease the task
+    /// starts holding.
+    ///
+    /// An explicit attempt clears the outage outright — the user's
+    /// attempt supersedes the schedule, and a lease minted two
+    /// connections ago must not be presented by the next ladder. A
+    /// scheduled one leaves it alone: without that, every retry would
+    /// zero its own attempt counter and the ladder would never end.
+    #[tokio::test]
+    async fn an_attempts_cause_decides_the_outage_and_the_lease_it_carries() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-cause.sock");
+        set.apply_lease(incarnation, "lease-1".into());
+        set.apply_state(incarnation, dropped("the connection closed"));
+        set.begin_outage("h1");
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        assert_eq!(set.ssh["h1"].cause, AttemptCause::AutoReconnect);
+        assert!(
+            set.outages.contains_key("h1"),
+            "a scheduled attempt leaves the ladder it belongs to alone"
+        );
+        assert_eq!(
+            set.carried_lease("h1", set.ssh["h1"].cause).as_deref(),
+            Some("lease-1")
+        );
+
+        // The user clicks ↻ mid-ladder.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        assert_eq!(set.ssh["h1"].cause, AttemptCause::Explicit);
+        assert!(
+            !set.outages.contains_key("h1"),
+            "an explicit attempt supersedes the schedule outright"
+        );
+        assert_eq!(
+            set.carried_lease("h1", set.ssh["h1"].cause),
+            None,
+            "cleared, not merely not-passed: the lease went with the outage"
+        );
+        assert!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .is_none(),
+            "so a ladder started after it cannot present the old lease either"
+        );
+    }
+
+    /// A lease publication is attributed like every other feed item. One
+    /// from a connection this set has since replaced must land nowhere:
+    /// stored, it would become the lease the *next* outage presents —
+    /// a lease two connections old, offered to a session that never
+    /// issued it.
+    #[tokio::test]
+    async fn a_lease_from_a_replaced_connection_is_dropped() {
+        let (mut set, _feed) = a_set();
+        let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-stale.sock");
+        set.apply_lease(live, "lease-live".into());
+
+        let replaced = set.minter.mint("h1", set.conns["h1"].generation - 1);
+        set.apply_lease(replaced, "lease-from-the-connection-before".into());
+        assert_eq!(
+            set.ssh["h1"].lease.as_deref(),
+            Some("lease-live"),
+            "a replaced connection cannot overwrite the live one's lease"
+        );
+
+        // And an incarnation this set never minted at all.
+        set.apply_lease(HostId::new(9_999), "invented".into());
+        assert_eq!(set.ssh["h1"].lease.as_deref(), Some("lease-live"));
+
+        // A disconnect ends the outage the lease would have been kept
+        // for, so nothing survives to be presented.
+        set.begin_outage("h1");
+        set.disconnect("h1");
+        assert!(set
+            .carried_lease("h1", AttemptCause::AutoReconnect)
+            .is_none());
+    }
+
+    /// A lease still in flight when an explicit connect installs a fresh
+    /// attempt must not land on that attempt.
+    ///
+    /// The window is the ssh path's alone, and it is why "is this
+    /// connection current?" cannot answer this on its own: `open_ssh`
+    /// replaces [`SshState`] immediately, while the [`HostConn`] the
+    /// lease was minted under stays in `conns` until the *next* tunnel
+    /// comes up — so [`HostConnSet::owner_of`] accepts an item the
+    /// explicit connect was supposed to have cleared. Stored, it would
+    /// be copied onto the first outage of a connection that never
+    /// issued it, undoing §3.7's "cleared, not merely not-passed".
+    #[tokio::test]
+    async fn a_lease_does_not_land_on_the_attempt_that_superseded_it() {
+        let (mut set, _feed) = a_set();
+        let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-superseded.sock");
+
+        // The user clicks Connect. A fresh entry is in place at once;
+        // the old connection is not forgotten until its replacement's
+        // tunnel answers.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        assert!(
+            set.owner_of(live).is_some(),
+            "the connection the lease belongs to is still held — that is the window"
+        );
+
+        set.apply_lease(live, "lease-1".into());
+        assert_eq!(
+            set.ssh["h1"].lease, None,
+            "but the attempt that replaced it never held that lease"
+        );
+        set.begin_outage("h1");
+        assert!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .is_none(),
+            "so no ladder off this attempt can present it"
+        );
+    }
+
+    /// An outage carries the *freshest* lease, not the first one it ever
+    /// saw.
+    ///
+    /// A reconnect that reaches `Connected` mints a new lease and
+    /// tombstones the old one, so an outage still holding the old one
+    /// would present a tombstone on the next drop — the far side answers
+    /// `taken-over` and the host settles as somebody else's with nobody
+    /// else involved. A retry that only failed its establish holds no
+    /// lease at all, and there the outage's own is still the one to
+    /// present.
+    #[tokio::test]
+    async fn an_outage_carries_the_lease_of_the_connection_that_just_died() {
+        let (mut set, _feed) = a_set();
+        let first = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-refresh.sock");
+        set.apply_lease(first, "lease-1".into());
+        set.apply_state(first, dropped("the connection closed"));
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1")
+        );
+
+        // A retry that gets all the way to `Connected` again.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-lease-refresh.sock"),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        let second = set.mint_for("h1");
+        set.apply_state(second, HostConnState::Connected);
+        set.apply_lease(second, "lease-2".into());
+        set.apply_state(second, dropped("and it dropped again"));
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-2"),
+            "the second drop presents the second connection's lease"
+        );
+
+        // A retry that never gets a connection at all: its entry has no
+        // lease, and the outage keeps the one it has.
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::Ipc,
+            AttemptCause::AutoReconnect,
+        );
+        set.begin_outage("h1");
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-2"),
+            "a failed establish has no lease of its own to supersede it with"
+        );
     }
 
     /// The establish window answers `connecting`, not `disconnected`:
@@ -2004,6 +2499,7 @@ mod tests {
             ssh_target("workbox"),
             ConnectMode::Dial,
             RequestOrigin::User,
+            AttemptCause::Explicit,
         );
         let request = set.ssh["h1"].request;
         assert!(set.establishing("h1"), "the establish is in flight");
@@ -2028,6 +2524,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-focus.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2061,6 +2558,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-drop.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2090,6 +2588,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -2134,6 +2633,7 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-section.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2192,6 +2692,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -2226,6 +2727,7 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
+            AttemptCause::Explicit,
         );
         let section = set.section("h1").expect("connecting hosts have sections");
         assert!(
