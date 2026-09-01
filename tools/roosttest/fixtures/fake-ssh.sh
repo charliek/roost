@@ -40,6 +40,15 @@
 #                      block, ending in `Host key verification failed.`,
 #                      exit 255.
 #   exit-127           `sh: roost-session: command not found`, exit 127.
+#   unreachable        `No route to host`, exit 255 — a failure the
+#                      classifier deliberately has no rule for, so it
+#                      falls through to `Transport`. The only mode here
+#                      that fails an establish *retryably*: every other
+#                      one names a family the retry ladder refuses to
+#                      spend an attempt on (a key to review, a password
+#                      nobody can type under `BatchMode=yes`, a binary
+#                      that is not there), which is exactly why a lane
+#                      about giving up needed a mode of its own.
 #   drop-after:<n>     run FAKE_SSH_EXEC but cut its output after <n>
 #                      bytes, then exit 1.
 #   slow-stderr-changed-key:<secs>
@@ -235,6 +244,15 @@ slow-stderr-hang:*)
 exit-127)
     printf '%s\n' "sh: roost-session: command not found" >&2
     exit 127
+    ;;
+unreachable)
+    # Nothing here may match a `classify_ssh_failure` rule: no changed-key
+    # banner, no "Host key verification failed", no "Permission denied",
+    # no "client-bridge: no session", no "command not found" — and an
+    # exit that is not 127. What is left is the fallthrough, `Transport`,
+    # which is the one family a drop is allowed to retry.
+    printf '%s\n' "ssh: connect to host workbox port 22: No route to host" >&2
+    exit 255
     ;;
 esac
 

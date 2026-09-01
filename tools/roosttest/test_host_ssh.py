@@ -61,11 +61,13 @@ from __future__ import annotations
 import atexit
 import contextlib
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -150,6 +152,15 @@ NOT_FOUND_COPY = "roost-session isn't installed on"
 # settle signal — see the module docstring.
 TUNNEL_FAILED = "ssh tunnel could not be established"
 
+# The auto-reconnect ladder's two `info` lines (`host_conn.rs`, plan 040
+# §3.8). The band they mirror — `reconnecting in 8s (3/10)` — is not
+# reachable from any op (the palette's Connect subtitle is a `&'static
+# str` keyed on the section state), so the log is where this lane reads
+# the ladder. Their fields are `host`/`attempt`/`delay_ms` and
+# `host`/`attempts`, rendered `key=value` by the fmt subscriber.
+RECONNECT_SCHEDULED = "ssh host reconnect scheduled"
+RECONNECT_GAVE_UP = "ssh host reconnect gave up"
+
 
 def sh_quote(raw: str) -> str:
     return "'" + raw.replace("'", "'\\''") + "'"
@@ -211,6 +222,22 @@ def _install_wrapper() -> None:
     )
     SSH_WRAPPER.chmod(SSH_WRAPPER.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     os.environ["ROOST_SSH_BIN"] = str(SSH_WRAPPER)
+    # Beside it, and for the same reason: the reconnect ladder reads
+    # these once, out of the UI process's own environment, and only under
+    # `ROOST_TEST_MODE=1` (`host_conn/reconnect.rs`) — which
+    # `make e2e-host-ssh` sets.
+    #
+    # Shipped, the ladder is ten attempts on a 1s base, and a give-up
+    # against a black-holed route costs six to eight minutes (plan 040
+    # §3.5): every attempt pays an establish, a teardown and a lease
+    # probe on top of its sleep. A lane whose whole subject is *settling*
+    # cannot spend that, so it shortens the ladder rather than the
+    # assertions. 400ms keeps the rungs long enough that a case which has
+    # to get an op onto the wire inside an armed window (the disconnect,
+    # removal and quit cases below) is racing a several-hundred-millisecond
+    # timer rather than a round trip.
+    os.environ["ROOST_SSH_RECONNECT_ATTEMPTS"] = "4"
+    os.environ["ROOST_SSH_RECONNECT_BASE_MS"] = "400"
 
 
 _install_wrapper()
@@ -296,6 +323,51 @@ def kill_bridge_connections() -> list[int]:
     return killed
 
 
+def live_ssh_invocations(under: int | None = None) -> list[int]:
+    """Every logged fake-`ssh` invocation still running.
+
+    `under` scopes the answer to one process's descendants, which is what
+    closes the one false positive a pid list has: a pid the log named
+    long ago can have been recycled onto something else. When the UI is
+    still alive that is the read to take — every `ssh` it runs is its own
+    child. After it has exited there is nothing left to scope to, so the
+    bare liveness read is what there is, and the cases that use it run
+    seconds after the pids they care about were logged.
+    """
+    logged = []
+    for fields in invocations():
+        if not fields[0].startswith("pid="):
+            continue
+        pid = int(fields[0].removeprefix("pid="))
+        if sessionlib.pid_alive(pid):
+            logged.append(pid)
+    if under is None:
+        return logged
+    tree = set(_descendants(under))
+    return [pid for pid in logged if pid in tree]
+
+
+def hold(check, seconds: float = 2.0) -> None:
+    """Hold an assertion for a window rather than reading it once.
+
+    "Nothing further happens" has no edge to wait for, so a single read
+    the instant a ladder settles proves only "nothing further *yet*" — a
+    regression that armed one more timer would fire after it and still
+    pass. Same shape as `test_host_bootstrap.py`'s `assert_no_dialog_for`,
+    for the same reason.
+    """
+    deadline = time.monotonic() + scaled_timeout(seconds)
+    while True:
+        check()
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.1)
+
+
+def dialog_dump(roost: Roost) -> dict:
+    return roost.call("app.dialog_dump", {})
+
+
 # ---------------------------------------------------------------------------
 # The UI's log — the only surface carrying a classified reason
 # ---------------------------------------------------------------------------
@@ -314,8 +386,14 @@ class UiLog:
         self.needle = needle
         self.seen = len(self._matches())
 
+    #: The fmt subscriber colours *inside* a structured line — dim around
+    #: every `=`, italics around every field name — so `attempt=2` is
+    #: never a substring of the raw text even though that is exactly what
+    #: it says. Stripped on the way in, once, rather than at each read.
+    _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
     def _matches(self) -> list[str]:
-        output = ui._launch_output(self.target)
+        output = self._ANSI.sub("", ui._launch_output(self.target))
         return [line for line in output.splitlines() if self.needle in line]
 
     def wait_next(self, timeout: float = 90.0) -> str:
@@ -328,6 +406,16 @@ class UiLog:
         line = wait_until(fresh, timeout, f"the UI to log {self.needle!r}")
         self.seen += 1
         return line
+
+    def pending(self) -> int:
+        """How many matching lines have appeared past the cursor.
+
+        The read for "this must NOT have happened". `wait_next` can only
+        answer the opposite question, and a case that cancels a live
+        ladder has to prove the ladder was still live — that it was the
+        cancellation and not exhaustion that ended it.
+        """
+        return len(self._matches()) - self.seen
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +551,39 @@ def connect_expecting_failure(host: HostUnderTest, target: str, mode: str) -> st
 
 
 # ---------------------------------------------------------------------------
+# The auto-reconnect ladder (plan 040)
+# ---------------------------------------------------------------------------
+
+
+def drop_the_link(host: HostUnderTest, mode: str) -> None:
+    """Put `mode` in front of the *next* `ssh`, then kill the far side.
+
+    Order matters and is the whole trick this lane turns: the fake is
+    read per invocation, so the connection that is already up dies of a
+    SIGKILL (an unclassified bare EOF — the ordinary dropped link, and
+    the one drop shape the ladder retries), while every attempt the
+    ladder makes afterwards runs the mode under test.
+    """
+    configure_fake_ssh(mode)
+    assert kill_bridge_connections(), "no live bridge connection to kill"
+
+
+def wait_for_a_live_retry(scheduled: "UiLog", through: int = 3) -> None:
+    """Wait until the ladder has armed attempt `through`'s timer.
+
+    Not attempt 1: its rung is the shortest there is (half to all of
+    `ROOST_SSH_RECONNECT_BASE_MS`), and the cases that follow have to get
+    an op onto the wire *inside* an armed window. Waiting a couple of
+    rungs in spends a second of test time to buy a window several times
+    longer than the round trip — and asserting each number on the way
+    proves the ladder is climbing rather than re-arming in place.
+    """
+    for want in range(1, through + 1):
+        line = scheduled.wait_next()
+        assert f"attempt={want}" in line, line
+
+
+# ---------------------------------------------------------------------------
 # 1. The happy path: a host reached over ssh is a host
 # ---------------------------------------------------------------------------
 
@@ -497,16 +618,29 @@ def test_an_ssh_host_connects_and_renders_its_session(ssh_host, roost):
 # ---------------------------------------------------------------------------
 
 
-def test_killing_the_bridge_processes_disconnects_and_a_reconnect_restores_the_tab(
+def test_killing_the_bridge_processes_auto_reconnects_and_restores_the_tab(
     ssh_host, roost
 ):
-    """SIGKILL the far side, then connect again over a fresh tunnel.
+    """SIGKILL the far side, and touch nothing: the host comes back.
 
     This is the failure a remote transport actually has: no protocol
-    error, no disconnect op, just a pipe that ends. The client has to
-    land in `disconnected` (the palette offers Connect again), the
-    registry has to keep the host, and the reconnect has to find the same
-    terminal — because the session never went anywhere.
+    error, no disconnect op, just a pipe that ends. Until plan 040 the
+    recovery was a person clicking ↻; now a connection that reached
+    `Connected` climbs its own ladder, so the assertion is the absence of
+    a `connect()` call. Nothing here asks the UI to reconnect.
+
+    Recast rather than added beside its predecessor, which asked for the
+    reconnect by hand: with a sub-second first rung that manual call now
+    races the automatic one, and the `wait_not_connected` poll in front
+    of it can miss a disconnected window that closes before it looks
+    (plan 040 §2.9). Two reconnects for one drop is not a test, it is a
+    flake — so this is the same scenario with the manual half deleted.
+
+    The registry has to keep the host, the tunnel has to be rebuilt
+    rather than reused (`SshTunnel` has no `reestablish`; `apply_state`
+    tears it down on every `Disconnected`), the incarnation has to be
+    fresh, and the terminal has to still hold what was written before the
+    drop — because the session never went anywhere.
     """
     connect_and_wait(ssh_host)
     with ssh_host.client() as session:
@@ -516,18 +650,285 @@ def test_killing_the_bridge_processes_disconnects_and_a_reconnect_restores_the_t
         session.tab_feed_pty_bytes(tab, f"{line}\r\n".encode())
         wait_dump_contains(roost, key, line)
 
+        establishes_before = count(is_establish)
+        execs_before = count(is_exec)
         assert kill_bridge_connections(), "no live bridge connection to kill"
-        ssh_host.wait_not_connected()
+
+        # The ladder's own work, watched on the invocation log rather than
+        # on the palette: an ssh host with no connection reads as
+        # `disconnected` from the start of any attempt, so the palette
+        # cannot say whether the recovery below was this drop's or a
+        # window that never opened.
+        wait_until(
+            lambda: count(is_establish) > establishes_before,
+            60.0,
+            "the ladder to rebuild the tunnel",
+        )
+        ssh_host.wait_connected(60.0)
+        assert count(is_exec) > execs_before, "the reconnect reused a dead connection"
         assert ssh_host.saved_id in {
             row["id"] for row in roost.call("host.list", {})["hosts"]
         }, "a dropped transport must not unsave the host"
 
-        execs_before = count(is_exec)
-        connect_and_wait(ssh_host)
-        assert count(is_exec) > execs_before, "the reconnect reused a dead connection"
         again = host_key(roost, tab)
         assert again != key, "a reconnect must mint a fresh incarnation"
         wait_dump_contains(roost, again, line)
+
+
+def test_a_host_that_stays_down_climbs_the_ladder_and_then_settles(
+    ssh_host, roost, target
+):
+    """AC: the ladder advances, gives up, and stops — the off-switch.
+
+    A capped ladder is what makes auto-reconnect safe to have at all: the
+    thing being designed against is a client that hammers an `sshd` for
+    the rest of the afternoon. So this asserts the shape, not just the
+    end — attempt 1, then 2, then 3, then 4 (the band's `(3/4)` reads off
+    the same numbers), then the give-up naming how many it spent, and
+    then *nothing*.
+
+    `unreachable` is the fixture mode this test needed and none of the
+    older ones could supply: every other establish-failing mode names a
+    family the ladder refuses to spend an attempt on, and `drop-after`
+    sits in the fixture's second dispatch block where an establish never
+    reaches it. This one exits non-zero with stderr the classifier has no
+    rule for, so it lands on `Transport` — retryable, four times over.
+
+    ↻ Reconnect never left the screen, which is what settling is allowed
+    to rely on: the palette still offers Connect at the end.
+    """
+    connect_and_wait(ssh_host)
+    scheduled = UiLog(target, RECONNECT_SCHEDULED)
+    gave_up = UiLog(target, RECONNECT_GAVE_UP)
+    drop_the_link(ssh_host, "unreachable")
+
+    wait_for_a_live_retry(scheduled, through=4)
+    settled = gave_up.wait_next()
+    assert "attempts=4" in settled, settled
+
+    establishes = count(is_establish)
+
+    def nothing_further() -> None:
+        assert count(is_establish) == establishes, invocations()
+        assert scheduled.pending() == 0, "a settled ladder armed another timer"
+
+    hold(nothing_further, 3.0)
+
+    rows = host_row_ids(roost)
+    assert f"host:connect:{ssh_host.saved_id}" in rows, rows
+    assert f"host:disconnect:{ssh_host.saved_id}" not in rows, rows
+
+
+def test_a_changed_host_key_ends_the_ladder_instead_of_advancing_it(
+    ssh_host, roost, target
+):
+    """AC: a changed host key is never retried.
+
+    The security case, and the reason §3.3's table is an exhaustive
+    `match`: retrying a possible machine-in-the-middle on a loop is a
+    misfeature, not a convenience. The drop that starts the outage is an
+    ordinary bare EOF, so one attempt is made and is allowed to be — what
+    must never happen is a *second*. The copy has to stay the wary one
+    too: the changed-key warning, never the unknown-key remedy, which is
+    to review and accept the key.
+
+    Deviation from plan 040 C5(c), stated rather than hidden: the plan
+    asks for no `"reconnect scheduled"` line at all. There is exactly
+    one, and it is not reachable to remove from here — the changed key is
+    what the *retry's* establish discovers, and the drop that armed that
+    retry is a SIGKILLed pipe with no stderr to classify. "Never retried"
+    is therefore asserted where it lives: the ladder never advances past
+    the changed key.
+    """
+    connect_and_wait(ssh_host)
+    scheduled = UiLog(target, RECONNECT_SCHEDULED)
+    failed = UiLog(target, TUNNEL_FAILED)
+    drop_the_link(ssh_host, "hostkey-changed")
+
+    wait_for_a_live_retry(scheduled, through=1)
+    reason = failed.wait_next()
+    assert CHANGED_KEY_COPY in reason, reason
+    assert CHANGED_KEY_WARNING in reason, reason
+    assert UNKNOWN_KEY_REMEDY not in reason, reason
+
+    establishes = count(is_establish)
+
+    def one_attempt_only() -> None:
+        assert count(is_establish) == establishes, invocations()
+        assert scheduled.pending() == 0, "a changed host key armed another attempt"
+
+    hold(one_attempt_only, 3.0)
+
+    rows = host_row_ids(roost)
+    assert f"host:connect:{ssh_host.saved_id}" in rows, rows
+
+
+def test_a_missing_remote_binary_mid_ladder_settles_without_raising_a_card(
+    ssh_host, roost, target
+):
+    """AC: an offer-able family reached by a ladder raises no modal.
+
+    `NotFound` is one of the two families a bootstrap offer *is* keyed on
+    (`offer_for`), so this is the case where the consent gate has to earn
+    its keep: an attempt nobody asked for must never put a card on the
+    screen, however installable the far side looks. The gate is the
+    origin — every ladder attempt re-enters as `Ipc` — and the property
+    could only be unit-tested one layer down, at `HostConnSet`, because
+    the real path runs through `host_tunnel_ready` →
+    `maybe_offer_bootstrap` in the app.
+
+    It settles rather than retrying for the same reason the copy names:
+    a retry cannot install anything, and auto-install is forbidden.
+    """
+    connect_and_wait(ssh_host)
+    scheduled = UiLog(target, RECONNECT_SCHEDULED)
+    failed = UiLog(target, TUNNEL_FAILED)
+    drop_the_link(ssh_host, "exit-127")
+
+    wait_for_a_live_retry(scheduled, through=1)
+    reason = failed.wait_next()
+    assert NOT_FOUND_COPY in reason, reason
+    assert "roost-session" in reason, reason
+
+    establishes = count(is_establish)
+
+    def settled_and_silent() -> None:
+        assert count(is_establish) == establishes, invocations()
+        assert scheduled.pending() == 0, "an offer-able family armed another attempt"
+        assert dialog_dump(roost).get("dialog") is None, dialog_dump(roost)
+
+    hold(settled_and_silent, 3.0)
+
+
+def test_an_explicit_disconnect_during_a_scheduled_retry_stays_disconnected(
+    ssh_host, roost, target
+):
+    """AC: asking to disconnect ends the ladder.
+
+    Being reconnected eight seconds after asking to disconnect is the one
+    outcome nobody wants, and it is the outcome a timer nobody cancelled
+    produces. The `pending()` read in the middle is what keeps this
+    honest: it proves the ladder was still climbing when the op landed,
+    so a pass means the disconnect ended it rather than exhaustion
+    getting there first.
+    """
+    connect_and_wait(ssh_host)
+    scheduled = UiLog(target, RECONNECT_SCHEDULED)
+    gave_up = UiLog(target, RECONNECT_GAVE_UP)
+    drop_the_link(ssh_host, "unreachable")
+
+    wait_for_a_live_retry(scheduled)
+    ssh_host.disconnect()
+    establishes = count(is_establish)
+    assert gave_up.pending() == 0, "the ladder settled on its own before the disconnect"
+
+    def stays_down() -> None:
+        assert count(is_establish) == establishes, invocations()
+        assert scheduled.pending() == 0, "a disconnected host armed another attempt"
+        assert gave_up.pending() == 0, "a cancelled ladder still ran to its give-up"
+        rows = host_row_ids(roost)
+        assert f"host:disconnect:{ssh_host.saved_id}" not in rows, rows
+
+    hold(stays_down, 4.0)
+
+
+def test_removing_a_host_during_a_scheduled_retry_leaves_no_ssh_children(
+    ssh_host, roost, target
+):
+    """AC: removal cancels the ladder, processes and all.
+
+    `remove` goes through `disconnect`, so this is the second of §3.4's
+    two cancellation paths that leak processes when they are missed — a
+    timer that fires against a host the registry no longer has would dial
+    a machine nobody asked about and leave an `ssh` master behind it.
+    """
+    process = ui.owned_process(target)
+    if process is None:
+        pytest.skip("needs the harness's own UI process handle to walk its children")
+
+    connect_and_wait(ssh_host)
+    scheduled = UiLog(target, RECONNECT_SCHEDULED)
+    gave_up = UiLog(target, RECONNECT_GAVE_UP)
+    drop_the_link(ssh_host, "unreachable")
+
+    wait_for_a_live_retry(scheduled)
+    ssh_host.remove()
+    establishes = count(is_establish)
+    assert gave_up.pending() == 0, "the ladder settled on its own before the removal"
+
+    def nothing_further() -> None:
+        assert count(is_establish) == establishes, invocations()
+        assert scheduled.pending() == 0, "a removed host armed another attempt"
+
+    hold(nothing_further, 4.0)
+    # Waited for rather than asserted flat through the window above: the
+    # removal itself runs the tunnel's `-O exit`, so a sample taken in the
+    # first moments would catch the teardown doing its job.
+    wait_until(
+        lambda: live_ssh_invocations(under=process.pid) == [],
+        15.0,
+        "every ssh the removed host owned to be gone",
+    )
+    assert ssh_host.saved_id not in {
+        row["id"] for row in roost.call("host.list", {})["hosts"]
+    }
+
+
+def test_quitting_during_a_scheduled_retry_leaves_no_ssh_children(
+    ssh_host, roost, target
+):
+    """AC: a quit outruns an armed timer.
+
+    The window `EngineFeed::Quit` does not close by itself: it latches
+    the exit but the feed keeps draining, so a `ReconnectDue` queued
+    behind it would re-enter `connect_saved_host` after the user asked to
+    leave — spawning an `ssh` master with `ControlPersist=60s` that
+    outlives the app that made it. Two mechanisms answer that (the exit
+    teardown aborts every armed handle and any in-flight establish; the
+    due message is gated on the exit state), and this is where they are
+    exercised together against a real quit.
+
+    Relaunches the UI it ended rather than being the module's last test:
+    the SIGTERM case below owns that slot and asserts a different thing
+    (the *tunnel's* `-O exit` on the way out, which needs a live tunnel
+    at signal time — and a live ladder means there is none). Same
+    quit → launch cycle `test_sidebar_collapse_persistence.py` uses.
+    """
+    process = ui.owned_process(target)
+    if process is None:
+        pytest.skip("needs the harness's own UI process handle to quit and relaunch")
+
+    connect_and_wait(ssh_host)
+    scheduled = UiLog(target, RECONNECT_SCHEDULED)
+    gave_up = UiLog(target, RECONNECT_GAVE_UP)
+    drop_the_link(ssh_host, "unreachable")
+
+    wait_for_a_live_retry(scheduled)
+    assert gave_up.pending() == 0, "the ladder settled on its own before the quit"
+    establishes = count(is_establish)
+
+    ui.quit(target)
+    exit_code = process.wait(timeout=scaled_timeout(30.0))
+    assert exit_code == 0, (
+        f"the UI must end its run loop normally (exit {exit_code}); a "
+        "non-zero status means it was killed rather than dropping App"
+    )
+    assert count(is_establish) == establishes, (
+        "a timer fired after the quit was asked for"
+    )
+    # The exit path runs the tunnel's own `-O exit` on its way out, so
+    # this is a settle rather than an instant: what must not survive is
+    # an `ssh` still running once the app that spawned it is gone.
+    wait_until(
+        lambda: live_ssh_invocations() == [],
+        15.0,
+        "every ssh the quit UI owned to be gone",
+    )
+
+    # The module is not finished with this UI; every case after this one
+    # needs one alive, and `ROOST_SSH_BIN` reaches the replacement out of
+    # the same environment the first launch read it from.
+    ui.launch(target)
 
 
 # ---------------------------------------------------------------------------
