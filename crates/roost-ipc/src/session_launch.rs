@@ -61,6 +61,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::messages::{
@@ -589,6 +590,67 @@ pub(crate) async fn reap_by(child: &mut Child, deadline: Instant) {
         // `kill` is SIGKILL + reap, so the wait behind it is the one
         // the kernel is about to satisfy.
         let _ = child.kill().await;
+    }
+}
+
+/// The floor [`drain_tail`] gives a drain whose deadline is already
+/// spent — which, after a [`reap_by`] that ran out of budget, is every
+/// time.
+///
+/// Not scaled: it is a local scheduler allowance for a pipe that has
+/// already reached EOF, not a remote round trip.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(200);
+
+/// A drained stderr tail, and whether any of it was lost on the way.
+///
+/// The flag is the honest half. A caller that reads its *verdict* out of
+/// this text — which family of failure this was — needs to know when the
+/// text may be missing the line that would have decided it, so that
+/// "nothing matched" can be told apart from "we never saw it". Two
+/// things set it: a drain that ran out of time here, and the reader's
+/// own byte cap discarding leading bytes
+/// ([`crate::ssh::spawn_stderr_tail`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Tail {
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+}
+
+impl Tail {
+    /// A tail nothing could be read out of.
+    fn lost() -> Self {
+        Self {
+            text: String::new(),
+            truncated: true,
+        }
+    }
+}
+
+/// Collect a stderr tail task, bounded by `deadline` — or by
+/// [`STDERR_DRAIN_GRACE`] from now, when the deadline is already spent.
+///
+/// **Reaping a child does not close its stderr pipe.** The write end is
+/// inherited by whatever the child left behind — a remote `sh -c` that
+/// forked rather than exec'd its command, an `ssh` `ProxyCommand` helper
+/// that outlives the client it was started for — so an unbounded
+/// `tail.await` after the kill waits on *that* process instead of on our
+/// own budget: a 1s wait against a far side that slept for 10 took the
+/// whole 10, the deadline having stopped the exchange on time and the
+/// drain then given the clamp straight back.
+///
+/// The abort on expiry is what releases our read end, rather than
+/// leaving a detached reader holding it for the grandchild's life.
+pub(crate) async fn drain_tail(mut tail: JoinHandle<Tail>, deadline: Instant) -> Tail {
+    let deadline = deadline.max(Instant::now() + STDERR_DRAIN_GRACE);
+    match tokio::time::timeout_at(deadline, &mut tail).await {
+        Ok(Ok(tail)) => tail,
+        // A reader that panicked or was cancelled took its buffer with
+        // it: nothing arrived, which is the same fact an expiry reports.
+        Ok(Err(_joined)) => Tail::lost(),
+        Err(_elapsed) => {
+            tail.abort();
+            Tail::lost()
+        }
     }
 }
 

@@ -59,7 +59,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::messages::{ops, SessionBinaryIdentity, SessionIdentify};
-use crate::session_launch::{reap_by, Verdict};
+use crate::session_launch::{drain_tail, reap_by, Tail, Verdict};
 use crate::ssh::{
     classify_ssh_failure, exit_master, last_line, pick_socket_dir, scaled, SshFailure, SshTarget,
     SshTunnelOptions,
@@ -1748,13 +1748,6 @@ const ALREADY_RUNNING_BUDGET: Duration = Duration::from_secs(5);
 /// One `session.identify` over the exec chain.
 const IDENTIFY_BUDGET: Duration = Duration::from_secs(30);
 
-/// The floor [`drain_tail`] gives the stderr drain when the budget it
-/// was handed is already spent.
-///
-/// Not scaled: it is a local scheduler allowance for a pipe that has
-/// already reached EOF, not a remote round trip.
-const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(200);
-
 /// Cap on a probe exec's stdout (plan 039 §3.2). Discovery emits two
 /// `uname` fields, the remote `$HOME`, and at most one path per ladder
 /// rung.
@@ -1851,37 +1844,9 @@ impl ExecOutcome {
 struct JobChild {
     child: tokio::process::Child,
     /// The draining stderr tail, capped by [`crate::ssh`]'s reader.
-    tail: JoinHandle<String>,
+    tail: JoinHandle<Tail>,
     sink: tokio::process::ChildStdin,
     stdout: tokio::process::ChildStdout,
-}
-
-/// Collect [`JobChild::tail`], bounded by `deadline` — or by
-/// [`STDERR_DRAIN_GRACE`] from now, when the deadline is already spent.
-///
-/// **Reaping the child does not close that pipe.** Its write end is
-/// inherited by anything the child leaves behind — a remote `sh -c` that
-/// forked rather than exec'd its command, an `ssh` `ProxyCommand` helper
-/// that outlives the client — so an unbounded `tail.await` after the
-/// kill waits on *that* process instead of on our own budget. It is how
-/// a 1s [`BootstrapJob::await_gone_within`] took 10s against a far side
-/// that slept for 10: the deadline stopped the exchange on time and then
-/// the drain gave the whole clamp straight back.
-///
-/// Timing out here costs a sharper error message, never a wrong verdict:
-/// the tail only sharpens the text and lets `classify_ssh_failure`
-/// recognise a bridge that found no session, and a far side that never
-/// closed its stderr never said either. The abort is what releases our
-/// read end rather than leaving a detached task holding it.
-async fn drain_tail(mut tail: JoinHandle<String>, deadline: Instant) -> String {
-    let deadline = deadline.max(Instant::now() + STDERR_DRAIN_GRACE);
-    match tokio::time::timeout_at(deadline, &mut tail).await {
-        Ok(joined) => joined.unwrap_or_default(),
-        Err(_elapsed) => {
-            tail.abort();
-            String::new()
-        }
-    }
 }
 
 /// What an exec is fed on stdin.
@@ -2968,7 +2933,7 @@ impl BootstrapJob {
         let outcome = ExecOutcome {
             code: status.and_then(|status| status.code()),
             stdout: read?,
-            stderr: drain_tail(tail, deadline).await,
+            stderr: drain_tail(tail, deadline).await.text,
         };
         if outcome.ok() {
             write?;
@@ -3026,7 +2991,7 @@ impl BootstrapJob {
             }
             Err(error) => {
                 reap_by(&mut child, Instant::now()).await;
-                let tail = drain_tail(tail, deadline).await;
+                let tail = drain_tail(tail, deadline).await.text;
                 let code = child
                     .try_wait()
                     .ok()
@@ -3559,7 +3524,7 @@ async fn curl(
     if status.success() {
         return Ok(());
     }
-    let detail = last_line(&drain_tail(tail, deadline).await)
+    let detail = last_line(&drain_tail(tail, deadline).await.text)
         .unwrap_or_else(|| format!("curl exited {}", status.code().unwrap_or(-1)));
     Err(BootstrapError::Download(format!(
         "{} — {detail}",

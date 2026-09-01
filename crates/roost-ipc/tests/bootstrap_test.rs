@@ -520,20 +520,26 @@ impl Harness {
         path
     }
 
+    /// A symlink to the committed fixture plus a plain conf file beside
+    /// it, never a script of our own. Tests here run in parallel
+    /// threads, and an executable written while a sibling is forking
+    /// races `execve`: the fork inherits our still-open write descriptor
+    /// and the exec answers ETXTBSY on Linux. Nothing exec'd is written,
+    /// so there is no window — see the fixture's note on `$0.conf`.
     fn write_ssh_wrapper(&self, session_env: &Path) -> PathBuf {
         let path = self._root.path().join("ssh");
-        write_executable(
-            &path,
+        std::fs::write(
+            self._root.path().join("ssh.conf"),
             format!(
-                "#!/bin/sh\nFAKE_SSH_LOG={log}\nFAKE_SSH_MODE=run-remote\nFAKE_SSH_EXEC=true\n\
+                "FAKE_SSH_LOG={log}\nFAKE_SSH_MODE=run-remote\nFAKE_SSH_EXEC=true\n\
                  FAKE_SSH_SESSION_ENV={env}\nexport FAKE_SSH_LOG FAKE_SSH_MODE FAKE_SSH_EXEC \
-                 FAKE_SSH_SESSION_ENV\nexec {fixture} \"$@\"\n",
+                 FAKE_SSH_SESSION_ENV\n",
                 log = shell_quote(&self.log.display().to_string()),
                 env = shell_quote(&session_env.display().to_string()),
-                fixture = shell_quote(&fixture_path().display().to_string()),
-            )
-            .as_bytes(),
-        );
+            ),
+        )
+        .expect("write the fake ssh config");
+        std::os::unix::fs::symlink(fixture_path(), &path).expect("link the ssh wrapper");
         path
     }
 

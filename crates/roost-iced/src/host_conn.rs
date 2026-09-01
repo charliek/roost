@@ -126,6 +126,13 @@ pub(crate) struct ConnectFailure {
     /// socket that would not answer — which has no family and no remedy
     /// on the far host.
     pub(crate) family: Option<roost_ipc::ssh::SshFailure>,
+    /// Whether the stderr [`Self::family`] was classified from was
+    /// incomplete — a drain that ran out of time, or a byte cap that
+    /// discarded the leading bytes. `false` for a failure whose verdict
+    /// was not read out of a tail at all (this side's own failure, an
+    /// establish that timed out). It is here so a retry policy can
+    /// refuse to act on evidence it did not fully see.
+    pub(crate) truncated: bool,
     pub(crate) message: String,
 }
 
@@ -135,6 +142,7 @@ impl ConnectFailure {
     pub(crate) fn unclassified(message: impl Into<String>) -> Self {
         Self {
             family: None,
+            truncated: false,
             message: message.into(),
         }
     }
@@ -144,6 +152,7 @@ impl ConnectFailure {
         Self {
             message: failure.message(target),
             family: Some(failure),
+            truncated: false,
         }
     }
 }
@@ -161,6 +170,7 @@ impl From<roost_ipc::ssh::SshTunnelError> for ConnectFailure {
     fn from(error: roost_ipc::ssh::SshTunnelError) -> Self {
         Self {
             family: error.failure().cloned(),
+            truncated: error.truncated(),
             message: error.to_string(),
         }
     }
@@ -170,6 +180,7 @@ impl From<roost_ipc::ssh::VerifyError> for ConnectFailure {
     fn from(error: roost_ipc::ssh::VerifyError) -> Self {
         Self {
             family: error.failure().cloned(),
+            truncated: error.truncated(),
             // `{:#}` is what both callers printed before this type
             // existed — the anyhow chain on the socket arm, the ssh
             // error's own message on the other.
@@ -750,7 +761,9 @@ impl HostConnSet {
                 // The generation the band is already square with. A
                 // per-connection exec that fails after this point bumps
                 // past it, and that is what `apply_state` overlays.
-                entry.seen = tunnel.last_error().map_or(0, |(generation, _)| generation);
+                entry.seen = tunnel
+                    .last_error()
+                    .map_or(0, |recorded| recorded.generation);
                 entry.failure = None;
                 entry.tunnel = Some(tunnel);
                 let (label, mode) = (entry.label.clone(), entry.mode);
@@ -845,18 +858,22 @@ impl HostConnSet {
         let Some(entry) = self.ssh.get_mut(host) else {
             return;
         };
-        let Some((generation, failure)) = entry.tunnel.as_ref().and_then(|t| t.last_error()) else {
+        let Some(recorded) = entry.tunnel.as_ref().and_then(|t| t.last_error()) else {
             return;
         };
-        if generation <= entry.seen {
+        if recorded.generation <= entry.seen {
             return;
         }
-        entry.seen = generation;
-        let failure = ConnectFailure::classified(&entry.target, failure);
+        entry.seen = recorded.generation;
+        let failure = ConnectFailure {
+            truncated: recorded.truncated,
+            ..ConnectFailure::classified(&entry.target, recorded.failure)
+        };
         disconnected.reason = failure.message.clone();
         // Recorded as well as rendered: this is the *only* place a
-        // per-connection exec's family reaches the app layer, and it is
-        // the family a NotFound/NoSession offer routes off (plan 039
+        // per-connection exec's family — and whether it was read out of
+        // complete evidence — reaches the app layer, and it is the
+        // family a NotFound/NoSession offer routes off (plan 039
         // §3.5). Nothing reads it today, and the band is unchanged —
         // `section_reason` prefers a live connection's own reason, so
         // this slot is only ever consulted when there is no `HostConn`
