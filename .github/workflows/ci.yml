@@ -136,6 +136,9 @@ jobs:
               - 'mac/Resources/AppIcon.icns'
               - 'mac/AppIcon.icon/**'
               - 'mac/Resources/Roost-Iced.entitlements'
+              # Iced-only: the nested roost-session daemon (HS-4b) is
+              # signed with this file during the assemble.
+              - 'mac/Resources/roost-session.entitlements'
               # Sparkle pin (version+SHA in fetch.sh) — a bump must re-run
               # the bundle lanes that embed + sign the framework.
               - 'third_party/sparkle/**'
@@ -1169,6 +1172,71 @@ jobs:
             exit 1
           fi
           echo "OK: otool -L closure contains only /usr/lib and /System paths"
+
+          # HS-4b (plan 041 § 3.2): the host-session daemon ships inside
+          # the app — real Mach-O in Contents/MacOS/, relative symlink in
+          # Contents/Resources/bin/ (bundle-lib.sh's embed helper records
+          # which discovery rung each path serves). bundle-iced.sh
+          # self-checks the same things; this step is the independent
+          # proof that the shipped script actually did it.
+          SESSION_BIN="$APP/Contents/MacOS/roost-session"
+          { [ -f "$SESSION_BIN" ] && [ ! -L "$SESSION_BIN" ] && [ -x "$SESSION_BIN" ]; } \
+            || { echo "FAIL: $SESSION_BIN missing, not a regular file, or not executable"; exit 1; }
+          echo "OK: Contents/MacOS/roost-session is a real executable Mach-O"
+
+          SESSION_LINK="$APP/Contents/Resources/bin/roost-session"
+          # Exact target, not merely "resolves": an absolute link would
+          # work on the runner and break once the bundle is copied into
+          # /Applications or mounted from a DMG.
+          [ -L "$SESSION_LINK" ] \
+            || { echo "FAIL: $SESSION_LINK is not a symlink"; exit 1; }
+          link_target="$(readlink "$SESSION_LINK")"
+          [ "$link_target" = "../../MacOS/roost-session" ] \
+            || { echo "FAIL: $SESSION_LINK points at '$link_target', want ../../MacOS/roost-session"; exit 1; }
+          echo "OK: Contents/Resources/bin/roost-session -> ../../MacOS/roost-session"
+
+          codesign --verify --strict "$SESSION_BIN" \
+            || { echo "FAIL: codesign --verify --strict failed for $SESSION_BIN"; exit 1; }
+          echo "OK: codesign --verify --strict passed for the nested roost-session"
+
+          # …and the signature is OURS. On Apple Silicon the linker
+          # ad-hoc-signs every arm64 Mach-O, so a raw cargo artifact
+          # dropped in here would pass the strict verify above AND
+          # extract zero bytes of entitlements below. `runtime` is the
+          # only discriminator: codesign --options runtime sets it, the
+          # linker never does (it reports adhoc,linker-signed). Exact
+          # comma-delimited token match, same shape as
+          # roost_is_runtime_signed in mac/scripts/bundle-lib.sh.
+          session_sign_info=$(codesign -dvv "$SESSION_BIN" 2>&1)
+          session_flags=$(printf '%s\n' "$session_sign_info" \
+            | sed -n 's/.*flags=0x[0-9a-fA-F]*(\([^)]*\)).*/\1/p' | head -1)
+          case ",$session_flags," in
+            *,runtime,*) ;;
+            *)
+              echo "FAIL: roost-session flags are '($session_flags)' — no hardened-runtime flag, so bundle-iced.sh never signed it:"
+              printf '%s\n' "$session_sign_info"; exit 1 ;;
+          esac
+          echo "OK: roost-session carries the hardened-runtime flag (flags=($session_flags))"
+
+          # Entitlements posture: an EMPTY DICT, not "nothing" — the
+          # daemon punches no hole back through the hardened runtime
+          # (rationale in mac/Resources/roost-session.entitlements). Same
+          # extract-then-inspect technique as the app/Downloader checks
+          # above, but "no <key>" alone would be vacuous: an unsigned or
+          # merely linker-signed binary extracts to ZERO bytes and has no
+          # keys either. Require a non-empty, parseable plist whose dict
+          # is empty; the blob is dumped on failure rather than probed
+          # key by key.
+          sent="$work/roost-session-entitlements.plist"
+          codesign -d --entitlements - --xml "$SESSION_BIN" 2>/dev/null > "$sent"
+          [ -s "$sent" ] \
+            || { echo "FAIL: roost-session entitlements extraction is empty — the daemon carries no entitlements blob at all"; exit 1; }
+          plutil -lint "$sent" >/dev/null \
+            || { echo "FAIL: roost-session entitlements blob is not a parseable plist:"; cat "$sent"; exit 1; }
+          if grep -q '<key>' "$sent"; then
+            echo "FAIL: roost-session entitlements must stay an empty dict, but carry keys:"; cat "$sent"; exit 1
+          fi
+          echo "OK: roost-session signed with a real, empty entitlements dict (hardened runtime only)"
 
       - name: Run Iced bundle smoke (macOS)
         if: runner.os == 'macOS'

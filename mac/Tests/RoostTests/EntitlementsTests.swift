@@ -117,3 +117,16 @@ func roostctlHelperDropsCaptureEntitlements() throws {
         )
     }
 }
+
+// The bundled roost-session daemon (HS-4b) is signed with an EMPTY
+// entitlements dict — the rationale lives in the file's own comment.
+// Asserted here because an empty file is the easiest thing in the repo to
+// "helpfully" fill in, and the cost of that is invisible until an audit.
+@Test
+func roostSessionDaemonCarriesNoEntitlements() throws {
+    let ent = try plistDict("roost-session.entitlements")
+    #expect(
+        ent.isEmpty,
+        "roost-session.entitlements must stay an empty dict; found keys: \(ent.keys.sorted())"
+    )
+}
