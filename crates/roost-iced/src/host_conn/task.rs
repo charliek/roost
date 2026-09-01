@@ -300,6 +300,7 @@ async fn connect_loop(
         }
         previous = Some(incarnation);
 
+        let presented = held_lease.clone();
         let dialed = tokio::select! {
             biased;
             () = shutdown.requested() => None,
@@ -308,21 +309,33 @@ async fn connect_loop(
         // Only the first attempt may spawn or probe; a retry dials.
         mode = ConnectMode::Dial;
 
+        // Published here rather than on the success path, and only when
+        // the attempt actually ran: ownership moves on the wire at
+        // `session.connect`, and over ssh every attempt is a fresh task
+        // (`open_ssh` re-runs the whole ladder). A lease minted at step 2
+        // and then lost with a failed prologue would leave the *next*
+        // attempt presenting the tombstone that grant left behind — the
+        // far side answers `taken-over` and the host settles as somebody
+        // else's with no other client ever involved (plan 040 §3.7). A
+        // shutdown-cancelled select has nothing to publish and is going
+        // away regardless.
+        if dialed.is_some() && held_lease != presented {
+            if let Some(lease) = held_lease.clone() {
+                if !publish_lease(feed, incarnation, lease) {
+                    return;
+                }
+            }
+        }
+
         let ended = match dialed {
             None => ConnEnd::Shutdown,
             Some(Err(error)) => error.into(),
             Some(Ok(live)) => {
-                // Published as well as kept — [`attempt`] has already
-                // recorded it as ours. This task dies with the link, and
-                // the app side is the only place a lease can outlive the
-                // connection that minted it (plan 040 §3.7).
-                if !publish_lease(feed, incarnation, live.lease.clone())
-                    || !publish_workspace(
-                        feed,
-                        incarnation,
-                        HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
-                    )
-                    || !publish_state(feed, incarnation, machine.connected())
+                if !publish_workspace(
+                    feed,
+                    incarnation,
+                    HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
+                ) || !publish_state(feed, incarnation, machine.connected())
                 {
                     ConnEnd::FeedClosed
                 } else {
@@ -1399,6 +1412,63 @@ mod tests {
                 "lease-minted-here".to_string()
             ],
             "the retry presents the lease the failed prologue minted, not the one it started with"
+        );
+    }
+
+    /// …and over ssh it has to reach the *app*, because there is no
+    /// second attempt in this task to carry it.
+    ///
+    /// An ssh drop tears the tunnel down, so the ladder re-enters at
+    /// `open_ssh` and every attempt is a fresh task — a non-localhost
+    /// task returns instead of retrying. A lease minted at step 2 and
+    /// then lost with a failed prologue would die with the task, and the
+    /// next attempt, seeded from the outage, would present the tombstone
+    /// that grant left behind: `taken-over`, terminal, with no other
+    /// client ever involved (plan 040 §3.7). So the publication cannot
+    /// wait for a fully successful attempt.
+    #[tokio::test]
+    async fn a_lease_minted_before_a_failed_prologue_reaches_the_app_over_ssh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("granting-ssh.sock");
+        let _probed = a_session_that_grants_a_lease_then_fails(&socket, "lease-minted-here");
+
+        let mut config = config(socket, HostTransport::Ssh, ConnectMode::Dial);
+        config.held_lease = Some("lease-the-connect-replaced".into());
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let (_ops, ops_rx) = super::super::HostOps::channel();
+        run(
+            config,
+            HostIdMinter::new(),
+            ops_rx,
+            feed,
+            Arc::new(Shutdown::default()),
+        )
+        .await;
+
+        let items = feed_items(&mut rx);
+        let leases: Vec<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                EngineFeed::HostLease(_, lease) => Some(lease.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            leases,
+            vec!["lease-minted-here".to_string()],
+            "the granted lease is published exactly once, prologue or no prologue"
+        );
+        let final_state = items
+            .into_iter()
+            .filter_map(|item| match item {
+                EngineFeed::HostState(_, state) => Some(state),
+                _ => None,
+            })
+            .next_back()
+            .expect("a task publishes at least one state");
+        assert!(
+            matches!(final_state, HostConnState::Disconnected(_)),
+            "and the attempt itself still failed: {final_state:?}"
         );
     }
 

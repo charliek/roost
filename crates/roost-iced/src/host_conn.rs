@@ -1293,8 +1293,16 @@ impl HostConnSet {
             if !eligible || !reconnect::retryable(input, truncated) {
                 return;
             }
-            self.begin_outage(host);
         }
+        // Outside the gate, not inside it: this creates the entry on the
+        // drop that starts an outage *and* refreshes the lease it carries
+        // on every later one. Called only under the gate the refresh is
+        // dead code, and the case it exists for is real — an attempt
+        // whose `session.connect` was granted a lease and whose prologue
+        // then failed publishes that lease without ever reaching
+        // `Connected`, so nothing clears the outage and its lease is a
+        // tombstone from that moment on (§3.7).
+        self.begin_outage(host);
         // `HostConn::drop` publishes its own `disconnect_requested()`,
         // and a late `Dropped` can still arrive under the *same*
         // generation — which `owner_of` does not filter. So a second
@@ -2844,6 +2852,61 @@ mod tests {
                 .as_deref(),
             Some("lease-1"),
             "but the outage does, which is the whole reason it exists"
+        );
+    }
+
+    /// A second drop inside one outage carries the *second* attempt's
+    /// lease.
+    ///
+    /// The shape is the one `connect_loop` publishes a lease for without
+    /// ever reaching `Connected`: `session.connect` granted a lease — so
+    /// ownership moved on the wire and everything older is a tombstone —
+    /// and the prologue then failed. Nothing clears the outage on that
+    /// path (`Connected` is what does), so the entry survives to the next
+    /// drop and [`HostConnSet::begin_outage`] has to refresh what it
+    /// carries. Called from inside the entry-creation gate it never runs
+    /// for that drop, and the ladder goes on presenting a lease the far
+    /// side has already tombstoned: `taken-over`, terminal, with no other
+    /// client involved (plan 040 §3.7).
+    #[tokio::test]
+    async fn a_second_drop_refreshes_the_lease_the_outage_carries() {
+        let (mut set, _feed) = a_set();
+        let socket = "/nonexistent/roost-set-refresh.sock";
+        let first = a_connected_ssh_host(&mut set, socket);
+        set.apply_lease(first, "lease-1".into());
+        set.apply_state(first, dropped("the connection closed"));
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-1"),
+            "the drop that started the outage copied the lease out"
+        );
+
+        // The retry's tunnel comes up and its prologue is granted a lease
+        // before failing — no `Connected`, so the outage is still the
+        // same one.
+        assert!(retry_once(&mut set));
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from(socket),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        let second = set.mint_for("h1");
+        set.apply_lease(second, "lease-2".into());
+        set.apply_state(second, dropped("and the prologue failed"));
+
+        assert!(
+            set.outages.contains_key("h1"),
+            "the ladder is still walking the outage it started"
+        );
+        assert_eq!(
+            set.carried_lease("h1", AttemptCause::AutoReconnect)
+                .as_deref(),
+            Some("lease-2"),
+            "and the next attempt presents the lease the last one was granted"
         );
     }
 

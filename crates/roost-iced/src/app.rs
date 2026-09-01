@@ -2340,6 +2340,14 @@ impl App {
     /// one, so it goes through [`crate::host_conn::HostConnSet::open_ssh`]
     /// and reaches `connect` one feed item later — see
     /// [`crate::engine_feed::EngineFeed::HostTunnel`].
+    ///
+    /// Every dial route ends here, which is why the shutdown gate is here
+    /// too. `abandon_reconnects` rides the `ExitState` latch and so sweeps
+    /// exactly once; a bootstrap job whose success arm asks for a
+    /// reconnect, or an IPC `host.connect` serviced in a later `update`,
+    /// would otherwise establish a fresh `ControlPersist` master that
+    /// outlives the app. The two earlier guards stay where they are —
+    /// they short-circuit before doing other work.
     fn connect_saved_host(
         &mut self,
         host: &roost_engine::persistence::HostSnapshot,
@@ -2350,6 +2358,10 @@ impl App {
         use crate::host_conn::HostTransport;
         use roost_ipc::ssh::ResolvedTransport;
 
+        if self.exit_state != ExitState::Running {
+            tracing::debug!(host = %host.id, "not connecting a host during shutdown");
+            return;
+        }
         // A new attempt replaces the origin and the failure an in-flight
         // probe's question was built on, so that probe is now asking
         // about something that is no longer happening: user Connect →

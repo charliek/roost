@@ -1350,6 +1350,17 @@ impl TunnelState {
     /// watermark, and a genuinely newer classified family then reads as
     /// stale: classified@7, `Transport`@9, classified@8 completing in
     /// that order would report @7's family and drop @8's.
+    ///
+    /// **And `truncated` is not merely along for the ride.** Two
+    /// `Transport`s are of equal specificity, so a clean one settles
+    /// newest-wins over a truncated one and clears the flag that says
+    /// "the evidence was cut" — turning a tail that may have held a
+    /// `ChangedHostKey` back into a retryable drop (plan 040 §3.3 C). So
+    /// the fallthrough may not *clear* the flag; only a classified
+    /// family, which carries its own evidence, replaces it outright. Not
+    /// a blanket sticky bit: `last_error` is never reset for a tunnel's
+    /// life, so `|=` would make one cut tail refuse every later failure
+    /// on that tunnel for good.
     fn record(&self, generation: u64, failure: SshFailure, truncated: bool) {
         tracing::warn!(
             host = %self.target,
@@ -1376,7 +1387,7 @@ impl TunnelState {
         if more_specific || (same_specificity && generation > recorded.family_generation) {
             recorded.family_generation = generation;
             recorded.failure = failure;
-            recorded.truncated = truncated;
+            recorded.truncated = truncated || (incoming_is_fallthrough && recorded.truncated);
         }
     }
 }
@@ -2812,6 +2823,39 @@ mod tests {
         let recorded = recorded(&state).expect("recorded");
         assert_eq!(recorded.failure, SshFailure::Transport(Some("late".into())));
         assert!(recorded.truncated);
+    }
+
+    /// The fallthrough may advance the family and still not clear
+    /// `truncated`.
+    ///
+    /// Two `Transport`s are of equal specificity, so a clean concurrent
+    /// exec settles newest-wins over one whose tail was cut — and the cut
+    /// tail may have held a `ChangedHostKey` nobody could read. Clearing
+    /// the flag there hands the ladder a ten-attempt retry against
+    /// evidence that was never seen (plan 040 §3.3 C). A classified
+    /// family is different: it carries its own evidence, so its flag
+    /// replaces the stored one outright.
+    #[test]
+    fn a_transport_never_clears_a_truncation_a_classified_family_does() {
+        let state = recording_state();
+        state.record(7, SshFailure::Transport(None), true);
+        state.record(8, SshFailure::Transport(Some("reset".into())), false);
+        let cut = recorded(&state).expect("a recorded failure");
+        assert_eq!(cut.failure, SshFailure::Transport(Some("reset".into())));
+        assert!(
+            cut.truncated,
+            "a fallthrough carries no evidence of its own: {cut:?}"
+        );
+
+        let classified = recording_state();
+        classified.record(7, SshFailure::Transport(None), true);
+        classified.record(8, SshFailure::Auth, false);
+        let recorded = recorded(&classified).expect("a recorded failure");
+        assert_eq!(recorded.failure, SshFailure::Auth);
+        assert!(
+            !recorded.truncated,
+            "the classified family was read out of a whole tail: {recorded:?}"
+        );
     }
 
     /// The pre-existing rule, unchanged: connections overlap, so
