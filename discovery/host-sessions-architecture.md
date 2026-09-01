@@ -685,32 +685,40 @@ deviation is the client-notification step of Stop, noted inline.
 
 ## 10. SSH transport (HS-3)
 
-**Shipped in HS-3 slice 1 (plan 038).** The transport described below
-landed as designed, with one detail sharper than sketched here: the
-scratch directory holding the generated `ssh_config`, the
-`ControlMaster` control socket, and the local bridge socket is claimed
-per connect **attempt** (`roost-ssh-<host_id>-<pid>-<seq>`), not per
-saved host — a fresh attempt sweeps its host's older directories first
-(reclaiming this process's own outright, probing another process's
-`bridge.sock` before touching it, fail-safe on anything live or
-unclassifiable) rather than one directory being reused or fought over
-across overlapping lifecycle paths. See
+**Shipped in full: HS-3 slice 1, transport (plan 038); HS-3 slice 2,
+bootstrap (plan 039).** The transport described below landed as
+designed, with one detail sharper than sketched here: the scratch
+directory holding the generated `ssh_config`, the `ControlMaster`
+control socket, and the local bridge socket is claimed per connect
+**attempt** (`roost-ssh-<host_id>-<pid>-<seq>`), not per saved host —
+a fresh attempt sweeps its host's older directories first (reclaiming
+this process's own outright, probing another process's `bridge.sock`
+before touching it, fail-safe on anything live or unclassifiable)
+rather than one directory being reused or fought over across
+overlapping lifecycle paths. See
 [`docs/development/host-sessions.md` → Transport: SSH hosts](../docs/development/host-sessions.md#transport-ssh-hosts)
 for the shipped shape and
 [`docs/reference/paths.md`](../docs/reference/paths.md#ssh-scratch-directories)
-for the exact paths. What remains design here is the **bootstrap**
-half below (detect/install/verify a remote `roost-session` — not yet
-built). OSC 52 clipboard policy over SSH is settled (writes forward to
-the attached client's own machine under its `clipboard-write` setting;
-reads stay dropped everywhere, SSH included — [`config.md`](../docs/reference/config.md#clipboard-write));
-remote image paste stays deferred (roadmap open questions).
+for the exact paths. The **bootstrap** half sketched below (detect/
+install/verify a remote `roost-session`) also shipped, considerably
+more elaborate than the sketch — a whole candidate ladder rather than
+two rungs, a staged verify-before-commit install with incumbent
+backup/restore, and an install→stop→await-gone→start upgrade order
+the sketch's "install, then re-verify" glossed over; see
+[`docs/development/host-sessions.md` → Bootstrap: install/upgrade over SSH](../docs/development/host-sessions.md#bootstrap-installupgrade-over-ssh)
+for what actually landed. OSC 52 clipboard policy over SSH is settled
+(writes forward to the attached client's own machine under its
+`clipboard-write` setting; reads stay dropped everywhere, SSH included
+— [`config.md`](../docs/reference/config.md#clipboard-write)); remote
+image paste stays deferred (roadmap open questions).
 
 Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 
 ```text
  client ── UDS ── local bridge ── ssh -T host 'sh -c "…exec roost-session client-bridge"'
-                                        │ (the shipped remote command prefers
-                                        │  $HOME/.local/bin/roost-session, then PATH)
+                                        │ (the shipped remote command tries an
+                                        │  eight-rung candidate ladder — see
+                                        │  the bootstrap section linked above)
                                         │ (per accepted connection,
                                         │  shared ControlMaster)
                               far side: connect to local session UDS,
@@ -729,15 +737,19 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 - The stdio bridge is CI-able without sshd: run the far-side bridge
   subcommand over local pipes and drive the same protocol — a
   cheap lane that keeps the transport tested outside the shed.
-- Bootstrap on first connect: `uname` platform detect → candidate
-  paths (login-shell `command -v`, then `/bin/sh`; `~/.local/bin`,
-  brew/nix dirs) → require version **and** protocol match → install
-  by streaming to `dest.tmp.$$` via `tee`, `chmod`, `mv`, re-verify
-  → warn (don't edit dotfiles) if not on PATH. Non-interactive runs
-  fail rather than mutate a host. Cross-platform (Mac client →
-  Linux host) installs from the matching release asset; same-build
-  snapshot compatibility makes exact version match mandatory, which
-  the bootstrap enforces anyway.
+- Bootstrap on first connect, as shipped: `uname` platform detect →
+  an eight-rung candidate ladder (one definition generating both the
+  probe's discovery script and the transport's exec chain) → an
+  **install** rule requiring `app_version`, `session_protocol` and
+  `libghostty_build` to match exactly — deliberately stricter than the
+  unchanged runtime attach gate (protocol + payload kind + build, no
+  `app_version`) — → staged install to `dest.tmp.$$` via `tee`,
+  verify-before-commit, incumbent backed up and restored on a
+  post-commit failure → warn (don't edit dotfiles) if not on PATH.
+  Non-interactive runs (`roostctl`, IPC-originated connects) never
+  prompt and never mutate. Cross-platform (Mac client → Linux host)
+  installs from a checksum-verified release asset, on stable tags
+  only — a prerelease client never auto-downloads.
 
 ## 11. Failure modes
 

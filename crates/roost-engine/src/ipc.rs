@@ -2810,6 +2810,12 @@ async fn dispatch(
         }
         ops::APP_KEYBIND_DISPATCH => {
             let p: AppKeybindDispatchParams = decode(params)?;
+            if p.action != "paste" {
+                return Err(HandlerError::invalid_param(format!(
+                    "action must be \"paste\" (got {:?})",
+                    p.action
+                )));
+            }
             h.ui_call(|reply| UiRequest::AppKeybindDispatch {
                 action: p.action,
                 reply,

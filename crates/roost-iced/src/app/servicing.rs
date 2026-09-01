@@ -486,15 +486,17 @@ fn macos_test_gated<T>(
 /// (`close_tab`, `new_tab`, `close_project`, `copy`, …) would hand an
 /// arbitrary IPC client a way to close a live terminal, mutate workspace
 /// state, or write the system clipboard, and is refused before
-/// `dispatch_keybind_action` ever sees it.
+/// `dispatch_keybind_action` ever sees it. `ipc.rs`'s dispatcher already
+/// rejects a non-`"paste"` action as `invalid-param` ahead of the UI
+/// round trip (mirroring `app.dialog_answer`'s `action` check); this is
+/// the backstop that keeps the restriction true even if this function is
+/// ever called some other way.
 fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
     if action != "paste" {
-        return Err(format!(
-            "invalid-param: action must be \"paste\", got {action:?}"
-        ));
+        return Err(format!("action must be \"paste\", got {action:?}"));
     }
     KeybindAction::from_name(action)
-        .ok_or_else(|| "invalid-param: \"paste\" did not resolve to a KeybindAction".to_string())
+        .ok_or_else(|| "\"paste\" did not resolve to a KeybindAction".to_string())
 }
 
 impl App {

@@ -1,10 +1,10 @@
 # Host sessions — roadmap
 
 Status: **roadmap, in flight** — direction agreed 2026-08-26; HS-0,
-HS-1 (plans 035 + 036), and HS-2 (plan 037, PR #374) have shipped;
-HS-3's transport slice (plan 038, C1-C6) has shipped too, and its
-bootstrap slice (detect/install/verify a remote `roost-session`) is
-next. This refines [`host-sessions.md`](host-sessions.md) (the
+HS-1 (plans 035 + 036), HS-2 (plan 037, PR #374), and HS-3 in full —
+transport (plan 038, C1-C6) and bootstrap (plan 039, detect/install/
+verify a remote `roost-session`) — have shipped; HS-4 is next. This
+refines [`host-sessions.md`](host-sessions.md) (the
 discovery note, which stays the rationale document) into an ordered set
 of milestones with pinned design decisions. Per-milestone implementation
 plans are written when a milestone starts; this file records the
@@ -258,8 +258,16 @@ land (post-HS-3). Lifecycle practices adopted from Herdr:
 
 ### D9 — SSH transport and bootstrap (HS-3)
 
-**Status: the transport slice shipped as plan 038 (PR #377); the
-bootstrap slice below is still open.**
+**Status: shipped — the transport slice as plan 038 (PR #377), the
+bootstrap slice below as plan 039.** The bullets below describe
+bootstrap as originally scoped; see
+[`docs/development/host-sessions.md` → Bootstrap: install/upgrade over SSH](../docs/development/host-sessions.md#bootstrap-installupgrade-over-ssh)
+for what actually landed. The shipped rule is sharper than "version and
+protocol must both match" below: the **install** rule compares all
+three of `app_version`, `session_protocol` and `libghostty_build`
+byte-for-byte, deliberately stricter than the unchanged runtime attach
+gate (protocol + payload kind + build, no `app_version`) — see that
+section for why the two are allowed to disagree.
 
 - **Stdio-mux** (Herdr's shape): local UDS bridged to a far-side
   `roost-session client-bridge` process over ssh stdin/stdout — one
@@ -491,30 +499,37 @@ its first live use is HS-3.
 
 ### HS-3 — SSH remote host (the target payoff)
 
-**Transport slice shipped (plan 038, C1-C6).** The bullets below
-describe HS-3 as originally scoped; see
+**Shipped in full: transport (plan 038, C1-C6) and bootstrap (plan
+039).** The bullets below describe HS-3 as originally scoped; see
 [`docs/development/host-sessions.md` → Transport: SSH hosts](../docs/development/host-sessions.md#transport-ssh-hosts)
+and
+[`docs/development/host-sessions.md` → Bootstrap: install/upgrade over SSH](../docs/development/host-sessions.md#bootstrap-installupgrade-over-ssh)
 for what actually landed and
 [`docs/guides/host-sessions.md`](../docs/guides/host-sessions.md#adding-a-remote-host-over-ssh)
-for the user-facing shape. What shipped: D9's stdio-mux transport (a
-per-connection `ssh -T` exec over a shared private `ControlMaster`,
-`BatchMode=yes` — key/agent auth only, no password/2FA this slice),
-the target classifier (`workbox` / `user@host` / `ssh://user@host:port`
-in the palette's Add Host dialog and `roostctl host add --target`), the
-six-family classified-failure surface (changed/unknown host key, auth,
-no session, `roost-session` not found, transport — reaching the sidebar
-band and an attended attempt's toast), `--verify`'s mux-less probe over
-SSH, and `session.set_focus` (closing the HS-2 "session doesn't know
-what a client is looking at" gap, folded into this plan as C6). What
-did **not** ship in this slice: the **bootstrap** half of D9
-(auto-detect/install/verify a remote `roost-session` binary — a target
-still has to have `roost-session` reachable on its non-interactive PATH
-already) and SSH auto-reconnect (still manual, as originally scoped
-below).
+for the user-facing shape. What the transport slice shipped: D9's
+stdio-mux transport (a per-connection `ssh -T` exec over a shared
+private `ControlMaster`, `BatchMode=yes` — key/agent auth only, no
+password/2FA this slice), the target classifier (`workbox` /
+`user@host` / `ssh://user@host:port` in the palette's Add Host dialog
+and `roostctl host add --target`), the six-family classified-failure
+surface (changed/unknown host key, auth, no session, `roost-session`
+not found, transport — reaching the sidebar band and an attended
+attempt's toast), `--verify`'s mux-less probe over SSH, and
+`session.set_focus` (closing the HS-2 "session doesn't know what a
+client is looking at" gap, folded into that plan as C6). What the
+bootstrap slice then shipped: the eight-rung candidate ladder (one
+definition generating both the probe and the exec chain), the probe
+that classifies `Compatible` / `Mismatch` / `Missing` over a job-scoped
+`ControlMaster`, the consent-gated install (staged, verify-before-
+commit, incumbent backed up and restored on failure) sourced from a
+local override, this client's own sibling binary, or a checksum-
+verified release-asset download, the install→stop→await-gone→start→
+verify upgrade order, and the in-app offers on the NotFound/NoSession/
+NeedsRestart dialogs. SSH auto-reconnect remains manual, as originally
+scoped below (HS-4).
 
 - Palette accepts `workbox` / `user@host` / `ssh://…`; D9 transport
-  and bootstrap. **Transport shipped; bootstrap not yet built** — see
-  above.
+  and bootstrap. **Both shipped** — see above.
 - Disconnect vs Stop unchanged over SSH; reattach command surfaced
   on disconnect.
 - Remote clipboard policy decided (OSC 52 to the attached client's
@@ -535,12 +550,15 @@ that, the live criterion: Mac iced app connects to the shed VM —
 native tabs drive PTYs running in the VM; quit the Mac app, agents
 in the VM keep running; reconnect shows the same shells. A real
 Linux box run is supporting evidence, not the acceptance. **The
-automated lanes are met by the transport slice** — the pipes-based
-bridge lane in the required `session-e2e` job plus a fake-ssh UI
-lane in the Linux iced e2e cells (plan 038 C5); CI still has no
-sshd, so the shed-sshd checklist and the live Mac-to-shed criterion
-are exercised as plan 038's manual verification, and bootstrap
-verify waits on the bootstrap slice above.
+automated lanes are met by both slices** — the transport's pipes-based
+bridge lane in the required `session-e2e` job plus a fake-ssh UI lane
+in the Linux iced e2e cells (plan 038 C5); the bootstrap slice's own
+`cargo test -p roost-ipc` suite (hermetic fake-ssh `run-remote` mode,
+no sshd, no network) and its `test_host_bootstrap.py` UI lane riding
+the same fake-ssh cells (plan 039 C3/C6). CI still has no sshd, so the
+shed-sshd checklist and the live Mac-to-shed criterion (now including
+an end-to-end install against a shed-built binary) are exercised as
+manual verification for both plans.
 
 ### HS-4 — Make the primitive feel inevitable
 
