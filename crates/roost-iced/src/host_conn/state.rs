@@ -230,16 +230,38 @@ impl HostConnState {
 ///
 /// The jitter is supplied rather than drawn so the cap and the growth
 /// are testable; the connection task passes a real random each time.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// The base and the ceiling are per-ladder rather than module constants
+/// because two ladders want different first delays and the same growth:
+/// [`BACKOFF_BASE`] is right for probing a unix socket on this machine
+/// and wrong for a TCP + auth handshake (the SSH reconnect ladder builds
+/// its own). [`Default`] is the localhost pair.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Backoff {
     attempt: u32,
+    base: Duration,
+    cap: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new(BACKOFF_BASE, BACKOFF_CAP)
+    }
 }
 
 impl Backoff {
+    pub(crate) fn new(base: Duration, cap: Duration) -> Self {
+        Self {
+            attempt: 0,
+            base,
+            cap,
+        }
+    }
+
     /// The delay for the next attempt, and the counter advances.
     ///
     /// `jitter` is clamped to `0.0..=1.0` and spreads the delay over
-    /// `[0.5, 1.0] * base * 2^attempt`, capped at [`BACKOFF_CAP`].
+    /// `[0.5, 1.0] * base * 2^attempt`, capped at this ladder's `cap`.
     /// Full-jitter-down-to-half rather than full-jitter-to-zero: a
     /// storm of clients must spread out, but a single client must not
     /// spin on a socket that is not there.
@@ -253,16 +275,17 @@ impl Backoff {
         // and a client that has been retrying for hours must still get
         // the ceiling rather than a panic.
         let scale = 1u32.checked_shl(self.attempt.min(31)).unwrap_or(u32::MAX);
-        let raw = BACKOFF_BASE
+        let raw = self
+            .base
             .checked_mul(scale)
-            .unwrap_or(BACKOFF_CAP)
-            .min(BACKOFF_CAP);
+            .unwrap_or(self.cap)
+            .min(self.cap);
         self.attempt = self.attempt.saturating_add(1);
         raw.mul_f64(0.5 + 0.5 * jitter)
     }
 
     /// A successful connect clears the ladder: the next drop starts over
-    /// at [`BACKOFF_BASE`], not wherever the last outage left off.
+    /// at the base delay, not wherever the last outage left off.
     pub(crate) fn reset(&mut self) {
         self.attempt = 0;
     }
@@ -634,6 +657,39 @@ mod tests {
                 "{jitter} produced {delay:?}"
             );
         }
+    }
+
+    /// Parameterizing the base and the cap must not move localhost's
+    /// ladder: the default pair is still 250ms doubling to 30s, spelled
+    /// as literals so a stray edit to either constant is caught here
+    /// rather than in a reconnect that suddenly takes a minute.
+    #[test]
+    fn the_default_ladder_is_still_localhosts_250ms_to_30s() {
+        let mut backoff = Backoff::default();
+        assert_eq!(backoff.next_delay(1.0), Duration::from_millis(250));
+        assert_eq!(backoff.next_delay(1.0), Duration::from_millis(500));
+        for _ in 0..20 {
+            backoff.next_delay(1.0);
+        }
+        assert_eq!(backoff.next_delay(1.0), Duration::from_secs(30));
+    }
+
+    /// A ladder built with its own pair grows off that base and settles
+    /// on that ceiling — the seam the SSH reconnect policy needs.
+    #[test]
+    fn a_constructed_ladder_uses_the_base_and_cap_it_was_given() {
+        let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(4));
+        let delays: Vec<Duration> = (0..5).map(|_| backoff.next_delay(1.0)).collect();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(4),
+                Duration::from_secs(4),
+            ]
+        );
     }
 
     #[test]

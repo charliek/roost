@@ -77,6 +77,7 @@ use roost_ui_model::theme::Theme;
 
 pub(crate) mod mirror;
 pub(crate) mod queue;
+pub(crate) mod reconnect;
 pub(crate) mod restart;
 pub(crate) mod state;
 pub(crate) mod task;
