@@ -682,6 +682,13 @@ deviation is the client-notification step of Stop, noted inline.
   on both platforms at HS-3.
 - Reconnect/backoff: on connection loss, host marked disconnected
   with a retry affordance; automatic retry only for localhost.
+  **Superseded by HS-4 slice 1 (plan 040, shipped):** a saved SSH host
+  now gets the same kind of self-scheduled retry once it has actually
+  reached `Connected` — its own base delay and ceiling, giving up after
+  10 attempts and settling rather than retrying forever. Launch-time
+  reconnect stays localhost-only, unchanged. See
+  [`docs/development/host-sessions.md` → The lease/takeover lifecycle](../docs/development/host-sessions.md#the-leasetakeover-lifecycle)
+  for the shipped rule.
 
 ## 10. SSH transport (HS-3)
 
@@ -766,7 +773,7 @@ Stdio-mux, Herdr's shape — no remote socket forwarding to manage:
 | Session crash | Children die; layout persisted; client shows host disconnected; reconnect = fresh shells, same layout. |
 | Client crash / quit | Session unaffected (this is the feature). |
 | Client disconnect between handshake and READY | Server aborts the forwarder and discards the attach token; no partial state. |
-| SSH drop | Host disconnected; explicit reconnect (auto for SSH considered in HS-4). |
+| SSH drop | **Superseded by HS-4 slice 1 (plan 040, shipped):** host disconnected, and auto-retried on the same kind of jittered capped backoff `localhost` already had — once that host had actually reached `Connected` before the drop. Ten attempts, then it settles and ↻ Reconnect is the recovery; a changed/unknown host key, a refused login, or a session that's actually gone settle immediately instead of retrying. |
 | Stale socket after crash | Connect-probe → unlink → bind. `(dev,ino)` guard prevents cross-deletion. |
 | Second client connects | Takeover: **all** prior-client connections closed (control included) with a labeled envelope/ERROR; stale ops get `taken-over`. |
 

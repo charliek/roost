@@ -44,6 +44,16 @@ toolchain move — putting the snapshot API in reach.
    require an explicit Connect each launch (revisit in HS-4). Users
    who never connect a host see zero change (Hosts section hidden
    until the first connect).
+   **Revisited by HS-4 slice 1 (plan 040, shipped):** the rule above
+   stands exactly as written, narrowed to *launch* — an SSH host still
+   never auto-connects when Roost opens. What HS-4 slice 1 changed is
+   the *mid-session drop*: a saved SSH host that has actually reached
+   `Connected` once now auto-retries on its own capped backoff (1s
+   base, 30s ceiling, giving up and settling after 10 attempts) before
+   ↻ Reconnect becomes the only path back — the same shape `localhost`
+   already had for a drop. See
+   [`docs/development/host-sessions.md`](../docs/development/host-sessions.md#the-leasetakeover-lifecycle)
+   for the shipped rule.
 5. **Roost.app (Swift) is untouched.** The Mac client for host
    sessions is the iced Mac app. Whether the Swift app ever grows a
    host backend is downstream of the mac-iced direction question in
@@ -250,6 +260,13 @@ land (post-HS-3). Lifecycle practices adopted from Herdr:
   cleanly (architecture §4.1). Independent per-client viewports are
   HS-4.
 - Localhost auto-reconnects on launch once opted in; SSH is explicit.
+  **Narrowed to launch, and stands there unchanged** — an SSH host
+  still never auto-connects when Roost opens. **HS-4 slice 1 (plan
+  040, shipped)** revisited the *mid-session drop* instead: a saved
+  SSH host that reached `Connected` at least once now auto-retries a
+  drop on its own capped backoff, settling after 10 attempts, exactly
+  as localhost already did. See
+  [`docs/development/host-sessions.md`](../docs/development/host-sessions.md#the-leasetakeover-lifecycle).
 - Local in-process tabs and host tabs are separate worlds; no
   migration in the MVP.
 - Saved hosts (`{id, label, target, last_connected}`) live in the
@@ -565,7 +582,9 @@ manual verification for both plans.
 Only after HS-3 is boring — and explicitly a *bucket of separate
 follow-on plans*, not one milestone (each item below has its own
 architecture and risk): independent per-client viewports (replacing
-takeover); auto-reconnect for chosen SSH hosts; "Move tab to host";
+takeover); auto-reconnect for chosen SSH hosts (**slice 1 shipped as
+plan 040** — every SSH host gets it once connected, not a per-host
+opt-in; see D8); "Move tab to host";
 a Mac `roost-session` build for Mac-local persist (cheap in code,
 real packaging scope); second-window-as-second-client if the
 multi-window question becomes live. Porcelain-heavy; sequenced by
