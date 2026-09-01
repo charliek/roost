@@ -242,6 +242,26 @@ fn host_picker_frame(hosts: &[host_verbs::HostRow<'_>]) -> palette::PaletteFrame
     palette::PaletteFrame::new(HOST_PICKER_FRAME_ID, "Create on…", items)
 }
 
+/// Who the seeded row's connect is asked for by.
+///
+/// The activation's own origin, never a literal `User` — named here
+/// rather than spelled at the call site so the rule survives as
+/// something a test can hold on to, the way
+/// [`App::IPC_CONNECT_ORIGIN`](super::App::IPC_CONNECT_ORIGIN) does for
+/// `host.connect`. `Connect` earned that rule the hard way (plan 039
+/// §3.5: a modal is never raised at a machine, and `palette.activate`
+/// is reachable from `roostctl`); `Connect Host: localhost` is the same
+/// row family one verb over, and hardcoding `User` here made it the one
+/// that could still lie about who asked.
+///
+/// It is latent today, not live: the seed's target is `localhost`,
+/// which classifies to a local session, and only the ssh branch of
+/// `connect_saved_host` reads the origin at all. That is a property of
+/// the target, not of this row — so it is not something to lean on.
+fn seed_connect_origin(origin: crate::host_conn::RequestOrigin) -> crate::host_conn::RequestOrigin {
+    origin
+}
+
 fn provider_palette_frame(providers: &[provider::Provider]) -> palette::PaletteFrame {
     palette::PaletteFrame::new(
         "custom",
@@ -1560,7 +1580,7 @@ impl App {
                 self.host_add_requested(
                     host_verbs::SEED_LABEL,
                     crate::host_conn::LOCALHOST_TARGET,
-                    Some(crate::host_conn::RequestOrigin::User),
+                    Some(seed_connect_origin(origin)),
                 )
                 .map_err(|error| error.to_string())?;
             }
@@ -2151,6 +2171,33 @@ mod tests {
             App::IPC_CONNECT_ORIGIN,
             "both IPC doors onto a Connect answer the same way"
         );
+    }
+
+    /// The same rule, one verb over. The seeded `Connect Host:
+    /// localhost` row saves and connects in one gesture, and it was the
+    /// one activation that told `host_add_requested` a machine was a
+    /// person — a hardcoded `User` where the threaded origin was
+    /// already in hand.
+    #[test]
+    fn the_seeded_connect_carries_the_activation_that_asked_for_it() {
+        use crate::host_conn::RequestOrigin;
+        assert_eq!(
+            seed_connect_origin(App::CLICK_ACTIVATION_ORIGIN),
+            RequestOrigin::User,
+            "a click is a person, and stays one"
+        );
+        assert_eq!(
+            seed_connect_origin(App::IPC_ACTIVATION_ORIGIN),
+            RequestOrigin::Ipc,
+            "and palette.activate over the socket stays non-interactive"
+        );
+        for origin in [RequestOrigin::User, RequestOrigin::Ipc] {
+            assert_eq!(
+                seed_connect_origin(origin),
+                origin,
+                "the seed reports who actually asked: {origin:?}"
+            );
+        }
     }
 
     #[test]

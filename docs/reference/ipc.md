@@ -1076,7 +1076,7 @@ Request: `{"params": {}}`. Response:
   "title": "Install roost-session on workbox?",
   "body": "roost-session 0.0.19 (ghostty-abcdef0…) will be installed to ~/.local/bin/roost-session on workbox, from this Roost's own roost-session.",
   "buttons": ["Cancel", "Install"],
-  "host": "workbox"
+  "host": "3f9a2b7c1d4e4f5a"
 }
 ```
 
@@ -1085,8 +1085,11 @@ or absent (with every other field defaulted/empty) when no host modal
 is open. `variant` is present only for `"bootstrap"` —
 `"install" | "update" | "start"` — and `null`/absent otherwise.
 `buttons` lists every button in render order, the dismissing one
-first, exactly as the card draws them. `host` names the saved host the
-dialog is about, where it is about one.
+first, exactly as the card draws them. `host` is the saved host's
+**id** — the opaque hex `host.add` minted and `host.list` reports, the
+same value `host.connect` takes — not its label, even though the
+rendered `title` and `body` above interpolate the label. Absent when
+the dialog is not about a saved host.
 
 `app.dialog_answer` presses the visible modal's primary button, or
 dismisses it — through the same production handlers a real click or

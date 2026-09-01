@@ -1983,6 +1983,27 @@ impl App {
                 self.clipboard.start_next()
             }
             ClipboardReadCompletion::Paste { tab, target, value } => {
+                // The frame can freeze *during* the read: the guard in
+                // `enqueue_tab_paste` ran before the clipboard was
+                // touched, and a takeover or a `session.stop` landing in
+                // that window would otherwise deliver these bytes into a
+                // frame nothing is reading — issue #376's bug, reached
+                // by a third door. Re-asked here, at the last moment
+                // before the write.
+                //
+                // Toasted rather than dropped silently: the read already
+                // happened, so the user's paste is spent either way, and
+                // the other two routes answer a refusal with this exact
+                // sentence. A paste that vanishes without a word is the
+                // complaint #376 is about, and the frozen-frame banner
+                // says what the host is doing, not what became of the
+                // keystroke.
+                if let Some(frozen) = self.frozen_host_frame_for(tab) {
+                    let refusal = frozen.paste_refusal();
+                    tracing::info!(?tab, request_id, %refusal, "paste refused: the frame froze while the clipboard was being read");
+                    self.set_status(refusal.to_string());
+                    return self.clipboard.start_next();
+                }
                 let Some(terminal) = self.tabs.get(&tab) else {
                     tracing::debug!(?tab, request_id, "discarded paste for a closed tab");
                     return self.clipboard.start_next();
@@ -1996,7 +2017,21 @@ impl App {
     /// A clipboard image probe reported back. Two pastes racing produce
     /// two temp files and two pastes — tolerated: each one is what the
     /// user asked for, and the file the loser wrote is still theirs.
+    ///
+    /// The probe is a second async hop past the clipboard read, so it
+    /// re-asks the frozen-frame question for the same reason
+    /// [`Self::clipboard_read_completed`] does. Logged rather than
+    /// toasted: this arm has no `&mut self` to set a status with, and
+    /// the text read that spawned the probe already answered the user.
     pub fn paste_image_materialized(&self, tab: TabKey, path: Option<&str>) {
+        if let Some(frozen) = self.frozen_host_frame_for(tab) {
+            tracing::info!(
+                ?tab,
+                refusal = frozen.paste_refusal(),
+                "discarded an image paste for a frozen host frame"
+            );
+            return;
+        }
         deliver_paste_image(&self.tabs, tab, path);
     }
 

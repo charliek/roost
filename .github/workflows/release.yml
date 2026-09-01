@@ -21,7 +21,8 @@ name: Release
 #
 # The Release is created as a DRAFT and stays one until `publish-release`
 #   flips it, after all eight assets above are attached, plausibly sized (the
-#   two .sha256 sidecars use a much lower floor — they're tiny by design) and
+#   two .sha256 sidecars are tiny by design, so their floor is the smallest
+#   `sha256sum` record their reader accepts, not 1 MiB) and
 #   named for the tag. Publishing up front let two things go wrong: a failed
 #   build left a public, empty release behind, and apt-charliek could consume
 #   it — its collect-debs.sh walks releases newest-first and only *warns*
@@ -966,12 +967,13 @@ jobs:
           # multi-megabyte, and a truncated upload lands somewhere above
           # zero, so `> 0` would wave through exactly the corruption worth
           # catching. The two `.sha256` sidecars are NOT exempted from a size
-          # check — they're just tiny by design: a `sha256sum` two-field line
-          # is `<64 hex>  <filename>\n`, so 64 bytes is a floor that still
-          # catches an empty or truncated checksum file without rejecting a
-          # real one.
+          # check — they're just tiny by design, and their floor is derived
+          # per asset below rather than being a constant here: a bare 64-byte
+          # hash is not a `sha256sum` record at all (no filename field), and
+          # `parse_checksum_file` on the connecting client
+          # (crates/roost-ipc/src/bootstrap.rs) rejects it — so a flat 64
+          # would publish a sidecar the feature it exists for cannot use.
           min_bytes=1048576
-          min_bytes_checksum=64
           fail=0
           # Space-separated, then split by IFS. No heredoc: its terminator has
           # to sit at column 0, which would end this YAML block scalar. None of
@@ -1031,8 +1033,18 @@ jobs:
           for expected in ${expected_names}; do
             check_asset "${expected}" "${min_bytes}"
           done
+          # The sidecar's floor is the smallest record its reader accepts:
+          # 64 hex digits, at least one separator, and the bare asset
+          # filename — which is what the sidecar is named after, so the floor
+          # follows the name. `tr` above substitutes one character for one
+          # character, so the sanitized name is the same length as the raw
+          # one it was built from. sha256sum's real output sits two bytes
+          # higher (it separates with two spaces and ends with a newline);
+          # the floor stays at the parser's minimum so a legitimate variant
+          # cannot fail a release.
           for expected in ${checksum_names}; do
-            check_asset "${expected}" "${min_bytes_checksum}"
+            asset="${expected%.sha256}"
+            check_asset "${expected}" "$((64 + 1 + ${#asset}))"
           done
 
           # Reject anything else on the release. A reused draft from an earlier

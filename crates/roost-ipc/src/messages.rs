@@ -735,7 +735,9 @@ pub struct AppDialogDumpResult {
     /// Every button on the card, in render order (the dismissing one
     /// first, as the panel draws it).
     pub buttons: Vec<String>,
-    /// The saved host the dialog is about, where it is about one.
+    /// The saved host's **id** — not its label, which is what the
+    /// rendered `title`/`body` interpolate. `None` when the dialog is
+    /// not about a saved host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
 }

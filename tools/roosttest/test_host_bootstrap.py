@@ -892,9 +892,13 @@ def test_missing_binary_offers_install_and_attaches_after_confirm(
     assert bootstrap_host.label in dump["title"] or bootstrap_host.label in dump["body"], dump
     # From where — named honestly, never masked as github.com, since the
     # asset base is overridden to the loopback fixture server.
-    assert "downloaded from" in dump["body"], dump
+    assert "the release at" in dump["body"], dump
     assert "checksum-verified" in dump["body"], dump
     assert "127.0.0.1" in dump["body"], dump
+    # The composition reads as one sentence: the template contributes the
+    # preposition, the source arm a noun phrase. "from downloaded from"
+    # shipped once and only a rendered dialog showed it.
+    assert "from downloaded from" not in dump["body"], dump
     assert dump["buttons"] == ["Cancel", "Install"], dump
 
     answer(roost, "confirm")

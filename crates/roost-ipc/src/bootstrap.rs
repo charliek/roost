@@ -1748,6 +1748,13 @@ const ALREADY_RUNNING_BUDGET: Duration = Duration::from_secs(5);
 /// One `session.identify` over the exec chain.
 const IDENTIFY_BUDGET: Duration = Duration::from_secs(30);
 
+/// The floor [`drain_tail`] gives the stderr drain when the budget it
+/// was handed is already spent.
+///
+/// Not scaled: it is a local scheduler allowance for a pipe that has
+/// already reached EOF, not a remote round trip.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(200);
+
 /// Cap on a probe exec's stdout (plan 039 §3.2). Discovery emits two
 /// `uname` fields, the remote `$HOME`, and at most one path per ladder
 /// rung.
@@ -1849,6 +1856,34 @@ struct JobChild {
     stdout: tokio::process::ChildStdout,
 }
 
+/// Collect [`JobChild::tail`], bounded by `deadline` — or by
+/// [`STDERR_DRAIN_GRACE`] from now, when the deadline is already spent.
+///
+/// **Reaping the child does not close that pipe.** Its write end is
+/// inherited by anything the child leaves behind — a remote `sh -c` that
+/// forked rather than exec'd its command, an `ssh` `ProxyCommand` helper
+/// that outlives the client — so an unbounded `tail.await` after the
+/// kill waits on *that* process instead of on our own budget. It is how
+/// a 1s [`BootstrapJob::await_gone_within`] took 10s against a far side
+/// that slept for 10: the deadline stopped the exchange on time and then
+/// the drain gave the whole clamp straight back.
+///
+/// Timing out here costs a sharper error message, never a wrong verdict:
+/// the tail only sharpens the text and lets `classify_ssh_failure`
+/// recognise a bridge that found no session, and a far side that never
+/// closed its stderr never said either. The abort is what releases our
+/// read end rather than leaving a detached task holding it.
+async fn drain_tail(mut tail: JoinHandle<String>, deadline: Instant) -> String {
+    let deadline = deadline.max(Instant::now() + STDERR_DRAIN_GRACE);
+    match tokio::time::timeout_at(deadline, &mut tail).await {
+        Ok(joined) => joined.unwrap_or_default(),
+        Err(_elapsed) => {
+            tail.abort();
+            String::new()
+        }
+    }
+}
+
 /// What an exec is fed on stdin.
 #[derive(Clone, Copy)]
 enum ExecStdin<'a> {
@@ -1946,6 +1981,12 @@ impl SourceOrigin {
     /// An overridden asset base is named as itself. Rendering it as
     /// github.com would be a lie in exactly the situation — a fixture
     /// server, a mirror — where the user most needs the truth.
+    ///
+    /// Every arm is a noun phrase, never a clause of its own: the only
+    /// caller that assembles a sentence from it ([`SourcePreview::describe`],
+    /// read into the consent dialog's "from {source}" line) supplies the
+    /// preposition itself, so an arm that started with one — "downloaded
+    /// from X" — used to double it into "from downloaded from X".
     pub fn describe(&self, override_path: Option<&Path>) -> String {
         match self {
             Self::Override => match override_path {
@@ -1959,7 +2000,7 @@ impl SourceOrigin {
                 } else {
                     base.clone()
                 };
-                format!("downloaded from {where_from}, checksum-verified")
+                format!("the release at {where_from}, checksum-verified")
             }
         }
     }
@@ -2927,7 +2968,7 @@ impl BootstrapJob {
         let outcome = ExecOutcome {
             code: status.and_then(|status| status.code()),
             stdout: read?,
-            stderr: tail.await.unwrap_or_default(),
+            stderr: drain_tail(tail, deadline).await,
         };
         if outcome.ok() {
             write?;
@@ -2985,7 +3026,7 @@ impl BootstrapJob {
             }
             Err(error) => {
                 reap_by(&mut child, Instant::now()).await;
-                let tail = tail.await.unwrap_or_default();
+                let tail = drain_tail(tail, deadline).await;
                 let code = child
                     .try_wait()
                     .ok()
@@ -3518,7 +3559,7 @@ async fn curl(
     if status.success() {
         return Ok(());
     }
-    let detail = last_line(&tail.await.unwrap_or_default())
+    let detail = last_line(&drain_tail(tail, deadline).await)
         .unwrap_or_else(|| format!("curl exited {}", status.code().unwrap_or(-1)));
     Err(BootstrapError::Download(format!(
         "{} — {detail}",
@@ -5168,6 +5209,14 @@ mod tests {
         assert!(copy.contains("http://127.0.0.1:9/assets"), "{copy}");
         assert!(copy.contains(ASSET_BASE_ENV), "{copy}");
         assert!(!copy.contains("github.com"), "{copy}");
+        assert_eq!(
+            copy,
+            format!(
+                "the release at http://127.0.0.1:9/assets ({ASSET_BASE_ENV}), checksum-verified"
+            ),
+            "a noun phrase, not a clause — the consent dialog supplies the leading \
+             \"from\" itself, so this must not start with a preposition of its own: {copy}"
+        );
 
         let default = options()
             .source_preview(RemoteArch::Amd64)
@@ -5176,6 +5225,10 @@ mod tests {
         assert!(copy.contains("github.com"), "{copy}");
         assert!(copy.contains("checksum-verified"), "{copy}");
         assert!(!copy.contains(ASSET_BASE_ENV), "{copy}");
+        assert!(
+            copy.starts_with("the release at "),
+            "the default rung must read the same as the overridden one: {copy}"
+        );
     }
 
     /// A forced rung is the only rung. Forcing the sibling removes the

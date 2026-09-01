@@ -1757,6 +1757,14 @@ async fn await_gone_waits_out_a_delayed_finalization() {
 /// only after a complete `bridge_call` meant one hung poll could eat the
 /// whole budget and a second full poll would still start behind it — so
 /// the wait ran to ~2× while the error reported 1×.
+///
+/// It bounds the *whole* poll, teardown included, which is the half this
+/// fixture is uniquely good at catching: `/bin/sh` here is `dash` on
+/// Linux and `bash` on a Mac, and only `bash` exec-optimizes the
+/// fixture's `sh -c "$remote"`. On Linux the sleeping far side is
+/// therefore a **grandchild**, which the kill does not reach and which
+/// keeps the stderr pipe open — so an unbounded drain handed the clamp
+/// straight back and this ran for the stub's 10s, on Linux only.
 #[tokio::test]
 async fn await_gone_stays_inside_its_budget_when_a_poll_hangs() {
     let harness = Harness::new();

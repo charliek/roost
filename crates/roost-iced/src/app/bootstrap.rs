@@ -1305,7 +1305,7 @@ mod tests {
     fn the_update_card_warns_about_shells_only_when_one_is_running() {
         let hot = copy(
             &plan_bootstrap(&mismatch(), SessionState::Running),
-            "downloaded from https://example.test, checksum-verified",
+            "the release at https://example.test, checksum-verified",
             false,
         );
         assert_eq!(hot.confirm, "Update");
@@ -1317,10 +1317,19 @@ mod tests {
             ),
             "{hot:?}"
         );
+        assert!(
+            !hot.body.contains("from downloaded from"),
+            "the preposition must not double on the asset rung: {hot:?}"
+        );
+        assert!(
+            hot.body
+                .contains("from the release at https://example.test, checksum-verified"),
+            "{hot:?}"
+        );
 
         let cold = copy(
             &plan_bootstrap(&mismatch(), SessionState::NoSession),
-            "downloaded from https://example.test, checksum-verified",
+            "the release at https://example.test, checksum-verified",
             false,
         );
         assert_eq!(cold.confirm, "Update");
@@ -1389,6 +1398,16 @@ mod tests {
             !card.body.contains("github.com"),
             "a fixture server is never rendered as the release origin: {card:?}"
         );
+        assert!(
+            !card.body.contains("from downloaded from"),
+            "the preposition must not double on the asset rung: {card:?}"
+        );
+        assert!(
+            card.body.contains(&format!(
+                "from the release at {base} (ROOST_SESSION_ASSET_BASE), checksum-verified"
+            )),
+            "{card:?}"
+        );
 
         // The default ladder does name github.com — the assertion above
         // is about the override surviving, not about the word being
@@ -1404,6 +1423,10 @@ mod tests {
         );
         assert!(card.body.contains("github.com"), "{card:?}");
         assert!(!card.body.contains("ROOST_SESSION_ASSET_BASE"), "{card:?}");
+        assert!(
+            !card.body.contains("from downloaded from"),
+            "the preposition must not double on the default asset rung either: {card:?}"
+        );
 
         let source = overridden_options(None, Some("/tmp/roost-session"))
             .source_preview(RemoteArch::Amd64)
