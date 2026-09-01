@@ -1972,16 +1972,29 @@ jobs:
   session-e2e:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      # A brand-new macOS leg is variance-prone; the default fail-fast
+      # would cancel the proven Linux leg on a Mac flake, destroying the
+      # diagnostic signal on both. Mirrors `rust-build`'s matrix.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     # Covers a cold run: an uncached archive build now precedes the lane.
-    timeout-minutes: 40
+    # macOS's first runs are cache-cold on both ghostty and cargo (keys
+    # carry `runner.os`) on slower shared runners, and this lane also
+    # builds the daemon + CLI before the pytest suite — prescribe the
+    # headroom up front rather than discover it as a flake.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Install libclang (Linux)
+        if: runner.os == 'Linux'
         # bindgen needs it to build roost-vt with `--features ffi`.
+        # macOS gets it via Xcode's command-line tools.
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev
