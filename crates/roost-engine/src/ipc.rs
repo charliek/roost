@@ -26,7 +26,8 @@ use std::time::Duration;
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppDockBadgeParams, AppDockBadgeResult,
+    AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
+    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeybindDispatchParams,
     AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
@@ -407,6 +408,29 @@ pub enum UiRequest {
         path: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// `app.dialog_dump` — read which host modal is on screen and the
+    /// strings it is showing. Gated like `TabFeedPtyBytes`; a test seam
+    /// for the ssh bootstrap's consent card, never a surface.
+    AppDialogDump {
+        reply: tokio::sync::oneshot::Sender<Result<AppDialogDumpResult, String>>,
+    },
+    /// `app.dialog_answer` — confirm or cancel the visible host modal,
+    /// through the same routes a click and Enter/Escape take. `action`
+    /// is `"confirm" | "cancel"`. Gated like `AppDialogDump`.
+    AppDialogAnswer {
+        action: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// `app.keybind_dispatch` — run the paste accelerator through the
+    /// production dispatcher, the same one a real key event or native
+    /// menu click reaches. Gated like `AppDialogDump`; exists because
+    /// paste (issue #376) has no other IPC seam. `action` must be
+    /// `"paste"` — every other `KeybindAction` spelling is refused (see
+    /// `AppKeybindDispatchParams`'s doc comment in `roost-ipc`).
+    AppKeybindDispatch {
+        action: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// `app.update_status` — read back the macOS iced UI's Sparkle
     /// updater state (framework loaded, updater started, last completed
     /// check). Gated + macOS-iced-only like `AppDockBadge`.
@@ -460,6 +484,9 @@ pub enum UiRequest {
     /// localhost session that is not running.
     HostConnect {
         id: String,
+        /// `HostConnectParams::test_user_origin`, carried through
+        /// verbatim — see that field's doc for what it is and why.
+        test_user_origin: bool,
         reply: HostReply<HostConnectionResult>,
     },
     /// `host.disconnect` — drop the connection, leave the session
@@ -2757,6 +2784,46 @@ async fn dispatch(
             .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::APP_DIALOG_DUMP => {
+            let _: AppDialogDumpParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppDialogDump { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&result)
+        }
+        ops::APP_DIALOG_ANSWER => {
+            let p: AppDialogAnswerParams = decode(params)?;
+            if !matches!(p.action.as_str(), "confirm" | "cancel") {
+                return Err(HandlerError::invalid_param(format!(
+                    "action must be confirm or cancel (got {:?})",
+                    p.action
+                )));
+            }
+            h.ui_call(|reply| UiRequest::AppDialogAnswer {
+                action: p.action,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::APP_KEYBIND_DISPATCH => {
+            let p: AppKeybindDispatchParams = decode(params)?;
+            if p.action != "paste" {
+                return Err(HandlerError::invalid_param(format!(
+                    "action must be \"paste\" (got {:?})",
+                    p.action
+                )));
+            }
+            h.ui_call(|reply| UiRequest::AppKeybindDispatch {
+                action: p.action,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
         ops::APP_UPDATE_STATUS => {
             let _: AppUpdateStatusParams = decode(params)?;
             let result = h
@@ -2835,16 +2902,21 @@ async fn dispatch(
             // Connection state is the app's alone — there is no headless
             // fallback to give, and `no UI attached` is the honest
             // answer for a socket with no window behind it.
-            let id = if op == ops::HOST_CONNECT {
-                decode::<HostConnectParams>(params)?.id
+            let (id, test_user_origin) = if op == ops::HOST_CONNECT {
+                let p = decode::<HostConnectParams>(params)?;
+                (p.id, p.test_user_origin)
             } else {
-                decode::<HostDisconnectParams>(params)?.id
+                (decode::<HostDisconnectParams>(params)?.id, false)
             };
             let connect = op == ops::HOST_CONNECT;
             let result = h
                 .ui_call(move |reply| {
                     if connect {
-                        UiRequest::HostConnect { id, reply }
+                        UiRequest::HostConnect {
+                            id,
+                            test_user_origin,
+                            reply,
+                        }
                     } else {
                         UiRequest::HostDisconnect { id, reply }
                     }
@@ -2942,6 +3014,7 @@ fn map_test_op_err(err: String) -> HandlerError {
         || err.contains("is disabled")
         || err.contains("has no submenu to descend into")
         || err.contains("must not be empty")
+        || err.contains("unknown keybind action")
     {
         HandlerError::invalid_param(err)
     } else if err.contains("not supported on this UI") {

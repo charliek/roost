@@ -44,7 +44,10 @@ def test_deleting_the_last_project_exits_cleanly_and_flushes_state(roost, target
     run loop returned, which is what drops `App` and runs `Drop::drop`'s
     fsync-ing `workspace.flush()` — a killed or panicking process could not
     produce it. (The flush itself logs `workspace state flushed on
-    shutdown` at INFO, which the lanes run too quiet to assert on.)
+    shutdown` at INFO; `ui.launch`'s `RUST_LOG` floor — added for plan 039
+    C7's signal-teardown assertion — means the exit code above is a
+    redundant but not the only proof any more. Kept as the assertion here
+    regardless: an exit code is a coarser signal that costs no log parsing.)
     """
     if target != "iced":
         pytest.skip(

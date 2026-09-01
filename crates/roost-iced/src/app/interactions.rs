@@ -1513,8 +1513,14 @@ impl App {
         );
         #[cfg(target_os = "linux")]
         if outcome.paste_selection {
-            self.clipboard
-                .enqueue_paste_read(ClipboardOp::Selection, key);
+            // Middle-click paste doesn't sit in the `Result`-returning
+            // keybind dispatcher (`dispatch_keybind_action`), so a
+            // refusal is reported the same way that dispatcher's Err arm
+            // does: log, then toast.
+            if let Err(error) = self.enqueue_tab_paste(ClipboardOp::Selection, key) {
+                tracing::info!(%error, "middle-click paste refused");
+                self.set_status(error);
+            }
         }
         let clipboard = self.clipboard.start_next();
         match outcome.open_url {
@@ -1789,6 +1795,10 @@ impl ClipboardQueue {
         request_id
     }
 
+    // Private on purpose: this is the unguarded primitive. Every caller
+    // outside this queue's own tests must go through
+    // `App::enqueue_tab_paste`, which checks `frozen_host_frame_for`
+    // before a single byte of the clipboard is read (issue #376).
     fn enqueue_paste_read(&mut self, target: ClipboardOp, tab: TabKey) -> u64 {
         let request_id = self.allocate_request_id();
         self.pending_reads
@@ -1973,6 +1983,27 @@ impl App {
                 self.clipboard.start_next()
             }
             ClipboardReadCompletion::Paste { tab, target, value } => {
+                // The frame can freeze *during* the read: the guard in
+                // `enqueue_tab_paste` ran before the clipboard was
+                // touched, and a takeover or a `session.stop` landing in
+                // that window would otherwise deliver these bytes into a
+                // frame nothing is reading — issue #376's bug, reached
+                // by a third door. Re-asked here, at the last moment
+                // before the write.
+                //
+                // Toasted rather than dropped silently: the read already
+                // happened, so the user's paste is spent either way, and
+                // the other two routes answer a refusal with this exact
+                // sentence. A paste that vanishes without a word is the
+                // complaint #376 is about, and the frozen-frame banner
+                // says what the host is doing, not what became of the
+                // keystroke.
+                if let Some(frozen) = self.frozen_host_frame_for(tab) {
+                    let refusal = frozen.paste_refusal();
+                    tracing::info!(?tab, request_id, %refusal, "paste refused: the frame froze while the clipboard was being read");
+                    self.set_status(refusal.to_string());
+                    return self.clipboard.start_next();
+                }
                 let Some(terminal) = self.tabs.get(&tab) else {
                     tracing::debug!(?tab, request_id, "discarded paste for a closed tab");
                     return self.clipboard.start_next();
@@ -1986,7 +2017,21 @@ impl App {
     /// A clipboard image probe reported back. Two pastes racing produce
     /// two temp files and two pastes — tolerated: each one is what the
     /// user asked for, and the file the loser wrote is still theirs.
+    ///
+    /// The probe is a second async hop past the clipboard read, so it
+    /// re-asks the frozen-frame question for the same reason
+    /// [`Self::clipboard_read_completed`] does. Logged rather than
+    /// toasted: this arm has no `&mut self` to set a status with, and
+    /// the text read that spawned the probe already answered the user.
     pub fn paste_image_materialized(&self, tab: TabKey, path: Option<&str>) {
+        if let Some(frozen) = self.frozen_host_frame_for(tab) {
+            tracing::info!(
+                ?tab,
+                refusal = frozen.paste_refusal(),
+                "discarded an image paste for a frozen host frame"
+            );
+            return;
+        }
         deliver_paste_image(&self.tabs, tab, path);
     }
 
@@ -2018,13 +2063,37 @@ impl App {
         self.clipboard.start_next()
     }
 
-    pub(super) fn paste_into_active(&mut self, target: ClipboardOp) -> UiTask {
+    pub(super) fn paste_into_active(&mut self, target: ClipboardOp) -> Result<UiTask, String> {
         let tab = self.active_tab_key();
         if !self.tabs.contains_key(&tab) {
-            return UiTask::None;
+            return Ok(UiTask::None);
+        }
+        self.enqueue_tab_paste(target, tab)?;
+        Ok(self.clipboard.start_next())
+    }
+
+    /// The one place a paste read gets enqueued for a specific tab —
+    /// `paste_into_active` (keybind/menu paste) and the Linux
+    /// primary-selection middle-click route both funnel through this,
+    /// so a future third caller can't forget the check.
+    ///
+    /// Checked before the clipboard is touched at all: a frozen host
+    /// frame (taken over, or stopped) is still in `self.tabs` — that's
+    /// deliberate, it's what lets the last frame keep rendering — but
+    /// nothing on the other end will ever read what gets sent to it.
+    /// Reading the clipboard first and then discovering that would
+    /// consume the user's paste for nothing (issue #376); refusing here
+    /// means the clipboard is never touched.
+    pub(super) fn enqueue_tab_paste(
+        &mut self,
+        target: ClipboardOp,
+        tab: TabKey,
+    ) -> Result<(), String> {
+        if let Some(frozen) = self.frozen_host_frame_for(tab) {
+            return Err(frozen.paste_refusal().to_string());
         }
         self.clipboard.enqueue_paste_read(target, tab);
-        self.clipboard.start_next()
+        Ok(())
     }
 }
 

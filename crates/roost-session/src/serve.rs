@@ -43,7 +43,7 @@ use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::consts::{
-    self, DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS, FINALIZE_JOIN_TIMEOUT, SIGNAL_STOP_TIMEOUT,
+    DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS, FINALIZE_JOIN_TIMEOUT, SIGNAL_STOP_TIMEOUT,
 };
 use crate::readiness::{Readiness, Verdict};
 use crate::socket_guard::{unlink_if_ours, SocketIdentity, Unlinked};
@@ -67,9 +67,9 @@ pub struct SessionConfig {
     /// **This is the in-process test-harness knob, and nothing else.**
     /// The shipped binary never sets it directly: `start` builds its
     /// config through [`SessionConfig::from_profile`], which derives
-    /// this from `ROOST_TEST_MODE` exactly as `serve` used to read it,
-    /// so a daemon's behaviour is still decided by that one environment
-    /// variable.
+    /// this from `ROOST_TEST_MODE` via `identity::test_mode_env`, so a
+    /// daemon's behaviour is still decided by that one environment
+    /// variable — and by the same reader `identify` uses.
     ///
     /// A field rather than a read inside `serve` because the in-process
     /// integration tests run several sessions in one process, and a
@@ -80,9 +80,10 @@ pub struct SessionConfig {
     /// wants it to be something other than the truth.
     ///
     /// `None` in every shipped run: [`SessionConfig::from_profile`]
-    /// fills it from [`consts::FAKE_BUILD_ENV`] and only while
-    /// `test_mode` is on, so a production daemon cannot be talked into
-    /// lying about the pin it can actually decode. Carried as a field
+    /// fills it via [`identity::test_mode_env`], which reads
+    /// [`crate::consts::FAKE_BUILD_ENV`] only while `test_mode` is on,
+    /// so a production daemon cannot be talked into lying about the pin
+    /// it can actually decode. Carried as a field
     /// rather than read where it is used, so the environment is
     /// consulted once, at the edge, and everything downstream reads the
     /// config — the session e2e lane drives it by spawning a daemon
@@ -93,7 +94,7 @@ pub struct SessionConfig {
 impl SessionConfig {
     /// The shipped configuration for a profile.
     pub fn from_profile(profile: &BundleProfile, launch_cwd: PathBuf) -> Self {
-        let test_mode = std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1");
+        let (test_mode, fake_libghostty_build) = identity::test_mode_env();
         Self {
             socket_path: profile.socket_path.clone(),
             state_path: profile.state_json_path(),
@@ -101,10 +102,7 @@ impl SessionConfig {
             app_id: profile.app_id.to_string(),
             launch_cwd,
             test_mode,
-            fake_libghostty_build: test_mode
-                .then(|| std::env::var(consts::FAKE_BUILD_ENV).ok())
-                .flatten()
-                .filter(|value| !value.is_empty()),
+            fake_libghostty_build,
         }
     }
 }
@@ -179,25 +177,16 @@ pub async fn serve(
         // without a second binary (plan 037 §3.7) — and cannot make the
         // two disagree, which would be a failure mode no client could
         // make sense of.
-        // `.filter(test_mode)` restates `from_profile`'s gate
-        // structurally: `SessionConfig` is a public struct, so a caller
-        // that hand-builds one with `test_mode: false` and a fake set
-        // still gets the truth.
-        libghostty_build: match config
-            .fake_libghostty_build
-            .clone()
-            .filter(|_| config.test_mode)
-        {
-            Some(fake) => {
-                warn!(
-                    build = %fake,
-                    "reporting a fake libghostty build: {} is set in test mode",
-                    consts::FAKE_BUILD_ENV
-                );
-                fake
-            }
-            None => roost_vt::libghostty_build(),
-        },
+        //
+        // `identity::build_identity` is the one place this resolution
+        // happens — `roost-session identify` (plan 039 §3.1) answers the
+        // same question for a binary that has never run, and a second
+        // copy of this match here is exactly how the two would drift.
+        libghostty_build: identity::build_identity(
+            config.fake_libghostty_build.as_deref(),
+            config.test_mode,
+        )
+        .libghostty_build,
         default_tab_size: (DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS),
         test_mode,
     };

@@ -13,6 +13,41 @@ release workflow asserts they agree).
 
 ### Added
 
+- **Roost can install and upgrade `roost-session` on a remote host itself
+  (HS-3 bootstrap slice, plan 039)** — the SSH transport (plan 038, below)
+  still needed `roost-session` already installed, at the exact right build,
+  and started; this closes that gap. On an attended connect that fails
+  because it's missing, not running, or on a stale build, Roost probes the
+  far side over one job-private `ssh` `ControlMaster` — an eight-rung
+  candidate ladder (`~/.local/bin`, the non-interactive `PATH`, `/usr/bin`,
+  then the common brew/nix locations) shared by the probe and the connect
+  path itself, so anything the probe finds is something a connect can
+  already reach — and, only with explicit consent, installs or updates it.
+  The consent card names exactly what will happen (install/update/start),
+  where, and where the bytes are actually coming from — this Roost's own
+  binary, a checksum-verified release download, or an override — before
+  anything is touched; Cancel mutates nothing. An install streams to a
+  `.tmp.$$` file reserved against symlink/overwrite tricks, verifies the
+  staged binary identifies as the client's exact build **before** it ever
+  replaces the destination, and backs up any incumbent so a failure after
+  that point restores it rather than leaving the host with nothing working.
+  An upgrade runs install → stop (lease-free, no takeover) → wait for the
+  old process to actually finish exiting → start → verify the new session's
+  identity → reconnect — deliberately not "stop then install", so a failed
+  install never touches a running session. The install rule requires an
+  exact match on `app_version`, `session_protocol`, and `libghostty_build`
+  — stricter than the runtime attach gate, which still accepts an
+  already-running adjacent-version session unchanged. `roostctl` gains no
+  install/upgrade surface of its own, and an IPC-originated connect never
+  raises the consent dialog — this is an attended, in-app flow only, never
+  something a script or a machine can trigger. The NotFound and NoSession
+  troubleshooting rows and the remote "needs restart" dialog now describe
+  these in-app offers instead of pointing at a manual `ssh` session. See
+  the [Host Sessions guide](docs/guides/host-sessions.md#troubleshooting)
+  and [`docs/development/host-sessions.md`](docs/development/host-sessions.md#bootstrap-installupgrade-over-ssh)
+  for the shape, including the trust chain's honest limits (checksum
+  verification proves the bytes match the release, not the release's own
+  integrity — artifact signing is future work).
 - **Host sessions reach a remote machine over SSH directly (HS-3 transport
   slice, plan 038)** — a saved host's target can now be an SSH destination
   (`workbox`, `user@host`, `ssh://user@host:port` — only the `ssh://`
@@ -41,8 +76,8 @@ release workflow asserts they agree).
   for the shape, and [`docs/reference/ipc.md`](docs/reference/ipc.md) for
   the wire (byte-identical over SSH — the far side is a pure byte pump).
   The bootstrap half of this milestone (auto-detect/install/verify a
-  remote `roost-session` binary) is not part of this slice — a target
-  needs `roost-session` already reachable on its non-interactive `PATH`.
+  remote `roost-session` binary) is not part of this slice — see the
+  HS-3 bootstrap entry above, which shipped it separately.
 - **`session.set_focus` closes the HS-2 attention gap** — a session now
   learns the client's real focus (window focus + which tab is selected),
   pushed right after `session.connect` and on every edge that moves it,

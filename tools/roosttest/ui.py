@@ -744,7 +744,10 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         # no-title from a dev's ~/.bashrc — rides into the UI and every
         # tab inherits it, breaking hermetic assertions), plus the profile
         # selector. Then set our own config/state explicitly.
-        env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn")}
+        env = {
+            **os.environ,
+            "RUST_LOG": _floor_roost_iced_info(os.environ.get("RUST_LOG", "warn")),
+        }
         for leaked in _UI_ENV_SANITIZE:
             env.pop(leaked, None)
         env["ROOST_BUNDLE_PROFILE"] = spec.profile
@@ -780,6 +783,20 @@ def _log_size_or_zero(log: Path) -> int:
     `open`-launched bundles, which have no child to give a clean stdout to
     capture)."""
     return log.stat().st_size if log.exists() else 0
+
+
+def _floor_roost_iced_info(rust_log: str) -> str:
+    """Add `roost_iced=info` to `rust_log` unless it already names the
+    crate. Several E2E assertions read an INFO-level Rust log line a
+    quieter session filter would otherwise silence — a bundle launch's
+    "resolved bundle identity" line at boot, and (plan 039 C7) the
+    workspace-flush line a signal-driven teardown logs — so both launch
+    paths floor `RUST_LOG` through this rather than trusting CI's
+    `RUST_LOG=warn` e2e default to carry them. An operator's own
+    `roost_iced=...` choice always wins."""
+    if "roost_iced" in rust_log:
+        return rust_log
+    return f"{rust_log},roost_iced=info"
 
 
 def _forward_env(argv: list[str], name: str) -> None:
@@ -839,16 +856,14 @@ def _launch_iced_bundle(app: Path, *, state_dir: Path | None = None) -> None:
         "ROOST_SSH_BIN",
     ):
         _forward_env(argv, name)
-    # RUST_LOG is forwarded with a floor: the launch path asserts the
-    # INFO-level "resolved bundle identity" line after boot, so a session
-    # filter like RUST_LOG=warn (CI's default for e2e steps) must not
-    # silence the very line the assertion requires. Anything already
-    # naming roost_iced keeps the operator's explicit choice.
+    # RUST_LOG is forwarded with a floor (see `_floor_roost_iced_info`):
+    # the launch path asserts the INFO-level "resolved bundle identity"
+    # line after boot, so a session filter like RUST_LOG=warn (CI's
+    # default for e2e steps) must not silence the very line the assertion
+    # requires.
     rust_log = os.environ.get("RUST_LOG")
     if rust_log is not None:
-        if "roost_iced" not in rust_log:
-            rust_log = f"{rust_log},roost_iced=info"
-        argv += ["--env", f"RUST_LOG={rust_log}"]
+        argv += ["--env", f"RUST_LOG={_floor_roost_iced_info(rust_log)}"]
     argv += [str(app)]
     subprocess.run(argv, check=True)
 

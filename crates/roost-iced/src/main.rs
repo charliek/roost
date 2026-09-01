@@ -141,9 +141,16 @@ enum Message {
     HostDialogCardPressed,
     /// The Stop Session confirmation's destructive button.
     HostStopConfirm,
-    /// The upgrade prompt's "Restart session" (plan 037 §3.7). Only a
-    /// host this client could spawn for has the button at all.
+    /// The upgrade prompt's primary button, whichever of the two it is
+    /// (plan 037 §3.7, plan 039 §3.5): "Restart session" for a host this
+    /// client could spawn for, or "Update roost-session on <label>" for
+    /// one reached over ssh — which starts a read-only probe and a
+    /// second, specific consent card, and installs nothing by itself. A
+    /// host that can be offered neither has no button at all.
     HostRestartConfirm,
+    /// The bootstrap consent card's primary button: Install, Update or
+    /// Start, whichever the probe's answer made this card.
+    HostBootstrapConfirm,
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
@@ -560,6 +567,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::HostDialogCardPressed
         | Message::HostStopConfirm
         | Message::HostRestartConfirm
+        | Message::HostBootstrapConfirm
         | Message::ConfirmDeleteCancel
         | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }

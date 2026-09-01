@@ -75,12 +75,17 @@ unicode-width = { workspace = true }
 # arboard + softbuffer already pull in (winit still rides objc2 0.5) and
 # must move with THAT pair: a bump that shifts objc2-core-foundation's
 # major would otherwise resolve a second copy of the crate into the lock.
-[target.'cfg(target_os = "macos")'.dependencies]
-# `dlopen`/`dlerror` for the Sparkle seam (plan 028 § 3.8) — the
-# framework is loaded at runtime from inside the bundle, never linked,
-# so no build machinery may depend on it. Already in the workspace's
-# graph via roost-ipc + roost-engine.
+# `signal(2)` to restore SIGTERM/SIGINT to their default disposition
+# before the runtime is torn down (plan 039 § 3.9), and `dlopen`/`dlerror`
+# for the macOS Sparkle seam (plan 028 § 3.8). Unix-wide rather than
+# macOS-only because the signal restore ships on Linux too. Already in
+# the workspace's graph via roost-ipc + roost-engine.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The Sparkle framework is loaded at runtime from inside the bundle,
+# never linked, so no build machinery may depend on it.
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "CFBundle",

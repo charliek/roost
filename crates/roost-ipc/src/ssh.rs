@@ -121,6 +121,30 @@ pub struct SshTarget {
     /// and `user-host` both sanitize to `user-host`), still produce
     /// different tokens.
     pub token: String,
+    /// "The same account on the same machine", as far as the target
+    /// string can say so: `user@host:port` with the scheme dropped, the
+    /// host lowercased and the port defaulted to 22.
+    ///
+    /// [`Self::token`] answers a different question — it identifies one
+    /// *spelling*, because the filesystem slice it names must be
+    /// distinct for every distinct target. This one deliberately
+    /// collapses spellings, because a mutual-exclusion claim over a
+    /// remote `~/.local/bin/roost-session` has to hold whichever way the
+    /// two saved hosts pointing at that box happen to be written
+    /// (`workbox` and `ssh://WorkBox:22` are one machine, one file).
+    ///
+    /// **Not exact, and cannot be.** An `ssh_config` `Host` alias maps
+    /// an arbitrary name onto an arbitrary hostname, user and port, so
+    /// `workbox` and `charlie@10.0.0.4` can be the same account on the
+    /// same machine while no textual normalization could ever say so —
+    /// and the reverse, a bare `workbox` whose config sets `Port 2200`,
+    /// reads here as port 22. Resolving that would mean running `ssh -G`
+    /// per target, which is a subprocess in the connect path this flow
+    /// is specifically built not to have. The residual case is two
+    /// concurrent installs that this key does not merge; the install
+    /// itself is a staged write plus an atomic rename, so the loser
+    /// overwrites rather than tears.
+    pub claim_key: String,
 }
 
 impl SshTarget {
@@ -128,6 +152,7 @@ impl SshTarget {
         Self {
             raw: raw.to_string(),
             token: host_token(raw),
+            claim_key: claim_key(raw),
         }
     }
 }
@@ -211,6 +236,45 @@ fn host_token(raw: &str) -> String {
     format!("{truncated}-{:016x}", fnv1a64(raw.as_bytes()))
 }
 
+/// The port an ssh target with none spelled out is assumed to use.
+/// Assumed rather than resolved — see [`SshTarget::claim_key`].
+const DEFAULT_SSH_PORT: &str = "22";
+
+/// Canonicalize `raw` into [`SshTarget::claim_key`]'s
+/// `user@host:port` — scheme dropped, any path after the authority
+/// dropped, host lowercased, port defaulted.
+fn claim_key(raw: &str) -> String {
+    let rest = if starts_with_ssh_scheme(raw) {
+        &raw[SSH_SCHEME.len()..]
+    } else {
+        raw
+    };
+    // `ssh://host/path` is accepted by `classify`; only the authority
+    // names the machine.
+    let authority = rest.split('/').next().unwrap_or("");
+    // Rightmost `@`: a password-free ssh target has one, and splitting
+    // from the right keeps an `@` inside a user name on the user side.
+    let (user, host_port) = authority.rsplit_once('@').unwrap_or(("", authority));
+    let (host, port) = split_host_port(host_port);
+    format!("{user}@{}:{port}", host.to_ascii_lowercase())
+}
+
+/// Split an ssh authority's `host[:port]`, with `[::1]:22` handled as
+/// its own shape so an IPv6 literal's colons are not read as a port.
+fn split_host_port(authority: &str) -> (&str, &str) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').filter(|p| !p.is_empty());
+            return (host, port.unwrap_or(DEFAULT_SSH_PORT));
+        }
+    }
+    match authority.rsplit_once(':') {
+        // A bare IPv6 literal with no brackets has no port to find.
+        Some((host, port)) if !host.contains(':') && !port.is_empty() => (host, port),
+        _ => (authority, DEFAULT_SSH_PORT),
+    }
+}
+
 /// FNV-1a, 64-bit. Deliberately not `std::hash::DefaultHasher`: that
 /// hasher's algorithm is an implementation detail Rust does not
 /// guarantee across releases, and this token is meant to be stable —
@@ -268,21 +332,62 @@ pub fn generate_ssh_config(user_config: Option<&Path>, system_config: Option<&Pa
 // Argv builders
 // ============================================================================
 
-/// The remote command every mux `ssh` invocation execs: prefer
-/// `~/.local/bin/roost-session` (the bootstrap install location) and
-/// fall back to a bare `roost-session` resolved off the remote's
-/// non-interactive `PATH`. One argv element — the whole thing is
-/// `sh -c '<script>'`, so the far end never has to source a login
-/// shell just to find the binary.
+/// The remote command every mux `ssh` invocation execs.
+///
+/// **Defined once, in [`crate::bootstrap::exec_chain_command`]**, off
+/// the same candidate ladder the bootstrap probe searches — so anything
+/// the probe can *find* is something this transport can *exec* (plan 039
+/// §3.2). The two used to be separate: a two-rung heuristic here and a
+/// longer list over there, which meant a host could hold a perfectly
+/// good `roost-session` the probe saw and the transport could not
+/// reach, and the resulting dialog offered to install a binary that was
+/// already installed, forever.
+///
+/// `jailed` is [`SshTunnelOptions::jail_fs_root`] — the same value
+/// [`crate::bootstrap::BootstrapOptions::jail_fs_root`] carries, because
+/// the probe and this command have to resolve *the same rung*.
+/// Hardcoding `false` here — which this did — left a test-lane probe
+/// answering `Compatible { path: <jail>/usr/bin/roost-session }` while
+/// the connect behind it looked at a bare `/usr/bin/roost-session` and
+/// failed `NotFound`, on every flow whose winning rung is absolute
+/// rather than `$HOME`-relative.
+///
+/// **The flag is a value here, never a lookup.** Only [`remote_command`]
+/// reads the environment, at the outermost edge, so every caller that
+/// already holds an options bundle passes the flag it is actually
+/// running under — and the transport's ladder and the probe's can be
+/// pinned equal by a test that touches no process state at all.
+pub fn remote_command_for(jailed: bool) -> String {
+    crate::bootstrap::exec_chain_command(jailed)
+}
+
+/// [`remote_command_for`] under **this process's** own
+/// `ROOST_TEST_MODE`, for a caller holding no options bundle.
+///
+/// Everything inside the transport has one — a tunnel and a verify both
+/// take the flag off [`SshTunnelOptions::jail_fs_root`], which
+/// [`SshTunnelOptions::from_env`] set at *its* edge — so this is the
+/// spelling for the outside: the one-liner a diagnostic or a test wants
+/// when it is asking "what would a shipped process exec here".
+///
+/// The security property that motivated the old hardcoded `false`
+/// survives, because the gate reads **our own** process environment: a
+/// variable set on the far side cannot turn the seam on, and a shipped
+/// build never writes the expansion into the script at all. What that is
+/// *not* is a guarantee once this client is itself in test mode: from
+/// there the far side's own `ROOST_BOOTSTRAP_FS_ROOT` fully steers which
+/// binary the emitted chain `exec`s — which is precisely what the
+/// hardcoded `false` prevented even then, and precisely what a jailed
+/// lane needs. See `crate::bootstrap::test_mode_env`.
 pub fn remote_command() -> String {
-    r#"sh -c 'R="$HOME/.local/bin/roost-session"; [ -x "$R" ] || R=roost-session; exec "$R" client-bridge'"#.to_string()
+    remote_command_for(crate::bootstrap::test_mode_env())
 }
 
 /// The `-F`/`-S`/mux-option/`-T` prefix shared by [`exec_argv`] and
 /// [`establish_argv`] — both open (or reuse, via `ControlMaster=auto`)
 /// the same shared mux against the same target; they differ only in
 /// what they run once connected.
-fn mux_connect_argv(config_path: &Path, ctl_path: &Path, target: &str) -> Vec<String> {
+pub(crate) fn mux_connect_argv(config_path: &Path, ctl_path: &Path, target: &str) -> Vec<String> {
     vec![
         "-F".to_string(),
         config_path.display().to_string(),
@@ -303,9 +408,13 @@ fn mux_connect_argv(config_path: &Path, ctl_path: &Path, target: &str) -> Vec<St
 
 /// Argv for the per-connection exec: opens (or reuses) the shared mux
 /// and execs the remote bridge with a fresh stdio pipe of its own.
-pub fn exec_argv(config_path: &Path, ctl_path: &Path, target: &str) -> Vec<String> {
+///
+/// `jailed` is [`SshTunnelOptions::jail_fs_root`], carried down from the
+/// tunnel's own options rather than re-read here — see
+/// [`remote_command_for`].
+pub fn exec_argv(config_path: &Path, ctl_path: &Path, target: &str, jailed: bool) -> Vec<String> {
     let mut argv = mux_connect_argv(config_path, ctl_path, target);
-    argv.push(remote_command());
+    argv.push(remote_command_for(jailed));
     argv
 }
 
@@ -361,13 +470,13 @@ pub fn verify_argv(config_path: &Path, target: &str, remote_command: &str) -> Ve
 // ============================================================================
 
 /// The `-S` mux control socket, created by `ssh` itself.
-const CTL_FILE: &str = "ctl";
+pub(crate) const CTL_FILE: &str = "ctl";
 /// The local bridge's own listening socket — the path a client dials to
 /// reach the remote session.
 const BRIDGE_FILE: &str = "bridge.sock";
 /// The generated `ssh_config` every invocation is pointed at with `-F`.
 /// Not a socket, so it is not part of the `sun_path` probe.
-const CONFIG_FILE: &str = "ssh_config";
+pub(crate) const CONFIG_FILE: &str = "ssh_config";
 
 /// The two file names created under a host's control-socket directory.
 /// Both are `AF_UNIX` paths and both must fit `sun_path`, so the probe
@@ -527,9 +636,14 @@ impl SshFailure {
                 "{target} is reachable but has no roost session running. Run `roostctl session \
                  start` on that machine, then try again."
             ),
+            // The remedy is deliberately one sentence and one place: the
+            // install is an in-app, consent-gated flow (plan 039 §3.5),
+            // and `roostctl` has no bootstrap surface of its own — so
+            // the CLI's job here is to point at the app rather than to
+            // grow a second door.
             Self::NotFound => format!(
                 "roost-session isn't installed on {target} (or isn't on the non-interactive \
-                 PATH ssh uses there)."
+                 PATH ssh uses there) — connect from the Roost app to install it."
             ),
             Self::Transport(Some(line)) => format!("connecting to {target} failed: {line}"),
             Self::Transport(None) => format!("connecting to {target} failed"),
@@ -569,12 +683,16 @@ pub fn classify_ssh_failure(exit_code: Option<i32>, stderr_tail: &str) -> SshFai
     if stderr_tail.contains("command not found") || exit_code == Some(127) {
         return SshFailure::NotFound;
     }
-    let last_line = stderr_tail
-        .lines()
+    SshFailure::Transport(last_line(stderr_tail))
+}
+
+/// The last non-empty line of a stderr tail, trimmed — the one thing
+/// worth quoting back out of a blob that is mostly banner.
+pub(crate) fn last_line(text: &str) -> Option<String> {
+    text.lines()
         .map(str::trim)
         .rfind(|line| !line.is_empty())
-        .map(str::to_string);
-    SshFailure::Transport(last_line)
+        .map(str::to_string)
 }
 
 // ============================================================================
@@ -618,7 +736,7 @@ const STDERR_TAIL_BYTES: usize = 4 * 1024;
 const CHUNK: usize = 64 * 1024;
 
 /// Every budget in this module goes through the ambient test scale.
-fn scaled(budget: Duration) -> Duration {
+pub(crate) fn scaled(budget: Duration) -> Duration {
     budget.mul_f64(timeout_scale())
 }
 
@@ -652,7 +770,7 @@ impl SshConfigPaths {
         }
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         fn existing(candidate: &Option<PathBuf>) -> Option<&Path> {
             candidate.as_deref().filter(|path| path.exists())
         }
@@ -674,11 +792,20 @@ pub struct SshTunnelOptions {
     /// order — the first one that leaves room for a `sun_path` wins.
     pub scratch_parents: Vec<PathBuf>,
     pub ssh_bin: PathBuf,
+    /// Whether the remote command this tunnel `exec`s prefixes its
+    /// absolute rungs with [`crate::bootstrap::FS_ROOT_ENV`] — the same
+    /// value [`crate::bootstrap::BootstrapOptions::jail_fs_root`]
+    /// carries, and for the same reason. A tunnel and the bootstrap job
+    /// beside it must search and exec **one** ladder; a hardcoded answer
+    /// on either side is the `NotFound`-on-a-good-rung bug plan 039 §3.2
+    /// exists to prevent.
+    pub jail_fs_root: bool,
 }
 
 impl SshTunnelOptions {
-    /// `$TMPDIR` then `/tmp`, `$ROOST_SSH_BIN` or `ssh`, and the
-    /// standard config pair.
+    /// `$TMPDIR` then `/tmp`, `$ROOST_SSH_BIN` or `ssh`, the standard
+    /// config pair — and the one `ROOST_TEST_MODE` read the transport
+    /// makes, here at the edge rather than down where the argv is built.
     pub fn from_env() -> Self {
         let mut scratch_parents: Vec<PathBuf> = Vec::new();
         if let Some(tmpdir) = std::env::var_os("TMPDIR").filter(|value| !value.is_empty()) {
@@ -695,6 +822,7 @@ impl SshTunnelOptions {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("ssh")),
+            jail_fs_root: crate::bootstrap::test_mode_env(),
         }
     }
 }
@@ -760,6 +888,10 @@ struct TunnelState {
     ssh_bin: PathBuf,
     config_path: PathBuf,
     ctl_path: PathBuf,
+    /// [`SshTunnelOptions::jail_fs_root`], carried so every
+    /// per-connection [`exec_argv`] emits the ladder this tunnel was
+    /// opened for rather than re-reading the environment mid-flight.
+    jail_fs_root: bool,
     /// Bumped once per `ssh` exec, so a caller can tell "the failure I
     /// already reported" from "a new one since".
     generation: AtomicU64,
@@ -832,6 +964,7 @@ impl SshTunnel {
                 ssh_bin: options.ssh_bin,
                 config_path,
                 ctl_path,
+                jail_fs_root: options.jail_fs_root,
                 generation: AtomicU64::new(0),
                 last_error: Mutex::new(None),
                 closed: AtomicBool::new(false),
@@ -1042,7 +1175,12 @@ impl TunnelState {
     /// Serve one accepted connection over its own `ssh` exec.
     async fn serve(self: Arc<Self>, stream: UnixStream) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let argv = exec_argv(&self.config_path, &self.ctl_path, &self.target);
+        let argv = exec_argv(
+            &self.config_path,
+            &self.ctl_path,
+            &self.target,
+            self.jail_fs_root,
+        );
         let mut child = match spawn_ssh_command(
             &self.ssh_bin,
             &argv,
@@ -1128,7 +1266,7 @@ impl TunnelState {
 /// `-O exit`, bounded, status ignored. Only ever worth running while the
 /// control socket exists — without it there is no master to address, and
 /// `ssh` would go open a fresh connection to say so.
-async fn exit_master(ssh_bin: &Path, config_path: &Path, ctl_path: &Path, target: &str) {
+pub(crate) async fn exit_master(ssh_bin: &Path, config_path: &Path, ctl_path: &Path, target: &str) {
     if !ctl_path.exists() {
         return;
     }
@@ -1140,7 +1278,12 @@ async fn exit_master(ssh_bin: &Path, config_path: &Path, ctl_path: &Path, target
 }
 
 /// [`exit_master`] without a runtime, for [`Drop`].
-fn blocking_exit_master(ssh_bin: &Path, config_path: &Path, ctl_path: &Path, target: &str) {
+pub(crate) fn blocking_exit_master(
+    ssh_bin: &Path,
+    config_path: &Path,
+    ctl_path: &Path,
+    target: &str,
+) {
     if !ctl_path.exists() {
         return;
     }
@@ -1252,7 +1395,7 @@ fn ssh_command(
     command
 }
 
-fn spawn_ssh_command(
+pub(crate) fn spawn_ssh_command(
     ssh_bin: &Path,
     argv: &[String],
     stdin: Stdio,
@@ -1271,7 +1414,7 @@ fn spawn_ssh_command(
 ///
 /// A task rather than a read after `wait()`, because an unread stderr
 /// pipe fills and blocks the child that is being waited on.
-fn spawn_stderr_tail(child: &mut Child) -> JoinHandle<String> {
+pub(crate) fn spawn_stderr_tail(child: &mut Child) -> JoinHandle<String> {
     let stderr = child.stderr.take();
     tokio::spawn(async move {
         match stderr {
@@ -1313,13 +1456,13 @@ fn bind_bridge(path: &Path) -> Result<UnixListener, SshTunnelError> {
     Ok(listener)
 }
 
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     std::fs::DirBuilder::new().mode(0o700).create(dir)
 }
 
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1432,19 +1575,54 @@ pub const VERIFY_BUDGET: Duration = Duration::from_secs(30);
 /// pay for first. Both are bounded, so an unreachable target fails
 /// rather than hanging the caller.
 ///
-/// An ssh failure is flattened to its own `Display` rather than chained
+/// An ssh failure is rendered by its own `Display` rather than chained
 /// as a source: [`SshTunnelError`] already renders the whole message,
 /// and wrapping it would make `{:#}` print it twice.
-pub async fn verify_transport(transport: &ResolvedTransport) -> Result<SessionIdentify> {
+pub async fn verify_transport(
+    transport: &ResolvedTransport,
+) -> std::result::Result<SessionIdentify, VerifyError> {
     match transport {
         ResolvedTransport::Ssh(target) => {
             verify_ssh_target(target, &SshTunnelOptions::from_env(), VERIFY_BUDGET)
                 .await
-                .map_err(|error| anyhow!("{error}"))
+                .map_err(VerifyError::Ssh)
         }
         ResolvedTransport::LocalSession(socket) | ResolvedTransport::UnixSocket(socket) => {
             let budget = crate::session_launch::IPC_TIMEOUT.mul_f64(timeout_scale());
-            crate::session_launch::verify_socket(socket, budget).await
+            crate::session_launch::verify_socket(socket, budget)
+                .await
+                .map_err(VerifyError::Other)
+        }
+    }
+}
+
+/// Why a target did not verify.
+///
+/// Split by who can act on it, exactly as [`SshTunnelError`] is: an ssh
+/// target's refusal carries the classified [`SshFailure`] a caller can
+/// **branch** on, and every other way of failing is opaque. The families
+/// exist so that routing on one ("the binary is not installed over
+/// there") never means substring-matching the copy a user reads — which
+/// is the mistake the classifier exists to prevent.
+///
+/// Both renderings are the ones the two callers already printed before
+/// this type existed: `{error:#}` on an ssh refusal is
+/// [`SshTunnelError`]'s own message, and on anything else it is the
+/// `anyhow` chain.
+#[derive(Debug, thiserror::Error)]
+pub enum VerifyError {
+    #[error("{0}")]
+    Ssh(SshTunnelError),
+    #[error("{0:#}")]
+    Other(#[from] anyhow::Error),
+}
+
+impl VerifyError {
+    /// The classified family, when the far side is what refused.
+    pub fn failure(&self) -> Option<&SshFailure> {
+        match self {
+            Self::Ssh(error) => error.failure(),
+            Self::Other(_) => None,
         }
     }
 }
@@ -1482,15 +1660,20 @@ pub async fn verify_ssh_target(
     outcome
 }
 
-/// A directory name no concurrent verify can collide on: this process,
-/// this instant, and a counter for two verifies inside the same
-/// nanosecond.
-///
-/// Deliberately *not* [`scratch_dir_name`]'s shape — a verify belongs to
-/// no saved host, and the hex instant in the middle is what stops
-/// [`parse_scratch_dir_name`] from ever reading one of these as a host's
-/// leftovers for a sweep to reclaim.
+/// A directory name no concurrent verify can collide on.
 fn verify_dir_name() -> String {
+    one_shot_dir_name("verify")
+}
+
+/// A scratch-directory name for a piece of work that belongs to no
+/// saved host: `kind`, this process, this instant, and a counter for two
+/// of them inside the same nanosecond.
+///
+/// Deliberately *not* [`scratch_dir_name`]'s shape — the hex instant in
+/// the middle is what stops [`parse_scratch_dir_name`] from ever reading
+/// one of these as a host's leftovers for a sweep to reclaim. A verify
+/// probe and a bootstrap job both live here, and neither is a tunnel.
+pub(crate) fn one_shot_dir_name(kind: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let nanos = std::time::SystemTime::now()
@@ -1498,7 +1681,7 @@ fn verify_dir_name() -> String {
         .map(|since| since.as_nanos())
         .unwrap_or_default();
     format!(
-        "{SCRATCH_PREFIX}verify-{}-{nanos:x}-{:x}",
+        "{SCRATCH_PREFIX}{kind}-{}-{nanos:x}-{:x}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
@@ -1514,7 +1697,11 @@ async fn verify_in(
     write_private_file(&config_path, options.config_paths.render().as_bytes())
         .with_context(|| format!("write {}", config_path.display()))?;
 
-    let argv = verify_argv(&config_path, &target.raw, &remote_command());
+    let argv = verify_argv(
+        &config_path,
+        &target.raw,
+        &remote_command_for(options.jail_fs_root),
+    );
     let mut child = spawn_ssh_command(
         &options.ssh_bin,
         &argv,
@@ -1580,11 +1767,39 @@ async fn identify_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     stdin: &mut W,
     stdout: R,
 ) -> Result<SessionIdentify> {
+    let response = call_over(stdin, stdout, ops::SESSION_IDENTIFY).await?;
+    if !response.ok {
+        return Err(anyhow!(
+            "{}: {}",
+            ops::SESSION_IDENTIFY,
+            render_response_error(&response)
+        ));
+    }
+    Ok(serde_json::from_value(
+        response.result.unwrap_or(serde_json::Value::Null),
+    )?)
+}
+
+/// One no-parameter op spoken over a child's stdio, in the same envelope
+/// [`crate::IpcClient`] would have written, answered with whatever the
+/// far side said.
+///
+/// The refusal is *not* flattened into the error here, because two
+/// callers disagree about what a refusal means: a verify wants
+/// `session.identify` failing to be a failure, while the bootstrap job's
+/// lease-free `session.stop` (plan 039 §3.4) reads "the session is
+/// already shutting down" as the outcome it wanted. Only a transport or
+/// protocol fault is an `Err`.
+pub(crate) async fn call_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    stdin: &mut W,
+    stdout: R,
+    op: &str,
+) -> Result<Response> {
     const ID: i64 = 1;
 
     let request = RawRequest {
         id: ID,
-        op: ops::SESSION_IDENTIFY.to_string(),
+        op: op.to_string(),
         params: serde_json::json!({}),
     };
     write_frame(stdin, &serde_json::to_vec(&request)?).await?;
@@ -1592,10 +1807,7 @@ async fn identify_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     let mut reader = FrameReader::new(stdout);
     loop {
         let Some(frame) = reader.read_line().await? else {
-            return Err(anyhow!(
-                "the remote bridge closed without answering {}",
-                ops::SESSION_IDENTIFY
-            ));
+            return Err(anyhow!("the remote bridge closed without answering {op}"));
         };
         let value: serde_json::Value = serde_json::from_slice(&frame)?;
         // A session may push events at a connection it never subscribed;
@@ -1607,21 +1819,16 @@ async fn identify_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         if response.id != ID {
             return Err(anyhow!("answer carried id {}, not {ID}", response.id));
         }
-        if !response.ok {
-            let error = response.error.unwrap_or(crate::messages::ResponseError {
-                code: "internal".into(),
-                message: "ok=false with no error body".into(),
-            });
-            return Err(anyhow!(
-                "{}: {} ({})",
-                ops::SESSION_IDENTIFY,
-                error.message,
-                error.code
-            ));
-        }
-        return Ok(serde_json::from_value(
-            response.result.unwrap_or(serde_json::Value::Null),
-        )?);
+        return Ok(response);
+    }
+}
+
+/// A refused response's `message (code)`, with a stand-in for the
+/// malformed `ok=false` that carries no error body at all.
+pub(crate) fn render_response_error(response: &Response) -> String {
+    match &response.error {
+        Some(error) => format!("{} ({})", error.message, error.code),
+        None => "ok=false with no error body (internal)".to_string(),
     }
 }
 
@@ -1820,6 +2027,70 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
+    /// The claim key collapses the spellings the token deliberately
+    /// keeps apart. Every one of these names one account on one
+    /// machine, and two installs racing onto its single
+    /// `~/.local/bin/roost-session` is exactly what the claim exists to
+    /// stop.
+    #[test]
+    fn equivalent_spellings_of_one_machine_share_a_claim_key() {
+        let plain = SshTarget::new("workbox");
+        for equivalent in [
+            "ssh://workbox",
+            "SSH://workbox",
+            "ssh://WorkBox",
+            "ssh://workbox:22",
+            "ssh://workbox/",
+            "WORKBOX",
+        ] {
+            let other = SshTarget::new(equivalent);
+            assert_eq!(
+                plain.claim_key, other.claim_key,
+                "{equivalent:?} is the same box as workbox"
+            );
+            assert_ne!(
+                plain.token, other.token,
+                "{equivalent:?} still names a filesystem slice of its own"
+            );
+        }
+        assert_eq!(plain.claim_key, "@workbox:22");
+
+        let user = SshTarget::new("charlie@workbox");
+        assert_eq!(user.claim_key, "charlie@workbox:22");
+        assert_eq!(
+            SshTarget::new("ssh://charlie@WORKBOX:22").claim_key,
+            user.claim_key
+        );
+    }
+
+    /// And it keeps apart what actually differs — a second account, a
+    /// second port, a second machine. Merging any of those would let one
+    /// install block an unrelated one.
+    #[test]
+    fn a_different_account_port_or_machine_is_a_different_claim() {
+        let base = SshTarget::new("charlie@workbox").claim_key;
+        for other in [
+            "root@workbox",
+            "workbox",
+            "ssh://charlie@workbox:2200",
+            "charlie@otherbox",
+        ] {
+            assert_ne!(
+                base,
+                SshTarget::new(other).claim_key,
+                "{other:?} is not the same claim as charlie@workbox"
+            );
+        }
+
+        // An IPv6 literal's colons are the address, not a port.
+        assert_eq!(SshTarget::new("ssh://[::1]").claim_key, "@::1:22");
+        assert_eq!(SshTarget::new("ssh://[::1]:2222").claim_key, "@::1:2222");
+        assert_eq!(
+            SshTarget::new("ssh://[::1]:22").claim_key,
+            SshTarget::new("ssh://[::1]").claim_key
+        );
+    }
+
     /// The reason the hash covers the *full* raw string rather than the
     /// truncated prefix: two targets that sanitize to the same short
     /// prefix must not collide on disk.
@@ -1908,7 +2179,7 @@ mod tests {
     fn exec_argv_is_the_exact_vector() {
         let cfg = PathBuf::from("/home/charlie/.config/roost/ssh_config");
         let ctl = PathBuf::from("/tmp/roost-ssh-workbox/ctl");
-        let argv = exec_argv(&cfg, &ctl, "workbox");
+        let argv = exec_argv(&cfg, &ctl, "workbox", false);
         assert_eq!(
             argv,
             vec![
@@ -1926,9 +2197,26 @@ mod tests {
                 "BatchMode=yes",
                 "-T",
                 "workbox",
-                &remote_command(),
+                &remote_command_for(false),
             ]
         );
+    }
+
+    /// The tunnel's own flag reaches the argv. Pure: no environment, and
+    /// the two answers are asserted *different*, so an `exec_argv` that
+    /// ignored the flag (the shape the bug had) cannot pass.
+    #[test]
+    fn exec_argv_carries_the_tunnels_own_jail_flag() {
+        let cfg = PathBuf::from("/home/charlie/.config/roost/ssh_config");
+        let ctl = PathBuf::from("/tmp/roost-ssh-workbox/ctl");
+        for jailed in [false, true] {
+            assert_eq!(
+                exec_argv(&cfg, &ctl, "workbox", jailed).last().unwrap(),
+                &remote_command_for(jailed),
+                "jailed={jailed}"
+            );
+        }
+        assert_ne!(remote_command_for(false), remote_command_for(true));
     }
 
     #[test]
@@ -1983,7 +2271,7 @@ mod tests {
     #[test]
     fn verify_argv_is_the_exact_vector() {
         let cfg = PathBuf::from("/home/charlie/.config/roost/ssh_config");
-        let argv = verify_argv(&cfg, "workbox", &remote_command());
+        let argv = verify_argv(&cfg, "workbox", &remote_command_for(false));
         assert_eq!(
             argv,
             vec![
@@ -1997,18 +2285,52 @@ mod tests {
                 "BatchMode=yes",
                 "-T",
                 "workbox",
-                &remote_command(),
+                &remote_command_for(false),
             ]
         );
         assert!(!argv.contains(&"-S".to_string()));
         assert!(!argv.iter().any(|a| a.contains("ControlPersist")));
     }
 
+    /// Pinned as *properties* rather than as a literal: the string
+    /// itself is generated from the candidate ladder in
+    /// [`crate::bootstrap`], and a test that copies it out would have to
+    /// be edited every time a rung is added — which is exactly the edit
+    /// that would hide a rung being dropped.
     #[test]
-    fn remote_command_is_the_pinned_one_liner() {
+    fn the_remote_command_is_the_bootstrap_exec_chain() {
+        // The shipped ladder, spelled as a *value* rather than read off
+        // whatever `ROOST_TEST_MODE` this `cargo test` inherited — which
+        // is what makes the seam assertion below mean something.
+        let command = remote_command_for(false);
+        assert_eq!(command, crate::bootstrap::exec_chain_command(false));
+        assert!(
+            !command.contains(crate::bootstrap::FS_ROOT_ENV),
+            "a shipped transport never writes the jail expansion: {command}"
+        );
+        // sshd hands this to the user's login shell, which may be csh —
+        // where `'\''` is not an escape. The literal this replaced had
+        // no embedded quote and neither may its generated successor.
+        assert!(!command.contains(r"'\''"), "{command}");
+        assert!(
+            command.starts_with("sh -c "),
+            "one argv element, parsed by sh and not by the user's login shell: {command}"
+        );
+        assert!(
+            command.contains("$HOME/.local/bin/roost-session"),
+            "the install destination must be the first rung tried: {command}"
+        );
+        assert!(
+            command.contains("client-bridge"),
+            "the chain execs the bridge: {command}"
+        );
+        // The fall-through has to be classifiable, or a host with no
+        // binary at all never produces the failure family whose copy
+        // becomes the install offer.
+        assert!(command.contains("exit 127"), "{command}");
         assert_eq!(
-            remote_command(),
-            r#"sh -c 'R="$HOME/.local/bin/roost-session"; [ -x "$R" ] || R=roost-session; exec "$R" client-bridge'"#
+            classify_ssh_failure(Some(127), "roost-session: command not found\n"),
+            SshFailure::NotFound
         );
     }
 
@@ -2217,6 +2539,14 @@ mod tests {
         assert!(SshFailure::NoSession
             .message("workbox")
             .contains("roostctl session start"));
-        assert!(SshFailure::NotFound.message("workbox").contains("workbox"));
+        let not_found = SshFailure::NotFound.message("workbox");
+        assert!(not_found.contains("workbox"));
+        // The one remedy this family offers, and the only one there is:
+        // `roostctl` gains no install surface (plan 039 §3.5), so the
+        // sentence has to send the reader to the app.
+        assert!(
+            not_found.contains("connect from the Roost app to install it"),
+            "{not_found}"
+        );
     }
 }

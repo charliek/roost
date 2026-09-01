@@ -1044,6 +1044,90 @@ And the op is not defined concurrent with a live pointer drag of the
 seam: a drag in flight re-anchors on its press-time width and its
 release wins. Harnesses drive one or the other, never both at once.
 
+### Host bootstrap test ops (`app.dialog_dump` / `app.dialog_answer` / `app.keybind_dispatch`) *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it every op in this group errors. `tools/roosttest/` drives a
+real UI over this socket and nothing else, so without a seam onto the
+host dialog family (`HostDialog::{Add, ConfirmStop, ConfirmRestart,
+Bootstrap}` — [Host sessions (development)](../development/host-sessions.md#bootstrap-installupgrade-over-ssh))
+the consent card the SSH bootstrap flow (plan 039) gates on could not
+be exercised at all. Unlike the upgrade prompt, whose button composes
+ops a test can already send directly, the bootstrap job is
+deliberately UI-only and has no such back door.
+
+**These are a test seam and not a production surface.** Nothing but
+`ROOST_TEST_MODE=1` can reach them, `roostctl` grows no verb for any
+of them, and the rule they exist to protect is the opposite of a
+remote-control API: a modal must never be raised at — or answered by —
+a machine.
+
+`app.dialog_dump` reads which host modal is on screen and what it
+says — the *rendered* strings, not the state behind them, so a test
+asserting "the user is told the right thing" isn't re-deriving the
+copy rule a second time.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{
+  "dialog": "bootstrap",
+  "variant": "install",
+  "title": "Install roost-session on workbox?",
+  "body": "roost-session 0.0.19 (ghostty-abcdef0…) will be installed to ~/.local/bin/roost-session on workbox, from this Roost's own roost-session.",
+  "buttons": ["Cancel", "Install"],
+  "host": "3f9a2b7c1d4e4f5a"
+}
+```
+
+`dialog` is `"add" | "confirm_stop" | "confirm_restart" | "bootstrap"`,
+or absent (with every other field defaulted/empty) when no host modal
+is open. `variant` is present only for `"bootstrap"` —
+`"install" | "update" | "start"` — and `null`/absent otherwise.
+`buttons` lists every button in render order, the dismissing one
+first, exactly as the card draws them. `host` is the saved host's
+**id** — the opaque hex `host.add` minted and `host.list` reports, the
+same value `host.connect` takes — not its label, even though the
+rendered `title` and `body` above interpolate the label. Absent when
+the dialog is not about a saved host.
+
+`app.dialog_answer` presses the visible modal's primary button, or
+dismisses it — through the same production handlers a real click or
+Enter/Escape takes, so every guard the button itself has (re-reading
+state at confirm, the mutation claim, refusing to run twice) applies
+here too.
+
+Request: `{"params": {"action": "confirm"}}` (or `"cancel"`). Response:
+`{}`.
+
+`action` outside `"confirm" | "cancel"` is rejected `invalid-param`
+before anything else runs. Every other refusal is `internal`, carrying
+a human-readable reason: no host dialog is open; `"confirm"` sent to a
+dialog with no confirming action (a
+remote host whose `NeedsRestart` dialog can only offer the
+docs-pointer copy, `RestartAction::None`); or `"confirm"` sent to the
+Add Host dialog while it's already dialing a verify. A dialog with no
+primary action refuses `confirm` rather than silently dismissing — a
+test that thinks it pressed a button that isn't there should fail
+loudly, not pass by accident.
+
+`app.keybind_dispatch` runs a named keybind-table action through the
+same dispatcher a real key press or native menu click uses. It exists
+because paste has no other IPC back door — unlike a palette row, it's
+reachable only from a real key event — so the harness needed a seam to
+drive it at all, including issue #376's frozen-host-frame refusal.
+
+Request: `{"params": {"action": "paste"}}`. Response: `{}`.
+
+**Not a general keybind dispatcher.** `action` accepts only the
+literal `"paste"`; every other `KeybindAction` name (`"close_tab"`,
+`"new_tab"`, `"copy"`, …) is rejected — an arbitrary IPC client isn't
+trustworthy with a route that can close a live terminal, mutate
+workspace state, or write the system clipboard. Like
+`app.dialog_answer`'s `action` check, this is rejected `invalid-param`
+before anything else runs. Widening the allowlist happens one name at
+a time, alongside a concrete test need.
+
 ### Command palette (`palette.*`)
 
 Drive the command-palette overlay — open it, read its rows, filter,

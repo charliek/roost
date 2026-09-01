@@ -62,6 +62,7 @@ import atexit
 import contextlib
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -71,11 +72,11 @@ from pathlib import Path
 import pytest
 import session as sessionlib
 import ui
-from client import Roost
+from client import Roost, scaled_timeout
+from util import runs_alone
 
 # The host lane's vocabulary, unchanged: same fixtures' shape, same
 # palette reads, same incarnation probe. Only the transport differs.
-from client import RoostError
 from test_host_client import (
     HostUnderTest,
     first_project,
@@ -86,6 +87,7 @@ from test_host_client import (
     wait_dump_contains,
     wait_until,
 )
+from test_host_client import host_key as _host_key
 
 pytestmark = pytest.mark.host_client
 
@@ -242,6 +244,12 @@ def is_exec(argv: list[str]) -> bool:
     return len(argv) > 1 and "client-bridge" in argv[-1]
 
 
+def is_teardown(argv: list[str]) -> bool:
+    """The mux teardown: `-O exit` against the tunnel's own control
+    socket (`teardown_argv`, `ssh.rs`) — no remote command at all."""
+    return "-O" in argv and "exit" in argv
+
+
 def count(predicate) -> int:
     return sum(1 for fields in invocations() if predicate(fields[1:]))
 
@@ -384,7 +392,11 @@ def ssh_host(roost: Roost, session_env):
     try:
         yield under_test
     finally:
-        roost.palette_dismiss()
+        # Both suppressed: the C7 signal-teardown test ends the UI itself
+        # mid-test, so a socket write here is a `BrokenPipeError`, not a
+        # bug — that test's own assertions already covered what it did.
+        with contextlib.suppress(Exception):
+            roost.palette_dismiss()
         # Removal disconnects, which is what tears the tunnel (and its
         # `ssh` master) down — before the session it reaches goes away.
         with contextlib.suppress(Exception):
@@ -396,41 +408,20 @@ def ssh_host(roost: Roost, session_env):
 # ---------------------------------------------------------------------------
 
 
-# How many incarnations [`host_key`] scans per pass. Small on purpose,
-# and safe here for a reason `test_host_client` cannot rely on: this lane
-# only ever drives a UI it launched itself (see `_harness_owned_ui`), so
-# the app's minter is a handful of connects in, not hundreds.
-#
-# Deliberately NOT that module's 4096-wide single-pass scan. A miss there
-# costs 4096 IPC round trips — tens of seconds, i.e. the whole wait
-# budget — so a tab that reaches the client's mirror a moment *after* it
-# is created never gets a second pass. Over ssh that moment is real: the
-# `tab.opened` event crosses two extra pumps and a remote process before
-# the mirror has it.
-HOST_INCARNATION_WINDOW = 64
-
-
+# `host_probe.host_key` (a 64-wide first pass, each retry inside
+# `wait_until` re-scanning from the floor with double the span, floor
+# advancing on every hit) is exactly this lane's shape too — same
+# `tab.focus` probe, same discovery-is-attach story, same reason a
+# narrow first pass beats a wide single-pass scan: over ssh a
+# tab reaching the client's mirror a moment *after* it is created is the
+# common case, not the exception (the `tab.opened` event crosses two
+# extra pumps and a remote process before the mirror has it), so a miss
+# has to be cheap enough for `wait_until` to genuinely retry. Only this
+# lane's longer default budget is worth keeping local: ssh adds a tunnel
+# dial and a remote exec before the incarnation this call is watching
+# for even exists.
 def host_key(roost: Roost, tab_id: int, timeout: float = 60.0) -> str:
-    """Focus a host tab and return the `h<host>.<id>` spelling that
-    reached it.
-
-    The incarnation is minted per connect attempt and no op reports it,
-    so it is discovered by probing — and focusing is the discovery
-    because focusing is also the attach. A stale incarnation names
-    nothing, so a wrong guess is a clean `not-found` rather than a wrong
-    tab.
-    """
-
-    def probe() -> str | None:
-        for incarnation in range(1, HOST_INCARNATION_WINDOW + 1):
-            try:
-                roost.call("tab.focus", {"tab_id": f"h{incarnation}.{tab_id}"})
-            except RoostError:
-                continue
-            return f"h{incarnation}.{tab_id}"
-        return None
-
-    return wait_until(probe, timeout, f"the client to list host tab {tab_id}")
+    return _host_key(roost, tab_id, timeout=timeout)
 
 
 #: What `host.connect` may answer for an **ssh** host. The establish is
@@ -586,3 +577,65 @@ def test_a_missing_remote_binary_settles_disconnected_and_names_roost_session(
     reason = connect_expecting_failure(ssh_host, target, "exit-127")
     assert NOT_FOUND_COPY in reason, reason
     assert "roost-session" in reason, reason
+
+
+# ---------------------------------------------------------------------------
+# C7: a signal is a graceful quit, not a crash (plan 039 §3.9)
+# ---------------------------------------------------------------------------
+
+
+def test_sigterm_during_teardown_flushes_state_and_tears_the_tunnel_down(
+    ssh_host, target, request
+):
+    """AC: SIGTERM reaches the same path a menu Quit does.
+
+    Before this commit the iced UI installed no signal handler, so a
+    SIGTERM behaved exactly like a crash — no `Drop for App`, so no
+    workspace flush and no tunnel `-O exit` (an ssh ControlMaster would
+    strand until its own `ControlPersist` window expired; plan 038's known
+    gap). This asserts both halves land: the UI's own log gets the flush
+    line, and the fake `ssh` invocation log gets a teardown call against
+    the tunnel's own control socket.
+
+    This module, not `test_host_bootstrap.py`: both read `UiLog` and the
+    invocation log, but that module's `-O exit` is a **bootstrap job's**
+    own throwaway control socket (§3.8's job-scoped master) — a different
+    socket from the one this assertion is pinned to. This module is where
+    the *tunnel's* `-O exit` (`SshTunnel`'s `Drop`) lives.
+
+    SIGINT is not repeated here: it shares every line of the path this
+    exercises from the signal handler onward (`observe_quit_signal`,
+    `EngineFeed::Quit`, `ExitState::request`), and that shared path is
+    what the unit test in `app.rs` covers.
+
+    Necessarily the last thing this module does — SIGTERM ends the UI
+    process it drives, and every test after it needs one alive. Skips
+    loudly (`runs_alone`) rather than risk running that way: a
+    whole-directory `pytest tools/roosttest` would otherwise collect this
+    beside every other module and strand them all.
+    """
+    if not runs_alone(request):
+        pytest.skip(
+            "SIGTERMs the UI it drives, so it must be this module's own "
+            "pytest invocation (`make e2e-host-ssh`) — collected beside "
+            "other modules it would strand every test after it"
+        )
+    process = ui.owned_process(target)
+    if process is None:
+        pytest.skip("needs the harness's own UI process handle to signal")
+
+    connect_and_wait(ssh_host)
+    # The mux is up, so the tunnel's control socket exists for `-O exit`
+    # to address once the signal lands.
+    assert count(is_establish) >= 1, invocations()
+
+    flush_log = UiLog(target, "workspace state flushed on shutdown")
+    process.send_signal(signal.SIGTERM)
+    flush_log.wait_next(timeout=30.0)
+
+    exit_code = process.wait(timeout=scaled_timeout(30.0))
+    assert exit_code == 0, (
+        f"the UI must end its run loop normally (exit {exit_code}); a "
+        "non-zero status means it was killed rather than dropping App"
+    )
+    assert count(is_teardown) >= 1, invocations()

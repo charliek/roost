@@ -629,6 +629,21 @@ pub struct ClipboardWriteParams {
 // "why is this row gray." The resolver walk it pins is exactly the
 // one the production paint path runs, so it doubles as the
 // regression net for the bold-color resolver call site (#142).
+//
+// `app.dialog_dump` + `app.dialog_answer` are the same kind of seam
+// one layer up: they read which host modal is on screen and press its
+// buttons. They exist because `tools/roosttest/` drives a real UI over
+// this socket and nothing else, so without them the consent dialog the
+// ssh bootstrap is gated on (plan 039 §3.5) could not be exercised at
+// all — and unlike the upgrade prompt, whose button composes ops a test
+// can send directly, the bootstrap job is deliberately UI-only and has
+// no such back door.
+//
+// They are a **test seam and not a production surface**. Nothing but
+// `ROOST_TEST_MODE=1` can reach them, `roostctl` grows no verb for
+// them, and the rule they exist to protect is the opposite of a
+// remote-control API: a modal must never be raised at — or answered by
+// — a machine.
 
 /// `tab.feed_pty_bytes` request: inject bytes into a tab's PTY-output
 /// drain as if the supervisor had emitted them. Indistinguishable
@@ -690,6 +705,72 @@ pub struct TabFeedImeParams {
     pub cursor_start: Option<usize>,
     #[serde(default)]
     pub cursor_end: Option<usize>,
+}
+
+/// `app.dialog_dump` request: which host modal is on screen, and what
+/// it says. Gated on `ROOST_TEST_MODE=1`; see the section header above
+/// for why this is a test seam rather than a surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppDialogDumpParams {}
+
+/// What `app.dialog_dump` answers.
+///
+/// Deliberately the *rendered* strings rather than the state behind
+/// them: what a test needs to assert is that the user is being told the
+/// right thing, and re-deriving that from a state dump would be the
+/// test writing the copy rule a second time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDialogDumpResult {
+    /// `"add" | "confirm_stop" | "confirm_restart" | "bootstrap"`, or
+    /// `null` when no host modal is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<String>,
+    /// The bootstrap card's variant — `"install" | "update" | "start"`.
+    /// `null` for every other dialog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// Every button on the card, in render order (the dismissing one
+    /// first, as the panel draws it).
+    pub buttons: Vec<String>,
+    /// The saved host's **id** — not its label, which is what the
+    /// rendered `title`/`body` interpolate. `None` when the dialog is
+    /// not about a saved host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// `app.dialog_answer` request: press the visible host modal's primary
+/// button, or dismiss it. The same routes a click and the Enter/Escape
+/// keys take. Gated on `ROOST_TEST_MODE=1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppDialogAnswerParams {
+    /// `"confirm"` or `"cancel"`.
+    pub action: String,
+}
+
+/// `app.keybind_dispatch` request: run the paste accelerator through the
+/// same dispatch a real key event or native menu click takes. Gated on
+/// `ROOST_TEST_MODE=1`. Exists because paste has no other IPC back door:
+/// unlike a palette row, it is reachable only from a real key event, so
+/// nothing in this harness could otherwise drive it (and, since C9, its
+/// frozen-host-frame refusal per issue #376).
+///
+/// **Not a general keybind dispatcher.** `action` accepts only the
+/// literal `"paste"` — every other `KeybindAction::from_name` spelling
+/// (`"close_tab"`, `"new_tab"`, `"close_project"`, `"copy"`, …) is
+/// rejected, because an arbitrary IPC client is not trustworthy with a
+/// route that can close a live terminal, mutate workspace state, or
+/// write the system clipboard. Widen this allowlist only alongside a
+/// concrete test need, one name at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppKeybindDispatchParams {
+    /// Must be `"paste"` — the only action this op will dispatch.
+    pub action: String,
 }
 
 /// `tab.dump_resolved` request: walk a tab's render state through
@@ -1563,6 +1644,31 @@ impl std::fmt::Display for AttachPayloadKind {
     }
 }
 
+/// The offline identity of a `roost-session` **binary** — what
+/// `roost-session identify` prints, before that binary has ever bound a
+/// socket or hydrated a workspace.
+///
+/// Deliberately a different type from [`SessionIdentify`], not a subset
+/// reused via `Default`: `SessionIdentify` describes a *running*
+/// session (six required fields, three of which — `payload_kinds`,
+/// `session_id`, `started_at` — only exist once a process has actually
+/// started serving) and answers `session.identify` over the wire. This
+/// type describes a binary sitting on disk and answers a plain CLI
+/// invocation with no process, no socket, and no side effects; the
+/// bootstrap probe (plan 039) execs a candidate with `identify` and
+/// compares this triple against the client's own before ever streaming
+/// bytes at it. `roost-ipc` stays free of a `roost-vt` dependency
+/// because of this split — it is a plain data carrier, and the
+/// `libghostty_build` value is constructed by producers (`roost-session`
+/// for its own build, `roost-iced` for the client's expected value) that
+/// already depend on `roost-vt` for other reasons.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBinaryIdentity {
+    pub app_version: String,
+    pub session_protocol: u32,
+    pub libghostty_build: String,
+}
+
 /// `session.identify` result — the first thing a client asks a host
 /// session for, so every incompatibility is caught on stable JSON
 /// before any binary frame exists.
@@ -1925,6 +2031,25 @@ pub struct HostListResult {
 #[serde(deny_unknown_fields)]
 pub struct HostConnectParams {
     pub id: String,
+    /// `ROOST_TEST_MODE=1` only: route this connect through the same
+    /// `RequestOrigin::User` a sidebar or palette click carries, instead
+    /// of `host.connect`'s ordinary `Ipc` origin (plan 039 §3.5's
+    /// never-a-modal-at-a-machine rule). Ignored outside test mode, so
+    /// it can never let a real `roostctl`/IPC caller raise a consent
+    /// dialog. The `tools/roosttest` harness is IPC-only and has no
+    /// other way to reach the bootstrap offer or the remote-restart
+    /// prompt, which are both gated on a *person* having asked.
+    ///
+    /// `skip_serializing_if` rather than a bare default: this is a test
+    /// seam, and a production `host.connect` frame should not carry it
+    /// at all. (It is no longer load-bearing for `roostctl host
+    /// disconnect` — that op is sent its own `HostDisconnectParams`.)
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub test_user_origin: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2304,6 +2429,24 @@ pub mod ops {
     /// authorization answer. Same gate and platform restriction as
     /// `app.menu_dump`.
     pub const APP_NOTIFICATION_STATUS: &str = "app.notification_status";
+
+    /// Test-only read of the host modal on screen — which one, what it
+    /// says, and what its buttons are labelled. Same gate as
+    /// `tab.feed_pty_bytes`. It exists so the IPC-only pytest harness
+    /// can assert the ssh bootstrap's consent copy (plan 039 §3.5);
+    /// it is not a production surface and `roostctl` has no verb for it.
+    pub const APP_DIALOG_DUMP: &str = "app.dialog_dump";
+    /// Test-only press of the visible host modal's primary button, or a
+    /// dismiss — the same two routes a click and Enter/Escape take.
+    /// Same gate and the same "test seam, not a surface" rule as
+    /// `app.dialog_dump`.
+    pub const APP_DIALOG_ANSWER: &str = "app.dialog_answer";
+
+    /// Test-only dispatch of a named keybind-table action through the
+    /// production dispatcher. Same gate and "test seam, not a surface"
+    /// rule as `app.dialog_dump` — it exists because the paste
+    /// accelerator (issue #376's regression) has no other IPC seam.
+    pub const APP_KEYBIND_DISPATCH: &str = "app.keybind_dispatch";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";

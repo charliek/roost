@@ -20,9 +20,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use roost_ipc::bootstrap::shell_quote;
 use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 use roost_ipc::ssh::{
-    classify, remote_command, verify_ssh_target, ResolvedTransport, SshConfigPaths, SshFailure,
+    classify, remote_command_for, verify_ssh_target, ResolvedTransport, SshConfigPaths, SshFailure,
     SshTarget, SshTunnel, SshTunnelOptions,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,10 +65,10 @@ impl Harness {
             format!(
                 "#!/bin/sh\nFAKE_SSH_LOG={log}\nFAKE_SSH_MODE={mode}\nFAKE_SSH_EXEC={exec}\n\
                  export FAKE_SSH_LOG FAKE_SSH_MODE FAKE_SSH_EXEC\nexec {fixture} \"$@\"\n",
-                log = sh_quote(&log.display().to_string()),
-                mode = sh_quote(mode),
-                exec = sh_quote(exec),
-                fixture = sh_quote(&fixture_path().display().to_string()),
+                log = shell_quote(&log.display().to_string()),
+                mode = shell_quote(mode),
+                exec = shell_quote(exec),
+                fixture = shell_quote(&fixture_path().display().to_string()),
             ),
         )
         .expect("write the ssh wrapper");
@@ -93,6 +94,10 @@ impl Harness {
             },
             scratch_parents: vec![self.parent.clone()],
             ssh_bin: self.ssh_bin.clone(),
+            // This harness fakes `ssh` itself and never runs the remote
+            // command, so it wants the *shipped* ladder — the same one
+            // `is_exec` below recognizes.
+            jail_fs_root: false,
         }
     }
 
@@ -167,10 +172,6 @@ fn fixture_path() -> PathBuf {
         .expect("the fake-ssh fixture must exist")
 }
 
-fn sh_quote(raw: &str) -> String {
-    format!("'{}'", raw.replace('\'', r"'\''"))
-}
-
 /// The mux warm-up: its remote command is the literal `true`.
 fn is_establish(argv: &[String]) -> bool {
     argv.last().is_some_and(|last| last == "true")
@@ -178,7 +179,8 @@ fn is_establish(argv: &[String]) -> bool {
 
 /// A per-connection exec: its remote command is the bridge one-liner.
 fn is_exec(argv: &[String]) -> bool {
-    argv.last().is_some_and(|last| *last == remote_command())
+    argv.last()
+        .is_some_and(|last| *last == remote_command_for(false))
 }
 
 fn is_master_exit(argv: &[String]) -> bool {
@@ -675,7 +677,10 @@ async fn verify_speaks_identify_over_a_one_shot_exec_outside_the_mux() {
     let response = format!(r#"{{"id":"1","ok":true,"result":{result}}}"#);
     let harness = Harness::new(
         "ok",
-        &format!("read -r _request; printf '%s\\n' {}", sh_quote(&response)),
+        &format!(
+            "read -r _request; printf '%s\\n' {}",
+            shell_quote(&response)
+        ),
     );
 
     let identity = verify_ssh_target(

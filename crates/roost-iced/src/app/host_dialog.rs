@@ -17,6 +17,8 @@
 //! spends a round trip on `session.identify` — over a socket or over
 //! `ssh`, depending on what the target turned out to be.
 
+use crate::host_conn::ConnectFailure;
+
 /// The Add Host dialog's live contents.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct AddHostDraft {
@@ -43,6 +45,17 @@ impl AddHostDraft {
     /// "Connecting…" label read.
     pub(super) fn is_verifying(&self) -> bool {
         self.verifying.is_some()
+    }
+
+    /// The primary button's label. Inert while a dial is in flight
+    /// rather than hidden — a button that vanishes mid-press moves the
+    /// card under the pointer — so the label is what says so.
+    pub(super) fn confirm_label(&self) -> &'static str {
+        if self.is_verifying() {
+            "Connecting…"
+        } else {
+            "Add & Connect"
+        }
     }
 
     /// Arm a fresh dial. The error goes with it: the draft is being
@@ -101,6 +114,16 @@ pub(super) enum HostDialog {
         saved_id: String,
         prompt: super::host_notice::RestartPrompt,
     },
+    /// Consent to install, update or start `roost-session` on a host
+    /// reached over ssh (plan 039 §3.5).
+    ///
+    /// The fourth member of the family rather than a surface of its own,
+    /// because it is the same kind of question the other three are: one
+    /// the user still owes an answer to, over chrome that keeps working
+    /// underneath. It carries a snapshot for `ConfirmStop`'s reason —
+    /// the card describes the far side as a *read-only* probe found it,
+    /// and nothing has been touched over there yet.
+    Bootstrap(super::bootstrap::BootstrapDraft),
 }
 
 impl HostDialog {
@@ -111,7 +134,7 @@ impl HostDialog {
     pub(super) fn draft_mut(&mut self) -> Option<&mut AddHostDraft> {
         match self {
             Self::Add(draft) => Some(draft),
-            Self::ConfirmStop { .. } | Self::ConfirmRestart { .. } => None,
+            Self::ConfirmStop { .. } | Self::ConfirmRestart { .. } | Self::Bootstrap(_) => None,
         }
     }
 }
@@ -162,18 +185,24 @@ pub(super) fn validate_draft(
 /// The check itself is [`roost_ipc::ssh::verify_transport`] — one bar
 /// however the target is reached, and the same call `roostctl host add
 /// --verify` makes, so the dialog and the CLI cannot drift apart about
-/// what "verified" means. All this adds is the dialog's own error shape:
-/// a `String` to show under the fields.
+/// what "verified" means. All this adds is the dialog's own error shape.
+///
+/// That shape is a [`ConnectFailure`] rather than a `String`: the
+/// message under the fields is unchanged, but "Add & Connect" is one of
+/// the two doors a bootstrap offer opens from (plan 039 §3.5), and
+/// deciding *this was the not-found family* has to read the family — not
+/// a substring of the sentence shown to the user.
 ///
 /// The classify is a second one (`validate_draft` already ran it), and
 /// deliberately so: this half runs off the main thread, on a target the
 /// dialog only carries as a string.
-pub(super) async fn verify_target(target: String) -> Result<(), String> {
-    let transport = roost_ipc::ssh::classify(&target).map_err(|error| format!("{error:#}"))?;
+pub(super) async fn verify_target(target: String) -> Result<(), ConnectFailure> {
+    let transport = roost_ipc::ssh::classify(&target)
+        .map_err(|error| ConnectFailure::unclassified(format!("{error:#}")))?;
     roost_ipc::ssh::verify_transport(&transport)
         .await
         .map(drop)
-        .map_err(|error| format!("{error:#}"))
+        .map_err(ConnectFailure::from)
 }
 
 #[cfg(test)]

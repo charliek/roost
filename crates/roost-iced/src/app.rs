@@ -5,6 +5,7 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +74,7 @@ use crate::{chrome, input};
 // `mod palette` would collide with the `roost_ui_model::palette` import in
 // this module's namespace, so the palette-overlay half of App lives in
 // `palettes` (it hosts the command/agent/provider/notification palettes).
+pub(crate) mod bootstrap;
 mod host_dialog;
 pub(crate) mod host_notice;
 pub(crate) mod host_tab;
@@ -425,6 +427,23 @@ fn frozen_frame<'a>(
         .into()
 }
 
+/// The Add Host card's heading, and the Stop confirmation's.
+///
+/// Constants rather than literals at the widget, so `app.dialog_dump`
+/// reports what the card actually says instead of a second copy of it
+/// that could drift.
+const ADD_HOST_TITLE: &str = "Add Host";
+const ADD_HOST_BODY: &str = "Point Roost at a running roost-session: an SSH destination \
+                             (workbox, user@host, ssh://host:port) or a local socket path.";
+const STOP_SESSION_BODY: &str = "Every shell on that host ends. The layout is saved, so \
+                                 starting the session again reopens the same tabs as fresh \
+                                 shells.";
+const STOP_SESSION_CONFIRM: &str = "Stop Session";
+
+fn stop_session_title(label: &str) -> String {
+    format!("Stop the session on {label}?")
+}
+
 /// One labelled text field in the Add Host dialog (the mock's
 /// `label` + `.field` pair).
 fn dialog_field<'a>(
@@ -633,7 +652,7 @@ pub enum EngineOpResult {
         generation: u64,
         label: String,
         target: String,
-        result: Result<(), String>,
+        result: Result<(), crate::host_conn::ConnectFailure>,
     },
     /// The stopping half of an upgrade restart finished (plan 037 §3.7).
     ///
@@ -654,16 +673,23 @@ pub enum EngineOpResult {
 ///
 /// A join failure — the op panicked, or the runtime is shutting down —
 /// becomes that op's own error rather than a dropped completion: every
-/// dispatch owes the UI exactly one [`EngineOpResult`].
-fn spawn_engine_op<T: Send + 'static>(
+/// dispatch owes the UI exactly one [`EngineOpResult`]. That is the one
+/// thing an op's error type has to be able to express, hence the
+/// `From<String>` bound: most ops fail as a `String`, and the Add Host
+/// dial fails as a classified [`crate::host_conn::ConnectFailure`].
+fn spawn_engine_op<T, E>(
     handle: tokio::runtime::Handle,
-    op: impl Future<Output = Result<T, String>> + Send + 'static,
-    complete: impl FnOnce(Result<T, String>) -> EngineOpResult + Send + 'static,
-) -> EngineOpFuture {
+    op: impl Future<Output = Result<T, E>> + Send + 'static,
+    complete: impl FnOnce(Result<T, E>) -> EngineOpResult + Send + 'static,
+) -> EngineOpFuture
+where
+    T: Send + 'static,
+    E: Send + 'static + From<String>,
+{
     Box::pin(async move {
         let result = match handle.spawn(op).await {
             Ok(result) => result,
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(E::from(error.to_string())),
         };
         complete(result)
     })
@@ -1456,6 +1482,145 @@ impl ExitState {
     }
 }
 
+/// What a delivered SIGTERM/SIGINT should do — request the same graceful
+/// quit a menu Quit would, or (a repeat, meaning the graceful path is
+/// wedged) force the process down immediately. A pure decision over a
+/// shared latch, so it is testable without tokio or a real `App`.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitSignalAction {
+    RequestQuit,
+    Escalate,
+}
+
+/// `handled` is shared across every signal listener `spawn_quit_signals`
+/// installs, so a repeat of the *same* signal and a *different* one both
+/// escalate — "already handled one" is what matters, not which.
+fn observe_quit_signal(handled: &AtomicBool) -> QuitSignalAction {
+    if handled.swap(true, Ordering::SeqCst) {
+        QuitSignalAction::Escalate
+    } else {
+        QuitSignalAction::RequestQuit
+    }
+}
+
+/// Route SIGTERM and SIGINT into the same exit request a menu Quit makes
+/// (plan 039 §3.9) — closing plan 038's known gap, where a bare SIGTERM
+/// behaved exactly like a crash (no `Drop for App`, so no workspace flush
+/// and no tunnel `-O exit`; an ssh ControlMaster would strand until its
+/// `ControlPersist` window expired). A second signal past the first
+/// escalates to `process::exit(1)`: insurance against a wedged graceful
+/// path, which is the very freeze this exists to prevent.
+///
+/// Mirrors `roost-session`'s `spawn_signal_stops` (`serve.rs`), adapted to
+/// this app's own runtime and its own drain instead of a wire call.
+///
+/// Unlike that sibling, both streams are registered **synchronously**,
+/// before either listener task is spawned — under `runtime.enter()` so
+/// `signal()` has the reactor context it needs (`bootstrap()` is
+/// synchronous, pre-run-loop code that isn't itself executing on the
+/// runtime; `Handle::current()` panics with "no reactor running" without
+/// the guard). Registering from *inside* the spawned task, as an earlier
+/// version of this did to route around that panic, left a window between
+/// `spawn` returning and the task's first poll where the signal still had
+/// its OS default disposition — a SIGTERM/SIGINT landing in that window
+/// killed the process with no flush and no tunnel `-O exit`, the exact
+/// gap this function exists to close. Registering synchronously here
+/// closes it: by the time this returns, both signals are already routed
+/// through `observe_quit_signal`, before the caller can be interrupted.
+///
+/// Failure to register is treated as fatal to startup, like every other
+/// fallible step in `bootstrap()` (`?` throughout) — this call is *the*
+/// safety net C7 adds; starting anyway and logging-and-continuing would
+/// silently ship the app back into the pre-C7 bare-kill behavior with no
+/// visible signal that the protection is missing. `signal()` registration
+/// realistically only fails on a broken environment (e.g. the process is
+/// already out of OS signal-handling resources), so refusing to start is
+/// the defensible choice: the failure is surfaced immediately in the
+/// startup error rather than discovered later as a shutdown that dropped
+/// state.
+fn spawn_quit_signals(runtime: &tokio::runtime::Runtime, feed_tx: &EngineFeedSender) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let streams = {
+        let _guard = runtime.enter();
+        let term = signal(SignalKind::terminate()).context("install a SIGTERM handler")?;
+        let int = signal(SignalKind::interrupt()).context("install a SIGINT handler")?;
+        [("SIGTERM", term), ("SIGINT", int)]
+    };
+
+    let handled = Arc::new(AtomicBool::new(false));
+    for (name, mut stream) in streams {
+        let handled = Arc::clone(&handled);
+        let feed_tx = feed_tx.clone();
+        runtime.spawn(async move {
+            loop {
+                if stream.recv().await.is_none() {
+                    return;
+                }
+                match observe_quit_signal(&handled) {
+                    QuitSignalAction::RequestQuit => {
+                        tracing::info!(
+                            signal = name,
+                            "signal received; requesting a graceful quit"
+                        );
+                        if !feed_tx.send(EngineFeed::Quit) {
+                            return;
+                        }
+                    }
+                    QuitSignalAction::Escalate => {
+                        tracing::warn!(
+                            signal = name,
+                            "second signal received before the graceful quit finished; forcing exit"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Restores SIGTERM/SIGINT to `SIG_DFL` when dropped. An `App` field of
+/// this type, placed immediately before `runtime` in the struct so it
+/// drops immediately before it, is what keeps a wedged shutdown killable.
+///
+/// Tokio never unregisters the libc handlers `spawn_quit_signals` installs
+/// — it just stops polling the streams once the runtime that ran them is
+/// gone. Left alone, that means: `Runtime::drop` cancels the listener
+/// tasks (no more `observe_quit_signal`/escalate), but the OS-level
+/// handler is still armed, so a signal arriving *during* runtime shutdown
+/// is consumed and silently dropped — neither escalated nor left to the
+/// default disposition that would kill the process. If teardown itself
+/// hangs there, no further SIGTERM/SIGINT can force it down: the inverse
+/// of the freeze `spawn_quit_signals` exists to prevent.
+///
+/// Field placement makes the ordering explicit without extra plumbing:
+/// every field declared above `runtime` — including `hosts`, whose
+/// `SshTunnel` Drop blocks on `-O exit` — has already finished dropping
+/// by the time this one is reached, so the graceful path has always had
+/// its chance before defaults are restored; `runtime` itself hasn't
+/// started dropping yet, so `process::exit(1)` escalation is still live
+/// for the entire window this guard is protecting.
+///
+/// A signal delivered after this restore terminates the process by its
+/// own default disposition (143 for SIGTERM, 130 for SIGINT) rather than
+/// the escalate path's `exit(1)` — that's an accepted, arguably more
+/// correct, difference: the exit status then reflects that the process
+/// was killed by a signal rather than choosing to exit(1) on its own.
+struct RestoreDefaultQuitSignalsOnDrop;
+
+impl Drop for RestoreDefaultQuitSignalsOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: SIG_DFL is always a valid disposition, and libc::signal
+        // has no preconditions beyond a valid (signum, handler) pair.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+    }
+}
+
 /// A dispatched engine mutation: the Iced task that will deliver its
 /// completion, plus the id that completion will carry.
 ///
@@ -1825,6 +1990,10 @@ pub struct App {
     /// the relaunch connects — so the ladder is claimed here rather than
     /// left for a second press to start again on the same socket.
     host_restarts: crate::host_conn::restart::RestartsInFlight,
+    /// The probes and install jobs a bootstrap offer has in flight
+    /// (plan 039 §3.5) — the probes keyed by saved host, the jobs by
+    /// normalized target token.
+    bootstraps: bootstrap::BootstrapsInFlight,
     /// The Add Host dialog's Name field, and whether it still owes a
     /// focus. Same one-shot shape as the rename editor's: the request is
     /// raised where the dialog opens and drained by whichever route
@@ -1867,6 +2036,9 @@ pub struct App {
     // order — one field here, so no ordering trap at this seam.
     feed_rx: EngineFeedReceiver,
     feed_tx: EngineFeedSender,
+    /// Drops immediately before `runtime` — see
+    /// [`RestoreDefaultQuitSignalsOnDrop`] for why that position matters.
+    _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
     runtime: tokio::runtime::Runtime,
     _locks: InstanceLocks,
 }
@@ -1988,6 +2160,7 @@ impl App {
         ));
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
         runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
+        spawn_quit_signals(&runtime, &feed_tx)?;
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -2097,6 +2270,7 @@ impl App {
             host_selection: None,
             host_dialog: None,
             host_restarts: crate::host_conn::restart::RestartsInFlight::default(),
+            bootstraps: bootstrap::BootstrapsInFlight::default(),
             add_host_name_id: Id::unique(),
             add_host_socket_id: Id::unique(),
             add_host_focus_requested: false,
@@ -2106,6 +2280,7 @@ impl App {
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
+            _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
             runtime,
             _locks: locks,
         };
@@ -2135,7 +2310,9 @@ impl App {
             return;
         }
         for host in self.workspace.hosts() {
-            self.connect_saved_host(&host, |localhost| {
+            // Launch-time, so nobody asked and nobody is waiting: an
+            // `Ipc` origin, same as `roostctl`'s.
+            self.connect_saved_host(&host, crate::host_conn::RequestOrigin::Ipc, |localhost| {
                 // A remote host is manual-reconnect only, so it is not
                 // even resolved into a connection here.
                 localhost.then_some(crate::host_conn::ConnectMode::IfPresent)
@@ -2160,10 +2337,19 @@ impl App {
     fn connect_saved_host(
         &mut self,
         host: &roost_engine::persistence::HostSnapshot,
+        origin: crate::host_conn::RequestOrigin,
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
     ) {
+        use crate::host_conn::HostTransport;
         use roost_ipc::ssh::ResolvedTransport;
 
+        // A new attempt replaces the origin and the failure an in-flight
+        // probe's question was built on, so that probe is now asking
+        // about something that is no longer happening: user Connect →
+        // probe out → an IPC `host.connect` supersedes it → a consent
+        // card raised at nobody. Superseding the probe is not enough —
+        // nothing would re-arm it.
+        self.cancel_bootstrap_probe(&host.id);
         let transport = match roost_ipc::ssh::classify(&host.target) {
             Ok(transport) => transport,
             Err(error) => {
@@ -2176,22 +2362,44 @@ impl App {
             return;
         };
         let mode = spawn_gate(mode, host_verbs::VerbPolicy::current());
+        // The one place the transport becomes the connection set's own
+        // vocabulary. Everything downstream that used to ask "is this
+        // localhost?" — the spawn ladder, the auto-retry policy, and now
+        // what a build mismatch can offer — reads it off this value, so
+        // the three answers cannot disagree.
         match transport {
-            ResolvedTransport::LocalSession(socket) | ResolvedTransport::UnixSocket(socket) => self
-                .hosts
-                .connect(&host.id, &host.label, socket, localhost, mode),
+            ResolvedTransport::LocalSession(socket) => self.hosts.connect(
+                &host.id,
+                &host.label,
+                socket,
+                HostTransport::LocalSession,
+                mode,
+            ),
+            ResolvedTransport::UnixSocket(socket) => self.hosts.connect(
+                &host.id,
+                &host.label,
+                socket,
+                HostTransport::UnixSocket,
+                mode,
+            ),
             ResolvedTransport::Ssh(target) => {
-                self.hosts.open_ssh(&host.id, &host.label, target, mode)
+                self.hosts
+                    .open_ssh(&host.id, &host.label, target, mode, origin)
             }
         }
     }
 
     /// An ssh tunnel finished coming up, or failed to. Dialing is the
-    /// set's; the toast is the app's.
+    /// set's; the toast and the offer are the app's.
     fn host_tunnel_ready(&mut self, ready: crate::host_conn::HostTunnelReady) {
+        let saved_id = ready.host.clone();
         if let Some(reason) = self.hosts.tunnel_ready(ready) {
             self.set_status(reason);
         }
+        // The establish is one of the two places a `NotFound` can land —
+        // the other is a per-connection exec failing later, which
+        // arrives as a state change (see `service_engine`).
+        self.maybe_offer_bootstrap(&saved_id);
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
@@ -2304,11 +2512,15 @@ impl App {
     /// (the op panicked, or the runtime is shutting down) surfaces as that
     /// op's own error, so no dispatch can end in a completion that never
     /// arrives.
-    fn engine_op<T: Send + 'static>(
+    fn engine_op<T, E>(
         &self,
-        op: impl Future<Output = Result<T, String>> + Send + 'static,
-        complete: impl FnOnce(Result<T, String>) -> EngineOpResult + Send + 'static,
-    ) -> UiTask {
+        op: impl Future<Output = Result<T, E>> + Send + 'static,
+        complete: impl FnOnce(Result<T, E>) -> EngineOpResult + Send + 'static,
+    ) -> UiTask
+    where
+        T: Send + 'static,
+        E: Send + 'static + From<String>,
+    {
         UiTask::EngineOp(spawn_engine_op(self.runtime_handle.clone(), op, complete))
     }
 
@@ -2566,20 +2778,23 @@ impl App {
                     }
                     (Key::Named(Named::Enter), false) => {
                         self.rename_completion_key = Some(RenameCompletionKey::Enter);
-                        // One key, three dialogs: Add Host's Enter is
-                        // its "Add & Connect", Stop's and Restart's are
-                        // their confirming buttons. Each is that panel's
+                        // One key, four dialogs: Add Host's Enter is its
+                        // "Add & Connect", and the other three are their
+                        // confirming buttons. Each is that panel's
                         // primary action, which is what Enter means in a
-                        // dialog — and an upgrade prompt for a host this
-                        // client cannot restart has only "Close", so
-                        // Enter is that.
+                        // dialog — and an upgrade prompt for a host
+                        // nothing can be offered for has only "Close",
+                        // so Enter is that.
                         match &self.host_dialog {
                             Some(host_dialog::HostDialog::Add(_)) => task = self.submit_add_host(),
                             Some(host_dialog::HostDialog::ConfirmStop { .. }) => {
                                 self.host_stop_confirmed();
                             }
                             Some(host_dialog::HostDialog::ConfirmRestart { .. }) => {
-                                task = self.host_restart_confirmed();
+                                task = self.host_restart_dialog_confirmed();
+                            }
+                            Some(host_dialog::HostDialog::Bootstrap(_)) => {
+                                self.host_bootstrap_confirmed();
                             }
                             None => {}
                         }
@@ -2835,6 +3050,11 @@ impl App {
         match result {
             Ok(task) => task,
             Err(error) => {
+                // The toast alone is silent to anything outside the
+                // window (a test harness reading the log, a bug report
+                // after the fact) — this is the one boundary every
+                // keybind refusal passes through.
+                tracing::info!(%error, "keybind action refused");
                 self.set_status(error);
                 UiTask::None
             }
@@ -2891,7 +3111,7 @@ impl App {
                 Ok(UiTask::None)
             }
             KeybindAction::Copy => Ok(self.copy_active_selection()),
-            KeybindAction::Paste => Ok(self.paste_into_active(ClipboardOp::System)),
+            KeybindAction::Paste => self.paste_into_active(ClipboardOp::System),
             KeybindAction::ToggleSidebar => {
                 self.toggle_sidebar();
                 Ok(UiTask::None)
@@ -3095,17 +3315,12 @@ impl App {
         let body = match self.host_dialog.as_ref()? {
             host_dialog::HostDialog::Add(draft) => self.add_host_body(draft),
             host_dialog::HostDialog::ConfirmStop { label, .. } => column![
-                modal_heading(
-                    format!("Stop the session on {label}?"),
-                    "Every shell on that host ends. The layout is saved, so \
-                     starting the session again reopens the same tabs as fresh \
-                     shells.",
-                ),
+                modal_heading(stop_session_title(label), STOP_SESSION_BODY),
                 modal_buttons(
                     "Cancel",
                     Message::HostDialogCancel,
                     Some(ConfirmButton {
-                        label: "Stop Session",
+                        label: STOP_SESSION_CONFIRM,
                         style: chrome::danger_button,
                         press: Some(Message::HostStopConfirm),
                     }),
@@ -3113,19 +3328,33 @@ impl App {
             ],
             host_dialog::HostDialog::ConfirmRestart { prompt, .. } => column![
                 modal_heading(prompt.title.clone(), &prompt.body),
-                // A host this client cannot spawn for gets the state and
+                // A host nothing can be offered for gets the state and
                 // the pointer, and no button that would fail (§3.1).
+                // The other two differ only in what the button promises;
+                // which flow it starts is `host_restart_dialog_confirmed`'s
+                // to decide, so Enter and a click cannot route differently.
                 modal_buttons(
-                    if prompt.restartable {
-                        "Not now"
-                    } else {
-                        "Close"
-                    },
+                    prompt.dismiss_label(),
                     Message::HostDialogCancel,
-                    prompt.restartable.then_some(ConfirmButton {
-                        label: "Restart session",
+                    prompt.confirm.as_deref().map(|label| ConfirmButton {
+                        label,
                         style: chrome::danger_button,
                         press: Some(Message::HostRestartConfirm),
+                    }),
+                )
+            ],
+            // Consent to touch a host over ssh (plan 039 §3.5). The card
+            // is the offer: what, where, from where, and — for an update
+            // over a live session — what it ends.
+            host_dialog::HostDialog::Bootstrap(draft) => column![
+                modal_heading(draft.copy.title.clone(), &draft.copy.body),
+                modal_buttons(
+                    "Cancel",
+                    Message::HostDialogCancel,
+                    Some(ConfirmButton {
+                        label: draft.copy.confirm,
+                        style: chrome::primary_button,
+                        press: Some(Message::HostBootstrapConfirm),
                     }),
                 )
             ],
@@ -3141,12 +3370,7 @@ impl App {
     /// buttons — the approved mock, widget for widget.
     fn add_host_body(&self, draft: &host_dialog::AddHostDraft) -> Column<'_, Message> {
         let mut body = column![
-            modal_heading(
-                "Add Host".to_string(),
-                "Point Roost at a running roost-session: an SSH destination \
-                 (workbox, user@host, ssh://host:port) or a local socket \
-                 path.",
-            ),
+            modal_heading(ADD_HOST_TITLE.to_string(), ADD_HOST_BODY),
             dialog_field(
                 "Name",
                 "pop-os",
@@ -3168,16 +3392,11 @@ impl App {
         // Inert while the dial is in flight rather than hidden: a button
         // that vanishes mid-press moves the card under the pointer.
         let confirm = (!draft.is_verifying()).then_some(Message::AddHostSubmit);
-        let label = if draft.is_verifying() {
-            "Connecting…"
-        } else {
-            "Add & Connect"
-        };
         body.push(modal_buttons(
             "Cancel",
             Message::HostDialogCancel,
             Some(ConfirmButton {
-                label,
+                label: draft.confirm_label(),
                 style: chrome::primary_button,
                 press: confirm,
             }),
@@ -4635,6 +4854,22 @@ impl App {
         Some((view, host_notice::frozen_frame(section.state)?))
     }
 
+    /// [`Self::frozen_host_frame`]'s twin for a specific tab rather than
+    /// whichever host row is currently selected — what a keybind dispatch
+    /// that already resolved its own [`TabKey`] (paste, most notably) has
+    /// to ask instead. `is_local` short-circuits before the lookup: a
+    /// never-connected saved host's [`HostView::host`] is also
+    /// `HostId::LOCAL` as a placeholder, and a local tab must never match
+    /// that entry.
+    fn frozen_host_frame_for(&self, tab: TabKey) -> Option<host_notice::FrozenFrame> {
+        if tab.is_local() {
+            return None;
+        }
+        let view = self.host_view(tab.host)?;
+        let section = self.hosts.section(&view.saved_id)?;
+        host_notice::frozen_frame(section.state)
+    }
+
     /// The banner the window owes the frame it is showing, the host its
     /// button reconnects, and the frame that button is a promise about.
     /// The wording is composed here, at the draw, so the reconcile can
@@ -4669,7 +4904,7 @@ impl App {
             );
             return;
         }
-        self.host_connect_requested(saved_id);
+        self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
     }
 
     /// The project a host *lists* a tab under, whatever state its
@@ -4787,18 +5022,38 @@ impl App {
             .set_focus(host_focus_claim(self.window_focused, self.host_selection));
     }
 
-    /// Every *user-initiated* Connect: the sidebar's ↻ row, the
-    /// `Connect Host` palette verb, and the takeover banner's button.
+    /// The gated Connect: the sidebar's ↻ row, the takeover banner's
+    /// button, and the `Connect Host` palette verb — which
+    /// `palette.activate` also reaches over the IPC socket, hence the
+    /// `origin`.
     ///
     /// One gate sits here, and it is plan 037 §3.7's: a host whose
     /// compatibility check already failed does not get dialed again —
     /// dialing would reproduce the same refusal — it raises the upgrade
     /// prompt instead. Everything else connects.
-    pub fn host_connect_requested(&mut self, saved_id: &str) {
-        let mismatch = match self.hosts.state(saved_id) {
-            Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) => mismatch.clone(),
-            _ => return self.host_reconnect_requested(saved_id),
+    ///
+    /// **Only for a person**, per [`host_notice::connect_route`]: the
+    /// prompt's button now starts a remote install, and a machine that
+    /// activated the same palette row would otherwise be answered with
+    /// a modal (plan 039 §3.5).
+    pub fn host_connect_requested(
+        &mut self,
+        saved_id: &str,
+        origin: crate::host_conn::RequestOrigin,
+    ) {
+        let needs_restart = matches!(
+            self.hosts.state(saved_id),
+            Some(crate::host_conn::HostConnState::NeedsRestart(_))
+        );
+        if host_notice::connect_route(origin, needs_restart) == host_notice::ConnectRoute::Dial {
+            return self.host_reconnect_requested(saved_id, origin);
+        }
+        let Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) =
+            self.hosts.state(saved_id)
+        else {
+            unreachable!("connect_route only prompts for a NeedsRestart host")
         };
+        let mismatch = mismatch.clone();
         let Some(label) = self.host_label(saved_id) else {
             tracing::debug!(host = %saved_id, "connect requested for a host that is not saved");
             return;
@@ -4827,13 +5082,17 @@ impl App {
     /// flow's own relaunch has to come through *here* — the host is
     /// still in `NeedsRestart` at that moment, and re-raising the dialog
     /// the user just answered would be a loop.
-    pub fn host_reconnect_requested(&mut self, saved_id: &str) {
+    pub fn host_reconnect_requested(
+        &mut self,
+        saved_id: &str,
+        origin: crate::host_conn::RequestOrigin,
+    ) {
         let Ok(host) = self.saved_host(saved_id) else {
             tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
             return;
         };
         tracing::info!(host = %host.id, "connecting a saved host session");
-        self.connect_saved_host(&host, |localhost| {
+        self.connect_saved_host(&host, origin, |localhost| {
             Some(if localhost {
                 crate::host_conn::ConnectMode::SpawnIfMissing
             } else {
@@ -4868,6 +5127,7 @@ impl App {
     /// `Connecting { previous }` that consumers purge off — this is that
     /// message's stand-in (`HostConnSet::disconnect`'s contract).
     pub(crate) fn host_disconnect_requested(&mut self, saved_id: &str) {
+        self.cancel_bootstrap_probe(saved_id);
         let Some(incarnation) = self.hosts.disconnect(saved_id) else {
             tracing::debug!(host = %saved_id, "disconnect requested for a host with no connection");
             self.reconcile();
@@ -4884,6 +5144,7 @@ impl App {
         &mut self,
         saved_id: &str,
     ) -> Result<(), roost_engine::WorkspaceError> {
+        self.cancel_bootstrap_probe(saved_id);
         // `remove`, not `disconnect`: a disconnect keeps the last mirror
         // so the section can list its shells dimmed, and once the host
         // is forgotten there is no section left to list them in.
@@ -4901,16 +5162,18 @@ impl App {
     /// `connect` is what separates the two callers: the dialog's button
     /// says "Add & Connect" and means it, while `roostctl host add` is
     /// documented as registry-only (a `host connect` follows if you want
-    /// one).
+    /// one). It names *who* is connecting rather than merely whether to,
+    /// so a caller cannot start a connection without saying whether
+    /// there is anybody there to answer for it.
     pub(crate) fn host_add_requested(
         &mut self,
         label: &str,
         target: &str,
-        connect: bool,
+        connect: Option<crate::host_conn::RequestOrigin>,
     ) -> Result<roost_engine::persistence::HostSnapshot, roost_engine::WorkspaceError> {
         let host = self.workspace.add_host(label, target)?;
-        if connect {
-            self.host_reconnect_requested(&host.id);
+        if let Some(origin) = connect {
+            self.host_reconnect_requested(&host.id, origin);
         }
         self.reconcile();
         Ok(host)
@@ -5008,6 +5271,46 @@ impl App {
         self.host_stop_requested(&saved_id);
     }
 
+    /// The upgrade prompt's confirm, before either branch acts on it.
+    ///
+    /// **The state is re-read here, and that is the load-bearing part.**
+    /// The dialog is modal to the pointer, not to the world: an IPC
+    /// `host connect`, a launch-time retry, or another window's takeover
+    /// can move this host off `NeedsRestart` while the prompt is still on
+    /// screen. Acting then would reap a session that is healthy and
+    /// attached — every shell on it, for a mismatch that no longer
+    /// exists. So the question is asked again at the moment the answer is
+    /// acted on, and a host that moved on is told so instead — `undone`
+    /// naming what the branch that was about to run did not do.
+    ///
+    /// Answers with the host, its label, and whether the session over
+    /// there is the newer of the two, which only the remote branch has a
+    /// use for.
+    fn take_confirmed_restart_prompt(&mut self, undone: &str) -> Option<(String, String, bool)> {
+        let Some(host_dialog::HostDialog::ConfirmRestart { saved_id, .. }) =
+            self.host_dialog.take()
+        else {
+            return None;
+        };
+        let label = self
+            .host_label(&saved_id)
+            .unwrap_or_else(|| saved_id.clone());
+        let Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) =
+            self.hosts.state(&saved_id)
+        else {
+            tracing::info!(
+                host = %saved_id,
+                "restart abandoned: the host left NeedsRestart while the prompt was up"
+            );
+            self.set_status(format!(
+                "{label} is no longer waiting for a restart — nothing was {undone}"
+            ));
+            return None;
+        };
+        let session_is_newer = host_notice::session_is_newer(mismatch);
+        Some((saved_id, label, session_is_newer))
+    }
+
     /// "Restart session" — the client-side composition, step by step
     /// (plan 037 §3.7).
     ///
@@ -5024,36 +5327,14 @@ impl App {
     /// here — its dialog has no button — and the live flag is what says
     /// so rather than a snapshot taken when the dialog opened.
     ///
-    /// **The state is re-read here too, and that is the load-bearing
-    /// part.** The dialog is modal to the pointer, not to the world: an
-    /// IPC `host connect`, a launch-time retry, or another window's
-    /// takeover can move this host off `NeedsRestart` while the prompt
-    /// is still on screen. Confirming then would reap a session that is
-    /// healthy and attached — every shell on it, for a mismatch that no
-    /// longer exists. So the question is asked again at the moment the
-    /// answer is acted on, and a host that moved on is told so instead.
+    /// The state is re-read through
+    /// [`Self::take_confirmed_restart_prompt`], which is the
+    /// load-bearing part; `undone` is what a host that moved on is told
+    /// did not happen.
     pub fn host_restart_confirmed(&mut self) -> UiTask {
-        let Some(host_dialog::HostDialog::ConfirmRestart { saved_id, .. }) =
-            self.host_dialog.take()
-        else {
+        let Some((saved_id, label, _)) = self.take_confirmed_restart_prompt("stopped") else {
             return UiTask::None;
         };
-        let label = self
-            .host_label(&saved_id)
-            .unwrap_or_else(|| saved_id.clone());
-        if !matches!(
-            self.hosts.state(&saved_id),
-            Some(crate::host_conn::HostConnState::NeedsRestart(_))
-        ) {
-            tracing::info!(
-                host = %saved_id,
-                "restart abandoned: the host left NeedsRestart while the prompt was up"
-            );
-            self.set_status(format!(
-                "{label} is no longer waiting for a restart — nothing was stopped"
-            ));
-            return UiTask::None;
-        }
         let Some((socket, localhost)) = self.hosts.endpoint(&saved_id) else {
             tracing::debug!(host = %saved_id, "restart requested for a host with no connection");
             return UiTask::None;
@@ -5091,9 +5372,649 @@ impl App {
         match result {
             // The session is gone; connecting again spawns a fresh one
             // through the shared ladder and hydrates the saved layout.
-            Ok(()) => self.host_reconnect_requested(saved_id),
+            Ok(()) => {
+                self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User)
+            }
             Err(error) => self.set_status(error),
         }
+    }
+
+    // ── the test-mode dialog seam (plan 039 §3.5) ───────────────────
+    //
+    // `tools/roosttest/` drives a real UI over the IPC socket and
+    // nothing else, so a consent dialog is otherwise unreachable from
+    // it — and the bootstrap job, unlike the upgrade prompt, has no
+    // "compose the ops the button runs" back door on purpose. These two
+    // are the seam, gated on `ROOST_TEST_MODE=1` at the servicing edge
+    // and never a production surface.
+
+    /// What the host modal on screen is saying.
+    ///
+    /// Reads the same values the widgets do, one per arm, so the dump
+    /// and the card cannot disagree about the copy — the four titles and
+    /// bodies come from the very fields `host_dialog_modal` renders,
+    /// and the shared literals are named constants for exactly that
+    /// reason.
+    pub(crate) fn dialog_dump(&self) -> roost_ipc::messages::AppDialogDumpResult {
+        use roost_ipc::messages::AppDialogDumpResult;
+
+        let Some(dialog) = self.host_dialog.as_ref() else {
+            return AppDialogDumpResult::default();
+        };
+        let (kind, variant, title, body, buttons, host) = match dialog {
+            host_dialog::HostDialog::Add(draft) => (
+                "add",
+                None,
+                ADD_HOST_TITLE.to_string(),
+                ADD_HOST_BODY.to_string(),
+                vec!["Cancel".to_string(), draft.confirm_label().to_string()],
+                None,
+            ),
+            host_dialog::HostDialog::ConfirmStop { saved_id, label } => (
+                "confirm_stop",
+                None,
+                stop_session_title(label),
+                STOP_SESSION_BODY.to_string(),
+                vec!["Cancel".to_string(), STOP_SESSION_CONFIRM.to_string()],
+                Some(saved_id.clone()),
+            ),
+            host_dialog::HostDialog::ConfirmRestart { saved_id, prompt } => (
+                "confirm_restart",
+                None,
+                prompt.title.clone(),
+                prompt.body.clone(),
+                std::iter::once(prompt.dismiss_label().to_string())
+                    .chain(prompt.confirm.clone())
+                    .collect(),
+                Some(saved_id.clone()),
+            ),
+            host_dialog::HostDialog::Bootstrap(draft) => (
+                "bootstrap",
+                Some(draft.plan.variant.wire_name()),
+                draft.copy.title.clone(),
+                draft.copy.body.clone(),
+                vec!["Cancel".to_string(), draft.copy.confirm.to_string()],
+                Some(draft.saved_id.clone()),
+            ),
+        };
+        AppDialogDumpResult {
+            dialog: Some(kind.to_string()),
+            variant: variant.map(str::to_string),
+            title,
+            body,
+            buttons,
+            host,
+        }
+    }
+
+    /// Press the visible host modal's primary button, or dismiss it.
+    ///
+    /// Through the production handlers, not around them: `confirm` is
+    /// the same call the button's `Message` makes, so every guard the
+    /// button has — the re-read of state, the claim, the refusal to run
+    /// twice — is a guard this op also passes through.
+    ///
+    /// A dialog with no primary action refuses `confirm` rather than
+    /// silently dismissing: a test that thinks it pressed a button that
+    /// is not there should fail loudly.
+    pub(crate) fn dialog_answer(&mut self, action: &str) -> Result<UiTask, String> {
+        if self.host_dialog.is_none() {
+            return Err("no host dialog is open".to_string());
+        }
+        if action == "cancel" {
+            self.host_dialog_cancel();
+            self.reconcile();
+            return Ok(UiTask::None);
+        }
+        let task = match &self.host_dialog {
+            Some(host_dialog::HostDialog::Add(draft)) => {
+                if draft.is_verifying() {
+                    return Err("the Add Host dialog is already dialing".to_string());
+                }
+                self.submit_add_host()
+            }
+            Some(host_dialog::HostDialog::ConfirmStop { .. }) => {
+                self.host_stop_confirmed();
+                UiTask::None
+            }
+            Some(host_dialog::HostDialog::ConfirmRestart { prompt, .. }) => {
+                if prompt.confirm.is_none() {
+                    return Err("this dialog has no confirming action".to_string());
+                }
+                self.host_restart_dialog_confirmed()
+            }
+            Some(host_dialog::HostDialog::Bootstrap(_)) => {
+                self.host_bootstrap_confirmed();
+                UiTask::None
+            }
+            None => unreachable!("checked above"),
+        };
+        self.reconcile();
+        Ok(task)
+    }
+
+    // ── the bootstrap offer (plan 039 §3.5) ─────────────────────────
+
+    /// Route the upgrade prompt's primary button to whichever flow it
+    /// promised.
+    ///
+    /// One place rather than two arms at every call site: the button's
+    /// label and the flow it starts are decided together in
+    /// [`host_notice::restart_prompt`], and this is the only thing that
+    /// reads that decision back out.
+    fn host_restart_dialog_confirmed(&mut self) -> UiTask {
+        let remote = matches!(
+            &self.host_dialog,
+            Some(host_dialog::HostDialog::ConfirmRestart { prompt, .. })
+                if prompt.action == crate::host_conn::state::RestartAction::OfferRemoteUpdate
+        );
+        if remote {
+            self.host_remote_update_requested();
+            UiTask::None
+        } else {
+            self.host_restart_confirmed()
+        }
+    }
+
+    /// "Update roost-session on <label>" — the remote branch of the
+    /// upgrade prompt (plan 039 §3.5, entry point 2).
+    ///
+    /// It does **not** start an install: it replaces one dialog with the
+    /// probe that decides which of the three consent cards is the honest
+    /// one. Offer first, resolve at confirm — the far side is read, never
+    /// written, before the second dialog is answered.
+    ///
+    /// The state is re-read through
+    /// [`Self::take_confirmed_restart_prompt`]: the prompt is modal to
+    /// the pointer, not to the world, and a host that reconnected
+    /// underneath it has nothing left to update.
+    fn host_remote_update_requested(&mut self) {
+        let Some((saved_id, _, session_is_newer)) = self.take_confirmed_restart_prompt("changed")
+        else {
+            return;
+        };
+        self.start_bootstrap_probe(
+            &saved_id,
+            bootstrap::OfferContext {
+                session: bootstrap::SessionState::Running,
+                session_is_newer,
+                // A running session, not a failed connect — there is no
+                // family to still agree with when this is confirmed.
+                failure: None,
+            },
+        );
+    }
+
+    /// A user-driven connect failed; decide whether Roost has an offer.
+    ///
+    /// Two families have one — `NotFound` ("nothing to exec over there")
+    /// and `NoSession` ("a binary, but nothing running") — and the probe
+    /// is what turns either into a specific card. Everything else is
+    /// left to the band and the toast exactly as plan 038 left it.
+    ///
+    /// **The origin is the gate, not attendedness.** An IPC
+    /// `host.connect` from `roostctl` arrives as the same
+    /// `ConnectMode::Dial` a click does, and raising a modal to ask a
+    /// machine a question is the one thing this must never do (plan 039
+    /// §3.5's non-interactive refusal). `RequestOrigin` is the only
+    /// place that difference survives.
+    fn maybe_offer_bootstrap(&mut self, saved_id: &str) {
+        let failure = self.hosts.ssh_failure(saved_id).cloned();
+        let Some(session) = bootstrap::offer_for(
+            self.hosts.ssh_origin(saved_id),
+            failure.as_ref(),
+            self.hosts.ssh_reached_connected(saved_id),
+        ) else {
+            return;
+        };
+        self.start_bootstrap_probe(
+            saved_id,
+            bootstrap::OfferContext {
+                session,
+                session_is_newer: false,
+                failure,
+            },
+        );
+    }
+
+    /// Look at the far side, then raise the card that fits what is
+    /// there.
+    ///
+    /// Read-only from end to end, which is what makes it safe to run
+    /// before anybody has agreed to anything: nothing is written,
+    /// started or stopped until the dialog this opens is confirmed.
+    fn start_bootstrap_probe(&mut self, saved_id: &str, offer: bootstrap::OfferContext) {
+        // A modal already up owns the pointer and the keyboard, and the
+        // one that would open here is a question about a host the user
+        // is not currently being asked about.
+        if self.host_dialog.is_some() {
+            tracing::debug!(host = %saved_id, "not offering a bootstrap over an open dialog");
+            return;
+        }
+        let Ok(host) = self.saved_host(saved_id) else {
+            return;
+        };
+        let target = match roost_ipc::ssh::classify(&host.target) {
+            Ok(roost_ipc::ssh::ResolvedTransport::Ssh(target)) => target,
+            // Only an ssh host has a transport this can reach a binary
+            // over; the other two are somebody else's process.
+            _ => return,
+        };
+        // The debounce, and the anti-race. A second click while the
+        // first probe is out would open two cards for one host; a probe
+        // for a box a job is already setting up would offer to do it
+        // again.
+        if self.bootstraps.probing(saved_id) {
+            tracing::debug!(host = %saved_id, "a bootstrap probe is already out for this host");
+            return;
+        }
+        if self.bootstraps.job_running(&target.claim_key) {
+            self.set_status(format!("{} is already being set up", host.label));
+            return;
+        }
+        let generation = self.take_engine_op_id();
+        self.bootstraps.begin_probe(saved_id, generation);
+        let checking = format!("checking {}…", host.label);
+        self.hosts
+            .set_bootstrap_note(saved_id, Some(checking.clone()));
+        // The band carries this only where its own rule allows a reason
+        // — beside the `disconnected` word (`status_text_with_reason`),
+        // which is the NotFound/NoSession entry. The remote-update entry
+        // leaves the host in `needs restart`, so the toast is what says
+        // something is happening there.
+        self.set_status(checking);
+        self.reconcile();
+
+        let feed = self.feed_tx.clone();
+        let ssh = roost_ipc::ssh::SshTunnelOptions::from_env();
+        let request = bootstrap::BootstrapRequest {
+            saved_id: saved_id.to_string(),
+            generation,
+            label: host.label.clone(),
+            target: host.target.clone(),
+            token: target.token.clone(),
+            claim: target.claim_key.clone(),
+        };
+        // Spawned rather than dispatched as an engine op: this is
+        // reached from the feed drain and from a modal button, neither
+        // of which can hand Iced a task, and the answer has to be
+        // ordered against the connects around it anyway.
+        self.runtime_handle.spawn(async move {
+            // Built here rather than at the call site: `from_env` walks
+            // `$PATH` for a sibling binary, and that is a blocking stat
+            // per entry on the thread that draws frames.
+            let options =
+                roost_ipc::bootstrap::BootstrapOptions::from_env(bootstrap::client_identity());
+            let result = bootstrap::run_probe(target, ssh, options).await;
+            feed.send(crate::engine_feed::EngineFeed::HostBootstrap(Box::new(
+                bootstrap::BootstrapEvent::Probed {
+                    request,
+                    offer,
+                    result,
+                },
+            )));
+        });
+    }
+
+    /// Drop an in-flight probe, and the band line it left.
+    ///
+    /// Called wherever a connect or a disconnect begins: both replace
+    /// the state the probe's question was asked about, so its answer can
+    /// only describe something that has already stopped being true.
+    fn cancel_bootstrap_probe(&mut self, saved_id: &str) {
+        if self.bootstraps.cancel_probe(saved_id) {
+            tracing::debug!(host = %saved_id, "a new attempt superseded a bootstrap probe");
+            self.hosts.set_bootstrap_note(saved_id, None);
+        }
+    }
+
+    /// A bootstrap step reported back.
+    pub(crate) fn host_bootstrap_event(&mut self, event: bootstrap::BootstrapEvent) {
+        match event {
+            bootstrap::BootstrapEvent::Probed {
+                request,
+                offer,
+                result,
+            } => self.host_bootstrap_probed(request, offer, result),
+            bootstrap::BootstrapEvent::Finished { request, result } => {
+                self.host_bootstrap_finished(request, result)
+            }
+        }
+    }
+
+    /// The probe answered: raise the card, or say why there is nothing
+    /// to offer.
+    ///
+    /// The round trip is seconds long, and [`bootstrap::Landed`] is
+    /// every way the app can have moved inside it — the request
+    /// superseded, the host removed or re-targeted, or a modal opened.
+    /// That last one is the sharp edge: `open_host_dialog` *replaces*
+    /// whatever is up, and Enter routes to the visible dialog's confirm
+    /// — so a card that displaced a Stop confirmation would take the
+    /// Enter aimed at it, which is precisely the consent this whole flow
+    /// exists to protect. `start_bootstrap_probe` refuses to start under
+    /// an open dialog; this is the same refusal at the other end.
+    ///
+    /// The label and the target are re-read rather than taken from the
+    /// request, so a renamed or re-pointed host cannot be described by
+    /// the words it had when the probe went out.
+    fn host_bootstrap_probed(
+        &mut self,
+        request: bootstrap::BootstrapRequest,
+        offer: bootstrap::OfferContext,
+        result: Result<bootstrap::Probed, roost_ipc::bootstrap::BootstrapError>,
+    ) {
+        let bootstrap::BootstrapRequest {
+            saved_id,
+            generation,
+            label: asked_label,
+            target,
+            token,
+            ..
+        } = request;
+        let saved_id = saved_id.as_str();
+        let claimed = self.bootstraps.claim_probe(saved_id, generation);
+        let live = self.saved_host(saved_id).ok().and_then(|host| {
+            match roost_ipc::ssh::classify(&host.target) {
+                Ok(roost_ipc::ssh::ResolvedTransport::Ssh(live)) if live.token == token => {
+                    Some((host.label, live))
+                }
+                _ => None,
+            }
+        });
+        let landed = bootstrap::Landed {
+            claimed,
+            same_host: live.is_some(),
+            dialog_open: self.host_dialog.is_some(),
+        };
+        match landed.landing() {
+            bootstrap::ProbeLanding::Offer => {}
+            bootstrap::ProbeLanding::Stale => {
+                tracing::debug!(host = %saved_id, generation, "dropped a stale bootstrap probe");
+                return;
+            }
+            bootstrap::ProbeLanding::Moved => {
+                tracing::debug!(
+                    host = %saved_id,
+                    "dropped a bootstrap probe for a host that was removed or re-targeted"
+                );
+                self.hosts.set_bootstrap_note(saved_id, None);
+                self.reconcile();
+                return;
+            }
+            bootstrap::ProbeLanding::Deferred => {
+                let label = live.map_or(asked_label, |(label, _)| label);
+                tracing::info!(
+                    host = %saved_id,
+                    "a bootstrap offer landed under an open dialog; leaving it on the band"
+                );
+                // Said as the entry point knew it, because the plan the
+                // card would have carried is not composed on this path.
+                let note = match offer.session {
+                    bootstrap::SessionState::Running => {
+                        format!("roost-session on {label} can be updated — connect again")
+                    }
+                    bootstrap::SessionState::NoSession => {
+                        format!("{label} needs roost-session set up — connect again")
+                    }
+                };
+                self.hosts.set_bootstrap_note(saved_id, Some(note.clone()));
+                self.set_status(note);
+                self.reconcile();
+                return;
+            }
+        }
+        let (label, live_target) = live.expect("Offer implies the host is still the same one");
+        self.hosts.set_bootstrap_note(saved_id, None);
+        let probed = match result {
+            Ok(probed) => probed,
+            Err(error) => return self.report_bootstrap_failure(saved_id, &target, &error),
+        };
+        let plan = bootstrap::plan_bootstrap(&probed.probe.outcome, offer.session);
+        // Predicted, not resolved: choosing a rung for real means a
+        // subprocess and possibly a download, and that is the job's
+        // first phase rather than the offer's (plan 039 §3.3). The
+        // preview names a fall-through where one is possible rather
+        // than promising a rung it cannot vouch for.
+        let source = if plan.install {
+            match probed.source {
+                Ok(source) => source,
+                // Nothing can supply this build — the honest answer
+                // before consent rather than a card whose confirm
+                // would fail.
+                Err(error) => return self.report_bootstrap_failure(saved_id, &target, &error),
+            }
+        } else {
+            String::new()
+        };
+        let copy = bootstrap::bootstrap_copy(bootstrap::CopyInputs {
+            label: &label,
+            identity: &bootstrap::client_identity(),
+            dest: &bootstrap::card_dest(&plan),
+            dest_on_disk: &bootstrap::dest_on_disk(&plan, &probed.probe.home),
+            source: &source,
+            plan: &plan,
+            session_is_newer: offer.session_is_newer,
+        });
+        self.open_host_dialog(host_dialog::HostDialog::Bootstrap(
+            bootstrap::BootstrapDraft {
+                saved_id: saved_id.to_string(),
+                label,
+                token,
+                claim: live_target.claim_key,
+                arch: probed.probe.arch,
+                plan,
+                copy,
+                offer,
+            },
+        ));
+        self.reconcile();
+    }
+
+    /// The far side as it is *now*, for [`bootstrap::offer_still_stands`].
+    ///
+    /// Two facts, both read live: what the connection set says about the
+    /// host, and — for a cold offer that a connect attempt produced —
+    /// whether that attempt still says the same thing. A host with no
+    /// attempt on record answers `None` rather than `false`: the Add
+    /// Host entry verifies and never dials, so "nothing dialed" is its
+    /// normal shape and not evidence that anything moved.
+    fn live_bootstrap_state(&self, saved_id: &str) -> bootstrap::LiveState {
+        match self.hosts.state(saved_id) {
+            Some(crate::host_conn::HostConnState::NeedsRestart(_)) => {
+                bootstrap::LiveState::NeedsRestart
+            }
+            None | Some(crate::host_conn::HostConnState::Disconnected(_)) => {
+                bootstrap::LiveState::Cold {
+                    qualifies: self.hosts.ssh_origin(saved_id).map(|origin| {
+                        bootstrap::offer_for(
+                            Some(origin),
+                            self.hosts.ssh_failure(saved_id),
+                            self.hosts.ssh_reached_connected(saved_id),
+                        ) == Some(bootstrap::SessionState::NoSession)
+                    }),
+                }
+            }
+            _ => bootstrap::LiveState::Other,
+        }
+    }
+
+    /// The consent card's primary button.
+    ///
+    /// Four guards, and the first three are [`Self::host_restart_confirmed`]'s
+    /// three questions: is the host still there, is it still the machine
+    /// the card described, and is anybody else already doing this. The
+    /// third is keyed on [`roost_ipc::ssh::SshTarget::claim_key`] rather
+    /// than the saved id — two labels, or two spellings, naming one box
+    /// must not race two installs onto one `~/.local/bin/roost-session`.
+    ///
+    /// The fourth is the card's own: **the plan is only honest while the
+    /// far side is still what it was planned against**. The card is a
+    /// deliberate snapshot — it must not rewrite itself mid-read — and
+    /// both directions of the window that opens are damaging, a stale
+    /// `Update` reaping a session that came back healthy and a stale
+    /// cold plan installing under one that started. See
+    /// [`bootstrap::offer_still_stands`].
+    pub fn host_bootstrap_confirmed(&mut self) {
+        let Some(host_dialog::HostDialog::Bootstrap(draft)) = self.host_dialog.take() else {
+            return;
+        };
+        // Re-read the registry rather than trusting the snapshot: the
+        // host may have been removed or re-targeted while the card was
+        // up, and the second of those would aim this job at a machine
+        // the user is no longer describing.
+        let Ok(host) = self.saved_host(&draft.saved_id) else {
+            self.set_status(format!("{} is no longer saved", draft.label));
+            return;
+        };
+        let target = match roost_ipc::ssh::classify(&host.target) {
+            Ok(roost_ipc::ssh::ResolvedTransport::Ssh(target)) if target.token == draft.token => {
+                target
+            }
+            _ => {
+                self.set_status(format!(
+                    "{} no longer names the host this offer was about — nothing was changed",
+                    host.label
+                ));
+                return;
+            }
+        };
+        let live = self.live_bootstrap_state(&draft.saved_id);
+        if !bootstrap::offer_still_stands(draft.offer.session, live) {
+            tracing::info!(
+                host = %draft.saved_id,
+                ?live,
+                offered = ?draft.offer.session,
+                "bootstrap abandoned: the far side moved while the card was up"
+            );
+            self.set_status(format!(
+                "{} is no longer what that offer described — nothing was changed",
+                host.label
+            ));
+            self.reconcile();
+            return;
+        }
+        let generation = self.take_engine_op_id();
+        if !self.bootstraps.begin_job(&draft.claim, generation) {
+            tracing::debug!(claim = %draft.claim, "a bootstrap is already running for this target");
+            self.set_status(format!("{} is already being set up", host.label));
+            return;
+        }
+        tracing::info!(
+            host = %draft.saved_id,
+            variant = ?draft.plan.variant,
+            install = draft.plan.install,
+            stop = draft.plan.stop,
+            "setting up roost-session on a host"
+        );
+        self.hosts.set_bootstrap_note(
+            &draft.saved_id,
+            Some("setting up roost-session…".to_string()),
+        );
+        self.set_status(format!("setting up roost-session on {}…", host.label));
+        self.reconcile();
+
+        let feed = self.feed_tx.clone();
+        let ssh = roost_ipc::ssh::SshTunnelOptions::from_env();
+        let bootstrap::BootstrapDraft {
+            saved_id,
+            label,
+            token,
+            claim,
+            arch,
+            plan,
+            ..
+        } = draft;
+        let request = bootstrap::BootstrapRequest {
+            saved_id,
+            generation,
+            label,
+            target: host.target.clone(),
+            token,
+            claim,
+        };
+        self.runtime_handle.spawn(async move {
+            // Off the UI thread for `start_bootstrap_probe`'s reason:
+            // `from_env` walks `$PATH` looking for a sibling binary.
+            let options =
+                roost_ipc::bootstrap::BootstrapOptions::from_env(bootstrap::client_identity());
+            let result = bootstrap::run_bootstrap(target, ssh, options, plan, arch).await;
+            feed.send(crate::engine_feed::EngineFeed::HostBootstrap(Box::new(
+                bootstrap::BootstrapEvent::Finished { request, result },
+            )));
+        });
+    }
+
+    /// The job finished. Reconnect on success; say where it stopped
+    /// otherwise.
+    ///
+    /// The claim is released first and on **both** outcomes: a job that
+    /// failed at its first rung must not wedge the box out of ever being
+    /// set up again.
+    fn host_bootstrap_finished(
+        &mut self,
+        request: bootstrap::BootstrapRequest,
+        result: Result<bootstrap::BootstrapSuccess, roost_ipc::bootstrap::BootstrapError>,
+    ) {
+        let bootstrap::BootstrapRequest {
+            saved_id,
+            generation,
+            label,
+            target,
+            claim,
+            ..
+        } = request;
+        let saved_id = saved_id.as_str();
+        if !self.bootstraps.claim_job(&claim, generation) {
+            tracing::debug!(%claim, generation, "dropped a superseded bootstrap completion");
+            return;
+        }
+        match result {
+            Ok(success) => {
+                self.hosts.set_bootstrap_note(saved_id, None);
+                let mut message = format!("roost-session is running on {label}");
+                // Not a failure — Roost execs the absolute path — so it
+                // rides along on the success line rather than becoming
+                // one of its own. Nothing edits a dotfile over it.
+                if let Some(warning) = success.path_warning {
+                    message.push_str(" — ");
+                    message.push_str(&warning);
+                }
+                // `%message` mirrors `report_bootstrap_failure`'s own
+                // `tracing::warn!(%message, ...)`: the toast is
+                // ephemeral and carries no op, so the log is the only
+                // place a test (or a developer) can read the PATH
+                // warning this success line may be carrying.
+                tracing::info!(host = %saved_id, %message, "roost-session is set up; reconnecting");
+                self.set_status(message);
+                self.host_reconnect_requested(saved_id, crate::host_conn::RequestOrigin::User);
+            }
+            Err(error) => self.report_bootstrap_failure(saved_id, &target, &error),
+        }
+        self.reconcile();
+    }
+
+    /// One classified bootstrap failure, through plan 038's own
+    /// plumbing: the band gets it because it is the most recent true
+    /// thing about the host, and the toast gets it because a person
+    /// asked for this and is waiting.
+    fn report_bootstrap_failure(
+        &mut self,
+        saved_id: &str,
+        target: &str,
+        error: &roost_ipc::bootstrap::BootstrapError,
+    ) {
+        let message = error.message(target);
+        tracing::warn!(host = %saved_id, %message, "bootstrap failed");
+        // Only for a host the registry still has. A `host.remove` while
+        // the job was out leaves no band to render this on and nothing
+        // that would ever clear the entry — `HostConnSet::remove` has
+        // already swept it once.
+        if self.saved_host(saved_id).is_ok() {
+            self.hosts
+                .set_bootstrap_note(saved_id, Some(message.clone()));
+        }
+        self.set_status(message);
     }
 
     /// "Add & Connect": validate what can be answered now, then dial.
@@ -5158,7 +6079,7 @@ impl App {
         generation: u64,
         label: &str,
         target: &str,
-        result: Result<(), String>,
+        result: Result<(), crate::host_conn::ConnectFailure>,
     ) {
         let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) else {
             tracing::debug!(%label, "dropped an Add Host verify for a dialog that is closed");
@@ -5168,11 +6089,59 @@ impl App {
             tracing::debug!(%label, generation, "dropped a stale Add Host verify");
             return;
         }
-        if let Err(error) = result {
-            draft.error = Some(error);
+        if let Err(failure) = result {
+            // Two families are an offer rather than a refusal (plan 039
+            // §3.5): the target classified, ssh reached it, and the only
+            // thing missing is a binary or a running session — both of
+            // which Roost can put there. The rule is
+            // `bootstrap::offer_for`'s, the same one the connect path
+            // applies; a dialog the user is typing into is `User` by
+            // construction.
+            //
+            // **The host is saved first**, and that is the point of
+            // doing it here rather than after the offer is answered:
+            // the band, the job's claim and a retry all need a
+            // `saved_id`, and cancelling then leaves a saved,
+            // disconnected host the user can remove — rather than a
+            // dialog whose Cancel silently discards everything they
+            // typed. Registry-only (`connect: None`), because what
+            // follows is the offer rather than a dial that would only
+            // fail the same way again.
+            let session = bootstrap::offer_for(
+                Some(crate::host_conn::RequestOrigin::User),
+                failure.family.as_ref(),
+                // The dialog verified; it never held a connection to
+                // lose.
+                false,
+            );
+            let Some(session) = session else {
+                draft.error = Some(failure.message);
+                return;
+            };
+            let family = failure.family.clone();
+            match self.host_add_requested(label, target, None) {
+                Ok(host) => {
+                    tracing::info!(host = %host.id, "saved a host whose roost-session needs setting up");
+                    self.host_dialog = None;
+                    self.add_host_focus_requested = false;
+                    self.start_bootstrap_probe(
+                        &host.id,
+                        bootstrap::OfferContext {
+                            session,
+                            session_is_newer: false,
+                            failure: family,
+                        },
+                    );
+                }
+                Err(error) => {
+                    if let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) {
+                        draft.error = Some(error.to_string());
+                    }
+                }
+            }
             return;
         }
-        match self.host_add_requested(label, target, true) {
+        match self.host_add_requested(label, target, Some(crate::host_conn::RequestOrigin::User)) {
             Ok(host) => {
                 tracing::info!(host = %host.id, "added a host from the Add Host dialog");
                 self.host_dialog = None;
@@ -5482,7 +6451,10 @@ impl Message {
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
             Self::NewTab => return app.new_tab(),
             Self::NewProject => return app.new_project(),
-            Self::HostReconnect(saved_id) => app.host_connect_requested(&saved_id),
+            Self::HostReconnect(saved_id) => {
+                // A widget press, so a person by construction.
+                app.host_connect_requested(&saved_id, crate::host_conn::RequestOrigin::User)
+            }
             Self::HostFrameReconnect { saved_id, frame } => {
                 app.host_frame_reconnect_requested(&saved_id, frame)
             }
@@ -5492,7 +6464,8 @@ impl Message {
             Self::HostDialogCancel => app.host_dialog_cancel(),
             Self::HostDialogCardPressed => {}
             Self::HostStopConfirm => app.host_stop_confirmed(),
-            Self::HostRestartConfirm => return app.host_restart_confirmed(),
+            Self::HostRestartConfirm => return app.host_restart_dialog_confirmed(),
+            Self::HostBootstrapConfirm => app.host_bootstrap_confirmed(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
             _ => {}
@@ -5526,6 +6499,17 @@ mod tests {
         assert!(!state.observe(false));
         assert!(!state.take());
         assert_eq!(state, ExitState::Running);
+    }
+
+    #[test]
+    fn the_first_quit_signal_requests_and_every_later_one_escalates() {
+        let handled = AtomicBool::new(false);
+        assert_eq!(observe_quit_signal(&handled), QuitSignalAction::RequestQuit);
+        // A repeat of the same signal escalates...
+        assert_eq!(observe_quit_signal(&handled), QuitSignalAction::Escalate);
+        // ...and so does a *different* one arriving after the first: the
+        // latch is "already handled one", not "already saw this kind".
+        assert_eq!(observe_quit_signal(&handled), QuitSignalAction::Escalate);
     }
 
     #[test]

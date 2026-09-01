@@ -32,6 +32,9 @@ anyhow  = { workspace = true }
 clap    = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `identify` prints `SessionBinaryIdentity` as one JSON line — no other
+# op in this crate needs serde_json outside tests, until now.
+serde_json = "1"
 
 # fork / setsid / umask / pipe / poll / dup2 — the daemonize sequence
 # has no safe-Rust equivalent, and the same crate already backs
@@ -45,9 +48,6 @@ getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile   = "3"
-# Only the ops with no typed params struct on the wire need a hand-built
-# `{}`; the crate itself dials `session.stop` with `SessionStopParams`.
-serde_json = "1"
 
 [lints]
 workspace = true

@@ -136,7 +136,94 @@ client (roost-iced)                                    remote machine
 
 **Target classification is Rust-only.** `roost-ipc::ssh::classify` — the rule table that decides whether a saved host's `target` string is an SSH destination, a socket path, or the `localhost` sentinel — has no Swift twin. The Swift Mac app treats a host's `target` as an opaque display string (it round-trips the field through its `state.json` mirror per the HS-0 schema-twin rule, but never interprets it); `roostctl host *` against the Swift socket answers `unknown-op` regardless. A future Swift host-client surface needs the classifier's rule table (`ResolvedTransport`'s doc comment in `crates/roost-ipc/src/ssh.rs`) ported or shared, not re-derived from scratch.
 
-For the design rationale, the bootstrap slice (not yet built — install/verify a remote `roost-session`; see the [roadmap](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md#hs-3--ssh-remote-host-the-target-payoff)), and the full failure-mode table, see [`discovery/host-sessions-architecture.md` §10](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md#10-ssh-transport-hs-3).
+For the full failure-mode table, see [`discovery/host-sessions-architecture.md` §10](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md#10-ssh-transport-hs-3).
+
+## Bootstrap: install/upgrade over SSH
+
+The transport above still assumes `roost-session` is already installed on the far side, at the right build, and started — miss any of the three and the failure copy above is only advice: install it here, start it there. HS-3's bootstrap slice (plan 039) turns that advice into buttons: on an attended connect that fails `NotFound` or `NoSession`, Roost probes what's actually on the far side and — with explicit consent — installs or upgrades `roost-session` to this client's exact build, starts it, and reconnects. `crates/roost-ipc/src/bootstrap.rs` is the transport-agnostic half (scripts, parsers, the option types); `crates/roost-iced/src/app/bootstrap.rs` is the UI half (the action matrix, the consent card, the job).
+
+**The candidate ladder is one list with two consumers.** `CANDIDATES` in `bootstrap.rs` is defined once and generates *both* the probe's discovery script and an extension of `ssh.rs`'s `remote_command()` (the exec chain a connect actually runs) — so anything the probe can find is exactly what the transport can `exec`, closing the failure mode where a compatible binary sits on a rung the connect path never tried. Eight rungs, tried in order, first executable match wins:
+
+1. `$HOME/.local/bin/roost-session`
+2. bare `roost-session`, resolved off the remote's non-interactive `PATH` via `command -v`
+3. `/usr/bin/roost-session`
+4. `/home/linuxbrew/.linuxbrew/bin/roost-session`
+5. `$HOME/.nix-profile/bin/roost-session`
+6. `/etc/profiles/per-user/$USER/bin/roost-session`
+7. `/nix/var/nix/profiles/default/bin/roost-session`
+8. `/run/current-system/sw/bin/roost-session`
+
+The install destination (`$HOME/.local/bin/roost-session`) is rung 1, `const INSTALL_DEST` derived from `CANDIDATES[0]` at compile time rather than hand-duplicated, so a fresh install always wins the very next connect. A unit test parses both generated scripts and asserts they enumerate the identical rung order.
+
+Every bootstrap exec — discovery, identity, install, stop, start — shares one fresh, job-scoped `ssh` `ControlMaster` (`-S <job-scratch>/ctl -o ControlMaster=auto -o ControlPersist=60s`), explicitly `-O exit`ed when the job (or a pre-dialog probe) ends. It's immune to a wedged tunnel master and costs one auth handshake for the whole bootstrap rather than one per rung — the difference between one and roughly nine Touch-ID prompts on a confirm-mode agent key. The identity exec walks the discovered rungs in ladder order and stops at the first one that answers `roost-session identify`; **the verdict is always about that first-found candidate**, never a compatible one further down the ladder. A match at rung 3 while rung 1 exists but won't answer `identify` means rung 1 is a stale binary shadowing a good one — reporting the *deeper* rung `Compatible` would leave the transport still `exec`ing the stale rung 1 forever, with no dialog ever explaining why attach keeps failing. Reporting `Mismatch` on rung 1 instead installs over it, which self-heals.
+
+### The action matrix
+
+What a probe outcome and the far side's session state add up to, once the user consents:
+
+| Probe outcome | Session state | Action |
+|---|---|---|
+| `Missing` | no session | install → start(installed dest) |
+| `Mismatch` | no session | install → start(installed dest); stop skipped, nothing to stop |
+| `Compatible{path}` | no session | start(path) only — nothing written |
+| `Mismatch` | running | install → stop → await-gone → start(installed dest) |
+| `Compatible{path}` | running but mismatched (binary already updated on disk, process stale) | stop → await-gone → start(path); no install |
+| Darwin remote / unmapped arch / no source available | — | classified failure, host untouched |
+
+The `Compatible` + running row is the asymmetry worth noticing: the disk is already right, so the job is a restart, not an install.
+
+### The install
+
+Streaming and committing the new binary is four bounded execs over the job master, each running `/bin/sh -s`:
+
+1. **Prepare**: validates `$HOME` is set and absolute, computes `dest="$HOME/.local/bin/roost-session"`, sweeps any `<dest>.tmp.<digits>` left by an earlier interrupted attempt (that shape is this script's own, so those files are ours by construction — a cancelled bootstrap future has no runtime left to run its own remote cleanup), then names a fresh `tmp="${dest}.tmp.$$"` and **reserves** it: `[ ! -L "$tmp" ]` refuses a pre-planted symlink, `(set -C; : > "$tmp")` (noclobber) refuses if the path is somehow already there. The reported `(tmp, dest)` pair is validated against the exact shape this script could have produced — `dest` absolute and ending `/roost-session`, `tmp` exactly `<dest>.tmp.<digits>` — before either name is used for anything, because both are about to be `chmod`ed, `tee`ed into, and renamed.
+2. **Stream**: `sh -c 'tee -- <tmp> > /dev/null'`, the local source file piped in as stdin. The `> /dev/null` is a deliberate deviation from herdr's bare `tee` — without it, `tee` would echo the whole binary back up the SSH connection for nobody to read.
+3. **Verify staged**: `chmod -- 700 <tmp>`, then `exec <tmp> identify` — **before anything replaces `dest`**. The staged file lives its whole unverified life at 0700 (narrowing to 0700 and immediately widening back would reopen the exact window that mode closes). A mismatch or failure here removes the tmp and reports a classified failure with the prior `dest` byte-for-byte untouched.
+4. **Commit**: `chmod -- 755 <tmp>` (only now does it become world-executable), moves any existing `dest` aside to `<dest>.bak.<pid>` in the same directory (so it's still one rename) rather than overwriting it outright, then renames `tmp` into `dest`. A `[ ! -d dest ]` guard exists because POSIX `mv file dir` silently moves *into* a directory and exits 0 — without the guard, a `dest` that happened to be a directory would report a successful install with nothing actually installed, and the next connect would `exec` a directory and exit 126, a code nothing classifies as `NotFound`, so no install offer would ever appear again.
+
+The backup is removed only after a post-install re-verify (the same identity exec, against `dest` this time) passes, and moved back over `dest` — reporting `restored` on stdout — on any failure after the commit `mv`. `rm -f <tmp>` runs best-effort on every failure/cancel/timeout path from phase 1 onward.
+
+### The upgrade order
+
+For an upgrade (`Mismatch` + running), the job runs **install → stop → await-gone → start → post-start identify → reconnect** — not the more obvious "stop first, then replace the binary." Three reasons, all load-bearing:
+
+- No binary that has ever shipped has a `stop` subcommand, so the stop is a raw wire `session.stop` against the *currently running* (old) process — installing after stopping would have nothing to talk to.
+- The atomic rename in phase 4 never disturbs the running process; installing first means a failed install leaves the old session running and untouched, rather than the host with neither an old session nor a working new one.
+- `session.stop` replies **before** the process actually finalizes (unlink + lock release happen post-reply), so the job polls a bridge dial — bounded, scaled — until it reports "no session" before starting. Skipping this "await-gone" step lets a blind `start` lose the race to the dying old process, print `already-running pid=<old>`, and exit 0: a masked failure on the happy path.
+
+`session.stop` is answered before the lease gate, so this needs no `session.connect{takeover: true}` and has no eviction side effects; a `client-bridge: no session` reply on the stop step reads as already-stopped, i.e. success. The post-start identify step then asserts the running session's protocol + build actually match the client — catching "started the right binary and it immediately crashed" — before the job reports success and hands off to the normal `connect_saved_host` reconnect. That post-start check runs the full triple (`app_version` included) only when this job just wrote the bytes; a start-only flow (`Compatible{path}`, no install) instead checks the same protocol+build pair the ordinary runtime attach gate checks, because a `Compatible` probe already means that gate was going to pass.
+
+### Compatibility: install rule vs. runtime gate
+
+A remote binary matches for **install** purposes iff all three `SessionBinaryIdentity` fields — `app_version`, `session_protocol`, `libghostty_build` — equal the client's, exact string compare, no semver ordering. `roost-session identify` prints exactly this JSON on stdout and exits 0, answerable by a binary that has never run (no socket, no profile, no side effects); an old binary that doesn't have the subcommand at all exits non-zero on it, which degrades to "no identity" rather than an error, and reads as needs-upgrade.
+
+This is **deliberately stricter** than the runtime attach gate (`check_compatibility` in `host_conn/state.rs`), which checks only protocol + payload kind + `libghostty_build` — not `app_version` — and is unchanged by this slice. The asymmetry is intentional: the installer refuses to install anything but the exact build, while the runtime keeps accepting an already-running, same-build, adjacent-*version* session and never volunteers an update for it. Loosening the runtime gate to match the install rule would force a restart across every adjacent release with no actual ghostty bump — a localhost UX regression outside this slice's scope.
+
+### The trust chain, honestly
+
+Every release-asset download is checksum-verified **locally, before any byte crosses to the host**: the paired `.sha256` file must contain exactly one two-field `sha256sum` record whose filename matches the asset and whose hash is 64 hex characters, or the download refuses outright. What this proves: the bytes about to be installed are exactly what GitHub served for that release asset, and — separately, via the staged verify-before-commit step above — that they identify as this client's exact build.
+
+What it does **not** prove: the release's own integrity. The checksum file is served from the same origin as the asset itself (a compromised release could ship a matching checksum for a compromised binary), and there is no artifact signing in this slice — no Linux key material exists yet, and Sparkle's EdDSA signing is Mac-appcast-only, so there's nothing to reuse cheaply. Artifact signing is named future work, not a current gap papered over. A sibling-stream or `ROOST_SESSION_INSTALL_BIN`-override install has no published checksum at all; its only gate is the staged verify-before-commit step every source goes through.
+
+Downloads additionally enforce HTTPS, with a loopback (`http://127.0.0.1` / `localhost`) exception that exists solely for the test fixture server — any other scheme or host combination is a classified failure, so the override seam can't become a plaintext downgrade in practice. No `Authorization` header is ever sent this slice (the repo is public), and logged URLs are redacted of userinfo and query.
+
+### Env seams
+
+`BootstrapOptions::from_env` is the one function that reads process environment; everything else in the pure half is a function of values, matching `SshTunnelOptions`'s existing pattern.
+
+- **`ROOST_SESSION_INSTALL_BIN`** — an explicit local file to stream instead of resolving a source (dev escape hatch + test seam). Read unconditionally, **not** gated on `ROOST_TEST_MODE`. Rung 1 of the *source* ladder (distinct from the candidate ladder above) — a wrong file is still caught by the staged verify-before-commit step, so pointing this at garbage is a clean no-op, never a broken host.
+- **`ROOST_SESSION_ASSET_BASE`** — overrides the release-asset base URL (default `https://github.com/charliek/roost/releases/download/v<app_version>`, constructed only on stable tags — a prerelease client, where the tag doesn't spell `v<CARGO_PKG_VERSION>`, skips this rung entirely rather than guessing a URL). Also read unconditionally, not test-mode-gated — it's how a Mac client points its Linux install at a self-hosted mirror, not only a test fixture. The consent card names the actual origin whenever this is set (never rendered as `github.com`) — dishonest-friendly copy is exactly wrong here.
+- **`ROOST_BOOTSTRAP_SOURCE`** (`asset` | `sibling` | `env`) — forces one rung of the source ladder. **`ROOST_TEST_MODE=1`-gated**: this exists so a CI lane can force the download path even on a machine where a compatible sibling binary would otherwise win, not as a shipped preference knob.
+- **`ROOST_BOOTSTRAP_FS_ROOT`** — a path prefix the generated scripts splice in front of every *absolute* candidate rung (the `$HOME`-relative ones are already jailed by a fake `$HOME`). **`ROOST_TEST_MODE=1`-gated**, and deliberately a client-side decision rather than something the far side can set: an unguarded expansion here would let a hostile remote's own `~/.ssh/environment` or login rc redirect which binary gets `exec`ed. A shipped build never emits the expansion into a script at all — it names a literal `/usr/bin/roost-session`, full stop. Exists so the hermetic `run-remote` fake-ssh fixture can jail `/usr/bin/…`-shaped rungs into a tempdir instead of probing the developer's own machine.
+- **`ROOST_SESSION_FAKE_BUILD`** — overrides the `libghostty_build` a `roost-session` reports from `identify` (and from a running session's own `session.identify`). **`ROOST_TEST_MODE=1`-gated**, same double gate `roost-session`'s own serving path already used before this slice — this is how a test lane manufactures a running-session or on-disk mismatch without an actual ghostty pin bump.
+
+### Known limits
+
+- **The claim key that serializes one bootstrap per box cannot see an `ssh_config` `Host` alias, in either direction.** Mutual exclusion is keyed on `SshTarget::claim_key` — `user@host:port` with the scheme dropped, host lowercased, port defaulted to 22 — which collapses `workbox` and `ssh://WorkBox:22` onto the same key when they *are* textually the same authority, but cannot know that a `Host workbox` block in `~/.ssh/config` actually resolves to `charlie@10.0.0.4`, nor that a bare `workbox` alias's own `Port 2200` means this key's default-22 guess is wrong. Resolving that exactly would mean running `ssh -G` per target — a subprocess in the connect path this design specifically avoids. The residual case is two concurrent bootstraps racing on what is actually one box; the install itself is a staged write plus an atomic rename, so the loser overwrites cleanly rather than tearing anything.
+- **The exec chain no longer honors a relative `PATH` entry.** The `PATH` rung resolves through `command -v` and is then gated on `case "$p" in /*)`, so only an absolute answer is used — a relative entry in the remote's non-interactive `PATH` is silently skipped rather than `exec`ed. Deliberate: `exec`ing out of a relative `PATH` component is a security hazard, and a non-interactive `BatchMode` shell's `PATH` is not a trust boundary worth widening for.
+- **A client killed mid-install can leave a `dest.tmp.<pid>` on the host.** Nothing runs the remote cleanup for a cancelled or killed bootstrap — a cancelled future has no runtime left for the round trip, and a spawned cleanup task reliably never gets to run either. The *next* prepare phase sweeps any `<dest>.tmp.<digits>` it finds before staging its own, so this is self-healing on the next attempt, not a permanent leak.
+- **A stale binary on an earlier ladder rung shadows a later compatible one** until an install lands over it — see the identity-exec note above. Self-healing via the action matrix, but the first attach after the shadow appears still fails once before the fixing dialog shows up.
+- **A prerelease client never auto-downloads.** The default asset URL is constructed only when the running tag actually spells `v<CARGO_PKG_VERSION>`; a prerelease build (tag `v0.0.19-rc1`, `CARGO_PKG_VERSION` `0.0.19`) skips the download rung entirely and falls through to the classified "no build available to install" failure, naming `ROOST_SESSION_INSTALL_BIN` as the way around it — it never guesses at a prerelease asset URL nobody may have uploaded.
 
 ## Known limitations
 

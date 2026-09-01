@@ -479,6 +479,26 @@ fn macos_test_gated<T>(
     }
 }
 
+/// `app.keybind_dispatch`'s namespace restriction. The op exists solely
+/// so `ROOST_TEST_MODE=1` can drive the paste accelerator — nothing else
+/// in that table has another IPC seam — so `"paste"` is the only name it
+/// may resolve. Every other `KeybindAction::from_name` spelling
+/// (`close_tab`, `new_tab`, `close_project`, `copy`, …) would hand an
+/// arbitrary IPC client a way to close a live terminal, mutate workspace
+/// state, or write the system clipboard, and is refused before
+/// `dispatch_keybind_action` ever sees it. `ipc.rs`'s dispatcher already
+/// rejects a non-`"paste"` action as `invalid-param` ahead of the UI
+/// round trip (mirroring `app.dialog_answer`'s `action` check); this is
+/// the backstop that keeps the restriction true even if this function is
+/// ever called some other way.
+fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
+    if action != "paste" {
+        return Err(format!("action must be \"paste\", got {action:?}"));
+    }
+    KeybindAction::from_name(action)
+        .ok_or_else(|| "\"paste\" did not resolve to a KeybindAction".to_string())
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // A full authoritative snapshot on every reconcile is the recovery
@@ -1228,6 +1248,14 @@ impl App {
                         _ => None,
                     };
                     let connected = matches!(state, crate::host_conn::HostConnState::Connected);
+                    // A connection that *drops* is the second place a
+                    // classified ssh failure lands: the tunnel's own
+                    // per-connection exec is what failed, and
+                    // `overlay_ssh_reason` is what records its family.
+                    // Only a drop, so a Connecting/Connected transition
+                    // cannot re-raise a card for a failure already
+                    // answered.
+                    let dropped = matches!(state, crate::host_conn::HostConnState::Disconnected(_));
                     if let Some(host) = self.hosts.apply_state(host, state) {
                         // Stamp the registry the moment a connection
                         // settles — `last_connected` is what the Add Host
@@ -1254,12 +1282,26 @@ impl App {
                             self.purge_host_incarnation(previous);
                         }
                         tracing::debug!(%host, "host connection state changed");
+                        if dropped {
+                            self.maybe_offer_bootstrap(&host);
+                        }
                     }
                     // The band's dot and rollup are cached with the rows;
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
                 }
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
+                EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
+                // A signal reached the process (plan 039 §3.9). Same
+                // latch the macOS menu's Quit item uses — `take_exit_task`
+                // (called every `update()`) is what turns this into
+                // `UiTask::Exit` on the next message, which is guaranteed
+                // to be soon: the send that put this item here also woke
+                // the subscription that delivers it.
+                EngineFeed::Quit => {
+                    tracing::info!("signal requested a graceful quit");
+                    self.exit_state.request();
+                }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -2169,6 +2211,46 @@ impl App {
                 let result = macos_test_gated(self.test_mode, || activate_menu(&path));
                 let _ = reply.send(result);
             }
+            UiRequest::AppDialogDump { reply } => {
+                let result = if self.test_mode {
+                    Ok(self.dialog_dump())
+                } else {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                };
+                let _ = reply.send(result);
+            }
+            UiRequest::AppDialogAnswer { action, reply } => {
+                let result = if self.test_mode {
+                    self.dialog_answer(&action)
+                } else {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                };
+                // The button's own task, chained rather than replacing
+                // whatever this drain already owed — Add Host's confirm
+                // dispatches an engine op, and dropping it would leave
+                // the dialog waiting on a dial nobody started.
+                let _ = reply.send(match result {
+                    Ok(button) => {
+                        task = task.then(button);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                });
+            }
+            UiRequest::AppKeybindDispatch { action, reply } => {
+                let result = if !self.test_mode {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                } else {
+                    match paste_only_keybind(&action) {
+                        Ok(keybind) => {
+                            task = task.then(self.dispatch_keybind_action(keybind, false));
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                let _ = reply.send(result);
+            }
             UiRequest::AppUpdateStatus { reply } => {
                 let result = macos_test_gated(self.test_mode, read_update_status);
                 let _ = reply.send(result);
@@ -2205,7 +2287,9 @@ impl App {
                 let _ = reply.send(self.query_palette(&query));
             }
             UiRequest::PaletteActivate { id, reply } => {
-                let activation = self.activate_palette(&id);
+                // The row is the one a click runs; only the origin says
+                // that nobody is sitting in front of this one.
+                let activation = self.activate_palette(&id, Self::IPC_ACTIVATION_ORIGIN);
                 match activation.reply {
                     PaletteReplyRoute::Ready(result) => {
                         let _ = reply.send(result);
@@ -2365,7 +2449,7 @@ impl App {
                 // semantics; `host.connect` is the second step, and the
                 // Add Host dialog's "Add & Connect" takes both.
                 let _ = reply.send(
-                    self.host_add_requested(&label, &target, false)
+                    self.host_add_requested(&label, &target, None)
                         .map(Into::into),
                 );
             }
@@ -2386,8 +2470,12 @@ impl App {
                     .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
                 let _ = reply.send(result);
             }
-            UiRequest::HostConnect { id, reply } => {
-                let _ = reply.send(self.host_connect_op(&id));
+            UiRequest::HostConnect {
+                id,
+                test_user_origin,
+                reply,
+            } => {
+                let _ = reply.send(self.host_connect_op(&id, test_user_origin));
             }
             UiRequest::HostDisconnect { id, reply } => {
                 let _ = reply.send(self.host_disconnect_op(&id));
@@ -2396,6 +2484,15 @@ impl App {
         task
     }
 
+    /// Who a connection arriving over the IPC socket is asked for by.
+    ///
+    /// Named rather than spelled at the call site so the rule it stands
+    /// for — a modal never opens to answer a machine (plan 039 §3.5) —
+    /// is something a test can hold on to. `roostctl host connect` dials
+    /// exactly as a click does, so nothing downstream could infer this.
+    pub(super) const IPC_CONNECT_ORIGIN: crate::host_conn::RequestOrigin =
+        crate::host_conn::RequestOrigin::Ipc;
+
     /// `host.connect`, as the op answers it: start the attempt and
     /// report the state it left the host in.
     ///
@@ -2403,12 +2500,28 @@ impl App {
     /// dial, the identify and the lease are a round trip this reply does
     /// not wait for, and a client that wants the settled verdict watches
     /// the section (or asks again).
+    ///
+    /// `test_user_origin` is `HostConnectParams::test_user_origin`,
+    /// already gated in `roost-engine` on nothing — the test-mode check
+    /// lives here, next to every other `self.test_mode` gate, so a
+    /// production build ignores the flag outright rather than trusting
+    /// a decode-time gate two crates away. When it is honored, the
+    /// request routes through `host_connect_requested` — the same
+    /// NeedsRestart-aware entry a click uses — instead of the plain
+    /// dial `host.connect` otherwise gives a machine, which is the only
+    /// way `tools/roosttest` can reach the bootstrap offer or the
+    /// remote-restart prompt at all (plan 039 §3.5).
     fn host_connect_op(
         &mut self,
         saved_id: &str,
+        test_user_origin: bool,
     ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
         let host = self.saved_host(saved_id)?;
-        self.host_reconnect_requested(saved_id);
+        if test_user_origin && self.test_mode {
+            self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
+        } else {
+            self.host_reconnect_requested(saved_id, Self::IPC_CONNECT_ORIGIN);
+        }
         Ok(self.host_connection_result(host))
     }
 
@@ -2514,6 +2627,30 @@ mod tests {
         }
     }
 
+    /// `app.keybind_dispatch` is a paste-only seam, not a general
+    /// dispatcher: every other spelling `KeybindAction::from_name`
+    /// would otherwise resolve — including destructive/state-mutating
+    /// ones like `close_tab` and `close_project`, and the
+    /// clipboard-writing `copy` — must be refused, and refused with a
+    /// message that names the one action this op actually accepts.
+    #[test]
+    fn keybind_dispatch_test_op_accepts_only_paste() {
+        assert_eq!(paste_only_keybind("paste"), Ok(KeybindAction::Paste));
+
+        for other in ["close_tab", "new_tab", "close_project", "copy", "unbind"] {
+            let error =
+                paste_only_keybind(other).expect_err("a non-paste action name must be refused");
+            assert!(
+                error.contains("paste"),
+                "refusal for {other:?} must name the allowed action: {error}"
+            );
+        }
+
+        let error =
+            paste_only_keybind("not_a_real_action").expect_err("an unknown name is refused too");
+        assert!(error.contains("paste"));
+    }
+
     /// A host agent's notification is routed to the notification path,
     /// carrying the title and body verbatim — the inbox row and the
     /// desktop banner are then composed exactly as a local tab's are
@@ -2543,6 +2680,19 @@ mod tests {
         let key = TabKey::new(host, notification.tab_id);
         assert!(!key.is_local());
         assert_ne!(key, TabKey::local(7));
+    }
+
+    /// The one rule the origin field exists for: a connection asked for
+    /// over the IPC socket is never a user's, so nothing downstream can
+    /// decide to open a modal for it (plan 039 §3.5). `roostctl host
+    /// connect` reaches `host_reconnect_requested` with the very same
+    /// `ConnectMode` a click does, so this is the only place the
+    /// difference is stated.
+    #[test]
+    fn a_connect_arriving_over_ipc_is_never_a_users() {
+        use crate::host_conn::RequestOrigin;
+        assert_eq!(App::IPC_CONNECT_ORIGIN, RequestOrigin::Ipc);
+        assert_ne!(App::IPC_CONNECT_ORIGIN, RequestOrigin::User);
     }
 
     /// The clearing edge only. A *pending* flag is the mirror's to paint

@@ -4,6 +4,12 @@ name: Release
 #   * Roost-<version>.dmg                       (macOS, arm64)
 #   * Roost-Iced-<version>.dmg                  (macOS, arm64 — experimental)
 #   * roost_<version>_amd64.deb / _arm64.deb    (Linux, native per-arch)
+#   * roost-session-<version>-linux-amd64 / -arm64          (standalone binary,
+#       plan 039 §3.7 — the same roost-session build-deb.sh already stages
+#       into the .deb, restaged under the name the host-sessions bootstrap
+#       install rung fetches directly)
+#   * roost-session-<version>-linux-amd64.sha256 / -arm64.sha256  (its
+#       checksum sidecar, sha256sum two-field format)
 # then fires repository_dispatch at charliek/apt-charliek so the .deb lands in
 # the apt repo. The build-deps / ghostty-cache patterns mirror ci.yml.
 #
@@ -14,13 +20,16 @@ name: Release
 #   (Gatekeeper requires right-click → Open).
 #
 # The Release is created as a DRAFT and stays one until `publish-release`
-#   flips it, after both .debs and the DMG are attached, non-empty and named
-#   for the tag. Publishing up front let two things go wrong: a failed build
-#   left a public, empty release behind, and apt-charliek could consume it —
-#   its collect-debs.sh walks releases newest-first and only *warns* past one
-#   that carries no matching .deb, so it silently republishes the PREVIOUS
-#   version. A draft is invisible to it (GitHub lists drafts only to callers
-#   with push access, which its repo-scoped GITHUB_TOKEN doesn't have).
+#   flips it, after all eight assets above are attached, plausibly sized (the
+#   two .sha256 sidecars are tiny by design, so their floor is the smallest
+#   `sha256sum` record their reader accepts, not 1 MiB) and
+#   named for the tag. Publishing up front let two things go wrong: a failed
+#   build left a public, empty release behind, and apt-charliek could consume
+#   it — its collect-debs.sh walks releases newest-first and only *warns*
+#   past one that carries no matching .deb, so it silently republishes the
+#   PREVIOUS version. A draft is invisible to it (GitHub lists drafts only to
+#   callers with push access, which its repo-scoped GITHUB_TOKEN doesn't
+#   have).
 #
 # Sparkle auto-update (issue #122): the mac job EdDSA-signs the DMG with
 #   SPARKLE_ED_PRIVATE_KEY and hands sign.txt forward; the `appcast` job then
@@ -176,9 +185,13 @@ jobs:
         # off it), but "amd64" and "arm64" are near-identical at a glance in
         # adjacent rows, so the label spells the target out. The download
         # still lands as the real filename.
+        # `session_label`/`session_checksum_label` are the same per-cell
+        # display-name idea as `label`, for the standalone roost-session
+        # binary + its checksum sidecar (plan 039 §3.7) — the bootstrap
+        # install rung fetches these directly, independent of the .deb.
         include:
-          - { runner: ubuntu-24.04,     arch: amd64, label: "Linux — Intel / AMD 64-bit (.deb)" }
-          - { runner: ubuntu-24.04-arm, arch: arm64, label: "Linux — ARM 64-bit (.deb)" }
+          - { runner: ubuntu-24.04,     arch: amd64, label: "Linux — Intel / AMD 64-bit (.deb)", session_label: "Linux session daemon — Intel / AMD 64-bit (standalone binary)", session_checksum_label: "Linux session daemon — Intel / AMD 64-bit (sha256)" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, label: "Linux — ARM 64-bit (.deb)", session_label: "Linux session daemon — ARM 64-bit (standalone binary)", session_checksum_label: "Linux session daemon — ARM 64-bit (sha256)" }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -303,6 +316,34 @@ jobs:
           # instead of passing an unexpanded glob down to gh.
           deb="$(./linux/scripts/resolve-one-deb.sh out --arch "${ARCH}")"
           gh release upload "${GITHUB_REF_NAME}" "${deb}#${ASSET_LABEL}" --clobber
+
+      # Standalone roost-session artifact (plan 039 §3.7) — build-deb.sh
+      # above already built it in the same cargo invocation as the .deb's
+      # contents and staged it at dist/roost-session; this just renames a
+      # copy to the asset name the bootstrap install rung requests
+      # (crates/roost-ipc/src/bootstrap.rs `asset_name`) and writes its
+      # sha256 sidecar. No second cargo build.
+      - name: Stage the roost-session standalone artifact + checksum
+        id: stage_session
+        run: |
+          set -euo pipefail
+          out="$(./linux/scripts/stage-session-artifact.sh "${GITHUB_REF_NAME#v}" "${{ matrix.arch }}")"
+          asset_path="$(printf '%s\n' "${out}" | sed -n '1p')"
+          checksum_path="$(printf '%s\n' "${out}" | sed -n '2p')"
+          echo "asset_path=${asset_path}" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=${checksum_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload roost-session standalone artifact + checksum to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_LABEL: ${{ matrix.session_label }}
+          CHECKSUM_LABEL: ${{ matrix.session_checksum_label }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${{ steps.stage_session.outputs.asset_path }}#${ASSET_LABEL}" --clobber
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${{ steps.stage_session.outputs.checksum_path }}#${CHECKSUM_LABEL}" --clobber
 
   mac:
     needs: create-release
@@ -914,9 +955,24 @@ jobs:
           # globs and what the appcast's enclosure URL is built from, so that
           # is what we check.
           #
-          # The floor is 1 MiB rather than "non-empty": every one of these is
-          # multi-megabyte, and a truncated upload lands somewhere above zero,
-          # so `> 0` would wave through exactly the corruption worth catching.
+          # Eight assets total (plan 039 §3.7): the two .debs, the two macOS
+          # DMGs, and — new — a standalone `roost-session` binary per Linux
+          # arch plus its `.sha256` checksum sidecar. The bootstrap install
+          # rung on a connecting client fetches the binary + checksum
+          # directly (crates/roost-ipc/src/bootstrap.rs `asset_name`/
+          # `checksum_name`), independent of the .deb.
+          #
+          # Two size floors. The six binary/package assets keep the original
+          # 1 MiB floor rather than "non-empty": every one of them is
+          # multi-megabyte, and a truncated upload lands somewhere above
+          # zero, so `> 0` would wave through exactly the corruption worth
+          # catching. The two `.sha256` sidecars are NOT exempted from a size
+          # check — they're just tiny by design, and their floor is derived
+          # per asset below rather than being a constant here: a bare 64-byte
+          # hash is not a `sha256sum` record at all (no filename field), and
+          # `parse_checksum_file` on the connecting client
+          # (crates/roost-ipc/src/bootstrap.rs) rejects it — so a flat 64
+          # would publish a sidecar the feature it exists for cannot use.
           min_bytes=1048576
           fail=0
           # Space-separated, then split by IFS. No heredoc: its terminator has
@@ -932,37 +988,72 @@ jobs:
           # asset as unexpected, so `publish-release` would fail and the draft
           # would never flip — for exactly the `-rc` tags used to validate the
           # Sparkle round-trip. Stable tags are unaffected, which is why it
-          # would have hidden until the first prerelease.
+          # would have hidden until the first prerelease. `ver` (not
+          # `deb_ver`) is the right version for the session assets: the
+          # linux job's staging step names them from the raw tag spelling
+          # (`${GITHUB_REF_NAME#v}`), matching `asset_name()`'s
+          # `<CARGO_PKG_VERSION>` on a stable tag — the `~` mangling is a
+          # Debian-only convention the session binary has no reason to share.
           expected_names=""
           for raw in "roost_${deb_ver}_amd64.deb" \
                      "roost_${deb_ver}_arm64.deb" \
                      "Roost-${ver}.dmg" \
-                     "Roost-Iced-${ver}.dmg"; do
+                     "Roost-Iced-${ver}.dmg" \
+                     "roost-session-${ver}-linux-amd64" \
+                     "roost-session-${ver}-linux-arm64"; do
             expected_names="${expected_names}${expected_names:+ }$(printf '%s' "${raw}" | tr -c 'A-Za-z0-9._-' '.')"
           done
-          echo "expected asset names (after GitHub's filename sanitization): ${expected_names}"
+          checksum_names=""
+          for raw in "roost-session-${ver}-linux-amd64.sha256" \
+                     "roost-session-${ver}-linux-arm64.sha256"; do
+            checksum_names="${checksum_names}${checksum_names:+ }$(printf '%s' "${raw}" | tr -c 'A-Za-z0-9._-' '.')"
+          done
+          echo "expected asset names (after GitHub's filename sanitization): ${expected_names} ${checksum_names}"
 
-          for expected in ${expected_names}; do
+          # One check, parameterized by floor, called once per size tier —
+          # the six big assets and the two checksum sidecars share every rule
+          # except the floor.
+          check_asset() {
+            expected="$1"
+            floor="$2"
             sizes="$(printf '%s\n' "${assets}" \
               | awk -F'\t' -v e="${expected}" '$1 == e { print $2 }')"
             count="$(printf '%s\n' "${sizes}" | grep -c '^[0-9]' || true)"
             if [ "${count}" -ne 1 ]; then
               echo "::error::expected exactly one asset named ${expected} on ${tag}, found ${count}."
               fail=1
-              continue
+              return
             fi
-            if [ "${sizes}" -lt "${min_bytes}" ]; then
-              echo "::error::asset ${expected} on ${tag} is only ${sizes} bytes (expected at least ${min_bytes}) — it looks truncated."
+            if [ "${sizes}" -lt "${floor}" ]; then
+              echo "::error::asset ${expected} on ${tag} is only ${sizes} bytes (expected at least ${floor}) — it looks truncated."
               fail=1
             fi
+          }
+
+          for expected in ${expected_names}; do
+            check_asset "${expected}" "${min_bytes}"
+          done
+          # The sidecar's floor is the smallest record its reader accepts:
+          # 64 hex digits, at least one separator, and the bare asset
+          # filename — which is what the sidecar is named after, so the floor
+          # follows the name. `tr` above substitutes one character for one
+          # character, so the sanitized name is the same length as the raw
+          # one it was built from. sha256sum's real output sits two bytes
+          # higher (it separates with two spaces and ends with a newline);
+          # the floor stays at the parser's minimum so a legitimate variant
+          # cannot fail a release.
+          for expected in ${checksum_names}; do
+            asset="${expected%.sha256}"
+            check_asset "${expected}" "$((64 + 1 + ${#asset}))"
           done
 
           # Reject anything else on the release. A reused draft from an earlier
           # attempt can still be carrying an asset from a PREVIOUS version —
           # apt-charliek globs `roost_*.deb`, so a stale one there is a wrong
           # package shipped, and the named checks above would not see it.
+          all_expected_names="${expected_names} ${checksum_names}"
           unexpected="$(printf '%s\n' "${assets}" | cut -f1 \
-            | grep -vxF "$(printf '%s' "${expected_names}" | tr ' ' '\n')" || true)"
+            | grep -vxF "$(printf '%s' "${all_expected_names}" | tr ' ' '\n')" || true)"
           if [ -n "${unexpected}" ]; then
             echo "::error::unexpected assets on ${tag} (a stale upload from an earlier attempt?):"
             printf '%s\n' "${unexpected}" | sed 's/^/::error::  /'

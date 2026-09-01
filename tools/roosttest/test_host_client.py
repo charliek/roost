@@ -36,8 +36,8 @@ literally the assertion that those two agree.
 
 `h<host>.<id>`'s host component is an **incarnation**, minted afresh on
 every connect attempt (`keys.rs`), so it is discovered rather than
-assumed — [`host_key`] focuses upward until one answers, which is both
-the discovery and the attach.
+assumed — [`host_key`] (`host_probe.py`) focuses upward until one
+answers, which is both the discovery and the attach.
 
 # What is deliberately not here
 
@@ -65,6 +65,7 @@ import session as sessionlib
 import ui
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
+from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
 
 pytestmark = pytest.mark.host_client
 
@@ -74,15 +75,6 @@ pytestmark = pytest.mark.host_client
 # aligned by the attach params" — so this is a starting value, not an
 # expectation.
 COLS, ROWS = 80, 24
-
-# How many consecutive incarnations [`host_key`] scans before concluding
-# the host is not connected. Generous because the minter is the *app's*,
-# not this run's: a UI that a developer has been driving all afternoon is
-# already hundreds of connects in, and a ceiling tuned to one pytest run
-# would turn "connected, incarnation 300" into a timeout. The scan is a
-# one-off — [`_incarnation_floor`] makes every probe after the first
-# start where the last one landed.
-INCARNATION_SCAN_SPAN = 4096
 
 # Plan 037 §7.10: a focused-tab attach on localhost reaches a rendered
 # frame in under half a second, end to end through the UI. Scaled like
@@ -344,56 +336,11 @@ def inbox_ids(roost: Roost) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-# Where the next scan starts. Incarnations only ever go up (`keys.rs`
-# mints, never reuses), so the last one that answered is a valid floor
-# for the next probe — that is what keeps a 4096-wide scan a once-per-run
-# cost instead of a per-call one.
-_incarnation_floor = 1
-
-
-def host_key(roost: Roost, tab_id: int, timeout: float = 30.0) -> str:
-    """Focus a host tab and return the `h<host>.<id>` spelling that
-    reached it.
-
-    The incarnation is minted per connect attempt and is not reported by
-    any op, so it is *discovered*: probe upward until one answers. A
-    stale incarnation names nothing in the connection set (that is the
-    whole point of minting a fresh one), so a wrong guess is a clean
-    `not-found` rather than a wrong tab — which is what makes probing
-    safe rather than merely convenient.
-
-    Focusing is the discovery because focusing is also the attach
-    (§3.4's attach-on-focus): the same call a sidebar click makes.
-    """
-    global _incarnation_floor
-
-    def probe() -> str | None:
-        global _incarnation_floor
-        for incarnation in range(
-            _incarnation_floor, _incarnation_floor + INCARNATION_SCAN_SPAN
-        ):
-            key = f"h{incarnation}.{tab_id}"
-            try:
-                roost.call("tab.focus", {"tab_id": key})
-            except RoostError:
-                continue
-            _incarnation_floor = incarnation
-            return key
-        return None
-
-    return wait_until(probe, timeout, f"a connected host to list tab {tab_id}")
-
-
-def sibling_key(key: str, tab_id: int) -> str:
-    """Another tab of the same connection, without a second probe.
-
-    An incarnation belongs to the *connection*, not to a tab, so once one
-    of a host's tabs has been reached the rest are addressable by
-    substitution. Needed for tabs a test must NOT focus — focusing is
-    what attaches, and attaching is what a case about a background tab is
-    trying to avoid.
-    """
-    return f"{key.split('.', 1)[0]}.{tab_id}"
+# [`host_key`] and [`sibling_key`] live in `host_probe.py`, not here.
+# This module imports pytest, and the incarnation search needs a fence
+# that `tools/roosttest_unit`'s bare-`python3` lane can run — no pytest,
+# no UI, no two processes. They are re-exported because the ssh and
+# bootstrap lanes import them from this module.
 
 
 def focus(roost: Roost, key: str) -> None:

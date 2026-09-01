@@ -25,6 +25,10 @@ tokio       = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 
+# Streaming SHA-256 over a downloaded release asset, before a byte of
+# it is streamed to a host (plan 039 §3.6).
+sha2        = { workspace = true }
+
 # Logging.
 tracing     = { workspace = true }
 

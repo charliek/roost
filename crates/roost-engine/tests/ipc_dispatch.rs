@@ -551,6 +551,48 @@ async fn the_connection_ops_have_no_headless_answer() {
     }
 }
 
+/// `app.keybind_dispatch` accepts only `"paste"` (plan 039 §3.5's
+/// consent-card test seam is not a general keybind dispatcher). A bad
+/// action name must fail `invalid-param` — not `internal` — with no UI
+/// attached (this handler has no `ui_tx`), proving the check happens at
+/// the dispatcher, ahead of `ui_call`, the same way
+/// `tab_feed_ime_rejects_unknown_action` proves it for `tab.feed_ime`
+/// and the doc comment on `app.dialog_answer` promises for its own
+/// `action`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_keybind_dispatch_rejects_non_paste_action() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    let err = client
+        .call_raw(
+            ops::APP_KEYBIND_DISPATCH,
+            serde_json::json!({"action": "close_tab"}),
+        )
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "invalid-param"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
 /// Connect to a freshly-bound server with bounded retries instead of
 /// a flat sleep. CI runners under load can take more than 50ms to
 /// schedule the accept loop; a bounded retry is robust without
