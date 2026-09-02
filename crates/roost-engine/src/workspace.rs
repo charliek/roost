@@ -967,16 +967,30 @@ impl Workspace {
 
     /// Open a new tab in `project_id`. Returns the wire-format
     /// `Tab`. Caller spawns the PTY.
+    ///
+    /// An empty `cwd` is resolved here, not stored verbatim:
+    /// requested → the project's cwd → `$HOME` → `/`. Every path
+    /// (`ops::TAB_OPEN`, the facade, `LocalClient::open_tab`) reaches
+    /// this method, so title derivation below sees the resolved
+    /// value too.
     pub fn open_tab(&self, project_id: i64, cwd: &str, title: &str) -> Result<Tab, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.projects.contains_key(&project_id) {
-            return Err(WorkspaceError::ProjectNotFound(project_id));
-        }
+        let project_cwd = match inner.projects.get(&project_id) {
+            Some(p) => p.cwd.clone(),
+            None => return Err(WorkspaceError::ProjectNotFound(project_id)),
+        };
+        let cwd: String = if !cwd.is_empty() {
+            cwd.to_string()
+        } else if !project_cwd.is_empty() {
+            project_cwd
+        } else {
+            std::env::var("HOME").unwrap_or_else(|_| "/".into())
+        };
         let id = inner.alloc_id();
         let now = unix_now();
         let position = inner.next_tab_position(project_id);
         let derived_title = if title.is_empty() {
-            derive_title(cwd)
+            derive_title(&cwd)
         } else {
             title.to_string()
         };
@@ -984,7 +998,7 @@ impl Workspace {
             id,
             project_id,
             title: derived_title.clone(),
-            cwd: cwd.to_string(),
+            cwd,
             agent: AgentTabState::default(),
             has_notification: false,
             // Always start with user_titled=false. The caller-

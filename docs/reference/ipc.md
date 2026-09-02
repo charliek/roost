@@ -250,8 +250,9 @@ Request:
 }}
 ```
 
-`argv` empty means `[$SHELL]`. `cwd` empty means use the project's
-default cwd. `title` empty means derive from `cwd`. There is
+`argv` empty means `[$SHELL]`. `cwd` empty means resolve it: the
+project's cwd, then `$HOME`, then `/`. `title` empty means derive from
+the resolved `cwd`. There is
 deliberately no opaque command string — callers wanting shell
 word-splitting must pass `["sh", "-c", "..."]` explicitly. This `argv` is
 reachable from the CLI as `roostctl tab open -- <cmd…>` (see
