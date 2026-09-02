@@ -6,10 +6,11 @@
 //! fetched per call from `currentNotificationCenter()` (which is
 //! `AnyThread`) and never stored. Delegate callbacks arrive on an
 //! unspecified queue, so the delegate class is deliberately *not*
-//! `MainThreadOnly` and touches only [`PENDING`] and the atomics. What is
-//! main-thread stays main-thread: [`init`] takes the marker, and the
-//! retained delegate plus the init bookkeeping live in `thread_local!`s
-//! that nothing off the main thread reads.
+//! `MainThreadOnly` and touches only the process-wide [`PENDING`] and
+//! [`AUTHORIZATION`] locks. What is main-thread stays main-thread:
+//! [`init`] takes the marker, and the retained delegate plus the init
+//! bookkeeping live in `thread_local!`s that nothing off the main thread
+//! reads.
 //!
 //! Replace, not stack: the notification identifier is `roost-tab-{id}`,
 //! stable for the life of the tab, and UN's documented behaviour for a
@@ -27,7 +28,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use block2::{DynBlock, RcBlock};
@@ -72,20 +73,36 @@ const CATEGORY: &str = "roost-tab";
 
 /// Whether [`init`] reached a bundled center at all.
 static ENABLED: AtomicBool = AtomicBool::new(false);
-/// The user's answer to the authorization prompt, written from the
-/// completion blocks of [`request_authorization`] and
-/// [`refresh_authorization`] on whatever queue UN chose.
-static AUTHORIZED: AtomicBool = AtomicBool::new(false);
 
-/// Which query owns [`AUTHORIZED`]. UN completes these queries
-/// asynchronously on unspecified queues and documents no ordering
-/// between separately issued ones, so each carries the generation of the
-/// query that issued it and only the newest may write. Without that, a
-/// delayed `Denied` snapshot could land after a newer `Authorized` one
-/// and overwrite it — muting notifications with no further focus-gain
-/// edge to correct it, which is the very staleness this module refreshes
-/// to avoid.
-static QUERY_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The user's answer to the authorization prompt, and which query owns
+/// it. Written from the completion blocks of [`request_authorization`]
+/// and [`refresh_authorization`] on whatever queue UN chose.
+///
+/// UN completes these queries asynchronously on unspecified queues and
+/// documents no ordering between separately issued ones, so each carries
+/// the generation of the query that issued it and only the newest may
+/// write. Without that, a delayed `Denied` snapshot could land after a
+/// newer `Authorized` one and overwrite it — muting notifications with
+/// no further focus-gain edge to correct it, which is the very staleness
+/// this module refreshes to avoid.
+///
+/// The two fields move together under one lock rather than as two
+/// atomics because separating them reopens exactly that hole: a
+/// completion that read the ticket and found itself current can be
+/// overtaken *before it writes* by a newer query that both issues and
+/// lands in the gap, and then clobbers that fresher answer with its own
+/// older snapshot. Comparing the ticket and writing the bit has to be
+/// one critical section, which is why the Swift side holds both under a
+/// single `withLock` too (`DesktopNotifications.swift:73-107`).
+static AUTHORIZATION: Mutex<Authorization> = Mutex::new(Authorization {
+    authorized: false,
+    generation: 0,
+});
+
+struct Authorization {
+    authorized: bool,
+    generation: u64,
+}
 
 /// The click channel for every banner currently believed to be on screen,
 /// keyed by notification identifier. Not a `thread_local!`: `show()`
@@ -235,29 +252,51 @@ pub(crate) fn init(_mtm: MainThreadMarker) {
     }
 }
 
-/// Claim the next [`QUERY_GENERATION`] ticket, from wherever the
-/// caller's answer is at its freshest.
+/// Claim the next [`AUTHORIZATION`] ticket, from wherever the caller's
+/// answer is at its freshest.
 fn issue_query() -> u64 {
-    QUERY_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    with_authorization(|state| {
+        state.generation += 1;
+        state.generation
+    })
 }
 
 /// Record a completion's snapshot, unless a later query has since been
 /// issued: that one's answer is fresher by construction and writes when
 /// it lands, so an older snapshot is dropped rather than allowed to
-/// overwrite it. The transition log lives inside the guard — a discarded
-/// snapshot must not report a change it did not make.
+/// overwrite it. The log stays inside the guard though outside the lock
+/// — a discarded snapshot must not report a change it did not make —
+/// and only a flip reaches it, so the value it displaced is
+/// `!authorized`.
 fn store_authorization(generation: u64, authorized: bool) {
-    if QUERY_GENERATION.load(Ordering::SeqCst) != generation {
-        return;
-    }
-    let previous = AUTHORIZED.swap(authorized, Ordering::SeqCst);
-    if previous != authorized {
+    let changed = with_authorization(|state| {
+        if state.generation != generation || state.authorized == authorized {
+            return false;
+        }
+        state.authorized = authorized;
+        true
+    });
+    if changed {
         tracing::info!(
-            from = previous,
+            from = !authorized,
             to = authorized,
             "notifications: authorization changed"
         );
     }
+}
+
+fn is_authorized() -> bool {
+    with_authorization(|state| state.authorized)
+}
+
+/// Poisoning is recovered exactly as [`with_pending`] recovers it, and
+/// for the same reason: refusing to unlock would leave every later
+/// [`show`] permanently unauthorized.
+fn with_authorization<T>(f: impl FnOnce(&mut Authorization) -> T) -> T {
+    let mut state = AUTHORIZATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut state)
 }
 
 /// The same three options the Swift app asks for
@@ -332,7 +371,7 @@ pub(crate) fn status(_mtm: MainThreadMarker) -> AppNotificationStatusResult {
         AppNotificationStatusResult {
             backend: "available".into(),
             reason: None,
-            authorized: AUTHORIZED.load(Ordering::SeqCst),
+            authorized: is_authorized(),
         }
     } else {
         AppNotificationStatusResult {
@@ -353,10 +392,7 @@ pub(crate) fn status(_mtm: MainThreadMarker) -> AppNotificationStatusResult {
 /// whole Objective-C leg synchronously and hands back a channel, which is
 /// what keeps this future `Send`.
 pub(crate) async fn show(payload: Payload) -> Result<Shown, String> {
-    if !show_allowed(
-        ENABLED.load(Ordering::SeqCst),
-        AUTHORIZED.load(Ordering::SeqCst),
-    ) {
+    if !show_allowed(ENABLED.load(Ordering::SeqCst), is_authorized()) {
         tracing::debug!(
             title = %payload.title,
             tab_id = payload.tab.tab,
@@ -588,24 +624,24 @@ mod tests {
         }
     }
 
-    /// The one test that mutates [`AUTHORIZED`] and [`QUERY_GENERATION`],
-    /// deliberately so: they are process-wide, and a sibling test
-    /// touching them would race this one under the parallel runner. New
-    /// cases for the guard belong inside here, not beside it.
+    /// The one test that mutates [`AUTHORIZATION`], deliberately so: it
+    /// is process-wide, and a sibling test touching it would race this
+    /// one under the parallel runner. New cases for the guard belong
+    /// inside here, not beside it.
     #[test]
     fn only_the_newest_answer_may_write_the_cached_authorization() {
         let overtaken = issue_query();
         let newest = issue_query();
-        AUTHORIZED.store(false, Ordering::SeqCst);
+        with_authorization(|state| state.authorized = false);
 
         store_authorization(overtaken, true);
         assert!(
-            !AUTHORIZED.load(Ordering::SeqCst),
+            !is_authorized(),
             "a completion a later query overtook is dropped, not applied"
         );
         store_authorization(newest, true);
         assert!(
-            AUTHORIZED.load(Ordering::SeqCst),
+            is_authorized(),
             "the newest query's answer is the one that lands"
         );
 
@@ -616,12 +652,12 @@ mod tests {
         let refresh_in_flight = issue_query();
         store_authorization(issue_query(), false);
         assert!(
-            !AUTHORIZED.load(Ordering::SeqCst),
+            !is_authorized(),
             "the user's answer outranks a refresh issued before they gave it"
         );
         store_authorization(refresh_in_flight, true);
         assert!(
-            !AUTHORIZED.load(Ordering::SeqCst),
+            !is_authorized(),
             "and that refresh's stale snapshot cannot undo the answer"
         );
     }
