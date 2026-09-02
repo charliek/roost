@@ -90,23 +90,10 @@ impl LocalClient {
         cols: u32,
         rows: u32,
     ) -> Result<Tab> {
-        // Resolve cwd: caller-supplied → project's cwd → $HOME →
-        // "/". Matches the Mac side's `LocalClient.openTab`
-        // fallback. Both the UI's open-new-tab path and the
-        // `roostctl tab open` IPC call site land here, so the
-        // fallback is centralized.
-        let resolved_cwd: String = if !cwd.is_empty() {
-            cwd.to_string()
-        } else {
-            let projects = self.workspace.snapshot();
-            projects
-                .into_iter()
-                .find(|p| p.id == project_id)
-                .map(|p| p.cwd)
-                .filter(|c| !c.is_empty())
-                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()))
-        };
-        let tab = self.workspace.open_tab(project_id, &resolved_cwd, title)?;
+        // cwd resolution (requested → project's cwd → $HOME → "/")
+        // lives in `Workspace::open_tab` now, so every caller
+        // (this, the facade, `ops::TAB_OPEN`) gets it once.
+        let tab = self.workspace.open_tab(project_id, cwd, title)?;
         // Clamp + validate PTY dims. Zero → terminal default; values
         // exceeding u16 surface as a clear error rather than
         // silently truncating via `as u16` (CR-flagged: a CLI
@@ -115,9 +102,13 @@ impl LocalClient {
         // `IPCHandlerImpl.ipcDim` validation.
         let cols = pty_dim(cols, 80, "cols")?;
         let rows = pty_dim(rows, 24, "rows")?;
+        // Spawn `tab.cwd` — the resolved value `open_tab` just
+        // returned — not the `cwd` parameter above, which may still
+        // be empty. Spawning the parameter regresses this path back
+        // to the UI's own cwd (#266).
         match self
             .supervisor
-            .spawn(tab.id, &resolved_cwd, argv, cols, rows, &self.socket_path)
+            .spawn(tab.id, &tab.cwd, argv, cols, rows, &self.socket_path)
         {
             // The pre-subscribed receiver spawn returns is dropped;
             // the supervisor's stashed twin (`take_initial_receiver`)

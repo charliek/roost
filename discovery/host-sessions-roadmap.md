@@ -785,29 +785,45 @@ pays for itself but blocks nothing. #381 is the odd one out — it is a
 viewports, which closes it by construction), not an implementation task,
 and wants a conversation before a plan.
 
-**Release-blocking work from outside this roadmap (swept 2026-09-02).**
-This list stays scoped to items host-session work surfaced, so these are
-named rather than absorbed — but they gate the same release:
-[#355](https://github.com/charliek/roost/issues/355) (macOS notification
-authorization is checked once at launch and cached forever, both UIs) and
-[#369](https://github.com/charliek/roost/issues/369) (`tab.focus` over
-IPC never clears the sidebar badge) both land directly on the
-agent-notification routing this product is differentiated by, and HS-4b
-amplifies both — host tab focus routes through that same op, and a Mac
-host client keeps sessions alive long enough for a mid-session
-permission change to matter.
-[#351](https://github.com/charliek/roost/issues/351) is the same
-differentiator failing on the default Linux desktop stack: a
+**Release-blocking work from outside this roadmap — closed by plan 043
+(swept 2026-09-02).** This list stayed scoped to items host-session work
+surfaced, so these were named rather than absorbed, and every one of
+them has now shipped: [#355](https://github.com/charliek/roost/issues/355)
+(macOS notification authorization was checked once at launch and cached
+forever, both UIs) and [#369](https://github.com/charliek/roost/issues/369)
+(`tab.focus` over IPC never cleared the sidebar badge) both land directly
+on the agent-notification routing this product is differentiated by, and
+HS-4b amplified both — host tab focus routes through that same op, and a
+Mac host client keeps sessions alive long enough for a mid-session
+permission change to matter. [#266](https://github.com/charliek/roost/issues/266)
+was a cheap iced-only correctness bug that Mac already had fixed —
+exactly the drift the north star's parity rule exists to catch.
+[#356](https://github.com/charliek/roost/issues/356) was release
+machinery: the mac job never proved `SPARKLE_ED_PRIVATE_KEY` matched the
+bundled `SUPublicEDKey`, while the iced job already did the real
+derive-and-compare — a mechanical port, not a design question. Riding
+alongside as a mirror, not a new design,
+[#391](https://github.com/charliek/roost/issues/391) — the
+tolerated-signing-failure hole `bundle-iced.sh` already guarded against
+but `bundle.sh` left open when this slice closed it for the iced bundle
+only (see "Left open by this slice" above) — is closed too.
+
+[#351](https://github.com/charliek/roost/issues/351), the same
+differentiator failing on the default Linux desktop stack (a
 notification click switches tab but never raises the window, because
 winit's `focus_window` is a documented Wayland no-op and the
-`xdg-activation` token we already receive goes unused.
-[#266](https://github.com/charliek/roost/issues/266) is a cheap
-iced-only correctness bug that Mac already fixed — exactly the drift the
-north star's parity rule exists to catch.
-[#356](https://github.com/charliek/roost/issues/356) is release
-machinery: the mac job never proves `SPARKLE_ED_PRIVATE_KEY` matches the
-bundled `SUPublicEDKey`, while the iced job already does the real
-derive-and-compare — a mechanical port, not a design question.
+`xdg-activation` token we already receive goes unused), is **not** part
+of that close-out: plan 043 weighed it during planning and cut it, and
+it is now the **top post-release item**. The reason in one line: raising
+a Wayland window needs a compositor-minted `xdg-activation` token from a *real*
+notification daemon's *real* click, which none of the headless shed
+tiers can produce and the roosttest mock server cannot mint, so the only
+proof is a person clicking a banner on a real desktop — the wrong shape
+for a plan whose spine is "provable before strangers use it." Worth
+being precise about for release notes: banner-click-raises-window
+already works on macOS today (`UNUserNotificationCenter`'s default
+action raises the app, on both the Swift app and Roost-Iced) — #351 is
+a **Wayland-only** gap, not a cross-platform one.
 
 **The ghostty adoption items: none of them ship this release, and none
 of them needs a pin bump.** The pin already moved to main tip

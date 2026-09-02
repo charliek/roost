@@ -439,8 +439,12 @@ jobs:
       # SUPublicEDKey — builds signed with the real key would fail to verify
       # against it, and users on a throwaway-key build can't auto-update. A
       # prerelease (-beta/-rc) may keep it to validate the appcast round-trip
-      # with the matching throwaway private key. Mirrors create-release's
-      # `case "$tag" in *-*)` prerelease idiom.
+      # — but only by ALSO swapping SPARKLE_ED_PRIVATE_KEY to the matching
+      # throwaway private key: the derive-and-compare step below runs on
+      # every tag, no prerelease exemption, and would fail a prerelease that
+      # kept the throwaway public key here while signing with the real
+      # secret. Mirrors create-release's `case "$tag" in *-*)` prerelease
+      # idiom.
       - name: Guard against the throwaway Sparkle key on stable releases
         run: |
           set -euo pipefail
@@ -453,6 +457,92 @@ jobs:
             exit 1
           fi
           echo "SUPublicEDKey is not the throwaway placeholder — ok."
+
+      # BEFORE the build, for the same reason the iced job's twin check runs
+      # early: a bundle stamped with a public key whose private half never
+      # signed anything looks perfect and simply never updates. Unlike the
+      # guard above (a string blacklist, skipped on prereleases), this
+      # proves the SECRET and the TEMPLATE are actually a pair — on every
+      # tag, no prerelease exemption. SPARKLE_ED_PRIVATE_KEY is one
+      # repo-level secret holding the real key, and the template has carried
+      # the real key since #122 was resolved, so a prerelease that reverted
+      # the template to the throwaway public key would ship a DMG signed
+      # with the REAL key against a public key that rejects it — exactly
+      # the bug the old exemption allowed. mac/keys/README.md is the Swift
+      # key's home, even though its ceremony walkthrough covers the iced key.
+      - name: Verify the Sparkle key material
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          pub_key="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' mac/Resources/Info.plist.template | tr -d '[:space:]')"
+          if [ -z "${pub_key}" ]; then
+            echo "::error::mac/Resources/Info.plist.template's SUPublicEDKey is empty or unreadable — set the maintainer's real public key before tagging (mac/keys/README.md)."
+            exit 1
+          fi
+          if [ -z "${SPARKLE_ED_PRIVATE_KEY}" ]; then
+            echo "::error::SPARKLE_ED_PRIVATE_KEY secret is unset — can't sign the appcast entry (mac/keys/README.md)."
+            exit 1
+          fi
+          W="$(mktemp -d)"
+          chmod 700 "$W"
+          trap 'rm -rf "$W"' EXIT
+          # Two layers, matching the ROOST_ICED_SPARKLE_ED_PRIVATE_KEY
+          # convention: the secret is base64 of the key FILE, whose own
+          # contents are base64 of the ed25519 seed. Decode both so a
+          # mangled paste fails here. macOS `base64 --decode` is lenient
+          # (exit 0 on garbage), so a mangled paste is caught by the byte
+          # count below rather than the decode calls.
+          printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" | base64 --decode > "${W}/key" 2>/dev/null || true
+          seed_bytes="$(base64 --decode < "${W}/key" 2>/dev/null | wc -c | tr -d ' ')"
+          echo "SPARKLE_ED_PRIVATE_KEY decodes to ${seed_bytes} bytes after both base64 layers."
+          # 32 = the ed25519 seed generate_keys writes today; 96 = the older
+          # sk(64)||pk(32) layout. sign_update accepts exactly these two.
+          case "${seed_bytes}" in
+            32|96) ;;
+            *)
+              echo "::error::SPARKLE_ED_PRIVATE_KEY does not decode to a Sparkle ed25519 key (expected 32 or 96 bytes after both base64 layers, got ${seed_bytes}) — set it to \`base64 < <the file generate_keys -x wrote>\` (mac/keys/README.md)."
+              exit 1
+              ;;
+          esac
+          # The two halves are validated independently above, which cannot
+          # catch the failure that matters most: a secret holding a
+          # DIFFERENT valid key than the template's public half. That ships
+          # a bundle whose SUPublicEDKey rejects every signature we produce,
+          # and Sparkle reports it to users as nothing at all — just "no
+          # update". Sparkle's own `sign_update --verify` takes a private
+          # key, so it cannot prove the pair; derive the public half from
+          # the seed instead.
+          if [ "${seed_bytes}" = "32" ]; then
+            derive='import base64,sys; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; from cryptography.hazmat.primitives.serialization import Encoding,PublicFormat; print(base64.b64encode(K.from_private_bytes(sys.stdin.buffer.read()).public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)).decode())'
+            # --no-project: without it uv syncs the repo's docs project first, so a
+            # stale uv.lock or an unreachable theme git tag would fail the KEY
+            # check with a message about keys. Pinned for the same reason the
+            # rest of the release path is pinned.
+            derived="$(base64 --decode < "${W}/key" | uv run --no-project --with 'cryptography==46.0.3' python3 -c "${derive}")"
+            if [ "${derived}" != "${pub_key}" ]; then
+              echo "::error::SPARKLE_ED_PRIVATE_KEY is not the private half of mac/Resources/Info.plist.template's SUPublicEDKey. Signing with it would ship updates no installed Roost can verify. Re-run the ceremony (mac/keys/README.md)."
+              exit 1
+            fi
+            echo "keypair match confirmed (derived public half equals the template's SUPublicEDKey)"
+          else
+            # Unlike the iced step (which SKIPS 96-byte legacy keys because
+            # its public half lives only in a committed file, deliberately
+            # left unchanged here), this is the one place that deliberately
+            # diverges: Sparkle's legacy layout is sk(64)||pk(32), so the
+            # public half is present verbatim as the trailing 32 bytes and
+            # needs no derivation — extract and compare it. Skipping would
+            # make the check vacuous on exactly the older key format the
+            # Swift app is more likely to hold.
+            legacy_pub="$(base64 --decode < "${W}/key" | tail -c 32 | base64)"
+            if [ "${legacy_pub}" != "${pub_key}" ]; then
+              echo "::error::SPARKLE_ED_PRIVATE_KEY (legacy 96-byte key) does not carry mac/Resources/Info.plist.template's SUPublicEDKey as its trailing 32 bytes. Signing with it would ship updates no installed Roost can verify. Re-run the ceremony (mac/keys/README.md)."
+              exit 1
+            fi
+            echo "keypair match confirmed (legacy key's trailing 32 bytes equal the template's SUPublicEDKey)"
+          fi
+          rm -f "${W}/key"
+          echo "Sparkle key material looks well-formed (public key in template, private secret decodes to ${seed_bytes} bytes)."
 
       # The identity reaches bundle.sh / make-dmg.sh only when CAN_NOTARIZE —
       # otherwise empty, so they take the ad-hoc path (and make-dmg keeps the

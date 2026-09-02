@@ -250,8 +250,9 @@ Request:
 }}
 ```
 
-`argv` empty means `[$SHELL]`. `cwd` empty means use the project's
-default cwd. `title` empty means derive from `cwd`. There is
+`argv` empty means `[$SHELL]`. `cwd` empty means resolve it: the
+project's cwd, then `$HOME`, then `/`. `title` empty means derive from
+the resolved `cwd`. There is
 deliberately no opaque command string — callers wanting shell
 word-splitting must pass `["sh", "-c", "..."]` explicitly. This `argv` is
 reachable from the CLI as `roostctl tab open -- <cmd…>` (see
@@ -533,6 +534,13 @@ Sets the active (project, tab) selection.
 
 Request: `{"params": {"tab_id": "3"}}`. Response:
 `{"previous_project_id": "1", "previous_tab_id": "2"}`.
+
+Focusing a tab also acknowledges it: the focused tab's pending
+notification is cleared, so `tab.notification` with
+`has_pending: false` follows `active.changed` in the same batch — and
+only when the tab actually carried one. The badge, the project rollup
+and the notification-inbox row all derive from that bit, so they go
+with it. Focusing the already-active tab acknowledges it too.
 
 `tab_id` also accepts the host-qualified `h<host>.<id>` spelling on a
 **UI socket** — the plan 037 §3.4 wire spelling `roostctl tab focus`
@@ -984,12 +992,13 @@ ignores the variable entirely.
 
 Implemented only by the iced UI on macOS, same as `app.menu_dump`.
 
-### `app.notification_status` *(test-only — gated, macOS iced only)*
+### `app.notification_status` *(test-only — gated, macOS only)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
-Without it the server returns `not-enabled`. Reads back the macOS iced
-UI's `UNUserNotificationCenter` backend state
-(`crates/roost-iced/src/macos/notifications.rs`).
+Without it the server returns `not-enabled`. Reads back the calling
+UI's `UNUserNotificationCenter` backend state — the iced UI from
+`crates/roost-iced/src/macos/notifications.rs`, the Swift app from
+`DesktopNotifications.status()` in `mac/Sources/Roost/DesktopNotifications.swift`.
 
 Request: `{"params": {}}`. Response:
 
@@ -997,18 +1006,24 @@ Request: `{"params": {}}`. Response:
 {"backend": "available", "reason": null, "authorized": false}
 ```
 
-`backend` is `"available"` once the UN delegate has installed — a
-bundled launch that has reached `window_opened` — and `"unavailable"`
-otherwise: every bare-binary build (no app bundle, so UN is never
-touched), and a bundled app before its first window opens. `reason`
-names why it is unavailable (`"not running from an app bundle"`,
-`"window not opened yet"`), or `null` once available. `authorized` is
-the user's answer to the authorization prompt, always `false` while
-unavailable — CI's TCC authorization state is unknowable, so the
-automated suite never asserts this `true`; the real prompt/click is the
-morning checklist (#285).
+On iced, `backend` is `"available"` once the UN delegate has
+installed — a bundled launch that has reached `window_opened` — and
+`"unavailable"` otherwise: every bare-binary build (no app bundle, so
+UN is never touched), and a bundled app before its first window opens.
+`reason` names why it is unavailable (`"not running from an app
+bundle"`, `"window not opened yet"`), or `null` once available. The
+Swift app has no such gate — its `UNUserNotificationCenter` delegate is
+installed at construction, and a build that could not do that would
+have aborted at launch rather than produced a running process to query
+— so it always reports `backend: "available"` with a `null` `reason`.
+`authorized` is the user's answer to the authorization prompt on both
+UIs, always `false` while `backend` is `"unavailable"` — CI's TCC
+authorization state is unknowable, so the automated suite never asserts
+this `true`; the real prompt/click is the morning checklist (#285).
 
-Implemented only by the iced UI on macOS, same as `app.menu_dump`.
+Implemented by both UIs, macOS only — unlike `app.menu_dump` above and
+the other macOS-gated ops around it, which are iced only and have no
+Swift counterpart.
 
 ### `sidebar.set_width` *(test-only — gated)*
 
@@ -1594,7 +1609,7 @@ Response: `{}` — nothing to report beyond "applied".
 2. `connect-required` / `taken-over` — the lease gate.
 3. `not-found` — a tab id this session does not have.
 
-The apply is one workspace transaction and `not-found` leaves **nothing** applied: a client naming a tab that just closed must not flip the session to "focused" against whatever tab happened to be active. On success with an id, the session both marks itself focused and moves its own active selection (and its persisted selection) onto that tab, exactly as [`tab.focus`](#tabfocus) would; re-stating a focus that is already current emits no `active.changed`, so a reconnecting client's re-assert costs other clients no re-render. `null` moves the flag alone and leaves the selection where it is, so a reconnect restores the same tab.
+The apply is one workspace transaction and `not-found` leaves **nothing** applied: a client naming a tab that just closed must not flip the session to "focused" against whatever tab happened to be active. On success with an id, the session both marks itself focused and moves its own active selection (and its persisted selection) onto that tab, as [`tab.focus`](#tabfocus) would; it does **not** acknowledge the tab's notification — the client sends [`tab.clear_notification`](#tabclear_notification) for that. Re-stating a focus that is already current emits no `active.changed`, so a reconnecting client's re-assert costs other clients no re-render. `null` moves the flag alone and leaves the selection where it is, so a reconnect restores the same tab.
 
 **A focus does not outlive the client that reported it.** The lease deliberately outlives its connections, but the focus does not: the session reverts to "nobody is looking" (the flag only — the selection stays) when
 

@@ -6,10 +6,11 @@
 //! fetched per call from `currentNotificationCenter()` (which is
 //! `AnyThread`) and never stored. Delegate callbacks arrive on an
 //! unspecified queue, so the delegate class is deliberately *not*
-//! `MainThreadOnly` and touches only [`PENDING`] and the atomics. What is
-//! main-thread stays main-thread: [`init`] takes the marker, and the
-//! retained delegate plus the init bookkeeping live in `thread_local!`s
-//! that nothing off the main thread reads.
+//! `MainThreadOnly` and touches only the process-wide [`PENDING`] and
+//! [`AUTHORIZATION`] locks. What is main-thread stays main-thread:
+//! [`init`] takes the marker, and the retained delegate plus the init
+//! bookkeeping live in `thread_local!`s that nothing off the main thread
+//! reads.
 //!
 //! Replace, not stack: the notification identifier is `roost-tab-{id}`,
 //! stable for the life of the tab, and UN's documented behaviour for a
@@ -19,12 +20,14 @@
 //! honours the seam's replace contract, including for a fire that lands
 //! after a `Retire` (the lingering banner is replaced, not joined).
 //!
-//! Authorization is requested once at [`init`]; an unauthorized center
-//! makes every `show()` a silent no-op, matching
+//! Authorization is requested once at [`init`] and re-read from the
+//! system by [`refresh_authorization`] on every focus gain; an
+//! unauthorized center makes every `show()` a silent no-op, matching
 //! `mac/Sources/Roost/DesktopNotifications.swift:94-95`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -34,10 +37,10 @@ use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker};
 use objc2_foundation::{NSArray, NSError, NSSet, NSString};
 use objc2_user_notifications::{
-    UNAuthorizationOptions, UNMutableNotificationContent, UNNotification, UNNotificationCategory,
-    UNNotificationCategoryOptions, UNNotificationDefaultActionIdentifier,
+    UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent, UNNotification,
+    UNNotificationCategory, UNNotificationCategoryOptions, UNNotificationDefaultActionIdentifier,
     UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
-    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    UNNotificationSettings, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
 use roost_ipc::messages::AppNotificationStatusResult;
 use roost_ui_model::keys::TabKey;
@@ -70,9 +73,36 @@ const CATEGORY: &str = "roost-tab";
 
 /// Whether [`init`] reached a bundled center at all.
 static ENABLED: AtomicBool = AtomicBool::new(false);
-/// The user's answer to the authorization prompt, written from the
-/// completion block on whatever queue UN chose.
-static AUTHORIZED: AtomicBool = AtomicBool::new(false);
+
+/// The user's answer to the authorization prompt, and which query owns
+/// it. Written from the completion blocks of [`request_authorization`]
+/// and [`refresh_authorization`] on whatever queue UN chose.
+///
+/// UN completes these queries asynchronously on unspecified queues and
+/// documents no ordering between separately issued ones, so each carries
+/// the generation of the query that issued it and only the newest may
+/// write. Without that, a delayed `Denied` snapshot could land after a
+/// newer `Authorized` one and overwrite it — muting notifications with
+/// no further focus-gain edge to correct it, which is the very staleness
+/// this module refreshes to avoid.
+///
+/// The two fields move together under one lock rather than as two
+/// atomics because separating them reopens exactly that hole: a
+/// completion that read the ticket and found itself current can be
+/// overtaken *before it writes* by a newer query that both issues and
+/// lands in the gap, and then clobbers that fresher answer with its own
+/// older snapshot. Comparing the ticket and writing the bit has to be
+/// one critical section, which is why the Swift side holds both under a
+/// single `withLock` too (`DesktopNotifications.swift:73-107`).
+static AUTHORIZATION: Mutex<Authorization> = Mutex::new(Authorization {
+    authorized: false,
+    generation: 0,
+});
+
+struct Authorization {
+    authorized: bool,
+    generation: u64,
+}
 
 /// The click channel for every banner currently believed to be on screen,
 /// keyed by notification identifier. Not a `thread_local!`: `show()`
@@ -222,6 +252,53 @@ pub(crate) fn init(_mtm: MainThreadMarker) {
     }
 }
 
+/// Claim the next [`AUTHORIZATION`] ticket, from wherever the caller's
+/// answer is at its freshest.
+fn issue_query() -> u64 {
+    with_authorization(|state| {
+        state.generation += 1;
+        state.generation
+    })
+}
+
+/// Record a completion's snapshot, unless a later query has since been
+/// issued: that one's answer is fresher by construction and writes when
+/// it lands, so an older snapshot is dropped rather than allowed to
+/// overwrite it. The log stays inside the guard though outside the lock
+/// — a discarded snapshot must not report a change it did not make —
+/// and only a flip reaches it, so the value it displaced is
+/// `!authorized`.
+fn store_authorization(generation: u64, authorized: bool) {
+    let changed = with_authorization(|state| {
+        if state.generation != generation || state.authorized == authorized {
+            return false;
+        }
+        state.authorized = authorized;
+        true
+    });
+    if changed {
+        tracing::info!(
+            from = !authorized,
+            to = authorized,
+            "notifications: authorization changed"
+        );
+    }
+}
+
+fn is_authorized() -> bool {
+    with_authorization(|state| state.authorized)
+}
+
+/// Poisoning is recovered exactly as [`with_pending`] recovers it, and
+/// for the same reason: refusing to unlock would leave every later
+/// [`show`] permanently unauthorized.
+fn with_authorization<T>(f: impl FnOnce(&mut Authorization) -> T) -> T {
+    let mut state = AUTHORIZATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut state)
+}
+
 /// The same three options the Swift app asks for
 /// (`DesktopNotifications.swift:77-88`). macOS persists the user's answer
 /// against the bundle id, so a repeat launch re-answers from that record
@@ -233,7 +310,14 @@ fn request_authorization(center: &UNUserNotificationCenter) {
             let detail = unsafe { (*error).localizedDescription() };
             tracing::warn!(%detail, "notifications: authorization error");
         }
-        AUTHORIZED.store(granted.as_bool(), Ordering::SeqCst);
+        // The ticket is claimed here, not at issue time as
+        // `refresh_authorization` does — the asymmetry between the two
+        // writers. A settings query is a snapshot and ages; an
+        // authorization answer is an event, current the instant it
+        // fires however long the prompt stood. Claiming now is what
+        // stops a refresh issued while the prompt was up from
+        // discarding the user's actual answer.
+        store_authorization(issue_query(), granted.as_bool());
         tracing::info!(
             granted = granted.as_bool(),
             "notifications: authorization answered"
@@ -245,6 +329,31 @@ fn request_authorization(center: &UNUserNotificationCenter) {
             | UNAuthorizationOptions::Badge,
         &handler,
     );
+}
+
+/// Re-read the system's answer, because it can change under a running
+/// app: the user denies at first launch, grants in System Settings, and
+/// comes back. Called on the focus-gain edge, which is the moment that
+/// return happens.
+///
+/// Gated on [`ENABLED`] rather than `INITIALIZED`: the latter is set even
+/// when [`gate`] refused, and touching the center from a bare binary is
+/// the abort that gate exists to prevent.
+pub(crate) fn refresh_authorization(_mtm: MainThreadMarker) {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let generation = issue_query();
+    let handler = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
+        // SAFETY: UN hands the block a borrowed, autoreleased settings object.
+        let status = unsafe { settings.as_ref() }.authorizationStatus();
+        store_authorization(generation, authorized_from_status(status));
+        if status == UNAuthorizationStatus::NotDetermined {
+            request_authorization(&UNUserNotificationCenter::currentNotificationCenter());
+        }
+    });
+    UNUserNotificationCenter::currentNotificationCenter()
+        .getNotificationSettingsWithCompletionHandler(&handler);
 }
 
 /// The `app.notification_status` payload — the marker proves the
@@ -262,7 +371,7 @@ pub(crate) fn status(_mtm: MainThreadMarker) -> AppNotificationStatusResult {
         AppNotificationStatusResult {
             backend: "available".into(),
             reason: None,
-            authorized: AUTHORIZED.load(Ordering::SeqCst),
+            authorized: is_authorized(),
         }
     } else {
         AppNotificationStatusResult {
@@ -283,10 +392,7 @@ pub(crate) fn status(_mtm: MainThreadMarker) -> AppNotificationStatusResult {
 /// whole Objective-C leg synchronously and hands back a channel, which is
 /// what keeps this future `Send`.
 pub(crate) async fn show(payload: Payload) -> Result<Shown, String> {
-    if !show_allowed(
-        ENABLED.load(Ordering::SeqCst),
-        AUTHORIZED.load(Ordering::SeqCst),
-    ) {
+    if !show_allowed(ENABLED.load(Ordering::SeqCst), is_authorized()) {
         tracing::debug!(
             title = %payload.title,
             tab_id = payload.tab.tab,
@@ -375,6 +481,12 @@ fn submit(identifier: &str, payload: &Payload) -> oneshot::Receiver<Option<Strin
 
 fn show_allowed(enabled: bool, authorized: bool) -> bool {
     enabled && authorized
+}
+
+/// Only an explicit yes counts: `Denied`, `NotDetermined`, `Ephemeral`
+/// and any raw value this build does not know about all fall closed.
+fn authorized_from_status(status: UNAuthorizationStatus) -> bool {
+    status == UNAuthorizationStatus::Authorized || status == UNAuthorizationStatus::Provisional
 }
 
 /// Stable for the life of the tab: that is the whole replace mechanism.
@@ -474,6 +586,80 @@ mod tests {
         assert!(!show_allowed(true, false));
         assert!(!show_allowed(false, true));
         assert!(!show_allowed(false, false));
+    }
+
+    /// Raw values rather than the constants, so the arms are enumerated
+    /// exhaustively over what the type can hold rather than over what
+    /// this build happens to name.
+    #[test]
+    fn only_an_explicit_yes_authorizes_and_an_unknown_status_falls_closed() {
+        assert_eq!(
+            UNAuthorizationStatus::Authorized,
+            UNAuthorizationStatus(2),
+            "the raw values below are the crate's constants"
+        );
+        assert!(
+            !authorized_from_status(UNAuthorizationStatus(0)),
+            "notDetermined"
+        );
+        assert!(!authorized_from_status(UNAuthorizationStatus(1)), "denied");
+        assert!(
+            authorized_from_status(UNAuthorizationStatus(2)),
+            "authorized"
+        );
+        assert!(
+            authorized_from_status(UNAuthorizationStatus(3)),
+            "provisional"
+        );
+        assert!(
+            !authorized_from_status(UNAuthorizationStatus(4)),
+            "ephemeral"
+        );
+
+        for unknown in [5, -1, isize::MAX, isize::MIN] {
+            assert!(
+                !authorized_from_status(UNAuthorizationStatus(unknown)),
+                "a status this build does not know about is not consent: {unknown}"
+            );
+        }
+    }
+
+    /// The one test that mutates [`AUTHORIZATION`], deliberately so: it
+    /// is process-wide, and a sibling test touching it would race this
+    /// one under the parallel runner. New cases for the guard belong
+    /// inside here, not beside it.
+    #[test]
+    fn only_the_newest_answer_may_write_the_cached_authorization() {
+        let overtaken = issue_query();
+        let newest = issue_query();
+        with_authorization(|state| state.authorized = false);
+
+        store_authorization(overtaken, true);
+        assert!(
+            !is_authorized(),
+            "a completion a later query overtook is dropped, not applied"
+        );
+        store_authorization(newest, true);
+        assert!(
+            is_authorized(),
+            "the newest query's answer is the one that lands"
+        );
+
+        // The first-launch shape: a refresh is issued while the prompt
+        // still stands, then the user answers. The answer claims its
+        // ticket as it fires, so it outranks that refresh — and the
+        // refresh's older snapshot cannot undo it afterwards.
+        let refresh_in_flight = issue_query();
+        store_authorization(issue_query(), false);
+        assert!(
+            !is_authorized(),
+            "the user's answer outranks a refresh issued before they gave it"
+        );
+        store_authorization(refresh_in_flight, true);
+        assert!(
+            !is_authorized(),
+            "and that refresh's stale snapshot cannot undo the answer"
+        );
     }
 
     #[test]

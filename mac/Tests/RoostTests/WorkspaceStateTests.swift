@@ -256,6 +256,85 @@ struct WorkspaceStateTests {
         #expect(labels.contains("tabOpened"))
         #expect(labels.contains("activeChanged"))
     }
+
+    // #369 — focusing a tab acknowledges its notification. `commit`
+    // emits one event at a time with no batch envelope, so "same
+    // commit" here is "both events from the one `focusTab` call, in
+    // order". Mirrors `crates/roost-engine/tests/workspace_focus_test.rs`.
+
+    @Test func focusTabClearsTheFocusedTabsNotification() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let badged = try await ws.openTab(projectID: p.id, cwd: "/", title: "badged")
+        let other = try await ws.openTab(projectID: p.id, cwd: "/", title: "other")
+        _ = try await ws.focusTab(other.id)
+        try await ws.setTabHasNotification(badged.id, hasPending: true)
+
+        let captured = EventCapture()
+        await ws.subscribe { captured.append(label(for: $0)) }
+        _ = try await ws.focusTab(badged.id)
+
+        #expect(captured.snapshot() == ["activeChanged", "tabNotification"])
+        let pending = await ws.tab(badged.id)?.hasNotification
+        #expect(pending == false)
+    }
+
+    @Test func refocusingAClearTabEmitsNoNotificationEvent() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let one = try await ws.openTab(projectID: p.id, cwd: "/", title: "one")
+        let two = try await ws.openTab(projectID: p.id, cwd: "/", title: "two")
+        _ = try await ws.focusTab(two.id)
+
+        let captured = EventCapture()
+        await ws.subscribe { captured.append(label(for: $0)) }
+        _ = try await ws.focusTab(one.id)
+
+        #expect(captured.snapshot() == ["activeChanged"])
+    }
+
+    /// Deliberate, and the counterpart to the two above: a selection the
+    /// user did not ask for is not an acknowledgement. Closing the active
+    /// tab dumps the user onto a neighbour, and clearing that neighbour's
+    /// notification would eat it — badge, rollup and inbox row — for
+    /// something the user never focused. `closeTab` builds its own commit
+    /// and never reaches `focusTab`; that is the design, not an oversight,
+    /// and it matches the Rust core's `close_tab`.
+    @Test func closingTheActiveTabDoesNotAcknowledgeTheFallbackTabsNotification() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let fallback = try await ws.openTab(projectID: p.id, cwd: "/", title: "fallback")
+        let active = try await ws.openTab(projectID: p.id, cwd: "/", title: "active")
+        _ = try await ws.focusTab(active.id)
+        try await ws.setTabHasNotification(fallback.id, hasPending: true)
+
+        try await ws.closeTab(active.id)
+
+        let landed = await (ws.activeProjectID, ws.activeTabID)
+        #expect(landed.0 == p.id)
+        #expect(landed.1 == fallback.id)
+        let pending = await ws.tab(fallback.id)?.hasNotification
+        #expect(pending == true)
+    }
+
+    /// A notification raised while the window is unfocused is not
+    /// suppressed, so the active tab can wear a badge and the user can
+    /// click the pill it is already on.
+    @Test func focusingTheAlreadyActiveTabStillAcknowledgesItsNotification() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let active = try await ws.openTab(projectID: p.id, cwd: "/", title: "active")
+        _ = try await ws.focusTab(active.id)
+        try await ws.setTabHasNotification(active.id, hasPending: true)
+
+        let captured = EventCapture()
+        await ws.subscribe { captured.append(label(for: $0)) }
+        _ = try await ws.focusTab(active.id)
+
+        #expect(captured.snapshot() == ["activeChanged", "tabNotification"])
+        let pending = await ws.tab(active.id)?.hasNotification
+        #expect(pending == false)
+    }
 }
 
 /// Concurrency-safe label sink for the events test. Swift 6 strict

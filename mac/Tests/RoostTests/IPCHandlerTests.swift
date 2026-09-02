@@ -112,6 +112,11 @@ struct IPCHandlerDispatchTests {
         )
     }
 
+    @Test func notificationStatusRequiresTestMode() async {
+        let handler = await makeHandler()
+        await expectError("not-enabled", "app.notification_status", nil, on: handler)
+    }
+
     @Test func sidebarSetWidthRequiresTestMode() async {
         let handler = await makeHandler()
         await expectError(
@@ -474,5 +479,44 @@ struct IPCSidebarDumpResultTests {
         #expect(agents?[0]["tab_id"] as? String == "7")
         #expect(projects?[1]["project_id"] as? String == "2")
         #expect((projects?[1]["agents"] as? [[String: Any]])?.isEmpty == true)
+    }
+}
+
+/// `app.notification_status`'s Codable mirror. The op exists so one
+/// test asserts identically against both UIs, so the encoding has to
+/// match `AppNotificationStatusResult` in
+/// `crates/roost-ipc/src/messages.rs` — including the `reason` key,
+/// which the Rust struct carries no `skip_serializing_if` for and which
+/// Swift's synthesized `encodeIfPresent` would otherwise drop when nil.
+struct IPCAppNotificationStatusResultTests {
+    @Test func decodesIcedsShapeAndKeepsAnExplicitNullReason() throws {
+        let json = """
+        {"backend":"available","reason":null,"authorized":true}
+        """
+        let result = try JSONDecoder().decode(
+            IPCAppNotificationStatusResult.self, from: Data(json.utf8)
+        )
+        #expect(result.backend == "available")
+        #expect(result.reason == nil)
+        #expect(result.authorized)
+
+        let obj = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(result)
+        ) as? [String: Any]
+        #expect(obj?["backend"] as? String == "available")
+        #expect(obj?["authorized"] as? Bool == true)
+        #expect(obj?["reason"] is NSNull, "reason stays on the wire as null, not omitted")
+    }
+
+    @Test func carriesTheUnavailableReasonThrough() throws {
+        let value = IPCAppNotificationStatusResult(
+            backend: "unavailable", reason: "no app bundle", authorized: false
+        )
+        let obj = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(value)
+        ) as? [String: Any]
+        #expect(obj?["backend"] as? String == "unavailable")
+        #expect(obj?["reason"] as? String == "no app bundle")
+        #expect(obj?["authorized"] as? Bool == false)
     }
 }

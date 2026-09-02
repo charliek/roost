@@ -453,6 +453,12 @@ roost_setup_signing() {
   # framework signed with uniform options) — it is only dangerous on the
   # outer .app, where it would clobber these nested signatures.
   # shellcheck disable=SC2329  # invoked by the sourcing script after this function returns
+  # NOTE: no callers as of #391 — bundle.sh and bundle-iced.sh both sign
+  # Sparkle through codesign_sparkle_or_die's strict chain now. Kept
+  # rather than deleted because removing a signing helper in the same
+  # change that rewires signing buys nothing and risks something; delete
+  # it in a hygiene pass once the next release has shipped from the new
+  # path.
   codesign_framework_or_die() {
     local target="$1"
     # shellcheck disable=SC2086  # TS_FLAG must word-split (empty => no flag)
@@ -521,10 +527,11 @@ roost_setup_signing() {
   # after this returns — inner→outer to the end.
   #
   # This DELIBERATELY deviates from codesign_framework_or_die above,
-  # whose comment says --deep is safe on a framework. That holds for
-  # the Swift bundle's use (where it has shipped working updates and is
-  # deliberately left as-is — Swift path untouched, recorded as a
-  # future hygiene pass in plan 028 § 9), but the shed reference
+  # whose comment says --deep is safe on a framework. That held for
+  # the Swift bundle's use, where it shipped working updates — but the
+  # hygiene pass plan 028 § 9 recorded is done: bundle.sh now signs
+  # Sparkle through this chain too (#391), so nothing calls
+  # codesign_framework_or_die on Sparkle any more. The shed reference
   # embedding demonstrated the sharper truth: --deep, or a wrong
   # signing order, produces a bundle that signs AND notarizes clean yet
   # breaks at update-apply time — Sparkle's Installer/Downloader XPC

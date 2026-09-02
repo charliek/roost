@@ -805,15 +805,26 @@ final class Workspace {
     }
 
     func focusTab(_ tabID: Int64) throws -> (previousProject: Int64, previousTab: Int64) {
-        guard let row = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
+        guard var row = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         let prev = (activeProjectID, activeTabID)
         activeProjectID = row.projectId
         activeTabID = row.id
+        var events: [Event] = [.activeChanged(projectID: row.projectId, tabID: row.id)]
+        // Focusing a tab acknowledges its notification. Conditional
+        // because `.tabNotification` is an edge — emitting it on every
+        // focus would announce a change that did not happen.
+        if row.hasNotification {
+            row.hasNotification = false
+            tabs[tabID] = row
+            events.append(.tabNotification(tabID: tabID, hasPending: false))
+        }
         // Persist the active selection so it survives a relaunch
         // (restored by position). Skip when unchanged — focusing the
-        // already-active tab shouldn't churn the file.
+        // already-active tab shouldn't churn the file. The
+        // acknowledgement above never moves this: the notification flag
+        // is not in the persisted snapshot.
         let changed = prev != (row.projectId, row.id)
-        commit([.activeChanged(projectID: row.projectId, tabID: row.id)], persist: changed)
+        commit(events, persist: changed)
         return prev
     }
 

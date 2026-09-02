@@ -151,6 +151,9 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
     "UNNotificationContent",
     "UNNotificationRequest",
     "UNNotificationResponse",
+    # Only so `getNotificationSettingsWithCompletionHandler:` is in scope
+    # — the focus-gain refresh reads `authorizationStatus` off it.
+    "UNNotificationSettings",
     # Only so `requestWithIdentifier:content:trigger:` is in scope — the
     # trigger passed is always nil (deliver now).
     "UNNotificationTrigger",

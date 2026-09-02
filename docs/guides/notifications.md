@@ -27,6 +27,8 @@ A notification has four places it can show up. Under normal use three of them mo
 
    The macOS bullet above describes the Swift app. Roost-Iced on macOS (experimental) uses `UNUserNotificationCenter` too, but with a stable per-tab identifier rather than a unique one per event: a new notification for a tab **replaces** that tab's live banner instead of stacking another one in Notification Center — matching the Linux behavior above, not the Swift stacking. One live banner per tab, and a new event updates it in place. Banner clicks focus the tab while the app is running; a banner clicked after the app has quit and relaunched is not routed (unlike the Swift app).
 
+   **A macOS permission change takes effect live, on both apps.** Deny the authorization prompt (or later flip it in System Settings → Notifications) and Roost doesn't need a relaunch to notice: both the Swift app and Roost-Iced re-read the OS authorization state whenever the app regains focus, so granting permission and switching back to Roost is enough — the very next notification shows a banner. (Linux has no such prompt; a spec-compliant `org.freedesktop.Notifications` server is assumed present.)
+
 ## Focus policy
 
 One predicate governs the badge, the inbox row, and the banner together:

@@ -50,11 +50,14 @@ different surface.
 
 from __future__ import annotations
 
+import os
 import re
+import uuid
 
 import pytest
 
 from client import RoostError
+from util import wait_shell_ready, wait_tab_attached
 
 
 def _project_ids(roost) -> list[int]:
@@ -123,6 +126,56 @@ def test_project_create_appears_untitled_and_does_not_activate(roost):
             "`.projectCreated` arm only inserts locally without switching "
             "active; the Rust engine's create_project likewise only emits "
             "ProjectCreated"
+        )
+    finally:
+        _cleanup_project(roost, pid)
+
+
+# -- tab.open cwd default (#266) -------------------------------------------
+
+
+def test_tab_open_with_no_cwd_resolves_to_the_projects_cwd(roost):
+    """A bare `tab.open` (no `cwd`) resolves through `Workspace::open_tab`
+    to the project's cwd on both targets — Mac already did this via
+    `LocalClient.openTab`; this pins the Rust engine catching up (#266).
+
+    `/usr` stands in for the project's cwd rather than the `project`
+    fixture's `/tmp`: `/tmp` is a symlink to `/private/tmp` on macOS
+    (`conftest.py:97`), which would make the reply-cwd and the spawned
+    shell's real `pwd` diverge for a reason that has nothing to do with
+    this test. `/usr` exists on both targets and isn't a symlink.
+    """
+    project_cwd = "/usr"
+    pid = roost.create_project(name=f"pytest-cwd-{uuid.uuid4().hex[:8]}", cwd=project_cwd)
+    try:
+        # Raw call, bypassing client.py's `open_tab` convenience
+        # wrapper, entirely omitting `cwd` — exactly what a caller
+        # that never mentions cwd sends. The reply is read directly
+        # off this synchronous result, before the shell has even
+        # started, so it cannot be racing OSC 7 (cwd) or OSC 0/1/2
+        # (title).
+        reply = roost.call(
+            "tab.open",
+            {"project_id": str(pid), "title": "", "cols": 80, "rows": 24},
+        )
+        tab = reply["tab"]
+        assert tab["cwd"] == project_cwd, tab
+        # derive_title's basename of the resolved cwd — the "title is
+        # right too" half of the claim.
+        assert tab["title"] == "usr", tab
+
+        tab_id = int(tab["id"])
+        wait_tab_attached(roost, tab_id)
+        wait_shell_ready(roost, tab_id)
+
+        # Prove the *spawn*, not just the reply row: ask the live shell
+        # where it actually landed, and compare realpaths (belt-and-
+        # suspenders — `/usr` isn't a symlink, but a future project_cwd
+        # swap shouldn't silently stop proving this).
+        marker = f"LIFECYCLE_PWD_{uuid.uuid4().hex[:8]}"
+        roost.run(tab_id, f"echo {marker}=$(pwd -P)")
+        roost.wait_text(
+            tab_id, f"{marker}={os.path.realpath(project_cwd)}", timeout=8
         )
     finally:
         _cleanup_project(roost, pid)

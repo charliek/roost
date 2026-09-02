@@ -967,16 +967,30 @@ impl Workspace {
 
     /// Open a new tab in `project_id`. Returns the wire-format
     /// `Tab`. Caller spawns the PTY.
+    ///
+    /// An empty `cwd` is resolved here, not stored verbatim:
+    /// requested → the project's cwd → `$HOME` → `/`. Every path
+    /// (`ops::TAB_OPEN`, the facade, `LocalClient::open_tab`) reaches
+    /// this method, so title derivation below sees the resolved
+    /// value too.
     pub fn open_tab(&self, project_id: i64, cwd: &str, title: &str) -> Result<Tab, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.projects.contains_key(&project_id) {
-            return Err(WorkspaceError::ProjectNotFound(project_id));
-        }
+        let project_cwd = match inner.projects.get(&project_id) {
+            Some(p) => p.cwd.clone(),
+            None => return Err(WorkspaceError::ProjectNotFound(project_id)),
+        };
+        let cwd: String = if !cwd.is_empty() {
+            cwd.to_string()
+        } else if !project_cwd.is_empty() {
+            project_cwd
+        } else {
+            std::env::var("HOME").unwrap_or_else(|_| "/".into())
+        };
         let id = inner.alloc_id();
         let now = unix_now();
         let position = inner.next_tab_position(project_id);
         let derived_title = if title.is_empty() {
-            derive_title(cwd)
+            derive_title(&cwd)
         } else {
             title.to_string()
         };
@@ -984,7 +998,7 @@ impl Workspace {
             id,
             project_id,
             title: derived_title.clone(),
-            cwd: cwd.to_string(),
+            cwd,
             agent: AgentTabState::default(),
             has_notification: false,
             // Always start with user_titled=false. The caller-
@@ -1491,20 +1505,32 @@ impl Workspace {
         let (prev, now) = inner.select_tab(tab_id)?;
         // Persist the active selection so it survives a relaunch
         // (restored by position). Skip when unchanged — focusing the
-        // already-active tab shouldn't churn the file.
+        // already-active tab shouldn't churn the file. The
+        // acknowledgement below never moves this: the notification flag
+        // is not in the persisted snapshot.
         let persist = if prev != now {
             Persist::Write
         } else {
             Persist::Skip
         };
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::ActiveChanged {
-                project_id: now.0,
-                tab_id: now.1,
-            }],
-            persist,
-        );
+        let mut events = vec![WorkspaceEvent::ActiveChanged {
+            project_id: now.0,
+            tab_id: now.1,
+        }];
+        // Focusing a tab acknowledges its notification (`select_tab`
+        // above already refused an unknown tab). Conditional because
+        // `TabNotification` is an edge — emitting it on every focus
+        // would announce a change that did not happen.
+        if let Some(row) = inner.tabs.get_mut(&tab_id) {
+            if row.has_notification {
+                row.has_notification = false;
+                events.push(WorkspaceEvent::TabNotification {
+                    tab_id,
+                    has_pending: false,
+                });
+            }
+        }
+        self.commit(inner, events, persist);
         Ok(prev)
     }
 
@@ -1514,9 +1540,13 @@ impl Workspace {
     /// `Some(tab)` means "my window is focused and this session's tab is
     /// the one on screen": the session takes both halves of the
     /// suppression predicate from the client — the window flag *and* the
-    /// selection, which follows through the ordinary focus path so the
-    /// session's own active tab and its persisted selection agree with
-    /// what the user is actually looking at. `None` means nothing here is
+    /// selection, which moves through the same `select_tab` the
+    /// ordinary focus path uses so the session's own active tab and its
+    /// persisted selection agree with what the user is actually looking
+    /// at. It deliberately stops short of the rest of [`Self::focus_tab`]:
+    /// saying what you are looking at does not acknowledge the tab's
+    /// notification — the attached client sends `tab.clear_notification`
+    /// for that. `None` means nothing here is
     /// being looked at (the window lost focus, or the selection moved
     /// elsewhere) and moves only the flag: the selection is where the
     /// client left it, and forgetting it would re-open the tab that the

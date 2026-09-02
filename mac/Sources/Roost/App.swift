@@ -1026,14 +1026,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         activeSessionByProject.removeAll()
     }
 
-    /// Round-2 fix: AppKit doesn't always restore first responder to
-    /// the terminal view when the app regains focus (e.g. after
+    /// Two things happen on reactivation.
+    ///
+    /// The notification authorization is re-read from the system
+    /// (#355): coming back from System Settings is an activation, and
+    /// it is the moment a denial can have become a grant. It runs
+    /// *before* the palette guard below — a return with the palette
+    /// open is still a return from System Settings.
+    ///
+    /// Then, round-2 fix: AppKit doesn't always restore first responder
+    /// to the terminal view when the app regains focus (e.g. after
     /// switching apps, or after the rename popover closes). Without
     /// terminal-as-first-responder, ⌘V / ⌘C / ⌘X / ⌘A fall through to
     /// `NSText.paste(_:)` / `NSText.copy(_:)` etc. with no target
     /// and become no-ops. Snapping focus back here covers the
     /// common case without needing a click into the terminal area.
     func applicationDidBecomeActive(_ notification: Notification) {
+        desktopNotifications.refreshAuthorization()
         // While the palette is up it owns focus (its text field); don't
         // yank first responder back to the terminal on reactivation.
         guard !paletteOpen else { return }
@@ -1878,8 +1887,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // event then drives the project switch + tab select. Routing
             // through the workspace, rather than the prior UI-only
             // `focusTab`, keeps the core the source of truth (matches the
-            // GTK `focus_tab_by_id` fix). Raise the app (a jump wants
-            // focus) and clear the tab's notification.
+            // GTK `focus_tab_by_id` fix), and the workspace's `focusTab`
+            // is what acknowledges the notification. Raise the app (a
+            // jump wants focus).
             //
             // User action: reveal the sidebar so the jump destination is
             // visible; the `.active` event arm uses pure `focusTab` and
@@ -1887,8 +1897,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             self.ensureSidebarVisible()
             _ = try? RoostBackend.shared.localClient?.focusTab(tabID)
             NSApp.activate(ignoringOtherApps: true)
-            let socket = self.socketPath
-            Task.detached { await clearTabNotification(socketPath: socket, tabID: tabID) }
             return .close
         })
     }
@@ -2636,8 +2644,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // or any future external client — the UI hasn't switched
             // yet, so bring the requested tab forward (without raising
             // the app), matching GTK's `ActiveChanged` arm and the
-            // documented `tab focus` = "click the pill" behavior, which
-            // also clears the tab's notification badge via `selectTab`.
+            // documented `tab focus` = "click the pill" behavior. The
+            // core's notification bit is already acknowledged by then —
+            // `focusTab` cleared it in the commit that produced this
+            // event — and the `.tabNotification` right behind this one
+            // retires the badge the UI is still showing.
             let alreadyShown = activeProjectID == e.projectID
                 && activeSessionByProject[e.projectID]?.id == e.tabID
             if !alreadyShown, e.tabID != 0,
@@ -3412,32 +3423,52 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Selection only — no `NSApp.activate`. Guarded on the read, and
     /// skipped entirely while reacting to a core event, so nothing
     /// echoes back.
+    ///
+    /// Returns whether the push actually reached the core, which is
+    /// also "did `focusTab` acknowledge this tab's notification?" — the
+    /// caller mirrors that answer locally and must not assume it.
     @MainActor
-    private func syncCoreActiveTab(_ tabID: Int64) {
+    @discardableResult
+    private func syncCoreActiveTab(_ tabID: Int64) -> Bool {
         guard Self.shouldSyncCoreActiveTab(
             selected: tabID,
             coreActive: RoostBackend.shared.workspace?.activeTabID ?? 0,
+            // The core's flag, not the UI mirror: it is the core's
+            // notification being acknowledged, so the core decides.
+            hasNotification: RoostBackend.shared.workspace?.tab(tabID)?.hasNotification ?? false,
             applyingCoreEvent: applyingCoreEvent
-        ) else { return }
+        ) else { return false }
         do {
             _ = try RoostBackend.shared.localClient?.focusTab(tabID)
+            return true
         } catch {
             // The only failure is the tab vanishing between the UI
             // selection and here; its `.tabDeleted` is already in flight.
             RoostLogger.shared.warn("syncCoreActiveTab: focusTab(\(tabID)) failed: \(error)")
+            return false
         }
     }
 
     /// The `syncCoreActiveTab` decision, extracted so both halves are
     /// testable without an AppKit window: push when the UI moved the
-    /// selection itself, stay silent when the core already agrees or
-    /// when this selection *is* the UI reacting to the core.
+    /// selection itself, stay silent when the core already agrees *and*
+    /// has nothing left to acknowledge, or when this selection *is* the
+    /// UI reacting to the core.
+    ///
+    /// `focusTab` owes the workspace two things — move the selection and
+    /// acknowledge the tab's notification — so a badged tab is worth
+    /// pushing even when the selection is already where it belongs
+    /// (#369: a notification raised while the window was unfocused lands
+    /// on the active tab, and the user clicks the pill they are on). The
+    /// echo guard still dominates: a selection made while reacting to the
+    /// core never pushes, badge or no badge.
     static func shouldSyncCoreActiveTab(
         selected: Int64,
         coreActive: Int64,
+        hasNotification: Bool,
         applyingCoreEvent: Bool
     ) -> Bool {
-        !applyingCoreEvent && coreActive != selected
+        !applyingCoreEvent && (coreActive != selected || hasNotification)
     }
 
     @MainActor
@@ -3473,21 +3504,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // The local selection is committed *before* this, so the
         // `.active` echo the core fires back finds `alreadyShown` true
         // and is a no-op.
-        if let tabID = session.id {
-            syncCoreActiveTab(tabID)
-        }
-
-        // Phase 6a P7: focusing a notified tab clears its badge
-        // — fire ClearTabNotification daemon-side so every other
-        // watching client converges via the broadcast event. Also
-        // optimistically clear locally so the strip rebuild below
-        // doesn't render a stale badge for one frame.
-        if session.liveHasNotification, let tabID = session.id {
+        //
+        // `focusTab` acknowledges the tab's notification in the core
+        // synchronously, but the `.tabNotification` that retires the UI
+        // mirror is delivered two async hops later — so the rebuild
+        // below would paint one stale badge frame without this. Only
+        // when the push actually happened: the paths that skip it (a
+        // close-fallback selection arriving as a core event) leave the
+        // core's flag standing, and clearing the mirror there would show
+        // a clean pill over a pending inbox row and Dock badge.
+        if let tabID = session.id, syncCoreActiveTab(tabID) {
             session.liveHasNotification = false
-            let socket = socketPath
-            Task.detached {
-                await clearTabNotification(socketPath: socket, tabID: tabID)
-            }
         }
         rebuildTabBar()
         // Round-3 R2: keep the active pill visible when the strip
@@ -4545,14 +4572,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // Route through the core (like the inbox jump) so `workspace.active()`
         // — hence identify / tab.focus / the restored selection — tracks the
         // jump, not just UI selection. The `.active` event drives the project
-        // switch + tab select; clear the tab's notification.
+        // switch + tab select, and `focusTab` acknowledges the tab's
+        // notification in the same commit.
         //
         // User action (⌘⇧U): reveal the sidebar so the jump destination is
         // visible. `focusTab` is pure data mutation per DL-11.
         ensureSidebarVisible()
         _ = try? RoostBackend.shared.localClient?.focusTab(tabID)
-        let socket = socketPath
-        Task.detached { await clearTabNotification(socketPath: socket, tabID: tabID) }
     }
 
     /// The next tab with a pending notification: the active project first
@@ -5959,6 +5985,12 @@ extension RoostApp: UiBridge {
               let session = activeSessionByProject[pid]
         else { return "default" }
         return session.terminalView.currentCursorShapeName()
+    }
+
+    /// `app.notification_status`: the UN backend's state, straight off
+    /// the `DesktopNotifications` this app has held since launch.
+    func notificationStatus() -> (backend: String, reason: String?, authorized: Bool) {
+        desktopNotifications.status()
     }
 
     /// `app.window_metrics`'s optional `terminal_top` /
