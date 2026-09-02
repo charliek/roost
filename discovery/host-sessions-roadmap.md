@@ -809,19 +809,50 @@ machinery: the mac job never proves `SPARKLE_ED_PRIVATE_KEY` matches the
 bundled `SUPublicEDKey`, while the iced job already does the real
 derive-and-compare — a mechanical port, not a design question.
 
-**The ghostty pin: bump before the release, or not for a long while.**
-The pin is already at main tip (`f2d5758f`, bumped 2026-08-27), so the
-"943 commits behind" note above is stale and **none** of the
-adoption items (#364, #365, #366, #367) needs a bump — the C API they
-want is already vendored. The timing asymmetry is what matters: a bump
-*before* the first release is safe, because daemon and client ship in
-the same artifact and lockstep is automatic. *After* release it is
-materially riskier — HS-4b just made a long-lived `roost-session` daemon
-a real thing on both platforms, and every user with one running must
-restart it after upgrading or their attaches fail the exact-match gate
-(cleanly, with `build-mismatch` — the wire fails safe, not silently, but
-it still fails). Any pin bump we want in the near term should therefore
-ride this release, not the one after.
+**The ghostty adoption items: none of them ship this release, and none
+of them needs a pin bump.** The pin already moved to main tip
+(`f2d5758f`, zig 0.16, 2026-08-27), which is what filed #364-#367 in the
+first place — so the "943 commits behind" note above is stale, and every
+one of those issues consumes C API that is **already vendored**. Adopting
+is decoupled from bumping; no further bump is planned or wanted here.
+
+Verdict per item, decided 2026-09-02:
+
+- **#365 (`ghostty_terminal_paste`) — defer.** Tempting because paste
+  safety sounds release-shaped, but the dangerous half is already done:
+  `roost-ui-model::bracketed_paste::wrap` neutralizes embedded
+  `ESC[200~`/`ESC[201~` markers (the `ESC[201~rm -rf /` clipboard
+  attack), matching on the output tail so dropped markers cannot splice
+  into a fresh one, and it is mirrored byte-for-byte in
+  `mac/Sources/Roost/BracketedPaste.swift` under shared test vectors.
+  What upstream adds beyond that is the *unsafe-paste confirmation
+  dialog* — real footgun protection, but UX rather than a
+  vulnerability, and adopting it means re-routing paste through a new
+  FFI callback API on **both** UIs plus new modal UX on both. Replacing
+  a cross-platform-tested input path and adding two modals under
+  release pressure is a bad trade for a guard we already have the
+  security-critical part of.
+- **#364 (native notification + progress OSC) — defer the
+  implementation.** It touches the differentiator, which makes it the
+  one worth wanting, but it is blocked on a genuine constraint:
+  `OPT_USERDATA` is a single shared slot already fully consumed by
+  `write_pty` (`crates/roost-vt/src/terminal.rs:495-518`, exclusivity
+  documented there), so it needs a multiplexed-dispatcher redesign of
+  safety-critical FFI. A design-only pass is welcome as its own
+  exercise; the refactor is not release work.
+- **#366 (idle scrollback compression) — defer**, and measure before
+  implementing: the issue's own framing asks for a profile first, and
+  there is no observed memory problem to point at.
+- **#367 (libghostty-rs) — nothing actionable**, blocked on an upstream
+  release past 0.2.1.
+
+*Kept for whenever a bump does happen:* the timing is asymmetric now
+that HS-4b made a long-lived daemon real on both platforms. Bumping
+while daemon and client ship in one artifact is lockstep-safe; bumping
+after users have sessions running means each one must restart its daemon
+or its attaches fail the exact-match gate — cleanly, with
+`build-mismatch`, so the wire fails safe rather than corrupting a
+snapshot, but it still fails and would need release-note guidance.
 
 HS-4b shipped 2026-09-01 (plan 041, PR #389),
 so **what stands between here and the first release is the pre-release
