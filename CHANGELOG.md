@@ -13,6 +13,26 @@ release workflow asserts they agree).
 
 ### Added
 
+- **macOS gets local host sessions too (HS-4b, plan 041)** — `roost-session`
+  now ships inside `Roost-Iced.app` itself (`Contents/MacOS/roost-session`,
+  individually signed and codesign-verified, with a symlinked copy beside
+  the bundled `roostctl` so its own sibling-binary lookup resolves it too),
+  so the Mac build offers the same `localhost` surface Linux has had since
+  HS-2: a fresh install's palette shows **Connect Host: localhost** (saves
+  it and starts the daemon if nothing's listening yet), and a saved
+  `localhost` host auto-reconnects — connect-if-present, never spawning on
+  its own — the moment Roost launches. Quit Roost-Iced and a `localhost`
+  host's projects and tabs keep running in `roost-session`; relaunch and
+  they're still there, exactly like any other host — an ordinary local tab
+  still ends with the app, unchanged. Reaching a *remote* machine as an SSH
+  host is still Linux-only — Roost can't install or start `roost-session`
+  on a Mac for you yet — and the Swift `Roost.app` still has none of this
+  feature, permanently. For a Mac that should come back up after its own
+  reboot, the guide now has a [launchd LaunchAgent
+  recipe](docs/guides/host-sessions.md#surviving-reboots-launchd) —
+  `KeepAlive: {SuccessfulExit: false}` so a deliberate **Stop Session**
+  stays stopped instead of launchd resurrecting it. See the [Host Sessions
+  guide](docs/guides/host-sessions.md#macos-note) for the full shape.
 - **A saved SSH host reconnects itself after a drop (HS-4 slice 1, plan
   040)** — once a host has actually connected, Roost now treats a
   mid-session drop the way it always treated `localhost`: the sidebar

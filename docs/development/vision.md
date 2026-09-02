@@ -557,6 +557,7 @@ non-obvious enough to relitigate otherwise:
   spawn-if-missing. **Add Host stays** on macOS regardless: pointing it
   at an `ssh -L` forward to a Linux host is the feature's whole
   Mac→Linux payoff, not a dead end.
+  *Superseded by [DL-19](#dl-19-macos-ships-roost-session-too-the-mac-gate-lifts-2026-09-01) — the gate lifted in HS-4b.*
 
 See [`guides/host-sessions.md`](../guides/host-sessions.md) for the
 user-facing shape and
@@ -565,6 +566,34 @@ architecture (component topology, the attach sequence, the
 lease/takeover lifecycle); the roadmap's D11 — Hosts UX
 ([`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md))
 is the source decision this entry summarizes.
+
+### DL-19: macOS ships `roost-session` too, the Mac gate lifts (2026-09-01)
+
+Plan 041 (HS-4b) closes the gap
+[DL-18](#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)
+left open: `roost-session` now builds, bundles, and ships inside
+`Roost-Iced.app` (`Contents/MacOS/roost-session`, individually signed,
+with a relative symlink beside the bundled `roostctl` so its own
+sibling-of-exe lookup resolves the daemon too), so the Mac gate lifts
+unconditionally — every build now offers the `localhost` surface: the
+seeded **Connect Host: localhost** row,
+spawn-if-missing, and launch-time auto-reconnect (connect-if-present,
+localhost-only, never spawning) all behave identically on macOS and
+Linux. A host session's projects and tabs now persist across quitting
+Roost on both platforms — the same "host-section state outlives the
+app, an ordinary local tab doesn't" contract Linux already had under
+DL-18.
+
+What's still not shipped: connecting *to* a Mac as an SSH host (the
+install/upgrade bootstrap's `check_os` still refuses a Darwin remote)
+and a standalone darwin `roost-session` release artifact — both
+deliberately deferred to HS-4c. The Swift `Roost.app` remains
+permanently excluded, unchanged from DL-18.
+
+See [`guides/host-sessions.md`](../guides/host-sessions.md) for the
+user-facing shape, including the new [launchd supervision
+recipe](../guides/host-sessions.md#surviving-reboots-launchd) for
+surviving a Mac's own reboots.
 
 ## Direction (under evaluation)
 
