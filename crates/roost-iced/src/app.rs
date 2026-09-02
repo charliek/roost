@@ -3282,6 +3282,9 @@ impl App {
         if let Some(tab) = self.tabs.get(&self.active_tab_key()) {
             tab.set_window_focus(focused);
         }
+        if focused {
+            self.refresh_notification_authorization();
+        }
     }
 
     pub fn view(&self) -> Element<'_, Message> {

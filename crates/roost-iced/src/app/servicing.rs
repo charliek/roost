@@ -1666,6 +1666,22 @@ impl App {
         }
     }
 
+    /// Re-read the system's notification authorization.
+    ///
+    /// Called from `set_window_focus` on the focus-*gain* edge only —
+    /// deliberately not from `window_opened`, which also runs on focus
+    /// loss and would fire the refresh, and its conditional re-request,
+    /// at the instant the system's own prompt steals focus.
+    pub(super) fn refresh_notification_authorization(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(mtm) = seam_on_main("notifications refresh") else {
+                return;
+            };
+            crate::macos::notifications::refresh_authorization(mtm);
+        }
+    }
+
     /// Push `SPUUpdater.canCheckForUpdates` onto the "Check for
     /// Updates…" item, when it moved.
     ///
