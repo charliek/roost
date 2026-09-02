@@ -137,6 +137,13 @@ protocol UiBridge: AnyObject {
     /// `"default"`). Used by the `app.cursor_shape` IPC op.
     func currentCursorShape() -> String
 
+    /// The macOS notification backend's state for the test-only
+    /// `app.notification_status` op — same `{backend, reason,
+    /// authorized}` shape iced serves, so a test asserts identically on
+    /// both targets. The gate check (`ROOST_TEST_MODE=1`) lives in the
+    /// handler, not here.
+    func notificationStatus() -> (backend: String, reason: String?, authorized: Bool)
+
     /// Active tab's terminal viewport top offset (points, measured
     /// down from the content view's top edge) + the resolved font
     /// family in use — the optional `terminal_top` /

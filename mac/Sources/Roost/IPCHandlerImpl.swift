@@ -140,6 +140,8 @@ actor IPCHandlerImpl: IPCHandler {
             return AnyCodable([:] as [String: Any])
         case "app.cursor_shape":
             return try await encodeResult(self.appCursorShape(params: params))
+        case "app.notification_status":
+            return try await encodeResult(self.appNotificationStatus(params: params))
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -851,6 +853,33 @@ actor IPCHandlerImpl: IPCHandler {
             throw IPCHandlerError.internalError("no UI to read app.cursor_shape")
         }
         return IPCAppCursorShapeResult(shape: ui.currentCursorShape())
+    }
+
+    /// `app.notification_status`: the UN backend's state, the Swift half
+    /// of the op iced already serves (`read_notification_status` in
+    /// `crates/roost-iced/src/app/servicing.rs`). Test-gated on both
+    /// sides — it exists so the suite can assert the authorization the
+    /// user granted, not as a user-facing surface.
+    @MainActor
+    private func appNotificationStatus(
+        params: AnyCodable?
+    ) async throws -> IPCAppNotificationStatusResult {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "app.notification_status requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to read app.notification_status")
+        }
+        let status = ui.notificationStatus()
+        return IPCAppNotificationStatusResult(
+            backend: status.backend,
+            reason: status.reason,
+            authorized: status.authorized
+        )
     }
 
     @MainActor
@@ -2090,6 +2119,29 @@ private struct IPCAppSetWindowFocusParams: Codable {
 
 private struct IPCAppCursorShapeResult: Codable {
     let shape: String
+}
+
+/// `app.notification_status` response — mirrors
+/// `AppNotificationStatusResult` in `crates/roost-ipc/src/messages.rs`.
+///
+/// `reason` is encoded explicitly rather than through the synthesized
+/// `encodeIfPresent`, which would drop the key: the Rust struct carries
+/// no `skip_serializing_if`, so iced puts `"reason":null` on the wire
+/// and one client must be able to read both UIs.
+struct IPCAppNotificationStatusResult: Codable {
+    let backend: String
+    let reason: String?
+    let authorized: Bool
+    enum CodingKeys: String, CodingKey {
+        case backend, reason, authorized
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(backend, forKey: .backend)
+        try container.encode(reason, forKey: .reason)
+        try container.encode(authorized, forKey: .authorized)
+    }
 }
 
 /// Format an `NSColor` as `#RRGGBB` for the `tab.dump_resolved` wire

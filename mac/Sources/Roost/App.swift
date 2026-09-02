@@ -1026,14 +1026,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         activeSessionByProject.removeAll()
     }
 
-    /// Round-2 fix: AppKit doesn't always restore first responder to
-    /// the terminal view when the app regains focus (e.g. after
+    /// Two things happen on reactivation.
+    ///
+    /// The notification authorization is re-read from the system
+    /// (#355): coming back from System Settings is an activation, and
+    /// it is the moment a denial can have become a grant. It runs
+    /// *before* the palette guard below — a return with the palette
+    /// open is still a return from System Settings.
+    ///
+    /// Then, round-2 fix: AppKit doesn't always restore first responder
+    /// to the terminal view when the app regains focus (e.g. after
     /// switching apps, or after the rename popover closes). Without
     /// terminal-as-first-responder, ⌘V / ⌘C / ⌘X / ⌘A fall through to
     /// `NSText.paste(_:)` / `NSText.copy(_:)` etc. with no target
     /// and become no-ops. Snapping focus back here covers the
     /// common case without needing a click into the terminal area.
     func applicationDidBecomeActive(_ notification: Notification) {
+        desktopNotifications.refreshAuthorization()
         // While the palette is up it owns focus (its text field); don't
         // yank first responder back to the terminal on reactivation.
         guard !paletteOpen else { return }
@@ -5976,6 +5985,12 @@ extension RoostApp: UiBridge {
               let session = activeSessionByProject[pid]
         else { return "default" }
         return session.terminalView.currentCursorShapeName()
+    }
+
+    /// `app.notification_status`: the UN backend's state, straight off
+    /// the `DesktopNotifications` this app has held since launch.
+    func notificationStatus() -> (backend: String, reason: String?, authorized: Bool) {
+        desktopNotifications.status()
     }
 
     /// `app.window_metrics`'s optional `terminal_top` /
