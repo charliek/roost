@@ -393,6 +393,7 @@ fn retry_line(delay: Duration, attempt: u32, budget: u32) -> state::Disconnected
     let seconds = delay.as_millis().div_ceil(1_000).max(1);
     state::Disconnected {
         reason: format!("reconnecting in {seconds}s ({attempt}/{budget})"),
+        detail: None,
         retry_in: Some(delay),
     }
 }
@@ -1080,6 +1081,7 @@ impl HostConnSet {
                 tracing::warn!(%host, %reason, "ssh tunnel could not be established");
                 let mut disconnected = state::Disconnected {
                     reason: reason.clone(),
+                    detail: None,
                     retry_in: None,
                 };
                 self.schedule_reconnect(
@@ -1120,6 +1122,18 @@ impl HostConnSet {
             return Some(failure.message.as_str());
         }
         disconnected_reason(&self.retained.get(host)?.state)
+    }
+
+    /// The long form behind [`Self::section_reason`], when the reason is
+    /// a band line too short to carry what happened.
+    ///
+    /// Only the connection state has one — a settled localhost launch
+    /// failure writes it (`task::spawn_failure`), and nothing else does
+    /// — so unlike `section_reason` there is no ladder of sources here:
+    /// a bootstrap note and an establish failure are already their own
+    /// full text.
+    pub(crate) fn section_detail(&self, host: &str) -> Option<&str> {
+        self.section(host)?.state.detail()
     }
 
     /// Which connection attempt this host is on, as `host.status`
@@ -1585,6 +1599,7 @@ impl HostConnSet {
             host,
             state::Disconnected {
                 reason,
+                detail: None,
                 retry_in: None,
             },
         );
@@ -1792,6 +1807,7 @@ impl HostConnSet {
                     mirror,
                     state: HostConnState::Disconnected(state::Disconnected {
                         reason: "disconnected".into(),
+                        detail: None,
                         retry_in: None,
                     }),
                 },
@@ -2777,6 +2793,7 @@ mod tests {
             incarnation,
             HostConnState::Disconnected(state::Disconnected {
                 reason: "the session closed".into(),
+                detail: None,
                 retry_in: None,
             }),
         );
@@ -2820,6 +2837,7 @@ mod tests {
             incarnation,
             HostConnState::Disconnected(state::Disconnected {
                 reason: "roost-session isn't installed on workbox".into(),
+                detail: None,
                 retry_in: None,
             }),
         );
@@ -2834,6 +2852,7 @@ mod tests {
             incarnation,
             HostConnState::Disconnected(state::Disconnected {
                 reason: "the session closed".into(),
+                detail: None,
                 retry_in: None,
             }),
         );
@@ -2857,6 +2876,7 @@ mod tests {
     fn dropped(reason: &str) -> HostConnState {
         HostConnState::Disconnected(state::Disconnected {
             reason: reason.into(),
+            detail: None,
             retry_in: None,
         })
     }
@@ -3389,6 +3409,7 @@ mod tests {
             incarnation,
             HostConnState::Disconnected(state::Disconnected {
                 reason: "the session closed".into(),
+                detail: None,
                 retry_in: Some(Duration::from_millis(250)),
             }),
         );
@@ -4411,6 +4432,7 @@ mod tests {
             incarnation,
             HostConnState::Disconnected(state::Disconnected {
                 reason: "connection refused".into(),
+                detail: None,
                 retry_in: None,
             }),
         );

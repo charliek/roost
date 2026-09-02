@@ -318,6 +318,7 @@ mod tests {
         vec![
             HostConnState::Disconnected(Disconnected {
                 reason: "session ended".into(),
+                detail: None,
                 retry_in: None,
             }),
             HostConnState::Connecting { previous: None },

@@ -2633,7 +2633,10 @@ impl App {
                 // families are written as sentences and the rollup
                 // beside them is capped at 60 characters.
                 reason: self.hosts.section_reason(&host.id).map(str::to_string),
-                detail: None,
+                // Present only where the band had to cut something: a
+                // settled localhost launch failure, whose three rungs no
+                // 45-character line could hold.
+                detail: self.hosts.section_detail(&host.id).map(str::to_string),
                 // The band's output, verbatim. Re-deriving it here would
                 // be a second formatter to keep in step with the one the
                 // sidebar draws.

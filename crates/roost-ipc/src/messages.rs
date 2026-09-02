@@ -2125,6 +2125,15 @@ pub struct HostStatus {
     pub reason: Option<String>,
     /// The long form behind [`Self::reason`], when there is one the
     /// band has no room for.
+    ///
+    /// One thing fills it today: a **localhost session that could not be
+    /// started**, where [`Self::reason`] is the ≤45-character band line
+    /// (`"cannot find roost-session"`, `"roost-session failed to
+    /// start"`) and this is what actually happened — the launch ladder's
+    /// three rungs verbatim, the exec error, or the daemon's own
+    /// verdict. Such a host also carries no [`Self::retry`]: nothing a
+    /// retry could do would find a binary, so it settles and waits for
+    /// ↻ Reconnect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// The band's *output*: the sidebar reducer's own rollup string,

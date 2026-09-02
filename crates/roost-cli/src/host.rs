@@ -222,6 +222,14 @@ async fn status(client: &mut IpcClient, id: Option<&str>, json: bool) -> Result<
             let rollup = h.rollup.as_deref().unwrap_or("");
             let line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup);
             println!("{}", line.trim_end());
+            // The band shows the ~45-character `reason`; the operator's
+            // copy of a settled launch failure (the three rungs the
+            // locate ladder tried) is only ever here and in the log.
+            if let Some(detail) = h.detail.as_deref() {
+                for line in detail.lines() {
+                    println!("    {line}");
+                }
+            }
         }
     }
     Ok(0)

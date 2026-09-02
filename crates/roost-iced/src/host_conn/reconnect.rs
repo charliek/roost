@@ -103,6 +103,10 @@ pub(crate) enum Decision {
 /// | `NoSession` | no | Auto-reconnect never auto-spawns. |
 /// | `Establish(family: None)` | no | `SshTunnelError::Local`: no `ssh` binary, an unwritable scratch dir, a bridge that would not bind. |
 ///
+/// This is the ssh half. The localhost spawn ladder's equivalent
+/// verdict — which launch failures a retry could not fix — lives in
+/// [`task::spawn_failure`](super::task::spawn_failure).
+///
 /// `truncated` outranks all of it. A drain that expired or a byte cap
 /// that ate the leading bytes leaves an empty-ish tail, which
 /// `classify_ssh_failure` reads as `Transport(None)` — so without this
