@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use roost_ipc::messages::{ops, EventEnvelope, OscColorsParams};
+use roost_ipc::messages::{ops, EventEnvelope, OscColorsParams, RetrySchedule};
 use roost_ipc::ssh::{SshFailure, SshTunnel};
 use roost_ui_model::keys::{HostId, TabKey};
 use roost_ui_model::theme::Theme;
@@ -526,6 +526,15 @@ pub(crate) struct HostConnSet {
     /// Handed out by [`HostConnSet::connect`], never reused. See
     /// [`Registration`].
     next_generation: u64,
+    /// The last generation minted for each saved host, keyed like
+    /// [`Self::conns`] — but outliving the [`HostConn`] it was minted
+    /// for, which is the whole point. A disconnected host has no entry
+    /// in `conns` and would otherwise read as "never connected"; a
+    /// poller watching this number for an edge would then see it fall
+    /// back to `0` and count the next attempt twice. Written by
+    /// [`Self::mint_generation`]; dropped only by [`Self::remove`],
+    /// with the host itself.
+    generations: HashMap<String, u64>,
     /// The ssh transport for each saved host reached over one, keyed on
     /// the saved host's id like [`Self::conns`].
     ///
@@ -698,9 +707,11 @@ struct SshState {
     /// outage off, and what decides whether the next dial carries
     /// [`Outage::lease`].
     cause: AttemptCause,
-    /// Which connection this attempt produced, stamped by
-    /// [`HostConnSet::connect`]. `None` until the tunnel is up and that
-    /// call has run — an establish that never answers never has one.
+    /// This attempt's connection generation, minted by
+    /// [`HostConnSet::open_ssh`] when the handshake started and reused
+    /// verbatim by the [`HostConnSet::connect`] a working tunnel
+    /// reaches — so the two are the same number and an establish that
+    /// never answers still has one.
     ///
     /// It is what makes [`Self::lease`] attributable: a feed item is
     /// tagged with an incarnation, and the connection an incarnation
@@ -782,6 +793,7 @@ impl HostConnSet {
             mirrors: HashMap::new(),
             retained: HashMap::new(),
             next_generation: 0,
+            generations: HashMap::new(),
             ssh: HashMap::new(),
             next_ssh_request: 0,
             displaced: Vec::new(),
@@ -792,6 +804,21 @@ impl HostConnSet {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.conns.is_empty()
+    }
+
+    /// Number the attempt that is starting now, and record it as this
+    /// host's current generation.
+    ///
+    /// Called where an *attempt* begins — [`Self::open_ssh`] for a host
+    /// reached over ssh, [`Self::connect`] for every other transport —
+    /// so an establish that never comes up still advances the number
+    /// `host.status` reports. A value handed out is never handed out
+    /// again: the counter is set-wide and only ever climbs.
+    fn mint_generation(&mut self, host: &str) -> u64 {
+        self.next_generation += 1;
+        self.generations
+            .insert(host.to_string(), self.next_generation);
+        self.next_generation
     }
 
     /// Start (or restart) a connection to one saved host.
@@ -821,14 +848,18 @@ impl HostConnSet {
         let supersedes = self.conns.get(host).and_then(|conn| conn.incarnation);
         let held_lease = self.carried_lease(host, cause);
         self.forget(host);
-        self.next_generation += 1;
-        let generation = self.next_generation;
-        // Only the ssh path has an entry to stamp, and stamping it is
-        // what lets a lease publication be traced back to the attempt
-        // that opened the connection — see [`Self::apply_lease`].
-        if let Some(entry) = self.ssh.get_mut(host) {
-            entry.generation = Some(generation);
+        // An ssh attempt started at [`Self::open_ssh`] and was numbered
+        // there, so the connect a working tunnel reaches carries that
+        // number rather than minting a second one — one attempt is one
+        // generation, whether or not it ever gets a socket. The
+        // `unwrap_or_else` is the impossible case (an ssh connect with
+        // no entry behind it) taking a fresh number rather than
+        // reusing one.
+        let generation = match transport {
+            HostTransport::Ssh => self.ssh.get(host).and_then(|entry| entry.generation),
+            _ => None,
         }
+        .unwrap_or_else(|| self.mint_generation(host));
 
         let (ops, ops_rx) = HostOps::channel();
         let shutdown = Arc::new(Shutdown::default());
@@ -932,6 +963,13 @@ impl HostConnSet {
         let previous = self.take_tunnel(host);
         self.next_ssh_request += 1;
         let request = self.next_ssh_request;
+        // Here rather than in [`Self::connect`]: for an ssh host the
+        // attempt starts with the handshake, and most of the ways one
+        // fails — no route, a refused port, a changed host key — never
+        // reach a connect at all. Numbering it there would leave a
+        // ten-rung ladder reporting one generation while the band
+        // counts `(1/10)`…`(10/10)`.
+        let generation = self.mint_generation(host);
         let raw_target = target.raw.clone();
 
         let feed = self.feed.clone();
@@ -960,7 +998,7 @@ impl HostConnSet {
                 attended: cause == AttemptCause::Explicit && mode != ConnectMode::IfPresent,
                 origin,
                 cause,
-                generation: None,
+                generation: Some(generation),
                 lease: None,
                 tunnel: None,
                 establish: Some(establish.abort_handle()),
@@ -1082,6 +1120,54 @@ impl HostConnSet {
             return Some(failure.message.as_str());
         }
         disconnected_reason(&self.retained.get(host)?.state)
+    }
+
+    /// Which connection attempt this host is on, as `host.status`
+    /// reports it: the generation [`Self::mint_generation`] last handed
+    /// it, `0` before the first. One per attempt *started* — an ssh
+    /// establish that never comes up counts, which is what makes it an
+    /// edge a poller can wait on across a whole retry ladder. See
+    /// [`Self::generations`] for why it survives a disconnect.
+    pub(crate) fn generation(&self, host: &str) -> u64 {
+        self.generations.get(host).copied().unwrap_or(0)
+    }
+
+    /// This host's armed retry, if one is waiting to fire.
+    ///
+    /// The ssh ladder answers first and in full: it is the only one that
+    /// knows an attempt number, a budget, and when the timer was armed.
+    /// [`ReconnectLadder::next`](reconnect::ReconnectLadder::next) bumps
+    /// its counter before it hands back the `attempt` [`Self::arm_retry`]
+    /// writes into the band, so the number here is the same `3` the
+    /// band's `(3/10)` shows.
+    ///
+    /// A localhost retry is the connection task's own backoff and its
+    /// counter never leaves the task, so the delay is all there is.
+    pub(crate) fn retry_schedule(&self, host: &str) -> Option<RetrySchedule> {
+        if let Some(outage) = self.outages.get(host) {
+            if let Some(armed) = outage.armed.as_ref() {
+                return Some(RetrySchedule {
+                    delay_ms: armed.delay.as_millis() as u64,
+                    attempt: Some(outage.ladder.attempts()),
+                    budget: Some(outage.ladder.budget()),
+                    armed_at: Some(roost_engine::workspace::rfc3339(armed.at)),
+                });
+            }
+        }
+        // An ssh host's retries live on the ladder alone. Its state's
+        // `retry_in` mirrors the rung that was armed and outlives the
+        // timer — the dead connection stays in `conns` for the whole
+        // establish that follows — so reading it here would report a
+        // retry nothing holds.
+        let conn = self.conns.get(host)?;
+        if matches!(conn.transport, HostTransport::Ssh) {
+            return None;
+        }
+        let delay = conn.state.retry_in()?;
+        Some(RetrySchedule {
+            delay_ms: delay.as_millis() as u64,
+            ..RetrySchedule::default()
+        })
     }
 
     /// The classified family behind this host's last ssh failure, if it
@@ -1725,6 +1811,7 @@ impl HostConnSet {
         let incarnation = self.disconnect(host);
         self.retained.remove(host);
         self.bootstrap_notes.remove(host);
+        self.generations.remove(host);
         incarnation
     }
 
@@ -3232,6 +3319,176 @@ mod tests {
         set.apply_state(incarnation, dropped("the connection closed"));
         assert_eq!(set.outages["h1"].ladder.attempts(), 1);
         assert_eq!(band_state(&set, "h1"), band);
+    }
+
+    /// `host.status`'s `retry` and the band's `(n/N)` are the same two
+    /// numbers, read at two different moments: `arm_retry` takes the
+    /// `attempt` off `Decision::Retry`, the accessor reads
+    /// `ladder.attempts()` afterwards. `next` bumps the counter before
+    /// it answers, so they agree — walked over two rungs so the case
+    /// would fail if either side pinned a constant.
+    #[tokio::test]
+    async fn the_retry_schedule_carries_the_bands_own_numbers() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-sched.sock");
+        let budget = budget(&set);
+
+        for attempt in 1..=2 {
+            let schedule = set.retry_schedule("h1").expect("an armed retry");
+            assert_eq!(schedule.attempt, Some(attempt));
+            assert_eq!(schedule.budget, Some(budget));
+            assert_eq!(
+                schedule.delay_ms,
+                band_state(&set, "h1").retry_in.expect("armed").as_millis() as u64,
+                "the wire's delay is the one the timer was armed with"
+            );
+            assert_eq!(
+                band_reason(&set, "h1"),
+                format!(
+                    "reconnecting in {}s ({attempt}/{budget})",
+                    schedule.delay_ms.div_ceil(1_000).max(1)
+                )
+            );
+            assert!(
+                schedule.armed_at.is_some_and(|at| at.ends_with('Z')),
+                "and it says when, so a caller can count down"
+            );
+
+            assert!(retry_once(&mut set), "the due retry dials");
+            assert_eq!(
+                set.retry_schedule("h1"),
+                None,
+                "once the timer has fired nothing is armed, even though the \
+                 dead connection's own retry_in still mirrors the rung"
+            );
+            refuse(&mut set, unreachable());
+        }
+    }
+
+    /// A localhost retry is the connection task's own backoff: the delay
+    /// is published on the state, the counter never leaves the task.
+    #[tokio::test]
+    async fn a_localhost_retry_reports_a_delay_and_nothing_else() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-local.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        assert_eq!(
+            set.retry_schedule("h1"),
+            None,
+            "a connecting host has nothing armed"
+        );
+
+        set.apply_state(
+            incarnation,
+            HostConnState::Disconnected(state::Disconnected {
+                reason: "the session closed".into(),
+                retry_in: Some(Duration::from_millis(250)),
+            }),
+        );
+        assert_eq!(
+            set.retry_schedule("h1"),
+            Some(RetrySchedule {
+                delay_ms: 250,
+                ..RetrySchedule::default()
+            })
+        );
+
+        set.apply_state(incarnation, dropped("and it settled"));
+        assert_eq!(set.retry_schedule("h1"), None);
+    }
+
+    /// The generation is the host's, not the live connection's: a
+    /// disconnected host must not read `0` again, or a poller waiting
+    /// for the number to advance would count the next attempt twice.
+    #[tokio::test]
+    async fn the_generation_outlives_the_connection_and_dies_with_the_host() {
+        let (mut set, _feed) = a_set();
+        assert_eq!(set.generation("h1"), 0, "before any connect");
+
+        let connect = |set: &mut HostConnSet| {
+            set.connect(
+                "h1",
+                "one",
+                PathBuf::from("/nonexistent/roost-set-gen.sock"),
+                HostTransport::UnixSocket,
+                ConnectMode::Dial,
+                AttemptCause::Explicit,
+            );
+        };
+        connect(&mut set);
+        assert_eq!(set.generation("h1"), 1);
+
+        set.disconnect("h1");
+        assert_eq!(
+            set.generation("h1"),
+            1,
+            "a disconnect ends the connection, not the host's history"
+        );
+
+        connect(&mut set);
+        assert_eq!(set.generation("h1"), 2);
+
+        set.remove("h1");
+        assert_eq!(set.generation("h1"), 0, "forgetting the host forgets it");
+    }
+
+    /// The generation counts attempts *started*, not connections made —
+    /// which for an ssh host is the whole difference. Its attempt
+    /// begins at the handshake, and most of the ways one fails (no
+    /// route, a refused port, a changed host key) never reach a
+    /// `connect` at all, so numbering it there would leave a ten-rung
+    /// ladder reporting one generation while the band counts `(1/10)`
+    /// through `(10/10)` — and `host.status`'s one monotonic edge would
+    /// be flat exactly where a caller needs it.
+    #[tokio::test]
+    async fn an_ssh_generation_advances_once_per_attempt_started() {
+        let (mut set, _feed) = a_set();
+        ask_ssh(&mut set, "h1");
+        assert_eq!(
+            set.generation("h1"),
+            1,
+            "the attempt is numbered at the handshake, before any tunnel"
+        );
+
+        // The connect a working tunnel reaches is the same attempt, so
+        // it must not mint a second number.
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-sshgen.sock"),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        assert_eq!(set.generation("h1"), 1, "one attempt is one generation");
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+
+        set.apply_state(incarnation, dropped("the connection closed"));
+        assert_eq!(
+            set.generation("h1"),
+            1,
+            "a drop is what starts a ladder, not an attempt of its own"
+        );
+
+        // Each rung dials, and counts whether or not it comes up.
+        assert!(retry_once(&mut set));
+        assert_eq!(set.generation("h1"), 2);
+        refuse(&mut set, unreachable());
+        assert_eq!(
+            set.generation("h1"),
+            2,
+            "an establish that never came up is still that attempt"
+        );
+        assert!(retry_once(&mut set));
+        assert_eq!(set.generation("h1"), 3, "and the next rung is the next");
     }
 
     /// Eligibility is the *outage*, and a host that never worked has no

@@ -2510,6 +2510,9 @@ impl App {
             UiRequest::HostDisconnect { id, reply } => {
                 let _ = reply.send(self.host_disconnect_op(&id));
             }
+            UiRequest::HostStatus { id, reply } => {
+                let _ = reply.send(self.host_status_op(id.as_deref()));
+            }
         }
         task
     }
@@ -2566,6 +2569,79 @@ impl App {
         let host = self.saved_host(saved_id)?;
         self.host_disconnect_requested(saved_id);
         Ok(self.host_connection_result(host))
+    }
+
+    /// `host.status`, as the op answers it: every saved host's band, or
+    /// just the one named (plan 042 §3.1).
+    ///
+    /// One main-thread read, and it starts by rebuilding the two caches
+    /// it reads. Every *feed* item that moves a connection is classified
+    /// as workspace state (`engine_feed.rs`), so a request drained
+    /// behind one already reconciled — but a mutating request drained
+    /// *ahead* of this one in the same batch (a second client's
+    /// `host.connect`) only marks the batch dirty for the tail, and
+    /// reading the cache then would pair a fresh `generation` with a
+    /// stale `state`. Both refreshes are idempotent recomputations, so
+    /// running them here costs a reconcile's worth of work and buys one
+    /// freshness for the whole reply.
+    fn host_status_op(
+        &mut self,
+        id: Option<&str>,
+    ) -> Result<HostStatusResult, roost_engine::WorkspaceError> {
+        if let Some(id) = id {
+            self.saved_host(id)?;
+        }
+        self.refresh_host_views();
+        self.refresh_sidebar_agents();
+
+        let saved = self.workspace.hosts();
+        // `host_sections` is LOCAL plus one band per view, and empty
+        // when there are no saved hosts at all (the zero-host sidebar is
+        // byte-identical to the pre-host-sessions one).
+        let paired = saved.len() == self.host_views.len()
+            && (self.host_views.is_empty()
+                || self.host_sections.len() == self.host_views.len() + 1);
+        if !paired {
+            return Err(roost_engine::WorkspaceError::Inconsistent(format!(
+                "the sidebar has {} bands and {} views for {} saved hosts",
+                self.host_sections.len(),
+                self.host_views.len(),
+                saved.len(),
+            )));
+        }
+
+        let mut hosts = Vec::new();
+        for (index, host) in saved.into_iter().enumerate() {
+            if id.is_some_and(|id| id != host.id) {
+                continue;
+            }
+            let band = &self.host_sections[index + 1];
+            if band.saved_id.as_deref() != Some(host.id.as_str()) {
+                return Err(roost_engine::WorkspaceError::Inconsistent(format!(
+                    "band {index} is {:?}, not host {}",
+                    band.saved_id, host.id
+                )));
+            }
+            hosts.push(HostStatus {
+                id: host.id.clone(),
+                label: host.label,
+                target: host.target,
+                last_connected: host.last_connected,
+                generation: self.hosts.generation(&host.id),
+                state: band.state.wire().to_string(),
+                // The band's input, untruncated — the ssh failure
+                // families are written as sentences and the rollup
+                // beside them is capped at 60 characters.
+                reason: self.hosts.section_reason(&host.id).map(str::to_string),
+                detail: None,
+                // The band's output, verbatim. Re-deriving it here would
+                // be a second formatter to keep in step with the one the
+                // sidebar draws.
+                rollup: band.rollup.clone(),
+                retry: self.hosts.retry_schedule(&host.id),
+            });
+        }
+        Ok(HostStatusResult { hosts })
     }
 
     /// The saved host with this id, as the registry has it. The one

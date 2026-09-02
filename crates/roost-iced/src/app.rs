@@ -33,8 +33,9 @@ use roost_engine::{
 use roost_ipc::agent;
 use roost_ipc::messages::{
     AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
-    HostConnectionResult, PaletteItemView, PalettePresentResult, PaletteStateResult, Project,
-    SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
+    HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult,
+    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult,
+    WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;

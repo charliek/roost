@@ -380,6 +380,13 @@ pub enum WorkspaceError {
     HostLabelReserved,
     #[error("a host named {0:?} already exists")]
     HostLabelTaken(String),
+    /// An app-side invariant did not hold, so the reply would have been
+    /// a lie. Answered rather than papered over: today the only source
+    /// is `host.status` finding the sidebar's cached bands out of step
+    /// with the saved-host list they are built from, where the
+    /// alternative is a silently truncated list.
+    #[error("{0}")]
+    Inconsistent(String),
 }
 
 /// Repair persisted project positions that collide, in place.
@@ -717,7 +724,7 @@ impl Workspace {
             .iter_mut()
             .find(|h| h.id == id)
             .ok_or_else(|| WorkspaceError::HostNotFound(id.to_string()))?;
-        host.last_connected = Some(rfc3339_now());
+        host.last_connected = Some(rfc3339(std::time::SystemTime::now()));
         self.commit(inner, Vec::new(), Persist::Write);
         Ok(())
     }
@@ -2075,13 +2082,16 @@ pub(crate) fn random_hex(n: usize) -> String {
     out
 }
 
-/// `SystemTime::now()` as `YYYY-MM-DDTHH:MM:SSZ`. Hand-rolled rather
-/// than pulling in a date-time crate for one timestamp — mirrors
+/// A `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ`. Hand-rolled rather than
+/// pulling in a date-time crate for two timestamps — mirrors
 /// `roost_session::identity::rfc3339_utc` exactly, which this crate
 /// cannot depend on (`roost-session` depends on `roost-engine`, not the
 /// other way).
-fn rfc3339_now() -> String {
-    let secs = std::time::SystemTime::now()
+///
+/// Public because the iced UI stamps `host.status`'s `armed_at` with it
+/// and has no other way to format a time.
+pub fn rfc3339(at: std::time::SystemTime) -> String {
+    let secs = at
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
@@ -2097,7 +2107,7 @@ fn rfc3339_now() -> String {
 /// Days-since-epoch to `(year, month, day)` — Howard Hinnant's
 /// `civil_from_days`, the standard closed-form for this (avoids a
 /// leap-year loop). Duplicated from `roost_session::identity` for the
-/// same dependency-direction reason as [`rfc3339_now`].
+/// same dependency-direction reason as [`rfc3339`].
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
