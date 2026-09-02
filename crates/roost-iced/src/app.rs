@@ -1045,11 +1045,11 @@ fn drop_drag_and_collapse(drag_width: &mut Option<f32>, workspace: &Workspace) {
     workspace.set_sidebar_collapsed(true);
 }
 
-/// The core half of every focus change: the two ops the UI owes the
-/// workspace, in order. `focus_tab`'s error is also the "is this tab still
-/// there?" guard — a route holding only a `&Workspace` (the notification
-/// banner's click, which arrives with no `&mut App` in hand) gets both from
-/// this one call.
+/// The core half of every focus change: the one op the UI owes the
+/// workspace. `focus_tab` acknowledges the tab's notification itself, and
+/// its error is also the "is this tab still there?" guard — a route holding
+/// only a `&Workspace` (the notification banner's click, which arrives with
+/// no `&mut App` in hand) gets all of that from this one call.
 fn focus_tab_in_core(workspace: &Workspace, tab: TabKey) -> Result<(), String> {
     // The local workspace owns only the local id-space; another
     // instance's tab is not this workspace's to focus, and applying its
@@ -1059,9 +1059,7 @@ fn focus_tab_in_core(workspace: &Workspace, tab: TabKey) -> Result<(), String> {
     })?;
     workspace
         .focus_tab(tab_id)
-        .map_err(|error| error.to_string())?;
-    workspace
-        .set_tab_has_notification(tab_id, false)
+        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 

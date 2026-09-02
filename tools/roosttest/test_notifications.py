@@ -98,6 +98,34 @@ def test_jump_to_notification_focuses_and_clears(roost, project, palette):
     _wait(roost, lambda: roost.tab(a).get("has_notification") is False, "a badge cleared by jump")
 
 
+def test_bare_ipc_focus_clears_badge_rollup_and_inbox(roost, project, palette):
+    """The *bare op* counterpart to
+    `test_jump_to_notification_focuses_and_clears`: a plain `tab.focus`
+    over IPC — no palette, no UI jump — acknowledges the tab it focuses
+    (#369). Badge, project rollup and inbox row all derive from the same
+    `has_notification` bit, so all three must go."""
+    a = roost.open_tab(project, cwd="/tmp")
+    b = roost.open_tab(project, cwd="/tmp")  # b is active
+    roost.notify(a, "BareFocus", "acknowledge me")
+    assert roost.identify()["active_tab_id"] == b
+    # The inbox lags the badge, so wait for the row to exist before
+    # clearing it — otherwise its absence afterwards proves nothing.
+    roost._wait(lambda: f"notif:{a}" in _inbox_ids(palette), 5.0, "inbox registers a")
+
+    roost.focus(a)
+
+    _wait(roost, lambda: roost.identify()["active_tab_id"] == a, "bare tab.focus moved active")
+    _wait(roost, lambda: roost.tab(a).get("has_notification") is False, "a badge cleared by focus")
+    # There is no per-project `has_notification` on the wire: the sidebar
+    # rollup is derived from the project's tabs, so that is what is read.
+    _wait(
+        roost,
+        lambda: not any(t.get("has_notification") for t in roost.project(project)["tabs"]),
+        "project rollup cleared",
+    )
+    roost._wait(lambda: f"notif:{a}" not in _inbox_ids(palette), 5.0, "inbox row retired")
+
+
 def test_jump_to_unread_focuses_notified_tab(roost, project, palette):
     """`jump_to_unread` (Cmd/Ctrl+Shift+U) focuses the next tab with a
     pending notification + clears it — a multi-project triage shortcut.

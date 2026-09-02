@@ -18,7 +18,7 @@ struct AppCoreSyncTests {
     @Test func uiInitiatedSelectionPushesToTheCore() {
         #expect(
             RoostApp.shouldSyncCoreActiveTab(
-                selected: 7, coreActive: 3, applyingCoreEvent: false
+                selected: 7, coreActive: 3, hasNotification: false, applyingCoreEvent: false
             )
         )
     }
@@ -26,7 +26,20 @@ struct AppCoreSyncTests {
     @Test func syncIsSkippedWhenTheCoreAlreadyAgrees() {
         #expect(
             !RoostApp.shouldSyncCoreActiveTab(
-                selected: 7, coreActive: 7, applyingCoreEvent: false
+                selected: 7, coreActive: 7, hasNotification: false, applyingCoreEvent: false
+            )
+        )
+    }
+
+    /// #369: `focusTab` also acknowledges, so "the core already agrees"
+    /// is no longer the whole test. A notification raised while the
+    /// window was unfocused lands on the *active* tab, and clicking the
+    /// pill you are already on must still clear it — the only route to
+    /// the core is this push.
+    @Test func anAlreadyActiveBadgedTabStillPushesToAcknowledge() {
+        #expect(
+            RoostApp.shouldSyncCoreActiveTab(
+                selected: 7, coreActive: 7, hasNotification: true, applyingCoreEvent: false
             )
         )
     }
@@ -39,12 +52,28 @@ struct AppCoreSyncTests {
     @Test func aSelectionMadeWhileReactingToTheCoreNeverEchoes() {
         #expect(
             !RoostApp.shouldSyncCoreActiveTab(
-                selected: 7, coreActive: 3, applyingCoreEvent: true
+                selected: 7, coreActive: 3, hasNotification: false, applyingCoreEvent: true
             )
         )
         #expect(
             !RoostApp.shouldSyncCoreActiveTab(
-                selected: 7, coreActive: 7, applyingCoreEvent: true
+                selected: 7, coreActive: 7, hasNotification: false, applyingCoreEvent: true
+            )
+        )
+    }
+
+    /// The echo guard dominates the acknowledge: the UI is reacting to
+    /// a core event that already carried the false-edge, so pushing here
+    /// would answer the core's own broadcast with a second one.
+    @Test func aBadgedTabReactingToTheCoreStillNeverEchoes() {
+        #expect(
+            !RoostApp.shouldSyncCoreActiveTab(
+                selected: 7, coreActive: 7, hasNotification: true, applyingCoreEvent: true
+            )
+        )
+        #expect(
+            !RoostApp.shouldSyncCoreActiveTab(
+                selected: 7, coreActive: 3, hasNotification: true, applyingCoreEvent: true
             )
         )
     }

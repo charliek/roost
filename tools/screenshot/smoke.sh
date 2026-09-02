@@ -69,7 +69,7 @@ expect "${OUT}" 02-notify "Tab A active; Tab B (inactive) shows an AMBER leading
 rc tab focus --tab "${TAB_B}" >/dev/null
 sleep 1
 shot "${OUT}" 03-focus-clears >/dev/null
-expect "${OUT}" 03-focus-clears "Focusing Tab B switched the visible tab to B and cleared its notification badge; the project's trailing badge is gone. (If the active tab/terminal did NOT change, external IPC focus is broken — see the tab.focus fix.)"
+expect "${OUT}" 03-focus-clears "Focusing Tab B switched the visible tab to B and cleared its notification badge; the project's trailing badge is gone."
 
 # --- T5: claude-hook lifecycle ------------------------------------------
 HOOK_ENV=(env "ROOST_TAB_ID=${TAB_A}" "ROOST_SOCKET=${UT_SOCK}")

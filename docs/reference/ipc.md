@@ -534,6 +534,13 @@ Sets the active (project, tab) selection.
 Request: `{"params": {"tab_id": "3"}}`. Response:
 `{"previous_project_id": "1", "previous_tab_id": "2"}`.
 
+Focusing a tab also acknowledges it: the focused tab's pending
+notification is cleared, so `tab.notification` with
+`has_pending: false` follows `active.changed` in the same batch — and
+only when the tab actually carried one. The badge, the project rollup
+and the notification-inbox row all derive from that bit, so they go
+with it. Focusing the already-active tab acknowledges it too.
+
 `tab_id` also accepts the host-qualified `h<host>.<id>` spelling on a
 **UI socket** — the plan 037 §3.4 wire spelling `roostctl tab focus`
 and the attach path both drive. Focusing a host tab is client
@@ -1594,7 +1601,7 @@ Response: `{}` — nothing to report beyond "applied".
 2. `connect-required` / `taken-over` — the lease gate.
 3. `not-found` — a tab id this session does not have.
 
-The apply is one workspace transaction and `not-found` leaves **nothing** applied: a client naming a tab that just closed must not flip the session to "focused" against whatever tab happened to be active. On success with an id, the session both marks itself focused and moves its own active selection (and its persisted selection) onto that tab, exactly as [`tab.focus`](#tabfocus) would; re-stating a focus that is already current emits no `active.changed`, so a reconnecting client's re-assert costs other clients no re-render. `null` moves the flag alone and leaves the selection where it is, so a reconnect restores the same tab.
+The apply is one workspace transaction and `not-found` leaves **nothing** applied: a client naming a tab that just closed must not flip the session to "focused" against whatever tab happened to be active. On success with an id, the session both marks itself focused and moves its own active selection (and its persisted selection) onto that tab, as [`tab.focus`](#tabfocus) would; it does **not** acknowledge the tab's notification — the client sends [`tab.clear_notification`](#tabclear_notification) for that. Re-stating a focus that is already current emits no `active.changed`, so a reconnecting client's re-assert costs other clients no re-render. `null` moves the flag alone and leaves the selection where it is, so a reconnect restores the same tab.
 
 **A focus does not outlive the client that reported it.** The lease deliberately outlives its connections, but the focus does not: the session reverts to "nobody is looking" (the flag only — the selection stays) when
 
