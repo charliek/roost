@@ -1,9 +1,18 @@
 # Host sessions — roadmap
 
 Status: **roadmap, in flight** — direction agreed 2026-08-26; HS-0,
-HS-1 (plans 035 + 036), HS-2 (plan 037, PR #374), and HS-3 in full —
+HS-1 (plans 035 + 036), HS-2 (plan 037, PR #374), HS-3 in full —
 transport (plan 038, C1-C6) and bootstrap (plan 039, detect/install/
-verify a remote `roost-session`) — have shipped; HS-4 is next. This
+verify a remote `roost-session`) — and HS-4a (SSH auto-reconnect,
+plan 040, PR #380) and HS-4b (Mac-local persist, plan 041, PR #389)
+have shipped. **Next: the pre-release follow-ups** — see the
+[sequencing call](#sequencing-toward-the-first-release-proposed-2026-09-01).
+Both platforms now run a local session; what is still Linux-only is
+being an SSH *host* (HS-4c). None of it is released yet —
+the first release carrying host sessions gates on the
+[pre-release follow-ups](#tracked-follow-ups-pre--post-initial-release)
+plus the sequencing call recorded under
+[HS-4](#hs-4--make-the-primitive-feel-inevitable). This
 refines [`host-sessions.md`](host-sessions.md) (the
 discovery note, which stays the rationale document) into an ordered set
 of milestones with pinned design decisions. Per-milestone implementation
@@ -65,6 +74,17 @@ toolchain move — putting the snapshot API in reach.
    comes after the SSH payoff, not before — it is nearly free in code
    (pure Rust, portable-pty) but adds Mac packaging/notarization
    scope.
+   **Shipped (2026-09-01) as HS-4b** — this bullet's "Linux-only to
+   start" is now history: the Mac bundle carries the daemon, and both
+   platforms run a local session. What remains Linux-only is being an
+   SSH *host*. Discovery
+   verified the "nearly free in code" claim directly: `cargo check -p
+   roost-session` passes on macOS, `BundleProfile`'s session paths
+   already carry a Mac branch (`~/Library/Caches/RoostSession/`), and
+   the spawn ladder's sibling-of-exe rung finds a bundled binary with
+   zero code change. The remaining scope is exactly the
+   packaging/notarization named above, plus un-gating two `cfg!` sites
+   and widening CI — enumerated under HS-4b.
 
 ---
 
@@ -214,8 +234,10 @@ VT lives — which for a host is `roost-session`
 ### D6 — `roost-session` binary and lifecycle (Herdr checklist)
 
 Separate binary, packaged beside `roost`/`roostctl` in the deb
-(`nfpm.yaml`); the Mac bundle ships it only when Mac-local sessions
-land (post-HS-3). Lifecycle practices adopted from Herdr:
+(`nfpm.yaml`); the Mac bundle ships it at HS-4b (Mac-local persist),
+at `Contents/MacOS/roost-session` beside the app binary so the
+existing sibling-of-exe discovery rung finds it. Lifecycle practices
+adopted from Herdr:
 
 - Daemonize with a single fork + `setsid()`; parent exits
   immediately. Launch cwd passed as a consumed-once env hint, not
@@ -349,7 +371,11 @@ shape.
   launch auto-reconnect, no spawn-if-missing) — refining rather than
   contradicting the "no visible dead end" rule above. `Add Host`
   **stays** on macOS: an `ssh -L` forward to a Linux host is the
-  feature's Mac→Linux payoff, not a dead end.
+  feature's Mac→Linux payoff, not a dead end. **HS-4b lifts this
+  gate** by shipping the Mac `roost-session`; the gate's actual
+  implementation (one `VerbPolicy` value plus one redundant `cfg!` in
+  `reconnect_saved_hosts`) is enumerated there. Dialing an
+  already-running session was never gated, deliberately.
 - **Creation follows context.** `⌘N`/`Alt-N` and "+ New Project"
   create on the selected project's host; `⌘⇧N`/`Alt-Shift-N` opens a
   "New Project on…" picker (connected hosts + LOCAL); `⌘T`/`Alt-T`
@@ -579,26 +605,188 @@ manual verification for both plans.
 
 ### HS-4 — Make the primitive feel inevitable
 
-Only after HS-3 is boring — and explicitly a *bucket of separate
-follow-on plans*, not one milestone (each item below has its own
-architecture and risk): independent per-client viewports (replacing
-takeover); auto-reconnect for chosen SSH hosts (**slice 1 shipped as
-plan 040** — every SSH host gets it once connected, not a per-host
-opt-in; see D8); "Move tab to host";
-a Mac `roost-session` build for Mac-local persist (cheap in code,
-real packaging scope); second-window-as-second-client if the
-multi-window question becomes live. Porcelain-heavy; sequenced by
-usage, not up front.
+Explicitly a *bucket of separate follow-on plans*, not one milestone —
+each slice below has its own architecture and risk, and each gets its
+own implementation plan when it starts. Enumerated and sequenced
+2026-09-01; the sequence is a decision on today's information, made
+concrete on purpose (we would rather revise a stated order on user
+feedback than keep it ambiguous), and only HS-4b's "next" is firm.
 
-Slice 1's own follow-ups — the ones that outlived it rather than the
-ones it deferred by design — are filed and split pre/post initial
-release under [Tracked follow-ups](#tracked-follow-ups-pre--post-initial-release).
-The one that shapes this milestone: independent per-client viewports is
-listed above as *replacing* takeover, and
-[#381](https://github.com/charliek/roost/issues/381) is the narrower
-fix for takeover itself. They are alternatives to weigh together, not a
-sequence — a viewports design that removes takeover would close #381 by
-construction.
+#### HS-4a — SSH auto-reconnect (plan 040, PR #380) — SHIPPED
+
+Every SSH host gets it once its connection has actually worked — not a
+per-host opt-in (see D8's amended rule). Bounded ladder (1s base, 30s
+cap, settles after 10 attempts), never auto-connects at launch, never
+auto-spawns a session, never retries a changed host key or a failure
+classified from a truncated stderr tail. #379's unbounded drains fixed
+alongside. Its outliving follow-ups (#381–#388) are mapped under
+[Tracked follow-ups](#tracked-follow-ups-pre--post-initial-release).
+
+#### HS-4b — Mac-local persist (plan 041, PR #389) — SHIPPED
+
+The localhost story Linux got at HS-2, on the Roost-Iced Mac app:
+palette **Connect Host: localhost** (seeded row, spawn-if-missing),
+quit Roost, relaunch, same shells — plus, for free, every Mac becomes
+a *dialable* host, since dialing a running session was never gated.
+
+**Scope nuance, stated plainly:** persist covers tabs created under
+the localhost host section. Ordinary local tabs stay in-process and
+still end with the app — making persist the default for everything is
+HS-5, still an explicit future decision. Default behavior is untouched:
+zero saved hosts renders today's UI byte-identically on both platforms.
+
+Discovery (2026-09-01) verified the code side is essentially done:
+`cargo check -p roost-session` passes on macOS; the daemonize sequence
+is pure POSIX (the engine's one `/proc` read already has a
+`proc_pidinfo` branch); `BundleProfile` session paths have a tested Mac
+branch (`~/Library/Caches/RoostSession/roost.sock`, `RoostSessionDev`
+for debug builds — a dev daemon cannot collide with a real one); and
+`locate_session_binary`'s sibling-of-exe rung finds a bundled binary
+with no code change. The actual work, pinned for plan 041:
+
+1. **Un-gate — two sites, not one.** Flip `VerbPolicy::current()`
+   (`roost-ui-model/src/host_verbs.rs:72`, the designed seam every
+   consumer reads) **and** delete the redundant independent
+   `cfg!(target_os = "macos")` early-return in
+   `reconnect_saved_hosts` (`app.rs:2308-2311`), which bypasses the
+   policy. Both platforms' policies already run as unit tests on
+   either OS.
+2. **Bundle + sign.** `bundle-iced.sh` adds `roost-session` at
+   `Contents/MacOS/`, with its **own explicit `codesign_or_die` step
+   before the outer app sign** — the outer sign is non-`--deep`, so a
+   nested Mach-O ships improperly sealed unless signed individually
+   (the exact `roostctl` pattern at `bundle-iced.sh:179`). Verifiable
+   pre-tag with the local notarize dry-run. `release.yml` and
+   `make-dmg.sh` need nothing — the DMG packages the `.app` whole.
+3. **CI — the third gate.** The session lanes are Linux-only twice
+   over today (`runs-on` plus `e2e-mac`'s
+   `not session_daemon and not host_client` deselect). Floor for this
+   slice: a **macOS `session-e2e` cell** — that lane drives no UI and
+   needs no display, so it is CI config (the libclang step swaps for
+   Xcode's clang). Stretch: `test_host_client.py` on the macOS runner
+   (full UI + daemon; interacts with the runner's single-instance
+   constraints) — decide in the plan, and if deferred, file it rather
+   than dropping it.
+4. **Docs.** Mac section in the guide; a launchd-agent recipe as the
+   sibling of the Linux `enable-linger` reboot-survival recipe
+   (doc-only — supervision units stay deferred, see Open questions).
+
+**Cut from this slice:** no darwin bootstrap, no standalone darwin
+release artifact, no changes to `check_os`'s deliberate Darwin refusal
+— all HS-4c. The Swift Roost.app stays untouched (direction #5).
+
+**What actually shipped (plan 041, PR #389 — four commits).** The four
+items above landed as enumerated, with three corrections worth carrying
+forward:
+
+- **The un-gate needed a helper, not a deletion.** Removing
+  `reconnect_saved_hosts`' redundant `cfg!` outright would have left a
+  hypothetical gated build able to auto-connect (`IfPresent`) a
+  localhost host that `verbs()` withholds Disconnect and Stop for. It
+  now reads the same policy through a pure `reconnect_mode` helper. The
+  fallback value is still only *partly* coherent — `spawn_gate`
+  downgrades rather than refuses, and the sidebar ↻ and
+  `roostctl host connect` read no policy — which is pre-existing and
+  deliberate (dialing a running session was never gated, D11), but
+  whoever ever ships `localhost_surface: false` has to gate those two
+  routes too. Recorded at `the_gate_covers_both_directions`.
+- **Two sibling directories, not one.** The bundle serves two callers
+  of the discovery ladder: the UI's own exe sits in `Contents/MacOS/`
+  and the bundled `roostctl` in `Contents/Resources/bin/`. The real
+  Mach-O lands in the former (D6's pin) with a *relative* symlink in
+  the latter; the ladder's `"next to roostctl"` copy became
+  `"next to this program"` accordingly.
+- **Signature assertions have to key on the hardened-runtime flag.** On
+  Apple Silicon the linker ad-hoc-signs every arm64 Mach-O, so a raw
+  `cargo build` artifact already passes `codesign --verify --strict`
+  and yields a zero-byte entitlements dump — neither distinguishes "we
+  signed it" from "we never touched it". Only `--options runtime` sets
+  the `runtime` flag, so that is what the bundle self-check, the outer
+  sign's gate, and CI's assert step all test. The nested daemon ships
+  with an **empty entitlements dict** (a static Rust binary needs no
+  hole punched through the hardened runtime). Verified end to end: a
+  local notarize dry-run came back **Accepted** with the symlink intact
+  in a mounted DMG.
+
+Verification beyond CI: `make e2e-session` passes on macOS (47 tests,
+first run of that lane on the platform), and the live criterion on a
+real Mac covered spawn-from-bundle → marker → quit → survive →
+relaunch → auto-reconnect → Stop. The `session-e2e (macos-latest)` CI
+leg is green.
+
+**Left open by this slice:**
+[#390](https://github.com/charliek/roost/issues/390) the macOS
+`test_host_client.py` lane (the stretch item, deferred — it is a new
+lane class, not a cell swap: no macOS iced-UI lane exists in CI at
+all);
+[#391](https://github.com/charliek/roost/issues/391) the Swift
+`bundle.sh` keeps the nested-signature hole this slice closed for the
+iced bundle (plan-pinned as untouched);
+[#392](https://github.com/charliek/roost/issues/392) with the daemon
+binary unreachable the sidebar band reports an IPC io error instead of
+the ladder's actionable three-rung message — newly reachable on macOS,
+and not diagnosable without [#382](https://github.com/charliek/roost/issues/382)'s
+connection-state op.
+
+#### HS-4c — Mac as an SSH host
+
+Connect *to* a Mac the way HS-3 connects to a Linux box. Everything
+HS-4b ships, plus the bootstrap grows an OS axis: `check_os` accepts
+Darwin; the platform map and `asset_name` gain an OS dimension
+(darwin-arm64 only, matching the DMG); the candidate ladder gets
+Darwin paths validated against macOS `sshd`'s narrow non-interactive
+`PATH`; and a **cross-OS source rule** — streaming this client's own
+sibling binary is same-OS-only, so a Linux client bootstrapping a Mac
+(or vice versa) falls to the checksum-verified download or a local
+override. Ships the standalone `roost-session-<v>-darwin-arm64`
+artifact + checksum, with a signing decision for a bare Mach-O
+streamed over SSH. **Main cost and why it trails HS-4b:** validation
+is manual-only — there is no macOS analog of the shed VM — and the
+artifact matrix only fully proves itself at tag time, so it lands
+after HS-4b has proven the Mac binary in the wild.
+
+#### HS-4d — Multi-client: viewports vs. takeover integrity
+
+Two alternatives to weigh together, not a sequence: **independent
+per-client viewports** (replacing takeover outright) versus
+[#381](https://github.com/charliek/roost/issues/381)'s narrower fix —
+an atomic conditional-connect on the wire ("take over only if the
+lease is still X", a `session_protocol` bump) closing the best-effort
+guard and the third-client-tombstone hole plan 040 recorded. A
+viewports design that removes takeover closes #381 by construction.
+#381 sits in the pre-release list, so **this decision is on the
+release path** even though the viewports plan itself is not: before
+the first release, either #381's fix ships or the viewports direction
+is chosen and #381 is re-tagged as subsumed.
+
+#### HS-4e — Porcelain, sequenced by usage (unscheduled)
+
+"Move tab to host"; named sessions per host (`workbox:agents`);
+second-window-as-second-client if the multi-window question becomes
+live; the first real per-host setting when something needs one
+(#388's pinned convention); a `roostctl session install-unit`-style
+supervision helper if the launchd/systemd doc recipes prove popular.
+None of these starts without a usage signal.
+
+#### Sequencing toward the first release (proposed 2026-09-01)
+
+**HS-4b ✅ + the four pre-release follow-ups (#381 — or its HS-4d
+decision — #382, #383, #384) → first release → HS-4c → HS-4d's chosen
+path → HS-4e by usage.** HS-4b shipped 2026-09-01 (plan 041, PR #389),
+so **what stands between here and the first release is the pre-release
+follow-up list, nothing else on the milestone track.** Two of those
+four got sharper evidence from HS-4b: #382 (no connection-state op) is
+now also what blocks diagnosing #392 and what forces band assertions to
+be read as pixels, and #390 joins the testing-gap family though it is
+not itself release-blocking. Rationale for the order: HS-4b was small,
+locally verifiable pre-tag, and rounds out the platform story the
+release tells (both platforms persist locally, both connect to Linux
+hosts);
+HS-4c stays post-release because its risk is concentrated exactly
+where a first release is weakest — tag-time artifact surface and
+manual-only validation. The release itself also carries the standing
+live ritual: the shed L1–L4 reconnect checklist and the Mac→shed
+criterion, re-run against the release build.
 
 ### HS-5 — Local default flip (decision point, not scheduled)
 
@@ -703,9 +891,13 @@ never retried.
   degrades harmlessly to HS-2's behavior. See
   [`docs/reference/ipc.md`](../docs/reference/ipc.md#sessionset_focus)
   and [Known limitations](../docs/development/host-sessions.md#known-limitations).
-- Named sessions per host (`workbox:agents`) → after HS-3, if wanted.
+- Named sessions per host (`workbox:agents`) → HS-4e, on a usage
+  signal.
 - `systemd --user` / launchd supervision of `roost-session` (vs
-  plain daemon) → HS-2/3 hardening; plain daemon first.
+  plain daemon) → plain daemon shipped; the `enable-linger` systemd
+  recipe is documented (plan 040 C6), the launchd sibling lands with
+  HS-4b's docs, and an `install-unit` helper is HS-4e if the recipes
+  prove popular.
 - ~~Whether the Mac iced app ships host-sessions before general
   iced-on-Mac parity messaging~~ **Resolved by events**: the Mac iced
   build shipped the client surface with HS-2 (localhost hidden per

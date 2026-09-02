@@ -240,6 +240,37 @@ roost_cargo_target_dir() {
   echo "${cargo_target}"
 }
 
+# roost_build_workspace_bin REPO_ROOT CONFIG PACKAGE BIN_NAME
+#
+# Builds one workspace binary for CONFIG and sets ROOST_BUILT_BIN to the
+# artifact path in the caller's scope — the same caller-scope convention
+# roost_setup_cargo_profile uses, and required here rather than printing
+# the path: a command substitution would swallow cargo's build output
+# and demote the missing-artifact `exit 1` to a subshell exit.
+roost_build_workspace_bin() {
+  local repo_root="$1"
+  local config="$2"
+  local package="$3"
+  local bin_name="$4"
+
+  local cargo_bin
+  cargo_bin="$(roost_find_cargo)"
+  roost_setup_cargo_profile "${config}"
+  echo "==> Building ${bin_name} (cargo build -p ${package} --${ROOST_CARGO_PROFILE_DIR})"
+  (
+    # shellcheck disable=SC2164  # callers run this lib under `set -e`
+    cd "${repo_root}"
+    # shellcheck disable=SC2086
+    "${cargo_bin}" build -p "${package}" ${ROOST_CARGO_PROFILE_FLAG}
+  )
+
+  ROOST_BUILT_BIN="$(roost_cargo_target_dir "${repo_root}")/${ROOST_CARGO_PROFILE_DIR}/${bin_name}"
+  if [ ! -x "${ROOST_BUILT_BIN}" ]; then
+    echo "error: cargo build did not produce ${ROOST_BUILT_BIN}" >&2
+    exit 1
+  fi
+}
+
 # roost_build_and_embed_roostctl REPO_ROOT APP_DIR CONFIG
 #
 # Embed roostctl under Contents/Resources/bin/ so `claude install`
@@ -253,30 +284,71 @@ roost_build_and_embed_roostctl() {
   local app_dir="$2"
   local config="$3"
 
-  local cargo_bin
-  cargo_bin="$(roost_find_cargo)"
-  roost_setup_cargo_profile "${config}"
-  local cargo_profile_flag="${ROOST_CARGO_PROFILE_FLAG}"
-  local cargo_profile_dir="${ROOST_CARGO_PROFILE_DIR}"
-  echo "==> Building roostctl (cargo build -p roost-cli --${cargo_profile_dir})"
-  (
-    # shellcheck disable=SC2164  # callers run this lib under `set -e`
-    cd "${repo_root}"
-    # shellcheck disable=SC2086
-    "${cargo_bin}" build -p roost-cli ${cargo_profile_flag}
-  )
-
-  local cargo_target
-  cargo_target="$(roost_cargo_target_dir "${repo_root}")"
-  local roostctl_src="${cargo_target}/${cargo_profile_dir}/roostctl"
-  if [ ! -x "${roostctl_src}" ]; then
-    echo "error: cargo build did not produce ${roostctl_src}" >&2
-    exit 1
-  fi
+  roost_build_workspace_bin "${repo_root}" "${config}" roost-cli roostctl
   mkdir -p "${app_dir}/Contents/Resources/bin"
-  cp "${roostctl_src}" "${app_dir}/Contents/Resources/bin/roostctl"
+  cp "${ROOST_BUILT_BIN}" "${app_dir}/Contents/Resources/bin/roostctl"
   chmod +x "${app_dir}/Contents/Resources/bin/roostctl"
   echo "    Embedded: ${app_dir}/Contents/Resources/bin/roostctl"
+}
+
+# roost_build_and_embed_roost_session REPO_ROOT APP_DIR CONFIG
+#
+# Embed the `roost-session` host-session daemon (HS-4b, plan 041) so a
+# macOS bundle can start a local session with no separately installed
+# binary.
+#
+# Two paths, one Mach-O:
+#   * The REAL binary lands in Contents/MacOS/ — Apple's documented
+#     helper-tool location, and the directory the iced UI's own
+#     sibling-of-exe discovery rung searches (it passes its own
+#     executable to locate_session_binary, whose sibling dir inside a
+#     bundle is Contents/MacOS/). It is also the stable path the
+#     launchd recipe in docs/guides/host-sessions.md names.
+#   * A RELATIVE symlink at Contents/Resources/bin/roost-session,
+#     because the *bundled roostctl* sits there and `roostctl session
+#     start` climbs the same ladder from its own sibling dir. Relative
+#     so it survives the bundle being moved, copied into
+#     /Applications, or mounted read-only from a DMG.
+roost_build_and_embed_roost_session() {
+  local repo_root="$1"
+  local app_dir="$2"
+  local config="$3"
+
+  roost_build_workspace_bin "${repo_root}" "${config}" roost-session roost-session
+  cp "${ROOST_BUILT_BIN}" "${app_dir}/Contents/MacOS/roost-session"
+  chmod +x "${app_dir}/Contents/MacOS/roost-session"
+  mkdir -p "${app_dir}/Contents/Resources/bin"
+  ln -sfn ../../MacOS/roost-session "${app_dir}/Contents/Resources/bin/roost-session"
+  echo "    Embedded: ${app_dir}/Contents/MacOS/roost-session"
+  echo "    Embedded: ${app_dir}/Contents/Resources/bin/roost-session -> ../../MacOS/roost-session"
+}
+
+# roost_is_runtime_signed PATH
+#
+# True only when PATH carries a signature WE wrote — one with the
+# hardened-runtime flag, which `codesign --options runtime`
+# (codesign_or_die) sets and nothing else does.
+#
+# Why a flag check rather than a verify: on Apple Silicon the linker
+# ad-hoc-signs every arm64 Mach-O it emits, so a raw `cargo build`
+# artifact already reports flags=0x20002(adhoc,linker-signed), ALREADY
+# passes `codesign --verify --strict`, and yields a ZERO-byte
+# `codesign -d --entitlements` extraction. Neither a clean verify nor an
+# empty entitlements dump can therefore distinguish "we signed it" from
+# "we never touched it". The `runtime` token can: the linker never sets
+# it, and `linker-signed` must not be mistaken for it — hence the exact
+# comma-delimited token match below rather than a substring grep.
+roost_is_runtime_signed() {
+  local target="$1"
+  local flags=""
+  # codesign -d writes to stderr; a wholly unsigned target yields no
+  # flags= line at all, which falls through to the failure case.
+  flags="$(codesign -dvv "${target}" 2>&1 \
+    | sed -n 's/.*flags=0x[0-9a-fA-F]*(\([^)]*\)).*/\1/p' | head -1)" || true
+  case ",${flags}," in
+    *,runtime,*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # roost_setup_signing ENT_FILE ROOSTCTL_ENT_FILE

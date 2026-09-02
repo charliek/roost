@@ -1,5 +1,6 @@
-//! The palette's host-session verb family, and the one platform gate
-//! that decides which of them a build offers (plan 037 §3.1/§3.5).
+//! The palette's host-session verb family, and the one policy seam that
+//! decides which of them a build offers (plan 037 §3.1/§3.5, plan 041
+//! §3.1).
 //!
 //! Every host action lives in the command palette — there is no host
 //! menu and no per-section button beyond the inline ↻ Reconnect. One
@@ -8,10 +9,11 @@
 //! cannot Stop a session you are not attached to, and you cannot Remove
 //! a host you are still connected to.
 //!
-//! Pure and toolkit-free, which is the point: the macOS gate below is a
-//! field on [`VerbPolicy`] rather than a `cfg!` sprinkled through the
-//! adapter, so the Mac policy is a unit test that runs on Linux and the
-//! Linux policy is a unit test that runs on a Mac.
+//! Every shipping build offers the localhost surface. The withheld
+//! answer stays expressible as a [`VerbPolicy`] value rather than a
+//! `cfg!` sprinkled through the adapter, so a build that genuinely
+//! cannot reach a local session could hide the whole surface coherently
+//! — and both answers stay unit tests that run on any OS.
 
 use crate::host_sidebar::SectionState;
 
@@ -28,8 +30,8 @@ const CREATE_ON_PREFIX: &str = "host:create_on:";
 
 /// The id of the seeded-localhost Connect row — the one verb addressed
 /// to a host that is not saved yet (plan 037 §3.5). Activating it saves
-/// `localhost` and connects in one step, so a fresh Linux install
-/// reaches its own session without an Add Host detour.
+/// `localhost` and connects in one step, so a fresh install reaches its
+/// own session without an Add Host detour.
 pub const CONNECT_SEED_ID: &str = "host:connect_seed";
 
 /// The label and target the seeded entry saves under.
@@ -47,29 +49,33 @@ pub struct HostRow<'a> {
     pub label: &'a str,
     pub state: SectionState,
     /// Whether this host's target is this machine's own session. Only
-    /// this flag is gated on macOS; a host reached over an `ssh -L`
-    /// forward keeps its full verb set there.
+    /// this flag rides the policy; a host reached over an `ssh -L`
+    /// forward keeps its full verb set under either answer.
     pub localhost: bool,
 }
 
-/// The platform policy, as one value.
+/// The policy, as one value.
 ///
-/// `localhost_surface` is plan 037 §3.1's Mac gate: macOS packages no
-/// `roost-session`, so offering to connect to one would be a visible
-/// dead end (the roadmap's no-dead-end rule). `Add Host` is deliberately
-/// *not* gated — pointing a Mac at an `ssh -L` forward to a Linux box is
-/// the whole Mac→Linux payoff case, not a dead end.
+/// `localhost_surface` says whether this client offers to reach a
+/// session on this machine at all. [`VerbPolicy::current`] answers yes
+/// everywhere; `false` is kept expressible so hiding the surface stays a
+/// one-value change if some build ever cannot reach one (plan 041 §3.1's
+/// named fallback). `Add Host` is deliberately *never* gated — pointing
+/// at an `ssh -L` forward to another box is a real destination whatever
+/// the local answer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerbPolicy {
     pub localhost_surface: bool,
 }
 
 impl VerbPolicy {
-    /// What this build ships with. The single `cfg!` in the host-verb
-    /// path; everything else takes the answer as a value.
+    /// What this build ships with: every platform packages a
+    /// `roost-session` its client can reach (plan 041). A binary that is
+    /// genuinely missing gets the spawn ladder's own three-rung error,
+    /// which is actionable — a silently absent menu is not.
     pub fn current() -> Self {
         Self {
-            localhost_surface: !cfg!(target_os = "macos"),
+            localhost_surface: true,
         }
     }
 }
@@ -165,7 +171,7 @@ fn is_connected(state: SectionState) -> bool {
 ///   host that is not offers the way back in, plus Remove once it has
 ///   settled — removing a host mid-dial would race its own connection.
 /// * The seeded `localhost` row appears only on a fresh registry, and
-///   only where this client could talk to a local session at all.
+///   only where the policy offers the localhost surface at all.
 /// * `New Project on…` appears once there is somewhere else to create,
 ///   because with no hosts it is exactly `new_project`.
 pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
@@ -184,8 +190,8 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
     }
 
     for host in hosts {
-        // The Mac gate, applied at exactly one place: a localhost host
-        // on macOS has no session to reach, so it offers no connection
+        // The policy, applied at exactly one place: where the localhost
+        // surface is withheld, a localhost host offers no connection
         // verbs at all. It still lists in the sidebar and can still be
         // removed, which is the only honest thing left to do with it.
         let reachable = policy.localhost_surface || !host.localhost;
@@ -285,21 +291,33 @@ mod tests {
         items.iter().map(|item| item.id.as_str()).collect()
     }
 
-    const LINUX: VerbPolicy = VerbPolicy {
+    /// What every shipping build answers.
+    const FULL: VerbPolicy = VerbPolicy {
         localhost_surface: true,
     };
-    const MAC: VerbPolicy = VerbPolicy {
+    /// The withheld answer. No build produces it today; it is here
+    /// because the seam has to keep working if one ever does.
+    const GATED: VerbPolicy = VerbPolicy {
         localhost_surface: false,
     };
 
-    /// The zero-host baseline, both platforms. Linux seeds a localhost
-    /// Connect so a fresh install can reach its own session; macOS has
-    /// no session to reach and offers only Add Host — which is a real
-    /// destination there, not a dead end.
+    /// Every build ships the localhost surface — asserted on whatever OS
+    /// the suite runs, which is how `rust-build`'s two-OS `cargo test`
+    /// matrix proves it on both (plan 041 §3.1).
     #[test]
-    fn a_fresh_registry_offers_add_everywhere_and_the_seed_only_on_linux() {
-        assert_eq!(ids(&verbs(&[], LINUX)), vec![ADD_ID, CONNECT_SEED_ID]);
-        assert_eq!(ids(&verbs(&[], MAC)), vec![ADD_ID]);
+    fn the_shipping_policy_offers_the_localhost_surface() {
+        assert!(VerbPolicy::current().localhost_surface);
+    }
+
+    /// The zero-host baseline, under both answers. Add Host is
+    /// unconditional — it is the only entry point that exists before a
+    /// registry does. The seeded localhost Connect rides the surface, so
+    /// a withholding build would offer Add Host alone: fewer rows, but
+    /// still a real destination rather than a dead end.
+    #[test]
+    fn a_fresh_registry_offers_add_always_and_the_seed_only_with_the_surface() {
+        assert_eq!(ids(&verbs(&[], FULL)), vec![ADD_ID, CONNECT_SEED_ID]);
+        assert_eq!(ids(&verbs(&[], GATED)), vec![ADD_ID]);
     }
 
     /// The availability matrix, one host at a time. Connected offers the
@@ -334,7 +352,7 @@ mod tests {
         for (state, mut expected) in cases {
             expected.push(NEW_PROJECT_ON_ID);
             assert_eq!(
-                ids(&verbs(&[host("h", state)], LINUX)),
+                ids(&verbs(&[host("h", state)], FULL)),
                 expected,
                 "{state:?}"
             );
@@ -355,7 +373,7 @@ mod tests {
             SectionState::TakenOver,
             SectionState::Stopped,
         ] {
-            let items = verbs(&[host("h", state)], LINUX);
+            let items = verbs(&[host("h", state)], FULL);
             let has = |prefix: &str| items.iter().any(|item| item.id.starts_with(prefix));
             assert!(
                 !(has(STOP_PREFIX) && has(REMOVE_PREFIX)),
@@ -365,12 +383,12 @@ mod tests {
         }
     }
 
-    /// The Mac gate, tested on whatever OS this runs on — which is the
-    /// reason the policy is a value. A localhost host loses its
-    /// connection verbs there; a socket-path host (the `ssh -L` case)
-    /// keeps every one of them.
+    /// What withholding the surface costs, tested on whatever OS this
+    /// runs on — which is the reason the policy is a value rather than a
+    /// `cfg!`. A localhost host loses its connection verbs; a
+    /// socket-path host (the `ssh -L` case) keeps every one of them.
     #[test]
-    fn macos_hides_the_localhost_surface_and_nothing_else() {
+    fn a_gated_policy_hides_the_localhost_surface_and_nothing_else() {
         let local = HostRow {
             saved_id: "h1",
             label: "localhost",
@@ -379,29 +397,39 @@ mod tests {
         };
         let remote = host("h2", SectionState::Disconnected);
 
-        let mac = verbs(&[local, remote], MAC);
+        let gated = verbs(&[local, remote], GATED);
         assert!(
-            !ids(&mac).contains(&"host:connect:h1"),
-            "macOS must not offer to connect a localhost session it cannot run"
+            !ids(&gated).contains(&"host:connect:h1"),
+            "a client without the surface must not offer a session it cannot reach"
         );
         assert!(
-            ids(&mac).contains(&"host:remove:h1"),
+            ids(&gated).contains(&"host:remove:h1"),
             "but it is still a saved row the user can forget"
         );
-        assert!(ids(&mac).contains(&"host:connect:h2"));
+        assert!(ids(&gated).contains(&"host:connect:h2"));
         assert!(
-            ids(&mac).contains(&ADD_ID),
-            "Add Host is the Mac→Linux payoff case, never gated"
+            ids(&gated).contains(&ADD_ID),
+            "Add Host is the reach-another-box payoff case, never gated"
         );
 
-        // Same inputs, Linux policy: the localhost host is ordinary.
-        assert!(ids(&verbs(&[local, remote], LINUX)).contains(&"host:connect:h1"));
+        // Same inputs, the shipping answer: the localhost host is
+        // ordinary.
+        assert!(ids(&verbs(&[local, remote], FULL)).contains(&"host:connect:h1"));
     }
 
-    /// A connected localhost host on macOS: the gate applies to leaving
-    /// too, or a Mac build could hold a connection it has no verb to
-    /// drop. (It cannot get one — no launch auto-reconnect, no Connect —
-    /// but the rule is stated where it is enforced, not inferred.)
+    /// A connected localhost host under a withholding policy: the gate
+    /// applies to leaving too, so such a build lists no connection verbs
+    /// at all for it. Launch auto-reconnect reads the same policy so it
+    /// never *creates* that state on its own (`app.rs`'s
+    /// `reconnect_mode`).
+    ///
+    /// It is still reachable by hand, and deliberately so: dialing a
+    /// session that is already listening was never gated (D11), so the
+    /// sidebar's inline ↻ and `roostctl host connect` can still attach
+    /// one through `spawn_gate`'s `IfPresent` downgrade. Whichever build
+    /// ever ships `localhost_surface: false` has to gate those two
+    /// routes as well, or a user can attach with no verb to leave —
+    /// noted where the rule lives rather than left to be rediscovered.
     #[test]
     fn the_gate_covers_both_directions() {
         let connected = HostRow {
@@ -410,7 +438,7 @@ mod tests {
             state: SectionState::Connected,
             localhost: true,
         };
-        let offered = verbs(&[connected], MAC);
+        let offered = verbs(&[connected], GATED);
         let items = ids(&offered);
         assert!(!items.contains(&"host:disconnect:h1"));
         assert!(!items.contains(&"host:stop:h1"));
@@ -421,8 +449,8 @@ mod tests {
     /// ⌘N with an extra keystroke.
     #[test]
     fn the_picker_row_appears_only_once_there_is_somewhere_else_to_create() {
-        assert!(!ids(&verbs(&[], LINUX)).contains(&NEW_PROJECT_ON_ID));
-        assert!(ids(&verbs(&[host("h", SectionState::Disconnected)], LINUX))
+        assert!(!ids(&verbs(&[], FULL)).contains(&NEW_PROJECT_ON_ID));
+        assert!(ids(&verbs(&[host("h", SectionState::Disconnected)], FULL))
             .contains(&NEW_PROJECT_ON_ID));
     }
 
@@ -452,8 +480,8 @@ mod tests {
             host("live", SectionState::Connected),
             host("down", SectionState::Disconnected),
         ];
-        let mut items = verbs(&hosts, LINUX);
-        items.extend(verbs(&[], LINUX));
+        let mut items = verbs(&hosts, FULL);
+        items.extend(verbs(&[], FULL));
         items.extend(create_targets(&hosts, "Local"));
         for item in &items {
             assert!(parse(&item.id).is_some(), "{} does not parse", item.id);

@@ -4,7 +4,7 @@ A host session is a workspace that keeps running after Roost's window closes. In
 
 This guide is task-shaped: enabling a host on your own machine, reaching a second machine over SSH, the verb set, and what to do when something looks wrong. For the wire contract, see [`reference/ipc.md`](../reference/ipc.md#session-sockets); for the architecture, see [Host sessions (development)](../development/host-sessions.md).
 
-**Linux only, for now.** Host sessions are built into the iced UI — the Linux `roost` package and the experimental Roost-Iced Mac app. There is no `roost-session` daemon for macOS yet, so a Mac can only be a *client* of a host running elsewhere — see [macOS note](#macos-note) below. The Swift `Roost.app` doesn't have this feature at all; host sessions are iced-only.
+**Both platforms run a local session now.** Host sessions are built into the iced UI — the Linux `roost` package and the Roost-Iced Mac app both ship `roost-session` and can run a `localhost` session of their own; see [Enabling a host on this machine](#enabling-a-host-on-this-machine-localhost) below. What's still Linux-only is being an SSH *host*: reaching a machine as a remote SSH target still means a Linux box on the far end — see [macOS note](#macos-note) below for what that means for a Mac. The Swift `Roost.app` doesn't have this feature at all; host sessions are iced-only.
 
 ## Enabling a host on this machine (localhost)
 
@@ -22,6 +22,10 @@ roostctl session start   # starts (or confirms) roost-session
 then use the palette's **Add Host…** (or `roostctl host add`, below) to save it.
 
 Once connected, the sidebar gains a **LOCALHOST** section (or whatever label you gave it) alongside your local **LOCAL** projects, and any project you create there survives quitting Roost. With zero hosts saved, the sidebar is exactly what it always was — this is purely additive.
+
+`roost-session`'s own socket, state, and logs live at: on Linux, `$XDG_RUNTIME_DIR/roost-session/roost.sock` (state under `$XDG_DATA_HOME/roost-session/`, logs under `$XDG_STATE_HOME/roost-session/`); on macOS, `~/Library/Caches/RoostSession/roost.sock` (state under `~/Library/Application Support/RoostSession/`, logs under `~/Library/Logs/RoostSession/` — `RoostSessionDev` in place of `RoostSession` for a debug build, so a dev daemon can never collide with a real one). See [Paths and Environment](../reference/paths.md#session-profile) for the full table.
+
+**Persistence is scoped to host sections, not to Roost as a whole — worth stating plainly.** A project or tab created under *any* host section, including **LOCALHOST**, survives quitting Roost, because its shells live in `roost-session`, not in the app. An ordinary **LOCAL** tab is still hosted in-process and still ends when Roost quits, exactly as before — nothing about this feature changes that. Making persistence the default for local tabs too is a real option, but it's a deliberate future decision, not something this slice changed quietly.
 
 ## Adding a remote host (over SSH)
 
@@ -156,10 +160,63 @@ Roost catches this at Connect, before it ever tries to render anything, and show
 
 ## macOS note
 
-There is no `roost-session` build for macOS yet (tracked as future work — see the [roadmap](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)). On the Roost-Iced Mac build this means:
+`localhost` now works on macOS exactly the same way it does on Linux: `roost-session` ships inside `Roost-Iced.app` itself (`Contents/MacOS/roost-session`), so the seeded **Connect Host: localhost** row, spawn-if-missing, and launch-time auto-reconnect described above all apply unchanged to the Mac build. What stays Mac-specific:
 
-- The `localhost` surface is hidden entirely: no seeded `Connect Host: localhost` row, no launch-time auto-reconnect, nothing that would spawn a session your Mac can't build.
-- **Add Host still works, and it's the whole Mac→Linux payoff of this feature.** Point your Mac straight at a Linux box's SSH target — `workbox` / `user@host` / `ssh://…` — and Add Host reaches it directly; there's no manual `ssh -L` forward to stand up first (see [Adding a remote host](#adding-a-remote-host-over-ssh) above — the older forwarding recipe still works too, if you'd rather use it). Everything past Add Host — Connect, the sidebar section, the verb set — behaves identically once you've added a remote target.
+- **No SSH-to-a-Mac bootstrap yet.** Reaching a remote machine over SSH still means a Linux box on the far end: the install/upgrade flow that probes a remote and offers to install or start `roost-session` there for you (the [not-found row](#troubleshooting) below, and the remote "needs restart" dialog) only knows how to target Linux, so a Mac can't be added as a remote SSH host through those flows today. That's tracked as future work — see the [roadmap](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md).
+- **Add Host still reaches a Linux box directly** — `workbox` / `user@host` / `ssh://…` — with no manual `ssh -L` forward to stand up first (see [Adding a remote host](#adding-a-remote-host-over-ssh) above — the older forwarding recipe still works too, if you'd rather use it). Everything past Add Host — Connect, the sidebar section, the verb set — behaves identically whether the target is `localhost` or a remote Linux machine.
+- **The Swift `Roost.app` still has none of this feature at all** — permanently (see the top of this guide).
+
+### Surviving reboots (launchd)
+
+The [SSH-host reboot recipe](#adding-a-remote-host-over-ssh) above — `systemd --user` plus `loginctl enable-linger` — is Linux-specific. A Mac's own `roost-session` needs a different supervisor to come back on its own after a reboot, and the mechanism macOS actually offers has different scope, so this states the trade honestly rather than pretending it's the same trick.
+
+A `launchd` LaunchAgent is the macOS analog: a plist under `~/Library/LaunchAgents/` that launchd loads for your login session and can be told to keep the process running.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.stridelabs.roost-session</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Roost-Iced.app/Contents/MacOS/roost-session</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+</dict>
+</plist>
+```
+
+`--foreground` matters under a supervisor: launchd wants to own the process directly, so the daemon must not fork away from it the way an unsupervised `roost-session start` normally does.
+
+`KeepAlive` is deliberately `{SuccessfulExit: false}`, not bare `true`. A clean **Stop Session** (or `roostctl session stop`) exits `0` — under bare `KeepAlive: true`, launchd would read that as a crash and immediately resurrect the daemon you just told to stop, and it would just as happily race the upgrade flow's own stop-then-restart. `SuccessfulExit: false` reads that same exit `0` as "stopped on purpose" and only respawns on a nonzero exit — an actual crash — which auto-reconnect's connect-if-present then absorbs on its own.
+
+Load it once with:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.stridelabs.roost-session.plist
+```
+
+To stop it for good — not just for now — unload the agent:
+
+```bash
+launchctl bootout gui/$(id -u)/ai.stridelabs.roost-session
+```
+
+**Stop Session** and `roostctl session stop` still work exactly as they always do under supervision: the daemon ends and, because of `SuccessfulExit: false`, stays ended. What it does *not* do is forget the LaunchAgent — `RunAtLoad` starts a fresh session at your next login. Boot it out when you want that to stop happening too.
+
+Say what this actually buys you, honestly: a `gui/$UID` LaunchAgent starts at your **next login**, not at boot, and it stops at **logout** — this is not the same scope as Linux's `enable-linger` (which keeps a unit running with nobody logged in at all). A reboot brings your saved sidebar layout back either way, the next time Roost opens, but the *running shell processes* inside a session never survive a reboot, on any platform — what the LaunchAgent buys you is not having to remember to start `roost-session` by hand after you log back in.
+
+Point this at your real install (`/Applications/Roost-Iced.app`), not a dev/debug build — a debug build resolves the separate `RoostSessionDev` profile (see [Paths and Environment](../reference/paths.md#session-profile)), so pointing the plist at one is harmless, just confusing to debug later.
 
 ## Troubleshooting
 

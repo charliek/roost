@@ -73,7 +73,7 @@ flowchart LR
     Stripe["sidebar rollup stripe"]
     Banner["desktop notification"]
     IPC["JSON IPC server"]
-    Session["roost-session<br/>(opt-in host, Linux)"]
+    Session["roost-session<br/>(opt-in host, Linux + macOS)"]
 
     CLI --> IPC
     Hook --> IPC

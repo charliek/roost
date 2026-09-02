@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Hardened-runtime entitlements for the bundled `roost-session`
+    daemon (Contents/MacOS/roost-session, symlinked from
+    Contents/Resources/bin/) — HS-4b, plan 041.
+
+    Editing note: no double hyphens anywhere in this comment. AMFI's
+    XML parser (the one codesign hands an entitlements file to) rejects
+    the sequence even inside a comment, and the bundle build then dies
+    with "AMFIUnserializeXML: syntax error".
+
+    Deliberately EMPTY. The hardened runtime itself comes from
+    codesign's `runtime` option (codesign_or_die in bundle-lib.sh); an
+    entitlement is only needed to punch a hole back through it, and
+    this binary needs none:
+
+    * None of the app's capture set (device.audio-input, camera,
+      automation.apple-events). How macOS attributes a hosted shell's
+      mic/camera request under this headless process is an open
+      question, deliberately left to real usage evidence (plan 041
+      § 9): a TCC grant is inherited by every child the daemon ever
+      spawns, so it gets added when a concrete need names it, not
+      speculatively.
+
+    * NOT com.apple.security.cs.disable-library-validation, which
+      roostctl.entitlements carries (and whose own comment calls
+      droppable). Library validation only bites a process that loads
+      code signed by a different Team ID; roost-session links only
+      platform dylibs (libghostty-vt is linked in as a static archive,
+      and it dlopens nothing), so granting it would weaken the
+      hardened runtime for a WHY that does not apply here.
+
+    * No App Sandbox flags: sandboxing the shells the session hosts
+      would defeat the product, exactly as for the two UIs.
+
+    An empty dict is not the same as passing no entitlements file at
+    all: codesign_or_die always passes one, and this file keeps the
+    daemon's posture explicit and asserted (EntitlementsTests.swift
+    and CI's "Assert bundle contents" step).
+-->
+<plist version="1.0">
+<dict/>
+</plist>

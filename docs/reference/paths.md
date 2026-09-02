@@ -103,8 +103,10 @@ The directories are created at first launch with mode `0700`.
 
 `Session` resolves paths the same way the three UI profiles do, and is
 now live: the headless `roost-session` daemon (HS-1a, plan 035) resolves
-it — the Linux `.deb` ships it as `/usr/bin/roost-session`, opt-in via
-`roostctl session start`. It is still **not** a `roostctl --target` value
+it — the Linux `.deb` ships it as `/usr/bin/roost-session` and
+`Roost-Iced.app` ships it at `Contents/MacOS/roost-session` (HS-4b),
+opt-in via `roostctl session start` or the palette's
+**Connect Host: localhost**. It is still **not** a `roostctl --target` value
 and **not** a legal `ROOST_BUNDLE_PROFILE` value — `roostctl --target
 session` is rejected, and `ROOST_BUNDLE_PROFILE=session` is rejected by
 ordinary target resolution (the dedicated `session` verbs never consult
