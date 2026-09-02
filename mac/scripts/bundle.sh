@@ -164,9 +164,100 @@ ENT_FILE="${MAC_DIR}/Resources/Roost.entitlements"
 ROOSTCTL_ENT_FILE="${MAC_DIR}/Resources/roostctl.entitlements"
 if roost_setup_signing "${ENT_FILE}" "${ROOSTCTL_ENT_FILE}"; then
   codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl" "${ROOSTCTL_ENT_FILE}"
-  codesign_framework_or_die "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
-  codesign_or_die "${APP_DIR}"
+
+  # Under ROOST_ALLOW_UNSIGNED=1 a nested sign that FAILED returns 0 and
+  # the build walks on. The outer sign is not --deep, so it would then
+  # seal a helper still wearing only its linker signature — nested code
+  # with no hardened runtime and (with a Developer ID) the wrong Team ID,
+  # which notarization and Gatekeeper can reject. Same disposition as the
+  # abandoned-Sparkle branch below: refuse to seal a bad nested state.
+  NESTED_SIGNED=1
+  # shellcheck disable=SC2066  # single-item list is deliberate: bundle.sh
+  # embeds only roostctl (bundle-iced.sh's loop also covers roost-session);
+  # kept as a loop to mirror that script's structure, not an if-statement.
+  for nested_bin in \
+    "${APP_DIR}/Contents/Resources/bin/roostctl"
+  do
+    if ! roost_is_runtime_signed "${nested_bin}"; then
+      echo "==> warn: ${nested_bin} does not carry our signature (no hardened-runtime flag)" >&2
+      NESTED_SIGNED=0
+    fi
+  done
+
+  # An abandoned Sparkle chain (a component failure bypassed by
+  # ROOST_ALLOW_UNSIGNED=1) returns nonzero: skip the outer signature
+  # too, so a half-re-signed framework is never sealed under it — the
+  # exact state the strict chain exists to prevent. The hard-fail path
+  # (no ROOST_ALLOW_UNSIGNED) exits inside the helper and never gets
+  # here.
+  if [ "${NESTED_SIGNED}" != "1" ]; then
+    echo "==> warn: a nested binary is not signed by us; skipping the Sparkle chain and the outer app signature so an unsigned-by-us helper is never sealed under them" >&2
+  elif codesign_sparkle_or_die "${APP_DIR}/Contents/Frameworks/Sparkle.framework"; then
+    codesign_or_die "${APP_DIR}"
+  else
+    echo "==> warn: Sparkle chain abandoned; skipping the outer app signature so a half-re-signed framework is never sealed under it" >&2
+  fi
 fi
+
+# ---------------------------------------------------------------------
+# Post-bundle signature verification (mirrors bundle-iced.sh's self-check,
+# signature portion only — bundle.sh has no file-presence self-check).
+#
+# Whether to verify signatures is keyed on what actually HAPPENED, not on
+# ROOST_ALLOW_UNSIGNED — that flag only *tolerates* signing failures; with
+# working inputs a build with it set still signs everything, and skipping
+# verification there would be a silent pass.
+#
+# The predicate is Contents/_CodeSignature/CodeResources, which only the
+# outer bundle signature writes. `codesign -dv` cannot be the predicate:
+# it reports a signature on a bundle that was never sealed (linker
+# signing — see roost_is_runtime_signed in bundle-lib.sh).
+# ---------------------------------------------------------------------
+echo "==> Verifying bundle signature: ${APP_DIR}"
+BUNDLE_SIG_CHECK_FAILED=0
+if [ -f "${APP_DIR}/Contents/_CodeSignature/CodeResources" ]; then
+  if ! codesign -dv "${APP_DIR}" >/dev/null 2>&1; then
+    # Sealed but unreadable is BROKEN, not unsigned — something wrote the
+    # resource seal and the signature no longer reads back. Fatal
+    # regardless of ROOST_ALLOW_UNSIGNED: that bypass exists only for a
+    # bundle that was genuinely never signed at all.
+    echo "    FAIL: the .app carries Contents/_CodeSignature/CodeResources but 'codesign -dv' cannot read its signature — the bundle is broken, not unsigned" >&2
+    BUNDLE_SIG_CHECK_FAILED=1
+  else
+    # The nested binary must carry OUR signature. A strict verify alone
+    # does not prove that — see roost_is_runtime_signed in bundle-lib.sh
+    # for why the hardened-runtime flag is the only honest discriminator
+    # here.
+    ROOSTCTL_BIN="${APP_DIR}/Contents/Resources/bin/roostctl"
+    if codesign --verify --strict "${ROOSTCTL_BIN}" >/dev/null 2>&1 \
+       && roost_is_runtime_signed "${ROOSTCTL_BIN}"; then
+      echo "    OK: ${ROOSTCTL_BIN#"${APP_DIR}/"} strictly verifies and carries our hardened-runtime signature"
+    else
+      echo "    FAIL: ${ROOSTCTL_BIN#"${APP_DIR}/"} does not strictly verify, or lacks the hardened-runtime flag that proves we signed it" >&2
+      BUNDLE_SIG_CHECK_FAILED=1
+    fi
+    # Signing is inner→outer and never --deep; *verification* is deep —
+    # it is the only way to prove the nested signatures survived being
+    # sealed under the outer one.
+    if codesign --verify --deep --strict "${APP_DIR}" >/dev/null 2>&1; then
+      echo "    OK: codesign --verify --deep --strict passed for the .app"
+    else
+      echo "    FAIL: codesign --verify --deep --strict failed for the .app" >&2
+      BUNDLE_SIG_CHECK_FAILED=1
+    fi
+  fi
+elif [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
+  echo "    WARN: the .app carries no outer signature — SKIPPING all signature verification (ROOST_ALLOW_UNSIGNED=1 bypassed a signing step). This bundle is not shippable." >&2
+else
+  echo "    FAIL: the .app carries no outer signature and ROOST_ALLOW_UNSIGNED is not set" >&2
+  BUNDLE_SIG_CHECK_FAILED=1
+fi
+
+if [ "${BUNDLE_SIG_CHECK_FAILED}" -ne 0 ]; then
+  echo "error: bundle signature verification failed for ${APP_DIR}" >&2
+  exit 1
+fi
+echo "    Signature verification passed."
 
 echo "==> Bundled: ${APP_DIR}"
 echo "    Bundle ID:    ${BUNDLE_ID}"
