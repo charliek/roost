@@ -740,6 +740,29 @@ jobs:
           tools/roosttest/test_host_ssh.py
           --roost-target iced --roost-fresh -v
 
+      # Plan 042 W2's local-transport twin of the SSH-transport step: no
+      # tunnel at all, just `$ROOST_SESSION_BIN` pointed at a path that
+      # does not exist, so `localhost`'s own spawn attempt settles
+      # disconnected instead of ever dialing a socket. AFTER the
+      # SSH-transport step and never beside it (or the host-client step) —
+      # the override poisons every `roost-session` launch a concurrent
+      # host lane in this UI would attempt (`make e2e-host-missing-daemon`
+      # carries the same warning).
+      - name: Run missing-daemon E2E (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-missing-daemon-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-missing-daemon-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_host_local_missing_daemon.py
+          --roost-target iced --roost-fresh -v
+
       # HS-3 slice 2's bootstrap lane (plan 039 C6): the same fake-`ssh`
       # fixture in `run-remote` mode, so the generated probe/install/start
       # scripts really run. AFTER the SSH-transport step and never beside
@@ -881,6 +904,24 @@ jobs:
           tools/wayland/weston-run.sh
           uv run --group test pytest
           tools/roosttest/test_host_ssh.py
+          --roost-target iced --roost-fresh -v
+
+      # The Wayland twin of the X11 missing-daemon step. Same ordering
+      # rule: after the SSH-transport step, never beside it or the
+      # host-client step.
+      - name: Run missing-daemon E2E (Linux Wayland)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-missing-daemon-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-missing-daemon-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_host_local_missing_daemon.py
           --roost-target iced --roost-fresh -v
 
       # The Wayland twin of the X11 bootstrap step. Same ordering rule:
