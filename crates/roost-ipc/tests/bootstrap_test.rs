@@ -55,9 +55,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use roost_ipc::bootstrap::{
-    asset_name, checksum_name, shell_quote, BootstrapError, BootstrapJob, BootstrapOptions,
-    IdentityGate, InstallPhase, InstallSource, ProbeOutcome, RemoteArch, ResolvedSource,
-    SourceOrigin,
+    asset_name, checksum_name, shell_quote, sniff_binary, BootstrapError, BootstrapJob,
+    BootstrapOptions, IdentityGate, InstallPhase, InstallSource, ProbeOutcome, RemoteArch,
+    ResolvedSource, Sniff, SourceOrigin,
 };
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 use roost_ipc::session_launch::Verdict;
@@ -635,8 +635,14 @@ impl Harness {
 
     /// A local file to install *from*, which is also a working fake.
     fn source_file(&self, stub: &Stub) -> PathBuf {
-        let path = self._root.path().join(format!("source-{}", stub.name));
-        write_executable(&path, stub.script(&self.state).as_bytes());
+        self.source_bytes(&stub.name, stub.script(&self.state).as_bytes())
+    }
+
+    /// A source file that is raw bytes rather than a fake session —
+    /// what the override guard classifies, and nothing else runs it.
+    fn source_bytes(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = self._root.path().join(format!("source-{name}"));
+        write_executable(&path, bytes);
         path
     }
 
@@ -1360,6 +1366,185 @@ async fn a_source_that_cannot_be_read_fails_the_stream_and_stages_nothing() {
     }
     assert!(harness.staged().is_empty(), "{:?}", harness.staged());
     assert!(!harness.dest().exists(), "nothing was installed");
+    job.close().await;
+}
+
+// ============================================================================
+// The override guard
+// ============================================================================
+
+/// A synthetic ELF header: 52 bytes for class 1 (ELF32), 64 for class 2
+/// (ELF64), with `e_machine` at offset 18 encoded the way `EI_DATA`
+/// says it is.
+fn elf_header(class: u8, data: u8, machine: u16) -> Vec<u8> {
+    let mut header = vec![0u8; if class == 1 { 52 } else { 64 }];
+    header[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    header[4] = class;
+    header[5] = data;
+    header[6] = 1;
+    header[16] = 2;
+    let raw = if data == 1 {
+        machine.to_le_bytes()
+    } else {
+        machine.to_be_bytes()
+    };
+    header[18..20].copy_from_slice(&raw);
+    header
+}
+
+const EM_RISCV: u16 = 0xf3;
+
+const MACH_O_MAGICS: [[u8; 4]; 6] = [
+    [0xfe, 0xed, 0xfa, 0xce],
+    [0xfe, 0xed, 0xfa, 0xcf],
+    [0xce, 0xfa, 0xed, 0xfe],
+    [0xcf, 0xfa, 0xed, 0xfe],
+    [0xca, 0xfe, 0xba, 0xbe],
+    [0xbe, 0xba, 0xfe, 0xca],
+];
+
+/// Both classes and both endiannesses, because the header declares its
+/// own byte order and a guard that assumed little-endian would misread
+/// a big-endian one as some other machine entirely.
+#[test]
+fn sniff_reads_the_arch_of_every_elf_class_and_endianness() {
+    for class in [1u8, 2] {
+        for data in [1u8, 2] {
+            assert_eq!(
+                sniff_binary(&elf_header(class, data, 0x3e)),
+                Sniff::Elf(RemoteArch::Amd64),
+                "class {class} data {data}"
+            );
+            assert_eq!(
+                sniff_binary(&elf_header(class, data, 0xb7)),
+                Sniff::Elf(RemoteArch::Arm64),
+                "class {class} data {data}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sniff_carries_the_raw_machine_of_an_elf_roost_has_no_build_for() {
+    for data in [1u8, 2] {
+        assert_eq!(
+            sniff_binary(&elf_header(2, data, EM_RISCV)),
+            Sniff::ElfOther(EM_RISCV),
+            "data {data}"
+        );
+    }
+}
+
+#[test]
+fn sniff_recognizes_every_mach_o_magic() {
+    for magic in MACH_O_MAGICS {
+        let mut file = magic.to_vec();
+        file.extend_from_slice(&[0u8; 60]);
+        assert_eq!(sniff_binary(&file), Sniff::MachO, "{magic:02x?}");
+    }
+}
+
+/// The fall-through half of the guard, and the half the rest of this
+/// suite depends on: a `#!/bin/sh` stub and a 4-byte `\x7fELF` fixture
+/// are unrecognizable, not wrong, so they go on to the staged verify.
+#[test]
+fn sniff_leaves_a_script_or_a_truncated_header_unknown() {
+    assert_eq!(sniff_binary(b"#!/bin/sh\necho hi\n"), Sniff::Unknown);
+    assert_eq!(sniff_binary(b"\x7fELF"), Sniff::Unknown);
+    assert_eq!(sniff_binary(b""), Sniff::Unknown);
+    assert_eq!(sniff_binary(&elf_header(2, 1, 0x3e)[..19]), Sniff::Unknown);
+    // An ELF whose class or byte order is not one of the two defined
+    // values can't be read, which is not the same as being wrong.
+    assert_eq!(sniff_binary(&elf_header(2, 9, 0x3e)), Sniff::Unknown);
+    assert_eq!(sniff_binary(&elf_header(7, 1, 0x3e)), Sniff::Unknown);
+}
+
+/// Plan 042 AC9: the wrong-arch override fails at `resolve_source`,
+/// naming both arches, with nothing sent to the host.
+#[tokio::test]
+async fn an_install_bin_of_the_wrong_arch_is_refused_before_anything_is_streamed() {
+    let harness = Harness::new();
+    let source = harness.source_bytes("arm64", &elf_header(2, 1, 0xb7));
+    let mut options = harness.options();
+    options.install_bin = Some(source.clone());
+    let job = harness.job(options).await;
+
+    let error = job
+        .resolve_source(RemoteArch::Amd64)
+        .await
+        .expect_err("an arm64 binary is not installable on an amd64 host");
+    let BootstrapError::Source(detail) = &error else {
+        panic!("{error:?}");
+    };
+    assert!(detail.contains("arm64"), "{detail}");
+    assert!(detail.contains("amd64"), "{detail}");
+    assert!(detail.contains(&source.display().to_string()), "{detail}");
+    assert!(error.message("workbox").contains("untouched"));
+
+    assert!(!harness.dest().exists(), "nothing was installed");
+    assert!(harness.staged().is_empty(), "{:?}", harness.staged());
+    job.close().await;
+}
+
+#[tokio::test]
+async fn an_install_bin_that_is_a_macos_binary_is_refused() {
+    let harness = Harness::new();
+    let mut bytes = vec![0xcf, 0xfa, 0xed, 0xfe];
+    bytes.extend_from_slice(&[0u8; 60]);
+    let source = harness.source_bytes("macho", &bytes);
+    let mut options = harness.options();
+    options.install_bin = Some(source);
+    let job = harness.job(options).await;
+
+    let error = job
+        .resolve_source(RemoteArch::Arm64)
+        .await
+        .expect_err("a Mach-O will never run on a Linux host");
+    assert!(
+        matches!(&error, BootstrapError::Source(detail) if detail.contains("macOS")),
+        "{error:?}"
+    );
+    assert!(!harness.dest().exists(), "nothing was installed");
+    job.close().await;
+}
+
+#[tokio::test]
+async fn an_install_bin_for_an_unsupported_machine_is_refused_naming_it() {
+    let harness = Harness::new();
+    let source = harness.source_bytes("riscv", &elf_header(2, 1, EM_RISCV));
+    let mut options = harness.options();
+    options.install_bin = Some(source);
+    let job = harness.job(options).await;
+
+    let error = job
+        .resolve_source(RemoteArch::Amd64)
+        .await
+        .expect_err("roost publishes no riscv64 build");
+    assert!(
+        matches!(&error, BootstrapError::Source(detail) if detail.contains("0xf3")),
+        "{error:?}"
+    );
+    assert!(!harness.dest().exists(), "nothing was installed");
+    job.close().await;
+}
+
+/// The guard refuses only what it can prove wrong. This suite's own
+/// fake `roost-session` is a shell script, so the override rung has to
+/// keep accepting it — no test-mode exemption in the product code.
+#[tokio::test]
+async fn an_install_bin_the_guard_cannot_classify_still_resolves() {
+    let harness = Harness::new();
+    let source = harness.source_file(&Stub::matching("script"));
+    let mut options = harness.options();
+    options.install_bin = Some(source.clone());
+    let job = harness.job(options).await;
+
+    let resolved = job
+        .resolve_source(RemoteArch::Amd64)
+        .await
+        .expect("a script is unrecognizable, not wrong");
+    assert_eq!(resolved.path(), source);
+    assert_eq!(*resolved.origin(), SourceOrigin::Override);
     job.close().await;
 }
 

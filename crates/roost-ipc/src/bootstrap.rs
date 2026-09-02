@@ -1115,6 +1115,73 @@ pub fn map_arch(uname_m: &str) -> Result<RemoteArch, BootstrapError> {
     }
 }
 
+/// What the first bytes of a candidate `roost-session` say it is.
+///
+/// Deliberately coarse, and deliberately biased towards
+/// [`Sniff::Unknown`]: the only callers use this to refuse what is
+/// *provably* wrong for a Linux host, and everything it cannot identify
+/// has to keep flowing to the far side's staged verify, which is the
+/// gate that actually decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sniff {
+    /// An ELF for an architecture roost publishes a build for.
+    Elf(RemoteArch),
+    /// An ELF for some other machine, carrying the raw `e_machine`.
+    ElfOther(u16),
+    /// A Mach-O object or universal binary — the Mac-developer mistake.
+    MachO,
+    /// A script, a short file, or a format this doesn't know.
+    Unknown,
+}
+
+/// A whole ELF64 header, which is more than [`sniff_binary`] reads but
+/// is the natural unit to lift off disk in one go.
+const HEADER_PEEK: u64 = 64;
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const EM_X86_64: u16 = 0x3e;
+const EM_AARCH64: u16 = 0xb7;
+
+/// The six Mach-O magics: thin objects little- and big-endian
+/// (`FEEDFACE`/`FEEDFACF` and their byte-swaps) plus the fat header
+/// (`CAFEBABE`) and its swap.
+const MACHO_MAGICS: [[u8; 4]; 6] = [
+    [0xfe, 0xed, 0xfa, 0xce],
+    [0xfe, 0xed, 0xfa, 0xcf],
+    [0xce, 0xfa, 0xed, 0xfe],
+    [0xcf, 0xfa, 0xed, 0xfe],
+    [0xca, 0xfe, 0xba, 0xbe],
+    [0xbe, 0xba, 0xfe, 0xca],
+];
+
+/// Classify a file's leading bytes. Pure, total, and never panics on a
+/// short slice — a truncated header is [`Sniff::Unknown`], not a guess.
+///
+/// `e_machine` sits at offset 18 in both ELF classes and is encoded in
+/// the header's own endianness, which `EI_DATA` (offset 5) declares, so
+/// 20 bytes is everything this needs. An ELF whose `EI_CLASS` or
+/// `EI_DATA` is not one of the two defined values is unreadable rather
+/// than wrong, and falls through as unknown.
+pub fn sniff_binary(bytes: &[u8]) -> Sniff {
+    if MACHO_MAGICS.iter().any(|magic| bytes.starts_with(magic)) {
+        return Sniff::MachO;
+    }
+    if bytes.len() < 20 || !bytes.starts_with(&ELF_MAGIC) {
+        return Sniff::Unknown;
+    }
+    let raw = [bytes[18], bytes[19]];
+    let machine = match (bytes[4], bytes[5]) {
+        (1 | 2, 1) => u16::from_le_bytes(raw),
+        (1 | 2, 2) => u16::from_be_bytes(raw),
+        _ => return Sniff::Unknown,
+    };
+    match machine {
+        EM_X86_64 => Sniff::Elf(RemoteArch::Amd64),
+        EM_AARCH64 => Sniff::Elf(RemoteArch::Arm64),
+        other => Sniff::ElfOther(other),
+    }
+}
+
 // ============================================================================
 // Release assets
 // ============================================================================
@@ -3194,8 +3261,9 @@ pub fn client_arch() -> Option<RemoteArch> {
 /// **Only rung 3 is sha256-verified here, and that is the design.**
 /// There is no published checksum for a file on this machine, so there
 /// is nothing rungs 1 and 2 could be checked against locally. What gates
-/// them is the sibling rung's own local `identify` plus — for every rung
-/// alike — the remote staged verify before the commit and the
+/// them is rung 1's own [`sniff_binary`] and the sibling rung's local
+/// `identify`, plus — for every rung alike — the remote staged verify
+/// before the commit and the
 /// post-commit re-verify after it, which are the two checks that decide
 /// what actually runs over there.
 pub async fn resolve_source(
@@ -3208,7 +3276,7 @@ pub async fn resolve_source(
 
     if wanted(InstallSource::Env) {
         match &options.install_bin {
-            Some(path) => return resolve_override(path),
+            Some(path) => return resolve_override(path, arch),
             None if forced == Some(InstallSource::Env) => {
                 return Err(BootstrapError::Source(format!(
                     "{INSTALL_BIN_ENV} was forced as the install source but is not set"
@@ -3249,27 +3317,66 @@ pub async fn resolve_source(
 /// [`crate::session_launch::locate_session_binary`]'s reason: an
 /// explicit override that cannot be used means the user asked for a
 /// specific binary, and quietly installing a different one is worse than
-/// failing. What it is *not* checked for is being the right build —
-/// that is the staged verify's job, on the far side, where it is the
-/// same check for every source.
-fn resolve_override(path: &Path) -> Result<ResolvedSource, BootstrapError> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
+/// failing.
+///
+/// What is checked **here** is only what can be settled from the file's
+/// own first bytes ([`sniff_binary`]): its architecture class against
+/// the remote's, and formats that are provably not a Linux binary for
+/// that host — a wrong-arch ELF, an ELF for a machine roost has no build
+/// for, a Mach-O. Anything else — a shell script, a short file, an
+/// unrecognized format — passes through untouched.
+///
+/// What stays the far side's job is being the *right build*: the staged
+/// verify before the commit runs `identify` over there and is the same
+/// check for every rung of the ladder. So is anything that only the
+/// remote can know, such as a missing dynamic loader for an otherwise
+/// correct ELF.
+///
+/// Accepted: this reads a path the streamer later reopens, so a file
+/// swapped in between is a TOCTOU window on the developer's own machine.
+/// That is fine, because this guard is early feedback on a dev escape
+/// hatch — not a security boundary. The staged verify is.
+fn resolve_override(path: &Path, arch: RemoteArch) -> Result<ResolvedSource, BootstrapError> {
+    let unreadable = |error: std::io::Error| {
         BootstrapError::Source(format!(
             "{INSTALL_BIN_ENV}={} could not be read: {error}",
             path.display()
         ))
-    })?;
+    };
+    let metadata = std::fs::metadata(path).map_err(unreadable)?;
     if !metadata.is_file() {
         return Err(BootstrapError::Source(format!(
             "{INSTALL_BIN_ENV}={} is not a regular file",
             path.display()
         )));
     }
-    Ok(ResolvedSource {
-        path: path.to_path_buf(),
-        origin: SourceOrigin::Override,
-        verified: None,
-    })
+
+    let mut head = Vec::with_capacity(HEADER_PEEK as usize);
+    std::fs::File::open(path)
+        .and_then(|file| {
+            use std::io::Read as _;
+            file.take(HEADER_PEEK).read_to_end(&mut head)
+        })
+        .map_err(unreadable)?;
+    match sniff_binary(&head) {
+        Sniff::Elf(found) if found != arch => Err(BootstrapError::Source(format!(
+            "{INSTALL_BIN_ENV}={} is an {found} Linux binary but that host is {arch}",
+            path.display()
+        ))),
+        Sniff::ElfOther(machine) => Err(BootstrapError::Source(format!(
+            "{INSTALL_BIN_ENV}={} is an ELF for machine 0x{machine:x}, not amd64/arm64",
+            path.display()
+        ))),
+        Sniff::MachO => Err(BootstrapError::Source(format!(
+            "{INSTALL_BIN_ENV}={} is a macOS binary, not a Linux one",
+            path.display()
+        ))),
+        Sniff::Elf(_) | Sniff::Unknown => Ok(ResolvedSource {
+            path: path.to_path_buf(),
+            origin: SourceOrigin::Override,
+            verified: None,
+        }),
+    }
 }
 
 /// Rung 2: this client's own `roost-session`, if it could run over there
