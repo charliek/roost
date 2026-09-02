@@ -770,9 +770,60 @@ None of these starts without a usage signal.
 
 #### Sequencing toward the first release (proposed 2026-09-01)
 
-**HS-4b ✅ + the four pre-release follow-ups (#381 — or its HS-4d
-decision — #382, #383, #384) → first release → HS-4c → HS-4d's chosen
-path → HS-4e by usage.** HS-4b shipped 2026-09-01 (plan 041, PR #389),
+**HS-4b ✅ + the pre-release follow-ups (#381 — or its HS-4d
+decision — #382, #383, #384, plus #392 and #393 added 2026-09-02) →
+first release → HS-4c → HS-4d's chosen path → HS-4e by usage.**
+
+**Order within the pre list (recommended 2026-09-02):** #382 first — it
+is small, and it is the enabler the rest lean on: it makes #392's band
+copy assertable, it replaces #384's log-scraping with real state, and it
+is what turns "read the PNG" into a test. Then #393+#384 together, since
+a live harness and the ability to place a build on a remote are one
+capability. #392 rides along once #382 exists. #383 is testing-debt that
+pays for itself but blocks nothing. #381 is the odd one out — it is a
+*design* decision (atomic conditional-connect vs. adopting HS-4d's
+viewports, which closes it by construction), not an implementation task,
+and wants a conversation before a plan.
+
+**Release-blocking work from outside this roadmap (swept 2026-09-02).**
+This list stays scoped to items host-session work surfaced, so these are
+named rather than absorbed — but they gate the same release:
+[#355](https://github.com/charliek/roost/issues/355) (macOS notification
+authorization is checked once at launch and cached forever, both UIs) and
+[#369](https://github.com/charliek/roost/issues/369) (`tab.focus` over
+IPC never clears the sidebar badge) both land directly on the
+agent-notification routing this product is differentiated by, and HS-4b
+amplifies both — host tab focus routes through that same op, and a Mac
+host client keeps sessions alive long enough for a mid-session
+permission change to matter.
+[#351](https://github.com/charliek/roost/issues/351) is the same
+differentiator failing on the default Linux desktop stack: a
+notification click switches tab but never raises the window, because
+winit's `focus_window` is a documented Wayland no-op and the
+`xdg-activation` token we already receive goes unused.
+[#266](https://github.com/charliek/roost/issues/266) is a cheap
+iced-only correctness bug that Mac already fixed — exactly the drift the
+north star's parity rule exists to catch.
+[#356](https://github.com/charliek/roost/issues/356) is release
+machinery: the mac job never proves `SPARKLE_ED_PRIVATE_KEY` matches the
+bundled `SUPublicEDKey`, while the iced job already does the real
+derive-and-compare — a mechanical port, not a design question.
+
+**The ghostty pin: bump before the release, or not for a long while.**
+The pin is already at main tip (`f2d5758f`, bumped 2026-08-27), so the
+"943 commits behind" note above is stale and **none** of the
+adoption items (#364, #365, #366, #367) needs a bump — the C API they
+want is already vendored. The timing asymmetry is what matters: a bump
+*before* the first release is safe, because daemon and client ship in
+the same artifact and lockstep is automatic. *After* release it is
+materially riskier — HS-4b just made a long-lived `roost-session` daemon
+a real thing on both platforms, and every user with one running must
+restart it after upgrading or their attaches fail the exact-match gate
+(cleanly, with `build-mismatch` — the wire fails safe, not silently, but
+it still fails). Any pin bump we want in the near term should therefore
+ride this release, not the one after.
+
+HS-4b shipped 2026-09-01 (plan 041, PR #389),
 so **what stands between here and the first release is the pre-release
 follow-up list, nothing else on the milestone track.** Two of those
 four got sharper evidence from HS-4b: #382 (no connection-state op) is
@@ -836,6 +887,34 @@ uncategorised, not implicitly "post".
   `ConnectTimeout`, and a daemonised master outliving the app. It found
   real bugs, and it encodes three traps that each made a lane report
   PASS while proving nothing.
+- **[#393](https://github.com/charliek/roost/issues/393) No easy way to
+  get a matching dev `roost-session` onto a remote host.** Scoped with
+  #384, because they are two halves of one capability: a live harness
+  needs a way to *place* the build it tests. The install half already
+  exists (`ROOST_SESSION_INSTALL_BIN`, ungated, staged
+  verify-before-commit) and so does the hard part of cross-building from
+  a Mac (`tools/shed/build-in-shed.sh` already redirects
+  `CARGO_TARGET_DIR` and bind-mounts the ghostty dirs) — what is missing
+  is that the shed builder does not build `roost-session`, nothing
+  carries the artifact back out, and the arch axis is a silent trap. Not
+  release-*blocking* on its own; it is on the pre list because every
+  remaining item here wants a live remote check, and doing it first is
+  what makes the other three cheap.
+- **[#392](https://github.com/charliek/roost/issues/392) A missing
+  daemon binary reports an unusable error.** The spawn ladder produces
+  the right three-rung message, then localhost's own retry ladder
+  buries it: `connect_loop` sets `mode = Dial` after the first attempt
+  (`host_conn/task.rs:309-310`), `ensure_socket` returns `Ok` for `Dial`
+  without probing, and each retry's generic dial failure overwrites the
+  band with `io error: No such file`. Localhost's ladder is **unbounded**
+  — the attempt budget is `SSH_ATTEMPT_BUDGET`, SSH-only — so a broken
+  install retries forever, re-burying the message each time. The verdict
+  is already written down for the SSH side: `retryable()`'s table gives
+  `NotFound` a "no — nothing to exec, and a retry cannot install it"
+  (`host_conn/reconnect.rs:102`); the localhost spawn failure is the
+  same class and arrives as `DropInput::Session(None)`, which retries.
+  Small, and worth doing before a release precisely because a broken
+  install is a first-run experience.
 
 ### Post initial release
 
