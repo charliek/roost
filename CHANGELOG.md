@@ -289,6 +289,51 @@ release workflow asserts they agree).
   new libghostty error codes (`IO_ERROR`, `LIMIT_EXCEEDED`, `REJECTED`) are
   mapped into `roost-vt`'s `Error` enum.
 
+### Fixed
+
+- **macOS notification authorization is re-read on focus gain, on both
+  UIs (#355)** — granting or revoking notification permission in System
+  Settings used to need a relaunch to take effect; the authorization
+  state was read once at launch and cached for the life of the process.
+  Both the Swift app and Roost-Iced now re-read it whenever the window
+  regains focus — the moment a user comes back from System Settings —
+  so the next notification honors the change with no relaunch.
+  `app.notification_status`, the test-gated IPC op for reading this
+  state, is now served by both UIs with the same
+  `{backend, reason, authorized}` shape.
+- **Focusing a tab acknowledges its notification, in both cores
+  (#369)** — `tab.focus` moved the selection but left the tab's
+  pending-attention badge standing, so a hook- or `roostctl`-driven
+  focus (not just a click) left the sidebar lying. The core now clears
+  the notification and emits `tab.notification` with
+  `has_pending: false` right after `active.changed`, in the same
+  batch, which also retires the tab's inbox row and its project's
+  rollup — all three derive from the same bit. Focusing an
+  already-active badged tab acknowledges it too.
+- **`tab.open` with no `cwd` resolves correctly on iced (#266)** — a
+  bare `roostctl tab open` landed the new shell in the *UI process's*
+  own working directory instead of the project's; Mac already resolved
+  this, and the shared Rust engine's IPC handler now does too. The fix
+  lives in `Workspace::open_tab`, the one path every caller reaches, so
+  title derivation and agent git metrics — both keyed off tab cwd —
+  stop drifting from where the shell actually runs.
+- **The mac release job now proves the Sparkle keypair matches before
+  building (#356)** — it previously checked only that the public key
+  wasn't the known throwaway string. It now derives the release
+  secret's public half (through both base64 layers, comparing the
+  trailing 32 bytes directly for a 96-byte legacy key) and checks it
+  against the committed `SUPublicEDKey` in the Info.plist template —
+  the same real derive-and-compare the iced job has done since #349,
+  with no prerelease exemption. A mismatched pair used to ship a DMG
+  that could never self-update, with nothing else noticing.
+- **`bundle.sh`'s nested signatures can no longer fail silently under
+  `ROOST_ALLOW_UNSIGNED=1` (#391)** — mirroring the guard
+  `bundle-iced.sh` already had, a tolerated failure signing the nested
+  `roostctl` or Sparkle framework now blocks the outer `Roost.app`
+  signature instead of producing a bundle that looks signed but isn't,
+  and a permanent post-bundle verification step catches a broken or
+  partial seal the pre-sign guard alone could miss.
+
 ## v0.0.18 — 2026-08-25
 
 **Linux switches to the iced UI, and macOS gains an experimental iced build

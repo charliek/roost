@@ -992,12 +992,13 @@ ignores the variable entirely.
 
 Implemented only by the iced UI on macOS, same as `app.menu_dump`.
 
-### `app.notification_status` *(test-only — gated, macOS iced only)*
+### `app.notification_status` *(test-only — gated, macOS only)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
-Without it the server returns `not-enabled`. Reads back the macOS iced
-UI's `UNUserNotificationCenter` backend state
-(`crates/roost-iced/src/macos/notifications.rs`).
+Without it the server returns `not-enabled`. Reads back the calling
+UI's `UNUserNotificationCenter` backend state — the iced UI from
+`crates/roost-iced/src/macos/notifications.rs`, the Swift app from
+`DesktopNotifications.status()` in `mac/Sources/Roost/DesktopNotifications.swift`.
 
 Request: `{"params": {}}`. Response:
 
@@ -1005,18 +1006,24 @@ Request: `{"params": {}}`. Response:
 {"backend": "available", "reason": null, "authorized": false}
 ```
 
-`backend` is `"available"` once the UN delegate has installed — a
-bundled launch that has reached `window_opened` — and `"unavailable"`
-otherwise: every bare-binary build (no app bundle, so UN is never
-touched), and a bundled app before its first window opens. `reason`
-names why it is unavailable (`"not running from an app bundle"`,
-`"window not opened yet"`), or `null` once available. `authorized` is
-the user's answer to the authorization prompt, always `false` while
-unavailable — CI's TCC authorization state is unknowable, so the
-automated suite never asserts this `true`; the real prompt/click is the
-morning checklist (#285).
+On iced, `backend` is `"available"` once the UN delegate has
+installed — a bundled launch that has reached `window_opened` — and
+`"unavailable"` otherwise: every bare-binary build (no app bundle, so
+UN is never touched), and a bundled app before its first window opens.
+`reason` names why it is unavailable (`"not running from an app
+bundle"`, `"window not opened yet"`), or `null` once available. The
+Swift app has no such gate — its `UNUserNotificationCenter` delegate is
+installed at construction, and a build that could not do that would
+have aborted at launch rather than produced a running process to query
+— so it always reports `backend: "available"` with a `null` `reason`.
+`authorized` is the user's answer to the authorization prompt on both
+UIs, always `false` while `backend` is `"unavailable"` — CI's TCC
+authorization state is unknowable, so the automated suite never asserts
+this `true`; the real prompt/click is the morning checklist (#285).
 
-Implemented only by the iced UI on macOS, same as `app.menu_dump`.
+Implemented by both UIs, macOS only — unlike `app.menu_dump` above and
+the other macOS-gated ops around it, which are iced only and have no
+Swift counterpart.
 
 ### `sidebar.set_width` *(test-only — gated)*
 
