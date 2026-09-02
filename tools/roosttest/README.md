@@ -199,6 +199,36 @@ def test_echo(roost, project):
     assert "X=42" in roost.dump_text(tab)
 ```
 
+### Host connection state: `host.status`, never the log
+
+Assert a host's connection state through the `host.status` op
+(`client.host_status(id=None)`), never by scraping the UI's `tracing`
+output. A log line is an operator convenience that a refactor is free to
+reword or drop; a test reading one passes just as happily against a
+feature that has stopped working, which is exactly what
+`test_host_ssh.py` did before plan 042. The op returns the same state
+the sidebar's band is drawn from: `state`, `reason` (untruncated),
+`rollup` (the band's own string), `generation`, and `retry`.
+
+Two edges are worth knowing before writing a wait against it:
+
+- **`generation` counts attempts *started*, not connections.** An ssh
+  establish that never succeeds still advances it, and it survives a
+  disconnect. Read it *before* the op that starts an attempt and wait
+  for it to advance — two consecutive attempts can fail with
+  byte-identical reasons, so "disconnected with a reason" cannot tell
+  one from the next. It is also the flatness check for "nothing further
+  happened": a timer that fired and re-armed between two polls can leave
+  `retry` looking absent at both, but cannot leave `generation` still.
+- **`retry.attempt` is monotonic, and a poll may skip a rung.** Wait for
+  `attempt >= n` and assert non-decrease across polls; never demand to
+  see a particular rung, which a short `ROOST_SSH_RECONNECT_BASE_MS`
+  makes a race.
+
+`retry` is present only while a rung is armed, and it carries
+`attempt`/`budget` for the ssh ladder alone — a localhost backoff
+reports `delay_ms` and nothing else.
+
 ### OSC-routed regression patterns *(test-mode IPC ops)*
 
 When the behavior under test is a **byte-level wiring** detail — does

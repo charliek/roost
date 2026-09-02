@@ -299,6 +299,23 @@ class Roost:
         (plan 007 §3.8)."""
         return self.call("app.sidebar_dump", {})
 
+    # -- host sessions ----------------------------------------------------
+    def host_status(self, id: str | None = None) -> dict:
+        """Every saved host's live connection state, or just `id`'s.
+
+        Returns the op's result verbatim: ``{"hosts": [{id, label,
+        target, last_connected?, generation, state, reason?, detail?,
+        rollup?, retry?}, ...]}``. This is the surface a test asserts
+        host state through — never the UI's log, whose lines are an
+        operator convenience a refactor is free to reword.
+
+        `generation` counts attempts *started*, so it is the edge to
+        wait on when two consecutive attempts fail identically. An
+        unknown `id` raises `RoostError('not-found')`, and every
+        optional field is absent rather than null."""
+        params = {} if id is None else {"id": id}
+        return self.call("host.status", params)
+
     # -- command palette --------------------------------------------------
     # Each op returns the resulting palette state:
     #   {open: bool, frame?: str, query: str, selection: int,

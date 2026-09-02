@@ -1,10 +1,10 @@
 //! `roostctl host` — manage the client-side saved-host registry
 //! (host-sessions HS-2, plan 037 C1).
 //!
-//! Five verbs — `add`, `list`, `remove`, `connect`, `disconnect` — each
-//! driving the same `host.*` op the UI's own palette row does, so the
-//! CLI can never diverge from what a click does (plan 037 §3.5's
-//! ops-parity rule).
+//! Six verbs — `add`, `list`, `remove`, `connect`, `disconnect`,
+//! `status` — each driving the same `host.*` op the UI's own palette row
+//! does, so the CLI can never diverge from what a click does (plan 037
+//! §3.5's ops-parity rule).
 //!
 //! `Stop Session` is the one palette verb with no equivalent here: it
 //! goes straight onto the host's own queue as `session.stop`, so there
@@ -16,12 +16,14 @@
 //! resolved and connected (`main.rs`'s ordinary target-selector
 //! prologue), never the session profile.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use clap::Subcommand;
 
 use roost_ipc::messages::{
     ops, HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult,
-    HostDisconnectParams, HostListResult, HostRemoveParams,
+    HostDisconnectParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
 };
 use roost_ipc::{ssh, IpcClient};
 
@@ -52,8 +54,27 @@ pub enum HostCmd {
         #[arg(long, default_value_t = false)]
         verify: bool,
     },
-    /// List saved hosts.
+    /// List saved hosts, with the connection state each one is in.
+    ///
+    /// The state column is a best-effort second call (`host.status`):
+    /// a UI that refuses it prints `state=?` rather than failing the
+    /// listing, because the registry is what this verb promised.
+    /// `--json` stays the registry alone — a script that wants state
+    /// asks the op that owns it, `host status --json`.
     List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Report every saved host's live connection state — the settled
+    /// answer `host connect` is too early to give.
+    ///
+    /// `--id` narrows it to one host. `--json` prints the op's own
+    /// result verbatim, which is the contract a script reads
+    /// (`generation`, `reason`, `rollup`, `retry`); the human form is
+    /// `id  label  state  rollup`.
+    Status {
+        #[arg(long)]
+        id: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -65,7 +86,7 @@ pub enum HostCmd {
     /// Connect a saved host by id. Unconditional takeover (reconnect IS
     /// takeover on this wire), and on localhost it starts the session if
     /// it is not already running. Returns once the attempt is under way
-    /// — watch the sidebar or `host list` for the settled state.
+    /// — watch the sidebar or poll `host status` for the settled state.
     Connect {
         #[arg(long)]
         id: String,
@@ -89,6 +110,7 @@ pub async fn run(cmd: &HostCmd, client: &mut IpcClient) -> i32 {
             verify,
         } => add(client, label, target, *verify).await,
         HostCmd::List { json } => list(client, *json).await,
+        HostCmd::Status { id, json } => status(client, id.as_deref(), *json).await,
         HostCmd::Remove { id } => remove(client, id).await,
         HostCmd::Connect { id } | HostCmd::Disconnect { id } => {
             connection(client, op_for(cmd), id).await
@@ -147,16 +169,59 @@ async fn add(client: &mut IpcClient, label: &str, target: &str, verify: bool) ->
 async fn list(client: &mut IpcClient, json: bool) -> Result<i32> {
     let resp: HostListResult = client.call(ops::HOST_LIST, serde_json::json!({})).await?;
     if json {
+        // Deliberately the registry alone: two ops' answers merged
+        // under one key would leave a script unable to say which one
+        // it read. `host status --json` is where state lives.
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(0);
+    }
+    if resp.hosts.is_empty() {
+        println!("no saved hosts");
+        return Ok(0);
+    }
+    // Best-effort, and only for the human form: a UI too old for the op,
+    // or an engine answering headless, still owes the reader the
+    // registry it asked for.
+    let states: HashMap<String, String> = client
+        .call::<_, HostStatusResult>(ops::HOST_STATUS, HostStatusParams::default())
+        .await
+        .map(|status| status.hosts.into_iter().map(|h| (h.id, h.state)).collect())
+        .unwrap_or_default();
+    for h in &resp.hosts {
+        let last = h.last_connected.as_deref().unwrap_or("never");
+        let state = states.get(&h.id).map(String::as_str).unwrap_or("?");
+        println!(
+            "{}  {}  target={}  state={}  last_connected={}",
+            h.id, h.label, h.target, state, last
+        );
+    }
+    Ok(0)
+}
+
+/// `host status` — the read-side twin of `connect`'s reply.
+///
+/// `--json` prints the op's result unaltered, so a script reads the
+/// same contract the functional harness asserts on over the wire: a CLI
+/// that reshaped it would be a second wire format to keep in step. The
+/// human form is the four fields a person reads off the sidebar.
+async fn status(client: &mut IpcClient, id: Option<&str>, json: bool) -> Result<i32> {
+    let resp: HostStatusResult = client
+        .call(
+            ops::HOST_STATUS,
+            HostStatusParams {
+                id: id.map(str::to_string),
+            },
+        )
+        .await?;
+    if json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else if resp.hosts.is_empty() {
         println!("no saved hosts");
     } else {
         for h in &resp.hosts {
-            let last = h.last_connected.as_deref().unwrap_or("never");
-            println!(
-                "{}  {}  target={}  last_connected={}",
-                h.id, h.label, h.target, last
-            );
+            let rollup = h.rollup.as_deref().unwrap_or("");
+            let line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup);
+            println!("{}", line.trim_end());
         }
     }
     Ok(0)
@@ -183,6 +248,7 @@ fn op_for(cmd: &HostCmd) -> &'static str {
     match cmd {
         HostCmd::Add { .. } => ops::HOST_ADD,
         HostCmd::List { .. } => ops::HOST_LIST,
+        HostCmd::Status { .. } => ops::HOST_STATUS,
         HostCmd::Remove { .. } => ops::HOST_REMOVE,
         HostCmd::Connect { .. } => ops::HOST_CONNECT,
         HostCmd::Disconnect { .. } => ops::HOST_DISCONNECT,
@@ -243,6 +309,8 @@ mod tests {
         for (args, op) in [
             ("add --label l --target t", ops::HOST_ADD),
             ("list", ops::HOST_LIST),
+            ("status", ops::HOST_STATUS),
+            ("status --id abc", ops::HOST_STATUS),
             ("remove --id abc", ops::HOST_REMOVE),
             ("connect --id abc", ops::HOST_CONNECT),
             ("disconnect --id abc", ops::HOST_DISCONNECT),
@@ -264,6 +332,27 @@ mod tests {
         match parse(&["disconnect", "--id", "3f9a2b7c1d4e4f5a"]) {
             HostCmd::Disconnect { id } => assert_eq!(id, "3f9a2b7c1d4e4f5a"),
             other => panic!("expected disconnect, got {other:?}"),
+        }
+    }
+
+    /// `--id` is optional on `status` alone: the op's default is every
+    /// saved host, and a verb that demanded an id would make the listing
+    /// form — the one a harness polls — unreachable.
+    #[test]
+    fn status_narrows_only_when_asked() {
+        assert!(matches!(
+            parse(&["status"]),
+            HostCmd::Status {
+                id: None,
+                json: false
+            },
+        ));
+        match parse(&["status", "--id", "3f9a2b7c1d4e4f5a", "--json"]) {
+            HostCmd::Status { id, json } => {
+                assert_eq!(id.as_deref(), Some("3f9a2b7c1d4e4f5a"));
+                assert!(json);
+            }
+            other => panic!("expected status, got {other:?}"),
         }
     }
 
