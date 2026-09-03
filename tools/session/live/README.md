@@ -30,8 +30,9 @@ minutes). Runs by hand in a shed.
 In a shed whose landing dir is the mounted repo (`roost-dev`):
 
 ```bash
-ROOST_REPO=$HOME/roost CARGO_TARGET_DIR=$HOME/rt ~/roost/tools/shed/build-in-shed.sh
-cargo build -p roost-session          # the far side of the bridge
+ROOST_REPO=$HOME/roost CARGO_TARGET_DIR=$HOME/rt \
+  ROOST_SHED_PACKAGES="roost-iced roost-cli roost-session" \
+  ~/roost/tools/shed/build-in-shed.sh   # roost-session is the far side of the bridge
 sudo apt install jq                   # once, on a shed provisioned before jq was added
 sudo loginctl enable-linger "$(id -un)"   # once; see below
 tools/session/live/live.sh L1
