@@ -335,6 +335,141 @@ sshd_start() {
   return 0
 }
 
+# ── the far side of the bridge: the session daemon ───────────────────
+# `roost-session` is what the app's ssh exec attaches to, and *where* it
+# looks for it is not a choice this harness gets to make. The remote
+# command runs `roost-session client-bridge`, which resolves the socket
+# through `roost-ipc`'s one rule (`paths.rs`, `resolve_paths_linux`):
+#
+#     $XDG_RUNTIME_DIR/<namespace>/roost.sock   when that variable is
+#                                               set, non-empty, absolute
+#     /tmp/<namespace>-<uid>/roost.sock         otherwise
+#
+# and the `XDG_RUNTIME_DIR` it reads is the **remote non-interactive
+# login's**, which `pam_systemd` sets to `/run/user/<uid>`.
+#
+# This harness exports its own `XDG_RUNTIME_DIR` (a scratch dir, so a
+# lane's UI socket can never collide with a developer's real one). That
+# override is right for the UI and wrong for the daemon: a `roostctl
+# session start` run under it lands the socket somewhere the bridge
+# never looks. The lanes passed anyway for as long as *some other*
+# daemon happened to be listening at the bridge's path — which is not a
+# thing a harness may depend on, and is false on a fresh shed.
+#
+# So the session verbs, and only they, run under the runtime dir the
+# bridge will resolve. Everything else keeps the scratch dir.
+SESSION_STARTED=0
+SESSION_ID=""
+SESSION_ENV=()
+
+# What the bridge's own shell sees, read over ssh rather than guessed:
+# this single value is what the whole resolution turns on.
+remote_runtime_dir() {
+  timeout "$PROBE_HARD_TIMEOUT" ssh \
+    -o ConnectTimeout="$PROBE_CONNECT_TIMEOUT" "${PROBE_SSH_OPTS[@]}" \
+    "$PROBE_TARGET" 'printf %s "${XDG_RUNTIME_DIR-}"' 2>/dev/null
+}
+
+# The daemon as the bridge finds it. `roostctl session status` resolves
+# the session profile through the same `BundleProfile::session()` the
+# bridge's `client-bridge` does, and running it *over ssh* runs it under
+# the remote login's own environment — so this is the bridge's own
+# resolution, not a re-derivation of it that could agree with a wrong
+# answer. Non-zero means nothing is listening where the bridge looks.
+#
+# `$RT` names a path on the far side on purpose: this harness's "remote"
+# is this same box, which is the whole conceit of driving
+# `ssh://…@localhost`.
+remote_session_status() {
+  timeout "$PROBE_HARD_TIMEOUT" ssh \
+    -o ConnectTimeout="$PROBE_CONNECT_TIMEOUT" "${PROBE_SSH_OPTS[@]}" \
+    "$PROBE_TARGET" "'$RT/roostctl' session status" 2>&1
+}
+
+# Start the daemon where the bridge will look, or confirm the one that
+# is already there — and record which of the two happened, because a
+# daemon this harness did not start is not a daemon it may stop.
+ensure_remote_session() {
+  local rd out user
+  if out=$(remote_session_status); then
+    say "a session is already listening where the bridge looks; leaving it alone"
+    say "    $(grep '^socket=' <<<"$out" || true)"
+    return 0
+  fi
+  rd=$(remote_runtime_dir) || fail "could not read the remote's XDG_RUNTIME_DIR over ssh"
+  say "the remote's non-interactive XDG_RUNTIME_DIR is '${rd:-<unset>}'"
+  case "$rd" in
+    /*)
+      user=$(id -un)
+      [ -d "$rd" ] ||
+        fail "the bridge resolves its socket under $rd, but that directory does not exist. It is a per-login runtime dir: run 'sudo loginctl enable-linger $user' once on this box so it persists, then re-run"
+      [ -w "$rd" ] || fail "$rd is not writable by $user, so the daemon cannot bind there"
+      # Existing is not the same as staying. `pam_systemd` creates
+      # `/run/user/<uid>` per login and removes it with the last one, so
+      # a directory that is only there because *this* preflight's own
+      # ssh just logged in would take the daemon's socket with it
+      # moments later — a lane that then failed would be reporting on
+      # the box. Lingering is what makes it permanent, and that is a
+      # decision about the box, so it is named rather than taken.
+      case "$rd" in
+        /run/user/*)
+          if command -v loginctl >/dev/null 2>&1; then
+            case "$(loginctl show-user "$user" -p Linger 2>/dev/null)" in
+              Linger=yes) ;;
+              *) fail "$rd is a per-login runtime dir and lingering is off for $user — it goes away with the last login, and the daemon's socket with it. Run 'sudo loginctl enable-linger $user' once on this box, then re-run" ;;
+            esac
+          fi
+          ;;
+      esac
+      SESSION_ENV=(env "XDG_RUNTIME_DIR=$rd")
+      ;;
+    *)
+      # Unset, empty or relative all mean the same thing to the
+      # resolver, and this side has to mean it too: unset, so the
+      # daemon takes the `/tmp/<namespace>-<uid>` fallback the bridge
+      # will take.
+      SESSION_ENV=(env -u XDG_RUNTIME_DIR)
+      ;;
+  esac
+  say "starting roost-session under the runtime dir the bridge resolves"
+  "${SESSION_ENV[@]}" "$RT/roostctl" session start >/dev/null 2>&1 ||
+    fail "roostctl session start failed under ${SESSION_ENV[*]}"
+  # The claim is not "start exited 0", it is "the bridge can find it".
+  # Taken back on the way out, both times: a daemon this preflight
+  # started and then refused to trust is exactly the mis-placed litter
+  # this whole seam exists to stop leaving behind, and `SESSION_STARTED`
+  # is not set yet, so teardown would not know about it.
+  if ! out=$(remote_session_status); then
+    "${SESSION_ENV[@]}" "$RT/roostctl" session stop >/dev/null 2>&1
+    fail "the daemon started, but nothing answers where the bridge looks: $(tail -1 <<<"$out")"
+  fi
+  SESSION_ID=$(sed -n 's/^session_id=//p' <<<"$out")
+  if [ -z "$SESSION_ID" ]; then
+    "${SESSION_ENV[@]}" "$RT/roostctl" session stop >/dev/null 2>&1
+    fail "the session answered without an id: $out"
+  fi
+  SESSION_STARTED=1
+  say "session $SESSION_ID at $(sed -n 's/^socket=//p' <<<"$out")"
+  return 0
+}
+
+# Only ever the daemon this harness started, and only while it is still
+# the one running: the id is re-read and compared, so a pre-existing
+# session — or one somebody else started after ours went away — is never
+# stopped by a lane's teardown.
+stop_remote_session_if_ours() {
+  [ "$SESSION_STARTED" -eq 1 ] || return 0
+  local now
+  now=$("${SESSION_ENV[@]}" "$RT/roostctl" session status 2>/dev/null |
+    sed -n 's/^session_id=//p')
+  if [ "$now" = "$SESSION_ID" ]; then
+    "${SESSION_ENV[@]}" "$RT/roostctl" session stop >/dev/null 2>&1
+  fi
+  SESSION_STARTED=0
+  SESSION_ID=""
+  return 0
+}
+
 # ── the app, as a direct child ───────────────────────────────────────
 # The harness owns the X server rather than borrowing `xvfb-run`'s, for
 # two reasons that are the same reason: the app must be *this* shell's
@@ -729,6 +864,9 @@ live_cleanup() {
   pkill -x roost-iced 2>/dev/null || true
   [ -n "$XVFB" ] && kill "$XVFB" 2>/dev/null
   sleep 1
+  # After the app, so the client goes before the far side it dialed —
+  # and only ever the daemon this harness itself started.
+  stop_remote_session_if_ours
   reap_ssh_masters
   rm -f "$BOGUS_KEY" "$BOGUS_KEY.pub"
   return 0
@@ -770,8 +908,9 @@ preflight() {
     fail "refusing to start: $left ssh processes and $scratch scratch dirs survived the reap"
   fi
   probe_live "positive control" || fail "the route is not usable before the lane even starts"
-  # `roost-session` is the far side of the bridge; the ssh exec finds it
-  # on the remote's PATH. Starting it here is what makes localhost a
-  # realistic remote.
-  ctl session start >/dev/null 2>&1 || true
+  # `roost-session` is the far side of the bridge, and this is what
+  # makes localhost a realistic remote. Asserted, not attempted: a lane
+  # whose far side is missing fails at `connect_and_wait` with a reason
+  # about the *box*, which reads like a finding about the app.
+  ensure_remote_session
 }

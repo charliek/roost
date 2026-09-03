@@ -33,12 +33,49 @@ In a shed whose landing dir is the mounted repo (`roost-dev`):
 ROOST_REPO=$HOME/roost CARGO_TARGET_DIR=$HOME/rt ~/roost/tools/shed/build-in-shed.sh
 cargo build -p roost-session          # the far side of the bridge
 sudo apt install jq                   # once, on a shed provisioned before jq was added
+sudo loginctl enable-linger "$(id -un)"   # once; see below
 tools/session/live/live.sh L1
 ```
 
 `roost-session` has to be on the remote's **non-interactive** `PATH` (on
 `roost-dev`, `~/.local/bin/roost-session` symlinks into `~/rt/debug`) —
 that is what makes `localhost` a realistic remote.
+
+### The far side: where the daemon has to be listening
+
+Preflight **starts the session daemon itself** and refuses to run a lane
+until it answers *where the bridge looks*. Those are two different
+places, and conflating them is how these lanes came to depend on a
+daemon somebody else had started:
+
+* the app's remote command is `roost-session client-bridge`, which
+  resolves its socket through `roost-ipc`'s one rule (`paths.rs`,
+  `resolve_paths_linux`) — `$XDG_RUNTIME_DIR/<namespace>/roost.sock`
+  when that variable is set, non-empty and absolute, else
+  `/tmp/<namespace>-<uid>/roost.sock`;
+* the `XDG_RUNTIME_DIR` it reads is the **remote non-interactive
+  login's** (`pam_systemd` sets `/run/user/<uid>`), not this harness's —
+  and the harness exports a scratch `XDG_RUNTIME_DIR` of its own so a
+  lane's *UI* socket can never collide with a developer's real one.
+
+So preflight reads the remote's value over ssh (`ssh <target>
+'printf %s "$XDG_RUNTIME_DIR"'`), starts `roostctl session start` under
+exactly that (unset when the remote's is unset, empty or relative — the
+three cases the resolver treats alike), and then proves reachability by
+running `roostctl session status` **over ssh**, so the check is the
+bridge's own resolution rather than a re-derivation that could agree
+with a wrong answer. A daemon that was already listening there is used
+as-is and left alone; only one preflight started is stopped again in
+teardown, and only while `session_id` still matches.
+
+That is what `enable-linger` is for: `/run/user/<uid>` is created per
+login and removed with the last one, so without it the daemon's socket
+directory disappears underneath it — possibly moments after preflight's
+own ssh created it. So for a `/run/user/…` runtime dir preflight checks
+**both** that the directory is there and that `loginctl` reports
+`Linger=yes`, and refuses with the exact command to run otherwise. It
+names the remedy rather than taking it: lingering is a decision about
+the box, not about a test run.
 
 | Parameter | Default | |
 |---|---|---|
@@ -97,6 +134,10 @@ rule. Remove or tag the rule yourself, then re-run.
   starts `roost-iced` under it, so a SIGTERM lands on the process under
   test and `wait` returns its exit status — which is the whole proof
   that the graceful quit path ran.
+* **The harness owns its far side.** Preflight starts the session
+  daemon under the runtime dir the *bridge* resolves and proves it
+  reachable through that same resolution, so a lane never quietly
+  borrows a daemon somebody else left running (see Setup).
 * **Every claim is asserted.** A lane that echoes a number nobody
   compares passes while the feature is broken; this harness reported
   three false passes before that rule existed.
