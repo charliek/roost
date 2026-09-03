@@ -183,6 +183,25 @@ reap_ssh_masters() {
 }
 
 # ── severance, and proof of it ───────────────────────────────────────
+# Every rule this harness inserts carries a comment tag, and every `-D`
+# names that tag in the spec it deletes. That is the whole fence: a
+# firewall is shared machinery, so a box may already carry a port-22
+# DROP rule an administrator put there — and a cleanup that deleted "any
+# rule matching this shape" would silently take it away and never put it
+# back. Tagging makes removal exact: this harness takes back what it
+# installed and cannot touch anything else.
+LIVE_RULE_TAG="roost-live-harness"
+
+# The two rules a severance is, written once so `-I` and `-D` cannot
+# drift: a delete spec that differs from the insert by one token matches
+# nothing, quietly leaving the route black-holed for the next lane.
+#
+# The shapes are deliberately asymmetric — outbound is filtered on the
+# destination port, inbound on the source port — so what dies is a dial
+# *to* an sshd, not an inbound ssh session into the box running this.
+BLACKHOLE_OUT=(-p tcp --dport 22 -m comment --comment "$LIVE_RULE_TAG" -j DROP)
+BLACKHOLE_IN=(-p tcp --sport 22 -m comment --comment "$LIVE_RULE_TAG" -j DROP)
+
 # BOTH families: `localhost` resolves to ::1 here, so an IPv4-only rule
 # set installs cleanly, reports nothing amiss, and drops not one packet.
 # `mutate.sh M1` is the control that proves this harness can see that.
@@ -190,16 +209,18 @@ reap_ssh_masters() {
 # `-I` stacks, and an interrupted lane never reaches its `-D`. One stale
 # DROP silently black-holes the *next* lane — which then "proves" a
 # severance it never performed. So both directions of every family are
-# deleted until none matches, before installing and after removing.
+# deleted until none matches, before installing and after removing. The
+# loop is bounded because `-D` failing is the only way it ends, and a
+# `sudo` that fails for some other reason would otherwise spin forever.
 blackhole_rules_off() {
   local t n
   for t in iptables ip6tables; do
     n=0
-    while sudo "$t" -D OUTPUT -p tcp --dport 22 -j DROP 2>/dev/null; do
+    while sudo "$t" -D OUTPUT "${BLACKHOLE_OUT[@]}" 2>/dev/null; do
       n=$((n + 1)); [ "$n" -lt 32 ] || break
     done
     n=0
-    while sudo "$t" -D INPUT -p tcp --sport 22 -j DROP 2>/dev/null; do
+    while sudo "$t" -D INPUT "${BLACKHOLE_IN[@]}" 2>/dev/null; do
       n=$((n + 1)); [ "$n" -lt 32 ] || break
     done
   done
@@ -212,8 +233,33 @@ blackhole_rules_on() {
   blackhole_rules_off
   if [ "$families" = v4 ]; then list=(iptables); else list=(iptables ip6tables); fi
   for t in "${list[@]}"; do
-    sudo "$t" -I OUTPUT -p tcp --dport 22 -j DROP || return 1
-    sudo "$t" -I INPUT -p tcp --sport 22 -j DROP || return 1
+    sudo "$t" -I OUTPUT "${BLACKHOLE_OUT[@]}" || return 1
+    sudo "$t" -I INPUT "${BLACKHOLE_IN[@]}" || return 1
+  done
+  return 0
+}
+
+# The other half of the fence: a port-22 DROP rule this harness did not
+# write. Reported, never deleted — removing somebody else's firewall rule
+# is the failure this tagging exists to prevent, so the only thing the
+# harness does about one is refuse to run. It has to refuse: a box that
+# is already partly severed makes every "the route was live, then I cut
+# it" claim below a claim about someone else's rule.
+#
+# Read from `-S` over the whole filter table (custom chains included),
+# which prints rules in iptables' own normalized spelling
+# (`-p tcp -m tcp --dport 22 …`) rather than the spelling used to install
+# them. `|| true` closes each pipeline because *no match* is the normal
+# outcome, and grep's exit 1 under the entry scripts' `pipefail` would
+# abort preflight in the one case where it should pass.
+untagged_port22_drops() {
+  local t
+  for t in iptables ip6tables; do
+    { sudo "$t" -S 2>/dev/null || true; } |
+      grep -E -- '-j DROP( |$)' |
+      grep -E -- '--(d|s)port 22( |$)' |
+      grep -Ev -- "--comment $LIVE_RULE_TAG( |$)" |
+      sed "s|^|$t |" || true
   done
   return 0
 }
@@ -691,6 +737,10 @@ live_cleanup() {
 # Whatever the last (possibly interrupted) run left: a stale DROP would
 # sever this run before it starts, a stale mux would answer for a route
 # it believes severed, and a stale scratch dir would read as a leak.
+#
+# "Whatever the last run left" is scoped by the rule tag, so the reap
+# cannot reach past this harness. What it finds outside its own tag it
+# reports and refuses on instead.
 preflight() {
   require_tools
   mkdir -p "$ART" "$XDG_RUNTIME_DIR"
@@ -700,6 +750,17 @@ preflight() {
   sleep 1
   blackhole_rules_off
   reap_ssh_masters
+  # After the reap, so this harness's own leftovers are already gone and
+  # anything still standing is somebody else's. Before `probe_live`,
+  # because an untagged OUTPUT DROP would fail the probe first and the
+  # lane would then blame the route instead of naming the rule.
+  local foreign
+  foreign=$(untagged_port22_drops)
+  if [ -n "$foreign" ]; then
+    say "port-22 DROP rules this harness did not install (no '$LIVE_RULE_TAG' tag):"
+    printf '%s\n' "$foreign" | sed 's/^/    /'
+    fail "refusing to start: this box is already partly severed by $(printf '%s\n' "$foreign" | grep -c .) rule(s) the harness does not own — remove them (or tag them) yourself; the harness will not delete a rule it did not write"
+  fi
   local left scratch
   left=$(ssh_count)
   scratch=$(scratch_count)

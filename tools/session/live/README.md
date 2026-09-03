@@ -46,6 +46,37 @@ that is what makes `localhost` a realistic remote.
 | `ROOST_LIVE_TARGET` | `ssh://shed@localhost` | the host the lanes drive; the probes dial exactly this |
 | `ROOST_LIVE_ART` | `<repo>/target/live-ssh` | per-lane output and the V5 captures |
 
+### The firewall rules, and what preflight refuses
+
+Severance is `iptables`/`ip6tables` DROP rules on port 22, and a firewall
+is shared machinery. So **every rule the harness inserts is tagged**:
+
+```
+-A OUTPUT -p tcp -m tcp --dport 22 -m comment --comment roost-live-harness -j DROP
+-A INPUT  -p tcp -m tcp --sport 22 -m comment --comment roost-live-harness -j DROP
+```
+
+Cleanup deletes by that full spec, tag included, so it takes back exactly
+what it installed. A port-22 DROP rule an administrator put there is
+never a candidate: the `-D` cannot match it. (`mutate.sh M1` installs the
+same tagged rules, IPv4-only — that is the whole of its mutation.)
+
+The other side of the same fence: **preflight refuses to run a lane while
+an untagged port-22 DROP rule exists.** It prints each one verbatim, as
+`iptables -S` spells it, and stops —
+
+```
+[L1] port-22 DROP rules this harness did not install (no 'roost-live-harness' tag):
+    iptables -A OUTPUT -p tcp -m tcp --dport 22 -j DROP
+[L1] FAIL: refusing to start: this box is already partly severed by 1 rule(s) …
+```
+
+It refuses rather than deleting because removing somebody else's firewall
+rule is the failure the tag exists to prevent, and it refuses rather than
+continuing because a box that is *already* partly severed makes every
+"the route was live, then I cut it" claim a claim about someone else's
+rule. Remove or tag the rule yourself, then re-run.
+
 ## What holds these lanes up
 
 * **State comes from the op that owns it.** Every connection claim is a
