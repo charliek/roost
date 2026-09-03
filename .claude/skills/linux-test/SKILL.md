@@ -109,6 +109,20 @@ then `palette activate <id>` (positional id, e.g. `close_project`) drives
 the same dispatch as the keybind, so you can screenshot modal overlays with
 no XTEST.
 
+### Dev loop: a matching `roost-session` daemon on a real remote
+A separate loop from the three lanes above — for exercising the
+host-sessions bootstrap (Add Host → install → connect) against a real
+Linux remote, not for the iced real-input tests. `tools/session/dev-session.sh`
+builds `roost-session` in a shed of the target's own architecture
+(`roost-dev` for aarch64; a shed on a remote shed server such as `mini3`
+for amd64 — no cross-compile), fetches it back proving the version pin
+matches this checkout, and can point a local `Roost-Iced.app` at it via
+`ROOST_SESSION_INSTALL_BIN` so the product's own bootstrap does the
+install. See `tools/session/README.md` and
+`docs/development/host-sessions.md`'s "Dev loop" section — the live
+SSH-severance harness that runs against a host connected this way is a
+separate tool (`tools/session/live/`), not covered here.
+
 ## How it works (so you can debug it)
 - **`.shed/provision.yaml`** — an `install` hook (once: build deps for
   `roost-iced`, weston/cage/seatd, Xvfb/xdotool, python test deps, GTK4-dev

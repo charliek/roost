@@ -225,6 +225,59 @@ Downloads additionally enforce HTTPS, with a loopback (`http://127.0.0.1` / `loc
 - **A stale binary on an earlier ladder rung shadows a later compatible one** until an install lands over it — see the identity-exec note above. Self-healing via the action matrix, but the first attach after the shadow appears still fails once before the fixing dialog shows up.
 - **A prerelease client never auto-downloads.** The default asset URL is constructed only when the running tag actually spells `v<CARGO_PKG_VERSION>`; a prerelease build (tag `v0.0.19-rc1`, `CARGO_PKG_VERSION` `0.0.19`) skips the download rung entirely and falls through to the classified "no build available to install" failure, naming `ROOST_SESSION_INSTALL_BIN` as the way around it — it never guesses at a prerelease asset URL nobody may have uploaded.
 
+## Dev loop: a matching daemon on a real remote
+
+The bootstrap above is easy to unit-test but hard to *see*: exercising it
+for real means a Mac client, a `roost-session` binary built for a Linux
+target's exact architecture, and a real `sshd` on the far end.
+[`tools/session/dev-session.sh`](https://github.com/charliek/roost/blob/main/tools/session/dev-session.sh)
+(usage in [`tools/session/README.md`](https://github.com/charliek/roost/blob/main/tools/session/README.md))
+is that loop, run entirely from a Mac.
+
+**No cross-compile, no container, no `roostctl` verb.** The repo's stance
+on cross-compiling `roost-session` is the same as its stance on the
+shipped Linux packages ([the trust chain, above](#the-trust-chain-honestly)
+implies a real build, not an emulated one): build natively, on a shed
+(Apple VZ Linux microVM, [`tools/shed/`](https://github.com/charliek/roost/tree/main/tools/shed))
+of the target's own architecture. Two sheds cover the two architectures
+that matter: `roost-dev` (aarch64, local — both build host and remote
+target in one, the cheap loop) and a shed on a remote shed server such as
+`mini3` (x86_64, the realistic loop, since it's a genuinely separate box
+from the build host). `dev-session.sh build` builds `roost-session` there
+(reusing `tools/shed/build-in-shed.sh`, now parameterized by
+`ROOST_SHED_PACKAGES` so it can build just the daemon instead of the full
+iced + `roostctl` pair `shed-test.sh` wants); a shed with no mounted
+repo gets the working tree pushed first over a plain `tar | ssh tar x`
+pipe (the shed image ships without `rsync`).
+
+**The arch rule: `fetch` proves the version pin, `check` proves the
+arch.** `dev-session.sh fetch` copies the built binary back to this Mac
+and refuses outright unless its `identify` output — `app_version` and
+`libghostty_build` — matches this checkout's own local build. That
+catches a stale or differently-configured shed early, but it proves
+nothing about *architecture*: those two identity fields are
+target-independent (the ghostty pin and snapshot format don't vary by
+CPU) — the same "arch is invisible to the triple" property that makes the
+product-side ELF guard on `resolve_override` necessary in the first
+place (see [Env seams](#env-seams)). `dev-session.sh check
+<artifact> <ssh-target>` is the separate step that closes that gap: it
+reads the artifact's ELF `e_machine` and compares it against `ssh
+<target> uname -m`, refusing with both arches named before anything is
+handed to the product. `launch` runs `check` automatically whenever
+`--target` is given.
+
+**The env seam, and its asymmetry with `ROOST_SESSION_BIN`.** `launch`
+sets `ROOST_SESSION_INSTALL_BIN` (not `ROOST_SESSION_BIN`) in the
+launched app's environment and then lets the product's own bootstrap —
+Add Host → NotFound → the consent card → staged verify → atomic commit,
+described above — do the actual install; the script never `scp`s a
+daemon into place. `ROOST_SESSION_INSTALL_BIN` is the arch-guarded remote
+seam (see [Env seams](#env-seams)); `ROOST_SESSION_BIN` is the unrelated,
+unguarded localhost seam that feeds the *local* spawn ladder instead —
+pointing that one at a Linux binary just fails to start, with no arch
+message, because there is no remote to compare against. `tools/session/README.md`
+names this asymmetry explicitly so it isn't rediscovered by surprise.
+
 ## Known limitations
 
 - **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten when the lease turns over or its last connection closes. It remains true against a session too old to serve the op — that refusal is harmless (`unknown-op`, logged once per connection) and leaves HS-2's behavior: `notification.fired` never fires for whichever tab that session considers active.
