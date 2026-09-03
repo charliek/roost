@@ -9,6 +9,7 @@ ladder — see its own README.
 ```
 tools/
   roosttest/      Layer 1 — functional (IPC op-set), pytest. PRIMARY, runs in CI.
+  session/live/   Layer 1 — the ssh reconnect ladder against a real sshd. By hand, in a shed.
   screenshot/     Layer 2 — visual (pixels): roostctl capture + pngtool inspect.
   input/          Layer 3 — real OS input injection, platform-specific.
     linux/          uinput key/pointer + clipboard + single-monitor (COSMIC/Wayland).
@@ -24,6 +25,7 @@ tools/
 |---|---|---|---|---|---|
 | **1 — functional** | [`roosttest/`](roosttest/README.md) | JSON IPC (Python client) | the op set: `tab.dump`/`tab.list`/`palette.*`/`identify` — behavior + content (text) | mac + iced | ✅ headless |
 | **1 — session** | [`roosttest/test_session.py`](roosttest/README.md) | JSON IPC (Python client), no UI | the `roost-session` daemon: lifecycle, `session.identify`/`session.stop`, `events.subscribe`'s revision-fence contract | linux (CI runs it on `ubuntu-latest`; `roost-session` is not packaged for macOS) | ✅ `make e2e-session`, required |
+| **1 — live** | [`session/live/`](session/live/README.md) | `roostctl host status --json`, against a real `sshd` severed with `iptables` / `systemctl` | the ssh auto-reconnect ladder end to end: recover, spend the budget and settle, refuse to retry a changed host key, quit with a rung armed or an establish in flight, a refused port | linux, in a shed (needs `sudo`, real firewall rules) | ❌ not a CI lane; runs by hand in the shed |
 | **2 — visual** | [`screenshot/`](screenshot/README.md) | `roostctl` + `roostctl screenshot` | pixels: colors, badges, cursor, reflow, which tab/sidebar is shown | mac + iced | local |
 | **3 — real input** | [`input/`](input/linux/README.md) | OS key/pointer injection | the *real* key-encoder + mouse-gesture + clipboard path: selection, copy/paste, scroll | per-OS (linux now) | local |
 
