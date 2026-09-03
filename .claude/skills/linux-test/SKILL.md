@@ -123,6 +123,27 @@ install. See `tools/session/README.md` and
 SSH-severance harness that runs against a host connected this way is a
 separate tool (`tools/session/live/`), not covered here.
 
+### Live harness: the ssh reconnect ladder against a real `sshd`
+Another separate loop — `tools/session/live/` (plan 042, #384) drives a
+**real** `sshd` through a real severance and reads every claim back
+through `roostctl host status --json`, the only way any of this
+proves the fake-`ssh` unit tests aren't lying. Run inside a shed
+(`roost-dev`), never on the Mac:
+
+```bash
+tools/session/live/mutate.sh selftest   # all five traps must trip
+tools/session/live/live.sh L1           # sever, watch the ladder climb, recover unaided
+```
+
+Defaults: `ROOST_RT=$HOME/rt/debug`, target `ssh://shed@localhost`,
+artifacts under `<repo>/target/live-ssh`; see `tools/session/live/README.md`
+for the full lane list and the override variables. Needs `jq` and `sudo`
+(firewall rules against the live `sshd`). **Not a CI lane** — L2 alone
+burns the ~8-minute production attempt budget. Lanes run **one at a
+time**: L5 stops `sshd` itself, so start it detached from the ssh
+session you're driving it from (`nohup`/`tmux`/a second shed console),
+not inline in the shell you're typing the command in.
+
 ## How it works (so you can debug it)
 - **`.shed/provision.yaml`** — an `install` hook (once: build deps for
   `roost-iced`, weston/cage/seatd, Xvfb/xdotool, python test deps, GTK4-dev
