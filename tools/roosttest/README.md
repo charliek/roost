@@ -220,10 +220,13 @@ Two edges are worth knowing before writing a wait against it:
   one from the next. It is also the flatness check for "nothing further
   happened": a timer that fired and re-armed between two polls can leave
   `retry` looking absent at both, but cannot leave `generation` still.
-- **`retry.attempt` is monotonic, and a poll may skip a rung.** Wait for
-  `attempt >= n` and assert non-decrease across polls; never demand to
-  see a particular rung, which a short `ROOST_SSH_RECONNECT_BASE_MS`
-  makes a race.
+- **`retry.attempt` is monotonic within one outage, and a poll may skip
+  a rung.** Wait for `attempt >= n` and assert non-decrease across polls
+  while the same ladder is active; never demand to see a particular
+  rung, which a short `ROOST_SSH_RECONNECT_BASE_MS` makes a race. The
+  counter legitimately resets to `1` when suspend detection restarts
+  the ladder (`host_conn.rs`'s `restart_ladder`) — a suspended test box
+  is outside a lane's contract, so no lane tolerates that reset.
 
 `retry` is present only while a rung is armed, and it carries
 `attempt`/`budget` for the ssh ladder alone — a localhost backoff
