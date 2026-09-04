@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -223,11 +224,20 @@ class TargetContractTests(unittest.TestCase):
             self.assertTrue(socket_lock.exists())
 
 
+# The claim re-probes until this elapses; the cases below that only need
+# the *verdict* shorten it so the suite does not sit out the real window.
+# `test_state_cleanup_waits_out_a_lock_released_moments_later` is the one
+# that exercises the retry itself.
+_SHORT_SETTLE = 0.2
+
+
 class StateLockCleanupTests(unittest.TestCase):
     """`end_session` deletes the session state dir. That dir now holds the
     state lock, so the delete needs the same liveness proof the socket
     cleanup has — an unlinked lock inode is how two UIs come to write one
-    `state.json`."""
+    `state.json`. Since #397 a spawned `roost-session` keeps its own state
+    (and its own lock) one directory deeper, so the sweep has to answer for
+    that one too."""
 
     def _session(self) -> tuple[Path, Path]:
         root = Path(tempfile.mkdtemp(prefix="roost-unit-state-"))
@@ -236,6 +246,15 @@ class StateLockCleanupTests(unittest.TestCase):
         lock = ui.state_lock_path(root)
         lock.touch()
         return root, lock
+
+    def _spawned_session(self, root: Path) -> Path:
+        """The state a `roost-session` the UI spawned would leave behind."""
+        nested = root / ui.DERIVED_SESSION_SUBDIR
+        nested.mkdir()
+        (nested / "state.json").write_text("{}")
+        lock = ui.state_lock_path(nested)
+        lock.touch()
+        return lock
 
     def test_end_session_refuses_to_delete_state_while_the_state_lock_is_held(
         self,
@@ -246,10 +265,11 @@ class StateLockCleanupTests(unittest.TestCase):
         try:
             with (
                 patch("ui._SESSION_STATE_DIR", state),
+                patch("ui._STATE_LOCK_SETTLE_S", _SHORT_SETTLE),
                 patch("ui.quit"),
                 patch("ui._cleanup_owned_rust_runtime"),
             ):
-                with self.assertRaisesRegex(RuntimeError, "state lock .* is held"):
+                with self.assertRaisesRegex(RuntimeError, "state lock .* was still held"):
                     ui.end_session("iced")
                 # Still owned: nothing was deleted, so the next run must not
                 # believe the dir is free.
@@ -283,7 +303,58 @@ class StateLockCleanupTests(unittest.TestCase):
     def test_state_cleanup_without_a_lock_file_just_removes_the_dir(self) -> None:
         state, lock = self._session()
         lock.unlink()
+        # The dir is still there, so the claim re-probes for a lock a
+        # starting process might yet create; shortened, since what this
+        # case is about is the verdict.
+        with patch("ui._STATE_LOCK_SETTLE_S", _SHORT_SETTLE):
+            ui._remove_session_state("iced", state)
+        self.assertFalse(state.exists())
+
+    def test_state_cleanup_refuses_while_a_spawned_sessions_lock_is_held(self) -> None:
+        """A live daemon's state sits *inside* the dir being swept (#397).
+        Deleting it would leave that daemon writing to an unlinked inode
+        while its socket kept answering — the UI's own failure, one
+        directory deeper."""
+        state, ui_lock = self._session()
+        session_lock = self._spawned_session(state)
+        fd = os.open(session_lock, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with patch("ui._STATE_LOCK_SETTLE_S", _SHORT_SETTLE):
+                with self.assertRaisesRegex(
+                    RuntimeError, "roost-session state lock .* was still held"
+                ):
+                    ui._remove_session_state("iced", state)
+        finally:
+            os.close(fd)
+        self.assertTrue(session_lock.exists())
+        self.assertTrue((session_lock.parent / "state.json").exists())
+        # The UI's own lock is claimed first; a refusal deeper down must
+        # still leave it on disk for the next proof to find.
+        self.assertTrue(ui_lock.exists())
+
+    def test_state_cleanup_sweeps_a_stopped_sessions_state_with_the_dir(self) -> None:
+        state, _lock = self._session()
+        session_lock = self._spawned_session(state)
         ui._remove_session_state("iced", state)
+        self.assertFalse(session_lock.exists())
+        self.assertFalse(state.exists())
+
+    def test_state_cleanup_waits_out_a_lock_released_moments_later(self) -> None:
+        """`roostctl session stop` exiting 0 proves the socket is gone, not the
+        process: the state flock is released after the socket finalizer. So the
+        claim has to re-probe rather than refuse on the first look."""
+        state, _lock = self._session()
+        session_lock = self._spawned_session(state)
+        fd = os.open(session_lock, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        released = threading.Timer(0.15, os.close, args=(fd,))
+        released.start()
+        self.addCleanup(released.cancel)
+        try:
+            ui._remove_session_state("iced", state)
+        finally:
+            released.join(5)
         self.assertFalse(state.exists())
 
 
