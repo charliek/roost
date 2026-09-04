@@ -644,7 +644,11 @@ rule because the second one will not get the same review the first did:
 
 - **One id-space per request.** All-bare goes local; all-qualified on
   one incarnation goes to that host. Anything mixed is `invalid-param`
-  naming the rule — never a partial application, never a guess. See
+  naming the rule — never a partial application, never a guess. Decide
+  what an **empty** list means and write it down, because "all bare" and
+  "all qualified" are both vacuously true of one: for these two ops an
+  empty `project_ids` routes local, while an empty `tab_ids` follows its
+  `project_id`, which is the only ref that can carry an id-space. See
   [ipc.md's routing matrix](../reference/ipc.md#the-reorder-routing-matrix).
 - **A session socket refuses the qualified form** (`invalid-param`), so
   the spelling means "client, route this" and can never mean anything
