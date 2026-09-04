@@ -673,6 +673,62 @@ See [`development/host-sessions.md`](host-sessions.md) for how a
 reorder actually travels and why the preview is held, and
 [`reference/ipc.md`](../reference/ipc.md#tabreorder) for the wire form.
 
+### DL-21: `App` stays unconstructible in tests — guards are lifted, `App` delegates (2026-09-04)
+
+Plan 045 (#383) settled a question plan 044 had answered three times by
+necessity. `App` has one constructor, `App::bootstrap`
+(`crates/roost-iced/src/app.rs`), and it measures fonts through iced,
+builds a tokio runtime, hydrates the workspace and binds the socket. The
+issue's first sketch was a test constructor that skips those. It was
+refused on evidence, not taste: `App` has 89 fields, and the five guard
+paths the issue names read eight of them. A test constructor would build
+81 fields nothing under test reads, and it would be a second `App` —
+one that passes while production fails, the failure mode plan 040 §3.6
+named. The codebase had already answered the other way:
+`app/interactions.rs` has 87 tests and not one of them constructs an
+`App` — every decision it tests is a free function over explicit state,
+and its `impl App` blocks hold the delegations — and `host_conn.rs`'s
+suite already tests an app-side decision (`offer_for`) against a real
+`HostConnSet`.
+
+**The rule, in three shapes — pick by what the thing under test *is*:**
+
+- A **decision** is a pure function over its inputs (`offer_for`,
+  `hold_verdict`, `current_stop`, `step`).
+- A **decision with state effects** is a function over the *narrowest
+  constructible cluster* it reads and writes. `ExitState`, `HostConnSet`
+  and `BootstrapsInFlight` are constructible in a unit test; `App` is
+  not, and a test constructor for it is refused by default — revisited
+  only for a behaviour that genuinely depends on an `App`-wide invariant
+  no cluster can carry, recorded here when it happens. (`reconnect_due`,
+  `tunnel_ready`, `dial_saved_host` in `app/host_lifecycle.rs`.)
+- **Wiring** — "the drain calls X on edge Y" — is tested by lifting the
+  *edge handler* so the call is inside it (`settle_host_state` carries
+  the probe cancel a `Disconnected` must make).
+
+What stays on `App` is a delegation plus the effects that need a
+window, a workspace or a spawned task — never a branch of its own. New
+guards follow this shape from the start rather than reaching it through
+a 340-line refactor after the bug.
+
+**The limit, stated:** the lifted function is fenced; the one-line
+delegation to it is not, and neither are the window/workspace/task
+effects the caller performs on what it returns. A change that bypasses
+the lift is caught by review and by the e2e lanes, not by a unit test.
+When a returned value *is* the next decision (an offer to raise, a
+reason to show), carry it in the return — `TunnelLanding::Landed
+{ reason }`, `HostEdge { offer }` — so the wiring between two decisions
+is inside the fence rather than in the caller. Every fence is proven
+with a negative control — stub the guard, watch the test fail, revert,
+watch it pass — because a guard whose test passes with the guard
+deleted has not been tested.
+
+**The seam this does not bless, and tolerates:** a `#[cfg(test)]` arm
+in a production enum (`DeadTunnel::Recorded`) is a last resort,
+acceptable only when the value's *source* is another crate's private
+state that no constructible cluster can reach. That is why it stays
+until #385's seam is cheap (costed in plan 045 §3.4).
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

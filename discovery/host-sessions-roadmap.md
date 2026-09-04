@@ -24,10 +24,14 @@ of colliding with the launcher's
 `host.status`'s `retry` now says *which* classified ssh failure armed the
 rung, not only when the next one fires
 ([#399](https://github.com/charliek/roost/issues/399)) — and gave the Add
-Host dialog a Tab ring (D11 below). Both platforms run a local session;
-what is still Linux-only is being an SSH *host* (HS-4c). **Next:
-[#383](https://github.com/charliek/roost/issues/383) +
-[#386](https://github.com/charliek/roost/issues/386) together, then the
+Host dialog a Tab ring (D11 below). Plan 045 then closed
+[#383](https://github.com/charliek/roost/issues/383) and
+[#386](https://github.com/charliek/roost/issues/386) together —
+`HostConnSet` is down to one `HostEntry` per saved host, and the three
+named `App` guards are lifted onto free functions with unit-test fences
+instead of e2e-or-nothing coverage (`docs/development/vision.md`'s
+DL-21 records the rule). Both platforms run a local session; what is
+still Linux-only is being an SSH *host* (HS-4c). **Next: the
 [#381](https://github.com/charliek/roost/issues/381) conversation**, with
 HS-4c after that.
 
@@ -1006,16 +1010,18 @@ conditional-connect vs. HS-4d viewports) whose regression coverage —
 `host.status`, the lanes, the live harness — now exists *before* the
 wire changes; #383 is a testing investment that pairs with #386 and
 should land before #381's implementation, not before a release.
-Post-release order of work (updated 2026-09-04 — plan 044 shipped): the
-two items that topped this list are done. **#398** (drag-reorder of a
-remote host's projects and tabs) and **#397** (the `ROOST_STATE_DIR`
-seam collision) both shipped, along with the `reason`-overwrite wrinkle
-(filed as #399 mid-plan) — see their entries below and the closure
-paragraph above for #399. **#387** (a far side that is merely
-restarting should not need a manual ↻) was costed alongside them and
-stays open by decision, not by oversight — see its entry below. Next up
-are #383 + #386 together; then the #381 conversation; HS-4c stays after
-that; #351 remains the top non-host post-release item.
+Post-release order of work (updated 2026-09-04 — plans 044 and 045
+shipped): the two items that topped this list are done. **#398**
+(drag-reorder of a remote host's projects and tabs) and **#397** (the
+`ROOST_STATE_DIR` seam collision) both shipped, along with the
+`reason`-overwrite wrinkle (filed as #399 mid-plan) — see their entries
+below and the closure paragraph above for #399. **#387** (a far side
+that is merely restarting should not need a manual ↻) was costed
+alongside them and stays open by decision, not by oversight — see its
+entry below. **#383** and **#386**, next up per the plan above, have
+also shipped, together as plan 045 — see their entries below. Next is
+the #381 conversation; HS-4c stays after that; #351 remains the top
+non-host post-release item.
 
 - **[#381](https://github.com/charliek/roost/issues/381) Session takeover is best-effort; needs an atomic
   conditional-connect on the wire.** Reconnect *is* takeover
@@ -1033,10 +1039,17 @@ that; #351 remains the top non-host post-release item.
   (`reconnecting in 8s (3/10)`) was reachable only by rendering the
   window and reading the PNG. Both were one refactor away from passing
   while the feature was broken. See the closure paragraph above.
-- **[#383](https://github.com/charliek/roost/issues/383) `App` is not constructible in a unit test.** `App::bootstrap`
-  measures fonts, builds a runtime, hydrates the workspace and binds the
-  socket, so every `App`-level guard gets e2e coverage or none — and
-  that is exactly where plan 040's late bugs lived.
+- **[#383](https://github.com/charliek/roost/issues/383) `App` is not constructible in a unit test. — Shipped, plan
+  045.** `App::bootstrap` measures fonts, builds a runtime, hydrates the
+  workspace and binds the socket, so every `App`-level guard gets e2e
+  coverage or none — and that is exactly where plan 040's late bugs
+  lived. The three named guards — the exit-state gates, the probe
+  cancel on a drop, and the bootstrap offer's real path — are now free
+  functions in `app/host_lifecycle.rs` over `ExitState` + `HostConnSet`
+  + `BootstrapsInFlight`, each with a unit test that fails when the
+  guard is deleted; `App` keeps a one-line delegation. No `App` test
+  constructor — `docs/development/vision.md`'s DL-21 records that as
+  the default rule.
 - **[#384](https://github.com/charliek/roost/issues/384) The live SSH-reconnect harness lives outside the repo. —
   Shipped, plan 042.** Only a real `sshd` exercises `ControlPersist`, a
   black-holed route hitting `ConnectTimeout`, and a daemonised master
@@ -1110,10 +1123,27 @@ that; #351 remains the top non-host post-release item.
   finally able to spawn a localhost daemon at all.
 - **[#385](https://github.com/charliek/roost/issues/385) No seam to inject a tunnel failure**, so a session-drop
   family is unreachable from a unit test and the fire-time re-check
-  needs a `#[cfg(test)]` enum arm. Contained and documented.
+  needs a `#[cfg(test)]` enum arm. Contained and documented. **Costed in
+  plan 045 §3.4, left open.** `#[cfg(test)]` does not cross crates, and
+  `crates/roost-ipc/Cargo.toml` has no `[features]` table today, so an
+  injectable `record` on `SshTunnel` needs a new public cargo feature on
+  a wire crate (`roost-ipc`) that `roost-iced` enables from
+  `[dev-dependencies]` — roughly 40–60 lines across two crates, plus
+  feature unification making every `cargo test --workspace` build of
+  `roost-ipc` carry the seam, to delete a contained, documented
+  seven-line `DeadTunnel::Recorded` arm. Not trivial by the "nearly
+  free" bar. Plan 045 found a second use for the same seam: it is also
+  what a positive offer fence on the drop edge needs (that family
+  requires a value only `SshTunnel::last_error` can supply), so the
+  payoff doubles once it exists — but it is still not implemented here.
 - **[#386](https://github.com/charliek/roost/issues/386) `HostConnSet`'s six parallel `HashMap`s want one
-  `HostEntry`.** Deferred on purpose so the consolidation lands *after*
-  the call sites exist; a lifecycle-clarity investment, not growth.
+  `HostEntry`. — Shipped, plan 045.** Deferred on purpose so the
+  consolidation lands *after* the call sites exist; a lifecycle-clarity
+  investment, not growth. `HostConnSet` now keys one
+  `HashMap<String, HostEntry>` per saved host instead of six parallel
+  maps — a pure refactor, no behaviour change — with the guards lifted
+  onto free functions (see #383's entry above) rather than an `App`
+  test constructor, per the same DL-21 rule.
 - **[#387](https://github.com/charliek/roost/issues/387) `NoSession` settles immediately**, so a far side that is
   merely restarting costs a manual ↻. Consistent with localhost,
   documented, and mitigated by running `roost-session` as a lingering

@@ -61,6 +61,23 @@ release workflow asserts they agree).
   back, Shift+Tab reverses, and Enter or Space activates whichever button
   the ring is on.
 
+### Internal
+
+- **`HostConnSet` keeps one `HostEntry` per saved host, and three `App`
+  guards are now unit-tested (#383, #386)** — no user-visible change.
+  `HostConnSet` used to carry six parallel `HashMap`s keyed on a saved
+  host's id (`conns`, `retained`, `generations`, `ssh`, `outages`,
+  `bootstrap_notes`); it's one `HashMap<String, HostEntry>` now, so a
+  host's lifecycle has one clearing path per operation instead of six
+  chances to forget one. And the three guards that decide whether a
+  reconnect fires, whether a landed tunnel is dialed, and whether a
+  saved-host connect proceeds while the app is quitting — previously
+  reachable only through `App::bootstrap`, which measures fonts, builds
+  a tokio runtime, and binds the IPC socket, so they had e2e coverage or
+  none — are lifted onto free functions over `ExitState`, `HostConnSet`,
+  and `BootstrapsInFlight` in a new `app/host_lifecycle.rs`. Each now has
+  a unit test that fails when the guard is deleted.
+
 ## v0.0.19 — 2026-09-04
 
 _The host-sessions release: `roost-session` ships in `Roost-Iced.app` and
