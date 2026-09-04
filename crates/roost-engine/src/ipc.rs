@@ -34,22 +34,22 @@ use roost_ipc::messages::{
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
     ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
     HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
-    HostListParams, HostListResult, HostRemoveParams, IdentifyParams, IdentifyResult,
-    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
-    SessionSetFocusParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    HostListParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
+    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
+    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
+    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
+    SessionIdentify, SessionIdentifyParams, SessionSetFocusParams, SessionSetThemeParams,
+    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
+    SidebarSetWidthParams, TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
+    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
@@ -494,6 +494,13 @@ pub enum UiRequest {
     HostDisconnect {
         id: String,
         reply: HostReply<HostConnectionResult>,
+    },
+    /// `host.status` — every saved host's connection state as the
+    /// sidebar's band has it, or just the one named. A read, but an
+    /// app-side one: the connection set is the app's alone.
+    HostStatus {
+        id: Option<String>,
+        reply: HostReply<HostStatusResult>,
     },
 }
 
@@ -1635,7 +1642,8 @@ async fn dispatch_outcome(
         | ops::HOST_REMOVE
         | ops::HOST_LIST
         | ops::HOST_CONNECT
-        | ops::HOST_DISCONNECT => {
+        | ops::HOST_DISCONNECT
+        | ops::HOST_STATUS => {
             return Err(HandlerError::unknown_op(op));
         }
         _ => {}
@@ -2930,6 +2938,14 @@ async fn dispatch(
             let hosts = h.workspace.hosts().into_iter().map(Host::from).collect();
             encode(&HostListResult { hosts })
         }
+        ops::HOST_STATUS => {
+            let p: HostStatusParams = decode(params)?;
+            let result = h
+                .ui_call(move |reply| UiRequest::HostStatus { id: p.id, reply })
+                .await?
+                .map_err(ws_err)?;
+            encode(&result)
+        }
         other => Err(HandlerError::unknown_op(other)),
     }
 }
@@ -3049,7 +3065,7 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
             HandlerError::not_found(e.to_string())
         }
         WorkspaceError::TabProjectMismatch { .. } => HandlerError::invalid_param(e.to_string()),
-        WorkspaceError::Io(_) | WorkspaceError::Json(_) => {
+        WorkspaceError::Io(_) | WorkspaceError::Json(_) | WorkspaceError::Inconsistent(_) => {
             HandlerError::new("internal", e.to_string())
         }
         WorkspaceError::HostNotFound(_) => HandlerError::not_found(e.to_string()),

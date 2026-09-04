@@ -306,7 +306,7 @@ is a real fault and exits 1, not 3.
 
 ## `host` subcommands
 
-Manage the **client-side** saved-host registry for [host sessions](../guides/host-sessions.md) — `add`, `list`, `remove`, `connect`, `disconnect`. Unlike `session`, a saved host is UI state (`Workspace.hosts` in the running UI's own `state.json`), not a session daemon's workspace — so every verb here addresses the ordinary UI socket (`--target` / auto-detect / `ROOST_BUNDLE_PROFILE`, same as `tab`/`project`), never `--socket` against a session. Each verb drives the matching `host.*` IPC op one-to-one, so the CLI can never diverge from what a palette click does. See [ipc.md](ipc.md) for the wire.
+Manage the **client-side** saved-host registry for [host sessions](../guides/host-sessions.md) — `add`, `list`, `remove`, `connect`, `disconnect`, `status`. Unlike `session`, a saved host is UI state (`Workspace.hosts` in the running UI's own `state.json`), not a session daemon's workspace — so every verb here addresses the ordinary UI socket (`--target` / auto-detect / `ROOST_BUNDLE_PROFILE`, same as `tab`/`project`), never `--socket` against a session. Each verb drives the matching `host.*` IPC op one-to-one, so the CLI can never diverge from what a palette click does. See [ipc.md](ipc.md) for the wire.
 
 ```bash
 roostctl host add --label pop-os --target /home/charlie/.local/state/roost/roost-session.sock
@@ -316,11 +316,17 @@ roostctl host list --json
 roostctl host remove --id 3f9a2b7c1d4e4f5a
 roostctl host connect --id 3f9a2b7c1d4e4f5a
 roostctl host disconnect --id 3f9a2b7c1d4e4f5a
+roostctl host status
+roostctl host status --id 3f9a2b7c1d4e4f5a --json
 ```
 
 `--target` accepts an SSH destination (`workbox`, `user@host`, `ssh://user@host:port` — only the `ssh://` spelling carries an explicit port; `ssh://[::1]:22` for a literal IPv6 host), a Unix socket path (anything containing `/`), or `localhost` — see [`roost_ipc::ssh::classify`](https://github.com/charliek/roost/blob/main/crates/roost-ipc/src/ssh.rs) for the full rule table. `host add` is **registry-only by default**: it saves `--label`/`--target` without dialing anything, so a typo'd target still saves cleanly — the sidebar's connection dot is what reports it at the next connect attempt. `--verify` additionally dials `session.identify` against `--target` first (through the same target-resolution `roost_ipc::ssh::verify_transport` and the Add Host dialog's own "Add & Connect" both use) and refuses to save on an unreachable or incompatible session — the CLI equivalent of the dialog's validation, stated once so the two bars cannot drift apart. Over an SSH target this is a **mux-less probe**: a one-shot `ssh` exec outside any `ControlMaster` (`ControlMaster=no`, no `-S`), so a stale or wedged control socket from a previous attempt can never make the probe report a false positive, and nothing is left running afterward, win or lose.
 
-`host connect` is unconditional takeover (reconnecting to an already-connected host IS takeover on this wire) and, on a `localhost` target, spawns the session first if nothing is listening. It returns once the attempt is under way, not once it settles — watch the sidebar or poll `host list` for the connected/taken-over/needs-restart outcome. `host disconnect` never stops the session; its shells keep running and a later connect picks them back up.
+`host connect` is unconditional takeover (reconnecting to an already-connected host IS takeover on this wire) and, on a `localhost` target, spawns the session first if nothing is listening. It returns once the attempt is under way, not once it settles — watch the sidebar or poll `host status` for the connected/taken-over/needs-restart outcome. `host disconnect` never stops the session; its shells keep running and a later connect picks them back up.
+
+`host list` prints one line per saved host — `id  label  target=…  state=…  last_connected=…`. The `state=` column is a **best-effort second call** to `host.status` after the registry read: a target that answers `unknown-op` (a session socket, the Swift app) or errors for any other reason prints `state=?` for every row rather than failing the listing. `host list --json` is deliberately the registry alone, unchanged — a script that wants connection state calls the op that owns it.
+
+`host status` is that op. It reports, for every saved host (or just `--id`), the state the sidebar's band is drawn from: `generation` (which attempt the host is on — the monotonic edge to poll against), `state`, `reason` (the band's untruncated input), `rollup` (the band's own output), and `retry` (an armed auto-reconnect's `delay_ms`/`attempt`/`budget`/`armed_at`, absent when nothing is scheduled). `--json` prints the op's result verbatim and is what scripts and the functional harness assert on; the human form is `id  label  state  rollup`, followed by the host's `detail` on indented lines when there is one — a settled launch failure's full text, which the band has no room for. See [ipc.md](ipc.md) for the field-by-field wire shape.
 
 There is no `roostctl host stop`: the palette's **Stop Session** verb goes straight onto the host's own connection as an ordinary `session.stop`, not through a client-side `host.*` op, so there is nothing yet for a CLI verb to drive.
 

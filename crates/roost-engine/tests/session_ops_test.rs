@@ -153,6 +153,7 @@ async fn a_session_socket_does_not_know_the_host_ops() {
         (ops::HOST_LIST, serde_json::json!({})),
         (ops::HOST_CONNECT, serde_json::json!({"id": "abc"})),
         (ops::HOST_DISCONNECT, serde_json::json!({"id": "abc"})),
+        (ops::HOST_STATUS, serde_json::json!({})),
     ] {
         let err = call(&f.handler, op, params)
             .await

@@ -115,6 +115,20 @@ roostctl host remove --id <id>
 
 See [`reference/cli.md`](../reference/cli.md#host-subcommands) for the full flag reference.
 
+### Checking a host from the command line
+
+`host connect` returns as soon as the attempt is under way, not once it settles, so the follow-up question — *did it work?* — has its own verb:
+
+```bash
+roostctl host status              # every saved host
+roostctl host status --id <id>    # just one
+roostctl host status --json       # the same, for a script
+```
+
+It prints the state the sidebar's band is showing you: the host's `state`, the band's own line (`disconnected — reconnecting in 8s (3/10)`, or an agent count while connected), and — indented underneath, when there is one — the full `reason` if the band's 60-character line had to cut it short (a changed-host-key sentence, say), followed by the `detail` the band has no room for, which is where a failed local session start spells out what it actually tried. `roostctl host list` carries an abbreviated `state=` column for the same reason. If you're scripting against it, watch the `--json` `generation` field: it counts connection attempts *started*, so it moves even when two attempts fail identically.
+
+This is a question about the **client**: which hosts this Roost is connected to. `roostctl session status` is the other half — run on the machine hosting a session, it says whether a daemon is listening there at all.
+
 ### Keybinds and creation routing
 
 Creation follows context, so you never have to think about "which host am I on" for the common case:
@@ -222,7 +236,9 @@ Point this at your real install (`/Applications/Roost-Iced.app`), not a dev/debu
 
 **"Needs restart" / an amber dot that won't turn green.** A build or protocol mismatch — see [The upgrade / restart flow](#the-upgrade-restart-flow) above. This is expected the first time you Connect after upgrading Roost on a machine whose `roost-session` predates the upgrade.
 
-**A host stays "disconnected" and won't come back (a stale socket).** The socket file can outlive the process that created it — the daemon crashed, was killed, or the machine rebooted without cleaning up. On `localhost`, Roost retries the connection itself with a capped backoff (you'll see the amber dot briefly, then grey); if it never recovers, run `roostctl session status` (or, over SSH, run it on the remote machine) to check whether anything is actually listening, and `roostctl session start` if not. A host reached over Roost's own SSH transport does the same once it's actually connected at least once — a mid-session drop retries on its own (`reconnecting in Ns (k/10)`, capped at 30 seconds between tries) and settles with a "gave up after 10 tries" message if the far side genuinely isn't coming back; ↻ Reconnect is still right there either way. On a remote host reached over the [fallback `ssh -L` forward](#scripted-fallback-forwarding-with-ssh-n-l) instead — a plain socket path, not Roost's SSH transport — none of that applies: first check the tunnel itself is still up, since a dropped SSH connection there looks identical to a dead session from Roost's side.
+**The band says "cannot find roost-session" or "roost-session failed to start".** The daemon couldn't be *started* — a different thing from a session that died, and Roost treats it differently: it says so once and stops, rather than burying the message under a retry every quarter-second against a socket nothing is going to create. The band has room for the headline only; `roostctl host status` prints the full `detail` beside it — for a missing binary, the launch ladder's three rungs verbatim (`$ROOST_SESSION_BIN`, next to this program, `$PATH`), and for a failed start, the exec error or the daemon's own verdict. `roostctl session start` reproduces the same ladder in your shell if you'd rather see it there. The fix is one of three: point `ROOST_SESSION_BIN` at the binary, put it on `PATH`, or reinstall so it sits next to the Roost app again (a packaged install always does — a half-copied build directory is the usual cause). Then press ↻ Reconnect; nothing is retrying behind your back.
+
+**A host stays "disconnected" and won't come back (a stale socket).** The socket file can outlive the process that created it — the daemon crashed, was killed, or the machine rebooted without cleaning up. On `localhost`, Roost retries a session that *dropped* — one that was running and went away — with a capped backoff (you'll see the amber dot briefly, then grey); a session that cannot *start* is the case above and settles instead of retrying. If a dropped one never recovers, run `roostctl session status` (or, over SSH, run it on the remote machine) to check whether anything is actually listening, and `roostctl session start` if not. A host reached over Roost's own SSH transport does the same once it's actually connected at least once — a mid-session drop retries on its own (`reconnecting in Ns (k/10)`, capped at 30 seconds between tries) and settles with a "gave up after 10 tries" message if the far side genuinely isn't coming back; ↻ Reconnect is still right there either way. On a remote host reached over the [fallback `ssh -L` forward](#scripted-fallback-forwarding-with-ssh-n-l) instead — a plain socket path, not Roost's SSH transport — none of that applies: first check the tunnel itself is still up, since a dropped SSH connection there looks identical to a dead session from Roost's side.
 
 **Connecting over a native SSH target fails outright (a classified reason).** Every SSH connect attempt is bounded, and a failure is classified into one of six families — its exact copy lands in the sidebar band as `disconnected — <reason>`, and in the log; an attempt you asked for (a palette Connect, `roostctl host connect`) also raises a toast, a background retry does not. The families, and what they mean:
 

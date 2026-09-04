@@ -413,7 +413,9 @@ async fn host_add_rejects_reserved_label_and_remove_reports_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_ops_route_to_an_attached_ui() {
     use roost_engine::ipc::UiRequest;
-    use roost_ipc::messages::{host_state, Host, HostAddResult, HostConnectionResult};
+    use roost_ipc::messages::{
+        host_state, Host, HostAddResult, HostConnectionResult, HostStatus, HostStatusResult,
+    };
 
     let dir = tempdir().unwrap();
     let socket_path = dir.path().join("roost.sock");
@@ -466,6 +468,20 @@ async fn host_ops_route_to_an_attached_ui() {
                     recorder.lock().unwrap().push("disconnect");
                     let _ = reply.send(Err(roost_engine::WorkspaceError::HostNotFound(id)));
                 }
+                UiRequest::HostStatus { id, reply } => {
+                    recorder.lock().unwrap().push("status");
+                    let _ = reply.send(Ok(HostStatusResult {
+                        hosts: vec![HostStatus {
+                            id: id.unwrap_or_else(|| "h1".into()),
+                            label: "pop-os".into(),
+                            target: "/tmp/s.sock".into(),
+                            generation: 2,
+                            state: host_state::DISCONNECTED.to_string(),
+                            rollup: Some("disconnected".into()),
+                            ..HostStatus::default()
+                        }],
+                    }));
+                }
                 _ => {}
             }
         }
@@ -504,6 +520,20 @@ async fn host_ops_route_to_an_attached_ui() {
         other => panic!("expected Server error, got {other:?}"),
     }
 
+    // The optional `id` narrows the read; the bare form asks for every
+    // saved host.
+    let status: HostStatusResult = client
+        .call(ops::HOST_STATUS, serde_json::json!({"id": "h1"}))
+        .await
+        .expect("host.status");
+    assert_eq!(status.hosts[0].id, "h1");
+    assert_eq!(status.hosts[0].generation, 2);
+    let status: HostStatusResult = client
+        .call(ops::HOST_STATUS, serde_json::json!({}))
+        .await
+        .expect("host.status");
+    assert_eq!(status.hosts.len(), 1);
+
     client
         .call::<_, serde_json::Value>(ops::HOST_REMOVE, serde_json::json!({"id": "h1"}))
         .await
@@ -511,13 +541,13 @@ async fn host_ops_route_to_an_attached_ui() {
 
     assert_eq!(
         *seen.lock().unwrap(),
-        vec!["add", "connect", "disconnect", "remove"]
+        vec!["add", "connect", "disconnect", "status", "status", "remove"]
     );
 }
 
-/// `host.connect` / `host.disconnect` have no headless implementation:
-/// connection state belongs to the app, and inventing one would answer
-/// with a state nothing is in.
+/// `host.connect` / `host.disconnect` / `host.status` have no headless
+/// implementation: connection state belongs to the app, and inventing
+/// one would answer with a state nothing is in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_connection_ops_have_no_headless_answer() {
     let dir = tempdir().unwrap();
@@ -536,7 +566,7 @@ async fn the_connection_ops_have_no_headless_answer() {
     });
     let mut client = connect_with_retry(&server_socket).await;
 
-    for op in [ops::HOST_CONNECT, ops::HOST_DISCONNECT] {
+    for op in [ops::HOST_CONNECT, ops::HOST_DISCONNECT, ops::HOST_STATUS] {
         let err = client
             .call_raw(op, serde_json::json!({"id": "h1"}))
             .await

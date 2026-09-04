@@ -181,6 +181,15 @@ wrapper small.
 - **Test-harness map**: the harnesses are organized in three layers —
   see [`tools/README.md`](tools/README.md) (functional / visual /
   real-input) for which to reach for.
+- **Host-session dev loop + live harness**: [`tools/session/`](tools/session/README.md)
+  — `dev-session.sh build|fetch|check|launch|all` builds a matching
+  `roost-session` natively in a shed of the *target's* arch and hands it
+  to the app's own bootstrap via `ROOST_SESSION_INSTALL_BIN` (arch is
+  guarded on both sides); `tools/session/live/` is the ssh auto-reconnect
+  harness against a real `sshd` (`mutate.sh selftest`, lanes L1–L5),
+  run by hand in a shed, one lane at a time — not a CI lane (#395).
+  Host connection state is observable through `roostctl host status
+  --json` (`host.status`); tests assert on it, never on the log.
 - **Linux testing on a Mac**: the iced UI's real-input tiers (X11/Xvfb,
   weston/Wayland, and the cage+uinput Wayland pointer-drag guard) only
   run on Linux, and Docker Desktop can't run the cage+uinput tier (no

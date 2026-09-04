@@ -109,6 +109,41 @@ then `palette activate <id>` (positional id, e.g. `close_project`) drives
 the same dispatch as the keybind, so you can screenshot modal overlays with
 no XTEST.
 
+### Dev loop: a matching `roost-session` daemon on a real remote
+A separate loop from the three lanes above — for exercising the
+host-sessions bootstrap (Add Host → install → connect) against a real
+Linux remote, not for the iced real-input tests. `tools/session/dev-session.sh`
+builds `roost-session` in a shed of the target's own architecture
+(`roost-dev` for aarch64; a shed on a remote shed server such as `mini3`
+for amd64 — no cross-compile), fetches it back proving the version pin
+matches this checkout, and can point a local `Roost-Iced.app` at it via
+`ROOST_SESSION_INSTALL_BIN` so the product's own bootstrap does the
+install. See `tools/session/README.md` and
+`docs/development/host-sessions.md`'s "Dev loop" section — the live
+SSH-severance harness that runs against a host connected this way is a
+separate tool (`tools/session/live/`), not covered here.
+
+### Live harness: the ssh reconnect ladder against a real `sshd`
+Another separate loop — `tools/session/live/` (plan 042, #384) drives a
+**real** `sshd` through a real severance and reads every claim back
+through `roostctl host status --json`, the only way any of this
+proves the fake-`ssh` unit tests aren't lying. Run inside a shed
+(`roost-dev`), never on the Mac:
+
+```bash
+tools/session/live/mutate.sh selftest   # all five traps must trip
+tools/session/live/live.sh L1           # sever, watch the ladder climb, recover unaided
+```
+
+Defaults: `ROOST_RT=$HOME/rt/debug`, target `ssh://shed@localhost`,
+artifacts under `<repo>/target/live-ssh`; see `tools/session/live/README.md`
+for the full lane list and the override variables. Needs `jq` and `sudo`
+(firewall rules against the live `sshd`). **Not a CI lane** — L2 alone
+burns the ~8-minute production attempt budget. Lanes run **one at a
+time**: L5 stops `sshd` itself, so start it detached from the ssh
+session you're driving it from (`nohup`/`tmux`/a second shed console),
+not inline in the shell you're typing the command in.
+
 ## How it works (so you can debug it)
 - **`.shed/provision.yaml`** — an `install` hook (once: build deps for
   `roost-iced`, weston/cage/seatd, Xvfb/xdotool, python test deps, GTK4-dev

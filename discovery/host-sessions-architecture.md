@@ -686,7 +686,12 @@ deviation is the client-notification step of Stop, noted inline.
   now gets the same kind of self-scheduled retry once it has actually
   reached `Connected` — its own base delay and ceiling, giving up after
   10 attempts and settling rather than retrying forever. Launch-time
-  reconnect stays localhost-only, unchanged. See
+  reconnect stays localhost-only, unchanged. **Amended by plan 042
+  (2026-09-03):** "automatic retry for localhost" means a session that
+  *dropped*. A localhost session that could not be **started** now
+  settles on the first attempt with a `reason` plus a `detail`, and arms
+  no retry at all — the ladder it used to run was unbounded and re-buried
+  the launch ladder's own message on every rung. See
   [`docs/development/host-sessions.md` → The lease/takeover lifecycle](../docs/development/host-sessions.md#the-leasetakeover-lifecycle)
   for the shipped rule.
 
@@ -886,6 +891,16 @@ hosts → HS-2 (needs two hosts and a client).
   full bootstrap + attach from a Mac client into the VM; CI keeps
   the localhost lanes, shed covers SSH manually until a CI story
   exists.
+
+**Post plan 042 (2026-09-03), one rule this section predates:** a lane
+asserts a host's connection state through the `host.status` op, never by
+scraping the client's `tracing` output. The op reports the same `state` /
+`reason` / `rollup` / `detail` / `retry` the sidebar band is drawn from,
+plus a `generation` counting attempts started. `test_host_ssh.py` was
+ported off log needles onto it, `test_host_local_missing_daemon.py` was
+added for the localhost launch failure, and the SSH-severance harness
+that had lived outside the repo came in as `tools/session/live/` on the
+same rule (by hand in a shed, still not a CI lane).
 
 ## 13. Open questions (carried, not blocking)
 

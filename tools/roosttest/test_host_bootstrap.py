@@ -77,12 +77,19 @@ and the field is not documented anywhere they would read it). Scenario
 10 below is the fence on the *original* rule: an ordinary `host.connect`
 — what `roostctl` actually sends — must still never prompt.
 
-A second seam closes an unrelated gap: `success.path_warning`
-(`app.rs::host_bootstrap_finished`) used to reach only the ephemeral
-status banner, with no op and no log line — unlike a *failed* job's
-`report_bootstrap_failure`, which already logs `%message`. The
-completion line now carries `%message` too, symmetrically, which is
-what scenario 9 reads.
+# How a job's verdict is read: `host.status`, never the log
+
+Every claim here about what a bootstrap did to a host comes off the
+`host.status` op (plan 042 W1), the same surface `test_host_ssh.py`
+asserts through: a failed job's classified message *is* the band's
+reason (`report_bootstrap_failure` → `set_bootstrap_note`, which
+`section_reason` puts in front of everything else), and a successful
+one's verdict is the reconnect it starts, which moves `generation`.
+The one thing that surface does not carry is `success.path_warning`
+(`app.rs::host_bootstrap_finished`), which rides the ephemeral status
+banner and the completion log line alone — so scenario 9 asserts the
+state that warning describes (an install landing off the far side's
+`$PATH`, and connecting anyway) rather than its copy.
 
 Condition waits only — with one deliberate exception. A claim of the
 form "no dialog ever appears" has no condition to wait for, so
@@ -131,15 +138,16 @@ from test_host_client import (
 from test_host_ssh import (
     FAKE_SSH_SESSION_ENV,
     NOT_FOUND_COPY,
-    TUNNEL_FAILED,
-    UiLog,
     _harness_owned_ui,  # noqa: F401  (autouse: this lane needs a harness-owned UI too)
     configure_fake_ssh,
+    hold,
     host_key,
     invocations,
     session_env,  # noqa: F401  (ssh_host's own dependency; pytest resolves it in *this* module)
     sh_quote,
     ssh_host,  # noqa: F401  (scenario 1 reuses it verbatim)
+    status,
+    wait_for_a_settled_reason,
 )
 
 pytestmark = pytest.mark.host_client
@@ -685,6 +693,54 @@ CONNECT_STARTED = ("disconnected", "connecting", "connected")
 
 
 # ---------------------------------------------------------------------------
+# Connection state — `host.status`, never the log
+# ---------------------------------------------------------------------------
+
+#: The band's reason while a bootstrap job is out
+#: (`app.rs::host_bootstrap_confirmed`'s `set_bootstrap_note`). It is the
+#: *most current* thing about the host until the job ends, so a wait for
+#: a job's verdict has to exclude it: `section_reason` puts the note in
+#: front of every other reason, and this one arrives before the answer.
+IN_PROGRESS_REASON = "setting up roost-session…"
+
+
+@dataclass
+class SavedHost:
+    """The two fields `test_host_ssh`'s `host.status` helpers read.
+
+    `status`/`wait_for_a_settled_reason` want `.roost` and `.saved_id`,
+    which `BootstrapHost` and `HostUnderTest` both have. Scenario 10
+    saves its host with a bare `host.add` — it wants an unreachable ssh
+    target and no session behind it — so this is what it hands them.
+    """
+
+    roost: Roost
+    saved_id: str
+
+
+def wait_for_a_bootstrap_verdict(
+    host: BootstrapHost, before: str | None, timeout: float = 120.0
+) -> dict:
+    """Wait for the running job to replace the band's reason with its own.
+
+    The note the job set on the way in ([`IN_PROGRESS_REASON`]) and the
+    reason the *connect* failure left before it (`before`) are both
+    excluded, because either read alone would be the state as it was one
+    transition ago — the job's own verdict is the first reason that is
+    neither.
+    """
+
+    def answered() -> dict | None:
+        row = status(host)
+        reason = row.get("reason")
+        if not reason or reason in (IN_PROGRESS_REASON, before):
+            return None
+        return row
+
+    return wait_until(answered, timeout, "the bootstrap job's own verdict on the band")
+
+
+# ---------------------------------------------------------------------------
 # The saved ssh host under test
 # ---------------------------------------------------------------------------
 
@@ -1054,7 +1110,7 @@ def test_running_mismatch_offers_remote_update_and_reconnects(
 
 
 def test_checksum_failure_leaves_the_jail_untouched(
-    bootstrap_host: BootstrapHost, roost: Roost, corrupted_asset: str, target
+    bootstrap_host: BootstrapHost, roost: Roost, corrupted_asset: str
 ):
     """A hash that does not match must stop the install *before* the
     bytes go anywhere, so the destination is not the only thing to
@@ -1062,14 +1118,21 @@ def test_checksum_failure_leaves_the_jail_untouched(
     `<dest>.tmp.<pid>` before anything reaches `dest` at all, so a
     regression that streamed first and verified after would leave the
     jail dirty and a bare `not dest.exists()` would still pass.
+
+    The classification is read off `host.status`: a failed job's message
+    becomes the band's reason (`app.rs::report_bootstrap_failure` →
+    `HostConnSet::set_bootstrap_note`, which `section_reason` puts in
+    front of everything else), so the sentence the user is left looking
+    at is the same one this asserts on.
     """
     result = bootstrap_host.connect_started()
 
     wait_dialog(roost, "bootstrap", "install")
-    log = UiLog(target, "bootstrap failed")
+    before = status(bootstrap_host).get("reason")
     answer(roost, "confirm")
-    line = log.wait_next()
-    assert "checksum" in line.lower(), line
+    row = wait_for_a_bootstrap_verdict(bootstrap_host, before)
+    assert "checksum" in row["reason"].lower(), row
+    assert row["state"] == "disconnected", row
 
     assert not bootstrap_host.jail.dest().exists(), "a checksum failure must install nothing"
     assert_jail_never_installed(bootstrap_host.jail)
@@ -1148,27 +1211,51 @@ def test_unix_socket_remote_keeps_the_docs_pointer_with_no_update_button(roost: 
 
 
 # ---------------------------------------------------------------------------
-# 9. PATH-warning suffix
+# 9. An install off the far side's $PATH still connects
 # ---------------------------------------------------------------------------
 
 
-def test_install_warns_when_the_non_interactive_path_misses_local_bin(
-    bootstrap_host: BootstrapHost, roost: Roost, valid_asset: str, target
+def test_an_install_outside_the_remote_path_still_connects(
+    bootstrap_host: BootstrapHost, roost: Roost, valid_asset: str
 ):
     """This module's jail never puts `~/.local/bin` on the far side's
-    `$PATH` (§ module docstring), so every successful install here is
-    already this scenario — the completion line the app now logs
-    symmetrically with a failed job's (`%message` on both,
-    `app.rs::host_bootstrap_finished` / `report_bootstrap_failure`) is
-    what makes it observable at all.
+    `$PATH` (§ module docstring), so every successful install here lands
+    somewhere the remote's own shell could never find — and Roost
+    connects anyway, because it execs the absolute path it just wrote
+    rather than a bare name.
+
+    That is the state half of the PATH warning. The *warning* itself
+    (`success.path_warning`, appended to
+    `app.rs::host_bootstrap_finished`'s completion message) reaches only
+    the ephemeral status banner and the log; no op carries it, and this
+    harness asserts host state through `host.status` alone, so the copy
+    is not asserted here. What is asserted is what it describes: the
+    install went to a directory that is not on the remote `$PATH`, the
+    job reported success (a reconnect it does not start on failure), and
+    the host came up.
     """
     result = bootstrap_host.connect_started()
 
     wait_dialog(roost, "bootstrap", "install")
-    log = UiLog(target, "roost-session is set up; reconnecting")
+    # `generation` counts attempts *started*. Only a job that succeeded
+    # asks for one (`host_bootstrap_finished`'s Ok arm reconnects; the
+    # Err arm sets a band reason and stops), so an advance past this
+    # read is the install's own verdict.
+    before = status(bootstrap_host)["generation"]
     answer(roost, "confirm")
-    line = log.wait_next()
-    assert "isn't on" in line and "PATH" in line, line
+    wait_until(
+        lambda: status(bootstrap_host)["generation"] > before,
+        120.0,
+        "the install to finish and the reconnect it starts to begin",
+    )
+    bootstrap_host.wait_connected()
+
+    dest = bootstrap_host.jail.dest()
+    assert dest.is_file() and os.access(dest, os.X_OK)
+    assert dest.parent != bootstrap_host.jail.stub_bin, (
+        "the jail's whole $PATH is one directory; an install into it would make "
+        "this scenario the ordinary one"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1191,14 +1278,20 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
     The stronger claim is that no probe ran **at all**, which is what the
     fake-`ssh` invocation log says: an IPC connect must never exec the
     discovery script (`/bin/sh -s`) in the first place.
+
+    That the connect *failed* the way it should is read off
+    `host.status`: the classified reason the band carries, watched from
+    the `generation` this host was at before `roostctl` ran, so it is
+    this attempt's verdict and not a leftover.
     """
     label = f"bs-cli-{uuid.uuid4().hex[:8]}"
     added = roost.call("host.add", {"label": label, "target": f"ssh://{label}.invalid"})["host"]
     saved_id = added["id"]
+    host = SavedHost(roost=roost, saved_id=saved_id)
     try:
         configure_fake_ssh("exit-127")
-        log = UiLog(target, TUNNEL_FAILED)
-        before = len(ssh_argvs())
+        generation = status(host)["generation"]
+        argvs_before = len(ssh_argvs())
         result = subprocess.run(
             [
                 sessionlib.roostctl_binary(),
@@ -1214,8 +1307,8 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
             timeout=scaled_timeout(60),
         )
         assert result.returncode == 0, result
-        line = log.wait_next()
-        assert NOT_FOUND_COPY in line, line
+        row = wait_for_a_settled_reason(host, generation)
+        assert NOT_FOUND_COPY in row["reason"], row
         assert_no_dialog_for(roost)
         rows = host_row_ids(roost)
         assert f"host:connect:{saved_id}" in rows
@@ -1251,7 +1344,7 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
         # its own, but its remote command is the exec chain — the
         # discovery script's `/bin/sh -s` belongs to the bootstrap job
         # alone, and no machine-driven op is allowed to reach it.
-        probed = [argv for argv in ssh_argvs()[before:] if is_probe_exec(argv)]
+        probed = [argv for argv in ssh_argvs()[argvs_before:] if is_probe_exec(argv)]
         assert not probed, probed
     finally:
         with contextlib.suppress(Exception):
@@ -1263,7 +1356,7 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
 # ---------------------------------------------------------------------------
 
 
-def test_paste_into_a_frozen_host_frame_is_refused(roost: Roost, target):
+def test_paste_into_a_frozen_host_frame_is_refused(roost: Roost):
     """The regression test for plan 039 C9 (§3.11), landing here per the
     plan's own instruction ("whichever lands second wires it").
 
@@ -1274,9 +1367,19 @@ def test_paste_into_a_frozen_host_frame_is_refused(roost: Roost, target):
     op that drives `KeybindAction::Paste` through the same dispatcher a
     real key event or native menu click reaches
     (`crates/roost-iced/src/app.rs`), since the accelerator has no other
-    IPC back door. The assertion is the pinned observable from §3.11:
-    the host-client lane drives the paste keybind against a frozen frame
-    and reads the refusal line off `UiLog`.
+    IPC back door.
+
+    What this case can assert, and what it cannot. The refusal's own
+    sentence goes to the status banner and the log
+    (`dispatch_keybind_action`'s Err arm) and no op reports either, so
+    the copy is fenced where it is written — `host_notice.rs`'s
+    `paste_refusal_names_state_and_remedy_distinctly` — not from here.
+    What is op-visible is the state the refusal is a function of, held
+    across the dispatch: the host stays frozen at `taken-over`, the
+    keybind starts no attempt of its own (`generation` unmoved), and
+    nothing raises a card over the frozen frame. The dispatch answering
+    at all is the third claim — refused inside the dispatcher, which is
+    where the guard lives, rather than erroring at the op.
     """
     session_env = sessionlib.make_env()
     try:
@@ -1292,9 +1395,18 @@ def test_paste_into_a_frozen_host_frame_is_refused(roost: Roost, target):
                 with EventStream(host.env.socket, lease=lease):
                     host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
 
-                    log = UiLog(target, "reconnect to paste")
+                    frozen = status(host)
+                    assert frozen["state"] == "taken-over", frozen
+
                     roost.call("app.keybind_dispatch", {"action": "paste"})
-                    line = log.wait_next(timeout=10.0)
-                    assert "reconnect to paste" in line, line
+
+                    def nothing_moved() -> None:
+                        row = status(host)
+                        assert row["state"] == "taken-over", row
+                        assert row["generation"] == frozen["generation"], row
+                        dump = dialog_dump(roost)
+                        assert dump.get("dialog") is None, dump
+
+                    hold(nothing_moved)
     finally:
         session_env.teardown()

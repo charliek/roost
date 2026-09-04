@@ -114,7 +114,9 @@ impl EngineError {
             Self::Workspace(WorkspaceError::TabNotFound(_)) => "tab_not_found",
             Self::Workspace(WorkspaceError::TabProjectMismatch { .. }) => "tab_project_mismatch",
             Self::Workspace(WorkspaceError::Io(_)) => "io_error",
-            Self::Workspace(WorkspaceError::Json(_)) => "invalid_state",
+            Self::Workspace(WorkspaceError::Json(_) | WorkspaceError::Inconsistent(_)) => {
+                "invalid_state"
+            }
             Self::Workspace(WorkspaceError::HostNotFound(_)) => "host_not_found",
             Self::Workspace(
                 WorkspaceError::HostLabelEmpty

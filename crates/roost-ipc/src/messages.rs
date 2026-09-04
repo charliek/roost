@@ -1029,10 +1029,13 @@ pub struct UpdateCheckDump {
 #[serde(deny_unknown_fields)]
 pub struct AppUpdateCheckParams {}
 
-/// `app.notification_status` request: read back the macOS iced UI's
-/// `UNUserNotificationCenter` backend state
-/// (`crates/roost-iced/src/macos/notifications.rs`). Gated and
-/// platform-restricted like `app.menu_dump`.
+/// `app.notification_status` request: read back the calling UI's
+/// `UNUserNotificationCenter` backend state — the iced UI from
+/// `crates/roost-iced/src/macos/notifications.rs`, the Swift app from
+/// `DesktopNotifications.status()`. Both answer one wire shape; only
+/// the reason a backend is unavailable differs (the Swift app installs
+/// its delegate at construction and so is always available). Gated on
+/// `ROOST_TEST_MODE=1` like `app.menu_dump`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppNotificationStatusParams {}
@@ -2066,12 +2069,102 @@ pub struct HostDisconnectParams {
 /// waiting for a dial, an identify and a lease before replying would
 /// block the caller on a remote round trip it can watch on the events
 /// stream instead. A caller that wants the settled answer polls
-/// `host.list` / the sidebar.
+/// [`host.status`](HostStatus) — which reports the connection state the
+/// sidebar's band is drawn from, not the state a request asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostConnectionResult {
     pub host: Host,
     /// One of [`host_state`]'s spellings.
     pub state: String,
+}
+
+/// `host.status` request: every saved host, or just the one named.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStatusParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStatusResult {
+    pub hosts: Vec<HostStatus>,
+}
+
+/// One saved host's connection state, as the sidebar's band reads it
+/// (plan 042 §3.1).
+///
+/// The registry fields come first and verbatim from [`Host`], so a
+/// caller correlating state with a saved host needs no second op.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStatus {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_connected: Option<String>,
+    /// Which connection attempt this host is on — bumped once per
+    /// attempt *started* (an explicit `host.connect`, a launch
+    /// auto-reconnect, or one rung of the ssh retry ladder), `0` before
+    /// the first, and kept across a disconnect.
+    ///
+    /// **The monotonic edge a poller waits on.** Two consecutive
+    /// attempts can fail with byte-identical reasons, so "disconnected
+    /// with a reason" cannot tell attempt N from N−1; reading this
+    /// before a connect and waiting for it to advance can. It counts
+    /// attempts rather than connections precisely so a host whose ssh
+    /// handshake never succeeds still moves it.
+    pub generation: u64,
+    /// One of [`host_state`]'s spellings — the same vocabulary
+    /// `host.connect` answers with, produced by the same classifier the
+    /// band's dot reads.
+    pub state: String,
+    /// The connection's own one-line reason, untruncated. This is the
+    /// band's *input*; [`Self::rollup`] is what it renders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The long form behind [`Self::reason`], when there is one the
+    /// band has no room for.
+    ///
+    /// One thing fills it today: a **localhost session that could not be
+    /// started**, where [`Self::reason`] is the ≤45-character band line
+    /// (`"cannot find roost-session"`, `"roost-session failed to
+    /// start"`) and this is what actually happened — the launch ladder's
+    /// three rungs verbatim, the exec error, or the daemon's own
+    /// verdict. Such a host also carries no [`Self::retry`]: nothing a
+    /// retry could do would find a binary, so it settles and waits for
+    /// ↻ Reconnect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The band's *output*: the sidebar reducer's own rollup string,
+    /// verbatim. For a **connected** host that is the agent count
+    /// (`"3 agents"`), not state text; absent when the band shows no
+    /// rollup at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollup: Option<String>,
+    /// The retry waiting to fire, absent when nothing will happen until
+    /// the user asks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetrySchedule>,
+}
+
+/// An armed auto-reconnect: what was scheduled, not what is left.
+///
+/// `delay_ms` is the delay the timer was armed with; `armed_at` is when,
+/// so a caller that wants a countdown can compute one. Only the ssh
+/// ladder carries a `attempt`/`budget` pair — a localhost retry is the
+/// connection task's own backoff and its counter never leaves the task,
+/// so those three are absent there and `delay_ms` is the whole story.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrySchedule {
+    pub delay_ms: u64,
+    /// The 1-based attempt number the band shows in `(3/10)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub armed_at: Option<String>,
 }
 
 /// The wire spellings of a host's connection state, shared by
@@ -2487,6 +2580,10 @@ pub mod ops {
     /// Drop a saved host's connection. Never Stop: the session keeps
     /// running and its shells with it (roadmap D8).
     pub const HOST_DISCONNECT: &str = "host.disconnect";
+    /// Read every saved host's connection state — the read-side twin of
+    /// [`HOST_CONNECT`]'s reply, and the surface a harness asserts
+    /// through instead of scraping the log (plan 042 §3.1).
+    pub const HOST_STATUS: &str = "host.status";
 }
 
 // ============================================================================
@@ -3600,6 +3697,77 @@ mod tests {
 
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppNotificationStatusParams>(bad).is_err());
+    }
+
+    #[test]
+    fn host_status_round_trips() {
+        round_trip(&HostStatusParams::default());
+        round_trip(&HostStatusParams {
+            id: Some("3f9a2b7c1d4e4f5a".into()),
+        });
+        // The all-hosts form is a bare `{}` on the wire, not
+        // `{"id": null}` — the op's default is "every host".
+        assert_eq!(
+            serde_json::to_value(HostStatusParams::default()).unwrap(),
+            serde_json::json!({})
+        );
+
+        let armed = HostStatus {
+            id: "3f9a2b7c1d4e4f5a".into(),
+            label: "workbox".into(),
+            target: "ssh://workbox".into(),
+            last_connected: Some("2026-09-01T17:40:02Z".into()),
+            generation: 3,
+            state: host_state::DISCONNECTED.into(),
+            reason: Some("reconnecting in 8s (3/10)".into()),
+            detail: None,
+            rollup: Some("disconnected — reconnecting in 8s (3/10)".into()),
+            retry: Some(RetrySchedule {
+                delay_ms: 8_000,
+                attempt: Some(3),
+                budget: Some(10),
+                armed_at: Some("2026-09-01T18:02:11Z".into()),
+            }),
+        };
+        round_trip(&armed);
+        round_trip(&HostStatusResult { hosts: vec![armed] });
+        round_trip(&HostStatusResult::default());
+
+        // Every optional is omitted rather than nulled, so a host that
+        // has never connected is four fields on the wire.
+        let never = HostStatus {
+            id: "a1b2c3d4e5f60718".into(),
+            label: "shed".into(),
+            target: "localhost".into(),
+            state: host_state::DISCONNECTED.into(),
+            ..HostStatus::default()
+        };
+        round_trip(&never);
+        assert_eq!(
+            serde_json::to_value(&never).unwrap(),
+            serde_json::json!({
+                "id": "a1b2c3d4e5f60718",
+                "label": "shed",
+                "target": "localhost",
+                "generation": 0,
+                "state": "disconnected",
+            })
+        );
+
+        // Localhost's own retry knows a delay and nothing else.
+        let local_retry = serde_json::to_value(RetrySchedule {
+            delay_ms: 250,
+            ..RetrySchedule::default()
+        })
+        .unwrap();
+        assert_eq!(local_retry, serde_json::json!({"delay_ms": 250}));
+
+        for bad in [r#"{"extra":"x"}"#, r#"{"id":"a","extra":1}"#] {
+            assert!(
+                serde_json::from_str::<HostStatusParams>(bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

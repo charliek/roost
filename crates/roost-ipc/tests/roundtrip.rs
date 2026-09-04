@@ -247,6 +247,30 @@ fn host_connection_vectors_decode_as_typed_params_and_results() {
         serde_json::from_value(response["result"].clone()).expect("host.disconnect result decode");
     assert_eq!(result.state, host_state::DISCONNECTED);
     assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+
+    let request = vector("host.status.request.json");
+    assert_eq!(request["op"], ops::HOST_STATUS);
+    let params: HostStatusParams =
+        serde_json::from_value(request["params"].clone()).expect("host.status params decode");
+    assert!(params.id.is_none(), "the vector is the all-hosts form");
+    assert_eq!(serde_json::to_value(&params).unwrap(), request["params"]);
+
+    let response = vector("host.status.response.json");
+    let result: HostStatusResult =
+        serde_json::from_value(response["result"].clone()).expect("host.status result decode");
+    let armed = &result.hosts[0];
+    assert_eq!(armed.generation, 3);
+    assert_eq!(
+        armed.retry.as_ref().map(|retry| retry.attempt),
+        Some(Some(3))
+    );
+    // The never-connected host is the shape a caller must be ready for:
+    // every optional omitted, `generation` still present at `0`.
+    let never = &result.hosts[1];
+    assert_eq!(never.generation, 0);
+    assert_eq!(never.retry, None);
+    assert_eq!(never.rollup, None);
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
 }
 
 #[test]

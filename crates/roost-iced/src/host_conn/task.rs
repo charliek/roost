@@ -184,9 +184,11 @@ enum AttemptError {
     Incompatible(Box<super::state::BuildMismatch>),
     /// The session said it is going away, with the wire's reason.
     Stopping(String),
-    /// Transport, refusal, or spawn failure. Retryable where policy
-    /// allows.
+    /// Transport or refusal. Retryable where policy allows.
     Transport(String),
+    /// The localhost launch ladder could not produce a daemon, and no
+    /// retry could. Terminal — see [`spawn_failure`].
+    Unrecoverable { reason: String, detail: String },
 }
 
 impl From<ClientError> for AttemptError {
@@ -207,7 +209,113 @@ impl From<AttemptError> for ConnEnd {
             AttemptError::Incompatible(mismatch) => ConnEnd::Incompatible(mismatch),
             AttemptError::Stopping(reason) => ConnEnd::Stopping(reason),
             AttemptError::Transport(reason) => ConnEnd::Dropped(reason),
+            AttemptError::Unrecoverable { reason, detail } => ConnEnd::Settled { reason, detail },
         }
+    }
+}
+
+/// Which rung of the localhost launch ladder failed, as
+/// [`spawn_failure`] classifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnStage {
+    /// [`session_launch::locate_session_binary`] — no rung found a
+    /// binary, or an explicit `ROOST_SESSION_BIN` was unusable.
+    Locate,
+    /// Reading the launch cwd.
+    Cwd,
+    /// [`session_launch::spawn_and_read_verdict`] — the exec itself, or
+    /// the read of the line it prints.
+    Launch,
+    /// The daemon's own [`session_launch::Verdict::Error`].
+    Verdict,
+    /// [`session_launch::confirm_serving`].
+    Confirm,
+}
+
+/// Whether a failed spawn is worth dialing again, and what to say.
+///
+/// | Stage | Verdict | `reason` |
+/// |---|---|---|
+/// | `Locate` | unrecoverable | `cannot find roost-session` |
+/// | `Cwd` | unrecoverable | `roost-session failed to start` |
+/// | `Launch`, exec-time io error | unrecoverable | `roost-session failed to start` |
+/// | `Launch`, anything else (verdict timeout, EOF, an over-long line) | transport | *(the error)* |
+/// | `Verdict` | unrecoverable | `roost-session failed to start` |
+/// | `Confirm` | transport | *(the error)* |
+///
+/// **Why every exec failure settles**, including the kinds that read as
+/// transient (`Interrupted`, a temporary fork failure): `mode` becomes
+/// [`ConnectMode::Dial`] after the first attempt, so **no retry can ever
+/// spawn again** — it would dial a socket that nothing is left to
+/// create, and the dial's generic io error would overwrite this reason
+/// every 250 ms forever. Settling is the only honest verdict under that
+/// loop, and ↻ Reconnect is the recovery. A future policy that let a
+/// retry spawn would revisit this table first.
+///
+/// The two timeout rows stay retryable for the mirror-image reason: the
+/// daemon *was* exec'd and may still be on its way to binding, and a
+/// dial is exactly the right retry for that.
+///
+/// This is the localhost half. The ssh transport's equivalent verdict
+/// lives in [`retryable`](super::reconnect::retryable).
+///
+/// **How `Launch` tells an exec failure from a verdict-read timeout.**
+/// [`session_launch::spawn_and_read_verdict`] attaches a real
+/// `io::Error` as a source exactly once — `Command::spawn`'s, through
+/// `with_context`. Every other failure it can return is a bare
+/// `anyhow!` string, the read's own io error included
+/// ([`session_launch::VerdictRead::Io`] stringifies before it leaves
+/// the reader). So an `io::Error` anywhere in the chain *is* the exec,
+/// and that stays true only while `VerdictRead::Io` carries a `String`.
+///
+/// Both settled `reason`s are written for the band's ~45 characters, not
+/// for the operator — what actually happened travels beside them as
+/// `detail`.
+fn spawn_failure(stage: SpawnStage, error: &anyhow::Error) -> AttemptError {
+    let bin = session_launch::BIN_NAME;
+    let detail = format!("{error:#}");
+    let reason = match stage {
+        SpawnStage::Locate => format!("cannot find {bin}"),
+        SpawnStage::Cwd | SpawnStage::Verdict => format!("{bin} failed to start"),
+        SpawnStage::Launch if error.chain().any(|cause| cause.is::<std::io::Error>()) => {
+            format!("{bin} failed to start")
+        }
+        SpawnStage::Launch | SpawnStage::Confirm => return AttemptError::Transport(detail),
+    };
+    AttemptError::Unrecoverable { reason, detail }
+}
+
+/// The copy for a socket with nothing behind it — one spelling, shared
+/// by the probe that finds it missing and the dial that discovers it.
+fn no_session_at(socket: &Path) -> String {
+    format!("no session is running at {}", socket.display())
+}
+
+/// A dial failed: say what actually happened when we can tell.
+///
+/// A [`ConnectMode::Dial`] attempt is the *retry* of a localhost
+/// connection whose first attempt already reported the honest reason —
+/// and `roost_ipc`'s own `io error: No such file` would overwrite it
+/// with something that reads like a bug in Roost. `NotFound` and
+/// `ConnectionRefused` against the socket mean one thing here, and it is
+/// the same thing [`ensure_socket`]'s probe says, so it is said the same
+/// way.
+///
+/// Only in `Dial` mode: the other two modes probed first, so a missing
+/// socket after a live probe is a race worth reporting literally.
+/// The redial policy is untouched — a session started by hand later
+/// still attaches with no ↻.
+fn dial_failure(mode: ConnectMode, socket: &Path, error: &roost_ipc::Error) -> AttemptError {
+    match (mode, error) {
+        (ConnectMode::Dial, roost_ipc::Error::Io(io))
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            AttemptError::Transport(no_session_at(socket))
+        }
+        _ => AttemptError::Transport(error.to_string()),
     }
 }
 
@@ -369,6 +477,21 @@ async fn connect_loop(
                 publish_state(feed, incarnation, machine.stopping(&reason));
                 return;
             }
+            ConnEnd::Settled { reason, detail } => {
+                // The operator's copy of the launch ladder's rungs: the
+                // band has room for `reason` alone, and this is the one
+                // place the whole text is written down for a person who
+                // is not looking at `roostctl host status`. Before the
+                // publish, so a feed that has already gone still logs.
+                tracing::warn!(
+                    host = %config.host,
+                    %reason,
+                    detail = %detail,
+                    "localhost session cannot start; not retrying"
+                );
+                publish_state(feed, incarnation, machine.settled(reason, detail));
+                return;
+            }
             ConnEnd::Dropped(reason) => {
                 let state = machine.dropped(reason, jitter());
                 let retry = state.retry_in();
@@ -486,7 +609,7 @@ async fn connect(
         .map_err(|_| {
             AttemptError::Transport(format!("dialing {} timed out", config.socket.display()))
         })?
-        .map_err(|error| AttemptError::Transport(error.to_string()))?;
+        .map_err(|error| dial_failure(mode, &config.socket, &error))?;
 
     // 1. Identify, and gate on it. Nothing binary exists yet, so every
     //    incompatibility is caught on stable JSON.
@@ -576,10 +699,7 @@ async fn ensure_socket(config: &ConnectionConfig, mode: ConnectMode) -> Result<(
     if mode == ConnectMode::SpawnIfMissing {
         return spawn_session(config).await;
     }
-    Err(AttemptError::Transport(format!(
-        "no session is running at {}",
-        config.socket.display()
-    )))
+    Err(AttemptError::Transport(no_session_at(&config.socket)))
 }
 
 /// Nothing is listening, and the user asked for a connection: climb the
@@ -588,8 +708,8 @@ async fn ensure_socket(config: &ConnectionConfig, mode: ConnectMode) -> Result<(
 async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
     if !config.transport.is_localhost() {
         return Err(AttemptError::Transport(format!(
-            "no session is running at {} and only a localhost session can be started from here",
-            config.socket.display()
+            "{} and only a localhost session can be started from here",
+            no_session_at(&config.socket)
         )));
     }
     let scale = scale();
@@ -598,11 +718,15 @@ async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
         std::env::current_exe().ok().as_deref(),
         std::env::var_os("PATH").as_deref(),
     )
-    .map_err(|error| AttemptError::Transport(format!("{error:#}")))?;
+    .map_err(|error| spawn_failure(SpawnStage::Locate, &error))?;
     // The launch cwd seeds the session's first project on a fresh state
     // file only; a UI has no better answer than its own.
-    let cwd = std::env::current_dir()
-        .map_err(|error| AttemptError::Transport(format!("read the working directory: {error}")))?;
+    let cwd = std::env::current_dir().map_err(|error| {
+        spawn_failure(
+            SpawnStage::Cwd,
+            &anyhow::Error::new(error).context("read the working directory"),
+        )
+    })?;
 
     let verdict = session_launch::spawn_and_read_verdict(
         &bin.path,
@@ -610,18 +734,18 @@ async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
         SPAWN_VERDICT_BUDGET.mul_f64(scale),
     )
     .await
-    .map_err(|error| AttemptError::Transport(format!("{error:#}")))?;
+    .map_err(|error| spawn_failure(SpawnStage::Launch, &error))?;
     if let session_launch::Verdict::Error(reason) = &verdict {
-        return Err(AttemptError::Transport(format!(
-            "{} start failed: {reason}",
-            session_launch::BIN_NAME
-        )));
+        return Err(spawn_failure(
+            SpawnStage::Verdict,
+            &anyhow::anyhow!("{reason}"),
+        ));
     }
     // Both success verdicts are confirmed rather than trusted: the
     // `already-running` loser can print before the winner has bound.
     session_launch::confirm_serving(&config.socket, SPAWN_CONFIRM_BUDGET.mul_f64(scale))
         .await
-        .map_err(|error| AttemptError::Transport(format!("{error:#}")))?;
+        .map_err(|error| spawn_failure(SpawnStage::Confirm, &error))?;
     Ok(())
 }
 
@@ -732,6 +856,12 @@ enum ConnEnd {
     Incompatible(Box<super::state::BuildMismatch>),
     Stopping(String),
     Dropped(String),
+    /// The connection cannot be made and no retry could change that.
+    /// Terminal on every transport — see [`spawn_failure`].
+    Settled {
+        reason: String,
+        detail: String,
+    },
 }
 
 /// The steady state: drain events into the mirror and intents into the
@@ -784,6 +914,14 @@ async fn serve(
                             // work one rung up.
                             Err(AttemptError::Transport(reason)) => {
                                 return ConnEnd::Dropped(reason)
+                            }
+                            // A resync never climbs the launch ladder,
+                            // so this is unreachable — but a verdict
+                            // that says "no retry can fix this" is
+                            // carried through rather than downgraded to
+                            // a retryable drop if it ever arrives.
+                            Err(AttemptError::Unrecoverable { reason, detail }) => {
+                                return ConnEnd::Settled { reason, detail }
                             }
                             Err(AttemptError::Incompatible(_)) => {
                                 return ConnEnd::Dropped(
@@ -995,6 +1133,137 @@ mod tests {
 
     fn seeded_mirror(revision: u64) -> SharedMirror {
         SharedMirror::new(HostMirror::from_list(seeded_list(Some(revision)), revision))
+    }
+
+    fn settled(error: &AttemptError) -> (&str, &str) {
+        match error {
+            AttemptError::Unrecoverable { reason, detail } => (reason.as_str(), detail.as_str()),
+            other => panic!("expected a settled verdict, got {other:?}"),
+        }
+    }
+
+    fn transport(error: &AttemptError) -> &str {
+        match error {
+            AttemptError::Transport(reason) => reason.as_str(),
+            other => panic!("expected a retryable verdict, got {other:?}"),
+        }
+    }
+
+    /// Every row of the classification table (plan 042 §3.2), including
+    /// the two that stay retryable — the ones that decide whether a
+    /// localhost host keeps a 250 ms ladder running against a socket
+    /// nothing will create.
+    #[test]
+    fn every_spawn_stage_gets_its_verdict() {
+        let plain = anyhow::anyhow!("the whole story");
+
+        let locate = spawn_failure(SpawnStage::Locate, &plain);
+        assert_eq!(
+            settled(&locate),
+            ("cannot find roost-session", "the whole story")
+        );
+
+        let cwd = spawn_failure(SpawnStage::Cwd, &plain);
+        assert_eq!(
+            settled(&cwd),
+            ("roost-session failed to start", "the whole story")
+        );
+
+        let verdict = spawn_failure(SpawnStage::Verdict, &plain);
+        assert_eq!(
+            settled(&verdict),
+            ("roost-session failed to start", "the whole story")
+        );
+
+        // No io error in the chain: the binary was exec'd and the read
+        // of its verdict is what expired, so a dial is the right retry.
+        assert_eq!(
+            transport(&spawn_failure(SpawnStage::Launch, &plain)),
+            "the whole story"
+        );
+        assert_eq!(
+            transport(&spawn_failure(SpawnStage::Confirm, &plain)),
+            "the whole story"
+        );
+
+        let exec = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("spawn /nope/roost-session");
+        let launched = spawn_failure(SpawnStage::Launch, &exec);
+        assert_eq!(
+            settled(&launched).0,
+            "roost-session failed to start",
+            "an exec that failed can never be retried: only the first attempt may spawn"
+        );
+        assert!(settled(&launched).1.contains("spawn /nope/roost-session"));
+    }
+
+    /// The invariant [`spawn_failure`]'s `Launch` arm rests on, against
+    /// the real function rather than a synthetic chain: a failed exec
+    /// carries an `io::Error`, and a successful exec whose verdict never
+    /// arrives does not.
+    #[tokio::test]
+    async fn only_a_failed_exec_puts_an_io_error_in_the_verdict_chain() {
+        let budget = Duration::from_secs(5);
+        let cwd = Path::new("/");
+
+        let missing = session_launch::spawn_and_read_verdict(
+            Path::new("/nonexistent/roost-session"),
+            cwd,
+            budget,
+        )
+        .await
+        .expect_err("a binary that is not there cannot be exec'd");
+        assert_eq!(
+            settled(&spawn_failure(SpawnStage::Launch, &missing)).0,
+            "roost-session failed to start"
+        );
+
+        // `true start` exec's fine and closes its stdout without a
+        // readiness line — the shape of a daemon that died on startup
+        // *after* the exec, which stays retryable.
+        let no_verdict =
+            session_launch::spawn_and_read_verdict(Path::new("/usr/bin/true"), cwd, budget)
+                .await
+                .expect_err("no line, so no verdict");
+        transport(&spawn_failure(SpawnStage::Launch, &no_verdict));
+    }
+
+    /// The launch-path twin: a redial of a socket that was never there
+    /// says so, instead of leaking `roost_ipc`'s `io error: No such
+    /// file` over the honest reason the first attempt published.
+    #[test]
+    fn a_redial_of_a_missing_socket_says_no_session_is_running() {
+        let socket = Path::new("/run/roost/roost.sock");
+        let missing = roost_ipc::Error::Io(std::io::ErrorKind::NotFound.into());
+        let refused = roost_ipc::Error::Io(std::io::ErrorKind::ConnectionRefused.into());
+        let expected = "no session is running at /run/roost/roost.sock";
+
+        assert_eq!(
+            transport(&dial_failure(ConnectMode::Dial, socket, &missing)),
+            expected
+        );
+        assert_eq!(
+            transport(&dial_failure(ConnectMode::Dial, socket, &refused)),
+            expected
+        );
+
+        // A mode that probed first found the socket live; it going away
+        // between the probe and the dial is a race, and reporting it
+        // literally is what makes that visible.
+        assert_ne!(
+            transport(&dial_failure(ConnectMode::IfPresent, socket, &missing)),
+            expected
+        );
+        // And an error that is not the socket's absence is never
+        // rewritten into a claim about the socket.
+        assert_ne!(
+            transport(&dial_failure(
+                ConnectMode::Dial,
+                socket,
+                &roost_ipc::Error::Io(std::io::ErrorKind::PermissionDenied.into()),
+            )),
+            expected
+        );
     }
 
     /// The pass-through contract C5 depends on: the mirror models

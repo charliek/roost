@@ -43,7 +43,8 @@ crates/
   roost-iced/             # iced UI — packaged .deb ships it as /usr/bin/roost;
                           #   src/macos/ holds the AppKit seams for Roost-Iced.app
   roost-session/          # opt-in headless host-session daemon (roost-session binary);
-                          #   Linux-only, started with `roostctl session start`
+                          #   Linux + macOS (bundled in Roost-Iced.app),
+                          #   started with `roostctl session start`
 mac/
   Sources/Roost/          # Swift Mac UI — embeds Workspace + PtySupervisor + IPC server
   Resources/              # themes, Info.plist.template, Info-iced.plist.template, entitlements
@@ -88,6 +89,8 @@ flowchart LR
 
 **The session/client edge is the one path that skips `Workspace`.** A `roost-session` a UI has connected to (host sessions, `docs/development/host-sessions.md`) is a *separate* in-process workspace running on another machine or process; its tabs never enter this UI's own `Workspace`. Instead `HostConn` mirrors that session's events straight into the UI event handler, so a host tab's bell, clipboard write (`tab.effect`), and attention notifications reach the same output surfaces a local tab's do: the notification inbox, the desktop banner, the sidebar's rows and dots, and the agents palette. Those surfaces are host-*aware* where identity matters — every row is keyed by `TabKey`, so a host tab and a local tab that share a number can never be confused, and the agents palette names the host in each row's context — and host-*blind* in what they render, since a remote row is drawn by the same widgets as a local one.
 
+**A host's connection state is the client's own, and it is readable from outside.** `HostConnSet` (`crates/roost-iced/src/host_conn.rs`) holds each host's `HostConnState` on the main thread — `Disconnected` / `Connecting` / `Connected` / `TakenOver` / `Stopped` / `NeedsRestart` — and one reducer projects it twice: into the sidebar section's status band, and onto the wire as [`host.status`](ipc.md#host-registry-host), which reports the band's own `rollup` string rather than re-deriving it. That is what makes the state assertable without reading pixels or log lines; `roostctl host status` is the same read from a shell. The two failure shapes are deliberately different: a connection that *dropped* retries itself (a localhost backoff, or the SSH ladder's ten jittered rungs), while a `localhost` session that could not be *started* settles on the first attempt — a `reason` for the band, a `detail` naming what the launch ladder actually hit, and no retry armed, because nothing a retry can do will create that binary. See [Host sessions (development)](../development/host-sessions.md) for the state machine and the SSH transport it rides.
+
 The wire surface is small enough to inspect by hand:
 
 ```bash
@@ -118,7 +121,7 @@ The iced side's equivalent subtlety is the drain: the feed is batched (capped pe
 
 ## Boundaries
 
-- Each UI process owns its workspace, PTY supervisor, and IPC server. There is no separate daemon by default — the one opt-in exception is `roost-session` (`crates/roost-session/`), a headless daemon for host-sessions, started with `roostctl session start` (see [`ipc.md`](ipc.md#session-sockets)). State is in memory + the bundle-profile `state.json` file.
+- Each UI process owns its workspace, PTY supervisor, and IPC server. There is no separate daemon by default — the one opt-in exception is `roost-session` (`crates/roost-session/`), a headless daemon for host-sessions, started with `roostctl session start` (see [`ipc.md`](ipc.md#session-sockets)). State is in memory + the bundle-profile `state.json` file. A saved host's *connection* state is the running UI's alone — `state.json` persists only the `{id, label, target, last_connected}` registry — which is why `host.connect` / `host.disconnect` / `host.status` have no headless form and answer `internal: no UI attached` without one.
 - `libghostty-vt` lives inside each UI for VT parsing + rendering.
 - OSC scanning lives in the UI (`OscScanner.swift` on macOS, the `roost-osc` crate + `roost-engine`'s `OscRouter` in the Rust UI) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace via `LocalClient.applyOSC`.
 - Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) all come from libghostty, through the `write_pty` effects callback each UI installs and drains onto the tab's PTY input. Roost's OSC scanner sees those queries but answers none of them — it did synthesize the OSC color replies until the pinned SHA started answering them, at which point synthesizing too meant double-answering. See [Terminal query replies](terminal-queries.md).

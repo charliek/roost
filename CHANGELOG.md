@@ -11,6 +11,14 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+_The host-sessions release: `roost-session` ships in `Roost-Iced.app` and
+the `.deb` (plus standalone `roost-session-<v>-linux-{amd64,arm64}`
+assets), a saved SSH host reconnects itself after a drop, a connection's
+state is readable on the wire (`host.status`) and from `roostctl host
+status`, a daemon that cannot start says so once instead of retrying
+forever, and the desktop-notification path is honest about authorization
+on macOS._
+
 ### Added
 
 - **macOS gets local host sessions too (HS-4b, plan 041)** — `roost-session`
@@ -247,6 +255,27 @@ release workflow asserts they agree).
   or over-limit input is refused before it reaches libghostty (corrupt
   payloads remain libghostty's per-record CRC check to reject). Groundwork
   for host sessions (#363); nothing in either UI consumes it yet.
+- **`host.status` reports every saved host's connection state (#382)** —
+  a new read op returns, for every saved host, its live state, retry
+  schedule, and the sidebar band's own rollup text, so `roostctl host
+  status [--id] [--json]` can answer "what is this host doing right now"
+  without rendering the window. `roostctl host list` also grows a
+  best-effort `state=` column, backed by the same op.
+- **A missing-daemon E2E lane (#392)** — `make e2e-host-missing-daemon`
+  (and its CI variant) proves that a `localhost` host with no reachable
+  `roost-session` binary settles once, with the right reason, instead of
+  spinning forever.
+- **`tools/session/dev-session.sh` builds a matching `roost-session` for
+  a remote (#393)** — one script builds `roost-session` on a target's
+  own architecture in a shed, fetches the artifact, cross-checks it
+  against the remote's `uname -m`, and launches Roost against it via
+  `ROOST_SESSION_INSTALL_BIN`, closing the loop from "I have a dev build
+  on this Mac" to "a Linux remote runs the matching daemon."
+- **A live SSH-reconnect harness ships in-repo (`tools/session/live/`,
+  #384)** — `mutate.sh selftest` and `live.sh`'s lanes exercise
+  auto-reconnect against a real `sshd`, asserting on `roostctl host
+  status` instead of scraping log lines. Not a CI lane — see the
+  `linux-test` skill for how to run it from `roost-dev`.
 
 ### Removed
 
@@ -333,6 +362,18 @@ release workflow asserts they agree).
   signature instead of producing a bundle that looks signed but isn't,
   and a permanent post-bundle verification step catches a broken or
   partial seal the pre-sign guard alone could miss.
+- **A `localhost` session that can't start settles once, with the
+  reason (#392)** — with the `roost-session` binary unreachable, the
+  band used to redial forever, re-burying the spawn ladder's actionable
+  message under a bare `io error: No such file` on every retry. It now
+  settles once instead, and the reason travels with it: `detail` on the
+  wire and under the row in `roostctl host status` names which rung
+  failed.
+- **A wrong-architecture `ROOST_SESSION_INSTALL_BIN` is refused before
+  it streams (#393)** — pointing the install seam at a binary built for
+  the other architecture used to fail late, at the remote's staged
+  verify, with nothing more than the remote shell's `Exec format error`.
+  It's now refused up front, naming both architectures.
 
 ## v0.0.18 — 2026-08-25
 

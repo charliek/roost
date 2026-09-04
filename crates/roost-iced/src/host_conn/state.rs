@@ -169,6 +169,12 @@ pub(crate) struct Disconnected {
     /// clean EOF from a localhost session, and the plan requires it be
     /// said rather than dressed up as a transient blip.
     pub(crate) reason: String,
+    /// The untruncated text behind `reason`, when `reason` is a band
+    /// line too short to carry it — the launch ladder's three rungs, an
+    /// exec error, the daemon's own verdict. Only [`HostStateMachine::settled`]
+    /// writes it; the band renders `reason` alone and `host.status`
+    /// carries this beside it.
+    pub(crate) detail: Option<String>,
     pub(crate) retry_in: Option<Duration>,
 }
 
@@ -221,6 +227,14 @@ impl HostConnState {
     pub(crate) fn retry_in(&self) -> Option<Duration> {
         match self {
             HostConnState::Disconnected(d) => d.retry_in,
+            _ => None,
+        }
+    }
+
+    /// The long form behind the band line, when this state carries one.
+    pub(crate) fn detail(&self) -> Option<&str> {
+        match self {
+            HostConnState::Disconnected(d) => d.detail.as_deref(),
             _ => None,
         }
     }
@@ -315,6 +329,7 @@ impl HostStateMachine {
             localhost,
             state: HostConnState::Disconnected(Disconnected {
                 reason: "not connected".into(),
+                detail: None,
                 retry_in: None,
             }),
             backoff: Backoff::default(),
@@ -364,7 +379,27 @@ impl HostStateMachine {
         let retry_in = self.localhost.then(|| self.backoff.next_delay(jitter));
         self.transition(HostConnState::Disconnected(Disconnected {
             reason: reason.into(),
+            detail: None,
             retry_in,
+        }))
+    }
+
+    /// The connection cannot be established and no retry could change
+    /// that — the localhost launch ladder could not produce a daemon
+    /// (`task::spawn_failure`). Never schedules a retry **whatever the
+    /// transport**: the localhost bool is deliberately not consulted,
+    /// because a retry here would dial a socket nothing is going to
+    /// create and overwrite this reason with a generic io error every
+    /// 250ms. ↻ Reconnect is the recovery.
+    pub(crate) fn settled(
+        &mut self,
+        reason: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> HostConnState {
+        self.transition(HostConnState::Disconnected(Disconnected {
+            reason: reason.into(),
+            detail: Some(detail.into()),
+            retry_in: None,
         }))
     }
 
@@ -375,6 +410,7 @@ impl HostStateMachine {
         self.backoff.reset();
         self.transition(HostConnState::Disconnected(Disconnected {
             reason: "disconnected".into(),
+            detail: None,
             retry_in: None,
         }))
     }
@@ -415,6 +451,7 @@ mod tests {
 
         let dropped = HostConnState::Disconnected(Disconnected {
             reason: "session ended".into(),
+            detail: None,
             retry_in: None,
         });
         let mismatch = HostConnState::NeedsRestart(BuildMismatch {
@@ -609,6 +646,31 @@ mod tests {
         assert!(
             state.retry_in().is_none(),
             "a non-localhost host is manual-reconnect only"
+        );
+    }
+
+    /// The one transition that ignores the localhost bool. A launch
+    /// failure on the *most* retryable transport there is still settles,
+    /// because the retry would dial a socket nothing is left to create —
+    /// so this is asserted on a localhost machine whose backoff has
+    /// already advanced, which is the shape a real settle arrives in.
+    #[test]
+    fn a_settled_localhost_never_schedules_a_retry() {
+        let mut machine = HostStateMachine::new(true);
+        machine.begin_attempt(None);
+        assert!(
+            machine.dropped("session ended", 1.0).retry_in().is_some(),
+            "the fixture only means something if this transport does retry"
+        );
+
+        let state = machine.settled("cannot find roost-session", "the three rungs, verbatim");
+        assert_eq!(
+            state,
+            HostConnState::Disconnected(Disconnected {
+                reason: "cannot find roost-session".into(),
+                detail: Some("the three rungs, verbatim".into()),
+                retry_in: None,
+            })
         );
     }
 

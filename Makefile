@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_sparkle.py`'s two classes split by lane: the bare-binary class
@@ -126,6 +126,15 @@ HOST_CLIENT_E2E_TESTS := tools/roosttest/test_host_client.py
 # and the incarnation probe both lanes use cannot tell two connected
 # hosts' tabs apart — so these two must never run at the same time.
 SSH_HOST_E2E_TESTS := tools/roosttest/test_host_ssh.py
+# Plan 042 W2's local-transport twin of SSH_HOST_E2E_TESTS: no tunnel, no
+# fake `ssh` — it sets `$ROOST_SESSION_BIN` to a path that does not exist
+# at import, so `localhost`'s own spawn attempt settles disconnected
+# instead of ever dialing a socket. Marked `host_client` for the same
+# deselect reasons and kept in its own list/target for the same one: the
+# override poisons every `roost-session` launch the harness UI would
+# otherwise attempt, so it must never run beside SSH_HOST_E2E_TESTS,
+# HOST_CLIENT_E2E_TESTS, or BOOTSTRAP_E2E_TESTS.
+MISSING_DAEMON_E2E_TESTS := tools/roosttest/test_host_local_missing_daemon.py
 # HS-3 slice 2's UI-side bootstrap lane (plan 039 C6): the same shape as
 # SSH_HOST_E2E_TESTS — `fake-ssh.sh`, this time in `run-remote` mode, so
 # the generated probe/install/start scripts really run — plus a loopback
@@ -252,6 +261,19 @@ e2e-host-ssh: $(GHOSTTY_LIB)  ## HS-3 SSH-transport E2E (the Iced UI reaching a 
 e2e-host-ssh-ci: $(GHOSTTY_LIB)  ## HS-3 SSH-transport E2E at CI parity. DESTRUCTIVE: force-quits a running Iced UI
 	cargo build -p roost-iced -p roost-cli -p roost-session
 	ROOST_TEST_MODE=1 uv run --group test pytest $(SSH_HOST_E2E_TESTS) --roost-target iced --roost-fresh
+
+# The same three binaries `e2e-host-ssh` needs — a stale build passes this
+# lane vacuously (an old binary that never gets a fresh `ROOST_SESSION_BIN`
+# override is not what settled the last time it ran). Never beside
+# e2e-host-client, e2e-host-ssh, or e2e-host-bootstrap: see
+# MISSING_DAEMON_E2E_TESTS.
+e2e-host-missing-daemon: $(GHOSTTY_LIB)  ## Plan 042 W2 local-daemon-missing E2E (an explicit Connect settles once, no retry)
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(MISSING_DAEMON_E2E_TESTS) --roost-target iced
+
+e2e-host-missing-daemon-ci: $(GHOSTTY_LIB)  ## Plan 042 W2 local-daemon-missing E2E at CI parity. DESTRUCTIVE: force-quits a running Iced UI
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(MISSING_DAEMON_E2E_TESTS) --roost-target iced --roost-fresh
 
 # The same three binaries `e2e-host-ssh` needs — the bootstrap job runs
 # the same fake-`ssh`-fronted transport, this time in `run-remote` mode.

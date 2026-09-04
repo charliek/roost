@@ -12,14 +12,17 @@ log() { echo "[provision $(date +%H:%M:%S)] $*"; }
 # as its XDND drag *source* to exercise roost-iced's native file-drop
 # target; roost-iced itself is GTK-free, verified independently by the
 # Cargo boundary gate in `make check-iced`.
-log "apt: GTK4 + libadwaita (XDND drag-source test dependency only), Wayland test compositors, X11 input, python test deps"
+#
+# jq is likewise not a build dep — tools/session/live/ (the host-sessions live
+# SSH-severance harness) parses IPC JSON with it inside the shed.
+log "apt: GTK4 + libadwaita (XDND drag-source test dependency only), Wayland test compositors, X11 input, python test deps, jq (host-sessions live harness)"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
 sudo apt-get install -y -qq \
   libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev clang \
   weston cage seatd \
   xvfb xdotool dbus-x11 mesa-vulkan-drivers libxkbcommon-x11-0 \
-  python3-pytest wl-clipboard zsh
+  python3-pytest wl-clipboard zsh jq
 log "apt done"
 
 # rust + zig are pinned in rust-toolchain.toml + mise.toml; mise ships on the

@@ -785,6 +785,34 @@ pays for itself but blocks nothing. #381 is the odd one out — it is a
 viewports, which closes it by construction), not an implementation task,
 and wants a conversation before a plan.
 
+**The pre list's own items — closed by plan 042 (swept 2026-09-03).**
+Four of the five items above have shipped: [#382](https://github.com/charliek/roost/issues/382)
+(`host.status` — a new op reporting every saved host's connection state,
+retry schedule and rollup, plus `roostctl host status`; `test_host_ssh.py`
+now asserts on that state instead of scraping `tracing` log lines for
+substrings), [#392](https://github.com/charliek/roost/issues/392) (a
+localhost session whose `roost-session` cannot be started now settles
+once and names why, instead of re-burying the spawn ladder's message
+under `io error: No such file` on every unbounded retry forever; the new
+`test_host_local_missing_daemon.py` E2E lane asserts it), [#393](https://github.com/charliek/roost/issues/393)
+(`tools/session/dev-session.sh` builds a matching `roost-session` on the
+target's architecture in a shed and installs it over the product's own
+bootstrap; `ROOST_SESSION_INSTALL_BIN` now refuses a provably wrong-arch
+binary before it streams, naming both arches), and [#384](https://github.com/charliek/roost/issues/384)
+(the live SSH-reconnect harness is in-repo now, at `tools/session/live/`,
+ported from `tracing`-log needles to assert on `host.status`; it is
+still not a CI lane — see [#395](https://github.com/charliek/roost/issues/395)
+below). Only [#381](https://github.com/charliek/roost/issues/381) and
+[#383](https://github.com/charliek/roost/issues/383) remain open on the
+pre list.
+
+One thing the #384 port surfaced and left as a live product wrinkle: an
+ssh failure's classified family never reaches a published `reason` on a
+retryable rung — the armed-rung line overwrites it in the same
+`host.status` update — so it surfaces only in the give-up copy. The
+live harness's L5 works around it by asserting the refusal as an OS
+fact rather than reading it back as a wire fact.
+
 **Release-blocking work from outside this roadmap — closed by plan 043
 (swept 2026-09-02).** This list stayed scoped to items host-session work
 surfaced, so these were named rather than absorbed, and every one of
@@ -876,7 +904,9 @@ follow-up list, nothing else on the milestone track.** Two of those
 four got sharper evidence from HS-4b: #382 (no connection-state op) is
 now also what blocks diagnosing #392 and what forces band assertions to
 be read as pixels, and #390 joins the testing-gap family though it is
-not itself release-blocking. Rationale for the order: HS-4b was small,
+not itself release-blocking. **Updated 2026-09-03:** plan 042 closed
+#382, #384, #392 and #393, so the pre list is now #381 and #383 alone —
+see the sweep paragraph above. Rationale for the order: HS-4b was small,
 locally verifiable pre-tag, and rounds out the platform story the
 release tells (both platforms persist locally, both connect to Linux
 hosts);
@@ -910,6 +940,29 @@ uncategorised, not implicitly "post".
 
 ### Pre initial release
 
+**Release decision (2026-09-03): the pre list is closed for v0.0.19.**
+With #382, #384, #392 and #393 shipped by plan 042 (PR #396) and
+043's notification/release items by PR #394, the first release carrying
+host sessions goes out from here; the two items still open below —
+#381 and #383 — move to **post-v0.0.19 by decision**, not by
+completion. Why it is safe: nothing in 042/043 changed a persisted
+format (`state.json`'s registry is 041's), `session_protocol` is still
+`2`, and #381's likely outcome — a protocol bump — is already the path
+the identity gate + the bootstrap's staged reinstall exercise (a stale
+daemon reads `NeedsRestart`, the consent card reinstalls from the
+release asset). Why it is right: #381 is a design conversation (atomic
+conditional-connect vs. HS-4d viewports) whose regression coverage —
+`host.status`, the lanes, the live harness — now exists *before* the
+wire changes; #383 is a testing investment that pairs with #386 and
+should land before #381's implementation, not before a release.
+Post-release order of work: **#387** (a far side that is merely
+restarting should not need a manual ↻ — the one "honest but unhelpful"
+first-release behavior) and the `reason`-overwrite wrinkle (an ssh
+family unreadable on the wire while a rung is armed) are the two cheap
+correctness follow-ups; then #383 + #386 together; then the #381
+conversation; HS-4c stays after that; #351 remains the top non-host
+post-release item.
+
 - **[#381](https://github.com/charliek/roost/issues/381) Session takeover is best-effort; needs an atomic
   conditional-connect on the wire.** Reconnect *is* takeover
   (`session.connect { takeover: true }`), and the guard in front of it
@@ -921,47 +974,47 @@ uncategorised, not implicitly "post".
   plan. Multi-client is the point of host sessions, so this is a
   correctness issue with a wrong outcome in both directions.
 - **[#382](https://github.com/charliek/roost/issues/382) No IPC op reports host connection state or the retry
-  schedule.** The functional lane asserts on `tracing` message
-  substrings, and the sidebar band copy (`reconnecting in 8s (3/10)`)
-  is reachable only by rendering the window and reading the PNG. Both
-  are one refactor away from passing while the feature is broken.
+  schedule. — Shipped, plan 042.** The functional lane asserted on
+  `tracing` message substrings, and the sidebar band copy
+  (`reconnecting in 8s (3/10)`) was reachable only by rendering the
+  window and reading the PNG. Both were one refactor away from passing
+  while the feature was broken. See the closure paragraph above.
 - **[#383](https://github.com/charliek/roost/issues/383) `App` is not constructible in a unit test.** `App::bootstrap`
   measures fonts, builds a runtime, hydrates the workspace and binds the
   socket, so every `App`-level guard gets e2e coverage or none — and
   that is exactly where plan 040's late bugs lived.
-- **[#384](https://github.com/charliek/roost/issues/384) The live SSH-reconnect harness lives outside the repo.** Only
-  a real `sshd` exercises `ControlPersist`, a black-holed route hitting
-  `ConnectTimeout`, and a daemonised master outliving the app. It found
-  real bugs, and it encodes three traps that each made a lane report
-  PASS while proving nothing.
+- **[#384](https://github.com/charliek/roost/issues/384) The live SSH-reconnect harness lives outside the repo. —
+  Shipped, plan 042.** Only a real `sshd` exercises `ControlPersist`, a
+  black-holed route hitting `ConnectTimeout`, and a daemonised master
+  outliving the app. It found real bugs, and it encoded three traps that
+  each made a lane report PASS while proving nothing. See the closure
+  paragraph above; the CI-lane gap it leaves is #395.
 - **[#393](https://github.com/charliek/roost/issues/393) No easy way to
-  get a matching dev `roost-session` onto a remote host.** Scoped with
-  #384, because they are two halves of one capability: a live harness
-  needs a way to *place* the build it tests. The install half already
-  exists (`ROOST_SESSION_INSTALL_BIN`, ungated, staged
-  verify-before-commit) and so does the hard part of cross-building from
-  a Mac (`tools/shed/build-in-shed.sh` already redirects
-  `CARGO_TARGET_DIR` and bind-mounts the ghostty dirs) — what is missing
-  is that the shed builder does not build `roost-session`, nothing
-  carries the artifact back out, and the arch axis is a silent trap. Not
-  release-*blocking* on its own; it is on the pre list because every
-  remaining item here wants a live remote check, and doing it first is
-  what makes the other three cheap.
+  get a matching dev `roost-session` onto a remote host. — Shipped,
+  plan 042.** Scoped with #384, because they are two halves of one
+  capability: a live harness needs a way to *place* the build it tests.
+  The install half already existed (`ROOST_SESSION_INSTALL_BIN`,
+  ungated, staged verify-before-commit) and so did the hard part of
+  cross-building from a Mac (`tools/shed/build-in-shed.sh` already
+  redirects `CARGO_TARGET_DIR` and bind-mounts the ghostty dirs) — what
+  was missing was that the shed builder did not build `roost-session`,
+  nothing carried the artifact back out, and the arch axis was a silent
+  trap. See the closure paragraph above.
 - **[#392](https://github.com/charliek/roost/issues/392) A missing
-  daemon binary reports an unusable error.** The spawn ladder produces
-  the right three-rung message, then localhost's own retry ladder
-  buries it: `connect_loop` sets `mode = Dial` after the first attempt
-  (`host_conn/task.rs:309-310`), `ensure_socket` returns `Ok` for `Dial`
-  without probing, and each retry's generic dial failure overwrites the
-  band with `io error: No such file`. Localhost's ladder is **unbounded**
-  — the attempt budget is `SSH_ATTEMPT_BUDGET`, SSH-only — so a broken
-  install retries forever, re-burying the message each time. The verdict
-  is already written down for the SSH side: `retryable()`'s table gives
-  `NotFound` a "no — nothing to exec, and a retry cannot install it"
-  (`host_conn/reconnect.rs:102`); the localhost spawn failure is the
-  same class and arrives as `DropInput::Session(None)`, which retries.
-  Small, and worth doing before a release precisely because a broken
-  install is a first-run experience.
+  daemon binary reports an unusable error. — Shipped, plan 042.** The
+  spawn ladder produced the right three-rung message, then localhost's
+  own retry ladder buried it: `connect_loop` sets `mode = Dial` after
+  the first attempt (`host_conn/task.rs:309-310`), `ensure_socket`
+  returned `Ok` for `Dial` without probing, and each retry's generic
+  dial failure overwrote the band with `io error: No such file`.
+  Localhost's ladder was **unbounded** — the attempt budget is
+  `SSH_ATTEMPT_BUDGET`, SSH-only — so a broken install retried forever,
+  re-burying the message each time. The verdict was already written
+  down for the SSH side: `retryable()`'s table gives `NotFound` a "no —
+  nothing to exec, and a retry cannot install it"
+  (`host_conn/reconnect.rs:102`); the localhost spawn failure was the
+  same class and arrived as `DropInput::Session(None)`, which retried.
+  See the closure paragraph above.
 
 ### Post initial release
 
@@ -979,6 +1032,12 @@ uncategorised, not implicitly "post".
   settling ladder needs no off-switch; filed so the convention
   (additive `#[serde(default)]` field, surfaced as a palette verb per
   D11, never a dialog) survives.
+- **[#395](https://github.com/charliek/roost/issues/395) The live
+  SSH-reconnect harness (`tools/session/live/`, #384) has no
+  `workflow_dispatch` CI lane.** It runs against a real `sshd` and takes
+  ~8 minutes (L2 alone), so it stays a person's `roost-dev` command, not
+  a required gate; a manually-triggered lane would let it run on demand
+  without holding up every PR.
 
 **Closed by shipped work:** [#379](https://github.com/charliek/roost/issues/379) (six unbounded stderr drains in
 `ssh.rs`) is fixed by plan 040 C1 — bounded drains plus a truncation

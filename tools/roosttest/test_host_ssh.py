@@ -39,19 +39,34 @@ cross a network, which is the one part of the chain a test cannot own.
   `BundleProfile::session()` on the far side resolves the throwaway
   profile the fixture started.
 
-# What can be asserted about a failure, and what cannot
+# How a failure is asserted: `host.status`, never the log
 
-A classified failure's copy reaches the *sidebar band*
-(`disconnected — <reason>`) and the UI's log. Neither `host.list` (a
-registry row: id, label, target) nor `app.sidebar_dump` (agent rows)
-carries it, so there is no op that returns the reason. The failure cases
-below therefore assert the strongest pair that is actually available:
-the connection state, read off the palette's host verbs the way
-`test_host_client.py` reads it, and the classified copy itself, read
-from the UI's own log — which also serves as the settle signal, because
-an ssh host with no connection yet reads as `disconnected` from the very
-start of an attempt (`refresh_host_views`), so the palette alone cannot
-say when the attempt finished.
+Every claim this module makes about connection state is read off the
+`host.status` op (plan 042 W1) — the classified reason, the band's own
+rollup, and the ssh ladder's armed rung with its `attempt`/`budget`.
+Until that op existed the only surface carrying a reason was the UI's
+`tracing` output, which this module scraped; a log line is an operator
+convenience a refactor is free to reword, so scraping it passed just as
+happily against a feature that had stopped working.
+
+Two properties of the op are what make the waits here honest, and both
+are worth knowing before reading a case:
+
+* **`generation` is the edge.** It counts attempts *started*, bumping
+  when an ssh establish begins rather than when it succeeds, and it
+  survives a disconnect. Two consecutive attempts can fail with
+  byte-identical reasons, so "disconnected with a reason" cannot tell
+  attempt N from N−1 — reading `generation` first and waiting for it to
+  advance can. It is what the old log cursor's "one more line" was.
+* **`retry` is present only while a rung is armed**, and disappears the
+  moment the timer fires. So `retry.attempt` climbs in visible steps but
+  a poll can miss one when the ladder's base is short: the waits below
+  assert `attempt >= n` and monotonic non-decrease, never equality with
+  a rung.
+
+What is still not an op, and stays an OS fact, is the fake `ssh`
+invocation log: how many establishes ran, and which `ssh` processes are
+still alive.
 
 Condition waits only.
 """
@@ -61,7 +76,6 @@ from __future__ import annotations
 import atexit
 import contextlib
 import os
-import re
 import shutil
 import signal
 import stat
@@ -148,18 +162,14 @@ CHANGED_KEY_WARNING = "Do not accept the new key"
 UNKNOWN_KEY_REMEDY = "review and accept it"
 NOT_FOUND_COPY = "roost-session isn't installed on"
 
-# What the UI logs when an establish fails (`host_conn.rs`). Also the
-# settle signal — see the module docstring.
-TUNNEL_FAILED = "ssh tunnel could not be established"
-
-# The auto-reconnect ladder's two `info` lines (`host_conn.rs`, plan 040
-# §3.8). The band they mirror — `reconnecting in 8s (3/10)` — is not
-# reachable from any op (the palette's Connect subtitle is a `&'static
-# str` keyed on the section state), so the log is where this lane reads
-# the ladder. Their fields are `host`/`attempt`/`delay_ms` and
-# `host`/`attempts`, rendered `key=value` by the fmt subscriber.
-RECONNECT_SCHEDULED = "ssh host reconnect scheduled"
-RECONNECT_GAVE_UP = "ssh host reconnect gave up"
+# The band's own two ladder lines (`host_conn.rs`'s `retry_line` and
+# `gave_up_copy`, plan 040 §3.8), as `host.status` reports them in
+# `rollup` — the sidebar reducer's output, `"{word} — {reason}"`.
+# Restated here for the same reason the failure copy above is: this is
+# what a user reads.
+DISCONNECTED_BAND = "disconnected — "
+RETRY_REASON = "reconnecting in "
+GAVE_UP_BAND = DISCONNECTED_BAND + "reconnect gave up after "
 
 
 def sh_quote(raw: str) -> str:
@@ -369,53 +379,74 @@ def dialog_dump(roost: Roost) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# The UI's log — the only surface carrying a classified reason
+# `host.status` — the surface carrying connection state
 # ---------------------------------------------------------------------------
 
 
-class UiLog:
-    """A cursor over the launched UI's captured output.
+def status(host: HostUnderTest) -> dict:
+    """This host's one `host.status` row."""
+    return host.roost.host_status(host.saved_id)["hosts"][0]
 
-    Counting matches rather than searching the whole file is what makes
-    "this attempt failed" distinguishable from "an earlier attempt in
-    this module did".
+
+def saved_ids(roost: Roost) -> set[str]:
+    """Every id `host.status`'s all-hosts form answers for.
+
+    The all-hosts form rather than a narrowed one because the question
+    it answers here is *absence*: a removed host must be gone from the
+    list, and `--id` on a host the registry has forgotten is a
+    `not-found` error, which is a weaker claim than the row simply not
+    being there.
     """
+    return {row["id"] for row in roost.host_status()["hosts"]}
 
-    def __init__(self, target: str, needle: str):
-        self.target = target
-        self.needle = needle
-        self.seen = len(self._matches())
 
-    #: The fmt subscriber colours *inside* a structured line — dim around
-    #: every `=`, italics around every field name — so `attempt=2` is
-    #: never a substring of the raw text even though that is exactly what
-    #: it says. Stripped on the way in, once, rather than at each read.
-    _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+def assert_ladder_quiet(
+    host: HostUnderTest, what: str, *, establishes: int, generation: int
+) -> dict:
+    """No establish ran, no rung is armed, no attempt was started.
 
-    def _matches(self) -> list[str]:
-        output = self._ANSI.sub("", ui._launch_output(self.target))
-        return [line for line in output.splitlines() if self.needle in line]
+    The three reads a "nothing further happened" window is held on
+    (`hold`), in one place because four cases make exactly this claim
+    and differ only in what `what` names as the thing that must have
+    stopped.
 
-    def wait_next(self, timeout: float = 90.0) -> str:
-        """Block until one more matching line appears; return it."""
+    `generation` is the strongest of the three: a timer that fired and
+    re-armed between two polls could show no `retry` at either, but
+    cannot start an attempt without moving it. The establish count is
+    the same claim as an OS fact.
 
-        def fresh() -> str | None:
-            lines = self._matches()
-            return lines[self.seen] if len(lines) > self.seen else None
+    Returns the row it read, so a caller with a further claim to make
+    about the same poll spends one `host.status` call rather than two.
+    """
+    assert count(is_establish) == establishes, invocations()
+    row = status(host)
+    assert row.get("retry") is None, f"{what} armed another rung: {row}"
+    assert row["generation"] == generation, f"{what} was retried anyway: {row}"
+    return row
 
-        line = wait_until(fresh, timeout, f"the UI to log {self.needle!r}")
-        self.seen += 1
-        return line
 
-    def pending(self) -> int:
-        """How many matching lines have appeared past the cursor.
+def assert_band_matches_retry(row: dict) -> None:
+    """The band and the schedule in one response say the same thing.
 
-        The read for "this must NOT have happened". `wait_next` can only
-        answer the opposite question, and a case that cancels a live
-        ladder has to prove the ladder was still live — that it was the
-        cancellation and not exhaustion that ended it.
-        """
-        return len(self._matches()) - self.seen
+    Plan 042 AC1. `rollup` is the sidebar reducer's own output and
+    `retry` is the timer the ladder armed; nothing but this rebuilds one
+    from the other, so a formatter change on either side that stopped
+    them agreeing would otherwise ship. Every number comes from the
+    *same* response — recomputing from a second read would be racing the
+    ladder rather than checking a format.
+
+    The seconds round up and floor at one, mirroring
+    `retry_line`'s `delay.as_millis().div_ceil(1_000).max(1)` exactly:
+    integer arithmetic, because a float `ceil` of 400ms and of 400.0ms
+    are not the same expression.
+    """
+    retry = row["retry"]
+    seconds = max(1, -(-retry["delay_ms"] // 1000))
+    want = (
+        f"{DISCONNECTED_BAND}{RETRY_REASON}{seconds}s "
+        f"({retry['attempt']}/{retry['budget']})"
+    )
+    assert row["rollup"] == want, (row["rollup"], want, retry)
 
 
 # ---------------------------------------------------------------------------
@@ -528,26 +559,56 @@ def connect_and_wait(host: HostUnderTest, timeout: float = 60.0) -> None:
     host.wait_connected(timeout)
 
 
-def connect_expecting_failure(host: HostUnderTest, target: str, mode: str) -> str:
-    """Reconfigure the fake, ask to connect, and return the classified
-    copy the UI logged.
+def wait_for_a_settled_reason(
+    host: HostUnderTest, after: int, timeout: float = 90.0
+) -> dict:
+    """Wait for an attempt started after generation `after` to settle
+    with a verdict of its own, and return its `host.status` row.
 
-    The log line is the settle signal as well as the assertion: a host
-    whose tunnel never came up has no connection object at all, and
-    `refresh_host_views` reads that as `disconnected` from the moment the
-    attempt starts — so the palette cannot say when the attempt ended.
+    Four conditions, and each closes a window the others leave open. The
+    generation must have advanced, or the reason belongs to the previous
+    attempt. The state must be `disconnected`: an ssh host with no
+    connection yet reads that way from the moment an attempt starts, so
+    it is a necessary condition rather than the settle signal. No retry
+    may be armed, and the reason must not still be the ladder's own
+    `reconnecting in …` line — those two are the settle signal, because
+    between a rung firing and its establish failing the band still
+    carries the armed rung's text with a fresher generation beside it.
+    """
+
+    def settled() -> dict | None:
+        row = status(host)
+        if row["generation"] <= after:
+            return None
+        if row["state"] != "disconnected" or row.get("retry") is not None:
+            return None
+        reason = row.get("reason")
+        if not reason or reason.startswith(RETRY_REASON):
+            return None
+        return row
+
+    return wait_until(settled, timeout, f"an attempt past generation {after} to settle")
+
+
+def connect_expecting_failure(host: HostUnderTest, mode: str) -> str:
+    """Reconfigure the fake, ask to connect, and return the classified
+    reason the attempt settled on.
+
+    `generation` read before the op is what makes this an assertion
+    about *this* attempt: it counts attempts started, so a reason read
+    without it could be the previous one's, still sitting in the band.
     """
     configure_fake_ssh(mode)
-    log = UiLog(target, TUNNEL_FAILED)
+    before = status(host)["generation"]
     result = host.connect()
     assert result["state"] in CONNECT_STARTED, result
-    line = log.wait_next()
+    row = wait_for_a_settled_reason(host, before)
     # Settled, and settled the right way: still offering Connect, never
     # Disconnect.
     rows = host_row_ids(host.roost)
     assert f"host:connect:{host.saved_id}" in rows, rows
     assert f"host:disconnect:{host.saved_id}" not in rows, rows
-    return line
+    return row["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -568,19 +629,56 @@ def drop_the_link(host: HostUnderTest, mode: str) -> None:
     assert kill_bridge_connections(), "no live bridge connection to kill"
 
 
-def wait_for_a_live_retry(scheduled: "UiLog", through: int = 3) -> None:
-    """Wait until the ladder has armed attempt `through`'s timer.
+def wait_for_a_live_retry(host: HostUnderTest, through: int = 3) -> dict:
+    """Wait until the ladder has armed attempt `through`'s timer, and
+    return the `host.status` row that says so.
 
     Not attempt 1: its rung is the shortest there is (half to all of
     `ROOST_SSH_RECONNECT_BASE_MS`), and the cases that follow have to get
     an op onto the wire *inside* an armed window. Waiting a couple of
     rungs in spends a second of test time to buy a window several times
-    longer than the round trip — and asserting each number on the way
-    proves the ladder is climbing rather than re-arming in place.
+    longer than the round trip.
+
+    `>=` rather than equality, with monotonic non-decrease asserted on
+    the way: a 400ms base against a 50ms poll means a rung can come and
+    go between two reads, and a test that demanded to *see* attempt 2
+    would fail on a ladder that was climbing correctly. What a skipped
+    rung cannot do is make the number go backwards, which is the
+    property that distinguishes climbing from re-arming in place.
     """
-    for want in range(1, through + 1):
-        line = scheduled.wait_next()
-        assert f"attempt={want}" in line, line
+    seen = 0
+
+    def climbed() -> dict | None:
+        nonlocal seen
+        row = status(host)
+        retry = row.get("retry")
+        if retry is None:
+            return None
+        attempt = retry["attempt"]
+        assert attempt >= seen, f"the ladder went back from {seen} to {attempt}"
+        seen = attempt
+        return row if attempt >= through else None
+
+    return wait_until(climbed, 60.0, f"the ladder to arm attempt {through}")
+
+
+def wait_for_the_give_up(host: HostUnderTest, timeout: float = 60.0) -> dict:
+    """Wait for the ladder to spend its budget and stop.
+
+    Both halves matter and neither implies the other: `retry is None`
+    says no timer is armed, which is also true in the middle of an
+    attempt, and the band's give-up copy is what says the ladder is
+    *finished* rather than between rungs.
+    """
+
+    def gave_up() -> dict | None:
+        row = status(host)
+        if row.get("retry") is not None:
+            return None
+        rollup = row.get("rollup") or ""
+        return row if rollup.startswith(GAVE_UP_BAND) else None
+
+    return wait_until(gave_up, timeout, "the ladder to give up")
 
 
 # ---------------------------------------------------------------------------
@@ -675,9 +773,7 @@ def test_killing_the_bridge_processes_auto_reconnects_and_restores_the_tab(
         wait_dump_contains(roost, again, line)
 
 
-def test_a_host_that_stays_down_climbs_the_ladder_and_then_settles(
-    ssh_host, roost, target
-):
+def test_a_host_that_stays_down_climbs_the_ladder_and_then_settles(ssh_host, roost):
     """AC: the ladder advances, gives up, and stops — the off-switch.
 
     A capped ladder is what makes auto-reconnect safe to have at all: the
@@ -696,32 +792,45 @@ def test_a_host_that_stays_down_climbs_the_ladder_and_then_settles(
 
     ↻ Reconnect never left the screen, which is what settling is allowed
     to rely on: the palette still offers Connect at the end.
+
+    It is also where plan 042's AC1 lives: an armed rung is the one
+    moment `rollup` and `retry` describe the same event, so this is
+    where the band's formatter and the schedule the op reports are
+    checked to agree.
     """
     connect_and_wait(ssh_host)
-    scheduled = UiLog(target, RECONNECT_SCHEDULED)
-    gave_up = UiLog(target, RECONNECT_GAVE_UP)
+    before = status(ssh_host)["generation"]
     drop_the_link(ssh_host, "unreachable")
 
-    wait_for_a_live_retry(scheduled, through=4)
-    settled = gave_up.wait_next()
-    assert "attempts=4" in settled, settled
+    armed = wait_for_a_live_retry(ssh_host, through=4)
+    assert_band_matches_retry(armed)
+    settled = wait_for_the_give_up(ssh_host)
+    assert settled["rollup"].startswith(f"{GAVE_UP_BAND}4 tries"), settled
+    # Every rung is one attempt started, and `generation` counts exactly
+    # those — so "gave up after 4" is checked against four real attempts,
+    # not against the number the copy happens to print. Rungs can be
+    # missed by a poll; the counter cannot.
+    assert settled["generation"] == before + armed["retry"]["budget"], (
+        before,
+        settled,
+    )
 
     establishes = count(is_establish)
+    generation = settled["generation"]
 
-    def nothing_further() -> None:
-        assert count(is_establish) == establishes, invocations()
-        assert scheduled.pending() == 0, "a settled ladder armed another timer"
-
-    hold(nothing_further, 3.0)
+    hold(
+        lambda: assert_ladder_quiet(
+            ssh_host, "a settled ladder", establishes=establishes, generation=generation
+        ),
+        3.0,
+    )
 
     rows = host_row_ids(roost)
     assert f"host:connect:{ssh_host.saved_id}" in rows, rows
     assert f"host:disconnect:{ssh_host.saved_id}" not in rows, rows
 
 
-def test_a_changed_host_key_ends_the_ladder_instead_of_advancing_it(
-    ssh_host, roost, target
-):
+def test_a_changed_host_key_ends_the_ladder_instead_of_advancing_it(ssh_host, roost):
     """AC: a changed host key is never retried.
 
     The security case, and the reason §3.3's table is an exhaustive
@@ -733,38 +842,50 @@ def test_a_changed_host_key_ends_the_ladder_instead_of_advancing_it(
     to review and accept the key.
 
     Deviation from plan 040 C5(c), stated rather than hidden: the plan
-    asks for no `"reconnect scheduled"` line at all. There is exactly
-    one, and it is not reachable to remove from here — the changed key is
-    what the *retry's* establish discovers, and the drop that armed that
-    retry is a SIGKILLed pipe with no stderr to classify. "Never retried"
-    is therefore asserted where it lives: the ladder never advances past
+    asks for no retry at all. There is exactly one, and it is not
+    reachable to remove from here — the changed key is what the
+    *retry's* establish discovers, and the drop that armed that retry is
+    a SIGKILLed pipe with no stderr to classify. "Never retried" is
+    therefore asserted where it lives: the ladder never advances past
     the changed key.
+
+    Exactly one, without having to catch a rung mid-air: `generation`
+    read before the drop must advance (a retry ran) and then hold flat
+    (no second one did). Waiting to *see* rung 1 armed would be a race —
+    a 400ms base against a 50ms poll usually shows it, and "usually" is
+    a flake.
     """
     connect_and_wait(ssh_host)
-    scheduled = UiLog(target, RECONNECT_SCHEDULED)
-    failed = UiLog(target, TUNNEL_FAILED)
+    before = status(ssh_host)["generation"]
     drop_the_link(ssh_host, "hostkey-changed")
 
-    wait_for_a_live_retry(scheduled, through=1)
-    reason = failed.wait_next()
+    row = wait_for_a_settled_reason(ssh_host, before)
+    reason = row["reason"]
     assert CHANGED_KEY_COPY in reason, reason
     assert CHANGED_KEY_WARNING in reason, reason
     assert UNKNOWN_KEY_REMEDY not in reason, reason
 
     establishes = count(is_establish)
+    generation = row["generation"]
 
-    def one_attempt_only() -> None:
-        assert count(is_establish) == establishes, invocations()
-        assert scheduled.pending() == 0, "a changed host key armed another attempt"
+    assert generation == before + 1, f"the ladder spent more than one rung: {row}"
 
-    hold(one_attempt_only, 3.0)
+    hold(
+        lambda: assert_ladder_quiet(
+            ssh_host,
+            "a changed host key",
+            establishes=establishes,
+            generation=generation,
+        ),
+        3.0,
+    )
 
     rows = host_row_ids(roost)
     assert f"host:connect:{ssh_host.saved_id}" in rows, rows
 
 
 def test_a_missing_remote_binary_mid_ladder_settles_without_raising_a_card(
-    ssh_host, roost, target
+    ssh_host, roost
 ):
     """AC: an offer-able family reached by a ladder raises no modal.
 
@@ -779,53 +900,70 @@ def test_a_missing_remote_binary_mid_ladder_settles_without_raising_a_card(
 
     It settles rather than retrying for the same reason the copy names:
     a retry cannot install anything, and auto-install is forbidden.
+
+    One rung runs — the drop that starts the outage is a SIGKILLed pipe
+    with nothing to classify, so the family is only discovered by the
+    retry's own establish — and `generation` is how that is counted:
+    advanced once, then flat. Waiting to see the rung armed instead
+    would be racing a 400ms timer with a 50ms poll.
     """
     connect_and_wait(ssh_host)
-    scheduled = UiLog(target, RECONNECT_SCHEDULED)
-    failed = UiLog(target, TUNNEL_FAILED)
+    before = status(ssh_host)["generation"]
     drop_the_link(ssh_host, "exit-127")
 
-    wait_for_a_live_retry(scheduled, through=1)
-    reason = failed.wait_next()
+    row = wait_for_a_settled_reason(ssh_host, before)
+    reason = row["reason"]
     assert NOT_FOUND_COPY in reason, reason
     assert "roost-session" in reason, reason
 
     establishes = count(is_establish)
+    generation = row["generation"]
+    assert generation == before + 1, f"the ladder spent more than one rung: {row}"
 
     def settled_and_silent() -> None:
-        assert count(is_establish) == establishes, invocations()
-        assert scheduled.pending() == 0, "an offer-able family armed another attempt"
-        assert dialog_dump(roost).get("dialog") is None, dialog_dump(roost)
+        assert_ladder_quiet(
+            ssh_host,
+            "an offer-able family",
+            establishes=establishes,
+            generation=generation,
+        )
+        dialog = dialog_dump(roost)
+        assert dialog.get("dialog") is None, dialog
 
     hold(settled_and_silent, 3.0)
 
 
 def test_an_explicit_disconnect_during_a_scheduled_retry_stays_disconnected(
-    ssh_host, roost, target
+    ssh_host, roost
 ):
     """AC: asking to disconnect ends the ladder.
 
     Being reconnected eight seconds after asking to disconnect is the one
     outcome nobody wants, and it is the outcome a timer nobody cancelled
-    produces. The `pending()` read in the middle is what keeps this
-    honest: it proves the ladder was still climbing when the op landed,
-    so a pass means the disconnect ended it rather than exhaustion
-    getting there first.
+    produces. The armed rung read just before the op is what keeps this
+    honest: `attempt` short of `budget` proves the ladder still had
+    rungs left when the disconnect landed, so a pass means the
+    disconnect ended it rather than exhaustion getting there first.
     """
     connect_and_wait(ssh_host)
-    scheduled = UiLog(target, RECONNECT_SCHEDULED)
-    gave_up = UiLog(target, RECONNECT_GAVE_UP)
     drop_the_link(ssh_host, "unreachable")
 
-    wait_for_a_live_retry(scheduled)
+    armed = wait_for_a_live_retry(ssh_host)
+    assert armed["retry"]["attempt"] < armed["retry"]["budget"], armed
     ssh_host.disconnect()
     establishes = count(is_establish)
-    assert gave_up.pending() == 0, "the ladder settled on its own before the disconnect"
+    generation = status(ssh_host)["generation"]
 
     def stays_down() -> None:
-        assert count(is_establish) == establishes, invocations()
-        assert scheduled.pending() == 0, "a disconnected host armed another attempt"
-        assert gave_up.pending() == 0, "a cancelled ladder still ran to its give-up"
+        row = assert_ladder_quiet(
+            ssh_host,
+            "a disconnected host",
+            establishes=establishes,
+            generation=generation,
+        )
+        assert not (row.get("rollup") or "").startswith(GAVE_UP_BAND), (
+            f"a cancelled ladder still ran to its give-up: {row}"
+        )
         rows = host_row_ids(roost)
         assert f"host:disconnect:{ssh_host.saved_id}" not in rows, rows
 
@@ -847,18 +985,20 @@ def test_removing_a_host_during_a_scheduled_retry_leaves_no_ssh_children(
         pytest.skip("needs the harness's own UI process handle to walk its children")
 
     connect_and_wait(ssh_host)
-    scheduled = UiLog(target, RECONNECT_SCHEDULED)
-    gave_up = UiLog(target, RECONNECT_GAVE_UP)
     drop_the_link(ssh_host, "unreachable")
 
-    wait_for_a_live_retry(scheduled)
+    armed = wait_for_a_live_retry(ssh_host)
+    assert armed["retry"]["attempt"] < armed["retry"]["budget"], armed
     ssh_host.remove()
     establishes = count(is_establish)
-    assert gave_up.pending() == 0, "the ladder settled on its own before the removal"
 
+    # The all-hosts form: a removed host has no row to read state off,
+    # and its absence from the list is the state. What "nothing further"
+    # means for it is therefore an OS fact — no further establish — plus
+    # the ssh children waited for below.
     def nothing_further() -> None:
         assert count(is_establish) == establishes, invocations()
-        assert scheduled.pending() == 0, "a removed host armed another attempt"
+        assert ssh_host.saved_id not in saved_ids(roost), "a removed host came back"
 
     hold(nothing_further, 4.0)
     # Waited for rather than asserted flat through the window above: the
@@ -869,9 +1009,7 @@ def test_removing_a_host_during_a_scheduled_retry_leaves_no_ssh_children(
         15.0,
         "every ssh the removed host owned to be gone",
     )
-    assert ssh_host.saved_id not in {
-        row["id"] for row in roost.call("host.list", {})["hosts"]
-    }
+    assert ssh_host.saved_id not in saved_ids(roost)
 
 
 def test_quitting_during_a_scheduled_retry_leaves_no_ssh_children(
@@ -899,12 +1037,10 @@ def test_quitting_during_a_scheduled_retry_leaves_no_ssh_children(
         pytest.skip("needs the harness's own UI process handle to quit and relaunch")
 
     connect_and_wait(ssh_host)
-    scheduled = UiLog(target, RECONNECT_SCHEDULED)
-    gave_up = UiLog(target, RECONNECT_GAVE_UP)
     drop_the_link(ssh_host, "unreachable")
 
-    wait_for_a_live_retry(scheduled)
-    assert gave_up.pending() == 0, "the ladder settled on its own before the quit"
+    armed = wait_for_a_live_retry(ssh_host)
+    assert armed["retry"]["attempt"] < armed["retry"]["budget"], armed
     establishes = count(is_establish)
 
     ui.quit(target)
@@ -936,7 +1072,7 @@ def test_quitting_during_a_scheduled_retry_leaves_no_ssh_children(
 # ---------------------------------------------------------------------------
 
 
-def test_an_auth_failure_settles_disconnected_with_the_auth_copy(ssh_host, target):
+def test_an_auth_failure_settles_disconnected_with_the_auth_copy(ssh_host):
     """`Permission denied (publickey).` — the most common real failure.
 
     What matters is that it is reported as itself: an auth problem is the
@@ -944,13 +1080,11 @@ def test_an_auth_failure_settles_disconnected_with_the_auth_copy(ssh_host, targe
     terminal), so a classifier that fell through to the generic transport
     message would strand them.
     """
-    reason = connect_expecting_failure(ssh_host, target, "auth-fail")
+    reason = connect_expecting_failure(ssh_host, "auth-fail")
     assert AUTH_COPY in reason, reason
 
 
-def test_a_changed_host_key_settles_disconnected_and_never_offers_to_accept(
-    ssh_host, target
-):
+def test_a_changed_host_key_settles_disconnected_and_never_offers_to_accept(ssh_host):
     """The wary case. A changed host key is what a machine-in-the-middle
     looks like from here, so the copy must warn rather than offer a
     remedy — and must never carry the *unknown*-key remedy, which is to
@@ -960,14 +1094,14 @@ def test_a_changed_host_key_settles_disconnected_and_never_offers_to_accept(
     (`Host key verification failed.`), so this case is also the fence on
     classification order.
     """
-    reason = connect_expecting_failure(ssh_host, target, "hostkey-changed")
+    reason = connect_expecting_failure(ssh_host, "hostkey-changed")
     assert CHANGED_KEY_COPY in reason, reason
     assert CHANGED_KEY_WARNING in reason, reason
     assert UNKNOWN_KEY_REMEDY not in reason, reason
 
 
 def test_a_missing_remote_binary_settles_disconnected_and_names_roost_session(
-    ssh_host, target
+    ssh_host,
 ):
     """Exit 127: the host is reachable, the binary is not there.
 
@@ -975,7 +1109,7 @@ def test_a_missing_remote_binary_settles_disconnected_and_names_roost_session(
     to say so — this is the one failure where the user's next step is an
     install on the far machine.
     """
-    reason = connect_expecting_failure(ssh_host, target, "exit-127")
+    reason = connect_expecting_failure(ssh_host, "exit-127")
     assert NOT_FOUND_COPY in reason, reason
     assert "roost-session" in reason, reason
 
@@ -994,13 +1128,14 @@ def test_sigterm_during_teardown_flushes_state_and_tears_the_tunnel_down(
     SIGTERM behaved exactly like a crash — no `Drop for App`, so no
     workspace flush and no tunnel `-O exit` (an ssh ControlMaster would
     strand until its own `ControlPersist` window expired; plan 038's known
-    gap). This asserts both halves land: the UI's own log gets the flush
-    line, and the fake `ssh` invocation log gets a teardown call against
-    the tunnel's own control socket.
+    gap). Both halves are asserted through what a process leaves behind:
+    the exit status is 0, which only the graceful quit path produces
+    (plan 039 §3.9), and the fake `ssh` invocation log gets a teardown
+    call against the tunnel's own control socket.
 
-    This module, not `test_host_bootstrap.py`: both read `UiLog` and the
-    invocation log, but that module's `-O exit` is a **bootstrap job's**
-    own throwaway control socket (§3.8's job-scoped master) — a different
+    This module, not `test_host_bootstrap.py`: both read the invocation
+    log, but that module's `-O exit` is a **bootstrap job's** own
+    throwaway control socket (§3.8's job-scoped master) — a different
     socket from the one this assertion is pinned to. This module is where
     the *tunnel's* `-O exit` (`SshTunnel`'s `Drop`) lives.
 
@@ -1030,10 +1165,12 @@ def test_sigterm_during_teardown_flushes_state_and_tears_the_tunnel_down(
     # to address once the signal lands.
     assert count(is_establish) >= 1, invocations()
 
-    flush_log = UiLog(target, "workspace state flushed on shutdown")
     process.send_signal(signal.SIGTERM)
-    flush_log.wait_next(timeout=30.0)
-
+    # The only exit proof there is, and the only one there needs to be:
+    # a status of 0 is reachable only through the run loop's own end
+    # (`Drop for App`, the workspace flush, the tunnel teardown), so
+    # waiting for a log line first would have been the same claim read
+    # off a weaker surface.
     exit_code = process.wait(timeout=scaled_timeout(30.0))
     assert exit_code == 0, (
         f"the UI must end its run loop normally (exit {exit_code}); a "
