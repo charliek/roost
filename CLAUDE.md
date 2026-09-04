@@ -145,8 +145,10 @@ wrapper small.
   `Helper` — name things for what they are.
 - Errors are returned, not logged-and-swallowed. Log at the boundary
   that handles them.
-- Rust tests live in `_test.rs` files in `tests/`; Swift tests use
-  `swift-testing` in `mac/Tests/RoostTests/`.
+- Rust unit tests live inline in `#[cfg(test)] mod tests`; `tests/*_test.rs`
+  is for cross-crate integration tests, and is impossible in the binary
+  crates (`roost-iced`, `roost-cli`) — no lib target to link against.
+  Swift tests use `swift-testing` in `mac/Tests/RoostTests/`.
 - Default to no comments. Add a comment only when the WHY is
   non-obvious — a hidden constraint, a workaround, a tricky
   invariant. Don't comment what well-named code already says.
