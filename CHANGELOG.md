@@ -11,6 +11,8 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+## v0.0.19 — 2026-09-04
+
 _The host-sessions release: `roost-session` ships in `Roost-Iced.app` and
 the `.deb` (plus standalone `roost-session-<v>-linux-{amd64,arm64}`
 assets), a saved SSH host reconnects itself after a drop, a connection's
