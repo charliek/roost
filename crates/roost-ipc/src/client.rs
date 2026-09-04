@@ -621,6 +621,14 @@ pub enum ServerCode {
     Superseded,
     /// The client sent something the framing forbids.
     ProtocolError,
+    // -- host routing (UI socket only) -----------------------------------
+    /// A **UI** socket could not reach the host session an op named: the
+    /// connection is gone, died mid-op, or its queue is full — and also
+    /// what a session's own refusal folds onto when its code is one a UI
+    /// socket does not speak (`shutting-down` above is the standing
+    /// example; see `docs/reference/ipc.md`'s reorder matrix). The
+    /// mirror of `shutting-down`: a session never sends this one.
+    HostUnavailable,
     // -- generic ----------------------------------------------------------
     UnknownOp,
     NotImplemented,
@@ -652,6 +660,7 @@ impl ServerCode {
             "overflow" => ServerCode::Overflow,
             "superseded" => ServerCode::Superseded,
             "protocol-error" => ServerCode::ProtocolError,
+            "host-unavailable" => ServerCode::HostUnavailable,
             "unknown-op" => ServerCode::UnknownOp,
             "not-implemented" => ServerCode::NotImplemented,
             "parse-error" => ServerCode::ParseError,
@@ -681,6 +690,7 @@ impl ServerCode {
             ServerCode::Overflow => "overflow",
             ServerCode::Superseded => "superseded",
             ServerCode::ProtocolError => "protocol-error",
+            ServerCode::HostUnavailable => "host-unavailable",
             ServerCode::UnknownOp => "unknown-op",
             ServerCode::NotImplemented => "not-implemented",
             ServerCode::ParseError => "parse-error",

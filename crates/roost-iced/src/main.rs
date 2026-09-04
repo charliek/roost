@@ -1,6 +1,7 @@
 mod app;
 mod chrome;
 mod engine_feed;
+mod focus_probe;
 mod font_registry;
 /// Host sessions, client side (plan 037): one connection owner per
 /// connected `roost-session`, publishing onto the engine feed.
@@ -30,7 +31,7 @@ use anyhow::Context;
 use iced::advanced::input_method;
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
-use iced::{event, keyboard, time, window, Event, Size, Subscription, Task, Theme};
+use iced::{event, keyboard, mouse, time, window, Event, Size, Subscription, Task, Theme};
 use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
@@ -67,6 +68,9 @@ enum Message {
     /// A tab the workspace lists still has no terminal. Armed only while
     /// the pending-attach set is non-empty.
     AttachRetryTick,
+    /// A host reorder is holding its preview and the belt needs a clock.
+    /// Armed only while a hold is up.
+    ReorderHoldTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
     WindowOpened(window::Id),
@@ -133,7 +137,32 @@ enum Message {
     /// 037 §3.1) — the one free-text flow in the host verb family.
     AddHostNameChanged(String),
     AddHostSocketChanged(String),
+    /// The dialog's primary action, from a focused field's `on_submit` or
+    /// from Enter/Space on a ringed button. Distinct from
+    /// [`Self::AddHostConfirmPressed`] because a submit out of a field
+    /// must leave the Tab ring on that field.
     AddHostSubmit,
+    /// "Add & Connect" pressed with the pointer, which also moves the Tab
+    /// ring onto it (plan 044 §3.4).
+    AddHostConfirmPressed,
+    /// The widget tree answered `UiTask::AddHostTabStep`: `found` is the
+    /// id that actually holds keyboard focus, or `None` when nothing
+    /// does. `backwards` rides along so a Shift+Tab whose answer lands
+    /// after the ring changed still steps the way it was pressed.
+    AddHostTabFound {
+        found: Option<iced::advanced::widget::Id>,
+        backwards: bool,
+    },
+    /// A pointer press landed while the Add Host dialog is up. Forwarded
+    /// regardless of capture status — a press into a text field IS
+    /// captured, and that is exactly the press that moves widget focus
+    /// out from under the ring.
+    AddHostPointerPressed,
+    /// The widget tree answered `UiTask::AddHostFocusResync`. Corrects
+    /// the ring to what the tree says; never steps it.
+    AddHostFocusResynced {
+        found: Option<iced::advanced::widget::Id>,
+    },
     /// Dismiss whichever host modal is up: Cancel, the backdrop, or Esc.
     HostDialogCancel,
     /// A press that landed on the modal card itself. Swallowed, so it
@@ -438,6 +467,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.retry_pending_attachments();
             Task::none()
         }
+        Message::ReorderHoldTick => {
+            app.reorder_hold_tick();
+            Task::none()
+        }
         Message::FileDropDeadline => {
             app.file_drop_deadline();
             Task::none()
@@ -477,6 +510,14 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::CapturedEscape => app.captured_escape().map_task(),
         Message::CapturedEnterRelease => {
             app.captured_enter_release();
+            Task::none()
+        }
+        Message::AddHostTabFound { found, backwards } => {
+            app.add_host_tab_found(found.as_ref(), backwards).map_task()
+        }
+        Message::AddHostPointerPressed => app.add_host_pointer_pressed().map_task(),
+        Message::AddHostFocusResynced { found } => {
+            app.add_host_focus_resynced(found.as_ref());
             Task::none()
         }
         Message::UrlOpenCompleted(result) => {
@@ -563,6 +604,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::AddHostNameChanged(_)
         | Message::AddHostSocketChanged(_)
         | Message::AddHostSubmit
+        | Message::AddHostConfirmPressed
         | Message::HostDialogCancel
         | Message::HostDialogCardPressed
         | Message::HostStopConfirm
@@ -577,14 +619,21 @@ fn view(app: &App) -> iced::Element<'_, Message> {
     strip_reorder::ReleaseBoundary::new(app.view(), app.has_drag_preview()).into()
 }
 
-/// Which state-conditional timers the subscription set carries. Kept as a
-/// plain value so the state → armed-members mapping is testable without a
-/// window, a renderer, or a bootstrapped `App`.
+/// Which state-conditional members the subscription set carries. Kept as
+/// a plain value so the state → armed-members mapping is testable without
+/// a window, a renderer, or a bootstrapped `App`.
+///
+/// Mostly timers, and one event listener: `add_host_pointer` is a second
+/// `listen_with` armed only while the Add Host card is up, so the rest of
+/// the app never pays a message per mouse press for a dialog that is not
+/// open.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ArmedTimers {
     status: bool,
     palette_retry: bool,
     attach_retry: bool,
+    reorder_hold: bool,
+    add_host_pointer: bool,
 }
 
 impl ArmedTimers {
@@ -593,6 +642,8 @@ impl ArmedTimers {
             status: app.status_active(),
             palette_retry: app.palette_retry_pending(),
             attach_retry: app.attach_retry_pending(),
+            reorder_hold: app.reorder_hold_pending(),
+            add_host_pointer: app.add_host_dialog_open(),
         }
     }
 
@@ -600,7 +651,11 @@ impl ArmedTimers {
     /// expected-length term the subscription test asserts against.
     #[cfg(test)]
     fn count(self) -> usize {
-        usize::from(self.status) + usize::from(self.palette_retry) + usize::from(self.attach_retry)
+        usize::from(self.status)
+            + usize::from(self.palette_retry)
+            + usize::from(self.attach_retry)
+            + usize::from(self.reorder_hold)
+            + usize::from(self.add_host_pointer)
     }
 }
 
@@ -645,6 +700,23 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
     }
     if armed.attach_retry {
         members.push(time::every(app::ATTACH_RETRY_INTERVAL).map(|_| Message::AttachRetryTick));
+    }
+    if armed.reorder_hold {
+        members.push(time::every(app::host_reorder_hold_tick()).map(|_| Message::ReorderHoldTick));
+    }
+    if armed.add_host_pointer {
+        // Deliberately status-blind, unlike the keyboard member above: a
+        // press into a `text_input` IS captured, and that is precisely the
+        // press that moves widget focus out from under the drawn ring.
+        // Its own closure, so its recipe hash cannot collide with the
+        // keyboard listener's.
+        members.push(event::listen_with(|event, _status, _window| {
+            matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            )
+            .then_some(Message::AddHostPointerPressed)
+        }));
     }
     Subscription::batch(members)
 }
@@ -753,6 +825,20 @@ impl UiTask for app::UiTask {
             app::UiTask::Focus(id) => window::gain_focus(id),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::SelectAllWidget(id) => iced::widget::operation::select_all(id),
+            // `iced::widget::operation` has a Task-returning `focus` but no
+            // `unfocus`, so this runs the core operation directly.
+            app::UiTask::UnfocusWidgets => iced::advanced::widget::operate(
+                iced::advanced::widget::operation::focusable::unfocus::<()>(),
+            )
+            .discard(),
+            app::UiTask::AddHostTabStep { backwards } => {
+                iced::advanced::widget::operate(focus_probe::find_focused_or_none())
+                    .map(move |found| Message::AddHostTabFound { found, backwards })
+            }
+            app::UiTask::AddHostFocusResync => {
+                iced::advanced::widget::operate(focus_probe::find_focused_or_none())
+                    .map(|found| Message::AddHostFocusResynced { found })
+            }
             app::UiTask::Resize(id, size) => window::resize(id, size),
             app::UiTask::Screenshot(id) => window::screenshot(id).map(Message::ScreenshotCaptured),
             app::UiTask::ClipboardRead { request_id, target } => {
@@ -895,11 +981,19 @@ mod tests {
             .collect()
     }
 
-    fn armed(status: bool, palette_retry: bool, attach_retry: bool) -> ArmedTimers {
+    fn armed(
+        status: bool,
+        palette_retry: bool,
+        attach_retry: bool,
+        reorder_hold: bool,
+        add_host_pointer: bool,
+    ) -> ArmedTimers {
         ArmedTimers {
             status,
             palette_retry,
             attach_retry,
+            reorder_hold,
+            add_host_pointer,
         }
     }
 
@@ -926,16 +1020,16 @@ mod tests {
             "an idle app subscribes to the wake and the window/keyboard events, nothing periodic"
         );
 
-        for timers in [
-            armed(false, false, false),
-            armed(true, false, false),
-            armed(false, true, false),
-            armed(false, false, true),
-            armed(true, true, false),
-            armed(true, false, true),
-            armed(false, true, true),
-            armed(true, true, true),
-        ] {
+        // Every combination, so a member that forgot its own arming
+        // condition (or shares a recipe id with another) is caught.
+        for bits in 0u8..32 {
+            let timers = armed(
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+                bits & 16 != 0,
+            );
             let ids = recipe_ids(subscription_with(Arc::clone(&wake), timers));
             let unique: HashSet<u64> = ids.iter().copied().collect();
             assert_eq!(

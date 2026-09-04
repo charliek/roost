@@ -1,5 +1,5 @@
 //! The contract between whoever *launches* a host session and the
-//! session itself: one env hint on the way in, one verdict line on the
+//! session itself: two env hints on the way in, one verdict line on the
 //! way out.
 //!
 //! It lives here rather than in `roost-session` because both ends need
@@ -33,7 +33,11 @@
 //! because HS-2's client climbs the identical ladder: an explicit
 //! Connect on a localhost host spawns a missing session exactly the way
 //! the CLI does, and two implementations of "which `roost-session` is
-//! this user's" is one more than the contract can survive.
+//! this user's" is one more than the contract can survive. The second
+//! env hint — the derived state dir of
+//! [`spawn_and_read_verdict`] — is here for the same reason: the UI and
+//! the CLI must agree on where a session they spawned keeps its state,
+//! and agreeing by construction is cheaper than agreeing twice.
 //!
 //! # The stop ladder
 //!
@@ -67,6 +71,7 @@ use tokio::time::Instant;
 use crate::messages::{
     ops, SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
 };
+use crate::paths::{derived_session_state_dir, STATE_DIR_ENV};
 use crate::socket_state::{self, SocketState};
 use crate::IpcClient;
 
@@ -529,8 +534,8 @@ pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> V
     }
 }
 
-/// Spawn `<bin> start` with the launch-cwd hint and read the one line
-/// it prints, everything bounded by `budget`.
+/// Spawn `<bin> start` with the two env hints and read the one line it
+/// prints, everything bounded by `budget`.
 ///
 /// The child here is the *launcher* — for a real `roost-session` it is
 /// the forking parent, which exits the moment its daemonized child
@@ -538,16 +543,57 @@ pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> V
 /// process killed: killing the launcher never touches a session that
 /// did come up, and a launcher that will not exit must not be able to
 /// hold its caller open past its budget.
-pub async fn spawn_and_read_verdict(bin: &Path, cwd: &Path, budget: Duration) -> Result<Verdict> {
+///
+/// # The derived state dir
+///
+/// `seam` is the caller's `ROOST_STATE_DIR` — a *parameter*, like
+/// [`locate_session_binary`]'s env values, so the whole launcher stays
+/// a function of what it is handed and its test needs no
+/// process-global env. When it holds a value the profile resolver
+/// would honour, the session is given `<that dir>/session` rather than
+/// inheriting the value: a child that resolved its launcher's own
+/// state dir would find that launcher's `state.lock` held and refuse
+/// to start — the isolation seam colliding with itself
+/// ([#397](https://github.com/charliek/roost/issues/397)). Both
+/// callers, the UI's connect ladder and `roostctl session start`, get
+/// the rule from here, so they cannot disagree about where a session
+/// they spawned keeps its state. Values the resolver ignores (empty,
+/// relative) derive nothing and set nothing, and the daemon's own
+/// reading of the variable is unchanged — a *direct* `roost-session
+/// start` under the seam still uses the value verbatim. Nothing else
+/// moves: the session's socket follows `XDG_RUNTIME_DIR`, so
+/// `roostctl session status|stop` still find it.
+///
+/// Exercised over a real child in
+/// `tests/session_launch_state_dir_test.rs`, which is a binary of its
+/// own because it forks — its header has the listener it raced when it
+/// was not.
+pub async fn spawn_and_read_verdict(
+    bin: &Path,
+    cwd: &Path,
+    seam: Option<&OsStr>,
+    budget: Duration,
+) -> Result<Verdict> {
     let deadline = Instant::now() + budget;
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("start")
         .env(LAUNCH_CWD_ENV, cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Inherited: the session tees its startup log there, and a
         // failed start is far easier to read with it in front of you.
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(derived) = derived_session_state_dir(seam) {
+        // On the app path this line is the only trace of the
+        // derivation; `roostctl session start` also says it on stderr.
+        tracing::info!(
+            state_dir = %derived.display(),
+            "{STATE_DIR_ENV} is set; giving the spawned {BIN_NAME} a state dir under it"
+        );
+        command.env(STATE_DIR_ENV, &derived);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
 

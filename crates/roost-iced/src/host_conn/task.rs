@@ -141,7 +141,7 @@ pub(crate) struct ConnectionConfig {
 /// [`session_launch::timeout_scale`] reads the environment on each call,
 /// and [`leg`] is per-op work on the control plane — the answer cannot
 /// change while the process runs, so it is worth remembering.
-fn scale() -> f64 {
+pub(crate) fn scale() -> f64 {
     static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *SCALE.get_or_init(session_launch::timeout_scale)
 }
@@ -728,9 +728,17 @@ async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
         )
     })?;
 
+    // Read here rather than inside the launcher, beside the `BIN_ENV`
+    // read above: the launcher is a function of what it is handed, and
+    // this is the process whose state dir the derivation is relative
+    // to. A daemon that inherited the raw value would refuse this UI's
+    // own `state.lock` (#397).
+    let seam = std::env::var_os(roost_ipc::paths::STATE_DIR_ENV);
+
     let verdict = session_launch::spawn_and_read_verdict(
         &bin.path,
         &cwd,
+        seam.as_deref(),
         SPAWN_VERDICT_BUDGET.mul_f64(scale),
     )
     .await
@@ -1209,6 +1217,7 @@ mod tests {
         let missing = session_launch::spawn_and_read_verdict(
             Path::new("/nonexistent/roost-session"),
             cwd,
+            None,
             budget,
         )
         .await
@@ -1222,7 +1231,7 @@ mod tests {
         // readiness line — the shape of a daemon that died on startup
         // *after* the exec, which stays retryable.
         let no_verdict =
-            session_launch::spawn_and_read_verdict(Path::new("/usr/bin/true"), cwd, budget)
+            session_launch::spawn_and_read_verdict(Path::new("/usr/bin/true"), cwd, None, budget)
                 .await
                 .expect_err("no line, so no verdict");
         transport(&spawn_failure(SpawnStage::Launch, &no_verdict));

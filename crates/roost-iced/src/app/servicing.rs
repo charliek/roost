@@ -2,7 +2,111 @@ use std::collections::BTreeMap;
 
 use roost_ui_model::keys::HostId;
 
+use super::interactions::{host_reorder_call, ReorderTarget};
 use super::*;
+
+/// The UI socket's own error codes (`docs/reference/ipc.md`'s "Errors"
+/// bullet) **minus `shutting-down`** — the codes that mean the same
+/// thing whichever socket answered, so a session's refusal spelt one of
+/// these can cross unchanged.
+///
+/// `shutting-down` is excluded even though it is on that list, because
+/// the same doc marks it session-socket-only: it describes a *session's*
+/// stop latch, which a UI socket has no notion of, and both reorder ops
+/// are in the session's mutating set — so a latched session answers it
+/// for exactly the ops this maps.
+const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 10] = [
+    "unknown-op",
+    "unknown-field",
+    "missing-param",
+    "invalid-param",
+    "parse-error",
+    "frame-too-large",
+    "duplicate-id",
+    "not-found",
+    "not-implemented",
+    "internal",
+];
+
+/// What a host-routed op's failure says on the wire (plan 044 §3.1 d6).
+///
+/// A session's own refusal keeps its code when that code is one a UI
+/// socket speaks, so a caller matching `invalid-param` sees the same
+/// thing whether the session or this client refused it — and the
+/// `message` is the session's own, not `Display` (which prefixes the
+/// code and would double it).
+///
+/// Everything else folds onto `host-unavailable`: a lease or lifecycle
+/// code, and any code a newer or older session invents. That matters
+/// because `ipc.md` tells a client to treat an unlisted code as fatal
+/// for the request, so passing an unbounded set through would put codes
+/// on the UI socket that its own contract says cannot appear there.
+/// Nothing is lost — the folded branch reports
+/// [`crate::host_conn::HostOpError`]'s `Display`, which for a refusal
+/// is the session's code *and* its sentence, and for a dead connection
+/// is the same sentence the drag gesture's status banner shows.
+fn host_op_failure(error: &crate::host_conn::HostOpError) -> roost_engine::ipc::HostOpFailure {
+    if let crate::host_conn::HostOpError::Rejected { code, message } = error {
+        if CODES_A_UI_SOCKET_ALSO_SPEAKS.contains(&code.as_str()) {
+            return roost_engine::ipc::HostOpFailure::new(code.as_str(), message.clone());
+        }
+    }
+    roost_engine::ipc::HostOpFailure::new(HOST_UNAVAILABLE, error.to_string())
+}
+
+/// This client could not reach the host session an op named.
+///
+/// `ServerCode::as_str` is not `const` (its `Other` arm derefs a
+/// `String`), so the spelling is written out here and tied to the typed
+/// variant by `host_unavailable_is_the_typed_code`.
+const HOST_UNAVAILABLE: &str = "host-unavailable";
+
+/// The answer for an incarnation this client is not connected to — the
+/// same `not-found` `tab.focus` gives for the same reason.
+fn no_connected_host() -> roost_engine::ipc::HostOpFailure {
+    roost_engine::ipc::HostOpFailure::new("not-found", "no connected host with that incarnation")
+}
+
+/// One host section as `app.sidebar_dump` reports it (plan 044 §3.1 d7).
+///
+/// The rows come from the view's mirror clone, which is the
+/// **authoritative** order — a drag preview lives in the App's preview
+/// slot and is applied when the sidebar is built, never here. Keys are
+/// built through the wire ref types rather than formatted by hand, so
+/// the spelling this emits cannot drift from the one the reorder and
+/// focus ops parse. A never-connected host has no mirror, so it lists
+/// no projects and mints no `h0.…` key.
+fn host_dump(view: &HostView) -> SidebarDumpHost {
+    SidebarDumpHost {
+        id: view.saved_id.clone(),
+        label: view.label.clone(),
+        state: view.state.wire().to_string(),
+        projects: view
+            .projects
+            .iter()
+            .map(|project| SidebarDumpHostProject {
+                key: roost_ipc::messages::WireProjectRef::Host {
+                    host: view.host.raw(),
+                    project: project.id,
+                }
+                .to_string(),
+                name: project.name.clone(),
+                tabs: project
+                    .tabs
+                    .iter()
+                    .map(|tab| SidebarDumpHostTab {
+                        key: roost_ipc::messages::WireTabRef::Host {
+                            host: view.host.raw(),
+                            tab: tab.id,
+                        }
+                        .to_string(),
+                        title: tab.title.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
 
 pub(crate) struct AgentMetricsResult {
     session: u64,
@@ -1914,6 +2018,7 @@ impl App {
         SidebarDumpResult {
             agents_visible: self.config.show_sidebar_agents,
             projects,
+            hosts: self.host_views.iter().map(host_dump).collect(),
         }
     }
 
@@ -2439,6 +2544,35 @@ impl App {
                 let _ = reply.send(result);
             }
             UiRequest::SidebarDump { reply } => {
+                // The host half of the dump reads the `host_views`
+                // cache, which a reconcile refreshes — so without this
+                // the answer can lag the mirror by one event, exactly
+                // the staleness `host_status_op` refreshes for.
+                //
+                // Only half of that precedent is taken, deliberately.
+                // (1) No `refresh_sidebar_agents()`: this op's whole
+                // contract is that `projects[].agents` is the cache the
+                // sidebar paints from, so a refresh a UI forgot to run
+                // is wire-visible (plan 007 §3.8) — refreshing it here
+                // would make the op self-healing and blind. Safe
+                // because the count that pass recomputes
+                // (`HostView::agents`) is written and read inside that
+                // one function, so leaving it zeroed until the next
+                // reconcile changes nothing anyone reads. (2) No
+                // band/view pairing guard: `host_status_op` zips
+                // `host_sections` with `host_views` and has to refuse
+                // when a mid-list removal has mispaired them; this op
+                // zips nothing — each section is built from one view —
+                // so there is no pairing to be wrong.
+                //
+                // Honest about what this line is worth: it is a belt
+                // against a same-batch race that no test exercises.
+                // Deleting it leaves the lane green, because the tail
+                // reconcile of the batch that carried the event has
+                // already refreshed the cache by the time a follow-up
+                // request is served (plan 044 §8 records it as a
+                // known-unexercised path).
+                self.refresh_host_views();
                 let _ = reply.send(Ok(self.sidebar_dump()));
             }
             UiRequest::TabDispatchMouseEvent {
@@ -2500,6 +2634,31 @@ impl App {
                     .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
                 let _ = reply.send(result);
             }
+            UiRequest::HostTabReorder {
+                host,
+                project_id,
+                tab_ids,
+                reply,
+            } => {
+                self.host_reorder_op(
+                    HostId::new(host),
+                    ReorderTarget::Tabs { project_id },
+                    &tab_ids,
+                    reply,
+                );
+            }
+            UiRequest::HostProjectReorder {
+                host,
+                project_ids,
+                reply,
+            } => {
+                self.host_reorder_op(
+                    HostId::new(host),
+                    ReorderTarget::Projects,
+                    &project_ids,
+                    reply,
+                );
+            }
             UiRequest::HostConnect {
                 id,
                 test_user_origin,
@@ -2560,6 +2719,30 @@ impl App {
             );
         }
         Ok(self.host_connection_result(host))
+    }
+
+    /// The UI-socket form of a host reorder (plan 044 §3.1 d6): the same
+    /// call the drop gesture dispatches, minus the preview.
+    ///
+    /// Alone among the `host.*` arms this one cannot answer inside
+    /// `update` — the outcome is the session's, a round trip away — so
+    /// the reply rides into the spawned future and is answered there.
+    /// Dropping it instead would reach the caller as
+    /// `internal: UI dropped reply`, which says nothing about a host.
+    fn host_reorder_op(
+        &self,
+        host: HostId,
+        target: ReorderTarget,
+        ordered_ids: &[i64],
+        reply: roost_engine::ipc::HostOpReply<()>,
+    ) {
+        let Some(call) = host_reorder_call(&self.hosts, host, target, ordered_ids) else {
+            let _ = reply.send(Err(no_connected_host()));
+            return;
+        };
+        self.runtime_handle.spawn(async move {
+            let _ = reply.send(call.await.map_err(|error| host_op_failure(&error)));
+        });
     }
 
     fn host_disconnect_op(
@@ -2732,6 +2915,103 @@ mod tests {
     use roost_ui_model::keys::HostId;
 
     use super::*;
+
+    /// Every `HostOpError` a host-routed op can fail with, and the code
+    /// plus message it puts on the UI socket (plan 044 §3.1 d6).
+    ///
+    /// The row that matters is `shutting-down`. Both reorder ops are in
+    /// a session's mutating set, so a session with a latched stop
+    /// answers that code for exactly these ops — and `ipc.md` says it is
+    /// session-socket-only, so letting it cross would put a code on the
+    /// UI socket that its own contract says cannot appear there. It
+    /// folds, and so does anything a session invents that this build has
+    /// never heard of.
+    #[test]
+    fn a_host_failure_reports_only_codes_a_ui_socket_speaks() {
+        use crate::host_conn::HostOpError;
+        use roost_ipc::client::ServerCode;
+
+        let rejected = |code: &str| HostOpError::Rejected {
+            code: ServerCode::from_wire(code),
+            message: "the session said so".into(),
+        };
+
+        for code in CODES_A_UI_SOCKET_ALSO_SPEAKS {
+            let failure = host_op_failure(&rejected(code));
+            assert_eq!(failure.code, code);
+            assert_eq!(
+                failure.message, "the session said so",
+                "a crossing code keeps the session's own sentence, not \
+                 `Display`'s code-prefixed one"
+            );
+        }
+
+        for code in [
+            "shutting-down",
+            "connect-required",
+            "taken-over",
+            "already-connected",
+            "too-many-tokens",
+            "a-code-from-a-newer-session",
+        ] {
+            let failure = host_op_failure(&rejected(code));
+            assert_eq!(failure.code, HOST_UNAVAILABLE, "{code} must not cross");
+            assert_eq!(
+                failure.message,
+                format!("{code}: the session said so"),
+                "folding keeps both halves of what the session said"
+            );
+        }
+
+        // The three that are this connection failing rather than the
+        // session answering: one code, and `HostOpError`'s own words —
+        // the sentence the drag gesture's status banner shows.
+        for error in [
+            HostOpError::Disconnected,
+            HostOpError::Transport("broken pipe".into()),
+            HostOpError::Unavailable,
+        ] {
+            let expected = error.to_string();
+            let failure = host_op_failure(&error);
+            assert_eq!(failure.code, HOST_UNAVAILABLE);
+            assert_eq!(failure.message, expected);
+        }
+    }
+
+    /// The minted spelling is the typed variant's, so a client matching
+    /// `ServerCode::HostUnavailable` and this handler cannot drift.
+    #[test]
+    fn host_unavailable_is_the_typed_code() {
+        assert_eq!(
+            HOST_UNAVAILABLE,
+            roost_ipc::client::ServerCode::HostUnavailable.as_str()
+        );
+        assert_eq!(
+            roost_ipc::client::ServerCode::from_wire(HOST_UNAVAILABLE),
+            roost_ipc::client::ServerCode::HostUnavailable,
+            "an unrecognised code would decode as `Other` and defeat the \
+             point of declaring it"
+        );
+    }
+
+    /// The other arm of `host_reorder_op`: an incarnation this client
+    /// holds no op queue for is answered, not dropped — dropping the
+    /// reply would reach the caller as `internal: UI dropped reply`.
+    #[test]
+    fn an_unconnected_incarnation_is_not_found() {
+        let failure = no_connected_host();
+        assert_eq!(failure.code, "not-found");
+        assert!(
+            failure.message.contains("incarnation"),
+            "the refusal names what was not found: {}",
+            failure.message
+        );
+        assert!(
+            CODES_A_UI_SOCKET_ALSO_SPEAKS.contains(&failure.code.as_str()),
+            "this arm mints its own code, so it has to be one the UI \
+             socket speaks"
+        );
+    }
 
     fn envelope(event: &str, data: serde_json::Value) -> roost_ipc::messages::EventEnvelope {
         roost_ipc::messages::EventEnvelope {

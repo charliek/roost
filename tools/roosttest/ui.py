@@ -27,9 +27,19 @@ from client import Roost, RoostError, scaled_timeout
 # Only set when the harness *launches* the UI; a reused dev instance keeps
 # its own state. None when reusing or before a session starts.
 #
-# The directory also holds the UI's **state lock** (`state.lock`), so
-# removing it is not a plain `rmtree` — see `_remove_session_state`.
+# The directory also holds the UI's **state lock** (`state.lock`) — and,
+# since #397, a spawned `roost-session`'s lock underneath it — so
+# removing it is not a plain `rmtree`; see `_remove_session_state`.
 _SESSION_STATE_DIR: Path | None = None
+
+# Where a `roost-session` the UI spawns keeps its own state: nested
+# inside its launcher's state dir, so the throwaway `ROOST_STATE_DIR`
+# above isolates the daemon too rather than colliding with it (#397).
+#
+# MIRRORS `roost_ipc::paths::derived_session_state_dir`, frozen on the
+# Rust side by
+# `paths::tests::a_spawned_session_derives_a_dir_nested_in_an_absolute_seam`.
+DERIVED_SESSION_SUBDIR = "session"
 
 # Harness-launched Rust UI process handle + file capturing its
 # stdout+stderr (the UI tees its log to stdout). Retained so `wait_alive`
@@ -636,9 +646,91 @@ def _cleanup_owned_rust_runtime(target: str) -> None:
         os.close(fd)
 
 
+# How long a state-lock claim keeps re-probing before it answers. Short:
+# it covers a handover in flight, not a daemon someone forgot to stop.
+_STATE_LOCK_SETTLE_S = 2.0
+
+# The sentinel for "somebody else holds this right now", distinct from
+# both an absent lock and a claimed descriptor.
+_LOCK_HELD = object()
+
+
+def _try_claim_state_lock(lock: Path, whose: str):
+    """One attempt at `lock`: the held descriptor, `None` if the file is not
+    there, or `_LOCK_HELD` if another process has it."""
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return _LOCK_HELD
+        locked = os.fstat(fd)
+        named = os.stat(lock, follow_symlinks=False)
+        if (locked.st_dev, locked.st_ino) != (named.st_dev, named.st_ino):
+            raise RuntimeError(f"{whose} state lock was replaced; refusing state cleanup")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _claim_state_lock(lock: Path, whose: str, held_means: str) -> int | None:
+    """Take `lock` exclusively and keep holding it, or `None` if nothing
+    claims it.
+
+    `None` is "nothing here is alive": the processes that take a state lock
+    create it eagerly at startup and never unlink it, so a lock that is
+    absent — or present and free — beside a used state dir is not a live
+    instance. A lock still *held* raises: the caller is about to delete the
+    file it names, and the whole point of the probe is that it must not do
+    so behind a live writer's back.
+
+    Both answers come from re-probing for `_STATE_LOCK_SETTLE_S` rather than
+    from one look, because a single look is wrong in both directions. A
+    `roostctl session stop` that exited 0 proves the daemon's *socket* is
+    gone, not its process — `serve()` releases the state flock after the
+    socket finalizer has run — so a lock can be held for a moment after the
+    stop that removed it succeeded. And a daemon still starting creates its
+    lock *after* a probe that found none, so an absent lock is only
+    provisional too. Re-probing closes both; the loop below does not care
+    which way the answer moves.
+
+    The caller keeps the descriptor and closes it after the delete, so the
+    claim spans the unlink: releasing here would leave a window for the
+    holder to come back between the proof and the removal.
+    """
+    if not lock.parent.is_dir():
+        # Nothing has even begun here, so there is nothing to wait for: a
+        # process creates its state dir before the lock inside it, which
+        # rules out the "still starting" case the retry exists for. This is
+        # also what keeps the retry off the common path — only the
+        # local-spawn lane ever grows a `session/` subdirectory at all.
+        return None
+    settle = scaled_timeout(_STATE_LOCK_SETTLE_S)
+    deadline = time.monotonic() + settle
+    while True:
+        claim = _try_claim_state_lock(lock, whose)
+        if isinstance(claim, int):
+            return claim
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    if claim is _LOCK_HELD:
+        raise RuntimeError(
+            f"{whose} state lock {lock} was still held {settle:.1f}s after the "
+            f"sweep began: {held_means}. Refusing to remove the session state dir"
+        )
+    return None
+
+
 def _remove_session_state(target: str, state_dir: Path) -> None:
     """Delete the session's throwaway state dir — but only once nothing holds
-    its **state lock**.
+    a **state lock** inside it.
 
     `state.lock` is an inode, not a name. Deleting it out from under a live
     UI frees the name, so the next launch creates a *fresh* lock inode, takes
@@ -647,40 +739,50 @@ def _remove_session_state(target: str, state_dir: Path) -> None:
     cleanup — and an unconditional `rmtree(..., ignore_errors=True)` would do
     it silently, with no liveness proof at all.
 
-    So take the lock first, the same shape `_cleanup_owned_rust_runtime` uses
-    for the socket lock, and raise rather than delete if it is held: a held
-    state lock means a UI is still writing that `state.json`.
+    Since #397 there are **two** such locks to answer for, because a
+    `roost-session` the UI spawns is handed `<state dir>/session`
+    (`DERIVED_SESSION_SUBDIR`) and takes its own `state.lock` there from
+    startup. A recursive delete would unlink a live daemon's lock *and* its
+    `state.json` while its socket kept answering — the daemon writing to an
+    unlinked inode, and the next lane dialing a session whose state dir no
+    longer exists. Same failure as the UI's, one directory deeper.
+
+    So claim every lock first, the same shape `_cleanup_owned_rust_runtime`
+    uses for the socket lock, and raise rather than delete if one is held: a
+    held lock means something is still writing that `state.json`. A lane that
+    starts a daemon stops it in its own teardown, so reaching this with the
+    session lock held means one leaked — which is worth a loud failure, not a
+    silent corruption.
     """
-    lock = state_lock_path(state_dir)
-    if not lock.exists():
-        # Never launched (or already cleaned): nothing claims this dir. The
-        # UI creates the lock eagerly at startup and never unlinks it, so an
-        # absent lock beside a used state dir is not a live instance.
-        shutil.rmtree(state_dir, ignore_errors=True)
-        return
-    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(lock, flags)
+    claims: list[tuple[Path, int]] = []
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError(
-                f"{target} state lock {lock} is held: a UI is still writing "
-                "state.json there; refusing to remove the session state dir"
-            ) from error
-        locked = os.fstat(fd)
-        named = os.stat(lock, follow_symlinks=False)
-        if (locked.st_dev, locked.st_ino) != (named.st_dev, named.st_ino):
-            raise RuntimeError(
-                f"{target} state lock was replaced; refusing state cleanup"
-            )
-        # Unlink the lock while still holding it, then sweep the rest. Errors
+        for lock, whose, held_means in (
+            (
+                state_lock_path(state_dir),
+                target,
+                "a UI is still writing state.json there",
+            ),
+            (
+                state_lock_path(state_dir / DERIVED_SESSION_SUBDIR),
+                "spawned roost-session",
+                "a daemon this run started is still writing state.json there. "
+                "A `roostctl session stop` releases this lock only after it has "
+                "unlinked the socket, so a stop that has just returned is still "
+                "expected to hold it briefly; this long means the daemon leaked",
+            ),
+        ):
+            fd = _claim_state_lock(lock, whose, held_means)
+            if fd is not None:
+                claims.append((lock, fd))
+        # Unlink each lock while still holding it, then sweep the rest. Errors
         # on the sweep are ignorable (a throwaway dir the harness owns); the
-        # lock is the part that must not go without proof.
-        lock.unlink()
+        # locks are the part that must not go without proof.
+        for lock, _ in claims:
+            lock.unlink()
         shutil.rmtree(state_dir, ignore_errors=True)
     finally:
-        os.close(fd)
+        for _, fd in claims:
+            os.close(fd)
 
 
 def _answering_pid(target: str) -> int | None:

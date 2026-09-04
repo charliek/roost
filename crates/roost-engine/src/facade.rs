@@ -14,6 +14,7 @@ use roost_ipc::messages::{
     Project, ProjectCreateParams, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     Tab, TabClearNotificationParams, TabCloseParams, TabFocusParams, TabOpenParams,
     TabReorderParams, TabResizeParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WireProjectRef, WireTabRef,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
@@ -133,6 +134,37 @@ impl EngineError {
     }
 }
 
+/// The façade drives the local workspace and holds no host connections,
+/// so it narrows the host-qualified wire spellings rather than
+/// pretending it could act on one — the rule `TabFocus` has applied
+/// since plan 037 §3.4, extended to the reorder ops by plan 044 §3.1 d6.
+fn local_project(project: WireProjectRef) -> Result<i64, EngineError> {
+    project.local().ok_or_else(|| {
+        EngineError::InvalidArgument(format!(
+            "project {project} names a host session; the engine façade drives the local \
+             workspace only"
+        ))
+    })
+}
+
+fn local_projects(projects: &[WireProjectRef]) -> Result<Vec<i64>, EngineError> {
+    projects.iter().copied().map(local_project).collect()
+}
+
+fn local_tabs(tabs: &[WireTabRef]) -> Result<Vec<i64>, EngineError> {
+    tabs.iter()
+        .copied()
+        .map(|tab| {
+            tab.local().ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "tab {tab} names a host session; the engine façade drives the local \
+                     workspace only"
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Toolkit-neutral application engine. It owns no runtime singleton and never
 /// calls a UI. Commands are serialized so command/result ordering is explicit
 /// even when multiple IPC or UI tasks invoke the same handle concurrently.
@@ -221,7 +253,8 @@ impl Engine {
                 Ok(CommandResult::DeletedTabs(ids))
             }
             EngineCommand::ProjectReorder(p) => {
-                self.workspace.reorder_projects(&p.project_ids)?;
+                self.workspace
+                    .reorder_projects(&local_projects(&p.project_ids)?)?;
                 Ok(CommandResult::Ack)
             }
             EngineCommand::TabOpen(p) => self.open_tab(p).await.map(CommandResult::Tab),
@@ -258,7 +291,9 @@ impl Engine {
                 Ok(CommandResult::Ack)
             }
             EngineCommand::TabReorder(p) => {
-                self.workspace.reorder_tabs(p.project_id, &p.tab_ids)?;
+                let project_id = local_project(p.project_id)?;
+                self.workspace
+                    .reorder_tabs(project_id, &local_tabs(&p.tab_ids)?)?;
                 Ok(CommandResult::Ack)
             }
             EngineCommand::TabClearNotification(p) => {
@@ -533,6 +568,107 @@ mod tests {
         .unwrap();
         assert_eq!(value["data"]["project_id"], "9");
         assert_eq!(value["data"]["tab_ids"], serde_json::json!(["10", "11"]));
+    }
+
+    /// The reorder commands narrow their refs the way `TabFocus` does:
+    /// the façade drives the local workspace, holds no host connections,
+    /// and refuses a spelling it could only act on by pretending.
+    #[tokio::test]
+    async fn reorder_commands_refuse_host_qualified_refs() {
+        let workspace = Arc::new(Workspace::new());
+        let project = workspace.create_project("p", "/tmp").unwrap();
+        let first = workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        let second = workspace.open_tab(project.id, "/tmp", "two").unwrap();
+        let engine = Engine::new(
+            workspace.clone(),
+            Arc::new(PtySupervisor::new()),
+            PathBuf::from("/tmp/roost-engine-test.sock"),
+        );
+
+        // The bare form still reorders, ids and all.
+        engine
+            .execute(EngineCommand::TabReorder(TabReorderParams {
+                project_id: WireProjectRef::Local(project.id),
+                tab_ids: vec![WireTabRef::Local(second.id), WireTabRef::Local(first.id)],
+            }))
+            .await
+            .expect("a bare tab reorder");
+        let order: Vec<i64> = workspace.snapshot()[0].tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![second.id, first.id]);
+
+        for command in [
+            EngineCommand::TabReorder(TabReorderParams {
+                project_id: WireProjectRef::Host {
+                    host: 3,
+                    project: 4,
+                },
+                tab_ids: vec![WireTabRef::Host { host: 3, tab: 9 }],
+            }),
+            // The mixed forms too: a bare project with a qualified tab
+            // is still a tab this workspace does not own.
+            EngineCommand::TabReorder(TabReorderParams {
+                project_id: WireProjectRef::Local(project.id),
+                tab_ids: vec![WireTabRef::Host { host: 3, tab: 9 }],
+            }),
+            EngineCommand::ProjectReorder(ProjectReorderParams {
+                project_ids: vec![WireProjectRef::Host {
+                    host: 3,
+                    project: 4,
+                }],
+            }),
+            EngineCommand::ProjectReorder(ProjectReorderParams {
+                project_ids: vec![
+                    WireProjectRef::Local(project.id),
+                    WireProjectRef::Host {
+                        host: 3,
+                        project: 4,
+                    },
+                ],
+            }),
+        ] {
+            let error = engine
+                .execute(command)
+                .await
+                .expect_err("a qualified ref must be refused");
+            assert_eq!(error.code(), "invalid_argument");
+            assert!(
+                error.to_string().contains("names a host session"),
+                "the refusal has to say why: {error}"
+            );
+        }
+
+        // Refused before mutating: the order the bare reorder left is
+        // still there.
+        let order: Vec<i64> = workspace.snapshot()[0].tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![second.id, first.id]);
+    }
+
+    /// The `EngineCommand` envelope is a serialization boundary, and the
+    /// local shape crossing it is byte-for-byte what it was before the
+    /// refs gained a host form.
+    #[test]
+    fn local_reorder_commands_serialize_unchanged() {
+        assert_eq!(
+            serde_json::to_value(EngineCommand::TabReorder(TabReorderParams {
+                project_id: WireProjectRef::Local(9),
+                tab_ids: vec![WireTabRef::Local(11), WireTabRef::Local(10)],
+            }))
+            .unwrap(),
+            serde_json::json!({
+                "command": "tab_reorder",
+                "params": {"project_id": "9", "tab_ids": ["11", "10"]},
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(EngineCommand::ProjectReorder(ProjectReorderParams {
+                project_ids: vec![WireProjectRef::Local(2), WireProjectRef::Local(1)],
+            }))
+            .unwrap(),
+            serde_json::json!({
+                "command": "project_reorder",
+                "params": {"project_ids": ["2", "1"]},
+            })
+        );
     }
 
     #[tokio::test]

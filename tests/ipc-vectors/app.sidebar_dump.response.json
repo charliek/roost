@@ -21,6 +21,29 @@
         "project_id": "2",
         "agents": []
       }
+    ],
+    "hosts": [
+      {
+        "id": "hs-2f1c",
+        "label": "workbench",
+        "state": "connected",
+        "projects": [
+          {
+            "key": "h3.4",
+            "name": "roost",
+            "tabs": [
+              { "key": "h3.9", "title": "zsh" },
+              { "key": "h3.7", "title": "claude" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "hs-9d40",
+        "label": "laptop",
+        "state": "disconnected",
+        "projects": []
+      }
     ]
   }
 }

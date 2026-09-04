@@ -61,7 +61,7 @@ use roost_ipc::messages::{
     ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
     TabCloseParams, TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams,
     TabOpenResult, TabReorderParams, TabResizeParams, TabSetStateParams, TabSetTitleParams,
-    TabState, TabWriteParams, WireTabRef,
+    TabState, TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -781,7 +781,12 @@ async fn main() -> Result<()> {
             client
                 .call::<_, serde_json::Value>(
                     ops::PROJECT_REORDER,
-                    ProjectReorderParams { project_ids: order },
+                    ProjectReorderParams {
+                        // The CLI's ids are numbers; the host-qualified
+                        // wire form is reachable through the op, not
+                        // through this verb (plan 044 §4).
+                        project_ids: order.into_iter().map(WireProjectRef::Local).collect(),
+                    },
                 )
                 .await?;
         }
@@ -829,8 +834,11 @@ async fn main() -> Result<()> {
                         .call::<_, serde_json::Value>(
                             ops::TAB_REORDER,
                             TabReorderParams {
-                                project_id,
-                                tab_ids: order_with_after(&ids, new_id, after),
+                                project_id: WireProjectRef::Local(project_id),
+                                tab_ids: order_with_after(&ids, new_id, after)
+                                    .into_iter()
+                                    .map(WireTabRef::Local)
+                                    .collect(),
                             },
                         )
                         .await?;
@@ -908,8 +916,8 @@ async fn main() -> Result<()> {
                 .call::<_, serde_json::Value>(
                     ops::TAB_REORDER,
                     TabReorderParams {
-                        project_id,
-                        tab_ids: order,
+                        project_id: WireProjectRef::Local(project_id),
+                        tab_ids: order.into_iter().map(WireTabRef::Local).collect(),
                     },
                 )
                 .await?;

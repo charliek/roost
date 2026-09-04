@@ -33,7 +33,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 
 use roost_ipc::messages::{ops, SessionIdentify, SessionStopResult, TabListResult};
-use roost_ipc::paths::BundleProfile;
+use roost_ipc::paths::{derived_session_state_dir, BundleProfile, STATE_DIR_ENV};
 use roost_ipc::session_launch::{
     self, await_stopped, confirm_serving, locate_session_binary, probe_gone,
     spawn_and_read_verdict, stop_session, timeout_scale, Verdict, BIN_ENV, BIN_NAME, IPC_TIMEOUT,
@@ -143,7 +143,22 @@ async fn start() -> Result<i32> {
     )?;
     let cwd = std::env::current_dir().context("read the working directory to seed the session")?;
 
-    let verdict = spawn_and_read_verdict(&bin.path, &cwd, scaled(VERDICT_TIMEOUT)).await?;
+    // Said before the spawn, and phrased for what is true at that
+    // moment: this start may yet fail, or find an `already-running`
+    // session that was started elsewhere — possibly directly, which
+    // honours the seam verbatim — so the derived directory is what a
+    // session started *now* would use, not a claim about whichever
+    // session ends up answering.
+    let seam = std::env::var_os(STATE_DIR_ENV);
+    if let Some(derived) = derived_session_state_dir(seam.as_deref()) {
+        eprintln!(
+            "roostctl session: {STATE_DIR_ENV} is set; a session started now would use {}",
+            derived.display()
+        );
+    }
+
+    let verdict =
+        spawn_and_read_verdict(&bin.path, &cwd, seam.as_deref(), scaled(VERDICT_TIMEOUT)).await?;
     let (pid, fresh) = match classify_verdict(&verdict) {
         StartStep::Confirm { pid, fresh } => (pid, fresh),
         StartStep::Failed(message) => {
@@ -746,7 +761,7 @@ mod tests {
         let dir = scratch(tag);
         let bin = fake_launcher(&dir, body);
         let started = std::time::Instant::now();
-        let verdict = spawn_and_read_verdict(&bin, &dir, TEST_BUDGET).await;
+        let verdict = spawn_and_read_verdict(&bin, &dir, None, TEST_BUDGET).await;
         (verdict, started.elapsed())
     }
 

@@ -485,11 +485,20 @@ impl App {
 
 // ── tab drag ──
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TabDragContext {
+    /// The instance whose id-space `project_id` and `source_id` belong
+    /// to. Two hosts showing the same numeric ids are two contexts.
+    pub(super) host: HostId,
     pub(super) project_id: i64,
     pub(super) source_id: i64,
     pub(super) generation: u64,
+}
+
+impl TabDragContext {
+    fn project(&self) -> ProjectKey {
+        ProjectKey::new(self.host, self.project_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -507,6 +516,10 @@ pub(super) struct TabDragPreview {
     /// already settled — no second release can re-commit it — and it is
     /// the id the completion must quote to be allowed to clear it.
     pub(super) pending_op: Option<u64>,
+    /// When a host's `Ok` was received, for a preview the session has
+    /// accepted but whose reorder event has not arrived yet. See
+    /// [`settle_reorder_completion`]; never set for a local reorder.
+    pub(super) held_since: Option<Instant>,
 }
 
 impl TabDragPreview {
@@ -528,7 +541,7 @@ struct TabDragCommitRequest {
 impl From<&TabDragPreview> for TabDragCommitRequest {
     fn from(preview: &TabDragPreview) -> Self {
         Self {
-            context: preview.context.clone(),
+            context: preview.context,
             original_ids: preview.original_ids.clone(),
             ordered_ids: preview.ordered_ids.clone(),
         }
@@ -628,21 +641,333 @@ fn settle_tab_drag_commit(
     }
 }
 
-/// A completion clears only the preview that dispatched it. A newer drag
-/// carries a different id (or none yet), so an older reorder reporting
-/// back cannot pull the order out from under the gesture that replaced it.
-fn clear_dispatched_preview<T>(
-    preview: &mut Option<T>,
+/// The ceiling on a held preview (see [`settle_reorder_completion`]).
+///
+/// A host's reply rides the control connection and its
+/// `tabs.reordered` / `projects.reordered` event rides the events
+/// connection — two sockets, no ordering between them — so without a
+/// bound a lagging stream would leave the accepted order on screen for
+/// as long as it lagged. Two seconds costs at most one late snap.
+const HOST_REORDER_HOLD: Duration = Duration::from_secs(2);
+
+fn host_reorder_hold() -> Duration {
+    HOST_REORDER_HOLD.mul_f64(crate::host_conn::task::scale())
+}
+
+/// How often a held preview re-checks its own belt. Armed only while a
+/// hold is up (a couple of seconds at most), so the idle app keeps
+/// scheduling nothing; short enough that the belt expires near its
+/// deadline rather than a whole hold late.
+const HOST_REORDER_HOLD_TICK: Duration = Duration::from_millis(250);
+
+/// [`HOST_REORDER_HOLD_TICK`] under the same scale as the hold it
+/// checks, so a stretched budget keeps its resolution.
+pub(crate) fn host_reorder_hold_tick() -> Duration {
+    HOST_REORDER_HOLD_TICK.mul_f64(crate::host_conn::task::scale())
+}
+
+/// What a reorder completion does to the preview it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReorderCompletion {
+    /// Drop the preview now: a local reorder (whose event lands with the
+    /// completion on the same feed), a refusal (the clear *is* the
+    /// rollback), or a host `Ok` the mirror has already caught up with.
+    Cleared,
+    /// A host `Ok` whose reorder event has not landed yet: keep drawing
+    /// the order the session accepted, stamped at `since`.
+    Held { since: Instant },
+    /// The completion names no live preview — a superseded reorder, or
+    /// one belonging to another instance. Leave everything alone.
+    Stale,
+}
+
+/// The live preview, as a completion sees it. Both axes answer with one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DispatchedPreview<'a> {
+    pub(super) pending_op: Option<u64>,
+    pub(super) host: HostId,
+    pub(super) original_ids: &'a [i64],
+}
+
+/// A completion settles only the preview that dispatched it, on that
+/// preview's own instance: a newer drag carries a different id (or none
+/// yet), and another host's completion carries another `host`, so
+/// neither can pull the order out from under the gesture on screen.
+///
+/// The `Held` case is what keeps a successful host drop from snapping:
+/// the reply and the reorder event race, and clearing on the reply alone
+/// would show the old order until the event landed.
+fn settle_reorder_completion(
+    preview: Option<DispatchedPreview<'_>>,
     op: u64,
-    pending_op: impl Fn(&T) -> Option<u64>,
-) -> bool {
-    let owned = preview
-        .as_ref()
-        .is_some_and(|preview| pending_op(preview) == Some(op));
-    if owned {
-        *preview = None;
+    host: HostId,
+    authoritative: &[i64],
+    result: Result<(), &str>,
+    now: Instant,
+) -> ReorderCompletion {
+    let Some(preview) =
+        preview.filter(|preview| preview.pending_op == Some(op) && preview.host == host)
+    else {
+        return ReorderCompletion::Stale;
+    };
+    if host.is_local() || result.is_err() || authoritative != preview.original_ids {
+        return ReorderCompletion::Cleared;
     }
-    owned
+    ReorderCompletion::Held { since: now }
+}
+
+/// Where a live preview stands at a reconcile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreviewStanding {
+    /// Whether the surface the gesture started on is still the one on
+    /// screen (the active project, for the tab strip).
+    scope_is_current: bool,
+    /// Whether the authoritative order is still the one the gesture armed
+    /// against.
+    order_is_unmoved: bool,
+    /// Whether the preview's own instance is still one the user may act
+    /// on — a host section that went dimmed, or an incarnation that is
+    /// gone, answers `false`.
+    host_is_live: bool,
+    held_since: Option<Instant>,
+}
+
+/// Everything that ends a live preview at a reconcile. The moved order is
+/// the ordinary path — for a host it is the reorder event landing, which
+/// is exactly when the held preview has nothing left to hold.
+fn reorder_preview_is_stale(standing: PreviewStanding, now: Instant) -> bool {
+    !standing.scope_is_current
+        || !standing.order_is_unmoved
+        || !standing.host_is_live
+        || standing
+            .held_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= host_reorder_hold())
+}
+
+/// Whether a host section's rows get a reorder strip of their own.
+///
+/// A never-connected host's placeholder incarnation is
+/// [`HostId::LOCAL`]: it lists no rows, and a strip built on it would
+/// take the local section's scope as well.
+pub(super) fn host_section_is_reorderable(host: HostId, section_is_interactive: bool) -> bool {
+    section_is_interactive && !host.is_local()
+}
+
+/// Whether this preview is being held for a host that has accepted the
+/// reorder but whose event has not arrived.
+///
+/// **A held preview is optimistic display state, not a live gesture.**
+/// Its generation was burned at dispatch, so nothing the widget still
+/// publishes can own it, and dropping it would show the pre-drop order
+/// until the host's event landed — the snap the hold exists to prevent.
+/// So every gesture-driven cancel spares it ([`App::cancel_tab_drag`]
+/// and its twin, which every such caller funnels through), and it ends
+/// only at a reconcile or when [`hold_verdict`] hands its slot over.
+fn preview_is_held(held_since: Option<Instant>) -> bool {
+    held_since.is_some()
+}
+
+/// What a fresh same-axis gesture does about the preview already in the
+/// one slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HoldVerdict {
+    /// Nothing is held: ordinary arming, which cancels what is there.
+    Arms,
+    /// A hold on this gesture's own section. The gesture is dropped —
+    /// it would arm against the order the session accepted while the
+    /// authority is still the old one, and cancel into a snap. The strip
+    /// stays enabled, so `on_select` still fires and a click still
+    /// selects; only the drag goes.
+    Absorbs,
+    /// A hold on another section. It gives up the slot rather than
+    /// silently making this drag inert — the honest cost of one preview
+    /// slot per axis. The snap lands on the *other* section and ends
+    /// when that section's own reorder event does.
+    Evicts,
+}
+
+fn hold_verdict(preview_host: HostId, held_since: Option<Instant>, gesture: HostId) -> HoldVerdict {
+    if !preview_is_held(held_since) {
+        HoldVerdict::Arms
+    } else if preview_host == gesture {
+        HoldVerdict::Absorbs
+    } else {
+        HoldVerdict::Evicts
+    }
+}
+
+/// Whether either axis is holding a preview — the state that arms the
+/// belt's timer, and the only thing that does.
+pub(super) fn any_preview_is_held(
+    tab: Option<&TabDragPreview>,
+    project: Option<&ProjectDragPreview>,
+) -> bool {
+    tab.is_some_and(|preview| preview_is_held(preview.held_since))
+        || project.is_some_and(|preview| preview_is_held(preview.held_since))
+}
+
+/// Which reorder op a gesture dispatches, and what it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReorderTarget {
+    /// One project's tabs, in that project's own id-space.
+    Tabs { project_id: i64 },
+    /// A section's projects.
+    Projects,
+}
+
+impl ReorderTarget {
+    fn wire_op(self) -> &'static str {
+        match self {
+            Self::Tabs { .. } => roost_ipc::messages::ops::TAB_REORDER,
+            Self::Projects => roost_ipc::messages::ops::PROJECT_REORDER,
+        }
+    }
+}
+
+/// A host reorder's params: the whole new order, ids string-wrapped
+/// exactly as [`RenameTarget::wire_params`] wraps its own.
+pub(super) fn host_reorder_params(target: ReorderTarget, ordered_ids: &[i64]) -> serde_json::Value {
+    let ids = ordered_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<String>>();
+    match target {
+        ReorderTarget::Tabs { project_id } => {
+            serde_json::json!({ "project_id": project_id.to_string(), "tab_ids": ids })
+        }
+        ReorderTarget::Projects => serde_json::json!({ "project_ids": ids }),
+    }
+}
+
+/// One host reorder, ready to await. `None` when that incarnation has no
+/// op queue — the host is not accepting operations, which the caller
+/// answers rather than drops.
+///
+/// The failure stays a [`crate::host_conn::HostOpError`] rather than a
+/// string: the gesture path wants its `Display` for the status banner,
+/// while the UI-socket op wants the session's own wire code out of
+/// `Rejected` (plan 044 §3.1 d6). Flattening here would lose the second.
+pub(super) fn host_reorder_call(
+    hosts: &crate::host_conn::HostConnSet,
+    host: HostId,
+    target: ReorderTarget,
+    ordered_ids: &[i64],
+) -> Option<
+    impl std::future::Future<Output = Result<(), crate::host_conn::HostOpError>> + Send + 'static,
+> {
+    let ops = hosts.ops_for(host)?.clone();
+    let params = host_reorder_params(target, ordered_ids);
+    let wire_op = target.wire_op();
+    Some(async move { ops.call(wire_op, params, false).await.map(drop) })
+}
+
+/// The completion a reorder dispatch answers with, whichever axis and
+/// whichever instance it went to.
+fn reorder_op_result(
+    target: ReorderTarget,
+    host: HostId,
+    op: u64,
+    ordered_ids: Vec<i64>,
+    result: Result<(), String>,
+) -> EngineOpResult {
+    match target {
+        ReorderTarget::Tabs { project_id } => EngineOpResult::TabsReordered {
+            op,
+            host,
+            project_id,
+            ordered_ids,
+            result,
+        },
+        ReorderTarget::Projects => EngineOpResult::ProjectsReordered {
+            op,
+            host,
+            ordered_ids,
+            result,
+        },
+    }
+}
+
+/// `None` rejects the press, the sibling of [`arm_project_drag_preview`]:
+/// no gesture is armed against a list the strip no longer renders.
+/// `scope_is_current` is the tab strip's own extra condition — its scope
+/// is one project, so a press published for another one is not this
+/// strip's to arm.
+fn arm_tab_drag_preview(
+    authoritative_ids: &[i64],
+    scope_is_current: bool,
+    strip_generation: u64,
+    context: TabDragContext,
+    original_ids: Vec<i64>,
+) -> Option<TabDragPreview> {
+    let armable = context.generation == strip_generation
+        && scope_is_current
+        && authoritative_ids == original_ids
+        && stable_ids(&original_ids)
+        && original_ids.contains(&context.source_id);
+    armable.then(|| TabDragPreview {
+        context,
+        ordered_ids: original_ids.clone(),
+        original_ids,
+        dragging: false,
+        pending_op: None,
+        held_since: None,
+    })
+}
+
+/// A press on the tab strip, against whatever is in the one slot: what a
+/// held preview does about it ([`hold_verdict`]), then the arm. `true`
+/// means a hold on the press's own section absorbed it, so the slot —
+/// and the other axis's preview — are left alone.
+///
+/// A hold on the press's own instance absorbs it, because arming against
+/// an order the authority has not caught up with is the snap the hold
+/// exists to prevent; a hold on another instance gives the slot up
+/// instead. That eviction is the honest cost of one preview slot per
+/// axis — the snap it causes lands on the *other* section and ends when
+/// that section's own reorder event does.
+///
+/// A rejected press burns the generation exactly as the
+/// [`App::cancel_tab_drag`] this replaced did: the slot is never held by
+/// the time the arm runs (`Arms` means it is not, `Evicts` emptied it),
+/// so that cancel's held-preview exemption could never have applied here.
+fn press_tab_strip(
+    preview: &mut Option<TabDragPreview>,
+    generation: &mut u64,
+    authoritative_ids: &[i64],
+    scope_is_current: bool,
+    context: TabDragContext,
+    original_ids: Vec<i64>,
+) -> bool {
+    if let Some(current) = preview.as_ref() {
+        match hold_verdict(current.context.host, current.held_since, context.host) {
+            HoldVerdict::Arms => {}
+            HoldVerdict::Absorbs => return true,
+            // The one clear that must NOT burn the generation, so it
+            // cannot go through `cancel_drag_preview` — whose "always"
+            // is about *cancels*. This press carries the current
+            // generation and the arm right below checks it, so burning
+            // would reject the very gesture the eviction exists to
+            // admit: `Evicts` silently making the drag inert, which is
+            // exactly what it promises not to do. Nothing is left to
+            // invalidate either — a held preview's own generation was
+            // burned when it dispatched (`TabDragSettlement::Dispatched`),
+            // so no widget can still own it.
+            HoldVerdict::Evicts => {
+                preview.take();
+            }
+        }
+    }
+    match arm_tab_drag_preview(
+        authoritative_ids,
+        scope_is_current,
+        *generation,
+        context,
+        original_ids,
+    ) {
+        Some(armed) => *preview = Some(armed),
+        None => cancel_drag_preview(preview, generation),
+    }
+    false
 }
 
 /// Threshold crossing for the tab strip, the sibling of
@@ -682,15 +1007,52 @@ fn end_tab_drag_preview_if_owned(
 }
 
 impl App {
-    fn active_project_tab_ids(&self, project_id: i64) -> Vec<i64> {
-        self.projects
-            .iter()
-            .find(|project| project.id == project_id)
-            .map(|project| project.tabs.iter().map(|tab| tab.id).collect())
+    /// One project's tab ids, from whichever instance owns it: the local
+    /// snapshot for a local key, that host's mirrored rows for a host
+    /// key. A dimmed section answers nothing, exactly as every other
+    /// host-row lookup does.
+    pub(super) fn tab_ids_for(&self, project: ProjectKey) -> Vec<i64> {
+        let tabs = match project.local_project() {
+            Some(project_id) => self
+                .projects
+                .iter()
+                .find(|row| row.id == project_id)
+                .map(|row| &row.tabs),
+            None => self.host_project_row(project).map(|(_, row)| &row.tabs),
+        };
+        tabs.map(|tabs| tabs.iter().map(|tab| tab.id).collect())
             .unwrap_or_default()
     }
 
+    /// Whether a gesture on this instance may still be acted on: the
+    /// local workspace always, a host only while its section is
+    /// interactive at the incarnation the gesture armed against.
+    pub(super) fn reorderable(&self, host: HostId) -> bool {
+        host.is_local() || self.interactive_host_view(host).is_some()
+    }
+
+    /// The gesture-driven cancel, and the choke point every caller
+    /// reaches — the strips' own cancels, the other axis arming,
+    /// `select_project`, a lost window focus.
+    ///
+    /// **A held preview is optimistic display state, not a live
+    /// gesture:** its generation was burned at dispatch, so nothing the
+    /// widget still publishes can own it, and dropping it would show the
+    /// pre-drop order until the host's reorder event landed — the snap
+    /// the hold exists to prevent. So a hold survives every cancel here.
+    /// It ends at a reconcile ([`Self::reconcile_tab_drag_preview`]:
+    /// the authoritative order moved, the host stopped being live, or
+    /// the belt expired) or when a same-axis gesture on another instance
+    /// takes the slot ([`press_tab_strip`]).
     pub(super) fn cancel_tab_drag(&mut self) {
+        if self.tab_preview_is_held() {
+            return;
+        }
+        self.drop_tab_drag_preview();
+    }
+
+    /// [`Self::cancel_tab_drag`] without the held-preview exemption.
+    fn drop_tab_drag_preview(&mut self) {
         cancel_drag_preview(&mut self.tab_drag_preview, &mut self.tab_strip_generation);
     }
 
@@ -698,52 +1060,43 @@ impl App {
         let Some(preview) = self.tab_drag_preview.as_ref() else {
             return;
         };
-        let active_project = self.workspace.active().0;
-        let authoritative = self.active_project_tab_ids(preview.context.project_id);
-        if active_project != preview.context.project_id || authoritative != preview.original_ids {
-            self.cancel_tab_drag();
+        let project = preview.context.project();
+        let standing = PreviewStanding {
+            scope_is_current: self.active_project_key() == project,
+            order_is_unmoved: self.tab_ids_for(project) == preview.original_ids,
+            host_is_live: self.reorderable(project.host),
+            held_since: preview.held_since,
+        };
+        if reorder_preview_is_stale(standing, Instant::now()) {
+            // The one forced cancel: this *is* the path a held preview
+            // clears on, so it must not consult the exemption below.
+            self.drop_tab_drag_preview();
         }
     }
 
-    fn begin_tab_drag_preview(
-        &mut self,
-        project_id: i64,
-        source_id: i64,
-        context_generation: u64,
-        original_ids: Vec<i64>,
-    ) {
-        self.cancel_project_drag();
-        let authoritative = self.active_project_tab_ids(project_id);
-        if context_generation != self.tab_strip_generation
-            || self.workspace.active().0 != project_id
-            || authoritative != original_ids
-            || !stable_ids(&original_ids)
-            || !original_ids.contains(&source_id)
-        {
-            self.cancel_tab_drag();
-            return;
-        }
-        self.tab_drag_preview = Some(TabDragPreview {
-            context: TabDragContext {
-                project_id,
-                source_id,
-                generation: context_generation,
-            },
-            ordered_ids: original_ids.clone(),
+    fn begin_tab_drag_preview(&mut self, context: TabDragContext, original_ids: Vec<i64>) {
+        let project = context.project();
+        let authoritative = self.tab_ids_for(project);
+        let scope_is_current = self.active_project_key() == project;
+        let absorbed = press_tab_strip(
+            &mut self.tab_drag_preview,
+            &mut self.tab_strip_generation,
+            &authoritative,
+            scope_is_current,
+            context,
             original_ids,
-            dragging: false,
-            pending_op: None,
-        });
+        );
+        // The strips cancel each other, and this runs after the press
+        // rather than before it — the same thing, since the two axes'
+        // slots and generations are disjoint state.
+        if !absorbed {
+            self.cancel_project_drag();
+        }
     }
 
     /// The gesture crossed the drag threshold: from here the carried pill
     /// may look dragged.
-    fn begin_tab_drag(&mut self, project_id: i64, source_id: i64, context_generation: u64) {
-        let context = TabDragContext {
-            project_id,
-            source_id,
-            generation: context_generation,
-        };
+    fn begin_tab_drag(&mut self, context: TabDragContext) {
         if !mark_tab_drag_dragging(
             &mut self.tab_drag_preview,
             self.tab_strip_generation,
@@ -753,24 +1106,25 @@ impl App {
         }
     }
 
+    /// Whether the live tab preview is one a host has accepted and whose
+    /// mirror has not caught up yet.
+    fn tab_preview_is_held(&self) -> bool {
+        self.tab_drag_preview
+            .as_ref()
+            .is_some_and(|preview| preview_is_held(preview.held_since))
+    }
+
     fn preview_tab_drag(
         &mut self,
-        project_id: i64,
-        source_id: i64,
-        context_generation: u64,
+        context: TabDragContext,
         original_ids: &[i64],
         ordered_ids: Vec<i64>,
     ) {
-        let context = TabDragContext {
-            project_id,
-            source_id,
-            generation: context_generation,
-        };
         let valid = self.tab_drag_preview.as_ref().is_some_and(|preview| {
             preview.context == context
-                && context_generation == self.tab_strip_generation
+                && context.generation == self.tab_strip_generation
                 && preview.original_ids == original_ids
-                && self.active_project_tab_ids(project_id) == original_ids
+                && self.tab_ids_for(context.project()) == original_ids
                 && same_stable_ids(&ordered_ids, original_ids)
         });
         if valid {
@@ -782,19 +1136,8 @@ impl App {
         }
     }
 
-    fn end_tab_drag_preview(
-        &mut self,
-        project_id: i64,
-        source_id: i64,
-        context_generation: u64,
-        original_ids: &[i64],
-    ) {
-        let context = TabDragContext {
-            project_id,
-            source_id,
-            generation: context_generation,
-        };
-        let authoritative = self.active_project_tab_ids(project_id);
+    fn end_tab_drag_preview(&mut self, context: TabDragContext, original_ids: &[i64]) {
+        let authoritative = self.tab_ids_for(context.project());
         end_tab_drag_preview_if_owned(
             &mut self.tab_drag_preview,
             &authoritative,
@@ -805,19 +1148,15 @@ impl App {
 
     fn commit_tab_drag(
         &mut self,
-        project_id: i64,
-        source_id: i64,
-        context_generation: u64,
+        context: TabDragContext,
         original_ids: &[i64],
         ordered_ids: Vec<i64>,
     ) -> UiTask {
-        let authoritative = self.active_project_tab_ids(project_id);
+        let host = context.host;
+        let project_id = context.project_id;
+        let authoritative = self.tab_ids_for(context.project());
         let request = TabDragCommitRequest {
-            context: TabDragContext {
-                project_id,
-                source_id,
-                generation: context_generation,
-            },
+            context,
             original_ids: original_ids.to_vec(),
             ordered_ids,
         };
@@ -826,9 +1165,8 @@ impl App {
             settle_tab_drag_commit(&mut self.tab_drag_preview, &authoritative, request, op);
         tracing::debug!(
             ?settlement,
+            host = host.raw(),
             project_id,
-            source_id,
-            context_generation,
             "Iced tab drag settlement"
         );
         match settlement {
@@ -843,6 +1181,10 @@ impl App {
             }
             TabDragSettlement::Dispatched { ordered_ids, op } => {
                 self.tab_strip_generation = self.tab_strip_generation.wrapping_add(1);
+                let target = ReorderTarget::Tabs { project_id };
+                if !host.is_local() {
+                    return self.host_reorder_dispatch(host, target, ordered_ids, op);
+                }
                 let client = self.client.clone();
                 let dispatched = ordered_ids.clone();
                 self.engine_op(
@@ -852,44 +1194,107 @@ impl App {
                             .await
                             .map_err(|error| error.to_string())
                     },
-                    move |result| EngineOpResult::TabsReordered {
-                        op,
-                        project_id,
-                        ordered_ids,
-                        result,
-                    },
+                    move |result| reorder_op_result(target, host, op, ordered_ids, result),
                 )
             }
         }
     }
 
+    /// [`Self::commit_tab_drag`]'s and [`Self::commit_project_drag`]'s
+    /// host arm, the shape `host_rename_dispatch` set: a host that is not
+    /// accepting ops answers the intent rather than dropping it, so the
+    /// completion always arrives and the preview never sticks.
+    fn host_reorder_dispatch(
+        &mut self,
+        host: HostId,
+        target: ReorderTarget,
+        ordered_ids: Vec<i64>,
+        op: u64,
+    ) -> UiTask {
+        match host_reorder_call(&self.hosts, host, target, &ordered_ids) {
+            Some(call) => self.engine_op(
+                async move { call.await.map_err(|error| error.to_string()) },
+                move |result| reorder_op_result(target, host, op, ordered_ids, result),
+            ),
+            None => self.engine_op(
+                async move { Err("that host is not accepting operations".to_string()) },
+                move |result| reorder_op_result(target, host, op, ordered_ids, result),
+            ),
+        }
+    }
+
     /// The preview outlives the dispatch so a successful reorder never
-    /// snaps: by the time the completion lands the authoritative order is
-    /// the previewed one (often via the reorder event, which clears the
-    /// preview first). A failure clears it too — that clear *is* the
-    /// rollback, with the reconcile behind it restoring the real order.
+    /// snaps: for a local reorder the authoritative order is the
+    /// previewed one by the time the completion lands (its event rides
+    /// the same feed), and for a host the preview is *held* until the
+    /// mirror catches up, because the reply and the event race. A
+    /// failure clears it either way — that clear *is* the rollback, with
+    /// the reconcile behind it restoring the real order.
     pub(super) fn tab_reorder_completed(
         &mut self,
         op: u64,
+        host: HostId,
         project_id: i64,
         ordered_ids: &[i64],
         result: Result<(), String>,
     ) {
-        let cleared =
-            clear_dispatched_preview(&mut self.tab_drag_preview, op, |preview| preview.pending_op);
+        let authoritative = self.tab_ids_for(ProjectKey::new(host, project_id));
+        let settlement = settle_reorder_completion(
+            self.tab_drag_preview
+                .as_ref()
+                .map(|preview| DispatchedPreview {
+                    pending_op: preview.pending_op,
+                    host: preview.context.host,
+                    original_ids: &preview.original_ids,
+                }),
+            op,
+            host,
+            &authoritative,
+            result.as_ref().map(drop).map_err(String::as_str),
+            Instant::now(),
+        );
+        match settlement {
+            ReorderCompletion::Cleared => self.tab_drag_preview = None,
+            ReorderCompletion::Held { since } => {
+                if let Some(preview) = self.tab_drag_preview.as_mut() {
+                    preview.held_since = Some(since);
+                }
+            }
+            ReorderCompletion::Stale => {
+                tracing::debug!(
+                    op,
+                    host = host.raw(),
+                    project_id,
+                    "tab reorder completed past its preview"
+                );
+            }
+        }
         if let Err(error) = result {
-            tracing::warn!(?error, project_id, ?ordered_ids, "Iced tab reorder failed");
+            tracing::warn!(
+                ?error,
+                host = host.raw(),
+                project_id,
+                ?ordered_ids,
+                "Iced tab reorder failed"
+            );
             self.set_status(format!("reorder tabs: {error}"));
-        } else if !cleared {
-            tracing::debug!(op, project_id, "tab reorder completed past its preview");
         }
     }
 
-    /// At most one preview exists — the strips cancel each other when a
-    /// gesture arms — so this settles whichever one owns the release.
+    /// At most one *gesture* is live — the strips cancel each other when
+    /// one arms — so this settles whichever axis owns the release. A
+    /// held preview is skipped: its gesture settled at the drop, and it
+    /// is only still here to hold the order (it can also sit on the
+    /// other axis from a live gesture, since a hold survives that
+    /// eviction).
     pub(crate) fn strip_pointer_released(&mut self) -> UiTask {
-        if let Some(preview) = self.tab_drag_preview.as_ref() {
+        if let Some(preview) = self
+            .tab_drag_preview
+            .as_ref()
+            .filter(|preview| !preview_is_held(preview.held_since))
+        {
             tracing::debug!(
+                host = preview.context.host.raw(),
                 project_id = preview.context.project_id,
                 source_id = preview.context.source_id,
                 generation = preview.context.generation,
@@ -897,27 +1302,21 @@ impl App {
                 "Iced root release settling tab drag preview"
             );
             let request = TabDragCommitRequest::from(preview);
-            self.commit_tab_drag(
-                request.context.project_id,
-                request.context.source_id,
-                request.context.generation,
-                &request.original_ids,
-                request.ordered_ids,
-            )
-        } else if let Some(preview) = self.project_drag_preview.as_ref() {
+            self.commit_tab_drag(request.context, &request.original_ids, request.ordered_ids)
+        } else if let Some(preview) = self
+            .project_drag_preview
+            .as_ref()
+            .filter(|preview| !preview_is_held(preview.held_since))
+        {
             tracing::debug!(
+                host = preview.context.host.raw(),
                 source_id = preview.context.source_id,
                 generation = preview.context.generation,
                 ordered_ids = ?preview.ordered_ids,
                 "Iced root release settling project drag preview"
             );
             let request = ProjectDragCommitRequest::from(preview);
-            self.commit_project_drag(
-                request.context.source_id,
-                request.context.generation,
-                &request.original_ids,
-                request.ordered_ids,
-            )
+            self.commit_project_drag(request.context, &request.original_ids, request.ordered_ids)
         } else {
             UiTask::None
         }
@@ -930,28 +1329,39 @@ impl App {
     pub(crate) fn tab_strip_event(&mut self, event: StripEvent) -> UiTask {
         match event {
             StripEvent::Started {
+                host,
                 scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
                 self.begin_tab_drag_preview(
-                    project_id,
-                    source_id,
-                    context_generation,
+                    TabDragContext {
+                        host,
+                        project_id,
+                        source_id,
+                        generation: context_generation,
+                    },
                     original_ids,
                 );
                 UiTask::None
             }
             StripEvent::DragBegan {
+                host,
                 scope_id: project_id,
                 source_id,
                 context_generation,
             } => {
-                self.begin_tab_drag(project_id, source_id, context_generation);
+                self.begin_tab_drag(TabDragContext {
+                    host,
+                    project_id,
+                    source_id,
+                    generation: context_generation,
+                });
                 UiTask::None
             }
             StripEvent::Preview {
+                host,
                 scope_id: project_id,
                 source_id,
                 context_generation,
@@ -959,38 +1369,66 @@ impl App {
                 ordered_ids,
             } => {
                 self.preview_tab_drag(
-                    project_id,
-                    source_id,
-                    context_generation,
+                    TabDragContext {
+                        host,
+                        project_id,
+                        source_id,
+                        generation: context_generation,
+                    },
                     &original_ids,
                     ordered_ids,
                 );
                 UiTask::None
             }
             StripEvent::Commit {
+                host,
                 scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
                 ordered_ids,
             } => self.commit_tab_drag(
-                project_id,
-                source_id,
-                context_generation,
+                TabDragContext {
+                    host,
+                    project_id,
+                    source_id,
+                    generation: context_generation,
+                },
                 &original_ids,
                 ordered_ids,
             ),
             StripEvent::Ended {
+                host,
                 scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
-                self.end_tab_drag_preview(project_id, source_id, context_generation, &original_ids);
+                self.end_tab_drag_preview(
+                    TabDragContext {
+                        host,
+                        project_id,
+                        source_id,
+                        generation: context_generation,
+                    },
+                    &original_ids,
+                );
                 UiTask::None
             }
-            StripEvent::Cancel { context_generation } => {
-                if context_generation == self.tab_strip_generation {
+            // A cancel from another section's strip, or one aimed at a
+            // held preview, is not this preview's: the strips share a
+            // generation, so without the host check one section's
+            // reflow would drop another's gesture.
+            StripEvent::Cancel {
+                host,
+                context_generation,
+            } => {
+                if context_generation == self.tab_strip_generation
+                    && self
+                        .tab_drag_preview
+                        .as_ref()
+                        .is_none_or(|preview| preview.context.host == host)
+                {
                     self.cancel_tab_drag();
                     self.reconcile();
                 }
@@ -1002,8 +1440,11 @@ impl App {
 
 // ── project drag ──
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ProjectDragContext {
+    /// The section whose project list this gesture is reordering. Two
+    /// hosts listing the same numeric ids are two contexts.
+    pub(super) host: HostId,
     pub(super) source_id: i64,
     pub(super) generation: u64,
 }
@@ -1016,6 +1457,8 @@ pub(super) struct ProjectDragPreview {
     pub(super) dragging: bool,
     /// Set once the reorder is dispatched — see [`TabDragPreview::pending_op`].
     pub(super) pending_op: Option<u64>,
+    /// See [`TabDragPreview::held_since`].
+    pub(super) held_since: Option<Instant>,
 }
 
 impl ProjectDragPreview {
@@ -1038,7 +1481,7 @@ struct ProjectDragCommitRequest {
 impl From<&ProjectDragPreview> for ProjectDragCommitRequest {
     fn from(preview: &ProjectDragPreview) -> Self {
         Self {
-            context: preview.context.clone(),
+            context: preview.context,
             original_ids: preview.original_ids.clone(),
             ordered_ids: preview.ordered_ids.clone(),
         }
@@ -1118,24 +1561,48 @@ fn settle_project_drag_commit(
 fn arm_project_drag_preview(
     authoritative_ids: &[i64],
     strip_generation: u64,
-    source_id: i64,
-    context_generation: u64,
+    context: ProjectDragContext,
     original_ids: Vec<i64>,
 ) -> Option<ProjectDragPreview> {
-    let armable = context_generation == strip_generation
+    let armable = context.generation == strip_generation
         && authoritative_ids == original_ids
         && stable_ids(&original_ids)
-        && original_ids.contains(&source_id);
+        && original_ids.contains(&context.source_id);
     armable.then(|| ProjectDragPreview {
-        context: ProjectDragContext {
-            source_id,
-            generation: context_generation,
-        },
+        context,
         ordered_ids: original_ids.clone(),
         original_ids,
         dragging: false,
         pending_op: None,
+        held_since: None,
     })
+}
+
+/// [`press_tab_strip`]'s twin, down to the eviction that must not burn
+/// the generation — see that function for why.
+fn press_project_strip(
+    preview: &mut Option<ProjectDragPreview>,
+    generation: &mut u64,
+    authoritative_ids: &[i64],
+    context: ProjectDragContext,
+    original_ids: Vec<i64>,
+) -> bool {
+    if let Some(current) = preview.as_ref() {
+        match hold_verdict(current.context.host, current.held_since, context.host) {
+            HoldVerdict::Arms => {}
+            HoldVerdict::Absorbs => return true,
+            // Clears without burning, and must not be consolidated back
+            // into `cancel_drag_preview` — see `press_tab_strip`.
+            HoldVerdict::Evicts => {
+                preview.take();
+            }
+        }
+    }
+    match arm_project_drag_preview(authoritative_ids, *generation, context, original_ids) {
+        Some(armed) => *preview = Some(armed),
+        None => cancel_drag_preview(preview, generation),
+    }
+    false
 }
 
 fn mark_project_drag_dragging(
@@ -1201,11 +1668,30 @@ fn end_project_drag_preview_if_owned(
 }
 
 impl App {
-    pub(super) fn sidebar_project_ids(&self) -> Vec<i64> {
-        self.projects.iter().map(|project| project.id).collect()
+    /// One section's project ids: the local snapshot, or that host's
+    /// mirrored rows. A never-connected host's placeholder incarnation is
+    /// [`HostId::LOCAL`], so the local branch is taken on the id itself
+    /// rather than on a lookup that placeholder would match.
+    pub(super) fn project_ids_for(&self, host: HostId) -> Vec<i64> {
+        if host.is_local() {
+            return self.projects.iter().map(|project| project.id).collect();
+        }
+        self.host_view(host)
+            .map(|view| view.projects.iter().map(|project| project.id).collect())
+            .unwrap_or_default()
     }
 
+    /// [`App::cancel_tab_drag`]'s twin, with the same held-preview
+    /// exemption and for the same reason.
     pub(super) fn cancel_project_drag(&mut self) {
+        if self.project_preview_is_held() {
+            return;
+        }
+        self.drop_project_drag_preview();
+    }
+
+    /// [`Self::cancel_project_drag`] without the held-preview exemption.
+    fn drop_project_drag_preview(&mut self) {
         cancel_drag_preview(
             &mut self.project_drag_preview,
             &mut self.project_strip_generation,
@@ -1222,42 +1708,52 @@ impl App {
     }
 
     pub(super) fn reconcile_project_drag_preview(&mut self) {
-        if self.project_drag_preview.is_none() {
+        let Some(preview) = self.project_drag_preview.as_ref() else {
             return;
-        }
-        // Project drags span the whole sidebar, so the full project-id list
-        // is the authority — unlike tabs, no active-project scope applies.
-        let authoritative = self.sidebar_project_ids();
-        if project_drag_preview_is_stale(self.project_drag_preview.as_ref(), &authoritative) {
-            self.cancel_project_drag();
-        }
-    }
-
-    fn begin_project_drag_preview(
-        &mut self,
-        source_id: i64,
-        context_generation: u64,
-        original_ids: Vec<i64>,
-    ) {
-        self.cancel_tab_drag();
-        let authoritative = self.sidebar_project_ids();
-        match arm_project_drag_preview(
-            &authoritative,
-            self.project_strip_generation,
-            source_id,
-            context_generation,
-            original_ids,
-        ) {
-            Some(preview) => self.project_drag_preview = Some(preview),
-            None => self.cancel_project_drag(),
-        }
-    }
-
-    fn begin_project_drag(&mut self, source_id: i64, context_generation: u64) {
-        let context = ProjectDragContext {
-            source_id,
-            generation: context_generation,
         };
+        // Project drags span one whole section, so that section's
+        // project-id list is the authority — unlike tabs, no
+        // active-project scope applies.
+        let host = preview.context.host;
+        let standing = PreviewStanding {
+            scope_is_current: true,
+            order_is_unmoved: !project_drag_preview_is_stale(
+                Some(preview),
+                &self.project_ids_for(host),
+            ),
+            host_is_live: self.reorderable(host),
+            held_since: preview.held_since,
+        };
+        if reorder_preview_is_stale(standing, Instant::now()) {
+            // See the tab twin: the forced cancel, because this is the
+            // path a held preview is meant to clear on.
+            self.drop_project_drag_preview();
+        }
+    }
+
+    fn begin_project_drag_preview(&mut self, context: ProjectDragContext, original_ids: Vec<i64>) {
+        let authoritative = self.project_ids_for(context.host);
+        let absorbed = press_project_strip(
+            &mut self.project_drag_preview,
+            &mut self.project_strip_generation,
+            &authoritative,
+            context,
+            original_ids,
+        );
+        // See `begin_tab_drag_preview` on the ordering.
+        if !absorbed {
+            self.cancel_tab_drag();
+        }
+    }
+
+    /// [`App::tab_preview_is_held`]'s twin.
+    fn project_preview_is_held(&self) -> bool {
+        self.project_drag_preview
+            .as_ref()
+            .is_some_and(|preview| preview_is_held(preview.held_since))
+    }
+
+    fn begin_project_drag(&mut self, context: ProjectDragContext) {
         if !mark_project_drag_dragging(
             &mut self.project_drag_preview,
             self.project_strip_generation,
@@ -1269,16 +1765,11 @@ impl App {
 
     fn preview_project_drag(
         &mut self,
-        source_id: i64,
-        context_generation: u64,
+        context: ProjectDragContext,
         original_ids: &[i64],
         ordered_ids: Vec<i64>,
     ) {
-        let context = ProjectDragContext {
-            source_id,
-            generation: context_generation,
-        };
-        let authoritative = self.sidebar_project_ids();
+        let authoritative = self.project_ids_for(context.host);
         if !preview_project_drag_if_owned(
             &mut self.project_drag_preview,
             &authoritative,
@@ -1291,17 +1782,8 @@ impl App {
         }
     }
 
-    fn end_project_drag_preview(
-        &mut self,
-        source_id: i64,
-        context_generation: u64,
-        original_ids: &[i64],
-    ) {
-        let context = ProjectDragContext {
-            source_id,
-            generation: context_generation,
-        };
-        let authoritative = self.sidebar_project_ids();
+    fn end_project_drag_preview(&mut self, context: ProjectDragContext, original_ids: &[i64]) {
+        let authoritative = self.project_ids_for(context.host);
         end_project_drag_preview_if_owned(
             &mut self.project_drag_preview,
             &authoritative,
@@ -1312,17 +1794,15 @@ impl App {
 
     fn commit_project_drag(
         &mut self,
-        source_id: i64,
-        context_generation: u64,
+        context: ProjectDragContext,
         original_ids: &[i64],
         ordered_ids: Vec<i64>,
     ) -> UiTask {
-        let authoritative = self.sidebar_project_ids();
+        let host = context.host;
+        let source_id = context.source_id;
+        let authoritative = self.project_ids_for(host);
         let request = ProjectDragCommitRequest {
-            context: ProjectDragContext {
-                source_id,
-                generation: context_generation,
-            },
+            context,
             original_ids: original_ids.to_vec(),
             ordered_ids,
         };
@@ -1331,8 +1811,8 @@ impl App {
             settle_project_drag_commit(&mut self.project_drag_preview, &authoritative, request, op);
         tracing::debug!(
             ?settlement,
+            host = host.raw(),
             source_id,
-            context_generation,
             "Iced project drag settlement"
         );
         match settlement {
@@ -1344,6 +1824,10 @@ impl App {
             }
             ProjectDragSettlement::Dispatched { ordered_ids, op } => {
                 self.project_strip_generation = self.project_strip_generation.wrapping_add(1);
+                let target = ReorderTarget::Projects;
+                if !host.is_local() {
+                    return self.host_reorder_dispatch(host, target, ordered_ids, op);
+                }
                 let client = self.client.clone();
                 let dispatched = ordered_ids.clone();
                 self.engine_op(
@@ -1353,11 +1837,7 @@ impl App {
                             .await
                             .map_err(|error| error.to_string())
                     },
-                    move |result| EngineOpResult::ProjectsReordered {
-                        op,
-                        ordered_ids,
-                        result,
-                    },
+                    move |result| reorder_op_result(target, host, op, ordered_ids, result),
                 )
             }
         }
@@ -1368,40 +1848,85 @@ impl App {
     pub(super) fn project_reorder_completed(
         &mut self,
         op: u64,
+        host: HostId,
         ordered_ids: &[i64],
         result: Result<(), String>,
     ) {
-        let cleared = clear_dispatched_preview(&mut self.project_drag_preview, op, |preview| {
-            preview.pending_op
-        });
+        let authoritative = self.project_ids_for(host);
+        let settlement = settle_reorder_completion(
+            self.project_drag_preview
+                .as_ref()
+                .map(|preview| DispatchedPreview {
+                    pending_op: preview.pending_op,
+                    host: preview.context.host,
+                    original_ids: &preview.original_ids,
+                }),
+            op,
+            host,
+            &authoritative,
+            result.as_ref().map(drop).map_err(String::as_str),
+            Instant::now(),
+        );
+        match settlement {
+            ReorderCompletion::Cleared => self.project_drag_preview = None,
+            ReorderCompletion::Held { since } => {
+                if let Some(preview) = self.project_drag_preview.as_mut() {
+                    preview.held_since = Some(since);
+                }
+            }
+            ReorderCompletion::Stale => {
+                tracing::debug!(
+                    op,
+                    host = host.raw(),
+                    "project reorder completed past its preview"
+                );
+            }
+        }
         if let Err(error) = result {
-            tracing::warn!(?error, ?ordered_ids, "Iced project reorder failed");
+            tracing::warn!(
+                ?error,
+                host = host.raw(),
+                ?ordered_ids,
+                "Iced project reorder failed"
+            );
             self.set_status(format!("reorder projects: {error}"));
-        } else if !cleared {
-            tracing::debug!(op, "project reorder completed past its preview");
         }
     }
 
     pub(crate) fn project_strip_event(&mut self, event: StripEvent) -> UiTask {
         match event {
             StripEvent::Started {
+                host,
                 scope_id: _,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
-                self.begin_project_drag_preview(source_id, context_generation, original_ids);
+                self.begin_project_drag_preview(
+                    ProjectDragContext {
+                        host,
+                        source_id,
+                        generation: context_generation,
+                    },
+                    original_ids,
+                );
                 UiTask::None
             }
             StripEvent::DragBegan {
+                host,
                 scope_id: _,
                 source_id,
                 context_generation,
             } => {
-                self.begin_project_drag(source_id, context_generation);
+                self.begin_project_drag(ProjectDragContext {
+                    host,
+                    source_id,
+                    generation: context_generation,
+                });
                 UiTask::None
             }
             StripEvent::Preview {
+                host,
                 scope_id: _,
                 source_id,
                 context_generation,
@@ -1409,33 +1934,62 @@ impl App {
                 ordered_ids,
             } => {
                 self.preview_project_drag(
-                    source_id,
-                    context_generation,
+                    ProjectDragContext {
+                        host,
+                        source_id,
+                        generation: context_generation,
+                    },
                     &original_ids,
                     ordered_ids,
                 );
                 UiTask::None
             }
             StripEvent::Commit {
+                host,
                 scope_id: _,
                 source_id,
                 context_generation,
                 original_ids,
                 ordered_ids,
-            } => {
-                self.commit_project_drag(source_id, context_generation, &original_ids, ordered_ids)
-            }
+            } => self.commit_project_drag(
+                ProjectDragContext {
+                    host,
+                    source_id,
+                    generation: context_generation,
+                },
+                &original_ids,
+                ordered_ids,
+            ),
             StripEvent::Ended {
+                host,
                 scope_id: _,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
-                self.end_project_drag_preview(source_id, context_generation, &original_ids);
+                self.end_project_drag_preview(
+                    ProjectDragContext {
+                        host,
+                        source_id,
+                        generation: context_generation,
+                    },
+                    &original_ids,
+                );
                 UiTask::None
             }
-            StripEvent::Cancel { context_generation } => {
-                if context_generation == self.project_strip_generation {
+            // See the tab strip's twin: the sections share a generation,
+            // so a cancel is this preview's only when it names the same
+            // instance, and a held preview outlives every cancel.
+            StripEvent::Cancel {
+                host,
+                context_generation,
+            } => {
+                if context_generation == self.project_strip_generation
+                    && self
+                        .project_drag_preview
+                        .as_ref()
+                        .is_none_or(|preview| preview.context.host == host)
+                {
                     self.cancel_project_drag();
                     self.reconcile();
                 }
@@ -1443,6 +1997,54 @@ impl App {
             }
         }
     }
+
+    /// The order a section's project strip draws: the authoritative one,
+    /// unless the live preview belongs to *this* section and still lines
+    /// up with it.
+    pub(super) fn visual_project_ids(&self, host: HostId) -> Vec<i64> {
+        visual_project_ids(
+            self.project_drag_preview.as_ref(),
+            host,
+            self.project_strip_generation,
+            self.project_ids_for(host),
+        )
+    }
+}
+
+/// [`App::visual_project_ids`]' rule, over the values it reads.
+fn visual_project_ids(
+    preview: Option<&ProjectDragPreview>,
+    host: HostId,
+    strip_generation: u64,
+    authoritative: Vec<i64>,
+) -> Vec<i64> {
+    preview
+        .filter(|preview| {
+            preview.context.host == host
+                && preview.orders_the_strip(strip_generation)
+                && preview.original_ids == authoritative
+                && same_stable_ids(&preview.ordered_ids, &authoritative)
+        })
+        .map(|preview| preview.ordered_ids.clone())
+        .unwrap_or(authoritative)
+}
+
+/// The tab strip's twin of [`visual_project_ids`]. One strip is drawn at
+/// a time — the active project's — so the preview has to name that
+/// project on that instance.
+pub(super) fn visual_tab_ids(
+    preview: Option<&TabDragPreview>,
+    project: ProjectKey,
+    authoritative: Vec<i64>,
+) -> Vec<i64> {
+    preview
+        .filter(|preview| {
+            preview.context.project() == project
+                && preview.original_ids == authoritative
+                && same_stable_ids(&preview.ordered_ids, &authoritative)
+        })
+        .map(|preview| preview.ordered_ids.clone())
+        .unwrap_or(authoritative)
 }
 
 // ── pointer ──
@@ -2506,9 +3108,26 @@ mod tests {
         assert!(!same_stable_ids(&[10, 20, 30], &[10, 20, 40]));
     }
 
+    /// A second instance, for the cases that only exist once two sections
+    /// list ids of their own.
+    const HOST: HostId = HostId::new(3);
+
+    fn local_project_context(source_id: i64, generation: u64) -> ProjectDragContext {
+        ProjectDragContext {
+            host: HostId::LOCAL,
+            source_id,
+            generation,
+        }
+    }
+
     fn tab_drag_preview_at(generation: u64, ordered_ids: Vec<i64>) -> TabDragPreview {
+        tab_drag_preview_on(HostId::LOCAL, generation, ordered_ids)
+    }
+
+    fn tab_drag_preview_on(host: HostId, generation: u64, ordered_ids: Vec<i64>) -> TabDragPreview {
         TabDragPreview {
             context: TabDragContext {
+                host,
                 project_id: 7,
                 source_id: 10,
                 generation,
@@ -2517,7 +3136,48 @@ mod tests {
             ordered_ids,
             dragging: true,
             pending_op: None,
+            held_since: None,
         }
+    }
+
+    /// A completion as `tab_reorder_completed` builds it, for the preview
+    /// on screen.
+    fn settle_completion(
+        preview: Option<&TabDragPreview>,
+        op: u64,
+        host: HostId,
+        authoritative: &[i64],
+        result: Result<(), &str>,
+        now: Instant,
+    ) -> ReorderCompletion {
+        settle_reorder_completion(
+            preview.map(|preview| DispatchedPreview {
+                pending_op: preview.pending_op,
+                host: preview.context.host,
+                original_ids: &preview.original_ids,
+            }),
+            op,
+            host,
+            authoritative,
+            result,
+            now,
+        )
+    }
+
+    fn settle_local_completion(
+        preview: Option<&TabDragPreview>,
+        op: u64,
+        authoritative: &[i64],
+        result: Result<(), &str>,
+    ) -> ReorderCompletion {
+        settle_completion(
+            preview,
+            op,
+            HostId::LOCAL,
+            authoritative,
+            result,
+            Instant::now(),
+        )
     }
 
     #[test]
@@ -2552,6 +3212,7 @@ mod tests {
             Some(&preview),
             &[10, 20, 30],
             &TabDragContext {
+                host: HostId::LOCAL,
                 project_id: 7,
                 source_id: 10,
                 generation: 5,
@@ -2604,6 +3265,7 @@ mod tests {
     fn stale_or_unowned_release_does_not_clear_a_newer_preview() {
         let newer = TabDragPreview {
             context: TabDragContext {
+                host: HostId::LOCAL,
                 project_id: 7,
                 source_id: 20,
                 generation: 5,
@@ -2612,9 +3274,11 @@ mod tests {
             ordered_ids: vec![20, 10, 30],
             dragging: false,
             pending_op: None,
+            held_since: None,
         };
         let stale = TabDragCommitRequest {
             context: TabDragContext {
+                host: HostId::LOCAL,
                 project_id: 7,
                 source_id: 10,
                 generation: 4,
@@ -2636,6 +3300,7 @@ mod tests {
                 &[10, 20, 30],
                 TabDragCommitRequest {
                     context: TabDragContext {
+                        host: HostId::LOCAL,
                         project_id: 7,
                         source_id: 10,
                         generation: 4,
@@ -2672,8 +3337,9 @@ mod tests {
             TabDragSettlement::Dispatched { op: 2, .. }
         ));
 
-        assert!(
-            !clear_dispatched_preview(&mut current, 1, |preview| preview.pending_op),
+        assert_eq!(
+            settle_local_completion(current.as_ref(), 1, &[20, 30, 10], Ok(())),
+            ReorderCompletion::Stale,
             "op 1 no longer owns any preview"
         );
         assert_eq!(
@@ -2682,44 +3348,481 @@ mod tests {
             "the newer drag keeps its optimistic order"
         );
 
-        assert!(clear_dispatched_preview(&mut current, 2, |preview| {
-            preview.pending_op
-        }));
-        assert!(current.is_none());
+        assert_eq!(
+            settle_local_completion(current.as_ref(), 2, &[20, 30, 10], Ok(())),
+            ReorderCompletion::Cleared
+        );
     }
 
     /// A preview the user dropped before its op reported back leaves the
-    /// completion with nothing to clear — and it must not resurrect it.
+    /// completion with nothing to settle — and it must not resurrect it.
     #[test]
     fn a_reorder_completion_with_no_preview_left_clears_nothing() {
-        let mut current: Option<TabDragPreview> = None;
-        assert!(!clear_dispatched_preview(&mut current, 1, |preview| {
-            preview.pending_op
-        }));
-        assert!(current.is_none());
+        assert_eq!(
+            settle_local_completion(None, 1, &[10, 20, 30], Ok(())),
+            ReorderCompletion::Stale
+        );
 
-        let mut armed = Some(tab_drag_preview_at(4, vec![20, 30, 10]));
-        assert!(
-            !clear_dispatched_preview(&mut armed, 1, |preview| preview.pending_op),
+        let armed = tab_drag_preview_at(4, vec![20, 30, 10]);
+        assert_eq!(
+            settle_local_completion(Some(&armed), 1, &[10, 20, 30], Ok(())),
+            ReorderCompletion::Stale,
             "a preview that never dispatched is owned by no completion"
         );
-        assert!(armed.is_some());
+    }
+
+    /// A local reorder's event rides the same feed as its completion, so
+    /// by the time the completion lands the authoritative order is
+    /// already the previewed one. Nothing is ever held locally — both
+    /// outcomes clear, and the failure's clear is the rollback.
+    #[test]
+    fn a_local_reorder_completion_always_clears_its_preview() {
+        let dispatched = TabDragPreview {
+            pending_op: Some(9),
+            ..tab_drag_preview_at(4, vec![20, 30, 10])
+        };
+        for (authoritative, result) in [
+            (vec![20, 30, 10], Ok(())),
+            (vec![10, 20, 30], Ok(())),
+            (vec![10, 20, 30], Err("refused")),
+        ] {
+            assert_eq!(
+                settle_local_completion(Some(&dispatched), 9, &authoritative, result),
+                ReorderCompletion::Cleared,
+                "{authoritative:?} / {result:?}"
+            );
+        }
+    }
+
+    /// The pinned host case: the op reply rides the control connection
+    /// and `tabs.reordered` rides the events connection, so an `Ok` that
+    /// cleared the preview would show the old order until the event
+    /// landed. A refusal still clears — that clear is the rollback.
+    #[test]
+    fn a_hosts_ok_holds_the_preview_until_its_reorder_event_lands() {
+        let now = Instant::now();
+        let dispatched = TabDragPreview {
+            pending_op: Some(9),
+            ..tab_drag_preview_on(HOST, 4, vec![20, 30, 10])
+        };
+
+        assert_eq!(
+            settle_completion(Some(&dispatched), 9, HOST, &[10, 20, 30], Ok(()), now),
+            ReorderCompletion::Held { since: now },
+            "the mirror has not moved yet, so the accepted order stays up"
+        );
+        assert_eq!(
+            settle_completion(Some(&dispatched), 9, HOST, &[20, 30, 10], Ok(()), now),
+            ReorderCompletion::Cleared,
+            "the event beat the reply: there is nothing left to hold for"
+        );
+        assert_eq!(
+            settle_completion(
+                Some(&dispatched),
+                9,
+                HOST,
+                &[10, 20, 30],
+                Err("that host is not accepting operations"),
+                now,
+            ),
+            ReorderCompletion::Cleared
+        );
+    }
+
+    /// Op ids are minted per window, so a completion that names another
+    /// instance cannot be the one this preview dispatched — and clearing
+    /// on it would pull another section's order off the screen.
+    #[test]
+    fn a_completion_from_another_instance_settles_nothing() {
+        let dispatched = TabDragPreview {
+            pending_op: Some(9),
+            ..tab_drag_preview_on(HOST, 4, vec![20, 30, 10])
+        };
+        assert_eq!(
+            settle_local_completion(Some(&dispatched), 9, &[10, 20, 30], Ok(())),
+            ReorderCompletion::Stale
+        );
+        assert_eq!(
+            settle_completion(
+                Some(&dispatched),
+                9,
+                HostId::new(4),
+                &[10, 20, 30],
+                Ok(()),
+                Instant::now(),
+            ),
+            ReorderCompletion::Stale
+        );
+    }
+
+    /// What ends a held preview: the mirror's order moving (the event
+    /// landed), the section it belongs to going dim or its incarnation
+    /// going away, or the belt running out. An unheld preview answers to
+    /// the first two alone — the belt is the hold's own bound.
+    #[test]
+    fn a_held_preview_ends_at_the_event_the_section_or_the_belt() {
+        let now = Instant::now();
+        let held = PreviewStanding {
+            scope_is_current: true,
+            order_is_unmoved: true,
+            host_is_live: true,
+            held_since: Some(now),
+        };
+        assert!(!reorder_preview_is_stale(held, now));
+        assert!(!reorder_preview_is_stale(
+            held,
+            now + host_reorder_hold() - Duration::from_millis(1)
+        ));
+        assert!(
+            reorder_preview_is_stale(held, now + host_reorder_hold()),
+            "the belt bounds a hold whose event never arrived"
+        );
+
+        for standing in [
+            PreviewStanding {
+                order_is_unmoved: false,
+                ..held
+            },
+            PreviewStanding {
+                host_is_live: false,
+                ..held
+            },
+            PreviewStanding {
+                scope_is_current: false,
+                ..held
+            },
+        ] {
+            assert!(
+                reorder_preview_is_stale(standing, now),
+                "{standing:?} ends the preview at once"
+            );
+        }
+
+        let unheld = PreviewStanding {
+            held_since: None,
+            ..held
+        };
+        assert!(
+            !reorder_preview_is_stale(unheld, now + host_reorder_hold() * 10),
+            "a live gesture has no deadline"
+        );
+    }
+
+    /// A held preview is display state, so every gesture-driven cancel
+    /// spares it: the choke points `cancel_tab_drag` / `cancel_project_drag`
+    /// consult this, and with them every caller — the other axis arming,
+    /// `select_project`'s `on_select` (which the project strip publishes
+    /// *before* the gesture's own start), a strip's own cancel, a lost
+    /// window focus, `cancel_drags`.
+    #[test]
+    fn a_held_preview_is_display_state_that_gesture_cancels_spare() {
+        assert!(preview_is_held(Some(Instant::now())));
+        assert!(
+            !preview_is_held(None),
+            "a dispatched local preview is cleared by its own completion, \
+             so every cancel behind it lands exactly as it always did"
+        );
+
+        // The root release is the other half: a settled preview is not
+        // commitable twice, held or not.
+        let mut held = Some(TabDragPreview {
+            pending_op: Some(9),
+            held_since: Some(Instant::now()),
+            ..tab_drag_preview_on(HOST, 4, vec![20, 30, 10])
+        });
+        let request = TabDragCommitRequest::from(held.as_ref().unwrap());
+        assert_eq!(
+            settle_tab_drag_commit(&mut held, &[10, 20, 30], request, 10),
+            TabDragSettlement::Ignored
+        );
+        assert!(held.is_some_and(|preview| preview.held_since.is_some()));
+    }
+
+    /// A hold absorbs only gestures on its *own* section. Absorbing
+    /// another section's — the local one above all — would leave that
+    /// drag silently inert, so the hold gives up the slot instead.
+    #[test]
+    fn a_hold_absorbs_only_its_own_sections_gesture() {
+        let now = Some(Instant::now());
+        assert_eq!(hold_verdict(HOST, now, HOST), HoldVerdict::Absorbs);
+        assert_eq!(
+            hold_verdict(HOST, now, HostId::LOCAL),
+            HoldVerdict::Evicts,
+            "a local drag is never made inert by a host's hold"
+        );
+        assert_eq!(hold_verdict(HOST, now, HostId::new(4)), HoldVerdict::Evicts);
+        assert_eq!(hold_verdict(HostId::LOCAL, now, HOST), HoldVerdict::Evicts);
+        for gesture in [HOST, HostId::LOCAL, HostId::new(4)] {
+            assert_eq!(
+                hold_verdict(HOST, None, gesture),
+                HoldVerdict::Arms,
+                "an unheld preview is just a gesture in the slot"
+            );
+        }
+    }
+
+    /// A held tab preview mid-hold, as a completion leaves it: its own
+    /// generation is already behind the strip's, burned when it
+    /// dispatched.
+    fn held_tab_preview() -> TabDragPreview {
+        TabDragPreview {
+            pending_op: Some(9),
+            held_since: Some(Instant::now()),
+            ..tab_drag_preview_on(HOST, 3, vec![20, 30, 10])
+        }
+    }
+
+    /// The eviction hands the slot over *without* burning the
+    /// generation, so the press that caused it still arms. Burning would
+    /// reject it one line later — [`HoldVerdict::Evicts`] silently making
+    /// the drag inert, which is exactly what it promises not to do.
+    #[test]
+    fn an_evicting_tab_press_arms_in_the_slot_it_took() {
+        let ids = vec![10, 20, 30];
+        let local = TabDragContext {
+            host: HostId::LOCAL,
+            project_id: 7,
+            source_id: 10,
+            generation: 4,
+        };
+
+        let mut preview = Some(held_tab_preview());
+        let mut generation = 4;
+        assert!(!press_tab_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            true,
+            local,
+            ids.clone()
+        ));
+        let armed = preview.expect("the evicting press arms rather than going inert");
+        assert_eq!(
+            generation, 4,
+            "the eviction must not burn the generation the evicting press carries"
+        );
+        assert_eq!(armed.context, local);
+        assert_eq!(armed.original_ids, ids);
+        assert!(!armed.dragging && armed.held_since.is_none());
+
+        // The same press on the hold's *own* section is absorbed
+        // instead, leaving slot and generation alone.
+        let mut preview = Some(held_tab_preview());
+        let mut generation = 4;
+        assert!(press_tab_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            true,
+            TabDragContext {
+                host: HOST,
+                ..local
+            },
+            ids.clone()
+        ));
+        assert_eq!(preview.map(|preview| preview.context.host), Some(HOST));
+        assert_eq!(generation, 4);
+
+        // A press the arm rejects still burns, exactly as the cancel this
+        // path replaced did.
+        let mut preview = Some(held_tab_preview());
+        let mut generation = 4;
+        assert!(!press_tab_strip(
+            &mut preview,
+            &mut generation,
+            &[10, 20],
+            true,
+            local,
+            ids
+        ));
+        assert!(preview.is_none());
+        assert_eq!(generation, 5);
+    }
+
+    /// The belt needs a clock of its own: nothing else wakes an idle
+    /// app, so this predicate is what arms the timer — and it must be
+    /// false for every preview that is not held, or an ordinary local
+    /// drag would start a periodic wakeup.
+    #[test]
+    fn only_a_held_preview_arms_the_belt_timer() {
+        let tab = tab_drag_preview_on(HOST, 4, vec![20, 30, 10]);
+        let held_tab = TabDragPreview {
+            pending_op: Some(9),
+            held_since: Some(Instant::now()),
+            ..tab.clone()
+        };
+        let project = project_drag_preview(true);
+        let held_project = ProjectDragPreview {
+            pending_op: Some(9),
+            held_since: Some(Instant::now()),
+            ..project.clone()
+        };
+
+        assert!(!any_preview_is_held(None, None));
+        assert!(!any_preview_is_held(Some(&tab), Some(&project)));
+        assert!(any_preview_is_held(Some(&held_tab), None));
+        assert!(any_preview_is_held(None, Some(&held_project)));
+        assert!(
+            any_preview_is_held(Some(&tab), Some(&held_project)),
+            "a hold on either axis arms it — and a hold survives the \
+             other axis arming, so both can be live at once"
+        );
+    }
+
+    /// Two sections can list the same numeric ids; the instance in the
+    /// context is what keeps their gestures apart.
+    #[test]
+    fn two_hosts_listing_the_same_ids_are_different_gestures() {
+        let ours = tab_drag_preview_on(HOST, 4, vec![20, 30, 10]);
+        let theirs = tab_drag_preview_on(HostId::new(4), 4, vec![20, 30, 10]);
+        assert_ne!(ours.context, theirs.context);
+        assert!(!tab_drag_commit_is_valid(
+            Some(&ours),
+            &[10, 20, 30],
+            &theirs.context,
+            &[10, 20, 30],
+            &[20, 30, 10],
+        ));
+
+        let mine = local_project_context(10, 4);
+        let hosted = ProjectDragContext { host: HOST, ..mine };
+        assert_ne!(mine, hosted);
+        assert!(
+            arm_project_drag_preview(&[10, 20, 30], 4, hosted, vec![10, 20, 30])
+                .is_some_and(|preview| preview.context == hosted)
+        );
+    }
+
+    /// The dispatch names the instance it went to, and a host's params
+    /// are the whole new order with string-wrapped ids — the spelling
+    /// `RenameTarget::wire_params` already uses.
+    #[test]
+    fn a_reorder_dispatch_names_its_instance_and_sends_the_whole_order() {
+        assert_eq!(
+            host_reorder_params(ReorderTarget::Tabs { project_id: 7 }, &[20, 30, 10]),
+            serde_json::json!({ "project_id": "7", "tab_ids": ["20", "30", "10"] })
+        );
+        assert_eq!(
+            host_reorder_params(ReorderTarget::Projects, &[3, 1, 2]),
+            serde_json::json!({ "project_ids": ["3", "1", "2"] })
+        );
+        assert_eq!(
+            ReorderTarget::Tabs { project_id: 7 }.wire_op(),
+            roost_ipc::messages::ops::TAB_REORDER
+        );
+        assert_eq!(
+            ReorderTarget::Projects.wire_op(),
+            roost_ipc::messages::ops::PROJECT_REORDER
+        );
+
+        assert!(matches!(
+            reorder_op_result(
+                ReorderTarget::Tabs { project_id: 7 },
+                HOST,
+                9,
+                vec![20, 30, 10],
+                Ok(()),
+            ),
+            EngineOpResult::TabsReordered {
+                op: 9,
+                host,
+                project_id: 7,
+                ..
+            } if host == HOST
+        ));
+        assert!(matches!(
+            reorder_op_result(ReorderTarget::Projects, HOST, 9, vec![3, 1, 2], Ok(())),
+            EngineOpResult::ProjectsReordered { op: 9, host, .. } if host == HOST
+        ));
+    }
+
+    /// One preview, many strips: only the section the gesture started on
+    /// draws its order, and every other section draws its own authority.
+    #[test]
+    fn only_the_section_a_gesture_started_on_draws_its_preview() {
+        let mut preview = ProjectDragPreview {
+            context: ProjectDragContext {
+                host: HOST,
+                ..local_project_context(10, 4)
+            },
+            ..project_drag_preview(true)
+        };
+        let authority = vec![10, 20, 30];
+
+        assert_eq!(
+            visual_project_ids(Some(&preview), HOST, 4, authority.clone()),
+            vec![20, 30, 10]
+        );
+        assert_eq!(
+            visual_project_ids(Some(&preview), HostId::LOCAL, 4, authority.clone()),
+            authority,
+            "the local strip draws its own list while a host is being dragged"
+        );
+        assert_eq!(
+            visual_project_ids(Some(&preview), HostId::new(4), 4, authority.clone()),
+            authority
+        );
+        assert_eq!(
+            visual_project_ids(Some(&preview), HOST, 5, authority.clone()),
+            authority,
+            "a burned generation with no dispatch behind it draws nothing"
+        );
+        // A dispatched (and held) preview keeps drawing past the burn.
+        preview.pending_op = Some(9);
+        assert_eq!(
+            visual_project_ids(Some(&preview), HOST, 5, authority.clone()),
+            vec![20, 30, 10]
+        );
+        assert_eq!(
+            visual_project_ids(Some(&preview), HOST, 5, vec![10, 20, 40]),
+            vec![10, 20, 40],
+            "an authority the gesture never armed against is drawn as it is"
+        );
+
+        let tabs = tab_drag_preview_on(HOST, 4, vec![20, 30, 10]);
+        assert_eq!(
+            visual_tab_ids(Some(&tabs), ProjectKey::new(HOST, 7), vec![10, 20, 30]),
+            vec![20, 30, 10]
+        );
+        assert_eq!(
+            visual_tab_ids(
+                Some(&tabs),
+                ProjectKey::new(HostId::LOCAL, 7),
+                vec![10, 20, 30]
+            ),
+            vec![10, 20, 30],
+            "the local project 7 is not the host's project 7"
+        );
+    }
+
+    /// Which sections take a strip at all. A never-connected host's
+    /// placeholder incarnation is `HostId::LOCAL`, so the incarnation
+    /// check is what keeps its (empty) section out of the local strip's
+    /// scope.
+    #[test]
+    fn only_an_interactive_section_at_a_real_incarnation_reorders() {
+        assert!(host_section_is_reorderable(HOST, true));
+        assert!(!host_section_is_reorderable(HOST, false));
+        assert!(!host_section_is_reorderable(HostId::LOCAL, true));
+        assert!(!host_section_is_reorderable(HostId::LOCAL, false));
     }
 
     #[test]
     fn exact_subthreshold_end_clears_without_accepting_stale_or_moved_state() {
         let original = vec![10, 20, 30];
         let context = TabDragContext {
+            host: HostId::LOCAL,
             project_id: 7,
             source_id: 10,
             generation: 4,
         };
         let preview = TabDragPreview {
-            context: context.clone(),
+            context,
             original_ids: original.clone(),
             ordered_ids: original.clone(),
             dragging: false,
             pending_op: None,
+            held_since: None,
         };
         let mut exact = Some(preview.clone());
         assert!(end_tab_drag_preview_if_owned(
@@ -2733,7 +3836,7 @@ mod tests {
             &original,
             &TabDragContext {
                 generation: 5,
-                ..context.clone()
+                ..context
             },
             &original,
         ));
@@ -2771,6 +3874,7 @@ mod tests {
     fn project_drag_preview(dragging: bool) -> ProjectDragPreview {
         ProjectDragPreview {
             context: ProjectDragContext {
+                host: HostId::LOCAL,
                 source_id: 10,
                 generation: 4,
             },
@@ -2782,12 +3886,14 @@ mod tests {
             },
             dragging,
             pending_op: None,
+            held_since: None,
         }
     }
 
     #[test]
     fn tab_drag_threshold_gates_the_pills_drag_styling() {
         let context = TabDragContext {
+            host: HostId::LOCAL,
             project_id: 7,
             source_id: 10,
             generation: 4,
@@ -2813,7 +3919,7 @@ mod tests {
             4,
             &TabDragContext {
                 source_id: 20,
-                ..context.clone()
+                ..context
             }
         ));
         assert!(!stale.expect("untouched").drags(10));
@@ -2825,11 +3931,12 @@ mod tests {
     #[test]
     fn project_drag_arms_only_for_the_current_generation_and_rendered_membership() {
         let ids = vec![10, 20, 30];
-        let armed = arm_project_drag_preview(&ids, 4, 20, 4, ids.clone())
+        let armed = arm_project_drag_preview(&ids, 4, local_project_context(20, 4), ids.clone())
             .expect("a current-generation press on a rendered project arms");
         assert_eq!(
             armed.context,
             ProjectDragContext {
+                host: HostId::LOCAL,
                 source_id: 20,
                 generation: 4,
             }
@@ -2837,15 +3944,26 @@ mod tests {
         assert_eq!(armed.ordered_ids, ids);
         assert!(!armed.dragging, "a bare press is not yet a drag");
 
-        assert!(arm_project_drag_preview(&ids, 5, 20, 4, ids.clone()).is_none());
-        assert!(arm_project_drag_preview(&[10, 20], 4, 20, 4, ids.clone()).is_none());
-        assert!(arm_project_drag_preview(&ids, 4, 99, 4, ids.clone()).is_none());
-        assert!(arm_project_drag_preview(&[10, 0], 4, 10, 4, vec![10, 0]).is_none());
+        assert!(
+            arm_project_drag_preview(&ids, 5, local_project_context(20, 4), ids.clone()).is_none()
+        );
+        assert!(
+            arm_project_drag_preview(&[10, 20], 4, local_project_context(20, 4), ids.clone())
+                .is_none()
+        );
+        assert!(
+            arm_project_drag_preview(&ids, 4, local_project_context(99, 4), ids.clone()).is_none()
+        );
+        assert!(
+            arm_project_drag_preview(&[10, 0], 4, local_project_context(10, 4), vec![10, 0])
+                .is_none()
+        );
     }
 
     #[test]
     fn project_drag_threshold_gates_agent_row_hiding() {
         let context = ProjectDragContext {
+            host: HostId::LOCAL,
             source_id: 10,
             generation: 4,
         };
@@ -2865,6 +3983,7 @@ mod tests {
             &mut stale,
             4,
             &ProjectDragContext {
+                host: HostId::LOCAL,
                 source_id: 20,
                 generation: 4,
             }
@@ -2879,6 +3998,7 @@ mod tests {
     fn project_drag_preview_updates_only_for_the_owning_gesture() {
         let ids = vec![10, 20, 30];
         let context = ProjectDragContext {
+            host: HostId::LOCAL,
             source_id: 10,
             generation: 4,
         };
@@ -2894,13 +4014,14 @@ mod tests {
         assert_eq!(preview.as_ref().unwrap().ordered_ids, [20, 10, 30]);
 
         for (authoritative, strip_generation, context, ordered) in [
-            (ids.clone(), 5, context.clone(), vec![30, 20, 10]),
-            (vec![10, 20], 4, context.clone(), vec![30, 20, 10]),
-            (ids.clone(), 4, context.clone(), vec![10, 20]),
+            (ids.clone(), 5, context, vec![30, 20, 10]),
+            (vec![10, 20], 4, context, vec![30, 20, 10]),
+            (ids.clone(), 4, context, vec![10, 20]),
             (
                 ids.clone(),
                 4,
                 ProjectDragContext {
+                    host: HostId::LOCAL,
                     source_id: 20,
                     generation: 4,
                 },
@@ -2940,6 +4061,7 @@ mod tests {
         let ids = vec![10, 20, 30];
         let mut tab_preview = Some(TabDragPreview {
             context: TabDragContext {
+                host: HostId::LOCAL,
                 project_id: 7,
                 source_id: 10,
                 generation: 4,
@@ -2948,6 +4070,7 @@ mod tests {
             ordered_ids: vec![102, 101],
             dragging: false,
             pending_op: None,
+            held_since: None,
         });
         let mut tab_generation = 4;
 
@@ -2955,7 +4078,8 @@ mod tests {
         cancel_drag_preview(&mut tab_preview, &mut tab_generation);
         assert!(tab_preview.is_none());
         assert_eq!(tab_generation, 5);
-        let mut project_preview = arm_project_drag_preview(&ids, 4, 10, 4, ids.clone());
+        let mut project_preview =
+            arm_project_drag_preview(&ids, 4, local_project_context(10, 4), ids.clone());
         assert!(project_preview.is_some());
 
         // The reverse eviction burns the project generation, so the press the
@@ -2964,7 +4088,79 @@ mod tests {
         cancel_drag_preview(&mut project_preview, &mut project_generation);
         assert!(project_preview.is_none());
         assert_eq!(project_generation, 5);
-        assert!(arm_project_drag_preview(&ids, project_generation, 10, 4, ids.clone()).is_none());
+        assert!(arm_project_drag_preview(
+            &ids,
+            project_generation,
+            local_project_context(10, 4),
+            ids.clone()
+        )
+        .is_none());
+    }
+
+    /// [`an_evicting_tab_press_arms_in_the_slot_it_took`]'s twin, and for
+    /// the same reason: the sidebar's eviction must not burn the
+    /// generation the evicting press carries.
+    #[test]
+    fn an_evicting_project_press_arms_in_the_slot_it_took() {
+        fn held() -> ProjectDragPreview {
+            ProjectDragPreview {
+                context: ProjectDragContext {
+                    host: HOST,
+                    source_id: 10,
+                    generation: 3,
+                },
+                pending_op: Some(9),
+                held_since: Some(Instant::now()),
+                ..project_drag_preview(true)
+            }
+        }
+        let ids = vec![10, 20, 30];
+        let local = local_project_context(10, 4);
+
+        let mut preview = Some(held());
+        let mut generation = 4;
+        assert!(!press_project_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            local,
+            ids.clone()
+        ));
+        let armed = preview.expect("the evicting press arms rather than going inert");
+        assert_eq!(
+            generation, 4,
+            "the eviction must not burn the generation the evicting press carries"
+        );
+        assert_eq!(armed.context, local);
+        assert_eq!(armed.original_ids, ids);
+        assert!(!armed.dragging && armed.held_since.is_none());
+
+        let mut preview = Some(held());
+        let mut generation = 4;
+        assert!(press_project_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            ProjectDragContext {
+                host: HOST,
+                ..local
+            },
+            ids.clone()
+        ));
+        assert_eq!(preview.map(|preview| preview.context.host), Some(HOST));
+        assert_eq!(generation, 4);
+
+        let mut preview = Some(held());
+        let mut generation = 4;
+        assert!(!press_project_strip(
+            &mut preview,
+            &mut generation,
+            &[10, 20],
+            local,
+            ids
+        ));
+        assert!(preview.is_none());
+        assert_eq!(generation, 5);
     }
 
     #[test]
@@ -2999,6 +4195,7 @@ mod tests {
             Some(&preview),
             &[10, 20, 30],
             &ProjectDragContext {
+                host: HostId::LOCAL,
                 source_id: 10,
                 generation: 5,
             },
@@ -3072,7 +4269,7 @@ mod tests {
     fn exact_subthreshold_project_end_clears_without_accepting_stale_or_moved_state() {
         let original = vec![10, 20, 30];
         let preview = project_drag_preview(false);
-        let context = preview.context.clone();
+        let context = preview.context;
 
         let mut exact = Some(preview.clone());
         assert!(end_project_drag_preview_if_owned(
@@ -3085,8 +4282,9 @@ mod tests {
             &mut stale,
             &original,
             &ProjectDragContext {
+                host: HostId::LOCAL,
                 generation: 5,
-                ..context.clone()
+                ..context
             },
             &original,
         ));
@@ -3107,10 +4305,12 @@ mod tests {
     fn project_drag_commit_after_the_agent_row_hide_uses_the_gesture_id_list() {
         let ids = vec![10, 20, 30];
         let context = ProjectDragContext {
+            host: HostId::LOCAL,
             source_id: 10,
             generation: 4,
         };
-        let mut preview = arm_project_drag_preview(&ids, 4, 10, 4, ids.clone());
+        let mut preview =
+            arm_project_drag_preview(&ids, 4, local_project_context(10, 4), ids.clone());
         assert!(!agent_rows_hidden(preview.as_ref()));
         assert!(mark_project_drag_dragging(&mut preview, 4, &context));
         assert!(agent_rows_hidden(preview.as_ref()));
@@ -3155,6 +4355,7 @@ mod tests {
         let ordered = vec![ids[2], ids[0], ids[1]];
         let mut preview = Some(ProjectDragPreview {
             context: ProjectDragContext {
+                host: HostId::LOCAL,
                 source_id: ids[2],
                 generation: 4,
             },
@@ -3162,6 +4363,7 @@ mod tests {
             ordered_ids: ordered.clone(),
             dragging: true,
             pending_op: None,
+            held_since: None,
         });
         let request = ProjectDragCommitRequest::from(preview.as_ref().unwrap());
 
@@ -3177,9 +4379,21 @@ mod tests {
 
         // The completion clears the preview it dispatched; the sidebar has
         // been showing this order the whole time, so nothing moves.
-        assert!(clear_dispatched_preview(&mut preview, 9, |preview| {
-            preview.pending_op
-        }));
+        assert_eq!(
+            settle_reorder_completion(
+                preview.as_ref().map(|preview| DispatchedPreview {
+                    pending_op: preview.pending_op,
+                    host: preview.context.host,
+                    original_ids: &preview.original_ids,
+                }),
+                9,
+                HostId::LOCAL,
+                &ordered,
+                Ok(()),
+                Instant::now(),
+            ),
+            ReorderCompletion::Cleared
+        );
         assert_eq!(
             workspace
                 .snapshot()

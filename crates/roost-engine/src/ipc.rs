@@ -50,7 +50,7 @@ use roost_ipc::messages::{
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
     TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
     TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
+    WindowResizeParams, WireProjectRef, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -111,6 +111,41 @@ type PaletteReply = tokio::sync::oneshot::Sender<Result<PaletteStateResult, Stri
 /// by a headless workspace. Stringifying at the seam would flatten both
 /// onto one code.
 pub type HostReply<T> = tokio::sync::oneshot::Sender<Result<T, WorkspaceError>>;
+
+/// Why a host-routed op did not happen, as the wire will say it.
+///
+/// The sibling of [`HostReply`]'s [`WorkspaceError`], for the ops the
+/// app forwards to a *session* rather than answering from its own
+/// registry (the host form of `tab.reorder` / `project.reorder`, plan
+/// 044 §3.1 d6). Their failure is the session's own refusal, which
+/// already carries a wire code; a `WorkspaceError` could not hold it
+/// and a bare string would flatten it onto `internal`. The app maps its
+/// `HostOpError` here — the session's code verbatim, or
+/// `host-unavailable` for a connection that is not there — and the
+/// dispatcher turns it back into a [`HandlerError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostOpFailure {
+    pub code: String,
+    pub message: String,
+}
+
+impl HostOpFailure {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl From<HostOpFailure> for HandlerError {
+    fn from(failure: HostOpFailure) -> Self {
+        HandlerError::new(failure.code, failure.message)
+    }
+}
+
+/// Reply for a host-routed op — see [`HostOpFailure`].
+pub type HostOpReply<T> = tokio::sync::oneshot::Sender<Result<T, HostOpFailure>>;
 
 /// Reply for [`UiRequest::PalettePresent`]: the user's choice, delivered
 /// once the palette closes (a pick or a dismissal). Unlike the other
@@ -478,6 +513,26 @@ pub enum UiRequest {
         host: u32,
         tab_id: i64,
         reply: HostReply<()>,
+    },
+    /// `tab.reorder` for a host-qualified project: send that host's
+    /// session the whole new tab order over its op queue (plan 044
+    /// §3.1 d6). The ids are already narrowed to the session's own bare
+    /// id-space — the incarnation is the `host` field.
+    ///
+    /// Unlike every other `host.*` arm, this one cannot be answered
+    /// inside `update`: the app has to await the session's reply. It
+    /// moves this `reply` into that future and answers from there.
+    HostTabReorder {
+        host: u32,
+        project_id: i64,
+        tab_ids: Vec<i64>,
+        reply: HostOpReply<()>,
+    },
+    /// `project.reorder`'s twin of [`UiRequest::HostTabReorder`].
+    HostProjectReorder {
+        host: u32,
+        project_ids: Vec<i64>,
+        reply: HostOpReply<()>,
     },
     /// `host.connect` — the palette's `Connect Host` and the sidebar's
     /// ↻ Reconnect, as an op. Unconditional takeover, and it may start a
@@ -1270,7 +1325,9 @@ impl IpcHandler {
     ///
     /// The error half is whatever the variant's reply channel carries:
     /// `String` for most, a [`WorkspaceError`] for the `host.*` ops so
-    /// the dispatcher can mint the same wire code the headless path does.
+    /// the dispatcher can mint the same wire code the headless path
+    /// does, and a [`HostOpFailure`] for the ops the app forwards to a
+    /// session, whose refusal already has a code of its own.
     async fn ui_call<T, E>(
         &self,
         make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, E>>) -> UiRequest,
@@ -1452,6 +1509,146 @@ fn session_test_mode(h: &IpcHandler) -> Result<(), HandlerError> {
     ))
 }
 
+/// A session's ids are one bare id-space by design; the `h<host>.<id>`
+/// spelling names a UI's client-side tab and is refused rather than
+/// silently narrowed to a number that would read (or reorder) some
+/// unrelated tab.
+fn bare_tab(tab: WireTabRef) -> Result<i64, HandlerError> {
+    tab.local().ok_or_else(|| {
+        HandlerError::invalid_param(
+            "host-qualified tab refs are a UI-socket form; session tab ids are bare",
+        )
+    })
+}
+
+/// [`bare_tab`]'s project twin, for the reorder ops' `WireProjectRef`.
+fn bare_project(project: WireProjectRef) -> Result<i64, HandlerError> {
+    project.local().ok_or_else(|| {
+        HandlerError::invalid_param(
+            "host-qualified project refs are a UI-socket form; session project ids are bare",
+        )
+    })
+}
+
+/// Which instance a reorder request names: this process's own
+/// workspace, or a connected host's session, reached over the app's op
+/// queue (plan 044 §3.1 d6). The ids the route comes back with are
+/// already narrowed to that instance's own bare id-space.
+enum ReorderInstance {
+    Local,
+    Host(u32),
+}
+
+/// A reorder names one instance or the other, never both — it carries a
+/// whole order in one id-space, and a list half in a host's numbering
+/// and half in ours would reorder something nobody asked for.
+fn mixed_refs(op: &str) -> HandlerError {
+    HandlerError::invalid_param(format!(
+        "{op}: every ref in one request must name the same instance — either all bare (local) \
+         or all `h<host>.<id>` on one host"
+    ))
+}
+
+/// The host form is client state: the connection whose session would
+/// serve it lives in the app, so a socket with no UI has nothing to
+/// route to. The `tab.focus` guard, one op over.
+fn needs_a_ui(op: &str) -> HandlerError {
+    HandlerError::invalid_param(format!(
+        "a host-qualified {op} needs a UI: host connections are client state"
+    ))
+}
+
+/// A session socket has one bare id-space and no host connections, so a
+/// qualified ref is refused by name there rather than narrowed — the
+/// same rule `tab.dump` applies, for the same reason.
+fn is_a_session_socket(h: &IpcHandler) -> bool {
+    h.session.is_some()
+}
+
+fn tab_reorder_route(
+    h: &IpcHandler,
+    p: TabReorderParams,
+) -> Result<(ReorderInstance, i64, Vec<i64>), HandlerError> {
+    let op = ops::TAB_REORDER;
+    if is_a_session_socket(h) {
+        let project_id = bare_project(p.project_id)?;
+        let tab_ids = p
+            .tab_ids
+            .into_iter()
+            .map(bare_tab)
+            .collect::<Result<_, _>>()?;
+        return Ok((ReorderInstance::Local, project_id, tab_ids));
+    }
+    match p.project_id {
+        WireProjectRef::Local(project_id) => {
+            let tab_ids = p
+                .tab_ids
+                .into_iter()
+                .map(|tab| tab.local().ok_or_else(|| mixed_refs(op)))
+                .collect::<Result<_, _>>()?;
+            Ok((ReorderInstance::Local, project_id, tab_ids))
+        }
+        WireProjectRef::Host { host, project } => {
+            let tab_ids = p
+                .tab_ids
+                .into_iter()
+                .map(|tab| match tab {
+                    WireTabRef::Host { host: named, tab } if named == host => Ok(tab),
+                    _ => Err(mixed_refs(op)),
+                })
+                .collect::<Result<_, _>>()?;
+            if !h.has_ui() {
+                return Err(needs_a_ui(op));
+            }
+            Ok((ReorderInstance::Host(host), project, tab_ids))
+        }
+    }
+}
+
+fn project_reorder_route(
+    h: &IpcHandler,
+    p: ProjectReorderParams,
+) -> Result<(ReorderInstance, Vec<i64>), HandlerError> {
+    let op = ops::PROJECT_REORDER;
+    if is_a_session_socket(h) {
+        let project_ids = p
+            .project_ids
+            .into_iter()
+            .map(bare_project)
+            .collect::<Result<_, _>>()?;
+        return Ok((ReorderInstance::Local, project_ids));
+    }
+    // An empty list names no instance, so it stays the local no-op it
+    // has always been. So does a list whose first ref is bare: a
+    // qualified one later in it is the mixed form, not a host route.
+    let host = match p.project_ids.first() {
+        Some(WireProjectRef::Host { host, .. }) => *host,
+        _ => {
+            let project_ids = p
+                .project_ids
+                .into_iter()
+                .map(|project| project.local().ok_or_else(|| mixed_refs(op)))
+                .collect::<Result<_, _>>()?;
+            return Ok((ReorderInstance::Local, project_ids));
+        }
+    };
+    let project_ids = p
+        .project_ids
+        .into_iter()
+        .map(|project| match project {
+            WireProjectRef::Host {
+                host: named,
+                project,
+            } if named == host => Ok(project),
+            _ => Err(mixed_refs(op)),
+        })
+        .collect::<Result<_, _>>()?;
+    if !h.has_ui() {
+        return Err(needs_a_ui(op));
+    }
+    Ok((ReorderInstance::Host(host), project_ids))
+}
+
 /// The four terminal-reading ops a session answers from its own tab
 /// tasks instead of from a UI it does not have.
 ///
@@ -1461,22 +1658,10 @@ fn session_test_mode(h: &IpcHandler) -> Result<(), HandlerError> {
 #[cfg(feature = "server-vt")]
 mod served {
     use super::{
-        session_test_mode, tab_ask, tab_commands, tab_gone, DumpData, HandlerError, IpcHandler,
-        ResolvedCellsData, WireTabRef,
+        bare_tab as bare, session_test_mode, tab_ask, tab_commands, tab_gone, DumpData,
+        HandlerError, IpcHandler, ResolvedCellsData, WireTabRef,
     };
     use crate::tab_task::TabCmd;
-
-    /// A session's ids are one bare id-space by design; the
-    /// `h<host>.<id>` spelling names a UI's client-side tab and is
-    /// refused here rather than silently narrowed to a number that
-    /// would read some unrelated tab.
-    fn bare(tab: WireTabRef) -> Result<i64, HandlerError> {
-        tab.local().ok_or_else(|| {
-            HandlerError::invalid_param(
-                "host-qualified tab refs are a UI-socket form; session tab ids are bare",
-            )
-        })
-    }
 
     pub(super) async fn dump(
         h: &IpcHandler,
@@ -2232,16 +2417,41 @@ async fn dispatch(
         }
         ops::TAB_REORDER => {
             let p: TabReorderParams = decode(params)?;
-            h.workspace
-                .reorder_tabs(p.project_id, &p.tab_ids)
-                .map_err(ws_err)?;
+            let (instance, project_id, tab_ids) = tab_reorder_route(h, p)?;
+            match instance {
+                ReorderInstance::Local => {
+                    h.workspace
+                        .reorder_tabs(project_id, &tab_ids)
+                        .map_err(ws_err)?;
+                }
+                ReorderInstance::Host(host) => {
+                    h.ui_call(|reply| UiRequest::HostTabReorder {
+                        host,
+                        project_id,
+                        tab_ids,
+                        reply,
+                    })
+                    .await??;
+                }
+            }
             Ok(serde_json::json!({}))
         }
         ops::PROJECT_REORDER => {
             let p: ProjectReorderParams = decode(params)?;
-            h.workspace
-                .reorder_projects(&p.project_ids)
-                .map_err(ws_err)?;
+            let (instance, project_ids) = project_reorder_route(h, p)?;
+            match instance {
+                ReorderInstance::Local => {
+                    h.workspace.reorder_projects(&project_ids).map_err(ws_err)?;
+                }
+                ReorderInstance::Host(host) => {
+                    h.ui_call(|reply| UiRequest::HostProjectReorder {
+                        host,
+                        project_ids,
+                        reply,
+                    })
+                    .await??;
+                }
+            }
             Ok(serde_json::json!({}))
         }
         ops::TAB_FOCUS => {

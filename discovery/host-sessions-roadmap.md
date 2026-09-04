@@ -806,12 +806,20 @@ below). Only [#381](https://github.com/charliek/roost/issues/381) and
 [#383](https://github.com/charliek/roost/issues/383) remain open on the
 pre list.
 
-One thing the #384 port surfaced and left as a live product wrinkle: an
-ssh failure's classified family never reaches a published `reason` on a
-retryable rung — the armed-rung line overwrites it in the same
-`host.status` update — so it surfaces only in the give-up copy. The
-live harness's L5 works around it by asserting the refusal as an OS
-fact rather than reading it back as a wire fact.
+One thing the #384 port surfaced was filed as
+[#399](https://github.com/charliek/roost/issues/399) and **closed by
+plan 044**: an ssh failure's classified family never reached a published
+`reason` on a retryable rung — the armed-rung line overwrote it in the
+same `host.status` update — so it surfaced only in the give-up copy, and
+the live harness's L5 worked around it by asserting the refusal as an OS
+fact. `reason` stays the armed-rung line (the band's input, and what
+`rollup` is derived from); the family now rides beside it in an additive
+`retry.reason`, read whenever it is present. Its absence is ordinary
+rather than a fault — the drop that starts an outage is usually the live
+connection dying, a bare EOF with nothing to classify, and the copy
+arrives with the next dial's failure — and it is not a function of the
+attempt number, since a suspend/wake resets the ladder to attempt 1 and
+carries the family across as the same outage.
 
 **Release-blocking work from outside this roadmap — closed by plan 043
 (swept 2026-09-02).** This list stayed scoped to items host-session work
@@ -955,16 +963,16 @@ conditional-connect vs. HS-4d viewports) whose regression coverage —
 `host.status`, the lanes, the live harness — now exists *before* the
 wire changes; #383 is a testing investment that pairs with #386 and
 should land before #381's implementation, not before a release.
-Post-release order of work (updated 2026-09-03 after hand-testing the
-candidate): **#398** first — drag-reorder of a remote host's projects
-and tabs, the parity gap a user hits daily — then **#397** (the
-`ROOST_STATE_DIR` seam collision); then **#387** (a far side that is
-merely restarting should not need a manual ↻ — the one "honest but
-unhelpful" first-release behavior) and the `reason`-overwrite wrinkle
-(an ssh family unreadable on the wire while a rung is armed), the two
-cheap correctness follow-ups; then #383 + #386 together; then the #381
-conversation; HS-4c stays after that; #351 remains the top non-host
-post-release item.
+Post-release order of work (updated 2026-09-04 — plan 044 shipped): the
+two items that topped this list are done. **#398** (drag-reorder of a
+remote host's projects and tabs) and **#397** (the `ROOST_STATE_DIR`
+seam collision) both shipped, along with the `reason`-overwrite wrinkle
+(filed as #399 mid-plan) — see their entries below and the closure
+paragraph above for #399. **#387** (a far side that is merely
+restarting should not need a manual ↻) was costed alongside them and
+stays open by decision, not by oversight — see its entry below. Next up
+are #383 + #386 together; then the #381 conversation; HS-4c stays after
+that; #351 remains the top non-host post-release item.
 
 - **[#381](https://github.com/charliek/roost/issues/381) Session takeover is best-effort; needs an atomic
   conditional-connect on the wire.** Reconnect *is* takeover
@@ -1022,23 +1030,41 @@ post-release item.
 ### Post initial release
 
 - **[#398](https://github.com/charliek/roost/issues/398) Drag-reorder
-  projects and tabs within a remote host's section.** Found
-  hand-testing the v0.0.19 candidate: the LOCAL section reorders both,
-  a host section neither — a deliberate gap (host sections sit outside
-  the local reorder strip, and a host project's tab strip is disabled
-  because reordering its tabs is an op-queue mutation, not a local
-  reorder). The fix routes the drop to the session's own
-  `project.reorder` / `tab.reorder` over the host connection and lets
-  the mirror re-render from the session's events, with a
-  `test_host_client` case. **First item of the next release** — the
-  parity gap people hit daily.
+  projects and tabs within a remote host's section. — Shipped, plan
+  044.** Found hand-testing the v0.0.19 candidate: the LOCAL section
+  reordered both, a host section neither — a deliberate gap (host
+  sections sat outside the local reorder strip, and a host project's
+  tab strip was disabled because reordering its tabs is an op-queue
+  mutation, not a local reorder). The drop now routes to the session's
+  own `project.reorder` / `tab.reorder` over the host connection and
+  the mirror re-renders from the session's events; the subtle half was
+  the settle rule — a successful drop's reply and its `*.reordered`
+  event ride separate connections with no ordering, so the preview is
+  held (not cleared) until the mirror's order actually moves, or a 2s
+  belt expires, rather than snapping back and re-ordering. Both reorder
+  ops also took on the host-qualified `h<incarnation>.<id>` spelling on
+  the UI socket, so the gesture isn't the only way to drive them, and
+  `app.sidebar_dump` gained an additive `hosts` array so a caller can
+  read a host section's order at all. Fenced end to end by two
+  `test_host_client.py` cases that drive the op against a real session
+  and assert the mirror follows while the local workspace stays
+  untouched.
 - **[#397](https://github.com/charliek/roost/issues/397) A spawned
-  `localhost` daemon inherits `ROOST_STATE_DIR`** and then refuses the
-  UI's own state lock. Real users never set the seam, and W2 reports it
-  honestly (`roost-session failed to start` with the daemon's verdict in
-  `detail`), but a UI launched with an isolated state dir can never
-  spawn its own daemon. Hand the daemon a derived dir when the seam is
-  set. Second, right behind #398.
+  `localhost` daemon inherits `ROOST_STATE_DIR`. — Shipped, plan
+  044.** Real users never set the seam, and W2 reported it honestly
+  (`roost-session failed to start` with the daemon's verdict in
+  `detail`), but a UI launched with an isolated state dir could never
+  spawn its own daemon — it handed the child its own state dir
+  wholesale, which the child then found already locked by the parent.
+  The shared launcher (`spawn_and_read_verdict`, used by both the UI's
+  Connect and `roostctl session start`) now derives `<value>/session`
+  for the child instead — *nested inside* the launcher's own state dir,
+  not a sibling of it, so whoever wipes one wipes the other and the
+  socket-based discovery (`roostctl session status`/`stop`) needs no
+  change. A direct `roost-session start` under the seam is unaffected —
+  only a launcher derives. Fenced by `test_host_local_spawn.py`, which
+  is also what makes the E2E harness's own always-set `ROOST_STATE_DIR`
+  finally able to spawn a localhost daemon at all.
 - **[#385](https://github.com/charliek/roost/issues/385) No seam to inject a tunnel failure**, so a session-drop
   family is unreachable from a unit test and the fire-time re-check
   needs a `#[cfg(test)]` enum arm. Contained and documented.
@@ -1048,7 +1074,17 @@ post-release item.
 - **[#387](https://github.com/charliek/roost/issues/387) `NoSession` settles immediately**, so a far side that is
   merely restarting costs a manual ↻. Consistent with localhost,
   documented, and mitigated by running `roost-session` as a lingering
-  `systemd --user` unit.
+  `systemd --user` unit. **Costed in plan 044 §3.5 and left settled, on
+  purpose.** `reconnect::retryable` is a per-family table with its own
+  tests, and the immediate-settle rule is documented in three places
+  already (the user guide, the dev notes, plan 040 §3.3) and consistent
+  with `localhost`'s own behavior — it looked like a two-line budget
+  change, but a short `NoSession` ladder is actually a policy decision
+  (which families would get one, how many rungs, what the band says
+  while it's armed, and holding the line that auto-reconnect never
+  auto-spawns a session on the far side), not the cheap fix it looks
+  like. Recommendation stands: leave it settled and revisit once there
+  is real usage evidence, the bar the issue itself sets.
 - **[#388](https://github.com/charliek/roost/issues/388) Per-host settings: convention pinned, no toggle ships.** A
   settling ladder needs no off-switch; filed so the convention
   (additive `#[serde(default)]` field, surfaced as a palette verb per

@@ -94,9 +94,18 @@ terminal from. It shares the socket path but not the framing; see
 * **Errors:** stable kebab-case codes. Current set:
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
-  `not-implemented`, `internal`, `shutting-down`. Clients should treat
-  unknown codes as fatal for the request and surface `message` to the
-  user. `shutting-down` is **session-socket only**: once
+  `not-implemented`, `internal`, `shutting-down`, `host-unavailable`.
+  Clients should treat unknown codes as fatal for the request and
+  surface `message` to the user. `host-unavailable` is
+  `shutting-down`'s mirror image — **UI-socket only** — and says a
+  host-routed op could not reach the session it named: the connection
+  is gone, died mid-op, or its queue is full. A session's own refusal
+  crossing to a UI socket keeps its code when that code is one of the
+  ten above that both sockets share; a session-scoped code (including
+  `shutting-down`) or one a newer session invents folds onto
+  `host-unavailable`, its own code and sentence kept in `message`, so a
+  UI socket never answers a code this list does not name.
+  `shutting-down` is **session-socket only**: once
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
   same session gets it too instead of a fresh reap report. Session
@@ -518,15 +527,60 @@ Request:
 
 Order is leftmost first. Ids not belonging to `project_id` are rejected
 with `invalid-param`. Tabs in the project not listed keep their
-relative order after the listed ones.
+relative order after the listed ones. Ids are the **canonical**
+spelling: a non-canonical integer (`"+4"`, `"04"`) is refused rather
+than normalized, as it is everywhere the `h<host>.<id>` form is
+accepted.
 
 Response: `{}`.
+
+On a **UI socket**, both ids also accept the host-qualified
+`h<host>.<id>` spelling (plan 044 §3.1) — `{"project_id": "h3.4",
+"tab_ids": ["h3.9", "h3.7"]}` reorders project `4`'s tabs on whichever
+connected host this UI process has minted connection id `3` for, by
+sending the session the same op over its op queue. It is the drag
+gesture's own path, as an op. The session is authoritative: the
+sidebar's new order comes from the `tabs.reordered` event that follows,
+not from this reply, and the local workspace is untouched.
 
 ### `project.reorder`
 
 Request: `{"params": {"project_ids": ["2", "1", "3"]}}`. Order is
 topmost first. Same partial-order rules as `tab.reorder`. Response:
 `{}`.
+
+Takes the same host-qualified form: `{"project_ids": ["h3.4", "h3.2"]}`
+reorders that host's sidebar section, and the same canonical-spelling
+rule.
+
+### The reorder routing matrix
+
+Both reorder ops carry a whole order in one id-space, so a request names
+one instance or the other and never both:
+
+| Request | Goes to |
+|---|---|
+| every ref bare (an empty list included) | the local workspace, exactly as before |
+| a `Host` project with every tab `Host` on the **same** incarnation (an empty `tab_ids` included) | that host's session |
+| every `project_id` `Host` on one incarnation | that host's session |
+| two different incarnations; a `Host` project with a bare tab; a **bare** project with a qualified tab; a bare project among qualified ones | `invalid-param`, naming the rule |
+| any qualified ref on a **session socket** | `invalid-param` ("host-qualified … refs are a UI-socket form") |
+| the host form on a socket with no UI | `invalid-param` ("needs a UI: host connections are client state") |
+
+A host-routed request answers with the session's own error code when
+that code is one a UI socket also speaks, so `invalid-param` from a
+session's partial-order rules reads the same as the local engine's. A
+connection that is not there (disconnected, dropped mid-op, its queue
+full) is `host-unavailable`, and so is a refusal whose code a UI socket
+does not speak — a session with a latched `session.stop` answers
+`shutting-down`, which is session-socket-only, so it folds with its own
+code and sentence kept in `message`. An incarnation this client is not
+connected to is `not-found`.
+Duplicates and unlisted rows keep whatever the answering instance
+decides — the partial-order rules above apply unchanged on both sides.
+
+`roostctl tab reorder` / `project reorder` take numeric ids and always
+build the local form; the host form is reachable through the op.
 
 ### `tab.focus`
 
@@ -753,6 +807,39 @@ appear, in sidebar order, including projects with zero agents.
 `projects[].agents` stays populated even when the toggle is off or a
 project drag is in progress: hiding the rows and flattening the sidebar
 during a drag are transient UI state, not part of this contract.
+
+#### `hosts` — the sections below LOCAL
+
+`projects` is this UI's own workspace. The host sections come back
+beside it, in sidebar order:
+
+```json
+{ "agents_visible": true,
+  "projects": [],
+  "hosts": [ { "id": "hs-2f1c", "label": "workbench", "state": "connected",
+               "projects": [ { "key": "h3.4", "name": "roost",
+                               "tabs": [ { "key": "h3.9", "title": "zsh" } ] } ] } ] }
+```
+
+`id` is the saved host's stable id — what a `host.*` verb is addressed
+to — and `state` is the section's own spelling, the same string
+`host.status` reports. Every `key` is the host-qualified
+`h<host>.<id>` form the UI socket's `tab.focus`, `tab.reorder` and
+`project.reorder` take, so a caller that read this dump can drive those
+ops without probing for the incarnation first.
+
+The order is the **authoritative** one — the mirror's, as the session
+last published it. The sidebar may be drawing a held drag preview for a
+moment after a drop; this op never reports it. The host views are
+refreshed before the read, so the answer cannot lag the mirror by an
+event. A dimmed (disconnected) section is listed with the rows it
+retained, still under the incarnation that published them; a host that
+has never connected has an empty `projects`.
+
+`hosts` is **omitted entirely** when there are none, so read it as
+absent-tolerant: host sessions are iced-only, and the Swift Mac app
+answers this op without the field at all. A UI with no host sections
+therefore returns byte-identical bodies on both.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
 
@@ -1241,7 +1328,8 @@ A session socket answers `unknown-op` for every verb here — the same "no shado
  "generation": 3, "state": "disconnected",
  "reason": "reconnecting in 8s (3/10)",
  "rollup": "disconnected — reconnecting in 8s (3/10)",
- "retry": {"delay_ms": 8000, "attempt": 3, "budget": 10, "armed_at": "2026-09-01T18:02:11Z"}}
+ "retry": {"delay_ms": 8000, "attempt": 3, "budget": 10, "armed_at": "2026-09-01T18:02:11Z",
+           "reason": "connecting to workbox failed: ssh: connect to host workbox port 22: Connection refused"}}
 ```
 
 - `generation` — which connection attempt this host is on. Bumped once per attempt **started** — an explicit `host.connect`, a launch auto-reconnect, or one rung of the ssh retry ladder — `0` before the first, and **kept across a disconnect**. This is the monotonic edge to wait on: two consecutive attempts can fail with byte-identical reasons, so "state is `disconnected` and `reason` is set" cannot tell attempt N from N−1, but reading `generation` before a connect and waiting for it to advance can. It counts attempts rather than connections on purpose: an ssh host whose handshake never succeeds reaches no connection at all, and a ten-rung ladder that left the number flat would be no edge.
@@ -1250,6 +1338,7 @@ A session socket answers `unknown-op` for every verb here — the same "no shado
 - `detail` — the long form behind `reason`, when there is one the band has no room for. One thing fills it: a **localhost session that could not be started**, where `reason` is the ≤45-character band line (`"cannot find roost-session"`, `"roost-session failed to start"`) and `detail` is what actually happened — the launch ladder's three rungs verbatim, the exec error, or the daemon's own start verdict. Such a host carries no `retry`: no retry could find a binary, so it settles once and waits for ↻ Reconnect.
 - `rollup` — the band's *output*, verbatim from the sidebar's reducer, capped at 60 characters with an ellipsis. For a **connected** host this is the agent count (`"3 agents"`), not state text; absent when the band shows no rollup at all. It is what the next frame draws — nothing here asserts a frame was painted.
 - `retry` — a `RetrySchedule`, absent unless an auto-reconnect is armed. `delay_ms` is the delay the timer was armed with (not what is left) and `armed_at` is when, so a caller can compute the remainder. `attempt` (1-based, the `3` in the band's `(3/10)`) and `budget` come with the **ssh** ladder only: a localhost retry is the connection task's own backoff whose counter never leaves the task, so it reports `delay_ms` alone.
+- `retry.reason` — **why** this rung is armed: the classified failure's own copy, in the same words the give-up line uses for it. It is a separate field from the `reason` above because that one is the band's input and `rollup` is derived from it — while a rung is armed the band has to read `reconnecting in 8s (3/10)`, so the family needs its own slot or it is unreadable until the attempt settles. ssh-only, like `attempt`/`budget`. **The rule for a caller is simply: read it when it is present.** Do not gate on `attempt` — the number is not a proxy in either direction. Absence is ordinary rather than a fault: the drop that *starts* an outage is usually the live connection dying, a bare bridge EOF with nothing to classify, and the classified copy arrives with the next dial's failure; a later rung armed by another connection coming up and dying reads absent again for the same reason. And presence is not confined to later rungs — a suspend/wake resets the ladder to `attempt: 1` while deliberately carrying the family it already had, because it is still the same outage.
 
 Every optional field is omitted rather than `null`, so a host that has never connected is `{"id", "label", "target", "generation": 0, "state": "disconnected"}` and nothing else.
 

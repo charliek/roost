@@ -208,6 +208,71 @@ fn sidebar_dump_vector_decodes_into_its_typed_params() {
     assert!(!row.is_active);
     assert_eq!(result.projects[1].project_id, 2);
     assert!(result.projects[1].agents.is_empty());
+
+    // The host half (plan 044 §3.1 d7). Two section kinds, because the
+    // shapes differ: a connected one carries qualified keys, and a host
+    // that has never connected carries none at all.
+    assert_eq!(result.hosts.len(), 2);
+    let connected = &result.hosts[0];
+    assert_eq!(connected.id, "hs-2f1c");
+    assert_eq!(connected.label, "workbench");
+    assert_eq!(connected.state, "connected");
+    assert_eq!(connected.projects.len(), 1);
+    assert_eq!(connected.projects[0].key, "h3.4");
+    assert_eq!(connected.projects[0].name, "roost");
+    let tabs = &connected.projects[0].tabs;
+    assert_eq!(
+        tabs.iter().map(|tab| tab.key.as_str()).collect::<Vec<_>>(),
+        ["h3.9", "h3.7"]
+    );
+    assert_eq!(tabs[0].title, "zsh");
+    // Every key in the vector must be one the ops actually parse — the
+    // doc promises a caller can drive `tab.reorder` straight off this
+    // dump, and a vector spelling them differently would document a
+    // shape no client could use.
+    for project in &connected.projects {
+        assert_eq!(
+            roost_ipc::messages::WireProjectRef::parse(&project.key),
+            Some(roost_ipc::messages::WireProjectRef::Host {
+                host: 3,
+                project: 4
+            })
+        );
+        for tab in &project.tabs {
+            assert!(matches!(
+                roost_ipc::messages::WireTabRef::parse(&tab.key),
+                Some(roost_ipc::messages::WireTabRef::Host { host: 3, .. })
+            ));
+        }
+    }
+    assert_eq!(result.hosts[1].id, "hs-9d40");
+    assert_eq!(result.hosts[1].state, "disconnected");
+    assert!(result.hosts[1].projects.is_empty());
+}
+
+/// The Swift Mac app answers `app.sidebar_dump` without a `hosts` field
+/// at all — host sessions are iced-only — so the vector without it has
+/// to keep decoding into the same struct. Pinned against the real
+/// vector with the field stripped, rather than a hand-written body, so
+/// the two can never drift apart.
+#[test]
+fn a_sidebar_dump_response_without_hosts_still_decodes() {
+    use roost_ipc::messages::SidebarDumpResult;
+
+    let mut path = vectors_dir();
+    path.push("app.sidebar_dump.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let mut resp: serde_json::Value = serde_json::from_str(&raw).expect("decode envelope");
+    resp["result"]
+        .as_object_mut()
+        .expect("result body")
+        .remove("hosts")
+        .expect("the vector carries hosts to strip");
+
+    let result: SidebarDumpResult =
+        serde_json::from_value(resp["result"].clone()).expect("decode a Mac-shaped result");
+    assert!(result.hosts.is_empty());
+    assert_eq!(result.projects.len(), 2);
 }
 
 /// `app.render_stats` is the one op whose *every* result field is a

@@ -203,13 +203,16 @@ class Roost:
     def rename_project(self, project_id: int, name: str) -> None:
         self.call("project.rename", {"project_id": str(project_id), "name": name})
 
-    def reorder_projects(self, project_ids: list[int]) -> None:
+    # Both reorder ops take bare ids or, on a UI socket, the
+    # host-qualified `h<incarnation>.<id>` keys `sidebar_dump()["hosts"]`
+    # hands out — one op, one spelling per instance (plan 044 §3.1 d6).
+    def reorder_projects(self, project_ids: list[int | str]) -> None:
         self.call(
             "project.reorder",
             {"project_ids": [str(project_id) for project_id in project_ids]},
         )
 
-    def reorder_tabs(self, project_id: int, tab_ids: list[int]) -> None:
+    def reorder_tabs(self, project_id: int | str, tab_ids: list[int | str]) -> None:
         self.call("tab.reorder", {"project_id": str(project_id),
                                   "tab_ids": [str(t) for t in tab_ids]})
 
@@ -292,12 +295,28 @@ class Roost:
 
     def sidebar_dump(self) -> dict:
         """{agents_visible, projects: [{project_id, agents: [{tab_id,
-        name, lifecycle, status_text, time_text, is_active}]}]}. The
-        sidebar's *last-rendered* agent rows, read from the same
-        per-project cache the sidebar paints from — a missed refresh
-        is observable here rather than invisible. Ungated, read-only
-        (plan 007 §3.8)."""
+        name, lifecycle, status_text, time_text, is_active}]}],
+        hosts?: [{id, label, state, projects: [{key, name, tabs:
+        [{key, title}]}]}]}. The sidebar's *last-rendered* agent rows,
+        read from the same per-project cache the sidebar paints from —
+        a missed refresh is observable here rather than invisible.
+        Ungated, read-only (plan 007 §3.8).
+
+        `hosts` is the host sections in sidebar order, refreshed before
+        the read and reporting the mirror's *authoritative* order rather
+        than a drag preview (plan 044 §3.1 d7). It is omitted entirely
+        when there are none — the Swift Mac app never emits it — so read
+        it with `.get("hosts", [])`. Each `key` is the host-qualified
+        spelling the UI socket's reorder/focus ops take, so a caller
+        needs no incarnation probe."""
         return self.call("app.sidebar_dump", {})
+
+    def sidebar_hosts(self) -> list[dict]:
+        """`sidebar_dump()["hosts"]`, absent-tolerant."""
+        return self.sidebar_dump().get("hosts", [])
+
+    def sidebar_host(self, saved_id: str) -> dict | None:
+        return next((h for h in self.sidebar_hosts() if h["id"] == saved_id), None)
 
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:

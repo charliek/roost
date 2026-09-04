@@ -7,7 +7,7 @@
 #   ./live.sh L3   hostkey:  a changed host key is never retried
 #   ./live.sh L4a  quit while a retry is ARMED
 #   ./live.sh L4b  quit while an establish is IN FLIGHT
-#   ./live.sh L5   refused: stop sshd instead of black-holing the route
+#   ./live.sh L5   refused: stop sshd instead of black-holing; cause read off the wire
 #
 # "Sever" is two things on purpose. iptables black-holes the route in
 # both directions, so every *retry* faces a hung TCP that has to run out
@@ -232,17 +232,52 @@ case "$MODE" in
     # Against a refused port the backoff is the only thing pacing the
     # ladder, so a few rungs land in seconds. One would be the drop's own
     # retry and would say nothing about climbing.
-    #
-    # Stated rather than hidden: the classified copy ("connecting to …
-    # Connection refused") is not observable here. The app folds the
-    # family in and arms the rung in the same update, so `reason` is
-    # already the armed-rung line by the time any op can read it — the
-    # copy surfaces only in a give-up, which this lane recovers before.
-    # `probe_severed refused` above is what carries the claim that the
-    # port refused rather than black-holed.
     watch_ladder $((GEN0 + 3)) 180 "a port that refuses" ||
       fail "the ladder did not climb against a refused port as it must (see the lines above)"
     expect_ge "$LADDER_MAX_ATTEMPT" 2 "no armed rung ever reported attempt 2"
+    # And *why* it is climbing, read off the wire (#399's `retry.reason`,
+    # which carries the classified family for as long as the rung is
+    # armed). As reliable as the assertion above it and for the same
+    # reason: the drop that starts this outage is the mux dying — a bare
+    # EOF with nothing to classify — while every rung after it is armed
+    # by an establish that met ECONNREFUSED, so the poll that saw
+    # attempt 2 read the cause out of that same row.
+    #
+    # Checked in two halves, because the copy is two halves and only the
+    # first is ours. The frame — `connecting to <target> failed: ` — is
+    # roost's own wording and is required as a shape; ssh's stderr line
+    # follows it and is not ours to pin, so only its verdict phrase is
+    # required, and required *after* the frame.
+    #
+    # Not a bare `*refused*` over the whole string: the target is inside
+    # that string, so a host whose name carried the word would satisfy
+    # the glob while the family said something else entirely (a
+    # black-holed route's copy is `… failed: … timed out`, and that is
+    # the control this discrimination is worth having for). Splitting on
+    # the frame puts the target on the other side of the check.
+    #
+    # The frame is matched as a shape rather than against this lane's own
+    # `$HOST_TARGET`: `ensure_host` reuses any saved host whose target
+    # merely *contains* the probe target, so a registry spelling that
+    # differs from `$HOST_TARGET` is a healthy lane, and pinning the
+    # target here would fail it for the wrong reason. The phrase is
+    # matched case-tolerantly for the same kind of reason — its casing is
+    # ssh's to choose.
+    #
+    # `probe_severed refused` above still carries its own claim, which is
+    # a different one — that the port *refused* rather than black-holed.
+    # That is severance; this is classification.
+    [ -n "$LADDER_RETRY_REASON" ] ||
+      fail "no armed rung said why it was armed (retry.reason absent on every rung seen)"
+    case "$LADDER_RETRY_REASON" in
+      "connecting to "*" failed: "*) ;;
+      *) fail "the armed rung's cause is not a classified connect failure: $LADDER_RETRY_REASON" ;;
+    esac
+    case "${LADDER_RETRY_REASON#*" failed: "}" in
+      *[Cc]"onnection refused"*)
+        say "the ladder's own cause, from the wire: $LADDER_RETRY_REASON" ;;
+      *) fail "the armed rung's cause does not name a refused connection: $LADDER_RETRY_REASON" ;;
+    esac
     say "restarting sshd"
     sshd_start
     # Exit codes are not the proof here: on a socket-activated box,

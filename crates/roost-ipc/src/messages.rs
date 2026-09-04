@@ -1131,20 +1131,26 @@ pub struct ProjectDeleteParams {
 // Reorder
 // ============================================================================
 
+/// Both reorder ops take the **whole** new order, and on a UI socket
+/// both accept the host-qualified spelling: `{"project_id": "h3.4",
+/// "tab_ids": ["h3.7", "h3.9"]}` reorders that host's tabs through its
+/// session instead of the local workspace (plan 044 §3.1 d6). Every ref
+/// in one request must name the same instance — see `docs/reference/
+/// ipc.md` for the routing matrix. Bare ids decode to `Local` and
+/// serialize bare, so local traffic is byte-identical to what it was
+/// before the qualified form existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabReorderParams {
-    #[serde(with = "string_int64")]
-    pub project_id: i64,
-    #[serde(with = "vec_string_int64")]
-    pub tab_ids: Vec<i64>,
+    pub project_id: WireProjectRef,
+    pub tab_ids: Vec<WireTabRef>,
 }
 
+/// See [`TabReorderParams`] for the host-qualified form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectReorderParams {
-    #[serde(with = "vec_string_int64")]
-    pub project_ids: Vec<i64>,
+    pub project_ids: Vec<WireProjectRef>,
 }
 
 // ============================================================================
@@ -1364,6 +1370,39 @@ pub struct SidebarDumpProject {
     pub agents: Vec<SidebarDumpAgentRow>,
 }
 
+/// One tab of a host project, as the sidebar lists it.
+///
+/// `key` is the `h<incarnation>.<id>` spelling every host-qualified
+/// UI-socket op takes, so a caller that read this dump can focus or
+/// reorder the row without probing for the incarnation first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpHostTab {
+    pub key: String,
+    pub title: String,
+}
+
+/// One project of a host section, with its tabs in the mirror's order.
+/// `key` is the host-qualified spelling, as on [`SidebarDumpHostTab`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpHostProject {
+    pub key: String,
+    pub name: String,
+    pub tabs: Vec<SidebarDumpHostTab>,
+}
+
+/// One host section of the sidebar (plan 044 §3.1 d7).
+///
+/// `id` is the saved host's stable id — what a `host.*` verb is
+/// addressed to — and `state` is the section's own wire spelling, the
+/// same string `host.status` reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpHost {
+    pub id: String,
+    pub label: String,
+    pub state: String,
+    pub projects: Vec<SidebarDumpHostProject>,
+}
+
 /// `app.sidebar_dump` response — the sidebar's **last-rendered** agent
 /// rows, read from the same per-project cache the sidebar paints from
 /// (`RenderedAgentRow` on both UIs), not re-derived from the workspace
@@ -1377,6 +1416,18 @@ pub struct SidebarDumpProject {
 pub struct SidebarDumpResult {
     pub agents_visible: bool,
     pub projects: Vec<SidebarDumpProject>,
+    /// The host sections below LOCAL, in sidebar order — the
+    /// **authoritative** order the mirror holds, never the drag preview
+    /// the sidebar may be drawing for a moment. A dimmed section is
+    /// listed with the rows it retained; a host that has never
+    /// connected has no projects.
+    ///
+    /// `default` + `skip_serializing_if` because the Swift Mac app
+    /// answers this op too and never emits `hosts` (host sessions are
+    /// iced-only): its response has to keep decoding into this type,
+    /// and a UI with no host sections stays byte-identical on both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<SidebarDumpHost>,
 }
 
 /// `app.render_stats` request — read the running UI's render-path
@@ -2152,9 +2203,10 @@ pub struct HostStatus {
 ///
 /// `delay_ms` is the delay the timer was armed with; `armed_at` is when,
 /// so a caller that wants a countdown can compute one. Only the ssh
-/// ladder carries a `attempt`/`budget` pair — a localhost retry is the
-/// connection task's own backoff and its counter never leaves the task,
-/// so those three are absent there and `delay_ms` is the whole story.
+/// ladder carries an `attempt`/`budget` pair and a [`Self::reason`] — a
+/// localhost retry is the connection task's own backoff and its counter
+/// never leaves the task, so those four are absent there and `delay_ms`
+/// is the whole story.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrySchedule {
     pub delay_ms: u64,
@@ -2165,6 +2217,23 @@ pub struct RetrySchedule {
     pub budget: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub armed_at: Option<String>,
+    /// **Why** this rung was armed: the classified copy of the failure
+    /// that caused it, in the same words the give-up line uses for it
+    /// (plan 044 §3.3, #399). Not always the same *value* as a
+    /// give-up's, though: that one names the drop which exhausted the
+    /// ladder, which may carry no family at all.
+    ///
+    /// It lives here rather than in [`HostStatus::reason`] because that
+    /// field is the band's *input* and [`HostStatus::rollup`] is derived
+    /// from it: while a rung is armed the band has to read
+    /// `reconnecting in 8s (3/10)`, so the family needs its own slot or
+    /// it is unreadable until the attempt settles.
+    ///
+    /// Absent when the drop carried no family — a bare bridge EOF, which
+    /// is the usual shape of the **first** rung of an outage (the live
+    /// connection dying), so a `retry` with no `reason` is ordinary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The wire spellings of a host's connection state, shared by
@@ -2718,6 +2787,79 @@ impl<'de> Deserialize<'de> for WireTabRef {
     }
 }
 
+/// [`WireTabRef`]'s project twin: the bare string-wrapped engine id
+/// (`"4"`) or the host-qualified `h<host>.<id>` spelling (`"h3.4"`) —
+/// plan 044 §3.1 d6, which gave the reorder ops their host form.
+///
+/// Everything the tab twin says applies here, including the canonical
+/// parser: `parse(s)?.to_string() == s`, so `h0.4` (the local instance
+/// is always bare), `+4` and leading zeros are rejected rather than
+/// normalized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireProjectRef {
+    Local(i64),
+    Host { host: u32, project: i64 },
+}
+
+/// `Local(0)` — the same "no project named" a defaulted string-wrapped
+/// id decoded to before this type existed.
+impl Default for WireProjectRef {
+    fn default() -> Self {
+        Self::Local(0)
+    }
+}
+
+impl WireProjectRef {
+    /// The bare engine id, or `None` for a host-qualified ref — the
+    /// narrowing every host-unaware consumer applies.
+    pub fn local(self) -> Option<i64> {
+        match self {
+            Self::Local(project) => Some(project),
+            Self::Host { .. } => None,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let parsed = match text.strip_prefix('h') {
+            Some(qualified) => {
+                let (host, project) = qualified.split_once('.')?;
+                Self::Host {
+                    host: host.parse().ok()?,
+                    project: project.parse().ok()?,
+                }
+            }
+            None => Self::Local(text.parse().ok()?),
+        };
+        if let Self::Host { host: 0, .. } = parsed {
+            return None;
+        }
+        (parsed.to_string() == text).then_some(parsed)
+    }
+}
+
+impl fmt::Display for WireProjectRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(project) => write!(f, "{project}"),
+            Self::Host { host, project } => write!(f, "h{host}.{project}"),
+        }
+    }
+}
+
+impl Serialize for WireProjectRef {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for WireProjectRef {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        Self::parse(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid project reference: {raw}")))
+    }
+}
+
 pub mod vec_string_int64 {
     use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -3045,7 +3187,7 @@ mod tests {
 
     #[test]
     fn vec_string_int64_round_trips() {
-        let p = TabReorderParams {
+        let p = TabsReorderedEvent {
             project_id: 1,
             tab_ids: vec![3, 2, 1],
         };
@@ -3403,7 +3545,57 @@ mod tests {
                     agents: Vec::new(),
                 },
             ],
+            hosts: Vec::new(),
         });
+    }
+
+    #[test]
+    fn sidebar_dump_result_round_trips_host_sections() {
+        round_trip(&SidebarDumpResult {
+            agents_visible: false,
+            projects: Vec::new(),
+            hosts: vec![
+                SidebarDumpHost {
+                    id: "hs-1".to_string(),
+                    label: "workbench".to_string(),
+                    state: "connected".to_string(),
+                    projects: vec![SidebarDumpHostProject {
+                        key: "h3.4".to_string(),
+                        name: "roost".to_string(),
+                        tabs: vec![SidebarDumpHostTab {
+                            key: "h3.9".to_string(),
+                            title: "zsh".to_string(),
+                        }],
+                    }],
+                },
+                // A host that has never connected: header only.
+                SidebarDumpHost {
+                    id: "hs-2".to_string(),
+                    label: "laptop".to_string(),
+                    state: "disconnected".to_string(),
+                    projects: Vec::new(),
+                },
+            ],
+        });
+    }
+
+    /// The Swift Mac app answers `app.sidebar_dump` too and never emits
+    /// `hosts` — host sessions are iced-only — so its response has to
+    /// keep decoding, and a UI with no host sections has to stay
+    /// byte-identical to the pre-plan-044 shape on both sockets.
+    #[test]
+    fn sidebar_dump_result_hosts_is_absent_both_ways_when_empty() {
+        let without: SidebarDumpResult =
+            serde_json::from_str(r#"{"agents_visible":true,"projects":[]}"#).unwrap();
+        assert!(without.hosts.is_empty());
+
+        let encoded = serde_json::to_string(&SidebarDumpResult {
+            agents_visible: true,
+            projects: Vec::new(),
+            hosts: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(encoded, r#"{"agents_visible":true,"projects":[]}"#);
     }
 
     #[test]
@@ -3727,9 +3919,21 @@ mod tests {
                 attempt: Some(3),
                 budget: Some(10),
                 armed_at: Some("2026-09-01T18:02:11Z".into()),
+                reason: Some(
+                    "connecting to workbox failed: ssh: connect to host workbox port 22: \
+                     Connection refused"
+                        .into(),
+                ),
             }),
         };
         round_trip(&armed);
+        // #399: `reason` says *why* the rung is armed while the band's
+        // own `reason` says how long — the two are different sentences
+        // in the same payload on purpose.
+        assert_ne!(
+            armed.reason.as_deref(),
+            armed.retry.as_ref().unwrap().reason.as_deref()
+        );
         round_trip(&HostStatusResult { hosts: vec![armed] });
         round_trip(&HostStatusResult::default());
 
@@ -3754,13 +3958,32 @@ mod tests {
             })
         );
 
-        // Localhost's own retry knows a delay and nothing else.
+        // Localhost's own retry knows a delay and nothing else — the
+        // new `reason` is omitted here exactly as the other three are.
         let local_retry = serde_json::to_value(RetrySchedule {
             delay_ms: 250,
             ..RetrySchedule::default()
         })
         .unwrap();
         assert_eq!(local_retry, serde_json::json!({"delay_ms": 250}));
+
+        // An ssh rung armed by a bare EOF: the numbers without a family.
+        // The first rung of an outage normally looks like this.
+        let bare_eof = serde_json::to_value(RetrySchedule {
+            delay_ms: 1_000,
+            attempt: Some(1),
+            budget: Some(10),
+            armed_at: Some("2026-09-01T18:02:11Z".into()),
+            reason: None,
+        })
+        .unwrap();
+        assert_eq!(
+            bare_eof,
+            serde_json::json!({
+                "delay_ms": 1_000, "attempt": 1, "budget": 10,
+                "armed_at": "2026-09-01T18:02:11Z",
+            })
+        );
 
         for bad in [r#"{"extra":"x"}"#, r#"{"id":"a","extra":1}"#] {
             assert!(

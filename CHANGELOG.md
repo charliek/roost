@@ -11,6 +11,56 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Remote host sections drag-reorder too (#398)** — dragging a project row
+  or a tab pill inside a connected host's section now reorders it exactly
+  like the LOCAL section always could; the drop routes over that host's own
+  connection as `project.reorder` / `tab.reorder` rather than mutating the
+  local workspace, so the new order lands on — and persists on — the
+  session itself, across a disconnect/reconnect or a relaunch. Both reorder
+  ops also accept the host-qualified `h<incarnation>.<id>` spelling on the
+  UI socket now, the same form `tab.focus` and `tab.dump` already use, so
+  the drag isn't the only way to drive it; `app.sidebar_dump` gained an
+  additive `hosts` array reporting every *saved* host's own project/tab
+  order, each entry carrying that host's connection state — a disconnected
+  section lists the rows it retained, a never-connected one lists none.
+  A refusal that crosses from the session onto the UI socket with no
+  code the UI socket already speaks (a latched `session.stop`, say) now
+  reports as the new `host-unavailable`, with the session's own sentence
+  kept in the message.
+
+### Changed
+
+- **`tab.reorder` / `project.reorder` narrow the ids they accept** — the
+  new host-qualified ref parser requires the canonical integer spelling,
+  so non-canonical forms like `"+4"` or `"04"`, which the old codec
+  silently accepted, are now refused. Every first-party caller already
+  writes the canonical form; this should only bite a caller that relied
+  on the old laxness.
+
+### Fixed
+
+- **A `localhost` host can now start its session with `ROOST_STATE_DIR`
+  set (#397)** — a spawned daemon used to inherit the launcher's own state
+  dir wholesale and refuse to start against the lock the UI already held.
+  It now gets its own dir nested under the launcher's (`<value>/session`),
+  so Connect on `localhost` works under the same seam the test harness
+  always launches under. `roostctl session start` derives the same way
+  under the same seam and now prints the derived path on stderr; a direct
+  `roost-session start` under the seam is unaffected and still uses it
+  verbatim.
+- **`host.status`'s `retry` says why a rung is armed, not just when
+  (#399)** — a retrying ssh connection used to overwrite its classified
+  failure with the armed-rung line, so `reason` said `reconnecting in 8s
+  (3/10)` and never why until the ladder gave up. The retry block now
+  carries an additive `reason` alongside the rung's numbers, present
+  whenever the drop that armed it was classified.
+- **Tab now moves through the Add Host dialog** — previously Tab did
+  nothing there; it now cycles Name → Target → Add & Connect → Cancel and
+  back, Shift+Tab reverses, and Enter or Space activates whichever button
+  the ring is on.
+
 ## v0.0.19 — 2026-09-04
 
 _The host-sessions release: `roost-session` ships in `Roost-Iced.app` and

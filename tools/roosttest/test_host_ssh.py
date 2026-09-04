@@ -161,6 +161,11 @@ CHANGED_KEY_WARNING = "Do not accept the new key"
 # is the one case where accepting is exactly the wrong advice.
 UNKNOWN_KEY_REMEDY = "review and accept it"
 NOT_FOUND_COPY = "roost-session isn't installed on"
+# The `unreachable` mode's stderr, verbatim from the fixture. Its
+# `workbox` is the fixture's own invention and has nothing to do with
+# the host under test's target — `classify_ssh_failure` quotes back the
+# last non-empty line it was handed, whatever it says.
+UNREACHABLE_STDERR = "ssh: connect to host workbox port 22: No route to host"
 
 # The band's own two ladder lines (`host_conn.rs`'s `retry_line` and
 # `gave_up_copy`, plan 040 §3.8), as `host.status` reports them in
@@ -170,6 +175,18 @@ NOT_FOUND_COPY = "roost-session isn't installed on"
 DISCONNECTED_BAND = "disconnected — "
 RETRY_REASON = "reconnecting in "
 GAVE_UP_BAND = DISCONNECTED_BAND + "reconnect gave up after "
+
+
+def transport_copy(target: str) -> str:
+    """`SshFailure::Transport(Some(line))`'s copy, rendered for `target`.
+
+    The fallthrough family — the one the ladder retries — restated here
+    rather than imported, for the reason the five constants above are.
+    Two halves, and only the first is ours: the frame
+    (`connecting to <target> failed: …`) is roost's user-facing wording,
+    and what follows it is whatever the far side wrote to stderr.
+    """
+    return f"connecting to {target} failed: {UNREACHABLE_STDERR}"
 
 
 def sh_quote(raw: str) -> str:
@@ -574,6 +591,13 @@ def wait_for_a_settled_reason(
     `reconnecting in …` line — those two are the settle signal, because
     between a rung firing and its establish failing the band still
     carries the armed rung's text with a fresher generation beside it.
+
+    That last filter is about *settling*, not about readability. Since
+    #399 the classified family is on the wire the whole time a rung is
+    armed, as `retry.reason` — what gets filtered here is the rung's own
+    line, which is a countdown rather than a verdict. A caller that wants
+    only the family reads it off an armed row instead of waiting here;
+    what waits here is a caller that wants the attempt to be *over*.
     """
 
     def settled() -> dict | None:
@@ -796,7 +820,9 @@ def test_a_host_that_stays_down_climbs_the_ladder_and_then_settles(ssh_host, roo
     It is also where plan 042's AC1 lives: an armed rung is the one
     moment `rollup` and `retry` describe the same event, so this is
     where the band's formatter and the schedule the op reports are
-    checked to agree.
+    checked to agree — and, since #399, where the other half of that
+    rung is fenced end to end: the cause it was armed for, read off the
+    socket rather than out of the struct that produced it.
     """
     connect_and_wait(ssh_host)
     before = status(ssh_host)["generation"]
@@ -804,6 +830,28 @@ def test_a_host_that_stays_down_climbs_the_ladder_and_then_settles(ssh_host, roo
 
     armed = wait_for_a_live_retry(ssh_host, through=4)
     assert_band_matches_retry(armed)
+    # #399: the band says *when* the next rung fires, so `retry.reason`
+    # is the one place that says *why* while a rung is armed.
+    #
+    # Not the only fence on it — `host_conn.rs`'s inline ladder tests and
+    # `wire_types_test.rs`'s round-trip both run under `cargo test` in
+    # CI — but the only **end-to-end** one: the only place the value is
+    # read off a real socket, out of a real UI, having crossed the
+    # serializer the tests above stop short of. That is what earns the
+    # strictness here. Equality rather than a substring, because a field
+    # that went missing and a field carrying the wrong family are the two
+    # ways this rots, and both have to bite.
+    #
+    # Read off the rung this case already waits for, never off one picked
+    # by attempt number: the contract is "read it when it is present"
+    # (`ipc.md`), and a rule gating on `attempt` would be wrong in both
+    # directions — a suspend/wake re-arms attempt 1 still carrying the
+    # family. What makes it present *here* is the drop shape, not the
+    # number: the SIGKILLed pipe that starts the outage has nothing to
+    # classify, and every rung after it is armed by an establish that met
+    # `unreachable`.
+    assert armed["retry"].get("reason") == transport_copy(armed["target"]), armed
+
     settled = wait_for_the_give_up(ssh_host)
     assert settled["rollup"].startswith(f"{GAVE_UP_BAND}4 tries"), settled
     # Every rung is one attempt started, and `generation` counts exactly

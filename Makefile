@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_sparkle.py`'s two classes split by lane: the bare-binary class
@@ -135,6 +135,17 @@ SSH_HOST_E2E_TESTS := tools/roosttest/test_host_ssh.py
 # otherwise attempt, so it must never run beside SSH_HOST_E2E_TESTS,
 # HOST_CLIENT_E2E_TESTS, or BOOTSTRAP_E2E_TESTS.
 MISSING_DAEMON_E2E_TESTS := tools/roosttest/test_host_local_missing_daemon.py
+# Plan 044 W2's positive twin of MISSING_DAEMON_E2E_TESTS (#397): the
+# `localhost` spawn that *works*, from a UI running under the harness's
+# throwaway `ROOST_STATE_DIR`. Marked `host_client` for the same deselect
+# reasons, and kept in its own list/target for a stronger one than the
+# other host lanes have: it puts a real daemon on this build's DEFAULT
+# session socket — the socket every other host lane's UI would dial
+# instead of spawning or settling, and the one `roostctl session
+# status|stop` address — so it demands that socket free before it runs
+# and stops what it started afterwards. Never beside HOST_CLIENT_E2E_TESTS,
+# SSH_HOST_E2E_TESTS, MISSING_DAEMON_E2E_TESTS or BOOTSTRAP_E2E_TESTS.
+LOCAL_SPAWN_E2E_TESTS := tools/roosttest/test_host_local_spawn.py
 # HS-3 slice 2's UI-side bootstrap lane (plan 039 C6): the same shape as
 # SSH_HOST_E2E_TESTS — `fake-ssh.sh`, this time in `run-remote` mode, so
 # the generated probe/install/start scripts really run — plus a loopback
@@ -274,6 +285,23 @@ e2e-host-missing-daemon: $(GHOSTTY_LIB)  ## Plan 042 W2 local-daemon-missing E2E
 e2e-host-missing-daemon-ci: $(GHOSTTY_LIB)  ## Plan 042 W2 local-daemon-missing E2E at CI parity. DESTRUCTIVE: force-quits a running Iced UI
 	cargo build -p roost-iced -p roost-cli -p roost-session
 	ROOST_TEST_MODE=1 uv run --group test pytest $(MISSING_DAEMON_E2E_TESTS) --roost-target iced --roost-fresh
+
+# The same three binaries the missing-daemon lane needs — here the UI
+# really does spawn the sibling `roost-session`, so a stale one is the
+# daemon under test. Never beside another host lane, and it needs this
+# build's default session socket free: see LOCAL_SPAWN_E2E_TESTS. Either
+# target asserts for real as long as the harness owns the UI — which,
+# without `--roost-fresh`, means only that no UI is already running; a
+# developer's live instance is reused instead and the lane then skips by
+# name, because the state dir of a UI the harness did not launch is not
+# knowable from outside. `-ci` is the shape that always asserts.
+e2e-host-local-spawn: $(GHOSTTY_LIB)  ## Plan 044 W2 local-daemon-spawn E2E (#397: a spawned session gets <ROOST_STATE_DIR>/session)
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(LOCAL_SPAWN_E2E_TESTS) --roost-target iced
+
+e2e-host-local-spawn-ci: $(GHOSTTY_LIB)  ## Plan 044 W2 local-daemon-spawn E2E at CI parity. DESTRUCTIVE: force-quits a running Iced UI
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(LOCAL_SPAWN_E2E_TESTS) --roost-target iced --roost-fresh
 
 # The same three binaries `e2e-host-ssh` needs — the bootstrap job runs
 # the same fake-`ssh`-fronted transport, this time in `run-remote` mode.
