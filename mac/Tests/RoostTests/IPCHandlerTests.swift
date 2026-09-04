@@ -276,6 +276,81 @@ struct IPCAgentReportDispatchTests {
         #expect((dict?["tab"] as? [String: Any])?["agent_lifecycle"] as? String == "working")
     }
 
+    /// `lifecycle_if` (plan 046 §3.8) end to end through the dispatcher.
+    /// Two failures this catches, and they look identical from the
+    /// outside: a `CodingKeys` case that never got added (the
+    /// `decodeParams(expected:)` set is derived from it, so the whole
+    /// report would come back `unknown-field`), and a decoder that
+    /// accepts the key while `applyReport` ignores it — which would
+    /// apply the patch and banner a turn that already ended.
+    @Test func agentReportGuardVetoesTheLifecyclePatchAndItsAttention() async throws {
+        let (handler, tabID) = try await makeHandlerWithTab()
+        _ = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID), "source": "claude", "session_id": "s1",
+                "ownership_action": "claim", "lifecycle": "finished",
+            ] as [String: Any])
+        )
+
+        let result = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID), "source": "claude", "session_id": "s1",
+                "ownership_action": "preserve",
+                "lifecycle": "waiting",
+                "lifecycle_if": ["working"],
+                "attention": "set",
+                "severity": "warn",
+                "title": "Claude Code",
+                "body": "Claude is waiting for your input",
+                "detail": "idle_prompt",
+            ] as [String: Any])
+        )
+        let dict = result?.value as? [String: Any]
+        // Ownership matched, so the report is accepted — only the patch
+        // and its notification were dropped.
+        #expect(dict?["accepted"] as? Bool == true)
+        let tab = dict?["tab"] as? [String: Any]
+        #expect(tab?["agent_lifecycle"] as? String == "finished")
+        #expect(tab?["state"] as? String == "idle")
+        #expect(tab?["has_notification"] as? Bool == false)
+        // `detail` is unguarded, so it still merges — the proof the
+        // report was applied rather than dropped whole.
+        let ownership = tab?["ownership"] as? [String: Any]
+        #expect(ownership?["detail"] as? String == "idle_prompt")
+    }
+
+    /// The other half of the guard: in the set, the patch applies
+    /// normally. Without this a `lifecycleIf` that vetoed everything
+    /// would pass the test above.
+    @Test func agentReportGuardAppliesThePatchWhenTheLifecycleMatches() async throws {
+        let (handler, tabID) = try await makeHandlerWithTab()
+        _ = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID), "source": "claude", "session_id": "s1",
+                "ownership_action": "claim", "lifecycle": "working",
+            ] as [String: Any])
+        )
+        let result = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID), "source": "claude", "session_id": "s1",
+                "ownership_action": "preserve",
+                "lifecycle": "finished",
+                "lifecycle_if": ["working"],
+                "attention": "set",
+                "severity": "info",
+                "title": "Claude Code",
+                "body": "Turn complete",
+            ] as [String: Any])
+        )
+        let tab = (result?.value as? [String: Any])?["tab"] as? [String: Any]
+        #expect(tab?["agent_lifecycle"] as? String == "finished")
+        #expect(tab?["has_notification"] as? Bool == true)
+    }
+
     @Test func agentReportRejectsUnknownField() async throws {
         let (handler, tabID) = try await makeHandlerWithTab()
         await expectReportError(

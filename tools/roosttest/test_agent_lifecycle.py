@@ -291,6 +291,51 @@ def test_idle_prompt_after_stop_keeps_finished(roost, project, target):
     assert roost.has_notification(tab), "the nag still reaches the user"
 
 
+def test_guarded_report_is_accepted_but_its_patch_is_vetoed(roost, project):
+    """`lifecycle_if` (plan 046 §3.8): a report may name the lifecycles
+    it is news from. Outside that set the lifecycle patch AND the
+    `attention: set` are dropped — an agent that nags on a timer
+    (Claude's `idle_prompt`, cursor's repeated `stop`) must not re-banner
+    a turn the user already saw finish.
+
+    The veto is not a rejection: `accepted` stays true (ownership
+    matched) and `detail` still merges, which is also the barrier
+    proving the report reached the state machine at all rather than
+    being dropped whole by an older server."""
+    tab = agent_tab(roost, project)
+    session = "sess-lifecycle-if"
+    roost.agent_report(tab, "claude", "claim", session_id=session, lifecycle="finished")
+    roost.wait_lifecycle(tab, "finished")
+    assert not roost.has_notification(tab)
+
+    vetoed = roost.agent_report(
+        tab, "claude", "preserve", session_id=session,
+        lifecycle="waiting", lifecycle_if=["working"],
+        attention="set", severity="warn",
+        title="Claude Code", body="Claude is waiting for your input",
+        detail="idle_prompt",
+    )
+    assert vetoed["accepted"] is True, vetoed
+    assert vetoed["tab"]["agent_lifecycle"] == "finished", vetoed["tab"]
+    assert vetoed["tab"]["state"] == "idle", vetoed["tab"]
+    assert vetoed["tab"]["has_notification"] is False, vetoed["tab"]
+    assert vetoed["tab"]["ownership"]["detail"] == "idle_prompt", vetoed["tab"]
+    assert not roost.has_notification(tab)
+
+    # In the set, the identical shape applies in full — without this a
+    # guard that vetoed everything would pass the assertions above.
+    roost.agent_report(tab, "claude", "preserve", session_id=session, lifecycle="working")
+    roost.wait_lifecycle(tab, "working")
+    applied = roost.agent_report(
+        tab, "claude", "preserve", session_id=session,
+        lifecycle="finished", lifecycle_if=["working"],
+        attention="set", title="Claude Code", body="Turn complete",
+    )
+    assert applied["accepted"] is True, applied
+    assert applied["tab"]["agent_lifecycle"] == "finished", applied["tab"]
+    assert applied["tab"]["has_notification"] is True, applied["tab"]
+
+
 def test_event_carrying_agent_id_leaves_lifecycle_unchanged(roost, project, target):
     """An event that fired inside a subagent describes the subagent's
     turn, not the tab owner's — its notification still reaches the user

@@ -139,7 +139,10 @@ fn request_vectors_have_required_envelope_shape() {
 /// deliberately schema-agnostic (see the module docs).
 #[test]
 fn agent_report_vector_decodes_into_its_typed_params() {
-    use roost_ipc::agent::{AgentLifecycle, AttentionOp, OwnershipAction, TabAgentReportParams};
+    use roost_ipc::agent::{
+        AgentLifecycle, AgentTabState, AttentionEffect, AttentionOp, Ownership, OwnershipAction,
+        TabAgentReportParams,
+    };
     use roost_ipc::messages::{ops, RawRequest, TabAgentReportResult};
 
     let mut path = vectors_dir();
@@ -151,8 +154,36 @@ fn agent_report_vector_decodes_into_its_typed_params() {
         serde_json::from_value(req.params).expect("decode agent_report params");
     assert_eq!(params.ownership_action, OwnershipAction::Preserve);
     assert_eq!(params.lifecycle, Some(AgentLifecycle::Waiting));
+    assert_eq!(params.lifecycle_if, None, "the plain report is unguarded");
     assert_eq!(params.attention, AttentionOp::Set);
     assert!(roost_ipc::agent::validate_report(&params).is_ok());
+
+    // The guarded form (plan 046 §3.8): same op, plus `lifecycle_if`.
+    // Applied here rather than only decoded, so the vector can't drift
+    // into a field the server parses and then ignores.
+    let mut path = vectors_dir();
+    path.push("tab.agent_report.guarded.request.json");
+    let raw = fs::read_to_string(&path).expect("read guarded request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::TAB_AGENT_REPORT);
+    let guarded: TabAgentReportParams =
+        serde_json::from_value(req.params).expect("decode guarded agent_report params");
+    assert_eq!(guarded.lifecycle_if, Some(vec![AgentLifecycle::Working]));
+    assert!(roost_ipc::agent::validate_report(&guarded).is_ok());
+
+    let finished = AgentTabState {
+        shell: roost_ipc::agent::ShellState::AtPrompt,
+        lifecycle: AgentLifecycle::Finished,
+        ownership: Some(Ownership {
+            source: guarded.source.clone(),
+            session_id: guarded.session_id.clone(),
+            ..Ownership::default()
+        }),
+    };
+    let out = roost_ipc::agent::apply_report(&finished, &guarded, 1_700_000_060);
+    assert!(out.accepted, "a vetoed report still matched the owner");
+    assert_eq!(out.state.lifecycle, AgentLifecycle::Finished);
+    assert_eq!(out.attention, AttentionEffect::Unchanged);
 
     let mut path = vectors_dir();
     path.push("tab.agent_report.response.json");

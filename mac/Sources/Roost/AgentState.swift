@@ -157,9 +157,11 @@ struct AgentTabState: Decodable, Hashable, Sendable {
 /// `attention` defaults to `preserve`. That keeps adapters pure — they
 /// never need to read current state to describe an event.
 ///
-/// `metadata` is the additive channel: the dispatcher rejects unknown
-/// fields (`decodeParams(expected:)`), so a new *named* field is not
-/// actually backwards-compatible and extensions go in the map.
+/// `metadata` is the open extension channel: the dispatcher rejects
+/// unknown fields (`decodeParams(expected:)`), so a new *named* field is
+/// a request-schema change rather than an additive one — an older server
+/// rejects the whole report — and anything an adapter can express as
+/// data goes in the map instead.
 struct AgentReport: Decodable, Hashable, Sendable {
     var tabID: Int64
     var source: String
@@ -168,6 +170,18 @@ struct AgentReport: Decodable, Hashable, Sendable {
     var ownershipAction: OwnershipAction
     /// `nil` (omitted on the wire) means "leave lifecycle unchanged".
     var lifecycle: AgentLifecycle?
+    /// Guard on the tab's **current** lifecycle. When present, the
+    /// `lifecycle` patch and any `attention == .set` apply only if the
+    /// current lifecycle is in this set; omitted means unconditional.
+    ///
+    /// A transition that did not happen is not news: agents nag on a
+    /// timer (Claude's `idle_prompt`, cursor's repeated `stop`) and an
+    /// unguarded nag re-banners a turn that already ended. `detail` and
+    /// `metadata` still merge, and `attention == .clear` still applies.
+    /// A `.release` still forces `.inactive` — the guard cannot keep a
+    /// departed agent's lifecycle alive — but its `attention == .set` is
+    /// gated like any other.
+    var lifecycleIf: [AgentLifecycle]?
     var attention: AttentionOp
     var severity: Severity
     /// Required when `attention == .set`, ignored otherwise. See
@@ -186,6 +200,7 @@ struct AgentReport: Decodable, Hashable, Sendable {
         sessionID: String = "",
         ownershipAction: OwnershipAction,
         lifecycle: AgentLifecycle? = nil,
+        lifecycleIf: [AgentLifecycle]? = nil,
         attention: AttentionOp = .preserve,
         severity: Severity = .info,
         title: String = "",
@@ -198,6 +213,7 @@ struct AgentReport: Decodable, Hashable, Sendable {
         self.sessionID = sessionID
         self.ownershipAction = ownershipAction
         self.lifecycle = lifecycle
+        self.lifecycleIf = lifecycleIf
         self.attention = attention
         self.severity = severity
         self.title = title
@@ -215,6 +231,7 @@ struct AgentReport: Decodable, Hashable, Sendable {
         case sessionID = "session_id"
         case ownershipAction = "ownership_action"
         case lifecycle
+        case lifecycleIf = "lifecycle_if"
         case attention
         case severity
         case title
@@ -230,6 +247,7 @@ struct AgentReport: Decodable, Hashable, Sendable {
         self.sessionID = try c.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
         self.ownershipAction = try c.decode(OwnershipAction.self, forKey: .ownershipAction)
         self.lifecycle = try c.decodeIfPresent(AgentLifecycle.self, forKey: .lifecycle)
+        self.lifecycleIf = try c.decodeIfPresent([AgentLifecycle].self, forKey: .lifecycleIf)
         self.attention = try c.decodeIfPresent(AttentionOp.self, forKey: .attention) ?? .preserve
         self.severity = try c.decodeIfPresent(Severity.self, forKey: .severity) ?? .info
         self.title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
@@ -456,6 +474,12 @@ enum Agent {
     ///   It is the sole supersede path.
     /// * `release` requires a match; it clears ownership and forces
     ///   lifecycle `inactive`.
+    /// * `lifecycleIf` gates the lifecycle patch and any
+    ///   `attention == .set` on the *current* lifecycle. A vetoed report
+    ///   is still `accepted` — it matched the owner — and its
+    ///   `detail`/`metadata` still merge. A `.release`'s forced
+    ///   `.inactive` is exempt from the guard; its `attention == .set`
+    ///   is not.
     /// * `lastEventAt` is stamped from `now` (server receipt time).
     static func applyReport(
         _ current: AgentTabState,
@@ -504,10 +528,19 @@ enum Agent {
             ownership = nil
         }
 
+        let vetoed: Bool
+        if let allowed = report.lifecycleIf {
+            vetoed = !allowed.contains(current.lifecycle)
+        } else {
+            vetoed = false
+        }
+
         let lifecycle: AgentLifecycle
         switch report.ownershipAction {
-        case .release: lifecycle = .inactive
-        case .claim, .preserve: lifecycle = report.lifecycle ?? current.lifecycle
+        case .release:
+            lifecycle = .inactive
+        case .claim, .preserve:
+            lifecycle = vetoed ? current.lifecycle : (report.lifecycle ?? current.lifecycle)
         }
 
         let state = AgentTabState(
@@ -519,7 +552,10 @@ enum Agent {
         let attention: AttentionEffect
         switch report.attention {
         case .set:
-            attention = .set(title: report.title, body: report.body, severity: report.severity)
+            attention =
+                vetoed
+                ? .unchanged
+                : .set(title: report.title, body: report.body, severity: report.severity)
         case .clear:
             attention = .clear
         case .preserve:

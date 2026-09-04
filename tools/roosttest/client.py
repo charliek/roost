@@ -141,6 +141,7 @@ class Roost:
         *,
         session_id: str = "",
         lifecycle: str | None = None,
+        lifecycle_if: list[str] | None = None,
         attention: str = "preserve",
         severity: str = "info",
         title: str = "",
@@ -153,7 +154,11 @@ class Roost:
         False when the report lost the `(source, session_id)` ownership
         check. `ownership_action` is `claim|preserve|release`;
         `attention` is `set|clear|preserve` (`set` requires title+body);
-        `lifecycle` omitted means "leave unchanged"."""
+        `lifecycle` omitted means "leave unchanged".
+
+        `lifecycle_if` guards the `lifecycle` patch and any
+        `attention="set"` on the tab's CURRENT lifecycle: outside the
+        set both are dropped while the report is still accepted."""
         params: dict = {
             "tab_id": str(tab_id),
             "source": source,
@@ -168,6 +173,8 @@ class Roost:
         }
         if lifecycle is not None:
             params["lifecycle"] = lifecycle
+        if lifecycle_if is not None:
+            params["lifecycle_if"] = lifecycle_if
         return self.call("tab.agent_report", params)
 
     # -- agent axes (read back off `tab.list`) ----------------------------

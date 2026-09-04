@@ -84,11 +84,24 @@ strictly decreasing across `order_high_to_low`.
 - `report` is a literal `tab.agent_report` params object. Required:
   `tab_id` (string-wrapped int64), `source`, `ownership_action`
   (`claim | preserve | release`). Optional, with defaults: `session_id`
-  `""`, `lifecycle` **omitted = unchanged**, `attention` `preserve`,
-  `severity` `info`, `title`/`body`/`detail` `""`, `metadata` `{}`. The
-  op is `deny_unknown_fields`, so a fixture may not carry stray keys —
-  in particular `last_event_at` is server-stamped from `now` and is not
-  a caller-supplied field.
+  `""`, `lifecycle` **omitted = unchanged**, `lifecycle_if` omitted =
+  unconditional, `attention` `preserve`, `severity` `info`,
+  `title`/`body`/`detail` `""`, `metadata` `{}`. The op is
+  `deny_unknown_fields`, so a fixture may not carry stray keys — in
+  particular `last_event_at` is server-stamped from `now` and is not a
+  caller-supplied field.
+- `shell_mark` (optional, on the **case**, not the report) is an OSC 133
+  mark applied to `current` before the report, so a case can state a
+  sequence rather than a single step — the prompt-mark failsafe dropping
+  the lifecycle, then a `lifecycle_if`-guarded report landing on what it
+  left behind. `expect.state` is measured against the post-mark state,
+  and an undefined mark is a fixture error rather than a no-op.
+- `report.lifecycle_if` gates the `lifecycle` patch and any
+  `attention: "set"` on the **current** lifecycle: outside the set both
+  are dropped, while `detail`/`metadata` still merge and
+  `attention: "clear"` still applies. A vetoed report is still
+  `accepted: true` — it matched the owner — and a `release` cannot be
+  vetoed at all.
 - `expect.attention` is the effect the caller should apply:
   `{"kind":"set","title":…,"body":…,"severity":…}`, `{"kind":"clear"}`,
   or `{"kind":"unchanged"}`.

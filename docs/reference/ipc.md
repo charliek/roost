@@ -687,11 +687,12 @@ Request:
 | `session_id` | string | opaque per-source session id; empty for sources with no session concept (`manual`, `legacy`). Ownership identity is the **pair** `(source, session_id)` — not `session_id` alone, since two agents could otherwise collide on an opaque id |
 | `ownership_action` | `"claim"` \| `"preserve"` \| `"release"` | **required, no default** — "take the tab" and "I already own it" have opposite failure modes, so there's no safe implicit choice |
 | `lifecycle` | `AgentLifecycle` | **optional; omitted means "leave the current lifecycle unchanged."** Present only on events that actually move it |
+| `lifecycle_if` | array of `AgentLifecycle` | **optional; omitted means unconditional** (every pre-046 client). A guard on the tab's *current* lifecycle — see [Guarded reports](#guarded-reports) below |
 | `attention` | `"set"` \| `"clear"` \| `"preserve"` | defaults to `"preserve"` |
 | `severity` | `"info"` \| `"warn"` \| `"error"` | defaults to `"info"`. Carried on the model now so a later policy revision can have `failed` interrupt regardless of focus; v1's notification policy does not yet consult it |
 | `title` / `body` | string | required when `attention == "set"` (`invalid-param` if missing), ignored otherwise |
 | `detail` | string | free-form reason for the report (`"permission_prompt"`, `"background_tasks:2"`, an error name…); recorded onto the ownership record when non-empty |
-| `metadata` | map<string, string> | **open extension channel.** The params struct carries `#[serde(deny_unknown_fields)]` per repo convention, so a new *named* field on this op would not actually be additive — both server implementations would need to change. `metadata` is the channel that genuinely is |
+| `metadata` | map<string, string> | **open extension channel** — the one field a client may extend without coordinating with the server. The params struct carries `#[serde(deny_unknown_fields)]` per the strict-server convention above, so a new *named* field on this op is a **request-schema change**, not an additive one: an older UI or `roost-session` answers `unknown-field` and drops the whole report, attention included. `lifecycle_if` was added that way in plan 046 — both server implementations changed together, and `protocol_version` did not move because `roostctl` and the UI ship as one build. Anything an adapter can express as data belongs in `metadata` instead |
 
 `ownership_action` semantics, enforced under one lock so the check and
 the mutation can't race a concurrent report:
@@ -709,6 +710,49 @@ the mutation can't race a concurrent report:
 * **`release`** also requires a match; it clears ownership and forces
   `lifecycle` to `"inactive"`.
 
+#### Guarded reports
+
+`lifecycle_if` makes a report conditional on where the tab already
+stands, so an adapter can say "this only means something if the turn was
+still running" without reading state first:
+
+```json
+{"id": "10", "op": "tab.agent_report", "params": {
+  "tab_id": "5",
+  "source": "claude",
+  "session_id": "abc123",
+  "ownership_action": "preserve",
+  "lifecycle": "waiting",
+  "lifecycle_if": ["working"],
+  "attention": "set",
+  "severity": "info",
+  "title": "Claude Code",
+  "body": "Claude is waiting for your input",
+  "detail": "idle_prompt"
+}}
+```
+
+* Current lifecycle **in** the set — the report applies in full.
+* Current lifecycle **not in** the set — the `lifecycle` patch **and**
+  any `attention: "set"` are dropped. A transition that did not happen
+  is not news: agents nag on a timer (Claude's `idle_prompt` ~60s after
+  a turn ended, cursor's repeated `stop`), and an unguarded nag
+  re-banners a turn the user already saw finish. `detail` and `metadata`
+  still merge, and `attention: "clear"` still applies.
+* A `release`'s **lifecycle** is exempt: it clears ownership and forces
+  `"inactive"` wherever the lifecycle stood — a guard cannot keep a
+  departed agent's dot alive. Its `attention: "set"` is **not** exempt
+  and is gated like any other, so an adapter can say "announce the
+  session ending only if the turn was still running".
+* An omitted `lifecycle_if` is unconditional — the behaviour every
+  client had before plan 046.
+
+The interaction worth knowing: the OSC 133 failsafe (`A`/`B`/`D` drops
+the lifecycle to `"inactive"` while keeping ownership as a label) leaves
+a tab whose agent is gone but still owned. A later report guarded on
+`["working"]` then correctly no-ops instead of re-lighting a dead
+agent's dot.
+
 Response:
 ```json
 {"id": "9", "ok": true, "result": {
@@ -721,6 +765,12 @@ Response:
 check above — `tab` is then the tab **unchanged**. The full `Tab` is
 always returned so an adapter never needs a follow-up `tab.list` to
 see what its own report did.
+
+A report vetoed by `lifecycle_if` is **not** a rejected one: `accepted`
+stays `true` (the ownership check passed) and the returned `tab` simply
+shows the unchanged `agent_lifecycle`. `accepted` answers "did this
+report belong to the tab's owner", never "did the lifecycle move" —
+compare the returned `agent_lifecycle` for that.
 
 ### `notification.create`
 

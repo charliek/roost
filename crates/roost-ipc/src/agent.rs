@@ -123,9 +123,11 @@ pub struct AgentTabState {
 /// `attention` defaults to `preserve`. That keeps adapters pure — they
 /// never need to read current state to describe an event.
 ///
-/// `metadata` is the additive channel. `deny_unknown_fields` (the
+/// `metadata` is the open extension channel. `deny_unknown_fields` (the
 /// server-side convention, see `messages.rs`) means a new *named* field
-/// is not actually backwards-compatible, so extensions go in the map.
+/// is a request-schema change rather than an additive one — an older
+/// server rejects the whole report — so anything an adapter can express
+/// as data goes in the map instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabAgentReportParams {
@@ -139,6 +141,19 @@ pub struct TabAgentReportParams {
     /// `None` (omitted on the wire) means "leave lifecycle unchanged".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<AgentLifecycle>,
+    /// Guard on the tab's **current** lifecycle. When present, the
+    /// `lifecycle` patch and any `attention: Set` apply only if the
+    /// current lifecycle is in this set; omitted means unconditional.
+    ///
+    /// A transition that did not happen is not news: agents nag on a
+    /// timer (Claude's `idle_prompt`, cursor's repeated `stop`) and an
+    /// unguarded nag re-banners a turn that already ended. `detail` and
+    /// `metadata` still merge, and `attention: Clear` still applies. A
+    /// `Release` still forces `Inactive` — the guard cannot keep a
+    /// departed agent's lifecycle alive — but its `attention: Set` is
+    /// gated like any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_if: Option<Vec<AgentLifecycle>>,
     #[serde(default)]
     pub attention: AttentionOp,
     #[serde(default)]
@@ -178,6 +193,7 @@ impl TabAgentReportParams {
             session_id: String::new(),
             ownership_action,
             lifecycle,
+            lifecycle_if: None,
             attention: AttentionOp::Preserve,
             severity: Severity::Info,
             title: String::new(),
@@ -382,6 +398,11 @@ pub struct ApplyOutcome {
 ///   is the sole supersede path.
 /// * `Release` requires a match; it clears ownership and forces
 ///   lifecycle `Inactive`.
+/// * `lifecycle_if` gates the lifecycle patch and any `attention: Set`
+///   on the *current* lifecycle. A vetoed report is still `accepted` —
+///   it matched the owner — and its `detail`/`metadata` still merge. A
+///   `Release`'s forced `Inactive` is exempt from the guard; its
+///   `attention: Set` is not.
 /// * `last_event_at` is stamped from `now` (server receipt time).
 pub fn apply_report(
     current: &AgentTabState,
@@ -430,10 +451,17 @@ pub fn apply_report(
         OwnershipAction::Release => None,
     };
 
+    let vetoed =
+        matches!(&report.lifecycle_if, Some(allowed) if !allowed.contains(&current.lifecycle));
+
     let lifecycle = match report.ownership_action {
         OwnershipAction::Release => AgentLifecycle::Inactive,
         OwnershipAction::Claim | OwnershipAction::Preserve => {
-            report.lifecycle.unwrap_or(current.lifecycle)
+            if vetoed {
+                current.lifecycle
+            } else {
+                report.lifecycle.unwrap_or(current.lifecycle)
+            }
         }
     };
 
@@ -444,6 +472,7 @@ pub fn apply_report(
     };
 
     let attention = match report.attention {
+        AttentionOp::Set if vetoed => AttentionEffect::Unchanged,
         AttentionOp::Set => AttentionEffect::Set {
             title: report.title.clone(),
             body: report.body.clone(),
@@ -530,6 +559,7 @@ mod tests {
         assert_eq!(minimal.tab_id, 3);
         assert_eq!(minimal.session_id, "");
         assert_eq!(minimal.lifecycle, None);
+        assert_eq!(minimal.lifecycle_if, None);
         assert_eq!(minimal.attention, AttentionOp::Preserve);
         assert_eq!(minimal.severity, Severity::Info);
         assert!(minimal.metadata.is_empty());
@@ -539,6 +569,34 @@ mod tests {
         assert!(!json.contains("lifecycle"), "omitted when None: {json}");
         let back: TabAgentReportParams = serde_json::from_str(&json).unwrap();
         assert_eq!(back, minimal);
+    }
+
+    #[test]
+    fn lifecycle_if_round_trips_and_is_omitted_when_absent() {
+        let guarded: TabAgentReportParams = serde_json::from_str(
+            r#"{"tab_id":"3","source":"claude","ownership_action":"preserve",
+                "lifecycle":"waiting","lifecycle_if":["working","waiting"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            guarded.lifecycle_if,
+            Some(vec![AgentLifecycle::Working, AgentLifecycle::Waiting])
+        );
+
+        let json = serde_json::to_string(&guarded).unwrap();
+        assert!(
+            json.contains(r#""lifecycle_if":["working","waiting"]"#),
+            "got: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<TabAgentReportParams>(&json).unwrap(),
+            guarded
+        );
+
+        let unguarded = report("claude", "s1", OwnershipAction::Preserve);
+        assert_eq!(unguarded.lifecycle_if, None);
+        let json = serde_json::to_string(&unguarded).unwrap();
+        assert!(!json.contains("lifecycle_if"), "got: {json}");
     }
 
     #[test]
