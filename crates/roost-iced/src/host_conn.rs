@@ -2476,7 +2476,7 @@ impl HostConnSet {
     }
 
     #[cfg(test)]
-    fn has_outage(&self, host: &str) -> bool {
+    pub(crate) fn has_outage(&self, host: &str) -> bool {
         self.entries
             .get(host)
             .is_some_and(|entry| entry.outage.is_some())
@@ -2501,10 +2501,26 @@ impl HostConnSet {
     }
 
     #[cfg(test)]
-    fn has_conn(&self, host: &str) -> bool {
+    pub(crate) fn has_conn(&self, host: &str) -> bool {
         self.entries
             .get(host)
             .is_some_and(|entry| entry.conn.is_some())
+    }
+
+    /// The same two reads, as values rather than references.
+    ///
+    /// [`SshState`] and [`Outage`] are this module's own types, so a
+    /// suite outside it — `app::host_lifecycle`'s, driving the app's
+    /// lifted edges against a real set — cannot spell
+    /// `set.ssh(host).request`. It asks for the number instead.
+    #[cfg(test)]
+    pub(crate) fn ssh_request(&self, host: &str) -> u64 {
+        self.ssh(host).request
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outage_armed(&self, host: &str) -> bool {
+        self.outage(host).armed.is_some()
     }
 }
 
@@ -2519,8 +2535,208 @@ pub(crate) fn blank_theme() -> OscColorsParams {
     }
 }
 
+/// The suite's own scaffolding, shared with the sibling suites that
+/// drive this set through the app's lifted edges
+/// ([`crate::app::host_lifecycle`]). Promoted out of `mod tests`
+/// unchanged — every body here is the one the inline cases were
+/// written against.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    /// A set on the test's own runtime. The receiver comes back with it
+    /// so the caller keeps the feed alive: a dropped receiver makes
+    /// every task's first publish fail, which would end the connections
+    /// these cases are driving by hand.
+    pub(crate) fn a_set() -> (HostConnSet, crate::engine_feed::EngineFeedReceiver) {
+        let (feed, rx) = crate::engine_feed::channel();
+        let set = HostConnSet::new(
+            tokio::runtime::Handle::current(),
+            feed,
+            &Theme::roost_dark(),
+        );
+        (set, rx)
+    }
+
+    /// Every ssh case below drives the *failed* half of an establish,
+    /// which needs no `ssh` at all: the tunnel object only exists on the
+    /// success path, and the process choreography behind it is pinned by
+    /// `roost_ipc`'s own fake-ssh tests. What is C4's to prove is the
+    /// handoff — who the answer belongs to, and what it leaves on the
+    /// band.
+    ///
+    /// **The invariant that keeps that true**: `open_ssh` spawns a task
+    /// that would exec the real `ssh` binary, and these cases rely on it
+    /// never being polled. `#[tokio::test]` is single-threaded by
+    /// default, so a spawned task only runs when the test awaits, and
+    /// none of them awaits after an `open_ssh`. Converting any of them to
+    /// `#[tokio::test(flavor = "multi_thread")]` — or adding an `.await`
+    /// between the `open_ssh` and the `tunnel_ready` that answers it —
+    /// would silently start dialing hosts from the unit suite.
+    pub(crate) fn ssh_target(raw: &str) -> roost_ipc::ssh::SshTarget {
+        match roost_ipc::ssh::classify(raw).expect("classify an ssh target") {
+            roost_ipc::ssh::ResolvedTransport::Ssh(target) => target,
+            other => panic!("{raw:?} is not an ssh target: {other:?}"),
+        }
+    }
+
+    pub(crate) fn failed(host: &str, request: u64, reason: &str) -> HostTunnelReady {
+        HostTunnelReady {
+            host: host.to_string(),
+            request,
+            result: Err(ConnectFailure::unclassified(reason)),
+        }
+    }
+
+    /// A classified establish failure, as the transport hands one back.
+    pub(crate) fn refused(
+        host: &str,
+        request: u64,
+        failure: roost_ipc::ssh::SshFailure,
+    ) -> HostTunnelReady {
+        HostTunnelReady {
+            host: host.to_string(),
+            request,
+            result: Err(ConnectFailure::classified("workbox", failure)),
+        }
+    }
+
+    pub(crate) fn dropped(reason: &str) -> HostConnState {
+        HostConnState::Disconnected(state::Disconnected {
+            reason: reason.into(),
+            detail: None,
+            retry_in: None,
+        })
+    }
+
+    /// An ssh host walked to `Connected` by an explicit connect — the
+    /// only state that mints a lease, and where each case below starts.
+    /// The cause a case turns on is the one it passes *after* this.
+    pub(crate) fn a_connected_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from(socket),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        incarnation
+    }
+
+    pub(crate) fn band_reason(set: &HostConnSet, host: &str) -> String {
+        set.section_reason(host)
+            .expect("a disconnected host has a reason")
+            .to_string()
+    }
+
+    /// The budget this outage was built with, so a case reads `(2/N)`
+    /// rather than pinning the shipped ten — the constant has a
+    /// `ROOST_TEST_MODE` override, and a suite run under it must not
+    /// start failing.
+    pub(crate) fn budget(set: &HostConnSet) -> u32 {
+        set.outage("h1").ladder.budget()
+    }
+
+    /// One turn of the ladder exactly as the app drives it: the armed
+    /// timer comes due, and the re-entry
+    /// `App::host_reconnect_requested` performs lands here as the same
+    /// `open_ssh` that call would reach. Returns whether the due message
+    /// authorized a dial.
+    pub(crate) fn retry_once(set: &mut HostConnSet) -> bool {
+        let request = set.ssh("h1").request;
+        // The origin and the cause are the set's own answer, not the
+        // test's: `App::host_reconnect_due` passes back exactly what it
+        // is handed, and the origin is the load-bearing consent gate.
+        let Some((origin, cause)) = set.reconnect_due("h1", request) else {
+            return false;
+        };
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            origin,
+            cause,
+        );
+        true
+    }
+
+    /// A working ssh host whose link has just dropped: the ladder is at
+    /// attempt one with a timer armed. Where every case below starts
+    /// that is not itself about that first decision.
+    pub(crate) fn a_dropped_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
+        let incarnation = a_connected_ssh_host(set, socket);
+        set.apply_state(incarnation, dropped("the connection closed"));
+        incarnation
+    }
+
+    /// A transport failure, which is the retryable establish shape.
+    pub(crate) fn unreachable() -> SshFailure {
+        SshFailure::Transport(Some("no route to host".into()))
+    }
+
+    /// Answer this host's in-flight establish with a classified failure,
+    /// as the transport hands one back.
+    pub(crate) fn refuse(set: &mut HostConnSet, failure: SshFailure) {
+        let ready = refused("h1", set.ssh("h1").request, failure);
+        set.tunnel_ready(ready);
+    }
+
+    /// A real `SshTunnel` with nothing behind it: `open` claims a
+    /// scratch directory and writes a config, and binds and connects
+    /// nothing. So a discard can be *measured* — the directory is gone
+    /// afterwards — with no `ssh` anywhere near the suite.
+    pub(crate) async fn an_unestablished_tunnel(parent: PathBuf) -> Arc<SshTunnel> {
+        Arc::new(
+            SshTunnel::open(
+                "discardcase",
+                &ssh_target("workbox"),
+                roost_ipc::ssh::SshTunnelOptions {
+                    config_paths: roost_ipc::ssh::SshConfigPaths {
+                        user: None,
+                        system: None,
+                    },
+                    // A macOS `$TMPDIR` can be too deep for a `sun_path`;
+                    // the fallback is what `from_env` would pick too.
+                    scratch_parents: vec![parent, PathBuf::from("/tmp")],
+                    // Never spawned: the teardown's `-O exit` is skipped
+                    // for a control socket that was never bound.
+                    ssh_bin: PathBuf::from("/nonexistent/ssh"),
+                    jail_fs_root: false,
+                },
+            )
+            .await
+            .expect("claim a scratch directory"),
+        )
+    }
+
+    /// Nothing in this suite may dial a real host: stop every handshake
+    /// an `open_ssh` spawned before anything is polled. A case that
+    /// awaits after an `open_ssh` — and the runtime only polls when it
+    /// does — calls this first.
+    pub(crate) fn abort_establishes(set: &mut HostConnSet) {
+        for entry in set.entries.values_mut().filter_map(|e| e.ssh.as_mut()) {
+            if let Some(establish) = entry.establish.take() {
+                establish.abort();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures::*;
     use super::*;
 
     #[test]
@@ -2549,20 +2765,6 @@ mod tests {
             roost_ui_model::keys::TabKey::new(first, 7),
             roost_ui_model::keys::TabKey::new(second, 7)
         );
-    }
-
-    /// A set on the test's own runtime. The receiver comes back with it
-    /// so the caller keeps the feed alive: a dropped receiver makes
-    /// every task's first publish fail, which would end the connections
-    /// these cases are driving by hand.
-    fn a_set() -> (HostConnSet, crate::engine_feed::EngineFeedReceiver) {
-        let (feed, rx) = crate::engine_feed::channel();
-        let set = HostConnSet::new(
-            tokio::runtime::Handle::current(),
-            feed,
-            &Theme::roost_dark(),
-        );
-        (set, rx)
     }
 
     /// The drain side resolves a feed item's host off the minter's
@@ -2760,45 +2962,6 @@ mod tests {
                 matches!(rx.try_recv(), Ok(Err(HostOpError::Unavailable))),
                 "a refused intent is answered, never dropped on the floor"
             );
-        }
-    }
-
-    /// Every ssh case below drives the *failed* half of an establish,
-    /// which needs no `ssh` at all: the tunnel object only exists on the
-    /// success path, and the process choreography behind it is pinned by
-    /// `roost_ipc`'s own fake-ssh tests. What is C4's to prove is the
-    /// handoff — who the answer belongs to, and what it leaves on the
-    /// band.
-    ///
-    /// **The invariant that keeps that true**: `open_ssh` spawns a task
-    /// that would exec the real `ssh` binary, and these cases rely on it
-    /// never being polled. `#[tokio::test]` is single-threaded by
-    /// default, so a spawned task only runs when the test awaits, and
-    /// none of them awaits after an `open_ssh`. Converting any of them to
-    /// `#[tokio::test(flavor = "multi_thread")]` — or adding an `.await`
-    /// between the `open_ssh` and the `tunnel_ready` that answers it —
-    /// would silently start dialing hosts from the unit suite.
-    fn ssh_target(raw: &str) -> roost_ipc::ssh::SshTarget {
-        match roost_ipc::ssh::classify(raw).expect("classify an ssh target") {
-            roost_ipc::ssh::ResolvedTransport::Ssh(target) => target,
-            other => panic!("{raw:?} is not an ssh target: {other:?}"),
-        }
-    }
-
-    fn failed(host: &str, request: u64, reason: &str) -> HostTunnelReady {
-        HostTunnelReady {
-            host: host.to_string(),
-            request,
-            result: Err(ConnectFailure::unclassified(reason)),
-        }
-    }
-
-    /// A classified establish failure, as the transport hands one back.
-    fn refused(host: &str, request: u64, failure: roost_ipc::ssh::SshFailure) -> HostTunnelReady {
-        HostTunnelReady {
-            host: host.to_string(),
-            request,
-            result: Err(ConnectFailure::classified("workbox", failure)),
         }
     }
 
@@ -3158,39 +3321,6 @@ mod tests {
         assert!(!set.ssh_reached_connected("h1"));
     }
 
-    fn dropped(reason: &str) -> HostConnState {
-        HostConnState::Disconnected(state::Disconnected {
-            reason: reason.into(),
-            detail: None,
-            retry_in: None,
-        })
-    }
-
-    /// An ssh host walked to `Connected` by an explicit connect — the
-    /// only state that mints a lease, and where each case below starts.
-    /// The cause a case turns on is the one it passes *after* this.
-    fn a_connected_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::User,
-            AttemptCause::Explicit,
-        );
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from(socket),
-            HostTransport::Ssh,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h1");
-        set.apply_state(incarnation, HostConnState::Connected);
-        incarnation
-    }
-
     /// The lease's whole life, walked rather than seeded.
     ///
     /// Every step of it is somewhere the previous store would have been
@@ -3533,65 +3663,6 @@ mod tests {
             Some(HostConnState::Disconnected(disconnected)) => disconnected.clone(),
             other => panic!("{host} is {other:?}, not disconnected"),
         }
-    }
-
-    fn band_reason(set: &HostConnSet, host: &str) -> String {
-        set.section_reason(host)
-            .expect("a disconnected host has a reason")
-            .to_string()
-    }
-
-    /// The budget this outage was built with, so a case reads `(2/N)`
-    /// rather than pinning the shipped ten — the constant has a
-    /// `ROOST_TEST_MODE` override, and a suite run under it must not
-    /// start failing.
-    fn budget(set: &HostConnSet) -> u32 {
-        set.outage("h1").ladder.budget()
-    }
-
-    /// One turn of the ladder exactly as the app drives it: the armed
-    /// timer comes due, and the re-entry
-    /// `App::host_reconnect_requested` performs lands here as the same
-    /// `open_ssh` that call would reach. Returns whether the due message
-    /// authorized a dial.
-    fn retry_once(set: &mut HostConnSet) -> bool {
-        let request = set.ssh("h1").request;
-        // The origin and the cause are the set's own answer, not the
-        // test's: `App::host_reconnect_due` passes back exactly what it
-        // is handed, and the origin is the load-bearing consent gate.
-        let Some((origin, cause)) = set.reconnect_due("h1", request) else {
-            return false;
-        };
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            origin,
-            cause,
-        );
-        true
-    }
-
-    /// A working ssh host whose link has just dropped: the ladder is at
-    /// attempt one with a timer armed. Where every case below starts
-    /// that is not itself about that first decision.
-    fn a_dropped_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
-        let incarnation = a_connected_ssh_host(set, socket);
-        set.apply_state(incarnation, dropped("the connection closed"));
-        incarnation
-    }
-
-    /// A transport failure, which is the retryable establish shape.
-    fn unreachable() -> SshFailure {
-        SshFailure::Transport(Some("no route to host".into()))
-    }
-
-    /// Answer this host's in-flight establish with a classified failure,
-    /// as the transport hands one back.
-    fn refuse(set: &mut HostConnSet, failure: SshFailure) {
-        let ready = refused("h1", set.ssh("h1").request, failure);
-        set.tunnel_ready(ready);
     }
 
     /// The headline case: a working ssh connection drops, and the host
@@ -4537,34 +4608,6 @@ mod tests {
         })
         .await
         .expect("the discarded tunnel's scratch directory is removed");
-    }
-
-    /// A real `SshTunnel` with nothing behind it: `open` claims a
-    /// scratch directory and writes a config, and binds and connects
-    /// nothing. So a discard can be *measured* — the directory is gone
-    /// afterwards — with no `ssh` anywhere near the suite.
-    async fn an_unestablished_tunnel(parent: PathBuf) -> Arc<SshTunnel> {
-        Arc::new(
-            SshTunnel::open(
-                "discardcase",
-                &ssh_target("workbox"),
-                roost_ipc::ssh::SshTunnelOptions {
-                    config_paths: roost_ipc::ssh::SshConfigPaths {
-                        user: None,
-                        system: None,
-                    },
-                    // A macOS `$TMPDIR` can be too deep for a `sun_path`;
-                    // the fallback is what `from_env` would pick too.
-                    scratch_parents: vec![parent, PathBuf::from("/tmp")],
-                    // Never spawned: the teardown's `-O exit` is skipped
-                    // for a control socket that was never bound.
-                    ssh_bin: PathBuf::from("/nonexistent/ssh"),
-                    jail_fs_root: false,
-                },
-            )
-            .await
-            .expect("claim a scratch directory"),
-        )
     }
 
     /// One `open_ssh` as the app drives it, with nothing riding on the
