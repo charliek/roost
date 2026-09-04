@@ -13,5 +13,13 @@
       <sparkle:minimumSystemVersion>15.0.0</sparkle:minimumSystemVersion>
       <enclosure url="https://github.com/charliek/roost/releases/download/v0.0.18/Roost-Iced-0.0.18.dmg" type="application/octet-stream" sparkle:edSignature="iUttgKadeci38ILkhISmAluH+W42SL1ZQL1hy6px256DVZiCTUN9DBNe8zO4nASHkCgTKQIWexeHYAKo/qU3AA==" length="12053137" />
     </item>
+    <item>
+      <title>0.0.19</title>
+      <pubDate>Fri, 04 Sep 2026 02:40:17 +0000</pubDate>
+      <sparkle:version>0.0.19</sparkle:version>
+      <sparkle:shortVersionString>0.0.19</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/charliek/roost/releases/download/v0.0.19/Roost-Iced-0.0.19.dmg" type="application/octet-stream" sparkle:edSignature="8A2dW0RkPjW5ZBaGhv/51ngAhQxvMAn/Feu8lFSGckFNHm5jXEHJCtrVJ6t/vA4pJOLNJYIO6ChTnjmtYGg7Cg==" length="15526802" />
+    </item>
   </channel>
 </rss>
