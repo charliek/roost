@@ -11,6 +11,23 @@ use serde_json::{json, Value};
 
 const TAB: i64 = 7;
 
+/// Names that must resolve to nothing: near-misses of events Claude
+/// really fires but Roost does not register, a truncated prefix, an
+/// over-long suffix, and non-ASCII. Shared by the two tests that assert
+/// on them — name resolution and full mapping — so the pair cannot
+/// drift when the event set grows.
+const UNMAPPED_EVENTS: [&str; 9] = [
+    "",
+    "SubagentStop",
+    "SubagentStart",
+    "PreCompact",
+    "PreTool",
+    "submit",
+    "Sto",
+    "Stopped",
+    "🙂",
+];
+
 fn only(event: &str, payload: &Value) -> TabAgentReportParams {
     let reports = claude_event_to_reports(event, payload, TAB);
     assert_eq!(reports.len(), 1, "{event} should map to exactly one report");
@@ -88,13 +105,70 @@ fn user_prompt_submit_works_and_clears_attention() {
     assert_eq!(report.attention, AttentionOp::Clear);
 }
 
+/// The immediate blocked signal (plan 046 §3.1) — it fires when the
+/// dialog opens, not ~6 s later like the `permission_prompt`
+/// notification, and it is unguarded because it *is* the transition.
+#[test]
+fn permission_request_blocks_and_names_the_tool() {
+    let report = only(
+        "PermissionRequest",
+        &json!({ "session_id": "s-1", "tool_name": "Bash", "tool_input": { "command": "ls" } }),
+    );
+    assert_eq!(report.ownership_action, OwnershipAction::Preserve);
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Waiting));
+    assert_eq!(report.lifecycle_if, None);
+    assert_eq!(report.attention, AttentionOp::Set);
+    assert_eq!(report.severity, Severity::Warn);
+    assert_eq!(report.title, "Claude Code");
+    assert_eq!(report.body, "Needs permission to use `Bash`");
+    assert_eq!(report.detail, "permission_request");
+}
+
+#[test]
+fn permission_request_without_a_tool_name_still_reads_as_a_sentence() {
+    for payload in [
+        json!({ "session_id": "s-1" }),
+        json!({ "session_id": "s-1", "tool_name": "" }),
+        json!({ "session_id": "s-1", "tool_name": 7 }),
+    ] {
+        let report = only("PermissionRequest", &payload);
+        assert_eq!(report.body, "Needs permission to use a tool", "{payload}");
+        assert_eq!(report.lifecycle, Some(AgentLifecycle::Waiting), "{payload}");
+    }
+}
+
+/// The four tool events say only "the turn is running". The probe order
+/// is `PreToolUse → PermissionRequest → (dialog) → PostToolUse`, so
+/// `PostToolUse` is what takes an approved tool back to `working` — a
+/// denied or failed tool leaves the turn running too, because Claude
+/// keeps going and reports the outcome itself.
+#[test]
+fn tool_events_keep_the_turn_running_without_notifying() {
+    for (event, detail) in [
+        ("PreToolUse", "pre_tool_use"),
+        ("PostToolUse", "post_tool_use"),
+        ("PostToolUseFailure", "post_tool_use_failure"),
+        ("PermissionDenied", "permission_denied"),
+    ] {
+        let report = only(
+            event,
+            &json!({ "session_id": "s-1", "tool_name": "Bash", "tool_response": "ok" }),
+        );
+        assert_eq!(
+            report.ownership_action,
+            OwnershipAction::Preserve,
+            "{event}"
+        );
+        assert_eq!(report.lifecycle, Some(AgentLifecycle::Working), "{event}");
+        assert_eq!(report.lifecycle_if, None, "{event}");
+        assert_eq!(report.attention, AttentionOp::Preserve, "{event}");
+        assert_eq!(report.detail, detail, "{event}");
+    }
+}
+
 #[test]
 fn blocking_notification_types_wait() {
-    for kind in [
-        "permission_prompt",
-        "agent_needs_input",
-        "elicitation_dialog",
-    ] {
+    for kind in ["agent_needs_input", "elicitation_dialog"] {
         let report = only(
             "Notification",
             &json!({ "session_id": "s-1", "message": "m", "notification_type": kind }),
@@ -104,6 +178,7 @@ fn blocking_notification_types_wait() {
             Some(AgentLifecycle::Waiting),
             "{kind} blocks the turn"
         );
+        assert_eq!(report.lifecycle_if, None, "{kind} is unguarded");
         assert_eq!(report.severity, Severity::Warn, "{kind}");
         assert_eq!(report.attention, AttentionOp::Set, "{kind}");
         assert_eq!(report.ownership_action, OwnershipAction::Preserve, "{kind}");
@@ -111,18 +186,40 @@ fn blocking_notification_types_wait() {
     }
 }
 
+/// `PermissionRequest` fires ~6 s before this notification and already
+/// moved the tab to `waiting`, so the notification is guarded on
+/// `working`: in the normal order it lands vetoed and does not banner a
+/// second time. The guard is what keeps it useful on a legacy settings
+/// file that has no `PermissionRequest` hook, where `working` is the
+/// live state when it arrives (plan 046 §3.1).
 #[test]
-fn idle_prompt_notifies_without_flipping_lifecycle() {
-    // Deliberately declassified (plan 006): `idle_prompt` is Claude's
-    // post-turn timer nag, not a modal block. Leaving lifecycle alone
-    // keeps a finished session reading "Finished" instead of flipping
-    // to a false "Waiting for input" when the nag fires; the
-    // notification itself still reaches the user.
+fn permission_prompt_waits_but_only_from_working() {
+    let report = only(
+        "Notification",
+        &json!({ "session_id": "s-1", "message": "m", "notification_type": "permission_prompt" }),
+    );
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Waiting));
+    assert_eq!(report.lifecycle_if, Some(vec![AgentLifecycle::Working]));
+    assert_eq!(report.severity, Severity::Warn);
+    assert_eq!(report.attention, AttentionOp::Set);
+    assert_eq!(report.ownership_action, OwnershipAction::Preserve);
+    assert_eq!(report.detail, "permission_prompt");
+}
+
+/// `idle_prompt` is both Claude's ~60 s post-turn nag and the only later
+/// signal after an Esc interrupt — Claude has no interrupt hook. Guarded
+/// on `working` it ends the interrupted turn and leaves a real `waiting`
+/// or `failed` alone, which is what the pre-046 mapping bought by
+/// refusing to touch lifecycle at all (plan 046 §3.1).
+#[test]
+fn idle_prompt_finishes_a_working_turn_and_nothing_else() {
     let report = only(
         "Notification",
         &json!({ "session_id": "s-1", "message": "m", "notification_type": "idle_prompt" }),
     );
-    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished));
+    assert_eq!(report.lifecycle_if, Some(vec![AgentLifecycle::Working]));
+    // A nag is not a warning even when it does move the lifecycle.
     assert_eq!(report.severity, Severity::Info);
     assert_eq!(report.attention, AttentionOp::Set);
     assert_eq!(report.detail, "idle_prompt");
@@ -142,6 +239,7 @@ fn informational_notification_types_leave_lifecycle_unchanged() {
             &json!({ "session_id": "s-1", "message": "m", "notification_type": kind }),
         );
         assert_eq!(report.lifecycle, None, "{kind} must not move lifecycle");
+        assert_eq!(report.lifecycle_if, None, "{kind}");
         assert_eq!(report.severity, Severity::Info, "{kind}");
         assert_eq!(report.attention, AttentionOp::Set, "{kind}");
         assert_eq!(report.detail, kind);
@@ -164,6 +262,7 @@ fn unknown_notification_type_notifies_without_touching_lifecycle() {
             &json!({ "session_id": "s-1", "message": "m", "notification_type": kind }),
         );
         assert_eq!(report.lifecycle, None, "{kind}");
+        assert_eq!(report.lifecycle_if, None, "{kind}");
         assert_eq!(report.severity, Severity::Info, "{kind}");
         assert_eq!(report.attention, AttentionOp::Set, "{kind}");
         assert_eq!(report.detail, kind);
@@ -488,15 +587,7 @@ fn legacy_installed_spellings_resolve_to_their_canonical_name() {
 
 #[test]
 fn canonical_hook_event_rejects_unrecognized_input() {
-    for event in [
-        "",
-        "SubagentStop",
-        "PreToolUse",
-        "submit",
-        "Sto",
-        "Stopped",
-        "🙂",
-    ] {
+    for event in UNMAPPED_EVENTS {
         assert_eq!(canonical_hook_event(event), None, "{event}");
     }
 }
@@ -528,16 +619,7 @@ fn cli_style_aliases_reach_the_same_arm() {
 #[test]
 fn unknown_event_names_map_to_nothing() {
     let payload = json!({ "session_id": "s-1" });
-    for event in [
-        "",
-        "SubagentStop",
-        "SubagentStart",
-        "PreCompact",
-        "PreToolUse",
-        "Sto",
-        "Stopped",
-        "🙂",
-    ] {
+    for event in UNMAPPED_EVENTS {
         none(event, &payload);
     }
 }
@@ -569,14 +651,7 @@ fn malformed_payloads_do_not_panic() {
         json!({ "session_id": 7, "notification_type": ["nested"], "background_tasks": "not-array" }),
         json!({ "background_tasks": {}, "session_crons": 3, "error": false }),
     ];
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "Notification",
-        "Stop",
-        "StopFailure",
-        "SessionEnd",
-    ] {
+    for event in CLAUDE_HOOK_EVENTS {
         for payload in &payloads {
             for report in claude_event_to_reports(event, payload, TAB) {
                 validate_report(&report).unwrap_or_else(|e| panic!("{event} on {payload}: {e}"));
@@ -629,16 +704,67 @@ fn every_report_carries_source_claude_and_the_payload_session_id() {
         "notification_type": "idle_prompt",
         "error": "overloaded",
     });
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "Notification",
-        "Stop",
-        "StopFailure",
-        "SessionEnd",
-    ] {
+    for event in CLAUDE_HOOK_EVENTS {
         let report = only(event, &payload);
         assert_eq!(report.source, "claude", "{event}");
         assert_eq!(report.session_id, "s-42", "{event}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Cross-agent isolation (plan 046 §3.1, §9)
+// ---------------------------------------------------------------------
+
+/// grok and cursor both execute Claude-format hooks, so with Roost's
+/// Claude entries installed either would run `agent-hook claude` on its
+/// own events. A stray *claim* is the damaging case — it is
+/// unconditional, so it evicts the real owner and no release from that
+/// owner ever matches again.
+#[test]
+fn a_payload_from_another_agent_yields_no_reports() {
+    for discriminator in ["hookEventName", "conversation_id", "cursor_version"] {
+        for event in CLAUDE_HOOK_EVENTS {
+            let mut payload = json!({
+                "session_id": "s-1",
+                "source": "startup",
+                "notification_type": "permission_prompt",
+                "message": "m",
+                "tool_name": "Bash",
+            });
+            payload[discriminator] = json!("x");
+            none(event, &payload);
+        }
+    }
+}
+
+/// Presence is the signal, not truthiness: cursor writing a null or an
+/// empty string is still cursor.
+#[test]
+fn a_foreign_discriminator_counts_even_when_it_carries_nothing() {
+    for value in [json!(null), json!(""), json!(0), json!({})] {
+        let payload = json!({ "session_id": "s-1", "source": "startup", "cursor_version": value });
+        none("SessionStart", &payload);
+    }
+}
+
+/// A payload that is not a JSON object carries no discriminator to
+/// reject it by and no `session_id` to scope it to, so every accessor
+/// reads as "absent". Without an explicit refusal a `SessionStart`
+/// would claim the tab for an id no release can ever match.
+#[test]
+fn a_payload_that_is_not_an_object_maps_to_nothing() {
+    for raw in [
+        json!("a bare string"),
+        json!([{"session_id": "s1"}]),
+        json!(7),
+        json!(null),
+        json!(true),
+    ] {
+        for event in CLAUDE_HOOK_EVENTS {
+            assert!(
+                claude_event_to_reports(event, &raw, 7).is_empty(),
+                "{event} produced reports for {raw}"
+            );
+        }
     }
 }

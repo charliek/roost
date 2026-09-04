@@ -44,8 +44,8 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// A timeout bounds time, not memory. Version banners are one line.
 const OUTPUT_CAP: u64 = 8 * 1024;
-/// `claude-settings.json` is six hook entries; anything past this is not
-/// a settings file, and reading it unbounded is how a symlink to
+/// `claude-settings.json` is a handful of hook entries; anything past this
+/// is not a settings file, and reading it unbounded is how a symlink to
 /// `/dev/zero` turns a diagnostic into an OOM.
 const SETTINGS_READ_CAP: u64 = 1024 * 1024;
 
@@ -2733,8 +2733,8 @@ fn hook_events_check(inputs: &Inputs) -> Check {
 /// Fold `(event, reason)` pairs into one line per *distinct* reason.
 ///
 /// A real install fails the same way on every event — a relocated
-/// `Roost.app` makes all six commands resolve elsewhere — and printing
-/// the identical sentence six times produced a ~500-character wall that
+/// `Roost.app` makes every command resolve elsewhere — and printing
+/// the identical sentence once per event produced a ~500-character wall that
 /// buried the one fact worth reading. Distinct reasons stay distinct;
 /// only exact repeats collapse. First-appearance order is preserved so
 /// the text tracks the settings file's own key order.
@@ -4324,7 +4324,7 @@ mod tests {
 
     /// The common shape — a relocated binary breaks every command the
     /// same way — must read as one sentence naming the count and the
-    /// events, not as six near-identical ones.
+    /// events, not as one near-identical sentence per event.
     #[test]
     fn one_reason_shared_by_every_command_collapses_to_one_line() {
         let n = CLAUDE_HOOK_EVENTS.len();
@@ -5490,7 +5490,7 @@ mod tests {
     }
 
     /// "One line per section" against a real overlong detail:
-    /// `claude.hook_command`'s warn names all six events and two absolute
+    /// `claude.hook_command`'s warn names every event and two absolute
     /// paths — past 200 characters in the field, which wraps to three or
     /// four lines in an 80-column terminal and destroys the scan the
     /// rolled-up view exists to provide. `-v` and `--json` keep the whole

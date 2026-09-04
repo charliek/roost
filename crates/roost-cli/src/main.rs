@@ -195,8 +195,10 @@ enum Cmd {
     /// `{}` on stdout — Claude treats nonzero as a failed hook.
     ClaudeHook {
         /// Hook event name. Accepts Claude Code's own `hook_event_name`
-        /// (`SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`,
-        /// `StopFailure`, `SessionEnd`) as well as the legacy CLI
+        /// (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+        /// `PermissionRequest`, `PermissionDenied`, `PostToolUse`,
+        /// `PostToolUseFailure`, `Notification`, `Stop`, `StopFailure`,
+        /// `SessionEnd`) as well as the legacy CLI
         /// spellings this binary wrote into `claude-settings.json`
         /// before this event set existed (`session-start`,
         /// `prompt-submit`, `notification`, `stop`, `session-end`) —
@@ -1174,9 +1176,12 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     // a closed reader, even though only some events use the payload.
     let mut stdin_buf = Vec::with_capacity(4096);
     let _ = std::io::stdin().take(1 << 20).read_to_end(&mut stdin_buf);
-    let payload: serde_json::Value =
-        serde_json::from_slice(&stdin_buf).unwrap_or(serde_json::Value::Null);
-    let payload = with_default_session(payload, tab_id);
+    let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
+        if std::env::var("ROOST_DEBUG").is_ok() {
+            eprintln!("roostctl claude-hook: unparseable payload for event: {event}");
+        }
+        return Ok(());
+    };
 
     let reports = canonical_hook_event(event)
         .map(|name| claude_event_to_reports(name, &payload, tab_id))
@@ -1207,6 +1212,26 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
             .await;
     }
     Ok(())
+}
+
+/// Decode a hook's stdin into the payload the adapter should see, or
+/// `None` when the body must map to nothing.
+///
+/// Stdin that arrived but does not parse is corrupt or foreign traffic.
+/// Without this, [`with_default_session`] would hand the adapter a
+/// synthesized `manual:<tab>` object with none of the sending agent's
+/// discriminators left in it, and a `SessionStart` would claim the tab
+/// away from its real owner — grok and cursor both execute
+/// Claude-format hooks, so that traffic is not hypothetical. Genuinely
+/// absent stdin is the different, documented by-hand case, so only a
+/// non-empty unparseable body is rejected.
+fn hook_payload(stdin_buf: &[u8], tab_id: i64) -> Option<serde_json::Value> {
+    let payload = if stdin_buf.iter().all(u8::is_ascii_whitespace) {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(stdin_buf).ok()?
+    };
+    Some(with_default_session(payload, tab_id))
 }
 
 /// Give a payload without a `session_id` a deterministic per-tab one.
@@ -1653,6 +1678,56 @@ mod tests {
         ]
       }
     ],
+    "PermissionDenied": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook PermissionDenied",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook PermissionRequest",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook PostToolUse",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook PostToolUseFailure",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook PreToolUse",
+            "type": "command"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
@@ -1746,6 +1821,52 @@ mod tests {
             assert_eq!(end[0].ownership_action, OwnershipAction::Release);
             assert_eq!(end[0].session_id, "manual:7");
         }
+    }
+
+    /// Truncated or foreign stdin must map to nothing. grok and cursor
+    /// both execute Claude-format hooks, so a body that fails to parse
+    /// is real traffic from another agent — and synthesizing a session
+    /// for it would hand `SessionStart` an unconditional claim that
+    /// evicts that agent's own owner, permanently: no release it ever
+    /// sends can match `manual:7`.
+    #[test]
+    fn stdin_that_does_not_parse_yields_no_payload() {
+        for body in [
+            &br#"{"hookEventName":"session_start""#[..],
+            &b"not json at all"[..],
+            &b"{"[..],
+        ] {
+            assert!(
+                hook_payload(body, 7).is_none(),
+                "unparseable body accepted: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// The by-hand flow `docs/development/claude-testing.md` documents
+    /// runs the hook with no stdin at all. That is absence, not
+    /// corruption, and must keep working.
+    #[test]
+    fn absent_stdin_still_gets_a_synthesized_session() {
+        for body in [&b""[..], &b"  \n\t "[..]] {
+            let payload = hook_payload(body, 7).expect("absent stdin rejected");
+            assert_eq!(
+                payload.get("session_id").and_then(|v| v.as_str()),
+                Some("manual:7")
+            );
+            let start = claude_event_to_reports("session-start", &payload, 7);
+            assert_eq!(start[0].ownership_action, OwnershipAction::Claim);
+        }
+    }
+
+    #[test]
+    fn a_well_formed_payload_reaches_the_adapter_unchanged() {
+        let payload = hook_payload(br#"{"session_id":"abc123"}"#, 7).expect("rejected");
+        assert_eq!(
+            payload.get("session_id").and_then(|v| v.as_str()),
+            Some("abc123")
+        );
     }
 
     #[test]

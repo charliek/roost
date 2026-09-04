@@ -112,6 +112,19 @@ def agent_tab(roost, project) -> int:
     return tab
 
 
+def wait_detail(roost, tab: int, detail: str, what: str) -> None:
+    """Wait until the tab owner's `detail` field holds `detail`.
+
+    The barrier for a report whose visible effect may be nothing:
+    `wait_notification` returns on a stale pending bit and
+    `wait_lifecycle` on an unchanged lifecycle, but `detail` merges even
+    when a `lifecycle_if` guard vetoes the patch. So this is what proves
+    a report reached the state machine rather than being dropped."""
+    roost._wait(
+        lambda: (roost.ownership(tab) or {}).get("detail") == detail, 5.0, what
+    )
+
+
 # ---------------------------------------------------------------------------
 # The full turn
 # ---------------------------------------------------------------------------
@@ -230,6 +243,78 @@ def test_stop_failure_is_failed_but_legacy_state_stays_closed(roost, project, ta
     roost.wait_lifecycle(tab, "finished")
 
 
+def test_permission_request_blocks_then_post_tool_use_resumes(roost, project, target):
+    """Plan 046 §3.1: `PermissionRequest` is the immediate blocked
+    signal, and the `permission_prompt` notification that follows it ~6s
+    later is guarded on `working` so the prompt banners exactly once.
+
+    The probe order is `PreToolUse -> PermissionRequest -> (dialog) ->
+    PostToolUse` — there is no second `PreToolUse` after an approval, so
+    `PostToolUse` is what takes the tab back to `working`. That is the
+    regression test for the orange-after-approval defect: before this,
+    the only path back was the next `UserPromptSubmit`."""
+    tab = agent_tab(roost, project)
+    session = "sess-permission-request"
+    claude_hook(target, tab, "SessionStart", {"session_id": session, "source": "startup"})
+    claude_hook(target, tab, "UserPromptSubmit", {"session_id": session, "prompt": "go"})
+    roost.wait_lifecycle(tab, "working")
+
+    claude_hook(target, tab, "PreToolUse", {"session_id": session, "tool_name": "Bash"})
+    wait_detail(roost, tab, "pre_tool_use", "PreToolUse landed")
+    assert roost.agent_lifecycle(tab) == "working", roost.tab(tab)
+
+    claude_hook(target, tab, "PermissionRequest", {"session_id": session, "tool_name": "Bash"})
+    roost.wait_lifecycle(tab, "waiting")
+    assert roost.tab(tab)["state"] == "needs_input"
+    roost.wait_notification(tab, True)
+
+    # Arm the "exactly one banner" assertion: with the pending bit down,
+    # a second `attention: set` would be visible on its own.
+    roost.clear_notification(tab)
+    roost.wait_notification(tab, False)
+
+    claude_hook(target, tab, "Notification", {
+        "session_id": session,
+        "notification_type": "permission_prompt",
+        "message": "Claude needs your permission to use Bash",
+    })
+    wait_detail(roost, tab, "permission_prompt", "the late permission_prompt landed")
+    assert roost.agent_lifecycle(tab) == "waiting", roost.tab(tab)
+    assert not roost.has_notification(tab), "the prompt must banner exactly once"
+
+    claude_hook(target, tab, "PostToolUse", {"session_id": session, "tool_name": "Bash"})
+    roost.wait_lifecycle(tab, "working")
+    assert roost.tab(tab)["state"] == "running"
+
+
+def test_idle_prompt_after_stop_failure_keeps_failed(roost, project, target):
+    """The other half of the `idle_prompt` guard (plan 046 §3.1): it now
+    finishes a turn, but only from `working`. A `failed` turn is the
+    loudest lifecycle Roost has and a ~60s timer is no evidence the
+    failure resolved, so the nag lands vetoed — accepted, `detail`
+    merged, lifecycle and banner untouched."""
+    tab = agent_tab(roost, project)
+    session = "sess-idle-after-failed"
+    claude_hook(target, tab, "SessionStart", {"session_id": session, "source": "startup"})
+    claude_hook(target, tab, "UserPromptSubmit", {"session_id": session, "prompt": "go"})
+    roost.wait_lifecycle(tab, "working")
+
+    claude_hook(target, tab, "StopFailure", {"session_id": session, "error": "overloaded"})
+    roost.wait_lifecycle(tab, "failed")
+    roost.wait_notification(tab, True)
+    roost.clear_notification(tab)
+    roost.wait_notification(tab, False)
+
+    claude_hook(target, tab, "Notification", {
+        "session_id": session,
+        "notification_type": "idle_prompt",
+        "message": "Claude is waiting for your input",
+    })
+    wait_detail(roost, tab, "idle_prompt", "the idle_prompt nag landed")
+    assert roost.agent_lifecycle(tab) == "failed", roost.tab(tab)
+    assert not roost.has_notification(tab), "a vetoed nag must not re-banner"
+
+
 def test_unknown_notification_type_notifies_without_moving_lifecycle(roost, project, target):
     """`notification_type` is a free string, so unknown values are
     expected. They fire the notification but leave lifecycle alone: the
@@ -277,14 +362,9 @@ def test_idle_prompt_after_stop_keeps_finished(roost, project, target):
         "notification_type": "idle_prompt",
         "message": "Claude is waiting for your input",
     })
-    # `wait_notification` would order nothing here — the preceding Stop
-    # already set the pending bit, so it returns on the stale value. The
-    # adapter stamps `detail` unconditionally, so that is the barrier.
-    roost._wait(
-        lambda: (roost.ownership(tab) or {}).get("detail") == "idle_prompt",
-        5.0,
-        "the idle_prompt notification landed",
-    )
+    # The preceding Stop already set the pending bit, so `wait_notification`
+    # would order nothing here.
+    wait_detail(roost, tab, "idle_prompt", "the idle_prompt notification landed")
 
     assert roost.agent_lifecycle(tab) == "finished", roost.tab(tab)
     assert roost.tab(tab)["state"] == "idle"

@@ -12,19 +12,24 @@
 //! `prompt_id?`, `permission_mode?`, `agent_id?`.
 //!
 //! ```text
-//! SessionStart      source: "startup"|"resume"|"clear"|"compact"|"fork"
-//!                   agent_type?  model?  session_title?
-//! UserPromptSubmit  prompt
-//!                   source?: "user"|"sdk"|"system"|"loop_wakeup"|"schedule_wakeup"
-//! Notification      message, title?, notification_type   <- a free STRING, not an enum
-//! Stop              stop_hook_active, last_assistant_message?
-//!                   background_tasks?: [{id, type, status, description, command?,
-//!                                        agent_type?}]
-//!                   session_crons?:   [{id, schedule, recurring, prompt}]
-//! StopFailure       error: <enum>, error_details?, last_assistant_message?
-//!                       <- the field is `error`, NOT `error_type`
-//! SessionEnd        reason: "clear"|"resume"|"logout"|"prompt_input_exit"
-//!                           |"other"|"bypass_permissions_disabled"
+//! SessionStart       source: "startup"|"resume"|"clear"|"compact"|"fork"
+//!                    agent_type?  model?  session_title?
+//! UserPromptSubmit   prompt
+//!                    source?: "user"|"sdk"|"system"|"loop_wakeup"|"schedule_wakeup"
+//! PreToolUse         tool_name, tool_input, tool_use_id
+//! PermissionRequest  tool_name, tool_input, permission_suggestions?
+//! PermissionDenied   tool_name
+//! PostToolUse        tool_name, tool_input, tool_response, duration_ms
+//! PostToolUseFailure tool_name
+//! Notification       message, title?, notification_type  <- a free STRING, not an enum
+//! Stop               stop_hook_active, last_assistant_message?
+//!                    background_tasks?: [{id, type, status, description, command?,
+//!                                         agent_type?}]
+//!                    session_crons?:   [{id, schedule, recurring, prompt}]
+//! StopFailure        error: <enum>, error_details?, last_assistant_message?
+//!                        <- the field is `error`, NOT `error_type`
+//! SessionEnd         reason: "clear"|"resume"|"logout"|"prompt_input_exit"
+//!                            |"other"|"bypass_permissions_disabled"
 //! ```
 //!
 //! `StopFailure.error` is one of `authentication_failed`,
@@ -47,11 +52,20 @@
 //! Subagent completion arrives as `SubagentStop`, a distinct event Roost
 //! does not register. `agent_id` is handled here as defense in depth, not
 //! as a fix for a reachable bug.
+//!
+//! The tool events (plan 046 §3.1) were added from the 2026-09-04 probe,
+//! which pinned the order `PreToolUse → PermissionRequest → (dialog) →
+//! PostToolUse`. There is no second `PreToolUse` after an approval, so
+//! the tab returns to `working` when the approved tool *finishes*, not
+//! when it starts — the honest consequence of the contract, documented
+//! rather than papered over.
 
 use roost_ipc::agent::{
     AgentLifecycle, AttentionOp, OwnershipAction, Severity, TabAgentReportParams,
 };
 use serde_json::Value;
+
+use crate::common::{array_len, field, has_field, non_empty, parse_normalized};
 
 /// Ownership `source` for every report this adapter emits.
 pub const SOURCE: &str = "claude";
@@ -60,9 +74,17 @@ pub const SOURCE: &str = "claude";
 /// vocabulary: `roostctl claude install` writes these names into
 /// `claude-settings.json`, and [`canonical_hook_event`] resolves every
 /// accepted spelling onto them.
-pub const CLAUDE_HOOK_EVENTS: [&str; 6] = [
+///
+/// Listed in the order a turn fires them, which is also the order the
+/// probe recorded.
+pub const CLAUDE_HOOK_EVENTS: [&str; 11] = [
     EventKind::SessionStart.canonical(),
     EventKind::UserPromptSubmit.canonical(),
+    EventKind::PreToolUse.canonical(),
+    EventKind::PermissionRequest.canonical(),
+    EventKind::PermissionDenied.canonical(),
+    EventKind::PostToolUse.canonical(),
+    EventKind::PostToolUseFailure.canonical(),
     EventKind::Notification.canonical(),
     EventKind::Stop.canonical(),
     EventKind::StopFailure.canonical(),
@@ -95,8 +117,36 @@ pub fn claude_event_to_reports(
     payload: &Value,
     tab_id: i64,
 ) -> Vec<TabAgentReportParams> {
-    // Recognize the event before touching the payload: an unmapped
-    // event must cost nothing, whatever size string it arrived with.
+    // grok and cursor execute Claude-format hooks too — grok when a
+    // Claude-shaped settings file is configured, cursor unconditionally
+    // through its `claudeUserHooks` path — so with Roost's Claude
+    // entries installed either would run `agent-hook claude` on its own
+    // events and alternate ownership with its real adapter. That is not
+    // cosmetic: a claim is unconditional, so a stray one evicts the real
+    // owner and no release from that owner can ever match again.
+    //
+    // Claude's own payloads are snake_case only (verified across the
+    // whole probe log), which makes grok's camelCase `hookEventName`
+    // twin a positive discriminator rather than a heuristic;
+    // `conversation_id` and `cursor_version` are cursor's.
+    for foreign in ["hookEventName", "conversation_id", "cursor_version"] {
+        if payload.get(foreign).is_some() {
+            return Vec::new();
+        }
+    }
+
+    // A payload that is not an object carries no discriminator to
+    // reject and no `session_id` to scope by, so every accessor below
+    // would read as "absent" and a `SessionStart` would claim the tab
+    // for an id nothing can release. Foreign or corrupt traffic must
+    // cost nothing, so it maps to nothing.
+    if !payload.is_object() {
+        return Vec::new();
+    }
+
+    // Recognize the event before touching the rest of the payload: an
+    // unmapped event must cost nothing, whatever size string it arrived
+    // with.
     let Some(kind) = EventKind::parse(event) else {
         return Vec::new();
     };
@@ -119,6 +169,11 @@ pub fn claude_event_to_reports(
     let mut report = match kind {
         EventKind::SessionStart => session_start(base, payload),
         EventKind::UserPromptSubmit => user_prompt_submit(base),
+        EventKind::PreToolUse => tool_progress(base, "pre_tool_use"),
+        EventKind::PostToolUse => tool_progress(base, "post_tool_use"),
+        EventKind::PostToolUseFailure => tool_progress(base, "post_tool_use_failure"),
+        EventKind::PermissionDenied => tool_progress(base, "permission_denied"),
+        EventKind::PermissionRequest => permission_request(base, payload),
         EventKind::Notification => notification(base, payload),
         EventKind::Stop => stop(base, payload),
         EventKind::StopFailure => stop_failure(base, payload),
@@ -140,6 +195,9 @@ pub fn claude_event_to_reports(
         }
         report.ownership_action = OwnershipAction::Preserve;
         report.lifecycle = None;
+        // With no lifecycle left to patch, a surviving guard would only
+        // gate the notification — the one thing this branch is keeping.
+        report.lifecycle_if = None;
         report.detail.clear();
         report.metadata.clear();
     }
@@ -167,34 +225,70 @@ fn user_prompt_submit(mut report: TabAgentReportParams) -> TabAgentReportParams 
     report
 }
 
+/// `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionDenied`
+/// — the turn is running. A denied or failed tool is not a failed turn:
+/// Claude keeps going and reports the outcome itself.
+fn tool_progress(mut report: TabAgentReportParams, detail: &str) -> TabAgentReportParams {
+    report.lifecycle = Some(AgentLifecycle::Working);
+    report.detail = detail.to_string();
+    report
+}
+
+fn permission_request(mut report: TabAgentReportParams, payload: &Value) -> TabAgentReportParams {
+    report.lifecycle = Some(AgentLifecycle::Waiting);
+    report.attention = AttentionOp::Set;
+    report.severity = Severity::Warn;
+    report.title = TITLE.to_string();
+    report.body = match non_empty(field(payload, "tool_name")) {
+        Some(tool) => format!("Needs permission to use `{tool}`"),
+        None => "Needs permission to use a tool".to_string(),
+    };
+    report.detail = "permission_request".to_string();
+    report
+}
+
 fn notification(mut report: TabAgentReportParams, payload: &Value) -> TabAgentReportParams {
     let kind = field(payload, "notification_type");
 
-    // Only the three blocking types move the lifecycle. Every other value
-    // — the known informational ones and any string this build has never
-    // seen — fires the notification but leaves lifecycle alone. That
-    // asymmetry is deliberate: `notification_type` is an open string, so
-    // new values are expected, and a false `waiting` is worse than a
-    // missed one because the state dot is sticky and would wrongly read
+    // `notification_type` is an open string, so new values are expected
+    // and the default is deliberately timid: fire the notification,
+    // leave lifecycle alone. A false `waiting` is worse than a missed
+    // one, because the state dot is sticky and would wrongly read
     // "blocked" while the notification reaches the user either way.
     //
-    // `idle_prompt` is excluded for exactly that reason: it is a timer nag
-    // Claude fires after a turn has already ended, not evidence the
-    // session is blocked. Treating it as blocking flipped a finished
-    // session's gray "Finished" to a false orange "Waiting for input"
-    // ~60s later, indistinguishable from a real permission prompt. The
-    // nag still notifies — at info severity, via the lifecycle-derived
-    // severity below — only the lifecycle stays untouched.
-    report.lifecycle = match kind {
-        "permission_prompt" | "agent_needs_input" | "elicitation_dialog" => {
-            Some(AgentLifecycle::Waiting)
+    // The two guarded rows exist because these notifications are timers,
+    // not transitions, and Claude will happily fire one at a turn that
+    // has already moved on:
+    //
+    // * `permission_prompt` arrives ~6 s after `PermissionRequest`
+    //   already moved the tab to `waiting`, so in the normal order it
+    //   fires vetoed and does not banner a second time. It still does
+    //   the whole job on a legacy settings file that has no
+    //   `PermissionRequest` hook, where `working` is the live state.
+    // * `idle_prompt` is a ~60 s nag, but it is also the *only* later
+    //   signal after an Esc interrupt (Claude has no interrupt hook).
+    //   Guarding it on `working` lets it end an interrupted turn while
+    //   leaving a real `waiting` or `failed` alone — the reason the
+    //   pre-046 mapping refused to touch lifecycle here at all.
+    let (lifecycle, lifecycle_if, severity) = match kind {
+        "permission_prompt" => (
+            Some(AgentLifecycle::Waiting),
+            Some(vec![AgentLifecycle::Working]),
+            Severity::Warn,
+        ),
+        "idle_prompt" => (
+            Some(AgentLifecycle::Finished),
+            Some(vec![AgentLifecycle::Working]),
+            Severity::Info,
+        ),
+        "agent_needs_input" | "elicitation_dialog" => {
+            (Some(AgentLifecycle::Waiting), None, Severity::Warn)
         }
-        _ => None,
+        _ => (None, None, Severity::Info),
     };
-    report.severity = match report.lifecycle {
-        Some(_) => Severity::Warn,
-        None => Severity::Info,
-    };
+    report.lifecycle = lifecycle;
+    report.lifecycle_if = lifecycle_if;
+    report.severity = severity;
     report.attention = AttentionOp::Set;
     report.title = non_empty(field(payload, "title"))
         .unwrap_or(TITLE)
@@ -275,6 +369,11 @@ fn session_end(mut report: TabAgentReportParams) -> TabAgentReportParams {
 enum EventKind {
     SessionStart,
     UserPromptSubmit,
+    PreToolUse,
+    PermissionRequest,
+    PermissionDenied,
+    PostToolUse,
+    PostToolUseFailure,
     Notification,
     Stop,
     StopFailure,
@@ -282,41 +381,40 @@ enum EventKind {
 }
 
 impl EventKind {
-    /// Matches without allocating, so an unrecognized event of any
-    /// length costs only the comparison.
     fn parse(event: &str) -> Option<EventKind> {
-        let eq = |want: &str| {
-            let mut w = want.bytes();
-            let matched = event
-                .bytes()
-                .filter(u8::is_ascii_alphanumeric)
-                .all(|c| w.next() == Some(c.to_ascii_lowercase()));
-            matched && w.next().is_none()
-        };
-        for (name, kind) in [
-            ("sessionstart", EventKind::SessionStart),
-            ("userpromptsubmit", EventKind::UserPromptSubmit),
-            // `roostctl`'s own legacy spelling, which every settings file
-            // an already-run `claude install` wrote still uses. It shares
-            // no run of characters with `UserPromptSubmit`, so
-            // normalization alone can't reach it.
-            ("promptsubmit", EventKind::UserPromptSubmit),
-            ("notification", EventKind::Notification),
-            ("stopfailure", EventKind::StopFailure),
-            ("stop", EventKind::Stop),
-            ("sessionend", EventKind::SessionEnd),
-        ] {
-            if eq(name) {
-                return Some(kind);
-            }
-        }
-        None
+        parse_normalized(
+            event,
+            &[
+                ("sessionstart", EventKind::SessionStart),
+                ("userpromptsubmit", EventKind::UserPromptSubmit),
+                // `roostctl`'s own legacy spelling, which every settings
+                // file an already-run `claude install` wrote still uses.
+                // It shares no run of characters with
+                // `UserPromptSubmit`, so normalization alone can't reach
+                // it.
+                ("promptsubmit", EventKind::UserPromptSubmit),
+                ("pretooluse", EventKind::PreToolUse),
+                ("permissionrequest", EventKind::PermissionRequest),
+                ("permissiondenied", EventKind::PermissionDenied),
+                ("posttooluse", EventKind::PostToolUse),
+                ("posttoolusefailure", EventKind::PostToolUseFailure),
+                ("notification", EventKind::Notification),
+                ("stopfailure", EventKind::StopFailure),
+                ("stop", EventKind::Stop),
+                ("sessionend", EventKind::SessionEnd),
+            ],
+        )
     }
 
     const fn canonical(self) -> &'static str {
         match self {
             EventKind::SessionStart => "SessionStart",
             EventKind::UserPromptSubmit => "UserPromptSubmit",
+            EventKind::PreToolUse => "PreToolUse",
+            EventKind::PermissionRequest => "PermissionRequest",
+            EventKind::PermissionDenied => "PermissionDenied",
+            EventKind::PostToolUse => "PostToolUse",
+            EventKind::PostToolUseFailure => "PostToolUseFailure",
             EventKind::Notification => "Notification",
             EventKind::Stop => "Stop",
             EventKind::StopFailure => "StopFailure",
@@ -325,23 +423,51 @@ impl EventKind {
     }
 }
 
-fn field<'a>(payload: &'a Value, key: &str) -> &'a str {
-    payload.get(key).and_then(Value::as_str).unwrap_or("")
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Present and non-null. `agent_id: null` is JSON's way of saying the
-/// key isn't carrying a value, so it reads as absent.
-fn has_field(payload: &Value, key: &str) -> bool {
-    payload.get(key).is_some_and(|v| !v.is_null())
-}
-
-fn non_empty(value: &str) -> Option<&str> {
-    (!value.is_empty()).then_some(value)
-}
-
-fn array_len(payload: &Value, key: &str) -> usize {
-    payload
-        .get(key)
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
+    /// Every mapped event must also be an *installed* one. A variant
+    /// added to `EventKind` but left out of `CLAUDE_HOOK_EVENTS` would
+    /// be understood by the adapter and never written into any agent's
+    /// config, so it could only ever arrive by hand. The match below
+    /// stops compiling when a variant is added, which is what forces
+    /// this list to be updated alongside the enum.
+    #[test]
+    fn every_event_kind_is_an_installed_hook_event() {
+        let all = [
+            EventKind::SessionStart,
+            EventKind::UserPromptSubmit,
+            EventKind::PreToolUse,
+            EventKind::PermissionRequest,
+            EventKind::PermissionDenied,
+            EventKind::PostToolUse,
+            EventKind::PostToolUseFailure,
+            EventKind::Notification,
+            EventKind::Stop,
+            EventKind::StopFailure,
+            EventKind::SessionEnd,
+        ];
+        for kind in all {
+            match kind {
+                EventKind::SessionStart
+                | EventKind::UserPromptSubmit
+                | EventKind::PreToolUse
+                | EventKind::PermissionRequest
+                | EventKind::PermissionDenied
+                | EventKind::PostToolUse
+                | EventKind::PostToolUseFailure
+                | EventKind::Notification
+                | EventKind::Stop
+                | EventKind::StopFailure
+                | EventKind::SessionEnd => {}
+            }
+            assert!(
+                CLAUDE_HOOK_EVENTS.contains(&kind.canonical()),
+                "{} is mapped but never installed",
+                kind.canonical()
+            );
+        }
+        assert_eq!(all.len(), CLAUDE_HOOK_EVENTS.len());
+    }
 }

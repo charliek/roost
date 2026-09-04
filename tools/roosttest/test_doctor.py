@@ -85,9 +85,17 @@ TAB_AXIS_IDS = (
 # `test_doctor_is_read_only`.
 AGENT_AXES = ("agent_lifecycle", "ownership", "has_notification", "hook_active")
 
+# Must stay `roost_agent::claude::CLAUDE_HOOK_EVENTS`: doctor's
+# `claude.hook_events` check fails a settings file that is missing any
+# of them, so a stale list here reads as a product bug.
 CLAUDE_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PermissionDenied",
+    "PostToolUse",
+    "PostToolUseFailure",
     "Notification",
     "Stop",
     "StopFailure",
