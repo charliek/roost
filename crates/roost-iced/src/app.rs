@@ -77,6 +77,7 @@ use crate::{chrome, input};
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 pub(crate) mod bootstrap;
 mod host_dialog;
+pub(crate) mod host_lifecycle;
 pub(crate) mod host_notice;
 pub(crate) mod host_tab;
 mod interactions;
@@ -2375,24 +2376,11 @@ impl App {
     }
 
     /// Classify a saved host's target and hand it to the connection set.
-    /// `mode` answers what to do with a resolved target, and `None`
-    /// declines the connection — which is how the launch probe skips a
-    /// remote host without duplicating the classification.
     ///
-    /// Three transports, two shapes. A local session and a socket path
-    /// both resolve to a socket that already exists, so they dial
-    /// straight away. An ssh target has no socket until a tunnel binds
-    /// one, so it goes through [`crate::host_conn::HostConnSet::open_ssh`]
-    /// and reaches `connect` one feed item later — see
-    /// [`crate::engine_feed::EngineFeed::HostTunnel`].
-    ///
-    /// Every dial route ends here, which is why the shutdown gate is here
-    /// too. `abandon_reconnects` rides the `ExitState` latch and so sweeps
-    /// exactly once; a bootstrap job whose success arm asks for a
-    /// reconnect, or an IPC `host.connect` serviced in a later `update`,
-    /// would otherwise establish a fresh `ControlPersist` master that
-    /// outlives the app. The two earlier guards stay where they are —
-    /// they short-circuit before doing other work.
+    /// The decision — the shutdown gate, the probe cancel, the
+    /// classification and the three-way dispatch — is
+    /// [`host_lifecycle::dial_saved_host`]'s; this is the delegation
+    /// that hands it the app's state.
     fn connect_saved_host(
         &mut self,
         host: &roost_engine::persistence::HostSnapshot,
@@ -2400,78 +2388,29 @@ impl App {
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
         cause: crate::host_conn::AttemptCause,
     ) {
-        use crate::host_conn::HostTransport;
-        use roost_ipc::ssh::ResolvedTransport;
-
-        if self.exit_state != ExitState::Running {
-            tracing::debug!(host = %host.id, "not connecting a host during shutdown");
-            return;
-        }
-        // A new attempt replaces the origin and the failure an in-flight
-        // probe's question was built on, so that probe is now asking
-        // about something that is no longer happening: user Connect →
-        // probe out → an IPC `host.connect` supersedes it → a consent
-        // card raised at nobody. Superseding the probe is not enough —
-        // nothing would re-arm it.
-        self.cancel_bootstrap_probe(&host.id);
-        let transport = match roost_ipc::ssh::classify(&host.target) {
-            Ok(transport) => transport,
-            Err(error) => {
-                tracing::warn!(host = %host.id, ?error, "cannot resolve a saved host's target");
-                return;
-            }
-        };
-        let localhost = transport.is_localhost();
-        let Some(mode) = mode(localhost) else {
-            return;
-        };
-        let mode = spawn_gate(mode, host_verbs::VerbPolicy::current());
-        // The one place the transport becomes the connection set's own
-        // vocabulary. Everything downstream that used to ask "is this
-        // localhost?" — the spawn ladder, the auto-retry policy, and now
-        // what a build mismatch can offer — reads it off this value, so
-        // the three answers cannot disagree.
-        match transport {
-            ResolvedTransport::LocalSession(socket) => self.hosts.connect(
-                &host.id,
-                &host.label,
-                socket,
-                HostTransport::LocalSession,
-                mode,
-                cause,
-            ),
-            ResolvedTransport::UnixSocket(socket) => self.hosts.connect(
-                &host.id,
-                &host.label,
-                socket,
-                HostTransport::UnixSocket,
-                mode,
-                cause,
-            ),
-            ResolvedTransport::Ssh(target) => {
-                self.hosts
-                    .open_ssh(&host.id, &host.label, target, mode, origin, cause)
-            }
-        }
+        host_lifecycle::dial_saved_host(
+            self.exit_state,
+            &mut self.hosts,
+            &mut self.bootstraps,
+            host,
+            origin,
+            mode,
+            cause,
+            host_verbs::VerbPolicy::current(),
+        );
     }
 
     /// An ssh tunnel finished coming up, or failed to. Dialing is the
-    /// set's; the toast and the offer are the app's.
+    /// set's (and the shutdown gate
+    /// [`host_lifecycle::tunnel_ready`]'s); the toast and the offer are
+    /// the app's.
     fn host_tunnel_ready(&mut self, ready: crate::host_conn::HostTunnelReady) {
-        // The same guard `host_reconnect_due` carries, for the window it
-        // cannot see (plan 040 §3.4): `EngineFeed::Quit` only latches the
-        // exit, so an establish that lands behind it in the same drain
-        // would otherwise dial a session while the app is shutting down
-        // — and `abandon_reconnects`, which runs after the drain, has
-        // nothing left to abort by then. The tunnel is still retired
-        // properly rather than dropped.
-        if self.exit_state != ExitState::Running {
-            tracing::debug!(host = %ready.host, "not connecting a host during shutdown");
-            self.hosts.discard_ready(ready);
+        let host_lifecycle::TunnelLanding::Landed { saved_id, reason } =
+            host_lifecycle::tunnel_ready(self.exit_state, &mut self.hosts, ready)
+        else {
             return;
-        }
-        let saved_id = ready.host.clone();
-        if let Some(reason) = self.hosts.tunnel_ready(ready) {
+        };
+        if let Some(reason) = reason {
             self.set_status(reason);
         }
         // The establish is one of the two places a `NotFound` can land —
@@ -5312,14 +5251,9 @@ impl App {
     /// consent path a raw re-entry would leave open, and its
     /// re-classification catches a host edited to a non-ssh target.
     fn host_reconnect_due(&mut self, saved_id: &str, request: u64) {
-        // `EngineFeed::Quit` does not stop the drain, so a due message
-        // sitting behind one would re-enter the connect path after the
-        // user asked to quit.
-        if self.exit_state != ExitState::Running {
-            tracing::debug!(host = %saved_id, "not reconnecting a host during shutdown");
-            return;
-        }
-        let Some((origin, cause)) = self.hosts.reconnect_due(saved_id, request) else {
+        let Some((origin, cause)) =
+            host_lifecycle::reconnect_due(self.exit_state, &mut self.hosts, saved_id, request)
+        else {
             return;
         };
         self.host_reconnect_requested(saved_id, origin, cause);
@@ -5878,36 +5812,14 @@ impl App {
         );
     }
 
-    /// A user-driven connect failed; decide whether Roost has an offer.
-    ///
-    /// Two families have one — `NotFound` ("nothing to exec over there")
-    /// and `NoSession` ("a binary, but nothing running") — and the probe
-    /// is what turns either into a specific card. Everything else is
-    /// left to the band and the toast exactly as plan 038 left it.
-    ///
-    /// **The origin is the gate, not attendedness.** An IPC
-    /// `host.connect` from `roostctl` arrives as the same
-    /// `ConnectMode::Dial` a click does, and raising a modal to ask a
-    /// machine a question is the one thing this must never do (plan 039
-    /// §3.5's non-interactive refusal). `RequestOrigin` is the only
-    /// place that difference survives.
+    /// A user-driven connect failed; raise the offer if there is one.
+    /// The decision — and the three reads it turns on — is
+    /// [`host_lifecycle::bootstrap_offer`]'s; this is the delegation
+    /// plus the probe it spawns.
     fn maybe_offer_bootstrap(&mut self, saved_id: &str) {
-        let failure = self.hosts.ssh_failure(saved_id).cloned();
-        let Some(session) = bootstrap::offer_for(
-            self.hosts.ssh_origin(saved_id),
-            failure.as_ref(),
-            self.hosts.ssh_reached_connected(saved_id),
-        ) else {
-            return;
-        };
-        self.start_bootstrap_probe(
-            saved_id,
-            bootstrap::OfferContext {
-                session,
-                session_is_newer: false,
-                failure,
-            },
-        );
+        if let Some(offer) = host_lifecycle::bootstrap_offer(&self.hosts, saved_id) {
+            self.start_bootstrap_probe(saved_id, offer);
+        }
     }
 
     /// Look at the far side, then raise the card that fits what is
@@ -5995,10 +5907,7 @@ impl App {
     /// the state the probe's question was asked about, so its answer can
     /// only describe something that has already stopped being true.
     fn cancel_bootstrap_probe(&mut self, saved_id: &str) {
-        if self.bootstraps.cancel_probe(saved_id) {
-            tracing::debug!(host = %saved_id, "a new attempt superseded a bootstrap probe");
-            self.hosts.set_bootstrap_note(saved_id, None);
-        }
+        host_lifecycle::cancel_bootstrap_probe(&mut self.hosts, &mut self.bootstraps, saved_id);
     }
 
     /// A bootstrap step reported back.

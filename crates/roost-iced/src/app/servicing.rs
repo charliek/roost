@@ -1347,27 +1347,25 @@ impl App {
                     self.apply_host_tab_frame(key, frame, &mut pty);
                 }
                 EngineFeed::HostState(host, state) => {
-                    let previous = match &state {
-                        crate::host_conn::HostConnState::Connecting { previous } => *previous,
-                        _ => None,
-                    };
-                    let connected = matches!(state, crate::host_conn::HostConnState::Connected);
-                    // A connection that *drops* is the second place a
-                    // classified ssh failure lands: the tunnel's own
-                    // per-connection exec is what failed, and
-                    // `overlay_ssh_reason` is what records its family.
-                    // Only a drop, so a Connecting/Connected transition
-                    // cannot re-raise a card for a failure already
-                    // answered.
-                    let dropped = matches!(state, crate::host_conn::HostConnState::Disconnected(_));
-                    if let Some(host) = self.hosts.apply_state(host, state) {
+                    // The transition itself — attribution, the drop's
+                    // probe cancel and the offer it may raise — is
+                    // `host_lifecycle::settle_host_state`'s; what is left
+                    // here is the window and the workspace it is spent
+                    // on.
+                    if let Some(edge) = host_lifecycle::settle_host_state(
+                        &mut self.hosts,
+                        &mut self.bootstraps,
+                        host,
+                        state,
+                    ) {
+                        let host = &edge.host;
                         // Stamp the registry the moment a connection
                         // settles — `last_connected` is what the Add Host
                         // list and a `roostctl host list` read to tell a
                         // host that has ever worked from one that never
                         // has, and nothing else writes it.
-                        if connected {
-                            if let Err(error) = self.workspace.touch_host_connected(&host) {
+                        if edge.connected {
+                            if let Err(error) = self.workspace.touch_host_connected(host) {
                                 tracing::debug!(%host, %error, "could not stamp last_connected");
                             }
                             // A session that just came up believes it is
@@ -1382,20 +1380,12 @@ impl App {
                         // app-side purge follows the set's — everything
                         // keyed by the dead incarnation is re-derived from
                         // the fresh mirror (plan 037 §3.2).
-                        if let Some(previous) = previous {
+                        if let Some(previous) = edge.previous {
                             self.purge_host_incarnation(previous);
                         }
-                        tracing::debug!(%host, "host connection state changed");
-                        if dropped {
-                            // The world the probe was asked about is
-                            // gone, whoever asked (plan 040 §3.6): the
-                            // confirmed-upgrade probe never consults
-                            // `offer_for` at all, so one still out at a
-                            // drop can land a card over a host that is
-                            // mid-ladder — and write a `bootstrap_note`
-                            // the band prefers over the reconnect copy.
-                            self.cancel_bootstrap_probe(&host);
-                            self.maybe_offer_bootstrap(&host);
+                        tracing::debug!(host = %edge.host, "host connection state changed");
+                        if let Some(offer) = edge.offer {
+                            self.start_bootstrap_probe(&edge.host, offer);
                         }
                     }
                     // The band's dot and rollup are cached with the rows;
