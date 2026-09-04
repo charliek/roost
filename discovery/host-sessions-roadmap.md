@@ -955,11 +955,14 @@ conditional-connect vs. HS-4d viewports) whose regression coverage —
 `host.status`, the lanes, the live harness — now exists *before* the
 wire changes; #383 is a testing investment that pairs with #386 and
 should land before #381's implementation, not before a release.
-Post-release order of work: **#387** (a far side that is merely
-restarting should not need a manual ↻ — the one "honest but unhelpful"
-first-release behavior) and the `reason`-overwrite wrinkle (an ssh
-family unreadable on the wire while a rung is armed) are the two cheap
-correctness follow-ups; then #383 + #386 together; then the #381
+Post-release order of work (updated 2026-09-03 after hand-testing the
+candidate): **#398** first — drag-reorder of a remote host's projects
+and tabs, the parity gap a user hits daily — then **#397** (the
+`ROOST_STATE_DIR` seam collision); then **#387** (a far side that is
+merely restarting should not need a manual ↻ — the one "honest but
+unhelpful" first-release behavior) and the `reason`-overwrite wrinkle
+(an ssh family unreadable on the wire while a rung is armed), the two
+cheap correctness follow-ups; then #383 + #386 together; then the #381
 conversation; HS-4c stays after that; #351 remains the top non-host
 post-release item.
 
@@ -1018,6 +1021,24 @@ post-release item.
 
 ### Post initial release
 
+- **[#398](https://github.com/charliek/roost/issues/398) Drag-reorder
+  projects and tabs within a remote host's section.** Found
+  hand-testing the v0.0.19 candidate: the LOCAL section reorders both,
+  a host section neither — a deliberate gap (host sections sit outside
+  the local reorder strip, and a host project's tab strip is disabled
+  because reordering its tabs is an op-queue mutation, not a local
+  reorder). The fix routes the drop to the session's own
+  `project.reorder` / `tab.reorder` over the host connection and lets
+  the mirror re-render from the session's events, with a
+  `test_host_client` case. **First item of the next release** — the
+  parity gap people hit daily.
+- **[#397](https://github.com/charliek/roost/issues/397) A spawned
+  `localhost` daemon inherits `ROOST_STATE_DIR`** and then refuses the
+  UI's own state lock. Real users never set the seam, and W2 reports it
+  honestly (`roost-session failed to start` with the daemon's verdict in
+  `detail`), but a UI launched with an isolated state dir can never
+  spawn its own daemon. Hand the daemon a derived dir when the seam is
+  set. Second, right behind #398.
 - **[#385](https://github.com/charliek/roost/issues/385) No seam to inject a tunnel failure**, so a session-drop
   family is unreachable from a unit test and the fire-time re-check
   needs a `#[cfg(test)]` enum arm. Contained and documented.
