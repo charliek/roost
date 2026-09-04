@@ -1370,6 +1370,39 @@ pub struct SidebarDumpProject {
     pub agents: Vec<SidebarDumpAgentRow>,
 }
 
+/// One tab of a host project, as the sidebar lists it.
+///
+/// `key` is the `h<incarnation>.<id>` spelling every host-qualified
+/// UI-socket op takes, so a caller that read this dump can focus or
+/// reorder the row without probing for the incarnation first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpHostTab {
+    pub key: String,
+    pub title: String,
+}
+
+/// One project of a host section, with its tabs in the mirror's order.
+/// `key` is the host-qualified spelling, as on [`SidebarDumpHostTab`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpHostProject {
+    pub key: String,
+    pub name: String,
+    pub tabs: Vec<SidebarDumpHostTab>,
+}
+
+/// One host section of the sidebar (plan 044 §3.1 d7).
+///
+/// `id` is the saved host's stable id — what a `host.*` verb is
+/// addressed to — and `state` is the section's own wire spelling, the
+/// same string `host.status` reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpHost {
+    pub id: String,
+    pub label: String,
+    pub state: String,
+    pub projects: Vec<SidebarDumpHostProject>,
+}
+
 /// `app.sidebar_dump` response — the sidebar's **last-rendered** agent
 /// rows, read from the same per-project cache the sidebar paints from
 /// (`RenderedAgentRow` on both UIs), not re-derived from the workspace
@@ -1383,6 +1416,18 @@ pub struct SidebarDumpProject {
 pub struct SidebarDumpResult {
     pub agents_visible: bool,
     pub projects: Vec<SidebarDumpProject>,
+    /// The host sections below LOCAL, in sidebar order — the
+    /// **authoritative** order the mirror holds, never the drag preview
+    /// the sidebar may be drawing for a moment. A dimmed section is
+    /// listed with the rows it retained; a host that has never
+    /// connected has no projects.
+    ///
+    /// `default` + `skip_serializing_if` because the Swift Mac app
+    /// answers this op too and never emits `hosts` (host sessions are
+    /// iced-only): its response has to keep decoding into this type,
+    /// and a UI with no host sections stays byte-identical on both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<SidebarDumpHost>,
 }
 
 /// `app.render_stats` request — read the running UI's render-path
@@ -3482,7 +3527,57 @@ mod tests {
                     agents: Vec::new(),
                 },
             ],
+            hosts: Vec::new(),
         });
+    }
+
+    #[test]
+    fn sidebar_dump_result_round_trips_host_sections() {
+        round_trip(&SidebarDumpResult {
+            agents_visible: false,
+            projects: Vec::new(),
+            hosts: vec![
+                SidebarDumpHost {
+                    id: "hs-1".to_string(),
+                    label: "workbench".to_string(),
+                    state: "connected".to_string(),
+                    projects: vec![SidebarDumpHostProject {
+                        key: "h3.4".to_string(),
+                        name: "roost".to_string(),
+                        tabs: vec![SidebarDumpHostTab {
+                            key: "h3.9".to_string(),
+                            title: "zsh".to_string(),
+                        }],
+                    }],
+                },
+                // A host that has never connected: header only.
+                SidebarDumpHost {
+                    id: "hs-2".to_string(),
+                    label: "laptop".to_string(),
+                    state: "disconnected".to_string(),
+                    projects: Vec::new(),
+                },
+            ],
+        });
+    }
+
+    /// The Swift Mac app answers `app.sidebar_dump` too and never emits
+    /// `hosts` — host sessions are iced-only — so its response has to
+    /// keep decoding, and a UI with no host sections has to stay
+    /// byte-identical to the pre-plan-044 shape on both sockets.
+    #[test]
+    fn sidebar_dump_result_hosts_is_absent_both_ways_when_empty() {
+        let without: SidebarDumpResult =
+            serde_json::from_str(r#"{"agents_visible":true,"projects":[]}"#).unwrap();
+        assert!(without.hosts.is_empty());
+
+        let encoded = serde_json::to_string(&SidebarDumpResult {
+            agents_visible: true,
+            projects: Vec::new(),
+            hosts: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(encoded, r#"{"agents_visible":true,"projects":[]}"#);
     }
 
     #[test]

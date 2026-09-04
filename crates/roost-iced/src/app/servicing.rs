@@ -67,6 +67,47 @@ fn no_connected_host() -> roost_engine::ipc::HostOpFailure {
     roost_engine::ipc::HostOpFailure::new("not-found", "no connected host with that incarnation")
 }
 
+/// One host section as `app.sidebar_dump` reports it (plan 044 §3.1 d7).
+///
+/// The rows come from the view's mirror clone, which is the
+/// **authoritative** order — a drag preview lives in the App's preview
+/// slot and is applied when the sidebar is built, never here. Keys are
+/// built through the wire ref types rather than formatted by hand, so
+/// the spelling this emits cannot drift from the one the reorder and
+/// focus ops parse. A never-connected host has no mirror, so it lists
+/// no projects and mints no `h0.…` key.
+fn host_dump(view: &HostView) -> SidebarDumpHost {
+    SidebarDumpHost {
+        id: view.saved_id.clone(),
+        label: view.label.clone(),
+        state: view.state.wire().to_string(),
+        projects: view
+            .projects
+            .iter()
+            .map(|project| SidebarDumpHostProject {
+                key: roost_ipc::messages::WireProjectRef::Host {
+                    host: view.host.raw(),
+                    project: project.id,
+                }
+                .to_string(),
+                name: project.name.clone(),
+                tabs: project
+                    .tabs
+                    .iter()
+                    .map(|tab| SidebarDumpHostTab {
+                        key: roost_ipc::messages::WireTabRef::Host {
+                            host: view.host.raw(),
+                            tab: tab.id,
+                        }
+                        .to_string(),
+                        title: tab.title.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 pub(crate) struct AgentMetricsResult {
     session: u64,
     claimed: Vec<String>,
@@ -1977,6 +2018,7 @@ impl App {
         SidebarDumpResult {
             agents_visible: self.config.show_sidebar_agents,
             projects,
+            hosts: self.host_views.iter().map(host_dump).collect(),
         }
     }
 
@@ -2502,6 +2544,35 @@ impl App {
                 let _ = reply.send(result);
             }
             UiRequest::SidebarDump { reply } => {
+                // The host half of the dump reads the `host_views`
+                // cache, which a reconcile refreshes — so without this
+                // the answer can lag the mirror by one event, exactly
+                // the staleness `host_status_op` refreshes for.
+                //
+                // Only half of that precedent is taken, deliberately.
+                // (1) No `refresh_sidebar_agents()`: this op's whole
+                // contract is that `projects[].agents` is the cache the
+                // sidebar paints from, so a refresh a UI forgot to run
+                // is wire-visible (plan 007 §3.8) — refreshing it here
+                // would make the op self-healing and blind. Safe
+                // because the count that pass recomputes
+                // (`HostView::agents`) is written and read inside that
+                // one function, so leaving it zeroed until the next
+                // reconcile changes nothing anyone reads. (2) No
+                // band/view pairing guard: `host_status_op` zips
+                // `host_sections` with `host_views` and has to refuse
+                // when a mid-list removal has mispaired them; this op
+                // zips nothing — each section is built from one view —
+                // so there is no pairing to be wrong.
+                //
+                // Honest about what this line is worth: it is a belt
+                // against a same-batch race that no test exercises.
+                // Deleting it leaves the lane green, because the tail
+                // reconcile of the batch that carried the event has
+                // already refreshed the cache by the time a follow-up
+                // request is served (plan 044 §8 records it as a
+                // known-unexercised path).
+                self.refresh_host_views();
                 let _ = reply.send(Ok(self.sidebar_dump()));
             }
             UiRequest::TabDispatchMouseEvent {

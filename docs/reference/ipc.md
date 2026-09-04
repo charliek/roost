@@ -808,6 +808,39 @@ appear, in sidebar order, including projects with zero agents.
 project drag is in progress: hiding the rows and flattening the sidebar
 during a drag are transient UI state, not part of this contract.
 
+#### `hosts` — the sections below LOCAL
+
+`projects` is this UI's own workspace. The host sections come back
+beside it, in sidebar order:
+
+```json
+{ "agents_visible": true,
+  "projects": [],
+  "hosts": [ { "id": "hs-2f1c", "label": "workbench", "state": "connected",
+               "projects": [ { "key": "h3.4", "name": "roost",
+                               "tabs": [ { "key": "h3.9", "title": "zsh" } ] } ] } ] }
+```
+
+`id` is the saved host's stable id — what a `host.*` verb is addressed
+to — and `state` is the section's own spelling, the same string
+`host.status` reports. Every `key` is the host-qualified
+`h<host>.<id>` form the UI socket's `tab.focus`, `tab.reorder` and
+`project.reorder` take, so a caller that read this dump can drive those
+ops without probing for the incarnation first.
+
+The order is the **authoritative** one — the mirror's, as the session
+last published it. The sidebar may be drawing a held drag preview for a
+moment after a drop; this op never reports it. The host views are
+refreshed before the read, so the answer cannot lag the mirror by an
+event. A dimmed (disconnected) section is listed with the rows it
+retained, still under the incarnation that published them; a host that
+has never connected has an empty `projects`.
+
+`hosts` is **omitted entirely** when there are none, so read it as
+absent-tolerant: host sessions are iced-only, and the Swift Mac app
+answers this op without the field at all. A UI with no host sections
+therefore returns byte-identical bodies on both.
+
 Ungated, read-only — always available, matching `app.window_metrics`.
 
 ### `app.render_stats` *(iced UI only)*

@@ -1186,3 +1186,427 @@ def test_roostctl_host_drives_the_same_registry_the_palette_does(host, roost, ta
     assert listed.returncode == 0, listed.stdout + listed.stderr
     assert f"{host.saved_id}  {host.label}" in listed.stdout, listed.stdout
     assert f"host:connect:{host.saved_id}" in host_row_ids(roost)
+
+
+# ---------------------------------------------------------------------------
+# 12. #398 — a host section reorders through the session
+# ---------------------------------------------------------------------------
+#
+# The drag gesture and these ops are one path (plan 044 §3.1 d3/d6): the
+# drop builds the same call. A mouse is not reachable from here, so the
+# lane drives the op and the gesture half is unit-tested in `roost-iced`.
+#
+# Every key below is read straight out of `app.sidebar_dump`'s `hosts`,
+# which is what makes these cases free of the incarnation probe every
+# other case in this file needs — the dump hands out the same
+# `h<incarnation>.<id>` spelling the ops take.
+
+
+def incarnation_of(key: str) -> str:
+    """The `h<incarnation>` half of a qualified key. A reconnect mints a
+    fresh one, which is how a case tells rebuilt rows from retained."""
+    return key.split(".", 1)[0]
+
+
+def bare(key: str) -> int:
+    """The id half of a qualified key — what the *session* calls the same
+    row, and the only spelling its own socket accepts."""
+    return int(key.split(".", 1)[1])
+
+
+def host_section(roost: Roost, saved_id: str) -> dict | None:
+    """This host's section of the sidebar, as `app.sidebar_dump` reports
+    it: the mirror's authoritative order, refreshed before the read."""
+    return roost.sidebar_host(saved_id)
+
+
+def host_project_row(roost: Roost, saved_id: str, project_id: int) -> dict | None:
+    section = host_section(roost, saved_id)
+    if section is None:
+        return None
+    return next((p for p in section["projects"] if bare(p["key"]) == project_id), None)
+
+
+def wait_host_project(roost, saved_id, project_id, ready, what, timeout=30.0) -> dict:
+    def settled():
+        row = host_project_row(roost, saved_id, project_id)
+        return row if row is not None and ready(row) else None
+
+    return wait_until(settled, timeout, what)
+
+
+def wait_host_section(roost, saved_id, ready, what, timeout=30.0) -> dict:
+    def settled():
+        section = host_section(roost, saved_id)
+        return section if section is not None and ready(section) else None
+
+    return wait_until(settled, timeout, what)
+
+
+def keys_of(rows: list[dict]) -> list[str]:
+    return [row["key"] for row in rows]
+
+
+def local_layout(roost: Roost) -> list[tuple[str, list[str]]]:
+    """The local workspace's project and tab ORDER, ids only.
+
+    AC2 is that a host reorder never touches this. Ids rather than whole
+    rows because the harness's own tabs keep moving `title` and
+    `last_active` underneath the comparison — the order is the claim.
+    """
+    return [(p["id"], [t["id"] for t in p["tabs"]]) for p in roost.list()]
+
+
+def capture_local_layout(roost: Roost) -> list[tuple[str, list[str]]]:
+    """[`local_layout`], with the fence's own precondition asserted.
+
+    A harness UI boots into an empty throwaway state dir, so left alone
+    the local workspace is one project with at most one tab — and a
+    layout with no order in it cannot detect a reorder, only a row
+    appearing or vanishing. The `local_rows` fixture seeds the order;
+    this refuses to stand in as a fence if it ever stops doing so.
+    """
+    layout = local_layout(roost)
+    assert len(layout) >= 2, f"too few local projects for AC2 to be falsifiable: {layout}"
+    assert any(len(tabs) >= 2 for _, tabs in layout), (
+        f"no local project has two tabs, so no local tab order exists to disturb: {layout}"
+    )
+    return layout
+
+
+def refused(call, *args) -> RoostError:
+    with pytest.raises(RoostError) as raised:
+        call(*args)
+    return raised.value
+
+
+@pytest.fixture
+def local_rows(roost):
+    """Two local projects, two tabs each — enough LOCAL order for AC2's
+    "the local workspace was not touched" to be able to fail.
+
+    Also the source of the *local* ids the mixed-spelling controls need:
+    the dangerous mixed arms are the ones naming a local project, and a
+    made-up id would be refused for being unknown rather than for being
+    mixed.
+    """
+    made = []
+    try:
+        for suffix in ("one", "two"):
+            pid = roost.create_project(name=f"local-{suffix}", cwd="/tmp")
+            made.append(pid)
+            for _ in range(2):
+                roost.open_tab(pid, cwd="/tmp", argv=["/bin/sh", "-c", "exec sleep 300"])
+        yield made
+    finally:
+        for pid in made:
+            try:
+                roost.delete_project(pid)
+            except RoostError:
+                pass
+
+
+def barrier_on_the_project_axis(roost: Roost, session: Roost, saved_id: str) -> None:
+    """Push one known-good op through this host's op queue and wait for
+    the session to act on it.
+
+    Why any barrier: a refusal that wrongly forwarded *before* refusing
+    would land on the session a network hop later, long after a
+    synchronous read had already passed. The op queue is FIFO, so once a
+    later op has been applied over there, the leak — if there was one —
+    has been applied too, and the caller's "nothing moved" assertion can
+    finally fail.
+
+    Why the OTHER axis: restoring the axis under test would overwrite the
+    very mutation being looked for, which is what makes a same-axis
+    barrier worthless.
+    """
+    section = wait_host_section(
+        roost,
+        saved_id,
+        lambda section: len(section["projects"]) >= 2,
+        "two host projects, so the barrier op has a project order to move",
+    )
+    swapped = list(reversed(keys_of(section["projects"])))
+    roost.reorder_projects(swapped)
+    wait_until(
+        lambda: [int(p["id"]) for p in session.list()] == [bare(key) for key in swapped],
+        30.0,
+        "the barrier project reorder to reach the session",
+    )
+
+
+def barrier_on_the_tab_axis(
+    roost: Roost, session: Roost, saved_id: str, project_id: int
+) -> None:
+    """[`barrier_on_the_project_axis`] one axis down — same reasoning."""
+    row = wait_host_project(
+        roost,
+        saved_id,
+        project_id,
+        lambda row: len(row["tabs"]) >= 2,
+        f"two tabs in host project {project_id}, so the barrier op has a tab order to move",
+    )
+    swapped = list(reversed(keys_of(row["tabs"])))
+    roost.reorder_tabs(row["key"], swapped)
+    wait_until(
+        lambda: session.project_tab_ids(project_id) == [bare(key) for key in swapped],
+        30.0,
+        "the barrier tab reorder to reach the session",
+    )
+
+
+def test_reordering_a_hosts_tabs_routes_to_the_session_and_the_mirror_follows(
+    host, roost, local_rows
+):
+    """`tab.reorder` on a host's project reorders it over there.
+
+    The session owns the order: this op sends it the same `tab.reorder`
+    the drop gesture does, and the sidebar's new order arrives on the
+    events connection as `tabs.reordered` rather than out of the reply.
+    So the two reads have to agree — the session's own `tab.list` and the
+    client's mirror — and the local workspace has to be untouched (AC2).
+
+    Persistence is checked the cheap way: a disconnect drops every row
+    the client holds, and the reconnect rebuilds them from the session's
+    own list, under a fresh incarnation. Surviving that is the same claim
+    as surviving a quit/relaunch of the client, which is the hand check
+    on the bundle (plan 044 §8).
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        opened = [quiet_tab(session, project, host.env.launch_cwd) for _ in range(3)]
+        # A second host project, so the barrier below has a project order
+        # to move without touching the tab order under test.
+        session.create_project(name="barrier", cwd=str(host.env.launch_cwd))
+
+        row = wait_host_project(
+            roost,
+            host.saved_id,
+            project,
+            lambda row: set(opened) <= {bare(tab["key"]) for tab in row["tabs"]},
+            f"the host's project {project} to list its three new tabs",
+        )
+        project_key = row["key"]
+        # The whole order, reversed: a partial list would leave the
+        # unlisted rows where they were and the assertion could pass on
+        # an order nobody moved.
+        wanted = list(reversed(keys_of(row["tabs"])))
+        assert len(wanted) >= 2, wanted
+        local_before = capture_local_layout(roost)
+
+        roost.reorder_tabs(project_key, wanted)
+
+        wait_until(
+            lambda: session.project_tab_ids(project) == [bare(key) for key in wanted],
+            30.0,
+            "the session's own tab order to become the one the op asked for",
+        )
+        wait_until(
+            lambda: keys_of(
+                (host_project_row(roost, host.saved_id, project) or {"tabs": []})["tabs"]
+            )
+            == wanted,
+            30.0,
+            "the client's mirror to follow the session's new tab order",
+        )
+        assert local_layout(roost) == local_before
+
+        # Every control below asks for an order DIFFERENT from the one in
+        # force, so a request forwarded before being refused would move
+        # something rather than re-apply what is already there.
+        disturbed = wanted[1:] + wanted[:1]
+        assert disturbed != wanted
+        elsewhere = f"h{int(incarnation_of(wanted[0])[1:]) + 1}"
+        controls = (
+            # A session speaks one bare id-space, so the qualified
+            # spelling is refused there by name rather than narrowed to a
+            # number that would reorder some unrelated project.
+            (
+                "a qualified ref on the session socket",
+                lambda: session.reorder_tabs(project_key, disturbed),
+            ),
+            # One order, one instance: a bare tab among qualified ones
+            # names this client's workspace in a list about the host's.
+            (
+                "a bare tab among qualified ones",
+                lambda: roost.reorder_tabs(
+                    project_key, [disturbed[0], bare(disturbed[1]), *disturbed[2:]]
+                ),
+            ),
+            # The dangerous direction, and the one the router reaches by
+            # its FIRST ref: a LOCAL project carrying the host's tab ids.
+            # That arm resolves against this process's own workspace, so
+            # a narrowing here damages the sidebar nobody was talking
+            # about — which is why the local layout is re-read below
+            # after every one of these, not once before them.
+            (
+                "a local project carrying host tabs",
+                lambda: roost.reorder_tabs(local_rows[0], disturbed),
+            ),
+            (
+                "two incarnations in one list",
+                lambda: roost.reorder_tabs(
+                    project_key,
+                    [disturbed[0], f"{elsewhere}.{bare(disturbed[1])}", *disturbed[2:]],
+                ),
+            ),
+        )
+        for what, call in controls:
+            assert refused(call).code == "invalid-param", what
+            assert local_layout(roost) == local_before, what
+
+        barrier_on_the_project_axis(roost, session, host.saved_id)
+        assert session.project_tab_ids(project) == [bare(key) for key in wanted], (
+            "a refused tab reorder reached the session anyway"
+        )
+
+        old = incarnation_of(project_key)
+        host.disconnect()
+        host.wait_not_connected()
+        # A dimmed section is still in the dump, listing the rows it
+        # retained under the incarnation that published them — those
+        # shells are running over there, and the order this case gave
+        # them is part of what it kept. The row is part of the wait, not
+        # a lookup after it: the dump can report the dim state one event
+        # before the retained rows land, and a lag should be a wait
+        # rather than an unmessaged `StopIteration`.
+        dimmed = wait_host_section(
+            roost,
+            host.saved_id,
+            lambda section: section["state"] != "connected"
+            and any(p["key"] == project_key for p in section["projects"]),
+            "the host's section to go dim without losing its rows",
+        )
+        retained = next((p for p in dimmed["projects"] if p["key"] == project_key), None)
+        assert retained is not None, dimmed
+        assert keys_of(retained["tabs"]) == wanted
+        # The incarnation the keys name is gone, so there is no session
+        # to forward to — `ipc.md`'s "an incarnation this client is not
+        # connected to is `not-found`".
+        assert refused(roost.reorder_tabs, project_key, wanted).code == "not-found"
+
+        host.connect_and_wait()
+        fresh = wait_host_project(
+            roost,
+            host.saved_id,
+            project,
+            lambda row: incarnation_of(row["key"]) != old
+            and all(incarnation_of(tab["key"]) != old for tab in row["tabs"])
+            and len(row["tabs"]) == len(wanted),
+            "a fresh incarnation to republish the project's rows",
+        )
+        assert [bare(tab["key"]) for tab in fresh["tabs"]] == [bare(key) for key in wanted]
+
+
+def test_reordering_a_hosts_projects_routes_to_the_session_and_the_mirror_follows(
+    host, roost, local_rows
+):
+    """`project.reorder`'s twin of the case above, one axis up.
+
+    Same claims — the session's order, the mirror's, the local sidebar
+    being untouched, and the rows surviving a disconnect and coming back
+    under a fresh incarnation — because the two axes share the routing,
+    the op queue and the settle rule, and only the id space differs.
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        # Two tabs, taken before the new projects exist so this stays the
+        # session's original project: the barrier below needs a tab order
+        # to move without touching the project order under test.
+        barrier_project = first_project(session)
+        for _ in range(2):
+            quiet_tab(session, barrier_project, host.env.launch_cwd)
+        made = [
+            session.create_project(name=f"reorder-{suffix}", cwd=str(host.env.launch_cwd))
+            for suffix in ("alpha", "beta")
+        ]
+
+        section = wait_host_section(
+            roost,
+            host.saved_id,
+            lambda section: set(made) <= {bare(p["key"]) for p in section["projects"]},
+            "the host's two new projects to reach the sidebar dump",
+        )
+        wanted = list(reversed(keys_of(section["projects"])))
+        assert len(wanted) >= 2, wanted
+        local_before = capture_local_layout(roost)
+
+        roost.reorder_projects(wanted)
+
+        wait_until(
+            lambda: [int(p["id"]) for p in session.list()] == [bare(key) for key in wanted],
+            30.0,
+            "the session's own project order to become the one the op asked for",
+        )
+        wait_until(
+            lambda: keys_of(
+                (host_section(roost, host.saved_id) or {"projects": []})["projects"]
+            )
+            == wanted,
+            30.0,
+            "the client's mirror to follow the session's new project order",
+        )
+        assert local_layout(roost) == local_before
+
+        disturbed = wanted[1:] + wanted[:1]
+        assert disturbed != wanted
+        elsewhere = f"h{int(incarnation_of(wanted[0])[1:]) + 1}"
+        controls = (
+            (
+                "a qualified ref on the session socket",
+                lambda: session.reorder_projects(disturbed),
+            ),
+            (
+                "a bare project among qualified ones",
+                lambda: roost.reorder_projects(
+                    [disturbed[0], bare(disturbed[1]), *disturbed[2:]]
+                ),
+            ),
+            # The dangerous direction: this router branches on the FIRST
+            # ref, so a BARE-first list is the arm that resolves against
+            # this process's own workspace. A qualified ref later in it
+            # must be refused rather than dropped.
+            (
+                "a bare-first list with a qualified ref behind it",
+                lambda: roost.reorder_projects([local_rows[0], *disturbed]),
+            ),
+            (
+                "two incarnations in one list",
+                lambda: roost.reorder_projects(
+                    [disturbed[0], f"{elsewhere}.{bare(disturbed[1])}", *disturbed[2:]]
+                ),
+            ),
+        )
+        for what, call in controls:
+            assert refused(call).code == "invalid-param", what
+            assert local_layout(roost) == local_before, what
+
+        barrier_on_the_tab_axis(roost, session, host.saved_id, barrier_project)
+        assert [int(p["id"]) for p in session.list()] == [bare(key) for key in wanted], (
+            "a refused project reorder reached the session anyway"
+        )
+
+        old = incarnation_of(wanted[0])
+        host.disconnect()
+        host.wait_not_connected()
+        dimmed = wait_host_section(
+            roost,
+            host.saved_id,
+            lambda section: section["state"] != "connected"
+            and len(section["projects"]) == len(wanted),
+            "the host's section to go dim without losing its rows",
+        )
+        assert keys_of(dimmed["projects"]) == wanted
+        assert refused(roost.reorder_projects, wanted).code == "not-found"
+
+        host.connect_and_wait()
+        fresh = wait_host_section(
+            roost,
+            host.saved_id,
+            lambda section: len(section["projects"]) == len(wanted)
+            and all(incarnation_of(p["key"]) != old for p in section["projects"]),
+            "a fresh incarnation to republish the host's project rows",
+        )
+        assert [bare(p["key"]) for p in fresh["projects"]] == [bare(key) for key in wanted]
