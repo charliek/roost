@@ -16,7 +16,8 @@
           "delay_ms": 8000,
           "attempt": 3,
           "budget": 10,
-          "armed_at": "2026-09-01T18:02:11Z"
+          "armed_at": "2026-09-01T18:02:11Z",
+          "reason": "connecting to workbox failed: ssh: connect to host workbox port 22: Connection refused"
         }
       },
       {

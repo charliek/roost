@@ -806,12 +806,20 @@ below). Only [#381](https://github.com/charliek/roost/issues/381) and
 [#383](https://github.com/charliek/roost/issues/383) remain open on the
 pre list.
 
-One thing the #384 port surfaced and left as a live product wrinkle: an
-ssh failure's classified family never reaches a published `reason` on a
-retryable rung — the armed-rung line overwrites it in the same
-`host.status` update — so it surfaces only in the give-up copy. The
-live harness's L5 works around it by asserting the refusal as an OS
-fact rather than reading it back as a wire fact.
+One thing the #384 port surfaced was filed as
+[#399](https://github.com/charliek/roost/issues/399) and **closed by
+plan 044**: an ssh failure's classified family never reached a published
+`reason` on a retryable rung — the armed-rung line overwrote it in the
+same `host.status` update — so it surfaced only in the give-up copy, and
+the live harness's L5 worked around it by asserting the refusal as an OS
+fact. `reason` stays the armed-rung line (the band's input, and what
+`rollup` is derived from); the family now rides beside it in an additive
+`retry.reason`, read whenever it is present. Its absence is ordinary
+rather than a fault — the drop that starts an outage is usually the live
+connection dying, a bare EOF with nothing to classify, and the copy
+arrives with the next dial's failure — and it is not a function of the
+attempt number, since a suspend/wake resets the ladder to attempt 1 and
+carries the family across as the same outage.
 
 **Release-blocking work from outside this roadmap — closed by plan 043
 (swept 2026-09-02).** This list stayed scoped to items host-session work

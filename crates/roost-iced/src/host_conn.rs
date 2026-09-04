@@ -606,6 +606,28 @@ pub(crate) struct Outage {
     /// The retry waiting to fire, if one is. Deliberately without a
     /// request stamp beside it — see [`HostConnSet::arm_reconnect`].
     armed: Option<Armed>,
+    /// Why the armed rung is armed: the classified copy of the failure
+    /// that took the [`Decision::Retry`], published as
+    /// `host.status`'s `retry.reason` (plan 044 §3.3, #399). Same
+    /// wording and same source as what [`gave_up_copy`] appends — but
+    /// not always the same *value*: the give-up reflects the drop that
+    /// exhausted the ladder, and if that drop is a bare EOF it appends
+    /// nothing while this field still holds the previous rung's family.
+    ///
+    /// Three rules, and each is load-bearing. It is written **only**
+    /// where a `Retry` is taken, never earlier: a late same-generation
+    /// `Dropped` reaches [`HostConnSet::schedule_reconnect`] as
+    /// `Session(None)` (the overlay returns `None` under `seen`) and a
+    /// write before the already-armed guard would erase the family the
+    /// rung was actually armed for. It is *carried* by
+    /// [`HostConnSet::restart_ladder`], which re-arms with no drop at
+    /// all — the suspend reset is the same outage. And it dies with the
+    /// struct in [`HostConnSet::clear_outage`], because an outage that
+    /// is over has no rung to explain.
+    ///
+    /// `None` is ordinary: a bare bridge EOF has no family, and that is
+    /// the usual first drop of an outage.
+    family: Option<String>,
     /// The tunnel the drop left behind, kept for its `last_error` alone.
     dead_tunnel: Option<DeadTunnel>,
 }
@@ -1149,14 +1171,17 @@ impl HostConnSet {
     /// This host's armed retry, if one is waiting to fire.
     ///
     /// The ssh ladder answers first and in full: it is the only one that
-    /// knows an attempt number, a budget, and when the timer was armed.
+    /// knows an attempt number, a budget, when the timer was armed, and
+    /// — [`Outage::family`] — why.
     /// [`ReconnectLadder::next`](reconnect::ReconnectLadder::next) bumps
     /// its counter before it hands back the `attempt` [`Self::arm_retry`]
     /// writes into the band, so the number here is the same `3` the
     /// band's `(3/10)` shows.
     ///
     /// A localhost retry is the connection task's own backoff and its
-    /// counter never leaves the task, so the delay is all there is.
+    /// counter never leaves the task, so the delay is all there is —
+    /// structurally, not by a branch: `outages` only ever holds ssh
+    /// hosts, so the fallthrough below cannot reach a family.
     pub(crate) fn retry_schedule(&self, host: &str) -> Option<RetrySchedule> {
         if let Some(outage) = self.outages.get(host) {
             if let Some(armed) = outage.armed.as_ref() {
@@ -1165,6 +1190,7 @@ impl HostConnSet {
                     attempt: Some(outage.ladder.attempts()),
                     budget: Some(outage.ladder.budget()),
                     armed_at: Some(roost_engine::workspace::rfc3339(armed.at)),
+                    reason: outage.family.clone(),
                 });
             }
         }
@@ -1223,6 +1249,7 @@ impl HostConnSet {
                 ladder: reconnect::ReconnectLadder::default(),
                 lease: None,
                 armed: None,
+                family: None,
                 dead_tunnel: None,
             });
         // Every drop, not only the first: an entry holding a lease is by
@@ -1406,9 +1433,13 @@ impl HostConnSet {
         // `HostConn::drop` publishes its own `disconnect_requested()`,
         // and a late `Dropped` can still arrive under the *same*
         // generation — which `owner_of` does not filter. So a second
-        // decision must not stack a second timer on the first, and must
+        // decision must not stack a second timer on the first, must
         // not let `apply_state`'s own `conn.state = next` overwrite the
-        // armed retry's line with the bare reason it carried.
+        // armed retry's line with the bare reason it carried, and must
+        // leave `Outage::family` alone: this second pass computed
+        // `family_copy == None` (the overlay early-returned under
+        // `seen`), so writing it here would erase the family the armed
+        // rung is for.
         if let Some(outage) = self.outages.get(host) {
             if let Some(armed) = &outage.armed {
                 *disconnected = retry_line(
@@ -1438,6 +1469,16 @@ impl HostConnSet {
         let budget = outage.ladder.budget();
         match decision {
             Decision::Retry { delay, attempt } => {
+                // Assigned, not merged: a decision describes the failure
+                // that caused it, so a rung armed by a bare EOF after
+                // one armed by a refused port is honestly `None` —
+                // merging would publish a cause this rung does not have.
+                //
+                // [`Self::restart_ladder`] carries the older copy
+                // forward instead, and is not a counter-example to this:
+                // it re-arms the *same* outage with no drop at all, so
+                // there is no newer failure for the field to describe.
+                outage.family = family_copy;
                 *disconnected = self.arm_retry(host, delay, attempt, budget);
             }
             Decision::Exhausted { attempts } => {
@@ -1608,6 +1649,14 @@ impl HostConnSet {
 
     /// Treat a woken ladder as a new outage: back to attempt one, at the
     /// base delay, with a fresh stamp — and no dial.
+    ///
+    /// [`Outage::family`] is carried, not cleared: nothing dropped here,
+    /// so the last classified failure is still the honest answer to why
+    /// this host is retrying (plan 044 §3.3). That is the opposite of
+    /// the assignment at a `Decision::Retry`, and deliberately so — a
+    /// decision has a *new* failure to describe and must not merge an
+    /// old one, whereas a reset has no failure of its own and is still
+    /// the same outage.
     fn restart_ladder(&mut self, host: &str) {
         let Some(outage) = self.outages.get_mut(host) else {
             return;
@@ -3385,6 +3434,146 @@ mod tests {
         }
     }
 
+    /// The armed rung's own `reason` (#399), read off the wire the same
+    /// way `host.status` does.
+    fn retry_reason(set: &HostConnSet) -> Option<String> {
+        set.retry_schedule("h1").expect("an armed retry").reason
+    }
+
+    /// **#399.** While a rung is armed, `reason` has to read
+    /// `reconnecting in 8s (3/10)` — the sidebar's rollup is derived
+    /// from it — so *why* the ladder is retrying needs its own field or
+    /// it is unreadable until the attempt settles.
+    ///
+    /// Three facts in one walk, because they are the same field seen at
+    /// three moments: the **first** rung of an outage carries no family
+    /// (the drop that starts one is the live connection dying, a bare
+    /// bridge EOF the overlay classifies nothing from); the next rung
+    /// does, through the establish arm; and a rung after *that* which was
+    /// itself armed by a bare EOF carries none again, because the field
+    /// names this rung's cause and the older copy is no longer true.
+    #[tokio::test]
+    async fn an_armed_rung_says_why_it_is_armed() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-why.sock");
+        assert_eq!(
+            set.retry_schedule("h1").expect("armed").attempt,
+            Some(1),
+            "the drop that starts an outage"
+        );
+        assert_eq!(
+            retry_reason(&set),
+            None,
+            "a bare bridge EOF has no family to name"
+        );
+
+        // Rung two: the retry dials, its establish fails, and *that*
+        // failure is classified.
+        assert!(retry_once(&mut set));
+        refuse(&mut set, unreachable());
+        assert_eq!(set.retry_schedule("h1").expect("armed").attempt, Some(2));
+        assert_eq!(
+            retry_reason(&set).as_deref(),
+            Some(unreachable().message("workbox").as_str()),
+            "and it is the family's own copy, the wording a give-up appends too"
+        );
+        let seconds = set
+            .retry_schedule("h1")
+            .expect("armed")
+            .delay_ms
+            .div_ceil(1_000)
+            .max(1);
+        assert_eq!(
+            band_reason(&set, "h1"),
+            format!("reconnecting in {seconds}s (2/{})", budget(&set)),
+            "the band still shows the rung, not the family — the rollup is derived from it"
+        );
+
+        // Rung three, armed by a connection that came up and died with
+        // nothing recorded: the honest answer is no family again.
+        assert!(retry_once(&mut set));
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-why.sock"),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        let third = set.mint_for("h1");
+        set.apply_state(third, dropped("and it dropped again"));
+        assert_eq!(set.retry_schedule("h1").expect("armed").attempt, Some(3));
+        assert_eq!(
+            retry_reason(&set),
+            None,
+            "the previous rung's copy is stale by now, and stale is a lie"
+        );
+    }
+
+    /// **The write-ordering trap (#399, plan 044 §3.3 d2).**
+    ///
+    /// `HostConn::drop` publishes its own `Dropped`, and a late one
+    /// arrives under the *same* generation. `overlay_ssh_reason`
+    /// early-returns `None` for it (the generation is already `seen`),
+    /// so it reaches `schedule_reconnect` as `Session(None)` with no
+    /// family at all — and it is caught by the already-armed guard,
+    /// which re-emits the line without re-arming.
+    ///
+    /// Which is why the family is written where the `Decision::Retry` is
+    /// taken and nowhere earlier: a write before that guard would erase
+    /// the family the armed rung is actually for, and `host.status`
+    /// would go quiet exactly when a user is watching it.
+    #[tokio::test]
+    async fn a_late_same_generation_drop_leaves_the_armed_rungs_reason_alone() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-late.sock");
+        assert!(retry_once(&mut set));
+        refuse(&mut set, unreachable());
+        let armed = set.retry_schedule("h1").expect("armed");
+        assert_eq!(armed.attempt, Some(2));
+        assert_eq!(
+            armed.reason.as_deref(),
+            Some(unreachable().message("workbox").as_str())
+        );
+
+        set.apply_state(incarnation, dropped("the connection closed"));
+
+        assert_eq!(
+            set.outages["h1"].ladder.attempts(),
+            2,
+            "no second timer stacked on the first"
+        );
+        assert_eq!(
+            set.retry_schedule("h1"),
+            Some(armed),
+            "and the whole schedule — the family included — is untouched"
+        );
+    }
+
+    /// A family no retry may be spent on ends the outage, and the
+    /// rung's `reason` goes with it: there is no armed rung left to
+    /// explain, and the band already carries that family's own copy
+    /// (#399). The give-up end of the same rule is pinned in
+    /// `repeated_establish_failures_run_the_ladder_to_its_budget`.
+    #[tokio::test]
+    async fn a_non_retryable_family_takes_the_rungs_reason_with_the_outage() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-nonretry.sock");
+        assert!(retry_once(&mut set));
+        refuse(&mut set, unreachable());
+        assert!(retry_reason(&set).is_some(), "a family was armed on");
+
+        assert!(retry_once(&mut set));
+        refuse(&mut set, SshFailure::ChangedHostKey);
+        assert!(!set.outages.contains_key("h1"));
+        assert_eq!(set.retry_schedule("h1"), None);
+        assert_eq!(
+            band_reason(&set, "h1"),
+            SshFailure::ChangedHostKey.message("workbox"),
+            "the band keeps the family that stopped the ladder"
+        );
+    }
+
     /// A localhost retry is the connection task's own backoff: the delay
     /// is published on the state, the counter never leaves the task.
     #[tokio::test]
@@ -3644,6 +3833,11 @@ mod tests {
                     "the failed retry re-arms rather than stalling"
                 );
                 assert!(set.outages["h1"].armed.is_some());
+                assert_eq!(
+                    retry_reason(&set).as_deref(),
+                    Some(unreachable().message("workbox").as_str()),
+                    "and every rung after the first says why it is armed (#399)"
+                );
             }
         }
 
@@ -3660,6 +3854,11 @@ mod tests {
             "and says so through the band, not only in a field"
         );
         assert_eq!(band_state(&set, "h1").retry_in, None);
+        assert_eq!(
+            set.retry_schedule("h1"),
+            None,
+            "the rung's own reason went with the outage — nothing is armed to explain"
+        );
         assert!(
             set.carried_lease("h1", AttemptCause::AutoReconnect)
                 .is_none(),
@@ -3904,6 +4103,14 @@ mod tests {
         assert_eq!(
             band_reason(&set, "h1"),
             format!("reconnecting in 1s (1/{})", budget(&set))
+        );
+        // A new *outage* only in the ladder's arithmetic — nothing
+        // dropped here, so the last classified failure is still the
+        // honest answer to why this host is retrying (#399).
+        assert_eq!(
+            retry_reason(&set).as_deref(),
+            Some(unreachable().message("workbox").as_str()),
+            "the reset carries the family across; it is the same outage"
         );
     }
 

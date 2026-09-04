@@ -264,6 +264,14 @@ fn host_connection_vectors_decode_as_typed_params_and_results() {
         armed.retry.as_ref().map(|retry| retry.attempt),
         Some(Some(3))
     );
+    // #399: the band's own `reason` is the armed-rung line; the rung's
+    // is why it was armed. Two different sentences in one payload.
+    assert_eq!(armed.reason.as_deref(), Some("reconnecting in 8s (3/10)"));
+    assert!(armed
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.reason.as_deref())
+        .is_some_and(|why| why.contains("Connection refused")));
     // The never-connected host is the shape a caller must be ready for:
     // every optional omitted, `generation` still present at `0`.
     let never = &result.hosts[1];

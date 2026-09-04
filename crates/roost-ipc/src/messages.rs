@@ -2203,9 +2203,10 @@ pub struct HostStatus {
 ///
 /// `delay_ms` is the delay the timer was armed with; `armed_at` is when,
 /// so a caller that wants a countdown can compute one. Only the ssh
-/// ladder carries a `attempt`/`budget` pair — a localhost retry is the
-/// connection task's own backoff and its counter never leaves the task,
-/// so those three are absent there and `delay_ms` is the whole story.
+/// ladder carries an `attempt`/`budget` pair and a [`Self::reason`] — a
+/// localhost retry is the connection task's own backoff and its counter
+/// never leaves the task, so those four are absent there and `delay_ms`
+/// is the whole story.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrySchedule {
     pub delay_ms: u64,
@@ -2216,6 +2217,23 @@ pub struct RetrySchedule {
     pub budget: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub armed_at: Option<String>,
+    /// **Why** this rung was armed: the classified copy of the failure
+    /// that caused it, in the same words the give-up line uses for it
+    /// (plan 044 §3.3, #399). Not always the same *value* as a
+    /// give-up's, though: that one names the drop which exhausted the
+    /// ladder, which may carry no family at all.
+    ///
+    /// It lives here rather than in [`HostStatus::reason`] because that
+    /// field is the band's *input* and [`HostStatus::rollup`] is derived
+    /// from it: while a rung is armed the band has to read
+    /// `reconnecting in 8s (3/10)`, so the family needs its own slot or
+    /// it is unreadable until the attempt settles.
+    ///
+    /// Absent when the drop carried no family — a bare bridge EOF, which
+    /// is the usual shape of the **first** rung of an outage (the live
+    /// connection dying), so a `retry` with no `reason` is ordinary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The wire spellings of a host's connection state, shared by
@@ -3901,9 +3919,21 @@ mod tests {
                 attempt: Some(3),
                 budget: Some(10),
                 armed_at: Some("2026-09-01T18:02:11Z".into()),
+                reason: Some(
+                    "connecting to workbox failed: ssh: connect to host workbox port 22: \
+                     Connection refused"
+                        .into(),
+                ),
             }),
         };
         round_trip(&armed);
+        // #399: `reason` says *why* the rung is armed while the band's
+        // own `reason` says how long — the two are different sentences
+        // in the same payload on purpose.
+        assert_ne!(
+            armed.reason.as_deref(),
+            armed.retry.as_ref().unwrap().reason.as_deref()
+        );
         round_trip(&HostStatusResult { hosts: vec![armed] });
         round_trip(&HostStatusResult::default());
 
@@ -3928,13 +3958,32 @@ mod tests {
             })
         );
 
-        // Localhost's own retry knows a delay and nothing else.
+        // Localhost's own retry knows a delay and nothing else — the
+        // new `reason` is omitted here exactly as the other three are.
         let local_retry = serde_json::to_value(RetrySchedule {
             delay_ms: 250,
             ..RetrySchedule::default()
         })
         .unwrap();
         assert_eq!(local_retry, serde_json::json!({"delay_ms": 250}));
+
+        // An ssh rung armed by a bare EOF: the numbers without a family.
+        // The first rung of an outage normally looks like this.
+        let bare_eof = serde_json::to_value(RetrySchedule {
+            delay_ms: 1_000,
+            attempt: Some(1),
+            budget: Some(10),
+            armed_at: Some("2026-09-01T18:02:11Z".into()),
+            reason: None,
+        })
+        .unwrap();
+        assert_eq!(
+            bare_eof,
+            serde_json::json!({
+                "delay_ms": 1_000, "attempt": 1, "budget": 10,
+                "armed_at": "2026-09-01T18:02:11Z",
+            })
+        );
 
         for bad in [r#"{"extra":"x"}"#, r#"{"id":"a","extra":1}"#] {
             assert!(

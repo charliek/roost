@@ -16,11 +16,11 @@ use std::path::PathBuf;
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
     ClipboardEffectTarget, EventBatch, EventEnvelope, ProjectReorderParams, ResponseError,
-    SessionBinaryIdentity, SessionConnectParams, SessionConnectResult, SessionIdentify,
-    SessionIdentifyParams, SessionSetFocusParams, SessionSetThemeParams, SessionSetThemeResult,
-    SessionStopParams, SessionStopResult, SessionStoppingEvent, TabAttachParams, TabAttachResult,
-    TabEffect, TabEffectEvent, TabReorderParams, WireProjectRef, WireTabRef,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    RetrySchedule, SessionBinaryIdentity, SessionConnectParams, SessionConnectResult,
+    SessionIdentify, SessionIdentifyParams, SessionSetFocusParams, SessionSetThemeParams,
+    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent,
+    TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, TabReorderParams, WireProjectRef,
+    WireTabRef, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -1032,4 +1032,63 @@ fn a_negative_id_is_the_answering_instances_business() {
     // the parser rather than deferred.
     assert!(WireProjectRef::parse("h-3.4").is_none());
     assert!(WireTabRef::parse("h-3.4").is_none());
+}
+
+/// `retry.reason` is additive and optional (plan 044 §3.3, #399): a
+/// payload written before this field existed still decodes, and a
+/// schedule without a family still serializes to exactly the bytes it
+/// did — a decoder pinned to the old shape sees no change.
+///
+/// The field carries **why** the rung is armed, which the sibling
+/// `HostStatus::reason` cannot: while a rung is armed that one has to
+/// read `reconnecting in 8s (3/10)`, because the sidebar's rollup is
+/// derived from it.
+#[test]
+fn a_retry_schedules_reason_is_additive() {
+    let armed = RetrySchedule {
+        delay_ms: 8_000,
+        attempt: Some(3),
+        budget: Some(10),
+        armed_at: Some("2026-09-01T18:02:11Z".into()),
+        reason: Some(
+            "connecting to workbox failed: ssh: connect to host workbox port 22: \
+             Connection refused"
+                .into(),
+        ),
+    };
+    round_trip(&armed);
+    assert_eq!(
+        serde_json::to_value(&armed).unwrap(),
+        serde_json::json!({
+            "delay_ms": 8_000,
+            "attempt": 3,
+            "budget": 10,
+            "armed_at": "2026-09-01T18:02:11Z",
+            "reason": "connecting to workbox failed: ssh: connect to host workbox \
+                       port 22: Connection refused",
+        })
+    );
+
+    // The pre-#399 payload, byte for byte: it decodes, and the missing
+    // family reads as absent rather than as an empty string.
+    let old: RetrySchedule = serde_json::from_str(
+        r#"{"delay_ms":8000,"attempt":3,"budget":10,"armed_at":"2026-09-01T18:02:11Z"}"#,
+    )
+    .expect("a payload from before the field existed still decodes");
+    assert_eq!(old.reason, None);
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        r#"{"delay_ms":8000,"attempt":3,"budget":10,"armed_at":"2026-09-01T18:02:11Z"}"#,
+        "a rung with no family re-encodes to the bytes it decoded from"
+    );
+
+    // And the localhost form stays the one field it has always been.
+    assert_eq!(
+        serde_json::to_string(&RetrySchedule {
+            delay_ms: 250,
+            ..RetrySchedule::default()
+        })
+        .unwrap(),
+        r#"{"delay_ms":250}"#
+    );
 }
