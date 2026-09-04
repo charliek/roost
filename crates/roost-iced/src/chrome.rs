@@ -403,6 +403,34 @@ pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// The gap between a modal button's edge and its focus ring, and the
+/// ring's own width.
+///
+/// The ring is drawn by a wrapper *around* the button rather than on the
+/// button's own border, because [`primary_button`]'s resting fill is
+/// [`ACCENT`] itself — an accent border on that quad would be invisible
+/// in exactly the state that matters most, a Tab landing on an
+/// un-hovered "Add & Connect". Outside the fill it reads against the card
+/// in all four button states, disabled included.
+pub const FOCUS_RING_PADDING: u16 = 2;
+pub const FOCUS_RING_WIDTH: f32 = 1.0;
+
+/// The Tab-traversal ring around a modal button (plan 044 §3.4).
+///
+/// Transparent rather than absent when unfocused: the wrapper's padding
+/// and border reserve their space either way, so moving the ring never
+/// moves the buttons under the pointer.
+pub fn focus_ring(focused: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        border: Border {
+            color: if focused { ACCENT } else { Color::TRANSPARENT },
+            width: FOCUS_RING_WIDTH,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
     let (background, text_color) = match status {
         button::Status::Hovered | button::Status::Pressed => (DANGER_ACCENT, TEXT),
@@ -919,6 +947,45 @@ mod tests {
             inline_rename_input(&theme, text_input::Status::Focused { is_hovered: false });
         assert_eq!(focused.border.color, ACCENT);
         assert_eq!(focused.selection, ACCENT);
+    }
+
+    /// The ring has to be *seen* in every button state, which is why it
+    /// is drawn outside the fill: the primary's resting background is
+    /// `ACCENT` itself, so an accent border on the button would vanish
+    /// there. What it must contrast with instead is the card behind it.
+    #[test]
+    fn the_focus_ring_reads_against_the_card_in_every_button_state() {
+        let theme = Theme::Dark;
+        assert_eq!(focus_ring(true)(&theme).border.color, ACCENT);
+        assert_eq!(focus_ring(true)(&theme).border.width, FOCUS_RING_WIDTH);
+        assert_eq!(
+            focus_ring(false)(&theme).border.color,
+            Color::TRANSPARENT,
+            "an unfocused button reserves the ring's space and draws nothing"
+        );
+        assert_eq!(
+            focus_ring(false)(&theme).border.width,
+            FOCUS_RING_WIDTH,
+            "the same width either way, so the ring never moves the row"
+        );
+        assert_eq!(
+            focus_ring(true)(&theme).background,
+            None,
+            "the ring is an outline; the button keeps its own fill"
+        );
+        assert_ne!(
+            Some(Background::Color(ACCENT)),
+            palette_panel(&theme).background,
+            "the ring is drawn on the modal card, so it must not be the card's color"
+        );
+
+        // The states the ring is drawn *beside*. The primary's Active fill
+        // is the accent, which is the whole reason the ring is not a
+        // border on the button.
+        assert_eq!(
+            primary_button(&theme, button::Status::Active).background,
+            Some(Background::Color(ACCENT))
+        );
     }
 
     #[test]

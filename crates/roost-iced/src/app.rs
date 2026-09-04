@@ -370,17 +370,36 @@ struct ConfirmButton<'a> {
 /// different questions, and the upgrade dialog for a *remote* host has
 /// no primary action at all — `confirm: None` leaves it with only the
 /// dismiss, which is plan 037 §3.1's "no dead button" made literal.
+///
+/// `ring` is Add Host's Tab traversal (plan 044 §3.4) and `None` for the
+/// three modals that have none. `None` builds today's row exactly: the
+/// ring wrapper reserves its space whether or not it is drawn, so a modal
+/// that can never show one must not carry the wrapper at all.
 fn modal_buttons<'a>(
     cancel_label: &'a str,
     cancel: Message,
     confirm: Option<ConfirmButton<'a>>,
+    ring: Option<host_dialog::ButtonRing>,
 ) -> Row<'a, Message> {
+    let ringed = |element: Element<'a, Message>, focused: bool| -> Element<'a, Message> {
+        match ring {
+            Some(_) => container(element)
+                .padding(chrome::FOCUS_RING_PADDING)
+                .style(chrome::focus_ring(focused))
+                .into(),
+            None => element,
+        }
+    };
     let mut buttons = row![
         iced::widget::Space::new().width(Fill),
-        button(text(cancel_label).size(12))
-            .padding([4, 12])
-            .style(chrome::transparent_button)
-            .on_press(cancel),
+        ringed(
+            button(text(cancel_label).size(12))
+                .padding([4, 12])
+                .style(chrome::transparent_button)
+                .on_press(cancel)
+                .into(),
+            ring.is_some_and(|ring| ring.cancel),
+        ),
     ];
     if let Some(confirm) = confirm {
         let mut primary = button(text(confirm.label).size(12))
@@ -389,7 +408,10 @@ fn modal_buttons<'a>(
         if let Some(message) = confirm.press {
             primary = primary.on_press(message);
         }
-        buttons = buttons.push(primary);
+        buttons = buttons.push(ringed(
+            primary.into(),
+            ring.is_some_and(|ring| ring.confirm),
+        ));
     }
     buttons.spacing(8).align_y(Alignment::Center)
 }
@@ -1410,6 +1432,19 @@ pub enum UiTask {
     Focus(window::Id),
     FocusWidget(Id),
     SelectAllWidget(Id),
+    /// Take keyboard focus away from every focusable widget — how the Add
+    /// Host ring lands on a button, which iced 0.14 cannot focus.
+    UnfocusWidgets,
+    /// Ask the widget tree who actually holds focus, so the Add Host ring
+    /// steps from what is true rather than from what it last stored. The
+    /// answer arrives as `Message::AddHostTabFound`.
+    AddHostTabStep {
+        backwards: bool,
+    },
+    /// The same question, asked after a pointer press so the ring can be
+    /// corrected without stepping. Answers as
+    /// `Message::AddHostFocusResynced`.
+    AddHostFocusResync,
     Resize(window::Id, Size),
     Screenshot(window::Id),
     ClipboardRead {
@@ -2843,36 +2878,79 @@ impl App {
         }
         if matches!(self.keyboard_route(), KeyboardRoute::HostDialog) {
             let mut task = UiTask::None;
-            if let keyboard::Event::KeyPressed { key, repeat, .. } = &event {
-                match (key.as_ref(), repeat) {
-                    (Key::Named(Named::Escape), false) => {
+            if let keyboard::Event::KeyPressed {
+                key, repeat: false, ..
+            } = &event
+            {
+                // Add Host's ring answers Enter and Space; the other
+                // three modals have no ring and keep Enter alone.
+                let ringed = match &self.host_dialog {
+                    Some(host_dialog::HostDialog::Add(draft)) => Some(
+                        host_dialog::dialog_key_action(&event, draft.ring(), draft.is_verifying()),
+                    ),
+                    _ => None,
+                };
+                // Enter and Space produce the same ring action, so the
+                // action alone cannot say which key it was — and the
+                // completion latch below is cleared by its own key's
+                // RELEASE. Latching Enter for a Space activation would
+                // strand it and eat the user's next Enter press. Space
+                // needs no latch: neither the terminal encoder nor the
+                // accelerator table acts on a `KeyReleased`.
+                let is_enter = matches!(key.as_ref(), Key::Named(Named::Enter));
+                // Not captured by a focused `text_input` (it has no Tab
+                // arm, and `\t` is a control char it never inserts), so
+                // Tab is the one key the dialog sees whether or not a
+                // field holds the caret — which is why the step has to
+                // ask the widget tree first.
+                let tab_step = ringed
+                    .is_some()
+                    .then(|| host_dialog::tab_step_direction(&event))
+                    .flatten();
+                match key.as_ref() {
+                    Key::Named(Named::Escape) => {
                         self.rename_completion_key = Some(RenameCompletionKey::Escape);
                         self.host_dialog_cancel();
                     }
-                    (Key::Named(Named::Enter), false) => {
-                        self.rename_completion_key = Some(RenameCompletionKey::Enter);
-                        // One key, four dialogs: Add Host's Enter is its
-                        // "Add & Connect", and the other three are their
-                        // confirming buttons. Each is that panel's
-                        // primary action, which is what Enter means in a
-                        // dialog — and an upgrade prompt for a host
-                        // nothing can be offered for has only "Close",
-                        // so Enter is that.
-                        match &self.host_dialog {
-                            Some(host_dialog::HostDialog::Add(_)) => task = self.submit_add_host(),
-                            Some(host_dialog::HostDialog::ConfirmStop { .. }) => {
-                                self.host_stop_confirmed();
-                            }
-                            Some(host_dialog::HostDialog::ConfirmRestart { .. }) => {
-                                task = self.host_restart_dialog_confirmed();
-                            }
-                            Some(host_dialog::HostDialog::Bootstrap(_)) => {
-                                self.host_bootstrap_confirmed();
-                            }
-                            None => {}
-                        }
+                    _ if tab_step.is_some() => {
+                        task = self.add_host_tab_step(tab_step == Some(true));
                     }
-                    _ => {}
+                    _ => match ringed {
+                        Some(host_dialog::DialogAction::Submit) => {
+                            if is_enter {
+                                self.rename_completion_key = Some(RenameCompletionKey::Enter);
+                            }
+                            task = self.submit_add_host();
+                        }
+                        Some(host_dialog::DialogAction::Cancel) => {
+                            if is_enter {
+                                self.rename_completion_key = Some(RenameCompletionKey::Enter);
+                            }
+                            self.host_dialog_cancel();
+                        }
+                        Some(host_dialog::DialogAction::Nothing) => {}
+                        // One key, three dialogs: each panel's confirming
+                        // button is its primary action, which is what
+                        // Enter means in a dialog — and an upgrade prompt
+                        // for a host nothing can be offered for has only
+                        // "Close", so Enter is that.
+                        None if is_enter => {
+                            self.rename_completion_key = Some(RenameCompletionKey::Enter);
+                            match &self.host_dialog {
+                                Some(host_dialog::HostDialog::ConfirmStop { .. }) => {
+                                    self.host_stop_confirmed();
+                                }
+                                Some(host_dialog::HostDialog::ConfirmRestart { .. }) => {
+                                    task = self.host_restart_dialog_confirmed();
+                                }
+                                Some(host_dialog::HostDialog::Bootstrap(_)) => {
+                                    self.host_bootstrap_confirmed();
+                                }
+                                Some(host_dialog::HostDialog::Add(_)) | None => {}
+                            }
+                        }
+                        None => {}
+                    },
                 }
             }
             // The modal owns the keyboard. `TextInput` still sees
@@ -3371,6 +3449,7 @@ impl App {
                     style: chrome::danger_button,
                     press: Some(Message::ConfirmDeleteConfirm),
                 }),
+                None,
             )
         ]);
         Some(Modal {
@@ -3400,6 +3479,7 @@ impl App {
                         style: chrome::danger_button,
                         press: Some(Message::HostStopConfirm),
                     }),
+                    None,
                 )
             ],
             host_dialog::HostDialog::ConfirmRestart { prompt, .. } => column![
@@ -3417,6 +3497,7 @@ impl App {
                         style: chrome::danger_button,
                         press: Some(Message::HostRestartConfirm),
                     }),
+                    None,
                 )
             ],
             // Consent to touch a host over ssh (plan 039 §3.5). The card
@@ -3432,6 +3513,7 @@ impl App {
                         style: chrome::primary_button,
                         press: Some(Message::HostBootstrapConfirm),
                     }),
+                    None,
                 )
             ],
         };
@@ -3467,7 +3549,11 @@ impl App {
         }
         // Inert while the dial is in flight rather than hidden: a button
         // that vanishes mid-press moves the card under the pointer.
-        let confirm = (!draft.is_verifying()).then_some(Message::AddHostSubmit);
+        //
+        // The button's own message, not `AddHostSubmit`: a submit from a
+        // focused field sends that one too, and moving the ring there
+        // would draw it on "Add & Connect" while the caret sits in Name.
+        let confirm = (!draft.is_verifying()).then_some(Message::AddHostConfirmPressed);
         body.push(modal_buttons(
             "Cancel",
             Message::HostDialogCancel,
@@ -3476,6 +3562,7 @@ impl App {
                 style: chrome::primary_button,
                 press: confirm,
             }),
+            Some(draft.button_ring()),
         ))
     }
 
@@ -5385,12 +5472,115 @@ impl App {
         self.add_host_focus_requested = false;
     }
 
+    /// A field edit is proof that field holds the caret — the only such
+    /// proof the toolkit offers, `text_input` having no focus callback —
+    /// so the ring follows it. Without this a click into a field leaves
+    /// the ring drawn on whichever button it was last on until the next
+    /// Tab recovers it.
     pub fn add_host_name_changed(&mut self, value: String) {
-        self.edit_add_host_draft(|draft| draft.name = value);
+        self.edit_add_host_draft(|draft| {
+            draft.name = value;
+            draft.set_ring(host_dialog::AddHostFocus::Name);
+        });
     }
 
     pub fn add_host_socket_changed(&mut self, value: String) {
-        self.edit_add_host_draft(|draft| draft.socket = value);
+        self.edit_add_host_draft(|draft| {
+            draft.socket = value;
+            draft.set_ring(host_dialog::AddHostFocus::Target);
+        });
+    }
+
+    /// Tab (or Shift+Tab) in the Add Host dialog: ask the widget tree who
+    /// holds focus before stepping the ring.
+    ///
+    /// The ring alone is not enough for Tab because a mouse click into a
+    /// field moves widget focus with nothing to tell the app; the answer
+    /// comes back as `add_host_tab_found`.
+    fn add_host_tab_step(&mut self, backwards: bool) -> UiTask {
+        let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) else {
+            return UiTask::None;
+        };
+        if !draft.begin_tab_step(backwards) {
+            // A probe is already out; the direction was queued behind it
+            // and the answer will resolve both presses. Stepping again
+            // off the same stored ring would move one stop for two.
+            return UiTask::None;
+        }
+        UiTask::AddHostTabStep { backwards }
+    }
+
+    /// The focus probe answered: step the ring and put the caret where
+    /// the new stop wants it.
+    ///
+    /// A button stop unfocuses everything, because iced 0.14 has no
+    /// focusable button to hand the caret to — the ring is drawn from app
+    /// state and "no widget focused" is what a ringed button looks like
+    /// to the widget tree.
+    pub(crate) fn add_host_tab_found(&mut self, found: Option<&Id>, backwards: bool) -> UiTask {
+        let name_id = self.add_host_name_id.clone();
+        let socket_id = self.add_host_socket_id.clone();
+        let stop = host_dialog::resolve_tab_step(
+            self.host_dialog.as_mut(),
+            found,
+            &name_id,
+            &socket_id,
+            backwards,
+        );
+        match stop {
+            Some(host_dialog::AddHostFocus::Name) => UiTask::FocusWidget(name_id),
+            Some(host_dialog::AddHostFocus::Target) => UiTask::FocusWidget(socket_id),
+            Some(host_dialog::AddHostFocus::Confirm | host_dialog::AddHostFocus::Cancel) => {
+                UiTask::UnfocusWidgets
+            }
+            None => UiTask::None,
+        }
+    }
+
+    /// "Add & Connect" pressed with the pointer.
+    ///
+    /// Its own entry rather than `submit_add_host` directly: a submit
+    /// from a focused field arrives as the same `AddHostSubmit` the
+    /// keyboard sends, and moving the ring there would draw it on the
+    /// button while the caret is still in a field.
+    pub(crate) fn add_host_confirm_pressed(&mut self) -> UiTask {
+        if let Some(draft) = self.host_dialog.as_mut().and_then(|d| d.draft_mut()) {
+            // A probe in flight describes the tree as it was before this
+            // press. Left alive, its answer would step on from the ring
+            // this press just set and walk the ring onto Cancel while the
+            // dial runs — so the user's next Enter, the reflex when the
+            // error text appears, would dismiss the dialog.
+            draft.invalidate_tab_step();
+            draft.set_ring(host_dialog::AddHostFocus::Confirm);
+        }
+        self.submit_add_host()
+    }
+
+    /// A pointer press landed while the Add Host dialog is up.
+    ///
+    /// The press may have moved widget focus (a click into a field) with
+    /// nothing to tell the app, so the ring is re-synced from the tree.
+    /// A press is the whole trigger: where it landed is the widget tree's
+    /// business, and asking it is cheaper than reasoning about geometry.
+    pub(crate) fn add_host_pointer_pressed(&mut self) -> UiTask {
+        if self.add_host_dialog_open() {
+            UiTask::AddHostFocusResync
+        } else {
+            UiTask::None
+        }
+    }
+
+    /// The re-sync probe answered: believe the tree, and do not step.
+    pub(crate) fn add_host_focus_resynced(&mut self, found: Option<&Id>) {
+        let name_id = self.add_host_name_id.clone();
+        let socket_id = self.add_host_socket_id.clone();
+        host_dialog::resolve_focus_resync(self.host_dialog.as_mut(), found, &name_id, &socket_id);
+    }
+
+    /// Whether the Add Host card is the modal that is up — the state that
+    /// arms the pointer-press subscription member.
+    pub fn add_host_dialog_open(&self) -> bool {
+        matches!(self.host_dialog, Some(host_dialog::HostDialog::Add(_)))
     }
 
     /// Every field edit, so `AddHostDraft::edited`'s "the error and the
@@ -6608,6 +6798,7 @@ impl Message {
             Self::AddHostNameChanged(value) => app.add_host_name_changed(value),
             Self::AddHostSocketChanged(value) => app.add_host_socket_changed(value),
             Self::AddHostSubmit => return app.submit_add_host(),
+            Self::AddHostConfirmPressed => return app.add_host_confirm_pressed(),
             Self::HostDialogCancel => app.host_dialog_cancel(),
             Self::HostDialogCardPressed => {}
             Self::HostStopConfirm => app.host_stop_confirmed(),
