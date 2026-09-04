@@ -1,5 +1,5 @@
 //! The contract between whoever *launches* a host session and the
-//! session itself: one env hint on the way in, one verdict line on the
+//! session itself: two env hints on the way in, one verdict line on the
 //! way out.
 //!
 //! It lives here rather than in `roost-session` because both ends need
@@ -33,7 +33,11 @@
 //! because HS-2's client climbs the identical ladder: an explicit
 //! Connect on a localhost host spawns a missing session exactly the way
 //! the CLI does, and two implementations of "which `roost-session` is
-//! this user's" is one more than the contract can survive.
+//! this user's" is one more than the contract can survive. The second
+//! env hint — the derived state dir of
+//! [`spawn_and_read_verdict`] — is here for the same reason: the UI and
+//! the CLI must agree on where a session they spawned keeps its state,
+//! and agreeing by construction is cheaper than agreeing twice.
 //!
 //! # The stop ladder
 //!
@@ -67,6 +71,7 @@ use tokio::time::Instant;
 use crate::messages::{
     ops, SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult,
 };
+use crate::paths::{derived_session_state_dir, STATE_DIR_ENV};
 use crate::socket_state::{self, SocketState};
 use crate::IpcClient;
 
@@ -529,8 +534,8 @@ pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> V
     }
 }
 
-/// Spawn `<bin> start` with the launch-cwd hint and read the one line
-/// it prints, everything bounded by `budget`.
+/// Spawn `<bin> start` with the two env hints and read the one line it
+/// prints, everything bounded by `budget`.
 ///
 /// The child here is the *launcher* — for a real `roost-session` it is
 /// the forking parent, which exits the moment its daemonized child
@@ -538,16 +543,52 @@ pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> V
 /// process killed: killing the launcher never touches a session that
 /// did come up, and a launcher that will not exit must not be able to
 /// hold its caller open past its budget.
-pub async fn spawn_and_read_verdict(bin: &Path, cwd: &Path, budget: Duration) -> Result<Verdict> {
+///
+/// # The derived state dir
+///
+/// `seam` is the caller's `ROOST_STATE_DIR` — a *parameter*, like
+/// [`locate_session_binary`]'s env values, so the whole launcher stays
+/// a function of what it is handed and its test needs no
+/// process-global env. When it holds a value the profile resolver
+/// would honour, the session is given `<that dir>/session` rather than
+/// inheriting the value: a child that resolved its launcher's own
+/// state dir would find that launcher's `state.lock` held and refuse
+/// to start — the isolation seam colliding with itself
+/// ([#397](https://github.com/charliek/roost/issues/397)). Both
+/// callers, the UI's connect ladder and `roostctl session start`, get
+/// the rule from here, so they cannot disagree about where a session
+/// they spawned keeps its state. Values the resolver ignores (empty,
+/// relative) derive nothing and set nothing, and the daemon's own
+/// reading of the variable is unchanged — a *direct* `roost-session
+/// start` under the seam still uses the value verbatim. Nothing else
+/// moves: the session's socket follows `XDG_RUNTIME_DIR`, so
+/// `roostctl session status|stop` still find it.
+pub async fn spawn_and_read_verdict(
+    bin: &Path,
+    cwd: &Path,
+    seam: Option<&OsStr>,
+    budget: Duration,
+) -> Result<Verdict> {
     let deadline = Instant::now() + budget;
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("start")
         .env(LAUNCH_CWD_ENV, cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Inherited: the session tees its startup log there, and a
         // failed start is far easier to read with it in front of you.
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(derived) = derived_session_state_dir(seam) {
+        // On the app path this line is the only trace of the
+        // derivation; `roostctl session start` also says it on stderr.
+        tracing::info!(
+            state_dir = %derived.display(),
+            "{STATE_DIR_ENV} is set; giving the spawned {BIN_NAME} a state dir under it"
+        );
+        command.env(STATE_DIR_ENV, &derived);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
 
@@ -1183,5 +1224,88 @@ mod tests {
             "{error:#}"
         );
         drop(listener);
+    }
+
+    // ------------------------------------------------------------------
+    // The derived state dir (#397)
+    //
+    // Driven over a real child, because the claim is about what reaches
+    // its environment. No process-global env anywhere: the seam is a
+    // parameter, so a case hands the launcher a value and reads back
+    // what the child saw. `paths.rs` table-tests the rule itself.
+    // ------------------------------------------------------------------
+
+    /// Generous on purpose: the stand-in prints and exits at once, so
+    /// nothing here waits on the clock — the budget only bounds a hang,
+    /// and a tight one would import `roost-cli`'s readiness flake.
+    const SEAM_BUDGET: Duration = Duration::from_secs(10);
+
+    /// What a child sees when the launcher sets nothing: whatever this
+    /// process itself carries. Usually nothing — but a developer
+    /// running the suite under `ROOST_STATE_DIR` still gets a true
+    /// assertion, because the claim is "the launcher left it alone",
+    /// not "the variable was absent".
+    fn ambient_state_dir() -> std::ffi::OsString {
+        std::env::var_os(STATE_DIR_ENV).unwrap_or_else(|| std::ffi::OsString::from("UNSET"))
+    }
+
+    /// Spawn a stand-in `roost-session` through the real launcher with
+    /// `seam` in hand, and hand back the `ROOST_STATE_DIR` it saw.
+    ///
+    /// The script takes its record path out of `LAUNCH_CWD_ENV` rather
+    /// than an interpolated literal, so no tempdir path has to survive
+    /// shell quoting, and the answer is read as bytes, so no path has
+    /// to be UTF-8. `${VAR-UNSET}` (not `${VAR:-UNSET}`) tells an unset
+    /// variable from an empty one. The variable is spelled out because
+    /// a shell cannot read the constant —
+    /// `paths::tests::the_state_dir_env_name_is_frozen` is what keeps
+    /// the two the same string.
+    async fn state_dir_handed_to(seam: Option<&OsStr>) -> (tempfile::TempDir, std::ffi::OsString) {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bin = dir.path().join(BIN_NAME);
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\n\
+             printf '%s' \"${ROOST_STATE_DIR-UNSET}\" > \"$ROOST_SESSION_LAUNCH_CWD/seen\"\n\
+             echo 'ready pid=4321'\n",
+        )
+        .expect("write the stand-in session");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let verdict = spawn_and_read_verdict(&bin, dir.path(), seam, SEAM_BUDGET)
+            .await
+            .expect("the stand-in reports a verdict");
+        assert_eq!(verdict, Verdict::Ready(4321));
+
+        let seen = std::fs::read(dir.path().join("seen"))
+            .expect("the stand-in records what it was handed");
+        (dir, std::ffi::OsString::from_vec(seen))
+    }
+
+    #[tokio::test]
+    async fn a_seam_gives_the_session_a_state_dir_nested_in_the_launchers_own() {
+        let isolated = tempfile::tempdir().expect("temp dir");
+        let (_dir, seen) = state_dir_handed_to(Some(isolated.path().as_os_str())).await;
+        assert_eq!(PathBuf::from(seen), isolated.path().join("session"));
+    }
+
+    #[tokio::test]
+    async fn no_seam_leaves_the_childs_environment_alone() {
+        let (_dir, seen) = state_dir_handed_to(None).await;
+        assert_eq!(seen, ambient_state_dir());
+    }
+
+    /// A value the resolver ignores derives nothing — and is not
+    /// forwarded either: the launcher sets no variable at all, so the
+    /// child's environment is the one `None` leaves it.
+    #[tokio::test]
+    async fn a_seam_the_resolver_ignores_sets_nothing_on_the_child() {
+        for raw in ["", "relative/state"] {
+            let (_dir, seen) = state_dir_handed_to(Some(OsStr::new(raw))).await;
+            assert_eq!(seen, ambient_state_dir(), "{raw:?}");
+        }
     }
 }

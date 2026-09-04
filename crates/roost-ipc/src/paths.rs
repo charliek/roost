@@ -152,7 +152,7 @@ impl BundleProfile {
         // while the socket/lock/log stay on the default profile path — the
         // CLI + harness find the UI by the unchanged socket. See
         // `apply_state_dir_override` for the strict (absolute) policy.
-        let state_dir = apply_state_dir_override(state_dir, std::env::var_os("ROOST_STATE_DIR"));
+        let state_dir = apply_state_dir_override(state_dir, std::env::var_os(STATE_DIR_ENV));
         Ok(BundleProfile {
             kind,
             app_label,
@@ -288,6 +288,27 @@ pub fn unrecognized_profile_env() -> Option<String> {
     }
 }
 
+/// The state-dir isolation seam.
+///
+/// A cross-process contract, not just a local read: every profile
+/// resolution here honours it, and
+/// [`crate::session_launch::spawn_and_read_verdict`] *writes* a derived
+/// value onto the `roost-session` it spawns. Frozen by a test.
+pub const STATE_DIR_ENV: &str = "ROOST_STATE_DIR";
+
+/// The one rule for a `ROOST_STATE_DIR` value: a non-empty, absolute
+/// path is honoured, anything else is not.
+///
+/// Silent — the warn belongs to [`apply_state_dir_override`], which is
+/// where a user's ignored value actually costs them something. Shared
+/// so [`derived_session_state_dir`] cannot drift from the resolver it
+/// has to agree with.
+fn honoured_state_dir(raw: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let raw = raw.filter(|v| !v.is_empty())?;
+    let path = PathBuf::from(raw);
+    path.is_absolute().then_some(path)
+}
+
 /// Apply a `ROOST_STATE_DIR` override to the resolved state dir. The env
 /// value is passed in (not read here) so the policy is unit-testable
 /// without mutating process-global env. Redirects **only** the state dir;
@@ -305,16 +326,39 @@ fn apply_state_dir_override(default: PathBuf, raw: Option<std::ffi::OsString>) -
     let Some(raw) = raw.filter(|v| !v.is_empty()) else {
         return default;
     };
-    let p = PathBuf::from(&raw);
-    if p.is_absolute() {
-        p
-    } else {
-        tracing::warn!(
-            value = ?raw,
-            "ROOST_STATE_DIR ignored: not an absolute path; using default state dir"
-        );
-        default
+    match honoured_state_dir(Some(&raw)) {
+        Some(path) => path,
+        None => {
+            tracing::warn!(
+                value = ?raw,
+                "ROOST_STATE_DIR ignored: not an absolute path; using default state dir"
+            );
+            default
+        }
     }
+}
+
+/// The state dir a **spawned** `roost-session` gets when its launcher is
+/// itself running under the seam: `Some(<value>/session)` for exactly
+/// the values [`apply_state_dir_override`] honours, `None` otherwise.
+///
+/// A daemon that simply inherited the value would resolve the
+/// *launcher's* state dir, find the launcher's `state.lock` held, and
+/// refuse to start — the seam colliding with itself
+/// ([#397](https://github.com/charliek/roost/issues/397)). Deriving a
+/// directory **inside** the launcher's own state dir inherits the
+/// isolation instead of the collision, and the daemon stays addressable
+/// because the socket never moves with this variable. Nested, not
+/// beside: whoever wipes the launcher's state dir wipes the session's
+/// with it, so anything that clears one has to account for the other.
+///
+/// Pure (the value is a parameter, not a read) for the same reason
+/// `apply_state_dir_override` is: the policy is testable without
+/// mutating process-global env. Borrowed rather than owned, as
+/// [`crate::session_launch::locate_session_binary`]'s env parameters
+/// are — clippy refuses an `Option<OsString>` this never consumes.
+pub fn derived_session_state_dir(raw: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    honoured_state_dir(raw).map(|dir| dir.join("session"))
 }
 
 #[cfg(target_os = "macos")]
@@ -969,5 +1013,58 @@ mod tests {
         assert_eq!(overridden.socket_path, base.socket_path);
         assert_eq!(overridden.socket_lock_path(), base.socket_lock_path());
         assert_eq!(overridden.log_path(), base.log_path());
+    }
+
+    // The derived state dir a launcher hands a spawned session (#397).
+    // The spawn itself is exercised over a real process in
+    // `tests/session_launch_state_dir_test.rs`, which needs its own
+    // binary because it has to set the variable these tests resolve
+    // profiles against.
+
+    /// The seam's name is a cross-process contract: a launcher sets it
+    /// on the session it spawns, every profile resolution reads it, and
+    /// the harness passes it to both. Nothing renames it alone.
+    #[test]
+    fn the_state_dir_env_name_is_frozen() {
+        assert_eq!(STATE_DIR_ENV, "ROOST_STATE_DIR");
+    }
+
+    #[test]
+    fn a_spawned_session_derives_a_dir_nested_in_an_absolute_seam() {
+        assert_eq!(
+            derived_session_state_dir(Some(std::ffi::OsStr::new("/tmp/throwaway"))),
+            Some(PathBuf::from("/tmp/throwaway/session"))
+        );
+    }
+
+    #[test]
+    fn a_spawned_session_derives_nothing_from_a_value_the_resolver_ignores() {
+        for raw in [None, Some(""), Some("relative/state")] {
+            let raw = raw.map(std::ffi::OsStr::new);
+            assert_eq!(derived_session_state_dir(raw), None, "{raw:?}");
+        }
+    }
+
+    /// The rule is *the same* rule, not a second copy of it: a value
+    /// derives a session dir exactly when it also redirects the
+    /// launcher's own state dir.
+    #[test]
+    fn the_derivation_honours_exactly_what_the_override_honours() {
+        let default = PathBuf::from("/default/state");
+        for raw in [
+            None,
+            Some(""),
+            Some("relative/state"),
+            Some("/tmp/throwaway"),
+        ] {
+            let raw = raw.map(std::ffi::OsStr::new);
+            let redirected =
+                apply_state_dir_override(default.clone(), raw.map(|v| v.to_os_string())) != default;
+            assert_eq!(
+                derived_session_state_dir(raw).is_some(),
+                redirected,
+                "{raw:?}"
+            );
+        }
     }
 }

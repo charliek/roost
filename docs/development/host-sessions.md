@@ -280,6 +280,31 @@ pointing that one at a Linux binary just fails to start, with no arch
 message, because there is no remote to compare against. `tools/session/README.md`
 names this asymmetry explicitly so it isn't rediscovered by surprise.
 
+**`ROOST_STATE_DIR`, the third seam on that ladder, and its own
+asymmetry.** The state-isolation seam
+([`paths.md`](../reference/paths.md#file-locations)) is read by *every*
+profile resolution, the daemon's included — so a UI launched under it
+that spawned a `localhost` session used to hand that session the UI's
+own state dir, where the UI's `state.lock` was already held, and the
+start refused ("another session (pid N) is using this state directory").
+Honest, and useless: the seam collided with itself, and the E2E harness
+launches its UI that way every run, so no lane could ever spawn a
+localhost daemon
+([#397](https://github.com/charliek/roost/issues/397)). The shared
+launch ladder now derives `<the launcher's state dir>/session` for the
+child — isolation inherited rather than collided with — and because
+both launchers (the UI's Connect and `roostctl session start`) take the
+rule from the one `spawn_and_read_verdict`, they cannot drift apart on
+where a session they started keeps its state. `roostctl` names the
+derived path on stderr; the UI logs it at `info`, which on the app path
+is the only trace. The asymmetry to remember: only a *launcher*
+derives. `roost-session start` run directly under `ROOST_STATE_DIR=X`
+still uses `X` verbatim — the daemon's own reading of the variable is
+untouched — and a value the resolver would ignore anyway (empty, or
+relative) derives nothing on either side. The daemon stays findable
+throughout, because the socket never moves with this variable:
+`roostctl session status|stop` address it by socket.
+
 ## Observing it: `host.status`, and the lanes that read it
 
 **Connection state is read through an op, never a log line.** [`host.status`](../reference/ipc.md#host-registry-host) reports, for every saved host, exactly what the sidebar band is drawn from — `state`, `reason` (untruncated), `rollup` (the band's own output, taken from the refreshed cache rather than re-formatted), `detail`, and `retry` while a rung is armed — plus `generation`, which counts attempts *started* and is the monotonic edge a poll waits on: two consecutive attempts can fail with byte-identical reasons, so "disconnected, with a reason" cannot tell attempt N from N−1. `roostctl host status [--id] [--json]` is the same read from a shell, and `roostctl host list`'s `state=` column is a best-effort second call to it. A `tracing` line is an operator convenience a refactor is free to reword or drop, and a test reading one passes just as happily against a feature that has stopped working — which is precisely what the SSH lane did before plan 042, so every lane below asserts on the op instead.
