@@ -185,24 +185,31 @@ pub(crate) enum Axis {
     Vertical,
 }
 
+/// `host` is the instance whose id-space this event's ids belong to: one
+/// section per host, so two hosts listing a project `4` publish two
+/// different gestures rather than one ambiguous id.
+///
 /// `scope_id` scopes a gesture to the surface it started on (the active
-/// project id for the tab strip, `0` for the project list) — it is only
-/// ever compared for equality, never run through `same_members`' zero
-/// reject, which applies to the item-id list.
+/// project id for the tab strip, the host's incarnation for a project
+/// list) — it is only ever compared for equality, never run through
+/// `same_members`' zero reject, which applies to the item-id list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StripEvent {
     Started {
+        host: HostId,
         scope_id: i64,
         source_id: i64,
         context_generation: u64,
         original_ids: Vec<i64>,
     },
     DragBegan {
+        host: HostId,
         scope_id: i64,
         source_id: i64,
         context_generation: u64,
     },
     Preview {
+        host: HostId,
         scope_id: i64,
         source_id: i64,
         context_generation: u64,
@@ -210,6 +217,7 @@ pub(crate) enum StripEvent {
         ordered_ids: Vec<i64>,
     },
     Commit {
+        host: HostId,
         scope_id: i64,
         source_id: i64,
         context_generation: u64,
@@ -217,12 +225,14 @@ pub(crate) enum StripEvent {
         ordered_ids: Vec<i64>,
     },
     Ended {
+        host: HostId,
         scope_id: i64,
         source_id: i64,
         context_generation: u64,
         original_ids: Vec<i64>,
     },
     Cancel {
+        host: HostId,
         context_generation: u64,
     },
 }
@@ -267,8 +277,13 @@ impl<'a> ReorderStrip<'a> {
         }
     }
 
-    /// The sidebar project list is one strip for the whole window, so it has
-    /// no scope to key gestures to; `0` is the constant it compares against.
+    /// The sidebar project list is one strip per host section, so the
+    /// incarnation is the scope it keys gestures to (`HostId::LOCAL` is
+    /// `0`, which is what the single-section window has always compared
+    /// against). Iced keys widget state by tree position and sections
+    /// come and go, so one strip's `previous_press` can be handed to
+    /// another host's strip — `previous.scope_id != self.scope_id`
+    /// below is the guard that drops it.
     pub(crate) fn projects(
         content: impl Into<Element<'a, Message>>,
         host: HostId,
@@ -279,7 +294,7 @@ impl<'a> ReorderStrip<'a> {
         Self {
             content: content.into(),
             axis: Axis::Vertical,
-            scope_id: 0,
+            scope_id: i64::from(host.raw()),
             ids,
             context_generation,
             enabled,
@@ -291,8 +306,22 @@ impl<'a> ReorderStrip<'a> {
     }
 }
 
+impl ReorderStrip<'_> {
+    fn scope(&self) -> StripScope {
+        StripScope {
+            host: self.host,
+            scope_id: self.scope_id,
+            context_generation: self.context_generation,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Gesture {
+    /// The instance this gesture's ids belong to. The tab strip's
+    /// `scope_id` is a bare project id, which two instances can both
+    /// own, so the scope alone does not separate them.
+    host: HostId,
     scope_id: i64,
     source_id: i64,
     original_ids: Vec<i64>,
@@ -330,6 +359,10 @@ struct ScopedPress {
     /// The strip's frame counter when this press was processed — the
     /// budget the wall clock cannot see.
     frame: u64,
+    /// See [`Gesture::host`]: without it a press on local project `4`
+    /// and one on host H's project `4` read as one double-click, and the
+    /// rename editor would open on a row the first press never touched.
+    host: HostId,
     scope_id: i64,
     source_id: i64,
     context_generation: u64,
@@ -364,6 +397,16 @@ struct State {
     frames: u64,
 }
 
+/// A strip's identity for a gesture: whose ids, which surface, and
+/// which generation of it. The three always travel together — a gesture
+/// is only ever this strip's while all three still match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StripScope {
+    host: HostId,
+    scope_id: i64,
+    context_generation: u64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ReleaseSettlement {
     Unowned,
@@ -377,32 +420,28 @@ enum PressSettlement {
 }
 
 impl State {
-    fn previous_press_for(
-        &self,
-        scope_id: i64,
-        source_id: i64,
-        context_generation: u64,
-    ) -> Option<ScopedPress> {
+    fn previous_press_for(&self, scope: StripScope, source_id: i64) -> Option<ScopedPress> {
         self.previous_press.filter(|previous| {
-            previous.scope_id == scope_id
+            previous.host == scope.host
+                && previous.scope_id == scope.scope_id
                 && previous.source_id == source_id
-                && previous.context_generation == context_generation
+                && previous.context_generation == scope.context_generation
         })
     }
 
-    fn settle_release(
-        &mut self,
-        scope_id: i64,
-        ids: &[i64],
-        context_generation: u64,
-    ) -> Option<StripEvent> {
+    fn settle_release(&mut self, scope: StripScope, ids: &[i64]) -> Option<StripEvent> {
         let gesture = self.gesture.take()?;
-        if !context_valid(&gesture, scope_id, ids, context_generation) {
+        if !context_valid(&gesture, scope, ids) {
+            // The gesture's own host, not this strip's: after a widget
+            // state reflow they can differ, and the App matches a cancel
+            // against the preview the gesture armed.
             Some(StripEvent::Cancel {
+                host: gesture.host,
                 context_generation: gesture.context_generation,
             })
         } else if gesture.dragging {
             Some(StripEvent::Commit {
+                host: gesture.host,
                 scope_id: gesture.scope_id,
                 source_id: gesture.source_id,
                 context_generation: gesture.context_generation,
@@ -411,6 +450,7 @@ impl State {
             })
         } else {
             Some(StripEvent::Ended {
+                host: gesture.host,
                 scope_id: gesture.scope_id,
                 source_id: gesture.source_id,
                 context_generation: gesture.context_generation,
@@ -423,21 +463,21 @@ impl State {
         &mut self,
         position: Point,
         at: Instant,
-        scope_id: i64,
+        scope: StripScope,
         source_id: i64,
         ids: &[i64],
-        context_generation: u64,
     ) -> PressSettlement {
         let press = ScopedPress {
             position,
             at,
             frame: self.frames,
-            scope_id,
+            host: scope.host,
+            scope_id: scope.scope_id,
             source_id,
-            context_generation,
+            context_generation: scope.context_generation,
         };
         let double = self
-            .previous_press_for(scope_id, source_id, context_generation)
+            .previous_press_for(scope, source_id)
             .is_some_and(|previous| press_continues_gesture(&previous, position, at, self.frames));
         // A third press must start over rather than rename again, which is
         // what Iced's own Double → Triple step bought.
@@ -447,18 +487,20 @@ impl State {
             PressSettlement::DoubleClick
         } else {
             self.gesture = Some(Gesture {
-                scope_id,
+                host: scope.host,
+                scope_id: scope.scope_id,
                 source_id,
                 original_ids: ids.to_vec(),
                 ordered_ids: ids.to_vec(),
                 origin: position,
-                context_generation,
+                context_generation: scope.context_generation,
                 dragging: false,
             });
             PressSettlement::Started(StripEvent::Started {
-                scope_id,
+                host: scope.host,
+                scope_id: scope.scope_id,
                 source_id,
-                context_generation,
+                context_generation: scope.context_generation,
                 original_ids: ids.to_vec(),
             })
         }
@@ -473,6 +515,7 @@ impl State {
         }
         gesture.dragging = true;
         Some(StripEvent::DragBegan {
+            host: gesture.host,
             scope_id: gesture.scope_id,
             source_id: gesture.source_id,
             context_generation: gesture.context_generation,
@@ -482,9 +525,8 @@ impl State {
     fn settle_owned_release(
         &mut self,
         event: &Event,
-        scope_id: i64,
+        scope: StripScope,
         ids: &[i64],
-        context_generation: u64,
     ) -> ReleaseSettlement {
         if !matches!(
             event,
@@ -493,7 +535,7 @@ impl State {
         {
             return ReleaseSettlement::Unowned;
         }
-        ReleaseSettlement::Owned(self.settle_release(scope_id, ids, context_generation))
+        ReleaseSettlement::Owned(self.settle_release(scope, ids))
     }
 }
 
@@ -540,9 +582,10 @@ fn next_preview_order(
     Ok((ordered_ids != current_preview).then_some(ordered_ids))
 }
 
-fn context_valid(gesture: &Gesture, scope_id: i64, ids: &[i64], context_generation: u64) -> bool {
-    gesture.context_generation == context_generation
-        && gesture.scope_id == scope_id
+fn context_valid(gesture: &Gesture, scope: StripScope, ids: &[i64]) -> bool {
+    gesture.host == scope.host
+        && gesture.context_generation == scope.context_generation
+        && gesture.scope_id == scope.scope_id
         && same_members(ids, &gesture.original_ids)
 }
 
@@ -603,9 +646,8 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
     ) {
         match tree.state.downcast_mut::<State>().settle_owned_release(
             event,
-            self.scope_id,
+            self.scope(),
             &self.ids,
-            self.context_generation,
         ) {
             ReleaseSettlement::Unowned => {}
             ReleaseSettlement::Owned(settlement) => {
@@ -644,6 +686,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
             state.previous_press = None;
             if let Some(gesture) = state.gesture.take() {
                 shell.publish((self.on_event)(StripEvent::Cancel {
+                    host: gesture.host,
                     context_generation: gesture.context_generation,
                 }));
             }
@@ -651,18 +694,21 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
         }
 
         if state.previous_press.is_some_and(|previous| {
-            previous.scope_id != self.scope_id
+            previous.host != self.host
+                || previous.scope_id != self.scope_id
                 || previous.context_generation != self.context_generation
                 || !self.ids.contains(&previous.source_id)
         }) {
             state.previous_press = None;
         }
 
-        if let Some(gesture) = state.gesture.take_if(|gesture| {
-            !context_valid(gesture, self.scope_id, &self.ids, self.context_generation)
-        }) {
+        if let Some(gesture) = state
+            .gesture
+            .take_if(|gesture| !context_valid(gesture, self.scope(), &self.ids))
+        {
             state.previous_press = None;
             shell.publish((self.on_event)(StripEvent::Cancel {
+                host: gesture.host,
                 context_generation: gesture.context_generation,
             }));
         }
@@ -684,14 +730,8 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                     "Iced reorder strip armed pointer press"
                 );
                 shell.publish((self.on_select)(self.host, source_id));
-                match state.arm_press(
-                    position,
-                    Instant::now(),
-                    self.scope_id,
-                    source_id,
-                    &self.ids,
-                    self.context_generation,
-                ) {
+                match state.arm_press(position, Instant::now(), self.scope(), source_id, &self.ids)
+                {
                     PressSettlement::Started(event) => {
                         shell.publish((self.on_event)(event));
                     }
@@ -727,6 +767,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                     Ok(Some(ordered_ids)) => {
                         gesture.ordered_ids.clone_from(&ordered_ids);
                         shell.publish((self.on_event)(StripEvent::Preview {
+                            host: gesture.host,
                             scope_id: gesture.scope_id,
                             source_id: gesture.source_id,
                             context_generation: gesture.context_generation,
@@ -736,9 +777,13 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                     }
                     Ok(None) => {}
                     Err(_) => {
+                        let host = gesture.host;
                         let context_generation = gesture.context_generation;
                         state.gesture = None;
-                        shell.publish((self.on_event)(StripEvent::Cancel { context_generation }));
+                        shell.publish((self.on_event)(StripEvent::Cancel {
+                            host,
+                            context_generation,
+                        }));
                     }
                 }
                 shell.capture_event();
@@ -747,6 +792,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                 state.previous_press = None;
                 if let Some(gesture) = state.gesture.take() {
                     shell.publish((self.on_event)(StripEvent::Cancel {
+                        host: gesture.host,
                         context_generation: gesture.context_generation,
                     }));
                 }
@@ -933,8 +979,21 @@ mod tests {
         assert!(!same_members(&[0, 1], &[0, 1]));
     }
 
+    fn scope(host: HostId, scope_id: i64, context_generation: u64) -> StripScope {
+        StripScope {
+            host,
+            scope_id,
+            context_generation,
+        }
+    }
+
     fn gesture(dragging: bool) -> Gesture {
+        gesture_on(HostId::LOCAL, dragging)
+    }
+
+    fn gesture_on(host: HostId, dragging: bool) -> Gesture {
         Gesture {
+            host,
             scope_id: 7,
             source_id: 10,
             original_ids: vec![10, 20, 30],
@@ -956,8 +1015,9 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            state.settle_release(7, &[10, 20, 30], 4),
+            state.settle_release(scope(HostId::LOCAL, 7, 4), &[10, 20, 30]),
             Some(StripEvent::Commit {
+                host: HostId::LOCAL,
                 scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
@@ -965,7 +1025,10 @@ mod tests {
                 ordered_ids: vec![20, 30, 10],
             })
         );
-        assert_eq!(state.settle_release(7, &[10, 20, 30], 4), None);
+        assert_eq!(
+            state.settle_release(scope(HostId::LOCAL, 7, 4), &[10, 20, 30]),
+            None
+        );
     }
 
     #[test]
@@ -976,11 +1039,11 @@ mod tests {
             ..State::default()
         };
         assert!(matches!(
-            state.settle_owned_release(&release, 7, &[10, 20, 30], 4),
+            state.settle_owned_release(&release, scope(HostId::LOCAL, 7, 4), &[10, 20, 30]),
             ReleaseSettlement::Owned(Some(StripEvent::Commit { .. }))
         ));
         assert_eq!(
-            state.settle_owned_release(&release, 7, &[10, 20, 30], 4),
+            state.settle_owned_release(&release, scope(HostId::LOCAL, 7, 4), &[10, 20, 30]),
             ReleaseSettlement::Unowned
         );
 
@@ -990,7 +1053,7 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            right.settle_owned_release(&right_release, 7, &[10, 20, 30], 4),
+            right.settle_owned_release(&right_release, scope(HostId::LOCAL, 7, 4), &[10, 20, 30]),
             ReleaseSettlement::Unowned
         );
         assert!(right.gesture.is_some());
@@ -1003,8 +1066,9 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            stale.settle_release(7, &[10, 20, 30], 5),
+            stale.settle_release(scope(HostId::LOCAL, 7, 5), &[10, 20, 30]),
             Some(StripEvent::Cancel {
+                host: HostId::LOCAL,
                 context_generation: 4,
             })
         );
@@ -1014,8 +1078,9 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            click.settle_release(7, &[10, 20, 30], 4),
+            click.settle_release(scope(HostId::LOCAL, 7, 4), &[10, 20, 30]),
             Some(StripEvent::Ended {
+                host: HostId::LOCAL,
                 scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
@@ -1025,6 +1090,63 @@ mod tests {
         assert!(click.gesture.is_none());
     }
 
+    /// Two hosts each own a project `4`, so an event that named only the
+    /// bare id would be ambiguous the moment a second section exists.
+    #[test]
+    fn every_published_event_names_the_instance_its_ids_belong_to() {
+        let host = HostId::new(7);
+        let ids = [10, 20, 30];
+        let origin = Point::new(100.0, 20.0);
+        let mut state = State::default();
+
+        let PressSettlement::Started(started) =
+            state.arm_press(origin, Instant::now(), scope(host, 4, 4), 10, &ids)
+        else {
+            panic!("a first press starts a gesture");
+        };
+        assert!(matches!(started, StripEvent::Started { host: h, .. } if h == host));
+        assert!(matches!(
+            state.begin_drag(Point::new(140.0, 20.0)),
+            Some(StripEvent::DragBegan { host: h, .. }) if h == host
+        ));
+        assert!(matches!(
+            state.settle_release(scope(host, 4, 4), &ids),
+            Some(StripEvent::Commit { host: h, .. }) if h == host
+        ));
+
+        let mut ended = State {
+            gesture: Some(gesture_on(host, false)),
+            ..State::default()
+        };
+        assert!(matches!(
+            ended.settle_release(scope(host, 7, 4), &ids),
+            Some(StripEvent::Ended { host: h, .. }) if h == host
+        ));
+
+        let mut cancelled = State {
+            gesture: Some(gesture_on(host, true)),
+            ..State::default()
+        };
+        assert!(matches!(
+            cancelled.settle_release(scope(host, 7, 5), &ids),
+            Some(StripEvent::Cancel { host: h, .. }) if h == host
+        ));
+    }
+
+    /// The scope is the incarnation, not a constant: iced keys widget
+    /// state by tree position, so a section appearing or disappearing can
+    /// hand one strip's `previous_press` to another host's strip, and the
+    /// scope comparison is what drops it.
+    #[test]
+    fn a_project_strips_scope_is_its_own_incarnation() {
+        let strip = |host| {
+            ReorderStrip::projects(iced::widget::Space::new(), host, vec![10, 20], 4, true).scope_id
+        };
+        assert_eq!(strip(HostId::LOCAL), 0);
+        assert_eq!(strip(HostId::new(3)), 3);
+        assert_ne!(strip(HostId::new(3)), strip(HostId::new(4)));
+    }
+
     #[test]
     fn ended_inactive_press_preserves_the_second_press_as_a_double_click() {
         let position = Point::new(250.0, 17.0);
@@ -1032,22 +1154,34 @@ mod tests {
         let now = Instant::now();
         let mut state = State::default();
         assert!(matches!(
-            state.arm_press(position, now, 7, 10, &ids, 4),
+            state.arm_press(position, now, scope(HostId::LOCAL, 7, 4), 10, &ids),
             PressSettlement::Started(StripEvent::Started { source_id: 10, .. })
         ));
         assert!(matches!(
-            state.settle_release(7, &ids, 4),
+            state.settle_release(scope(HostId::LOCAL, 7, 4), &ids),
             Some(StripEvent::Ended { source_id: 10, .. })
         ));
         assert_eq!(
-            state.arm_press(position, now + Duration::from_millis(100), 7, 10, &ids, 4),
+            state.arm_press(
+                position,
+                now + Duration::from_millis(100),
+                scope(HostId::LOCAL, 7, 4),
+                10,
+                &ids
+            ),
             PressSettlement::DoubleClick
         );
         assert!(state.gesture.is_none());
         // The third press starts over: a double-click must not rename on
         // every further press of the same sequence.
         assert!(matches!(
-            state.arm_press(position, now + Duration::from_millis(200), 7, 10, &ids, 4),
+            state.arm_press(
+                position,
+                now + Duration::from_millis(200),
+                scope(HostId::LOCAL, 7, 4),
+                10,
+                &ids
+            ),
             PressSettlement::Started(StripEvent::Started { source_id: 10, .. })
         ));
     }
@@ -1061,6 +1195,7 @@ mod tests {
         let position = Point::new(100.0, 52.0);
         let now = Instant::now();
         let previous = ScopedPress {
+            host: HostId::LOCAL,
             position,
             at: now,
             frame: 4,
@@ -1099,10 +1234,88 @@ mod tests {
         );
     }
 
+    /// The tab strip's scope is a bare project id, and a local project
+    /// and a host's can both be `7`. Without the host on the press, a
+    /// click on local tab 10 followed — inside the double-click window,
+    /// after a palette jump that moved the selection without burning the
+    /// generation — by a click on host H's tab 10 would open the rename
+    /// editor on a row the first click never touched.
+    #[test]
+    fn a_press_pair_that_spans_two_instances_is_not_a_double_click() {
+        let position = Point::new(250.0, 17.0);
+        let ids = [10, 20, 30];
+        let now = Instant::now();
+        let mut state = State::default();
+
+        assert!(matches!(
+            state.arm_press(position, now, scope(HostId::LOCAL, 7, 4), 10, &ids),
+            PressSettlement::Started(StripEvent::Started { .. })
+        ));
+        assert!(matches!(
+            state.settle_release(scope(HostId::LOCAL, 7, 4), &ids),
+            Some(StripEvent::Ended { .. })
+        ));
+        assert!(
+            matches!(
+                state.arm_press(
+                    position,
+                    now + Duration::from_millis(100),
+                    scope(HostId::new(3), 7, 4),
+                    10,
+                    &ids,
+                ),
+                PressSettlement::Started(StripEvent::Started { .. })
+            ),
+            "another instance's project 7 is another surface"
+        );
+
+        // The same pair on one instance still renames, so the guard is
+        // the host and nothing else.
+        let mut same = State::default();
+        assert!(matches!(
+            same.arm_press(position, now, scope(HostId::new(3), 7, 4), 10, &ids),
+            PressSettlement::Started(StripEvent::Started { .. })
+        ));
+        assert!(matches!(
+            same.settle_release(scope(HostId::new(3), 7, 4), &ids),
+            Some(StripEvent::Ended { .. })
+        ));
+        assert_eq!(
+            same.arm_press(
+                position,
+                now + Duration::from_millis(100),
+                scope(HostId::new(3), 7, 4),
+                10,
+                &ids,
+            ),
+            PressSettlement::DoubleClick
+        );
+    }
+
+    /// A gesture keeps publishing under the instance it armed on, even
+    /// if the strip holding its widget state is re-rendered as another
+    /// section's — the App matches a cancel against the preview the
+    /// gesture armed, not against whatever is on screen now.
+    #[test]
+    fn a_cancel_names_the_gesture_s_own_instance_not_the_strips() {
+        let host = HostId::new(3);
+        let ids = [10, 20, 30];
+        let mut state = State::default();
+        assert!(matches!(
+            state.arm_press(Point::ORIGIN, Instant::now(), scope(host, 7, 4), 10, &ids),
+            PressSettlement::Started(StripEvent::Started { .. })
+        ));
+        assert!(matches!(
+            state.settle_release(scope(HostId::LOCAL, 7, 4), &ids),
+            Some(StripEvent::Cancel { host: h, .. }) if h == host
+        ));
+    }
+
     #[test]
     fn double_click_history_is_scoped_to_stable_id_project_and_generation() {
         let state = State {
             previous_press: Some(ScopedPress {
+                host: HostId::LOCAL,
                 position: Point::new(10.0, 10.0),
                 at: Instant::now(),
                 frame: 0,
@@ -1112,10 +1325,25 @@ mod tests {
             }),
             ..State::default()
         };
-        assert!(state.previous_press_for(7, 10, 4).is_some());
-        assert!(state.previous_press_for(7, 20, 4).is_none());
-        assert!(state.previous_press_for(8, 10, 4).is_none());
-        assert!(state.previous_press_for(7, 10, 5).is_none());
+        assert!(state
+            .previous_press_for(scope(HostId::LOCAL, 7, 4), 10)
+            .is_some());
+        assert!(state
+            .previous_press_for(scope(HostId::LOCAL, 7, 4), 20)
+            .is_none());
+        assert!(state
+            .previous_press_for(scope(HostId::LOCAL, 8, 4), 10)
+            .is_none());
+        assert!(state
+            .previous_press_for(scope(HostId::LOCAL, 7, 5), 10)
+            .is_none());
+        assert!(
+            state
+                .previous_press_for(scope(HostId::new(3), 7, 4), 10)
+                .is_none(),
+            "the tab strip's scope is a bare project id, which another \
+             instance can own too — the host is what separates them"
+        );
     }
 
     #[test]
@@ -1124,13 +1352,14 @@ mod tests {
         let origin = Point::new(100.0, 20.0);
         let mut state = State::default();
         assert!(matches!(
-            state.arm_press(origin, Instant::now(), 7, 10, &ids, 4),
+            state.arm_press(origin, Instant::now(), scope(HostId::LOCAL, 7, 4), 10, &ids),
             PressSettlement::Started(StripEvent::Started { .. })
         ));
         assert_eq!(state.begin_drag(Point::new(104.0, 20.0)), None);
         assert_eq!(
             state.begin_drag(Point::new(108.0, 20.0)),
             Some(StripEvent::DragBegan {
+                host: HostId::LOCAL,
                 scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
@@ -1139,19 +1368,26 @@ mod tests {
         assert_eq!(state.begin_drag(Point::new(180.0, 60.0)), None);
         assert_eq!(state.begin_drag(origin), None);
         assert!(matches!(
-            state.settle_release(7, &ids, 4),
+            state.settle_release(scope(HostId::LOCAL, 7, 4), &ids),
             Some(StripEvent::Commit { .. })
         ));
 
         assert_eq!(state.begin_drag(Point::new(180.0, 60.0)), None);
         let elsewhere = Point::new(400.0, 20.0);
         assert!(matches!(
-            state.arm_press(elsewhere, Instant::now(), 7, 30, &ids, 4),
+            state.arm_press(
+                elsewhere,
+                Instant::now(),
+                scope(HostId::LOCAL, 7, 4),
+                30,
+                &ids
+            ),
             PressSettlement::Started(StripEvent::Started { .. })
         ));
         assert_eq!(
             state.begin_drag(Point::new(408.0, 20.0)),
             Some(StripEvent::DragBegan {
+                host: HostId::LOCAL,
                 scope_id: 7,
                 source_id: 30,
                 context_generation: 4,
@@ -1227,8 +1463,9 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            state.settle_release(7, &rendered, 4),
+            state.settle_release(scope(HostId::LOCAL, 7, 4), &rendered),
             Some(StripEvent::Commit {
+                host: HostId::LOCAL,
                 scope_id: 7,
                 source_id: 10,
                 context_generation: 4,

@@ -91,12 +91,13 @@ mod terminal_tab;
 #[cfg(test)]
 mod perf_bench;
 
+pub(crate) use self::interactions::host_reorder_hold_tick;
 pub(crate) use self::interactions::RenameTarget;
 use self::interactions::{
-    agent_rows_hidden, arm_rename_completion_for_open_editor, consume_rename_completion_key,
-    enqueue_osc_clipboard_write, native_file_drop_origin, paste_bytes, same_stable_ids,
-    ClipboardQueue, FileDropQueue, ProjectDragPreview, RenameCompletionKey, RenameEditor,
-    ScreenshotQueue, TabDragPreview,
+    agent_rows_hidden, any_preview_is_held, arm_rename_completion_for_open_editor,
+    consume_rename_completion_key, enqueue_osc_clipboard_write, host_section_is_reorderable,
+    native_file_drop_origin, paste_bytes, visual_tab_ids, ClipboardQueue, FileDropQueue,
+    ProjectDragPreview, RenameCompletionKey, RenameEditor, ScreenshotQueue, TabDragPreview,
 };
 pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
@@ -637,19 +638,22 @@ pub enum EngineOpResult {
     /// superseded reorder's completion cannot clear a newer drag's
     /// preview.
     ///
-    /// Bare, deliberately: `ordered_ids` is the order this op HANDED the
-    /// engine, echoed back so the preview can tell a superseded reorder
-    /// from a current one. It is a wire payload round-tripping, not
-    /// routing state — and it is already scoped by `project_id`, which
-    /// only the strip that dispatched it can have produced.
+    /// `host` is the instance the reorder was dispatched to, and it is
+    /// what the ids below mean: two hosts can each own a project `4`, so
+    /// the bare ids alone would name two different rows. They are echoed
+    /// back as a wire payload round-tripping — the preview reads them to
+    /// tell a superseded reorder from a current one — while the routing
+    /// is the `host` half.
     TabsReordered {
         op: u64,
+        host: HostId,
         project_id: i64,
         ordered_ids: Vec<i64>,
         result: Result<(), String>,
     },
     ProjectsReordered {
         op: u64,
+        host: HostId,
         ordered_ids: Vec<i64>,
         result: Result<(), String>,
     },
@@ -2606,15 +2610,17 @@ impl App {
             }
             EngineOpResult::TabsReordered {
                 op,
+                host,
                 project_id,
                 ordered_ids,
                 result,
-            } => self.tab_reorder_completed(op, project_id, &ordered_ids, result),
+            } => self.tab_reorder_completed(op, host, project_id, &ordered_ids, result),
             EngineOpResult::ProjectsReordered {
                 op,
+                host,
                 ordered_ids,
                 result,
-            } => self.project_reorder_completed(op, &ordered_ids, result),
+            } => self.project_reorder_completed(op, host, &ordered_ids, result),
             EngineOpResult::HostVerified {
                 generation,
                 label,
@@ -2713,6 +2719,26 @@ impl App {
     /// A tab whose budget ran out stays tracked but stops arming this.
     pub fn attach_retry_pending(&self) -> bool {
         self.pending_attachments.has_retryable()
+    }
+
+    /// A host reorder is holding its preview, so the belt needs a clock.
+    ///
+    /// Nothing else would give it one: with the 16 ms tick gone an idle
+    /// app schedules no timer at all, so a hold whose reorder event
+    /// never arrives would otherwise expire only when unrelated feed
+    /// traffic happened to run a reconcile.
+    pub fn reorder_hold_pending(&self) -> bool {
+        any_preview_is_held(
+            self.tab_drag_preview.as_ref(),
+            self.project_drag_preview.as_ref(),
+        )
+    }
+
+    /// The belt's own tick — [`Self::reorder_hold_pending`] armed it.
+    /// Only the two preview reconciles, which is all the belt is.
+    pub fn reorder_hold_tick(&mut self) {
+        self.reconcile_tab_drag_preview();
+        self.reconcile_project_drag_preview();
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -3575,19 +3601,14 @@ impl App {
         )
         .width(Fill)
         .height(chrome::ROW_HEIGHT);
-        // Local rows take their click from the reorder strip that wraps
-        // them (it owns press, drag and double-click as one gesture). A
-        // host section sits outside that strip — reordering a host's
-        // projects is a workspace mutation, which routes through the op
-        // queue rather than the local client — so its rows carry their
-        // own press, and a dimmed one carries none.
-        let project_row: Element<'a, Message> = if project_key.is_local() || dim {
-            project_row.into()
-        } else {
-            mouse_area(project_row)
-                .on_press(Message::ProjectSelected(project_key))
-                .into()
-        };
+        // Rows take their click from the reorder strip that wraps them
+        // (it owns press, drag and double-click as one gesture), on a
+        // host section exactly as on the local one. A dimmed section is
+        // the exception: it sits outside any strip, and a disabled strip
+        // publishes nothing at all on press — so those rows are simply
+        // press-less, which is the whole of "nothing here is actionable
+        // until the connection is back".
+        let project_row: Element<'a, Message> = project_row.into();
         let mut project_group = column![project_row].spacing(2);
         if self.config.show_sidebar_agents && !hide_agent_rows {
             for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
@@ -3696,24 +3717,18 @@ impl App {
         let active_project_key = self.active_project_key();
         let active_key = self.active_tab_key();
         let active_project = active_project_key.project;
-        let authoritative_project_ids = self.sidebar_project_ids();
-        let visual_project_ids = self
-            .project_drag_preview
-            .as_ref()
-            .filter(|preview| {
-                preview.orders_the_strip(self.project_strip_generation)
-                    && preview.original_ids == authoritative_project_ids
-                    && same_stable_ids(&preview.ordered_ids, &authoritative_project_ids)
-            })
-            .map(|preview| preview.ordered_ids.clone())
-            .unwrap_or(authoritative_project_ids);
+        // One preview slot per axis, one strip per section: the drawn
+        // order and the carried row belong to the section the gesture
+        // started on, and every other section draws its authority.
+        let visual_project_ids = self.visual_project_ids(host);
         // Sidebar rows are large, so the drag styling waits for the threshold
         // rather than flashing on every ordinary click.
-        let dragged_project = self
-            .project_drag_preview
-            .as_ref()
-            .filter(|preview| preview.dragging)
-            .map(|preview| preview.context.source_id);
+        let dragged_project = |section: HostId| {
+            self.project_drag_preview
+                .as_ref()
+                .filter(|preview| preview.dragging && preview.context.host == section)
+                .map(|preview| preview.context.source_id)
+        };
         let mut sidebar_body = column![].spacing(2).padding([4, 0]);
         for project in visual_project_ids.iter().filter_map(|project_id| {
             self.projects
@@ -3724,7 +3739,7 @@ impl App {
             sidebar_body = sidebar_body.push(self.sidebar_project_group(
                 project,
                 project_key,
-                dragged_project,
+                dragged_project(host),
                 false,
             ));
         }
@@ -3772,14 +3787,49 @@ impl App {
                 let mut list = column![self.host_band(&sections[0]), project_strip];
                 for (section, view) in sections[1..].iter().zip(&self.host_views) {
                     list = list.push(self.host_band(section));
+                    let reorderable =
+                        host_section_is_reorderable(view.host, section.state.interactive());
                     let dim = !section.state.interactive();
+                    // Only a section that can hold a gesture asks for a
+                    // preview order. A never-connected host's incarnation
+                    // is the LOCAL placeholder, so asking on its behalf
+                    // would answer with the *local* project list — true
+                    // today only because such a section's rows are
+                    // documented empty. Reading its own rows instead
+                    // makes that structural.
+                    let visual_ids: Vec<i64> = if reorderable {
+                        self.visual_project_ids(view.host)
+                    } else {
+                        view.projects.iter().map(|project| project.id).collect()
+                    };
                     let mut rows = column![].spacing(2).padding([4, 0]);
-                    for project in &view.projects {
+                    for project in visual_ids
+                        .iter()
+                        .filter_map(|id| view.projects.iter().find(|project| project.id == *id))
+                    {
                         let project_key = ProjectKey::new(view.host, project.id);
-                        rows =
-                            rows.push(self.sidebar_project_group(project, project_key, None, dim));
+                        rows = rows.push(self.sidebar_project_group(
+                            project,
+                            project_key,
+                            dragged_project(view.host),
+                            dim,
+                        ));
                     }
-                    list = list.push(rows);
+                    // Only an interactive section gets a strip: a
+                    // disabled one publishes nothing on press, not even
+                    // `on_select`, so rows inside it would lose their
+                    // click as well as their drag.
+                    list = if reorderable {
+                        list.push(ReorderStrip::projects(
+                            rows,
+                            view.host,
+                            visual_ids,
+                            self.project_strip_generation,
+                            self.strip_gestures_enabled(),
+                        ))
+                    } else {
+                        list.push(rows)
+                    };
                     if section.state.offers_reconnect() {
                         list = list.push(self.host_reconnect_row(&view.saved_id));
                     }
@@ -3824,16 +3874,14 @@ impl App {
         let authoritative_tab_ids = active_project_model
             .map(|project| project.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>())
             .unwrap_or_default();
-        let visual_tab_ids = self
-            .tab_drag_preview
-            .as_ref()
-            .filter(|preview| {
-                preview.context.project_id == active_project
-                    && preview.original_ids == authoritative_tab_ids
-                    && same_stable_ids(&preview.ordered_ids, &authoritative_tab_ids)
-            })
-            .map(|preview| preview.ordered_ids.clone())
-            .unwrap_or_else(|| authoritative_tab_ids.clone());
+        let visual_tab_ids = visual_tab_ids(
+            self.tab_drag_preview.as_ref(),
+            active_project_key,
+            authoritative_tab_ids,
+        );
+        // Whether this project's tabs can be dragged at all: the local
+        // workspace always, a host only while its section is interactive.
+        let reorderable_project = self.reorderable(active_project_key.host);
         let active_project_tabs = visual_tab_ids
             .iter()
             .filter_map(|tab_id| {
@@ -3980,12 +4028,13 @@ impl App {
                         .as_ref()
                         .is_some_and(|preview| preview.drags(tab.id)),
                 ));
-            // Local pills take their click from the strip below, which
-            // owns press + drag + double-click-to-rename as one gesture.
-            // A host project's strip is disabled (reordering its tabs is
-            // an op-queue mutation, not a local reorder), so its pills
-            // carry the plain press themselves.
-            tab_pills = tab_pills.push(if tab_key.is_local() {
+            // Pills take their click from the strip below, which owns
+            // press + drag + double-click-to-rename as one gesture. Only
+            // a project whose section cannot be reordered at all — a
+            // dimmed host — falls back to a plain press of its own; a
+            // strip disabled because a modal is up leaves its pills
+            // press-less exactly as the local strip always has.
+            tab_pills = tab_pills.push(if reorderable_project {
                 Element::from(pill_container)
             } else {
                 mouse_area(pill_container)
@@ -3999,7 +4048,7 @@ impl App {
             active_project,
             visual_tab_ids,
             self.tab_strip_generation,
-            self.strip_gestures_enabled() && active_project_key.is_local(),
+            self.strip_gestures_enabled() && reorderable_project,
         );
         let add_tab_button = button(text("+").size(16).color(chrome::MUTED_TEXT))
             .width(chrome::PILL_HEIGHT)
@@ -7465,6 +7514,7 @@ mod tests {
         assert_eq!(
             EngineOpResult::TabsReordered {
                 op: 8,
+                host: HostId::LOCAL,
                 project_id: 3,
                 ordered_ids: vec![9],
                 result: Ok(()),
@@ -7475,6 +7525,7 @@ mod tests {
         assert_eq!(
             EngineOpResult::ProjectsReordered {
                 op: 9,
+                host: HostId::LOCAL,
                 ordered_ids: vec![3],
                 result: Ok(()),
             }

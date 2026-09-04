@@ -67,6 +67,9 @@ enum Message {
     /// A tab the workspace lists still has no terminal. Armed only while
     /// the pending-attach set is non-empty.
     AttachRetryTick,
+    /// A host reorder is holding its preview and the belt needs a clock.
+    /// Armed only while a hold is up.
+    ReorderHoldTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
     WindowOpened(window::Id),
@@ -438,6 +441,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.retry_pending_attachments();
             Task::none()
         }
+        Message::ReorderHoldTick => {
+            app.reorder_hold_tick();
+            Task::none()
+        }
         Message::FileDropDeadline => {
             app.file_drop_deadline();
             Task::none()
@@ -585,6 +592,7 @@ struct ArmedTimers {
     status: bool,
     palette_retry: bool,
     attach_retry: bool,
+    reorder_hold: bool,
 }
 
 impl ArmedTimers {
@@ -593,6 +601,7 @@ impl ArmedTimers {
             status: app.status_active(),
             palette_retry: app.palette_retry_pending(),
             attach_retry: app.attach_retry_pending(),
+            reorder_hold: app.reorder_hold_pending(),
         }
     }
 
@@ -600,7 +609,10 @@ impl ArmedTimers {
     /// expected-length term the subscription test asserts against.
     #[cfg(test)]
     fn count(self) -> usize {
-        usize::from(self.status) + usize::from(self.palette_retry) + usize::from(self.attach_retry)
+        usize::from(self.status)
+            + usize::from(self.palette_retry)
+            + usize::from(self.attach_retry)
+            + usize::from(self.reorder_hold)
     }
 }
 
@@ -645,6 +657,9 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
     }
     if armed.attach_retry {
         members.push(time::every(app::ATTACH_RETRY_INTERVAL).map(|_| Message::AttachRetryTick));
+    }
+    if armed.reorder_hold {
+        members.push(time::every(app::host_reorder_hold_tick()).map(|_| Message::ReorderHoldTick));
     }
     Subscription::batch(members)
 }
@@ -895,11 +910,17 @@ mod tests {
             .collect()
     }
 
-    fn armed(status: bool, palette_retry: bool, attach_retry: bool) -> ArmedTimers {
+    fn armed(
+        status: bool,
+        palette_retry: bool,
+        attach_retry: bool,
+        reorder_hold: bool,
+    ) -> ArmedTimers {
         ArmedTimers {
             status,
             palette_retry,
             attach_retry,
+            reorder_hold,
         }
     }
 
@@ -926,16 +947,10 @@ mod tests {
             "an idle app subscribes to the wake and the window/keyboard events, nothing periodic"
         );
 
-        for timers in [
-            armed(false, false, false),
-            armed(true, false, false),
-            armed(false, true, false),
-            armed(false, false, true),
-            armed(true, true, false),
-            armed(true, false, true),
-            armed(false, true, true),
-            armed(true, true, true),
-        ] {
+        // Every combination, so a member that forgot its own arming
+        // condition (or shares a recipe id with another) is caught.
+        for bits in 0u8..16 {
+            let timers = armed(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
             let ids = recipe_ids(subscription_with(Arc::clone(&wake), timers));
             let unique: HashSet<u64> = ids.iter().copied().collect();
             assert_eq!(

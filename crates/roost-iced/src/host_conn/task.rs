@@ -141,7 +141,7 @@ pub(crate) struct ConnectionConfig {
 /// [`session_launch::timeout_scale`] reads the environment on each call,
 /// and [`leg`] is per-op work on the control plane — the answer cannot
 /// change while the process runs, so it is worth remembering.
-fn scale() -> f64 {
+pub(crate) fn scale() -> f64 {
     static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *SCALE.get_or_init(session_launch::timeout_scale)
 }
