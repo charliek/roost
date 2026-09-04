@@ -4674,41 +4674,16 @@ mod tests {
         );
     }
 
-    /// §3.6's fifth path. A bootstrap note sits in front of every other
-    /// reason the band can give — deliberately, while a bootstrap is
-    /// running — so a probe still outstanding when the link dies hides
-    /// the reconnect copy behind a question about a world that is gone.
-    /// Cancelling the probe on the drop is what clears it.
-    #[tokio::test]
-    async fn an_outstanding_probes_note_hides_the_reconnect_copy_until_the_drop_cancels_it() {
-        let (mut set, _feed) = a_set();
-        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-probe.sock");
-        // The confirmed-upgrade probe's note: `SessionState::Running`,
-        // and it never consulted `offer_for` at all.
-        set.set_bootstrap_note("h1", Some("checking one…".into()));
-        set.apply_state(incarnation, dropped("the connection closed"));
-
-        assert!(set.has_outage("h1"), "the ladder started anyway");
-        assert_eq!(
-            band_reason(&set, "h1"),
-            "checking one…",
-            "the hazard: the probe's line outranks the reconnect copy"
-        );
-
-        // What `cancel_bootstrap_probe` does on every `Disconnected`.
-        set.set_bootstrap_note("h1", None);
-        assert!(band_reason(&set, "h1").starts_with("reconnecting in "));
-    }
-
     /// **The consent property, over the values a real ladder leaves
-    /// behind** — not `offer_for` on hand-made arguments. Every
+    /// behind** — not `bootstrap_offer`'s decision on hand-made
+    /// arguments, and not its accessor reads left unchecked. Every
     /// auto-reconnect stamps `RequestOrigin::Ipc`, and that is the one
     /// gate that holds on every attempt: `reached_connected` is `false`
     /// from the second attempt on (its own `open_ssh` cleared it), and
     /// attempt *k* can carry a family attempt one never had.
     #[tokio::test]
     async fn no_attempt_of_a_ladder_can_raise_a_consent_card() {
-        use crate::app::bootstrap::offer_for;
+        use crate::app::host_lifecycle::bootstrap_offer;
         let (mut set, _feed) = a_set();
         a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-consent.sock");
 
@@ -4720,11 +4695,7 @@ mod tests {
         refuse(&mut set, SshFailure::NoSession);
         assert_eq!(set.ssh_failure("h1"), Some(&SshFailure::NoSession));
         assert_eq!(
-            offer_for(
-                set.ssh_origin("h1"),
-                set.ssh_failure("h1"),
-                set.ssh_reached_connected("h1")
-            ),
+            bootstrap_offer(&set, "h1"),
             None,
             "a machine asked for this attempt, so no card"
         );
@@ -4745,11 +4716,7 @@ mod tests {
         assert!(retry_once(&mut set));
         refuse(&mut set, SshFailure::NoSession);
         assert_eq!(
-            offer_for(
-                set.ssh_origin("h1"),
-                set.ssh_failure("h1"),
-                set.ssh_reached_connected("h1")
-            ),
+            bootstrap_offer(&set, "h1"),
             None,
             "the last attempt cannot raise a card either"
         );

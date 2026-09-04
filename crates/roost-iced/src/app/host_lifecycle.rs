@@ -1,4 +1,5 @@
-//! The edges where `App` state meets [`HostConnSet`] — dial, due, land.
+//! The five edges where `App` state meets [`HostConnSet`] — dial, due,
+//! land, drop, offer.
 //!
 //! Every function here is a decision over the narrowest constructible
 //! cluster it reads: the [`ExitState`] latch, the connection set, and
@@ -7,20 +8,27 @@
 //! toast, a spawned probe, a focus push — because none of that is what a
 //! unit test wants to drive (#383, plan 045 §3.2).
 //!
-//! What that buys: the three shutdown gates and the dial's probe cancel
-//! are each fenced by a test with a negative control, where before they
-//! were reachable only through `App::bootstrap` — which measures fonts,
+//! What that buys: the three shutdown gates, both probe cancels (the
+//! dial's and the drop's) and the bootstrap offer's real path are each
+//! fenced by a test with a negative control, where before they were
+//! reachable only through `App::bootstrap` — which measures fonts,
 //! builds a runtime, hydrates the workspace and binds a socket.
+//!
+//! Where a returned value *is* the next decision — a reason to show, an
+//! offer to raise — it rides the return ([`TunnelLanding::Landed`],
+//! [`HostEdge::offer`]) rather than being re-derived by the caller, so
+//! the wiring between two decisions is inside the fence too.
 
 use super::*;
 
 use crate::host_conn::{
-    AttemptCause, ConnectMode, HostConnSet, HostTransport, HostTunnelReady, RequestOrigin,
+    AttemptCause, ConnectMode, HostConnSet, HostConnState, HostTransport, HostTunnelReady,
+    RequestOrigin,
 };
 use roost_engine::persistence::HostSnapshot;
 use roost_ipc::ssh::ResolvedTransport;
 
-use self::bootstrap::BootstrapsInFlight;
+use self::bootstrap::{BootstrapsInFlight, OfferContext};
 
 /// An armed auto-reconnect came due — dial, and *as what*?
 ///
@@ -190,16 +198,104 @@ pub(super) fn cancel_bootstrap_probe(
     true
 }
 
+/// What one `EngineFeed::HostState` turned out to be, once the set has
+/// attributed it to a saved host.
+///
+/// Everything here is a *decision* the drain then spends on the window
+/// and the workspace: stamp `last_connected`, push the focus, purge the
+/// incarnation the transition replaced, raise the offer. The offer rides
+/// the edge rather than being asked for again by the caller — the drop's
+/// cancel and the drop's offer are one decision, in one order, and that
+/// order is what a test can hold.
+pub(super) struct HostEdge {
+    pub host: String,
+    pub connected: bool,
+    pub previous: Option<HostId>,
+    pub offer: Option<OfferContext>,
+}
+
+/// Settle one host-state transition. `None` when the incarnation is
+/// stale — an item minted by a connection this set has since dropped.
+pub(super) fn settle_host_state(
+    hosts: &mut HostConnSet,
+    bootstraps: &mut BootstrapsInFlight,
+    incarnation: HostId,
+    state: HostConnState,
+) -> Option<HostEdge> {
+    let previous = match &state {
+        HostConnState::Connecting { previous } => *previous,
+        _ => None,
+    };
+    let connected = matches!(state, HostConnState::Connected);
+    // A connection that *drops* is the second place a classified ssh
+    // failure lands: the tunnel's own per-connection exec is what
+    // failed, and `overlay_ssh_reason` is what records its family. Only
+    // a drop, so a Connecting/Connected transition cannot re-raise a
+    // card for a failure already answered.
+    let dropped = matches!(state, HostConnState::Disconnected(_));
+    let host = hosts.apply_state(incarnation, state)?;
+    let offer = if dropped {
+        // The world the probe was asked about is gone, whoever asked
+        // (plan 040 §3.6): the confirmed-upgrade probe never consults
+        // `offer_for` at all, so one still out at a drop can land a card
+        // over a host that is mid-ladder — and write a `bootstrap_note`
+        // the band prefers over the reconnect copy.
+        cancel_bootstrap_probe(hosts, bootstraps, &host);
+        bootstrap_offer(hosts, &host)
+    } else {
+        None
+    };
+    Some(HostEdge {
+        host,
+        connected,
+        previous,
+        offer,
+    })
+}
+
+/// A user-driven connect failed; decide whether Roost has an offer.
+///
+/// Two families have one — `NotFound` ("nothing to exec over there")
+/// and `NoSession` ("a binary, but nothing running") — and the probe
+/// is what turns either into a specific card. Everything else is
+/// left to the band and the toast exactly as plan 038 left it.
+///
+/// **The origin is the gate, not attendedness.** An IPC `host.connect`
+/// from `roostctl` arrives as the same `ConnectMode::Dial` a click
+/// does, and raising a modal to ask a machine a question is the one
+/// thing this must never do (plan 039 §3.5's non-interactive refusal).
+/// [`RequestOrigin`] is the only place that difference survives.
+///
+/// The three reads and the decision are together on purpose: taking
+/// `offer_for`'s arguments apart is how a test ends up proving the
+/// matrix while the accessors that feed it go unchecked (plan 040
+/// §3.6's near-miss), so the suite drives *this*.
+pub(crate) fn bootstrap_offer(hosts: &HostConnSet, saved_id: &str) -> Option<OfferContext> {
+    let failure = hosts.ssh_failure(saved_id).cloned();
+    let session = bootstrap::offer_for(
+        hosts.ssh_origin(saved_id),
+        failure.as_ref(),
+        hosts.ssh_reached_connected(saved_id),
+    )?;
+    Some(OfferContext {
+        session,
+        session_is_newer: false,
+        failure,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::time::Duration;
 
+    use crate::app::bootstrap::SessionState;
     use crate::host_conn::fixtures::{
-        a_dropped_ssh_host, a_set, abort_establishes, an_unestablished_tunnel, ssh_target,
+        a_connected_ssh_host, a_dropped_ssh_host, a_set, abort_establishes,
+        an_unestablished_tunnel, band_reason, dropped, refused, ssh_target,
     };
-    use crate::host_conn::state::HostConnState;
+    use roost_ipc::ssh::SshFailure;
 
     /// A saved host reached over ssh, as `state.json` carries one.
     fn an_ssh_host() -> HostSnapshot {
@@ -427,5 +523,94 @@ mod tests {
             "and the band line the probe left goes with it"
         );
         abort_establishes(&mut set);
+    }
+
+    /// F5. Plan 040 §3.6's fifth path, driven through the handler the
+    /// drain actually calls. A bootstrap note sits in front of every
+    /// other reason the band can give — deliberately, while a bootstrap
+    /// is running — so a probe still outstanding when the link dies
+    /// hides the reconnect copy behind a question about a world that is
+    /// gone. Cancelling the probe on the drop is what clears it, and
+    /// this asserts that the *drop edge* does the cancelling rather than
+    /// describing what a cancel would do.
+    #[tokio::test]
+    async fn a_drop_cancels_the_probe_and_uncovers_the_reconnect_copy() {
+        // The hazard first, on a set that only ever sees the set's own
+        // `apply_state` — the drop without the handler around it.
+        let (mut hazard, _hazard_feed) = a_set();
+        let incarnation =
+            a_connected_ssh_host(&mut hazard, "/nonexistent/roost-lifecycle-haz.sock");
+        abort_establishes(&mut hazard);
+        // The confirmed-upgrade probe's note: `SessionState::Running`,
+        // and it never consulted `offer_for` at all.
+        hazard.set_bootstrap_note("h1", Some("checking one…".to_string()));
+        hazard.apply_state(incarnation, dropped("the connection closed"));
+        assert!(hazard.has_outage("h1"), "the ladder started anyway");
+        assert_eq!(
+            band_reason(&hazard, "h1"),
+            "checking one…",
+            "the hazard: the probe's line outranks the reconnect copy"
+        );
+
+        // And now the same drop as the drain drives it.
+        let (mut set, _feed) = a_set();
+        let mut bootstraps = BootstrapsInFlight::default();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-lifecycle-drop.sock");
+        abort_establishes(&mut set);
+        bootstraps.begin_probe("h1", set.generation("h1"));
+        set.set_bootstrap_note("h1", Some("checking one…".to_string()));
+
+        let edge = settle_host_state(
+            &mut set,
+            &mut bootstraps,
+            incarnation,
+            dropped("the connection closed"),
+        )
+        .expect("the drop belongs to a live incarnation");
+
+        assert!(!edge.connected);
+        assert!(set.has_outage("h1"), "the ladder started anyway");
+        assert!(
+            !bootstraps.probing("h1"),
+            "the drop that ended the probe's question must also drop the probe"
+        );
+        assert!(
+            band_reason(&set, "h1").starts_with("reconnecting in "),
+            "and the reconnect copy is uncovered: {}",
+            band_reason(&set, "h1")
+        );
+        // A statement of today's shape, not a fence: this host reached
+        // `Connected`, so `offer_for` refuses whatever the origin and
+        // whatever the family. The drop edge's *positive* offer needs a
+        // family only `SshTunnel::last_error` can supply
+        // (`overlay_ssh_reason`) — #385's missing seam — so that half is
+        // the `e2e-host-bootstrap` lane's, and F6 fences the decision
+        // itself.
+        assert!(edge.offer.is_none());
+    }
+
+    /// F6's positive control. The consent property's own test
+    /// (`host_conn.rs`'s `no_attempt_of_a_ladder_can_raise_a_consent_card`)
+    /// proves that no rung of a ladder raises a card; on its own, a
+    /// `bootstrap_offer` that answered `None` unconditionally would
+    /// satisfy it. This is the case that must say `Some`: a person asked
+    /// for this connect, it never reached `Connected`, and the far side
+    /// had nothing to exec.
+    #[tokio::test]
+    async fn a_persons_first_connect_that_found_no_binary_is_offered_one() {
+        let (mut set, _feed) = a_set();
+        ask_ssh(&mut set);
+        abort_establishes(&mut set);
+        set.tunnel_ready(refused("h1", set.ssh_request("h1"), SshFailure::NotFound));
+
+        assert_eq!(
+            bootstrap_offer(&set, "h1"),
+            Some(OfferContext {
+                session: SessionState::NoSession,
+                session_is_newer: false,
+                failure: Some(SshFailure::NotFound),
+            }),
+            "the offer carries the family it is answering, so confirming can check it still holds"
+        );
     }
 }

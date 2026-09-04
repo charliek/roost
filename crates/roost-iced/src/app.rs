@@ -77,7 +77,7 @@ use crate::{chrome, input};
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 pub(crate) mod bootstrap;
 mod host_dialog;
-mod host_lifecycle;
+pub(crate) mod host_lifecycle;
 pub(crate) mod host_notice;
 pub(crate) mod host_tab;
 mod interactions;
@@ -5812,36 +5812,14 @@ impl App {
         );
     }
 
-    /// A user-driven connect failed; decide whether Roost has an offer.
-    ///
-    /// Two families have one — `NotFound` ("nothing to exec over there")
-    /// and `NoSession` ("a binary, but nothing running") — and the probe
-    /// is what turns either into a specific card. Everything else is
-    /// left to the band and the toast exactly as plan 038 left it.
-    ///
-    /// **The origin is the gate, not attendedness.** An IPC
-    /// `host.connect` from `roostctl` arrives as the same
-    /// `ConnectMode::Dial` a click does, and raising a modal to ask a
-    /// machine a question is the one thing this must never do (plan 039
-    /// §3.5's non-interactive refusal). `RequestOrigin` is the only
-    /// place that difference survives.
+    /// A user-driven connect failed; raise the offer if there is one.
+    /// The decision — and the three reads it turns on — is
+    /// [`host_lifecycle::bootstrap_offer`]'s; this is the delegation
+    /// plus the probe it spawns.
     fn maybe_offer_bootstrap(&mut self, saved_id: &str) {
-        let failure = self.hosts.ssh_failure(saved_id).cloned();
-        let Some(session) = bootstrap::offer_for(
-            self.hosts.ssh_origin(saved_id),
-            failure.as_ref(),
-            self.hosts.ssh_reached_connected(saved_id),
-        ) else {
-            return;
-        };
-        self.start_bootstrap_probe(
-            saved_id,
-            bootstrap::OfferContext {
-                session,
-                session_is_newer: false,
-                failure,
-            },
-        );
+        if let Some(offer) = host_lifecycle::bootstrap_offer(&self.hosts, saved_id) {
+            self.start_bootstrap_probe(saved_id, offer);
+        }
     }
 
     /// Look at the far side, then raise the card that fits what is
