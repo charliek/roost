@@ -222,9 +222,16 @@ async fn status(client: &mut IpcClient, id: Option<&str>, json: bool) -> Result<
             let rollup = h.rollup.as_deref().unwrap_or("");
             let line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup);
             println!("{}", line.trim_end());
-            // The band shows the ~45-character `reason`; the operator's
-            // copy of a settled launch failure (the three rungs the
-            // locate ladder tried) is only ever here and in the log.
+            // The band caps its line at 60 characters, so an ssh
+            // family's sentence (a changed host key, say) is ellipsized
+            // there; when the rollup did not carry the whole reason,
+            // print it in full underneath.
+            if let Some(reason) = h.reason.as_deref().filter(|r| !rollup.contains(r)) {
+                println!("    {reason}");
+            }
+            // The operator's copy of a settled launch failure (the three
+            // rungs the locate ladder tried) is only ever here and in
+            // the log.
             if let Some(detail) = h.detail.as_deref() {
                 for line in detail.lines() {
                     println!("    {line}");

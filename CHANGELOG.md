@@ -11,6 +11,14 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+_The host-sessions release: `roost-session` ships in `Roost-Iced.app` and
+the `.deb` (plus standalone `roost-session-<v>-linux-{amd64,arm64}`
+assets), a saved SSH host reconnects itself after a drop, a connection's
+state is readable on the wire (`host.status`) and from `roostctl host
+status`, a daemon that cannot start says so once instead of retrying
+forever, and the desktop-notification path is honest about authorization
+on macOS._
+
 ### Added
 
 - **macOS gets local host sessions too (HS-4b, plan 041)** — `roost-session`

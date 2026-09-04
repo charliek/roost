@@ -115,6 +115,20 @@ roostctl host remove --id <id>
 
 See [`reference/cli.md`](../reference/cli.md#host-subcommands) for the full flag reference.
 
+### Checking a host from the command line
+
+`host connect` returns as soon as the attempt is under way, not once it settles, so the follow-up question — *did it work?* — has its own verb:
+
+```bash
+roostctl host status              # every saved host
+roostctl host status --id <id>    # just one
+roostctl host status --json       # the same, for a script
+```
+
+It prints the state the sidebar's band is showing you: the host's `state`, the band's own line (`disconnected — reconnecting in 8s (3/10)`, or an agent count while connected), and — indented underneath, when there is one — the full `reason` if the band's 60-character line had to cut it short (a changed-host-key sentence, say), followed by the `detail` the band has no room for, which is where a failed local session start spells out what it actually tried. `roostctl host list` carries an abbreviated `state=` column for the same reason. If you're scripting against it, watch the `--json` `generation` field: it counts connection attempts *started*, so it moves even when two attempts fail identically.
+
+This is a question about the **client**: which hosts this Roost is connected to. `roostctl session status` is the other half — run on the machine hosting a session, it says whether a daemon is listening there at all.
+
 ### Keybinds and creation routing
 
 Creation follows context, so you never have to think about "which host am I on" for the common case:

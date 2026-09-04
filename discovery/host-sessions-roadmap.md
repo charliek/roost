@@ -904,7 +904,9 @@ follow-up list, nothing else on the milestone track.** Two of those
 four got sharper evidence from HS-4b: #382 (no connection-state op) is
 now also what blocks diagnosing #392 and what forces band assertions to
 be read as pixels, and #390 joins the testing-gap family though it is
-not itself release-blocking. Rationale for the order: HS-4b was small,
+not itself release-blocking. **Updated 2026-09-03:** plan 042 closed
+#382, #384, #392 and #393, so the pre list is now #381 and #383 alone —
+see the sweep paragraph above. Rationale for the order: HS-4b was small,
 locally verifiable pre-tag, and rounds out the platform story the
 release tells (both platforms persist locally, both connect to Linux
 hosts);
@@ -937,6 +939,29 @@ far — the rest of the issue tracker predates this split and is
 uncategorised, not implicitly "post".
 
 ### Pre initial release
+
+**Release decision (2026-09-03): the pre list is closed for v0.0.19.**
+With #382, #384, #392 and #393 shipped by plan 042 (PR #396) and
+043's notification/release items by PR #394, the first release carrying
+host sessions goes out from here; the two items still open below —
+#381 and #383 — move to **post-v0.0.19 by decision**, not by
+completion. Why it is safe: nothing in 042/043 changed a persisted
+format (`state.json`'s registry is 041's), `session_protocol` is still
+`2`, and #381's likely outcome — a protocol bump — is already the path
+the identity gate + the bootstrap's staged reinstall exercise (a stale
+daemon reads `NeedsRestart`, the consent card reinstalls from the
+release asset). Why it is right: #381 is a design conversation (atomic
+conditional-connect vs. HS-4d viewports) whose regression coverage —
+`host.status`, the lanes, the live harness — now exists *before* the
+wire changes; #383 is a testing investment that pairs with #386 and
+should land before #381's implementation, not before a release.
+Post-release order of work: **#387** (a far side that is merely
+restarting should not need a manual ↻ — the one "honest but unhelpful"
+first-release behavior) and the `reason`-overwrite wrinkle (an ssh
+family unreadable on the wire while a rung is armed) are the two cheap
+correctness follow-ups; then #383 + #386 together; then the #381
+conversation; HS-4c stays after that; #351 remains the top non-host
+post-release item.
 
 - **[#381](https://github.com/charliek/roost/issues/381) Session takeover is best-effort; needs an atomic
   conditional-connect on the wire.** Reconnect *is* takeover
