@@ -17,7 +17,7 @@ minutes). Runs by hand in a shed.
 ./live.sh L3     hostkey:  a changed host key is never retried
 ./live.sh L4a    quit while a retry is ARMED
 ./live.sh L4b    quit while an establish is IN FLIGHT
-./live.sh L5     refused:  stop sshd instead of black-holing the route
+./live.sh L5     refused:  stop sshd instead of black-holing; cause read off the wire
 
 ./mutate.sh selftest   all five controls; green only if every one trips
 ```
@@ -120,10 +120,16 @@ rule. Remove or tag the rule yourself, then re-run.
 * **State comes from the op that owns it.** Every connection claim is a
   `roostctl host status --json` read — `generation` (attempts *started*,
   the monotonic edge a poll cannot miss), `state`, `rollup` (the sidebar
-  band's own output), and `retry` (present only while a rung is armed).
-  Nothing reads what the app printed. ssh processes and scratch
-  directories are still counted directly: those are OS facts, not log
-  lines.
+  band's own output), and `retry` (present only while a rung is armed,
+  and carrying `retry.reason`, the classified copy of the failure that
+  armed it, whenever that drop had a family to classify). Nothing reads
+  what the app printed. ssh processes and scratch directories are still
+  counted directly: those are OS facts, not log lines. L5 is where the
+  line between the two kinds is sharpest — that the port *refused*
+  rather than black-holed is an OS fact and stays `probe_severed
+  refused`, while *why the ladder is retrying* is a wire fact and is
+  `retry.reason`. Until [#399](https://github.com/charliek/roost/issues/399)
+  the field did not exist and the first had to stand in for the second.
 * **The band agrees with the row it came from.** At every ladder poll
   that carries a `retry`, `rollup` must equal
   `disconnected — reconnecting in {ceil(delay_ms/1000)}s ({attempt}/{budget})`
@@ -155,6 +161,33 @@ rule. Remove or tag the rule yourself, then re-run.
   | `M3` | a flatness window shorter than the ladder's own gaps | a rung actually fired | `assert_flat` |
   | `M4b` | no exit path, so what the app owned leaks | an establish is in flight | the leak half of the same proof |
   | `M5` | `ssh.socket` re-activates a stopped `ssh.service` | `ssh.socket` is `active` | `probe_severed refused` |
+
+  **L5's `retry.reason` assertion has no control yet. Neither half of
+  it has been run, and both are written down here rather than assumed.**
+  The assertion is two claims and they need different controls:
+
+  * *The field arrives at all.* Only a build from before
+    [#399](https://github.com/charliek/roost/issues/399) can exhibit
+    its absence — no seam here fakes the wire, so nothing in `mutate.sh`
+    can withhold the field from a build that emits it. **To run:** build
+    the branch at `C6^`, run `./live.sh L5`, and require it to stop on
+    `no armed rung said why it was armed`. Not yet run.
+  * *The check discriminates the value, rather than finding any
+    non-empty string.* This one is controllable today, in this
+    harness's own idiom, and is **identified but not written**: sever
+    with L1's black-hole rules instead of stopping `sshd` (so skip the
+    `probe_severed refused` precondition — its precondition becomes
+    `probe_severed timeout`), let the ladder climb, and require the
+    reason check to trip. The establish then fails on a timeout, whose
+    copy is `connecting to … failed: … timed out` and carries no
+    refusal, so the phrase half must fire. It is the control most worth
+    having, because it is what separates the assertion from a
+    `[ -n ]` test.
+
+  What is *not* the reason there is no control: "breaking severance
+  would trip it". It would not — a severance that failed to bite
+  reconnects the host, and `watch_ladder` stops first with `connected
+  while the route was severed`, so the reason check is never reached.
 
 ## What is outside the contract
 

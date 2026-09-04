@@ -232,8 +232,15 @@ Two edges are worth knowing before writing a wait against it:
   is outside a lane's contract, so no lane tolerates that reset.
 
 `retry` is present only while a rung is armed, and it carries
-`attempt`/`budget` for the ssh ladder alone — a localhost backoff
-reports `delay_ms` and nothing else.
+`attempt`/`budget` and `reason` for the ssh ladder alone — a localhost
+backoff reports `delay_ms` and nothing else. `retry.reason` is *why*
+that rung is armed: the classified copy of the failure that armed it
+(#399), which is the only way to read the family while the ladder is
+still retrying, since `reason` is the armed-rung line by then. Read it
+when it is present and do not gate on `attempt`: absence is ordinary
+(the drop that starts an outage is usually a bare EOF with nothing to
+classify) and presence is not confined to later rungs (a suspend reset
+re-arms attempt 1 carrying the family forward).
 
 ### OSC-routed regression patterns *(test-mode IPC ops)*
 

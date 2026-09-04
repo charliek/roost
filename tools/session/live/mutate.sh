@@ -17,6 +17,17 @@
 #                         `probe_severed refused` must say so.
 #   ./mutate.sh selftest  all five; green only if every one trips.
 #
+# L5's `retry.reason` assertion (#399) has no control here yet, and the
+# gap is two-sized. Its *absence* half is genuinely out of reach: no
+# seam here fakes the wire, so only a pre-#399 build can withhold the
+# field, and that is a hand run rather than an M. Its *discrimination*
+# half — that the check reads the value rather than merely finding a
+# non-empty string — is reachable today and is identified, not written:
+# sever with L1's black-hole rules instead of stopping sshd (precondition
+# `probe_severed timeout`, as M1's is) and require L5's reason check to
+# trip, because a black-holed establish's copy says `timed out` and
+# carries no refusal. See the README's control section.
+#
 # Two rules make these controls worth having:
 #
 #   * Each asserts its **precondition first**. A control that trips for

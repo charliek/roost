@@ -121,6 +121,13 @@ row_reason() { field "$1" .reason; }
 row_attempt() { field "$1" .retry.attempt; }
 row_budget() { field "$1" .retry.budget; }
 row_delay_ms() { field "$1" .retry.delay_ms; }
+# Why the armed rung is armed (#399): the classified copy of the failure
+# that took the retry decision, in the words the give-up line uses for
+# it. Present only when that drop had a family — a bare EOF has none, and
+# that is the usual shape of the drop that *starts* an outage — so an
+# empty answer here is ordinary rather than a fault, and it is not a
+# function of the attempt number either way.
+row_retry_reason() { field "$1" .retry.reason; }
 row_has_retry() { [ -n "$(field "$1" .retry)" ]; }
 
 # One status read, retried briefly: a lane that mistakes a momentarily
@@ -756,15 +763,31 @@ wait_for_reconnect() {
 #   * every armed rung's band says what that same row's numbers say —
 #     asserted at every poll that carries a `retry`, not logged.
 #
+# It also *records* the causes armed rungs reported (`retry.reason`,
+# #399) in `LADDER_RETRY_REASON`, for a lane with a claim to make about
+# why the ladder is retrying. Recorded rather than asserted here: only
+# the lane knows what it severed with, and a rung armed by a bare EOF
+# honestly carries no cause at all.
+#
+# **Last distinct wins**, and the variable keeps only that one: a window
+# in which two different causes appeared leaves the second, and a lane
+# reading it cannot tell that from a window in which only the second
+# ever appeared. Each distinct cause is logged as it first appears, so
+# the disagreement is in the scrollback even when it is not in the
+# variable — a lane that has to assert on *every* cause needs its own
+# accumulator, not this one.
+#
 # A poll that cannot read a row is skipped in silence: `read_row` already
 # gave the op three chances, and the claims here are about rows that
 # exist. A window with no readable row at all ends in the timeout below.
 LADDER_MAX_ATTEMPT=0
+LADDER_RETRY_REASON=""
 LADDER_ROW=""
 watch_ladder() {
   local target=$1 limit=$2 what=$3
-  local row state att last=0
+  local row state att reason last=0
   LADDER_MAX_ATTEMPT=0
+  LADDER_RETRY_REASON=""
   say "watching the ladder for $what: generation must reach $target within ${limit}s"
   for _ in $(seq 1 "$limit"); do
     if row=$(read_row); then
@@ -785,6 +808,11 @@ watch_ladder() {
         if [ "$att" -gt "$LADDER_MAX_ATTEMPT" ]; then
           LADDER_MAX_ATTEMPT=$att
           say "    armed rung $(row_rollup "$row")"
+        fi
+        reason=$(row_retry_reason "$row")
+        if [ -n "$reason" ] && [ "$reason" != "$LADDER_RETRY_REASON" ]; then
+          LADDER_RETRY_REASON=$reason
+          say "    armed because: $reason"
         fi
         maybe_capture_band "$att"
       fi
