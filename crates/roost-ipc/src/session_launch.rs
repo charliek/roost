@@ -563,6 +563,11 @@ pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> V
 /// start` under the seam still uses the value verbatim. Nothing else
 /// moves: the session's socket follows `XDG_RUNTIME_DIR`, so
 /// `roostctl session status|stop` still find it.
+///
+/// Exercised over a real child in
+/// `tests/session_launch_state_dir_test.rs`, which is a binary of its
+/// own because it forks — its header has the listener it raced when it
+/// was not.
 pub async fn spawn_and_read_verdict(
     bin: &Path,
     cwd: &Path,
@@ -1224,88 +1229,5 @@ mod tests {
             "{error:#}"
         );
         drop(listener);
-    }
-
-    // ------------------------------------------------------------------
-    // The derived state dir (#397)
-    //
-    // Driven over a real child, because the claim is about what reaches
-    // its environment. No process-global env anywhere: the seam is a
-    // parameter, so a case hands the launcher a value and reads back
-    // what the child saw. `paths.rs` table-tests the rule itself.
-    // ------------------------------------------------------------------
-
-    /// Generous on purpose: the stand-in prints and exits at once, so
-    /// nothing here waits on the clock — the budget only bounds a hang,
-    /// and a tight one would import `roost-cli`'s readiness flake.
-    const SEAM_BUDGET: Duration = Duration::from_secs(10);
-
-    /// What a child sees when the launcher sets nothing: whatever this
-    /// process itself carries. Usually nothing — but a developer
-    /// running the suite under `ROOST_STATE_DIR` still gets a true
-    /// assertion, because the claim is "the launcher left it alone",
-    /// not "the variable was absent".
-    fn ambient_state_dir() -> std::ffi::OsString {
-        std::env::var_os(STATE_DIR_ENV).unwrap_or_else(|| std::ffi::OsString::from("UNSET"))
-    }
-
-    /// Spawn a stand-in `roost-session` through the real launcher with
-    /// `seam` in hand, and hand back the `ROOST_STATE_DIR` it saw.
-    ///
-    /// The script takes its record path out of `LAUNCH_CWD_ENV` rather
-    /// than an interpolated literal, so no tempdir path has to survive
-    /// shell quoting, and the answer is read as bytes, so no path has
-    /// to be UTF-8. `${VAR-UNSET}` (not `${VAR:-UNSET}`) tells an unset
-    /// variable from an empty one. The variable is spelled out because
-    /// a shell cannot read the constant —
-    /// `paths::tests::the_state_dir_env_name_is_frozen` is what keeps
-    /// the two the same string.
-    async fn state_dir_handed_to(seam: Option<&OsStr>) -> (tempfile::TempDir, std::ffi::OsString) {
-        use std::os::unix::ffi::OsStringExt;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let bin = dir.path().join(BIN_NAME);
-        std::fs::write(
-            &bin,
-            "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\n\
-             printf '%s' \"${ROOST_STATE_DIR-UNSET}\" > \"$ROOST_SESSION_LAUNCH_CWD/seen\"\n\
-             echo 'ready pid=4321'\n",
-        )
-        .expect("write the stand-in session");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let verdict = spawn_and_read_verdict(&bin, dir.path(), seam, SEAM_BUDGET)
-            .await
-            .expect("the stand-in reports a verdict");
-        assert_eq!(verdict, Verdict::Ready(4321));
-
-        let seen = std::fs::read(dir.path().join("seen"))
-            .expect("the stand-in records what it was handed");
-        (dir, std::ffi::OsString::from_vec(seen))
-    }
-
-    #[tokio::test]
-    async fn a_seam_gives_the_session_a_state_dir_nested_in_the_launchers_own() {
-        let isolated = tempfile::tempdir().expect("temp dir");
-        let (_dir, seen) = state_dir_handed_to(Some(isolated.path().as_os_str())).await;
-        assert_eq!(PathBuf::from(seen), isolated.path().join("session"));
-    }
-
-    #[tokio::test]
-    async fn no_seam_leaves_the_childs_environment_alone() {
-        let (_dir, seen) = state_dir_handed_to(None).await;
-        assert_eq!(seen, ambient_state_dir());
-    }
-
-    /// A value the resolver ignores derives nothing — and is not
-    /// forwarded either: the launcher sets no variable at all, so the
-    /// child's environment is the one `None` leaves it.
-    #[tokio::test]
-    async fn a_seam_the_resolver_ignores_sets_nothing_on_the_child() {
-        for raw in ["", "relative/state"] {
-            let (_dir, seen) = state_dir_handed_to(Some(OsStr::new(raw))).await;
-            assert_eq!(seen, ambient_state_dir(), "{raw:?}");
-        }
     }
 }

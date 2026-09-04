@@ -1017,9 +1017,9 @@ mod tests {
 
     // The derived state dir a launcher hands a spawned session (#397).
     // The spawn itself is exercised over a real process in
-    // `tests/session_launch_state_dir_test.rs`, which needs its own
-    // binary because it has to set the variable these tests resolve
-    // profiles against.
+    // `tests/session_launch_state_dir_test.rs`, which has to stay in a
+    // binary of its own because it forks — see that file's header for
+    // the listener it raced when it did not.
 
     /// The seam's name is a cross-process contract: a launcher sets it
     /// on the session it spawns, every profile resolution reads it, and
