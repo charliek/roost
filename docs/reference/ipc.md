@@ -529,8 +529,15 @@ Order is leftmost first. Ids not belonging to `project_id` are rejected
 with `invalid-param`. Tabs in the project not listed keep their
 relative order after the listed ones. Ids are the **canonical**
 spelling: a non-canonical integer (`"+4"`, `"04"`) is refused rather
-than normalized, as it is everywhere the `h<host>.<id>` form is
-accepted.
+than normalized. That holds on the **iced UI socket** and on a
+**session socket** — the two that parse a ref which may carry the
+`h<host>.<id>` form. The Swift Mac socket diverges, and it is
+documented rather than promised: it decodes both reorder ops through
+its plain string↔`Int64` codec (`@StringInt64` / `@StringInt64Array`),
+and Swift's `Int64(String)` accepts a leading `+` and leading zeros, so
+`"+4"` still normalizes there. Canonical traffic is byte-identical
+everywhere, which is what the vectors pin; a caller that wants one
+answer from both should send canonical ids.
 
 Response: `{}`.
 
