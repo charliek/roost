@@ -518,36 +518,15 @@ pub(crate) struct HostConnSet {
     /// seeds the theme that is current *now*, not the one at spawn.
     theme: Arc<Mutex<OscColorsParams>>,
     client_build: String,
-    /// Keyed on the saved host's stable id (`HostSnapshot.id`).
-    conns: HashMap<String, HostConn>,
+    /// Everything this set holds for one saved host, keyed on the saved
+    /// host's stable id (`HostSnapshot.id`). See [`HostEntry`] — one
+    /// entry per host is what makes "what does this host currently
+    /// have?" one read and one teardown rather than six.
+    entries: HashMap<String, HostEntry>,
     mirrors: HashMap<HostId, Arc<SharedMirror>>,
-    /// Keyed on the saved host's id, like [`Self::conns`], and never
-    /// holding an entry for a host that has one there.
-    retained: HashMap<String, RetainedSection>,
     /// Handed out by [`HostConnSet::connect`], never reused. See
     /// [`Registration`].
     next_generation: u64,
-    /// The last generation minted for each saved host, keyed like
-    /// [`Self::conns`] — but outliving the [`HostConn`] it was minted
-    /// for, which is the whole point. A disconnected host has no entry
-    /// in `conns` and would otherwise read as "never connected"; a
-    /// poller watching this number for an edge would then see it fall
-    /// back to `0` and count the next attempt twice. Written by
-    /// [`Self::mint_generation`]; dropped only by [`Self::remove`],
-    /// with the host itself.
-    generations: HashMap<String, u64>,
-    /// The ssh transport for each saved host reached over one, keyed on
-    /// the saved host's id like [`Self::conns`].
-    ///
-    /// **This is where the tunnels live, and the seam is deliberate.**
-    /// A tunnel is opened, torn down and read for its last failure at
-    /// exactly the three moments a connection is started, dropped and
-    /// reported — all of which this set already owns — and it already
-    /// holds the runtime handle the establish runs on and the feed the
-    /// answer comes back over. Hanging them off `App` instead would mean
-    /// duplicating `connect`/`disconnect`/`remove`'s lifecycle in a
-    /// second place and threading the runtime and the feed there twice.
-    ssh: HashMap<String, SshState>,
     /// Handed out by [`HostConnSet::open_ssh`], never reused.
     next_ssh_request: u64,
     /// In-flight establishes whose [`SshState`] is gone — displaced by a
@@ -569,19 +548,59 @@ pub(crate) struct HostConnSet {
     /// app. [`Self::abandon_reconnects`] is the only place they are
     /// aborted.
     displaced: Vec<AbortHandle>,
-    /// What an ssh host's retry ladder must carry across its own
-    /// attempts, keyed like [`Self::conns`]. See [`Outage`].
-    outages: HashMap<String, Outage>,
-    /// What a bootstrap is doing to a host right now, or how it ended —
-    /// keyed like [`Self::conns`].
+}
+
+/// Everything the set holds for one saved host, keyed on
+/// `HostSnapshot.id`.
+///
+/// Created only where one of its fields is first written —
+/// [`HostConnSet::mint_generation`], [`HostConnSet::connect`],
+/// [`HostConnSet::open_ssh`], [`HostConnSet::begin_outage`] and
+/// [`HostConnSet::set_bootstrap_note`] with a note — and removed only by
+/// [`HostConnSet::remove`]. Nothing that *clears* a field creates one,
+/// and nothing prunes an entry whose fields have all gone: an entry
+/// holding a generation alone is exactly what [`Self::generation`] says
+/// must outlive the connection.
+#[derive(Default)]
+struct HostEntry {
+    conn: Option<HostConn>,
+    /// Never `Some` while [`Self::conn`] is — `forget` clears it before
+    /// `connect` inserts, and `disconnect` inserts it only after taking
+    /// the connection.
+    retained: Option<RetainedSection>,
+    /// The last generation minted for this host — but outliving the
+    /// [`HostConn`] it was minted for, which is the whole point. A
+    /// disconnected host has no [`Self::conn`] and would otherwise read
+    /// as "never connected"; a poller watching this number for an edge
+    /// would then see it fall back to `0` and count the next attempt
+    /// twice. `0` means never minted. Written by
+    /// [`HostConnSet::mint_generation`]; dropped only by
+    /// [`HostConnSet::remove`], with the host itself.
+    generation: u64,
+    /// The ssh transport, for a host reached over one.
     ///
-    /// It sits in front of every other reason [`Self::section_reason`]
-    /// can give, because while a bootstrap runs it is the *most current*
-    /// thing true about the host: the connect failure that started it is
-    /// exactly what the job is answering, and going on showing it would
-    /// leave the band describing a question that is already being dealt
-    /// with.
-    bootstrap_notes: HashMap<String, String>,
+    /// **This is where the tunnels live, and the seam is deliberate.**
+    /// A tunnel is opened, torn down and read for its last failure at
+    /// exactly the three moments a connection is started, dropped and
+    /// reported — all of which this set already owns — and it already
+    /// holds the runtime handle the establish runs on and the feed the
+    /// answer comes back over. Hanging them off `App` instead would mean
+    /// duplicating `connect`/`disconnect`/`remove`'s lifecycle in a
+    /// second place and threading the runtime and the feed there twice.
+    ssh: Option<SshState>,
+    /// What an ssh host's retry ladder must carry across its own
+    /// attempts. See [`Outage`].
+    outage: Option<Outage>,
+    /// What a bootstrap is doing to this host right now, or how it
+    /// ended.
+    ///
+    /// It sits in front of every other reason
+    /// [`HostConnSet::section_reason`] can give, because while a
+    /// bootstrap runs it is the *most current* thing true about the
+    /// host: the connect failure that started it is exactly what the job
+    /// is answering, and going on showing it would leave the band
+    /// describing a question that is already being dealt with.
+    bootstrap_note: Option<String>,
 }
 
 /// One ssh host's outage: everything a retry ladder has to carry that
@@ -812,21 +831,32 @@ impl HostConnSet {
             minter: HostIdMinter::new(),
             theme: Arc::new(Mutex::new(theme_colors(theme))),
             client_build: roost_vt::libghostty_build(),
-            conns: HashMap::new(),
+            entries: HashMap::new(),
             mirrors: HashMap::new(),
-            retained: HashMap::new(),
             next_generation: 0,
-            generations: HashMap::new(),
-            ssh: HashMap::new(),
             next_ssh_request: 0,
             displaced: Vec::new(),
-            outages: HashMap::new(),
-            bootstrap_notes: HashMap::new(),
         }
     }
 
+    /// Whether this set holds any *live connection* — never "any state".
+    /// A host with only a retained section, an outage or a generation is
+    /// still a host this set has nothing running for.
     pub(crate) fn is_empty(&self) -> bool {
-        self.conns.is_empty()
+        !self.entries.values().any(|entry| entry.conn.is_some())
+    }
+
+    /// This host's entry, created if it has none.
+    ///
+    /// **The only entry-creating call in the set**, and it belongs at
+    /// exactly the five sites where the old parallel maps inserted:
+    /// [`Self::mint_generation`], [`Self::connect`], [`Self::open_ssh`],
+    /// [`Self::begin_outage`] and [`Self::set_bootstrap_note`] with a
+    /// note. Every read and every *clearing* write goes through
+    /// `entries.get`/`get_mut` instead, so clearing a field on a host
+    /// this set has never heard of stays the no-op it has always been.
+    fn entry_mut(&mut self, host: &str) -> &mut HostEntry {
+        self.entries.entry(host.to_string()).or_default()
     }
 
     /// Number the attempt that is starting now, and record it as this
@@ -839,9 +869,9 @@ impl HostConnSet {
     /// again: the counter is set-wide and only ever climbs.
     fn mint_generation(&mut self, host: &str) -> u64 {
         self.next_generation += 1;
-        self.generations
-            .insert(host.to_string(), self.next_generation);
-        self.next_generation
+        let minted = self.next_generation;
+        self.entry_mut(host).generation = minted;
+        minted
     }
 
     /// Start (or restart) a connection to one saved host.
@@ -868,7 +898,10 @@ impl HostConnSet {
         // and without it an explicit reconnect would leak everything the
         // old connection's tabs left behind (attach state, terminals,
         // inbox rows).
-        let supersedes = self.conns.get(host).and_then(|conn| conn.incarnation);
+        let supersedes = self
+            .entries
+            .get(host)
+            .and_then(|entry| entry.conn.as_ref()?.incarnation);
         let held_lease = self.carried_lease(host, cause);
         self.forget(host);
         // An ssh attempt started at [`Self::open_ssh`] and was numbered
@@ -879,7 +912,10 @@ impl HostConnSet {
         // no entry behind it) taking a fresh number rather than
         // reusing one.
         let generation = match transport {
-            HostTransport::Ssh => self.ssh.get(host).and_then(|entry| entry.generation),
+            HostTransport::Ssh => self
+                .entries
+                .get(host)
+                .and_then(|entry| entry.ssh.as_ref()?.generation),
             _ => None,
         }
         .unwrap_or_else(|| self.mint_generation(host));
@@ -910,24 +946,21 @@ impl HostConnSet {
             Arc::clone(&shutdown),
         ));
 
-        self.conns.insert(
-            host.to_string(),
-            HostConn {
-                label: label.to_string(),
-                socket,
-                transport,
-                generation,
-                ops,
-                shutdown,
-                incarnation: None,
-                focus_sent: None,
-                // What the task is actually doing the moment it is
-                // spawned. The feed's first `Connecting` replaces it —
-                // this is only what a frame drawn in between reads, so
-                // it must not be a state the machine cannot produce.
-                state: HostConnState::Connecting { previous: None },
-            },
-        );
+        self.entry_mut(host).conn = Some(HostConn {
+            label: label.to_string(),
+            socket,
+            transport,
+            generation,
+            ops,
+            shutdown,
+            incarnation: None,
+            focus_sent: None,
+            // What the task is actually doing the moment it is spawned.
+            // The feed's first `Connecting` replaces it — this is only
+            // what a frame drawn in between reads, so it must not be a
+            // state the machine cannot produce.
+            state: HostConnState::Connecting { previous: None },
+        });
     }
 
     /// Start an ssh-reached host's connection: open its tunnel, warm the
@@ -979,7 +1012,9 @@ impl HostConnSet {
         // the band: either it worked and this connect is its sequel, or
         // it did not and the user is trying again — and in both cases
         // this attempt's own outcome is the newer answer.
-        self.bootstrap_notes.remove(host);
+        if let Some(entry) = self.entries.get_mut(host) {
+            entry.bootstrap_note = None;
+        }
         if cause == AttemptCause::Explicit {
             self.clear_outage(host);
         }
@@ -1011,27 +1046,24 @@ impl HostConnSet {
             )));
         });
 
-        let superseded = self.ssh.insert(
-            host.to_string(),
-            SshState {
-                target: raw_target,
-                request,
-                label: label.to_string(),
-                mode,
-                attended: cause == AttemptCause::Explicit && mode != ConnectMode::IfPresent,
-                origin,
-                cause,
-                generation: Some(generation),
-                lease: None,
-                tunnel: None,
-                establish: Some(establish.abort_handle()),
-                seen: 0,
-                failure: None,
-                // Cleared with the entry, not carried: this is a fact
-                // about *this* attempt.
-                reached_connected: false,
-            },
-        );
+        let superseded = self.entry_mut(host).ssh.replace(SshState {
+            target: raw_target,
+            request,
+            label: label.to_string(),
+            mode,
+            attended: cause == AttemptCause::Explicit && mode != ConnectMode::IfPresent,
+            origin,
+            cause,
+            generation: Some(generation),
+            lease: None,
+            tunnel: None,
+            establish: Some(establish.abort_handle()),
+            seen: 0,
+            failure: None,
+            // Cleared with the entry, not carried: this is a fact about
+            // *this* attempt.
+            reached_connected: false,
+        });
         self.park_displaced(superseded);
     }
 
@@ -1067,7 +1099,7 @@ impl HostConnSet {
         // Both stale paths hand the tunnel to [`Self::discard_tunnel`]
         // rather than letting it fall out of scope here: dropping one on
         // the UI thread would run its blocking teardown on the UI thread.
-        match self.ssh.get(&host) {
+        match self.entries.get(&host).and_then(|entry| entry.ssh.as_ref()) {
             None => {
                 tracing::debug!(%host, "dropped a tunnel establish for a host that is no longer reached over ssh");
                 self.discard_tunnel(result);
@@ -1082,7 +1114,11 @@ impl HostConnSet {
         }
         match result {
             Ok(tunnel) => {
-                let entry = self.ssh.get_mut(&host).expect("the entry checked above");
+                let entry = self
+                    .entries
+                    .get_mut(&host)
+                    .and_then(|entry| entry.ssh.as_mut())
+                    .expect("the entry checked above");
                 let socket = tunnel.bridge_socket().to_path_buf();
                 // The generation the band is already square with. A
                 // per-connection exec that fails after this point bumps
@@ -1118,7 +1154,11 @@ impl HostConnSet {
                 // one's reason for the whole ladder and neither `(2/10)`
                 // nor the give-up copy would ever appear (§3.8).
                 self.write_disconnected(&host, disconnected);
-                let entry = self.ssh.get_mut(&host).expect("the entry checked above");
+                let entry = self
+                    .entries
+                    .get_mut(&host)
+                    .and_then(|entry| entry.ssh.as_mut())
+                    .expect("the entry checked above");
                 entry.establish = None;
                 entry.failure = Some(failure);
                 entry.attended.then_some(reason)
@@ -1134,16 +1174,17 @@ impl HostConnSet {
     /// own state, an establish that never reached one, and the retained
     /// section a disconnect left behind.
     pub(crate) fn section_reason(&self, host: &str) -> Option<&str> {
-        if let Some(note) = self.bootstrap_notes.get(host) {
+        let entry = self.entries.get(host)?;
+        if let Some(note) = entry.bootstrap_note.as_ref() {
             return Some(note.as_str());
         }
-        if let Some(conn) = self.conns.get(host) {
+        if let Some(conn) = entry.conn.as_ref() {
             return disconnected_reason(&conn.state);
         }
-        if let Some(failure) = self.ssh.get(host).and_then(|ssh| ssh.failure.as_ref()) {
+        if let Some(failure) = entry.ssh.as_ref().and_then(|ssh| ssh.failure.as_ref()) {
             return Some(failure.message.as_str());
         }
-        disconnected_reason(&self.retained.get(host)?.state)
+        disconnected_reason(&entry.retained.as_ref()?.state)
     }
 
     /// The long form behind [`Self::section_reason`], when the reason is
@@ -1163,9 +1204,9 @@ impl HostConnSet {
     /// it, `0` before the first. One per attempt *started* — an ssh
     /// establish that never comes up counts, which is what makes it an
     /// edge a poller can wait on across a whole retry ladder. See
-    /// [`Self::generations`] for why it survives a disconnect.
+    /// [`HostEntry::generation`] for why it survives a disconnect.
     pub(crate) fn generation(&self, host: &str) -> u64 {
-        self.generations.get(host).copied().unwrap_or(0)
+        self.entries.get(host).map_or(0, |entry| entry.generation)
     }
 
     /// This host's armed retry, if one is waiting to fire.
@@ -1180,10 +1221,11 @@ impl HostConnSet {
     ///
     /// A localhost retry is the connection task's own backoff and its
     /// counter never leaves the task, so the delay is all there is —
-    /// structurally, not by a branch: `outages` only ever holds ssh
-    /// hosts, so the fallthrough below cannot reach a family.
+    /// structurally, not by a branch: an [`Outage`] is only ever opened
+    /// for an ssh host, so the fallthrough below cannot reach a family.
     pub(crate) fn retry_schedule(&self, host: &str) -> Option<RetrySchedule> {
-        if let Some(outage) = self.outages.get(host) {
+        let entry = self.entries.get(host)?;
+        if let Some(outage) = entry.outage.as_ref() {
             if let Some(armed) = outage.armed.as_ref() {
                 return Some(RetrySchedule {
                     delay_ms: armed.delay.as_millis() as u64,
@@ -1196,10 +1238,10 @@ impl HostConnSet {
         }
         // An ssh host's retries live on the ladder alone. Its state's
         // `retry_in` mirrors the rung that was armed and outlives the
-        // timer — the dead connection stays in `conns` for the whole
+        // timer — the dead connection stays on the entry for the whole
         // establish that follows — so reading it here would report a
         // retry nothing holds.
-        let conn = self.conns.get(host)?;
+        let conn = entry.conn.as_ref()?;
         if matches!(conn.transport, HostTransport::Ssh) {
             return None;
         }
@@ -1219,19 +1261,30 @@ impl HostConnSet {
     /// there") and `NoSession` ("a binary, but nothing running") being
     /// the two that have an answer.
     pub(crate) fn ssh_failure(&self, host: &str) -> Option<&roost_ipc::ssh::SshFailure> {
-        self.ssh.get(host)?.failure.as_ref()?.family.as_ref()
+        self.entries
+            .get(host)?
+            .ssh
+            .as_ref()?
+            .failure
+            .as_ref()?
+            .family
+            .as_ref()
     }
 
     /// Who asked for this host's current ssh attempt.
     pub(crate) fn ssh_origin(&self, host: &str) -> Option<RequestOrigin> {
-        self.ssh.get(host).map(|ssh| ssh.origin)
+        self.entries
+            .get(host)
+            .and_then(|entry| Some(entry.ssh.as_ref()?.origin))
     }
 
     /// Whether this host's current ssh attempt ever reached a working
     /// connection. See [`SshState::reached_connected`] — it is what
     /// separates a first connect from a session dropping under the user.
     pub(crate) fn ssh_reached_connected(&self, host: &str) -> bool {
-        self.ssh.get(host).is_some_and(|ssh| ssh.reached_connected)
+        self.entries
+            .get(host)
+            .is_some_and(|entry| entry.ssh.as_ref().is_some_and(|ssh| ssh.reached_connected))
     }
 
     /// This host's outage, created if this is the drop that starts one.
@@ -1241,17 +1294,19 @@ impl HostConnSet {
     /// run again yet — so this is the last moment it can be copied
     /// somewhere the next attempt's `open_ssh` will not wipe (§3.7).
     pub(crate) fn begin_outage(&mut self, host: &str) -> &mut Outage {
-        let lease = self.ssh.get(host).and_then(|ssh| ssh.lease.clone());
-        let outage = self
-            .outages
-            .entry(host.to_string())
-            .or_insert_with(|| Outage {
-                ladder: reconnect::ReconnectLadder::default(),
-                lease: None,
-                armed: None,
-                family: None,
-                dead_tunnel: None,
-            });
+        // Cloned before the entry is borrowed mutably, which is also
+        // the order today's two maps forced.
+        let lease = self
+            .entries
+            .get(host)
+            .and_then(|entry| entry.ssh.as_ref()?.lease.clone());
+        let outage = self.entry_mut(host).outage.get_or_insert_with(|| Outage {
+            ladder: reconnect::ReconnectLadder::default(),
+            lease: None,
+            armed: None,
+            family: None,
+            dead_tunnel: None,
+        });
         // Every drop, not only the first: an entry holding a lease is by
         // construction the connection that just died, so it supersedes
         // whatever the outage carries. `None` does not clear, because
@@ -1277,7 +1332,7 @@ impl HostConnSet {
     fn carried_lease(&self, host: &str, cause: AttemptCause) -> Option<String> {
         match cause {
             AttemptCause::Explicit => None,
-            AttemptCause::AutoReconnect => self.outages.get(host)?.lease.clone(),
+            AttemptCause::AutoReconnect => self.entries.get(host)?.outage.as_ref()?.lease.clone(),
         }
     }
 
@@ -1293,7 +1348,7 @@ impl HostConnSet {
     ///
     /// The stamped generation is a *second* question, and the ssh path
     /// is where the two come apart: [`Self::open_ssh`] installs a fresh
-    /// [`SshState`] while the old [`HostConn`] is still in `conns` — an
+    /// [`SshState`] while the old [`HostConn`] is still on the entry — an
     /// ssh connect does not reach [`Self::connect`], and so does not
     /// `forget`, until its tunnel is up an establish later. So "is this
     /// connection still current?" can be yes while "is this the attempt
@@ -1306,7 +1361,11 @@ impl HostConnSet {
         let Some(minted) = self.minter.registration(incarnation) else {
             return;
         };
-        let Some(entry) = self.ssh.get_mut(&host) else {
+        let Some(entry) = self
+            .entries
+            .get_mut(&host)
+            .and_then(|entry| entry.ssh.as_mut())
+        else {
             return;
         };
         if entry.generation == Some(minted.generation) {
@@ -1323,11 +1382,14 @@ impl HostConnSet {
     /// yet must not vanish the moment the job's task ends.
     pub(crate) fn set_bootstrap_note(&mut self, host: &str, note: Option<String>) {
         match note {
-            Some(note) => {
-                self.bootstrap_notes.insert(host.to_string(), note);
-            }
+            Some(note) => self.entry_mut(host).bootstrap_note = Some(note),
+            // Never `entry_mut`: clearing a note on a host this set has
+            // never heard of has always been a no-op, and routing it
+            // through the entry API would leave a phantom entry behind.
             None => {
-                self.bootstrap_notes.remove(host);
+                if let Some(entry) = self.entries.get_mut(host) {
+                    entry.bootstrap_note = None;
+                }
             }
         }
     }
@@ -1356,7 +1418,7 @@ impl HostConnSet {
         host: &str,
         disconnected: &mut state::Disconnected,
     ) -> Option<(SshFailure, bool)> {
-        let entry = self.ssh.get_mut(host)?;
+        let entry = self.entries.get_mut(host)?.ssh.as_mut()?;
         let recorded = entry.tunnel.as_ref().and_then(|t| t.last_error())?;
         if recorded.generation <= entry.seen {
             return None;
@@ -1405,7 +1467,11 @@ impl HostConnSet {
             _ => None,
         };
 
-        if !self.outages.contains_key(host) {
+        if !self
+            .entries
+            .get(host)
+            .is_some_and(|entry| entry.outage.is_some())
+        {
             // §3.2's gates 1 and 2, read once here and never again:
             // `open_ssh` installs a fresh `SshState` with
             // `reached_connected: false` on every attempt, so re-reading
@@ -1414,9 +1480,9 @@ impl HostConnSet {
             // the existence of the outage entry *is* the record of
             // eligibility.
             let eligible = self
-                .ssh
+                .entries
                 .get(host)
-                .is_some_and(|entry| entry.reached_connected);
+                .is_some_and(|entry| entry.ssh.as_ref().is_some_and(|ssh| ssh.reached_connected));
             if !eligible || !reconnect::retryable(input, truncated) {
                 return;
             }
@@ -1440,7 +1506,11 @@ impl HostConnSet {
         // `family_copy == None` (the overlay early-returned under
         // `seen`), so writing it here would erase the family the armed
         // rung is for.
-        if let Some(outage) = self.outages.get(host) {
+        if let Some(outage) = self
+            .entries
+            .get(host)
+            .and_then(|entry| entry.outage.as_ref())
+        {
             if let Some(armed) = &outage.armed {
                 *disconnected = retry_line(
                     armed.delay,
@@ -1453,13 +1523,21 @@ impl HostConnSet {
         // Cloned before `apply_state` hands the tunnel to
         // `shutdown_tunnel`: this is the last moment its failure slot is
         // reachable, and the timer re-reads it before it dials.
-        let dead = self.ssh.get(host).and_then(|entry| {
-            Some(DeadTunnel::Tunnel {
-                tunnel: Arc::clone(entry.tunnel.as_ref()?),
-                seen: entry.seen,
-            })
-        });
-        let Some(outage) = self.outages.get_mut(host) else {
+        let dead = self
+            .entries
+            .get(host)
+            .and_then(|entry| entry.ssh.as_ref())
+            .and_then(|entry| {
+                Some(DeadTunnel::Tunnel {
+                    tunnel: Arc::clone(entry.tunnel.as_ref()?),
+                    seen: entry.seen,
+                })
+            });
+        let Some(outage) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.outage.as_mut())
+        else {
             return;
         };
         if dead.is_some() {
@@ -1529,7 +1607,11 @@ impl HostConnSet {
     /// counter, so a stamp taken at outage creation could never match
     /// again (§3.4).
     fn arm_reconnect(&mut self, host: &str, delay: Duration) {
-        let Some(request) = self.ssh.get(host).map(|entry| entry.request) else {
+        let Some(request) = self
+            .entries
+            .get(host)
+            .and_then(|entry| Some(entry.ssh.as_ref()?.request))
+        else {
             return;
         };
         let feed = self.feed.clone();
@@ -1538,7 +1620,11 @@ impl HostConnSet {
             tokio::time::sleep(delay).await;
             feed.send(crate::engine_feed::EngineFeed::ReconnectDue { host: due, request });
         });
-        let Some(outage) = self.outages.get_mut(host) else {
+        let Some(outage) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.outage.as_mut())
+        else {
             timer.abort();
             return;
         };
@@ -1566,20 +1652,26 @@ impl HostConnSet {
         host: &str,
         stamped: u64,
     ) -> Option<(RequestOrigin, AttemptCause)> {
-        // `is_some_and`, never `is_none_or`: `disconnect` removes the
-        // whole entry, and an `is_none_or` spelling would let a fired
-        // timer resurrect a host the user just disconnected.
+        // `is_some_and`, never `is_none_or`: `disconnect` takes the
+        // whole [`HostEntry::ssh`], and an `is_none_or` spelling would
+        // let a fired timer resurrect a host the user just
+        // disconnected.
         if !self
-            .ssh
+            .entries
             .get(host)
-            .is_some_and(|entry| entry.request == stamped)
+            .and_then(|entry| entry.ssh.as_ref())
+            .is_some_and(|ssh| ssh.request == stamped)
         {
             tracing::debug!(%host, stamped, "dropped a superseded reconnect timer");
             return None;
         }
         // Consumption takes the handle, so no dead one lingers behind a
         // later "is a retry pending?" read.
-        let Some(armed) = self.outages.get_mut(host).and_then(|o| o.armed.take()) else {
+        let Some(armed) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.outage.as_mut()?.armed.take())
+        else {
             tracing::debug!(%host, "a reconnect came due with nothing armed for it");
             return None;
         };
@@ -1615,13 +1707,23 @@ impl HostConnSet {
 
     /// A failure the dead tunnel recorded since the drop, if it is news.
     fn late_family(&self, host: &str) -> Option<(u64, SshFailure, bool)> {
-        self.outages.get(host)?.dead_tunnel.as_ref()?.late_failure()
+        self.entries
+            .get(host)?
+            .outage
+            .as_ref()?
+            .dead_tunnel
+            .as_ref()?
+            .late_failure()
     }
 
     /// A family found at fire time that no retry may be spent on: the
     /// host settles on that family's own copy instead of dialing.
     fn settle_late(&mut self, host: &str, generation: u64, family: SshFailure, truncated: bool) {
-        let Some(entry) = self.ssh.get_mut(host) else {
+        let Some(entry) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.ssh.as_mut())
+        else {
             return;
         };
         let failure = ConnectFailure {
@@ -1658,7 +1760,11 @@ impl HostConnSet {
     /// old one, whereas a reset has no failure of its own and is still
     /// the same outage.
     fn restart_ladder(&mut self, host: &str) {
-        let Some(outage) = self.outages.get_mut(host) else {
+        let Some(outage) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.outage.as_mut())
+        else {
             return;
         };
         outage.ladder.reset();
@@ -1680,12 +1786,16 @@ impl HostConnSet {
     /// Write a disconnected line onto the connection the band reads.
     ///
     /// Only over one that is already disconnected. The dead `HostConn` a
-    /// drop leaves in `conns` is what `section_reason` prefers and what
+    /// drop leaves on the entry is what `section_reason` prefers and what
     /// the ladder has to keep current; a connection that is still
     /// *serving* is a different thing, and an establish failing beside
     /// it (a ↻ on a connected host) is its own task's news to publish.
     fn write_disconnected(&mut self, host: &str, disconnected: state::Disconnected) {
-        if let Some(conn) = self.conns.get_mut(host) {
+        if let Some(conn) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.conn.as_mut())
+        {
             if matches!(conn.state, HostConnState::Disconnected(_)) {
                 conn.state = HostConnState::Disconnected(disconnected);
             }
@@ -1695,9 +1805,14 @@ impl HostConnSet {
     /// End this host's outage: the ladder, the lease, the dead tunnel
     /// and any armed timer go together.
     fn clear_outage(&mut self, host: &str) {
+        // `get_mut`, never `entry_mut`: ending an outage a host does
+        // not have must not conjure an entry for it.
         if let Some(Outage {
             armed: Some(armed), ..
-        }) = self.outages.remove(host)
+        }) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.outage.take())
         {
             armed.handle.abort();
         }
@@ -1713,17 +1828,16 @@ impl HostConnSet {
     /// zero-`ssh`-children check measures.
     ///
     /// [`Self::displaced`] is part of that second half: an establish
-    /// whose entry has gone is invisible to the walk over [`Self::ssh`],
-    /// and nothing will drain its answer once the app is on its way out.
+    /// whose entry has gone is invisible to the walk over
+    /// [`HostEntry::ssh`], and nothing will drain its answer once the
+    /// app is on its way out.
     pub(crate) fn abandon_reconnects(&mut self) {
-        for (host, outage) in self.outages.drain() {
-            if let Some(armed) = outage.armed {
+        for (host, entry) in self.entries.iter_mut() {
+            if let Some(armed) = entry.outage.take().and_then(|outage| outage.armed) {
                 tracing::debug!(%host, "aborting an armed reconnect on the way out");
                 armed.handle.abort();
             }
-        }
-        for (host, entry) in self.ssh.iter_mut() {
-            if let Some(establish) = entry.establish.take() {
+            if let Some(establish) = entry.ssh.as_mut().and_then(|ssh| ssh.establish.take()) {
                 tracing::debug!(%host, "aborting an in-flight ssh establish on the way out");
                 establish.abort();
             }
@@ -1756,7 +1870,11 @@ impl HostConnSet {
             request = ready.request,
             "discarding a tunnel establish that answered during shutdown"
         );
-        if let Some(entry) = self.ssh.get_mut(&ready.host) {
+        if let Some(entry) = self
+            .entries
+            .get_mut(&ready.host)
+            .and_then(|entry| entry.ssh.as_mut())
+        {
             if entry.request == ready.request {
                 entry.establish = None;
             }
@@ -1803,7 +1921,7 @@ impl HostConnSet {
     /// ([`Self::shutdown_tunnel`]) or awaited ahead of a replacement
     /// ([`Self::open_ssh`]).
     fn take_tunnel(&mut self, host: &str) -> Option<Arc<SshTunnel>> {
-        let tunnel = self.ssh.get_mut(host)?.tunnel.take()?;
+        let tunnel = self.entries.get_mut(host)?.ssh.as_mut()?.tunnel.take()?;
         tracing::debug!(%host, "tearing down an ssh tunnel");
         Some(tunnel)
     }
@@ -1832,13 +1950,20 @@ impl HostConnSet {
         // in-flight establish is dropped when it lands and the next
         // Connect opens a fresh tunnel.
         self.shutdown_tunnel(host);
-        let removed = self.ssh.remove(host);
+        let removed = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.ssh.take());
         self.park_displaced(removed);
         // Being reconnected eight seconds after asking to disconnect is
         // the one outcome nobody wants, and the lease the entry holds
         // has no owner left either.
         self.clear_outage(host);
-        let Some(conn) = self.conns.remove(host) else {
+        let Some(conn) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.conn.take())
+        else {
             self.minter.forget_host(host);
             return None;
         };
@@ -1848,19 +1973,21 @@ impl HostConnSet {
         if let Some((incarnation, mirror)) = incarnation
             .and_then(|incarnation| Some((incarnation, self.mirrors.remove(&incarnation)?)))
         {
-            self.retained.insert(
-                host.to_string(),
-                RetainedSection {
-                    label: conn.label.clone(),
-                    incarnation,
-                    mirror,
-                    state: HostConnState::Disconnected(state::Disconnected {
-                        reason: "disconnected".into(),
-                        detail: None,
-                        retry_in: None,
-                    }),
-                },
-            );
+            let retained = RetainedSection {
+                label: conn.label.clone(),
+                incarnation,
+                mirror,
+                state: HostConnState::Disconnected(state::Disconnected {
+                    reason: "disconnected".into(),
+                    detail: None,
+                    retry_in: None,
+                }),
+            };
+            // Not an `entry_mut` site: the entry exists by
+            // construction — `conn` was just taken out of it.
+            if let Some(entry) = self.entries.get_mut(host) {
+                entry.retained = Some(retained);
+            }
         }
         // `Drop` signals the task's own shutdown, which closes its queue
         // and answers everything still on it with `Disconnected`.
@@ -1874,9 +2001,11 @@ impl HostConnSet {
     /// entry is the app's to drop).
     pub(crate) fn remove(&mut self, host: &str) -> Option<HostId> {
         let incarnation = self.disconnect(host);
-        self.retained.remove(host);
-        self.bootstrap_notes.remove(host);
-        self.generations.remove(host);
+        // The only entry removal in the set. After `disconnect` the
+        // entry holds nothing but the retained section, the generation
+        // and the bootstrap note — exactly the three this used to clear
+        // one map at a time.
+        self.entries.remove(host);
         incarnation
     }
 
@@ -1887,13 +2016,19 @@ impl HostConnSet {
     /// purpose: the fresh `tab.list` is authoritative, so a reconnect is
     /// purge-then-rebuild and never a merge (§3.2).
     fn forget(&mut self, host: &str) {
-        if let Some(conn) = self.conns.remove(host) {
+        if let Some(conn) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.conn.take())
+        {
             if let Some(incarnation) = conn.incarnation {
                 self.mirrors.remove(&incarnation);
             }
             // `Drop` notifies and aborts.
         }
-        self.retained.remove(host);
+        if let Some(entry) = self.entries.get_mut(host) {
+            entry.retained = None;
+        }
         self.minter.forget_host(host);
     }
 
@@ -1904,7 +2039,9 @@ impl HostConnSet {
 
     /// The op queue for a host, by saved id.
     pub(crate) fn ops(&self, host: &str) -> Option<&HostOps> {
-        self.conns.get(host).map(|conn| &conn.ops)
+        self.entries
+            .get(host)
+            .and_then(|entry| Some(&entry.conn.as_ref()?.ops))
     }
 
     /// Enqueue one control-plane op on a host's queue.
@@ -1950,7 +2087,9 @@ impl HostConnSet {
     }
 
     pub(crate) fn state(&self, host: &str) -> Option<&HostConnState> {
-        self.conns.get(host).map(|conn| &conn.state)
+        self.entries
+            .get(host)
+            .and_then(|entry| Some(&entry.conn.as_ref()?.state))
     }
 
     /// Whether an ssh establish is still in flight for this host — the
@@ -1960,16 +2099,21 @@ impl HostConnSet {
     /// which is a wrong answer to hand a caller who just asked to
     /// connect.
     pub(crate) fn establishing(&self, host: &str) -> bool {
-        self.ssh
-            .get(host)
-            .is_some_and(|ssh| ssh.tunnel.is_none() && ssh.failure.is_none())
-            && !self.conns.contains_key(host)
+        self.entries.get(host).is_some_and(|entry| {
+            entry.conn.is_none()
+                && entry
+                    .ssh
+                    .as_ref()
+                    .is_some_and(|ssh| ssh.tunnel.is_none() && ssh.failure.is_none())
+        })
     }
 
     /// The incarnation currently serving a saved host, if it is
     /// connected.
     pub(crate) fn incarnation(&self, host: &str) -> Option<HostId> {
-        self.conns.get(host).and_then(|conn| conn.incarnation)
+        self.entries
+            .get(host)
+            .and_then(|entry| entry.conn.as_ref()?.incarnation)
     }
 
     /// The live mirror for an incarnation. C6/C7 read it through
@@ -1992,7 +2136,8 @@ impl HostConnSet {
     /// purges it and the fresh `tab.list` rebuilds, which is §3.2's
     /// purge-then-rebuild.
     pub(crate) fn section(&self, host: &str) -> Option<HostSectionView<'_>> {
-        if let Some(conn) = self.conns.get(host) {
+        let entry = self.entries.get(host)?;
+        if let Some(conn) = entry.conn.as_ref() {
             return Some(HostSectionView {
                 label: conn.label.as_str(),
                 state: &conn.state,
@@ -2002,7 +2147,7 @@ impl HostConnSet {
                     .and_then(|incarnation| self.mirrors.get(&incarnation)),
             });
         }
-        let retained = self.retained.get(host)?;
+        let retained = entry.retained.as_ref()?;
         Some(HostSectionView {
             label: retained.label.as_str(),
             state: &retained.state,
@@ -2017,7 +2162,8 @@ impl HostConnSet {
     pub(crate) fn connected(
         &self,
     ) -> impl Iterator<Item = (&str, &str, HostId, &Arc<SharedMirror>)> {
-        self.conns.iter().filter_map(|(host, conn)| {
+        self.entries.iter().filter_map(|(host, entry)| {
+            let conn = entry.conn.as_ref()?;
             let incarnation = conn.incarnation.filter(|_| conn.state.is_connected())?;
             let mirror = self.mirrors.get(&incarnation)?;
             Some((host.as_str(), conn.label.as_str(), incarnation, mirror))
@@ -2026,9 +2172,10 @@ impl HostConnSet {
 
     /// Where a saved host lives, and whether it is this machine's own.
     pub(crate) fn endpoint(&self, host: &str) -> Option<(&std::path::Path, bool)> {
-        self.conns
-            .get(host)
-            .map(|conn| (conn.socket.as_path(), conn.transport.is_localhost()))
+        self.entries.get(host).and_then(|entry| {
+            let conn = entry.conn.as_ref()?;
+            Some((conn.socket.as_path(), conn.transport.is_localhost()))
+        })
     }
 
     /// The socket a live incarnation's data connections dial — owned, so
@@ -2051,7 +2198,11 @@ impl HostConnSet {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *slot = colors.clone();
         }
-        for conn in self.conns.values() {
+        for conn in self
+            .entries
+            .values()
+            .filter_map(|entry| entry.conn.as_ref())
+        {
             // Lease-gated, and it rides the same queue as everything
             // else so it cannot interleave with an attach.
             let _ = conn.ops.send(
@@ -2080,7 +2231,11 @@ impl HostConnSet {
     /// `unknown-op`, which the connection tolerates, and the task logs
     /// once per incarnation rather than warning per call.
     pub(crate) fn set_focus(&mut self, claim: Option<TabKey>) {
-        for conn in self.conns.values_mut() {
+        for conn in self
+            .entries
+            .values_mut()
+            .filter_map(|entry| entry.conn.as_mut())
+        {
             let Some(incarnation) = conn.incarnation.filter(|_| conn.state.is_connected()) else {
                 continue;
             };
@@ -2121,7 +2276,11 @@ impl HostConnSet {
         let Some(host) = self.owner_of(incarnation) else {
             return false;
         };
-        let Some(conn) = self.conns.get_mut(&host) else {
+        let Some(conn) = self
+            .entries
+            .get_mut(&host)
+            .and_then(|entry| entry.conn.as_mut())
+        else {
             return false;
         };
         match conn.focus_sent {
@@ -2150,8 +2309,12 @@ impl HostConnSet {
         // rather than a connect that never worked, and the bootstrap
         // offer turns on exactly that difference.
         if next.is_connected() {
-            if let Some(entry) = self.ssh.get_mut(&host) {
-                entry.reached_connected = true;
+            if let Some(ssh) = self
+                .entries
+                .get_mut(&host)
+                .and_then(|entry| entry.ssh.as_mut())
+            {
+                ssh.reached_connected = true;
             }
         }
         match &next {
@@ -2191,7 +2354,7 @@ impl HostConnSet {
             self.purge(*previous);
         }
 
-        let conn = self.conns.get_mut(&host)?;
+        let conn = self.entries.get_mut(&host)?.conn.as_mut()?;
         // A different incarnation, or one that is no longer connected,
         // knows nothing about what it was told before: the queue behind
         // it was flushed, and a session that comes back is back on its
@@ -2245,7 +2408,11 @@ impl HostConnSet {
     /// both are dropped here rather than landing on the replacement.
     fn owner_of(&self, incarnation: HostId) -> Option<String> {
         let registration = self.minter.registration(incarnation)?;
-        let Some(conn) = self.conns.get(&registration.host) else {
+        let Some(conn) = self
+            .entries
+            .get(&registration.host)
+            .and_then(|entry| entry.conn.as_ref())
+        else {
             tracing::debug!(
                 incarnation = incarnation.raw(),
                 host = %registration.host,
@@ -2268,7 +2435,76 @@ impl HostConnSet {
     /// task would mint one.
     #[cfg(test)]
     fn mint_for(&self, host: &str) -> HostId {
-        self.minter.mint(host, self.conns[host].generation)
+        self.minter.mint(host, self.conn(host).generation)
+    }
+
+    /// The suite's reads into one host's entry, named for the maps they
+    /// replace. Each panics exactly where the `HashMap` index it stands
+    /// in for did — an assertion about a host with no entry is a broken
+    /// test, not a `None`.
+    #[cfg(test)]
+    fn ssh(&self, host: &str) -> &SshState {
+        self.entries[host]
+            .ssh
+            .as_ref()
+            .expect("an ssh entry for the host")
+    }
+
+    #[cfg(test)]
+    fn has_ssh(&self, host: &str) -> bool {
+        self.entries
+            .get(host)
+            .is_some_and(|entry| entry.ssh.is_some())
+    }
+
+    #[cfg(test)]
+    fn outage(&self, host: &str) -> &Outage {
+        self.entries[host]
+            .outage
+            .as_ref()
+            .expect("an outage for the host")
+    }
+
+    #[cfg(test)]
+    fn outage_mut(&mut self, host: &str) -> &mut Outage {
+        self.entries
+            .get_mut(host)
+            .expect("an entry for the host")
+            .outage
+            .as_mut()
+            .expect("an outage")
+    }
+
+    #[cfg(test)]
+    fn has_outage(&self, host: &str) -> bool {
+        self.entries
+            .get(host)
+            .is_some_and(|entry| entry.outage.is_some())
+    }
+
+    #[cfg(test)]
+    fn conn(&self, host: &str) -> &HostConn {
+        self.entries[host]
+            .conn
+            .as_ref()
+            .expect("a connection for the host")
+    }
+
+    #[cfg(test)]
+    fn conn_mut(&mut self, host: &str) -> &mut HostConn {
+        self.entries
+            .get_mut(host)
+            .expect("an entry for the host")
+            .conn
+            .as_mut()
+            .expect("conn")
+    }
+
+    #[cfg(test)]
+    fn has_conn(&self, host: &str) -> bool {
+        self.entries
+            .get(host)
+            .is_some_and(|entry| entry.conn.is_some())
     }
 }
 
@@ -2433,7 +2669,7 @@ mod tests {
             ConnectMode::Dial,
             AttemptCause::Explicit,
         );
-        let outgoing = set.conns["h1"].generation;
+        let outgoing = set.conn("h1").generation;
 
         // The user hits Connect again before the first task has wound
         // down.
@@ -2510,7 +2746,7 @@ mod tests {
 
         // A key from a connection that has been replaced, and one from a
         // host that is gone entirely.
-        let stale = set.minter.mint("h1", set.conns["h1"].generation - 1);
+        let stale = set.minter.mint("h1", set.conn("h1").generation - 1);
         for dead in [stale, HostId::new(9_999)] {
             let (tx, mut rx) = tokio::sync::oneshot::channel();
             assert!(matches!(
@@ -2581,7 +2817,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         assert_eq!(
             set.tunnel_ready(failed("h1", request, "workbox refused authentication"))
                 .as_deref(),
@@ -2602,7 +2838,7 @@ mod tests {
             RequestOrigin::Ipc,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h2"].request;
+        let request = set.ssh("h2").request;
         assert_eq!(
             set.tunnel_ready(failed("h2", request, "box is unreachable")),
             None,
@@ -2635,10 +2871,10 @@ mod tests {
             "a modal must never open to answer a machine"
         );
         assert!(
-            set.ssh["h1"].attended,
+            set.ssh("h1").attended,
             "an IPC dial still owes its caller a reason, exactly as today"
         );
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         assert_eq!(
             set.tunnel_ready(failed("h1", request, "workbox refused authentication"))
                 .as_deref(),
@@ -2677,7 +2913,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         let toast = set
             .tunnel_ready(refused("h1", request, SshFailure::NotFound))
             .expect("an attended failure is said out loud");
@@ -2698,7 +2934,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h2"].request;
+        let request = set.ssh("h2").request;
         set.tunnel_ready(failed(
             "h2",
             request,
@@ -2729,7 +2965,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         set.tunnel_ready(refused("h1", request, SshFailure::NotFound));
         assert_eq!(
             set.section_reason("h1"),
@@ -2760,7 +2996,7 @@ mod tests {
         );
 
         // Clearing it explicitly falls back to whatever else is current.
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         set.tunnel_ready(refused("h1", request, SshFailure::NoSession));
         set.set_bootstrap_note("h1", Some("setting up roost-session…".into()));
         set.set_bootstrap_note("h1", None);
@@ -2785,7 +3021,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let first = set.ssh["h1"].request;
+        let first = set.ssh("h1").request;
 
         set.open_ssh(
             "h1",
@@ -2795,7 +3031,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let second = set.ssh["h1"].request;
+        let second = set.ssh("h1").request;
         assert_ne!(first, second, "a request id is never reused");
 
         assert_eq!(set.tunnel_ready(failed("h1", first, "stale")), None);
@@ -2826,7 +3062,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         set.tunnel_ready(failed("h1", request, "workbox refused authentication"));
 
         set.connect(
@@ -2970,7 +3206,7 @@ mod tests {
         let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease.sock");
         set.apply_lease(incarnation, "lease-1".into());
         assert_eq!(
-            set.ssh["h1"].lease.as_deref(),
+            set.ssh("h1").lease.as_deref(),
             Some("lease-1"),
             "the lease lands on the entry the connection was opened under"
         );
@@ -3000,7 +3236,8 @@ mod tests {
             AttemptCause::AutoReconnect,
         );
         assert_eq!(
-            set.ssh["h1"].lease, None,
+            set.ssh("h1").lease,
+            None,
             "the fresh entry knows nothing about the connection that died"
         );
         assert_eq!(
@@ -3055,7 +3292,7 @@ mod tests {
         set.apply_state(second, dropped("and the prologue failed"));
 
         assert!(
-            set.outages.contains_key("h1"),
+            set.has_outage("h1"),
             "the ladder is still walking the outage it started"
         );
         assert_eq!(
@@ -3092,13 +3329,13 @@ mod tests {
             RequestOrigin::Ipc,
             AttemptCause::AutoReconnect,
         );
-        assert_eq!(set.ssh["h1"].cause, AttemptCause::AutoReconnect);
+        assert_eq!(set.ssh("h1").cause, AttemptCause::AutoReconnect);
         assert!(
-            set.outages.contains_key("h1"),
+            set.has_outage("h1"),
             "a scheduled attempt leaves the ladder it belongs to alone"
         );
         assert_eq!(
-            set.carried_lease("h1", set.ssh["h1"].cause).as_deref(),
+            set.carried_lease("h1", set.ssh("h1").cause).as_deref(),
             Some("lease-1")
         );
 
@@ -3111,13 +3348,13 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        assert_eq!(set.ssh["h1"].cause, AttemptCause::Explicit);
+        assert_eq!(set.ssh("h1").cause, AttemptCause::Explicit);
         assert!(
-            !set.outages.contains_key("h1"),
+            !set.has_outage("h1"),
             "an explicit attempt supersedes the schedule outright"
         );
         assert_eq!(
-            set.carried_lease("h1", set.ssh["h1"].cause),
+            set.carried_lease("h1", set.ssh("h1").cause),
             None,
             "cleared, not merely not-passed: the lease went with the outage"
         );
@@ -3139,17 +3376,17 @@ mod tests {
         let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-stale.sock");
         set.apply_lease(live, "lease-live".into());
 
-        let replaced = set.minter.mint("h1", set.conns["h1"].generation - 1);
+        let replaced = set.minter.mint("h1", set.conn("h1").generation - 1);
         set.apply_lease(replaced, "lease-from-the-connection-before".into());
         assert_eq!(
-            set.ssh["h1"].lease.as_deref(),
+            set.ssh("h1").lease.as_deref(),
             Some("lease-live"),
             "a replaced connection cannot overwrite the live one's lease"
         );
 
         // And an incarnation this set never minted at all.
         set.apply_lease(HostId::new(9_999), "invented".into());
-        assert_eq!(set.ssh["h1"].lease.as_deref(), Some("lease-live"));
+        assert_eq!(set.ssh("h1").lease.as_deref(), Some("lease-live"));
 
         // A disconnect ends the outage the lease would have been kept
         // for, so nothing survives to be presented.
@@ -3194,7 +3431,8 @@ mod tests {
 
         set.apply_lease(live, "lease-1".into());
         assert_eq!(
-            set.ssh["h1"].lease, None,
+            set.ssh("h1").lease,
+            None,
             "but the attempt that replaced it never held that lease"
         );
         set.begin_outage("h1");
@@ -3308,7 +3546,7 @@ mod tests {
     /// `ROOST_TEST_MODE` override, and a suite run under it must not
     /// start failing.
     fn budget(set: &HostConnSet) -> u32 {
-        set.outages["h1"].ladder.budget()
+        set.outage("h1").ladder.budget()
     }
 
     /// One turn of the ladder exactly as the app drives it: the armed
@@ -3317,7 +3555,7 @@ mod tests {
     /// `open_ssh` that call would reach. Returns whether the due message
     /// authorized a dial.
     fn retry_once(set: &mut HostConnSet) -> bool {
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         // The origin and the cause are the set's own answer, not the
         // test's: `App::host_reconnect_due` passes back exactly what it
         // is handed, and the origin is the load-bearing consent gate.
@@ -3352,7 +3590,7 @@ mod tests {
     /// Answer this host's in-flight establish with a classified failure,
     /// as the transport hands one back.
     fn refuse(set: &mut HostConnSet, failure: SshFailure) {
-        let ready = refused("h1", set.ssh["h1"].request, failure);
+        let ready = refused("h1", set.ssh("h1").request, failure);
         set.tunnel_ready(ready);
     }
 
@@ -3369,7 +3607,7 @@ mod tests {
         set.apply_state(incarnation, dropped("the connection closed"));
 
         assert!(
-            set.outages["h1"].armed.is_some(),
+            set.outage("h1").armed.is_some(),
             "a retryable drop leaves a timer waiting"
         );
         let band = band_state(&set, "h1");
@@ -3386,7 +3624,7 @@ mod tests {
         // same generation: no second timer, and the line the armed retry
         // wrote survives `apply_state` writing the raw reason back.
         set.apply_state(incarnation, dropped("the connection closed"));
-        assert_eq!(set.outages["h1"].ladder.attempts(), 1);
+        assert_eq!(set.outage("h1").ladder.attempts(), 1);
         assert_eq!(band_state(&set, "h1"), band);
     }
 
@@ -3539,7 +3777,7 @@ mod tests {
         set.apply_state(incarnation, dropped("the connection closed"));
 
         assert_eq!(
-            set.outages["h1"].ladder.attempts(),
+            set.outage("h1").ladder.attempts(),
             2,
             "no second timer stacked on the first"
         );
@@ -3565,7 +3803,7 @@ mod tests {
 
         assert!(retry_once(&mut set));
         refuse(&mut set, SshFailure::ChangedHostKey);
-        assert!(!set.outages.contains_key("h1"));
+        assert!(!set.has_outage("h1"));
         assert_eq!(set.retry_schedule("h1"), None);
         assert_eq!(
             band_reason(&set, "h1"),
@@ -3717,7 +3955,7 @@ mod tests {
         );
         refuse(&mut set, unreachable());
         assert!(
-            !set.outages.contains_key("h1"),
+            !set.has_outage("h1"),
             "nothing about this host has ever worked, so nothing is owed a retry"
         );
     }
@@ -3744,16 +3982,16 @@ mod tests {
             AttemptCause::Explicit,
         );
         refuse(&mut set, SshFailure::ChangedHostKey);
-        assert!(!set.outages.contains_key("h1"));
+        assert!(!set.has_outage("h1"));
 
         // And mid-ladder, on a host that had been working.
         a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-key.sock");
-        assert!(set.outages.contains_key("h1"), "the drop started a ladder");
+        assert!(set.has_outage("h1"), "the drop started a ladder");
 
         assert!(retry_once(&mut set), "and its first retry dialed");
         refuse(&mut set, SshFailure::ChangedHostKey);
         assert!(
-            !set.outages.contains_key("h1"),
+            !set.has_outage("h1"),
             "a family no retry may be spent on ends the outage"
         );
         assert_eq!(
@@ -3774,11 +4012,11 @@ mod tests {
     async fn a_ladder_survives_its_own_retrys_open_ssh() {
         let (mut set, _feed) = a_set();
         a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-survive.sock");
-        assert_eq!(set.outages["h1"].ladder.attempts(), 1);
+        assert_eq!(set.outage("h1").ladder.attempts(), 1);
 
         assert!(retry_once(&mut set));
         assert!(
-            !set.ssh["h1"].reached_connected,
+            !set.ssh("h1").reached_connected,
             "the fresh entry knows nothing — which is the trap"
         );
 
@@ -3795,11 +4033,11 @@ mod tests {
         set.apply_state(second, dropped("and it dropped again"));
 
         assert_eq!(
-            set.outages["h1"].ladder.attempts(),
+            set.outage("h1").ladder.attempts(),
             2,
             "the ladder continued instead of refusing a host that had worked"
         );
-        assert!(set.outages["h1"].armed.is_some());
+        assert!(set.outage("h1").armed.is_some());
     }
 
     /// **The K1.1 regression, and the give-up.** A retry whose
@@ -3828,11 +4066,11 @@ mod tests {
             refuse(&mut set, unreachable());
             if attempt < budget {
                 assert_eq!(
-                    set.outages["h1"].ladder.attempts(),
+                    set.outage("h1").ladder.attempts(),
                     attempt + 1,
                     "the failed retry re-arms rather than stalling"
                 );
-                assert!(set.outages["h1"].armed.is_some());
+                assert!(set.outage("h1").armed.is_some());
                 assert_eq!(
                     retry_reason(&set).as_deref(),
                     Some(unreachable().message("workbox").as_str()),
@@ -3842,7 +4080,7 @@ mod tests {
         }
 
         assert!(
-            !set.outages.contains_key("h1"),
+            !set.has_outage("h1"),
             "the ladder settles when its budget is spent"
         );
         assert_eq!(
@@ -3904,12 +4142,12 @@ mod tests {
         // Nothing in this suite may dial a real host, and this is the
         // one case that lets the runtime run: stop the handshake
         // `open_ssh` spawned before anything is polled.
-        for entry in set.ssh.values_mut() {
+        for entry in set.entries.values_mut().filter_map(|e| e.ssh.as_mut()) {
             if let Some(establish) = entry.establish.take() {
                 establish.abort();
             }
         }
-        let delay = set.outages["h1"].armed.as_ref().expect("armed").delay;
+        let delay = set.outage("h1").armed.as_ref().expect("armed").delay;
         // The clock is paused, so this is instant.
         tokio::time::sleep(delay + Duration::from_secs(1)).await;
 
@@ -3941,7 +4179,7 @@ mod tests {
 
         // Disconnected in between.
         a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-race-a.sock");
-        let armed = set.ssh["h1"].request;
+        let armed = set.ssh("h1").request;
         set.disconnect("h1");
         assert!(
             set.reconnect_due("h1", armed).is_none(),
@@ -3950,7 +4188,7 @@ mod tests {
 
         // An explicit connect in between.
         a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-race-b.sock");
-        let armed = set.ssh["h1"].request;
+        let armed = set.ssh("h1").request;
         set.open_ssh(
             "h1",
             "one",
@@ -3964,9 +4202,9 @@ mod tests {
         // Connected again in between: the request is untouched, and the
         // outage is what is gone.
         let incarnation = a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-race-c.sock");
-        let armed = set.ssh["h1"].request;
+        let armed = set.ssh("h1").request;
         set.apply_state(incarnation, HostConnState::Connected);
-        assert!(!set.outages.contains_key("h1"), "a success ends the outage");
+        assert!(!set.has_outage("h1"), "a success ends the outage");
         assert!(set.reconnect_due("h1", armed).is_none());
     }
 
@@ -3999,7 +4237,7 @@ mod tests {
 
         set.apply_state(live, dropped("the connection closed"));
         assert!(
-            !set.outages.contains_key("h1"),
+            !set.has_outage("h1"),
             "the user's own attempt is the schedule now"
         );
         assert_eq!(band_state(&set, "h1").retry_in, None);
@@ -4016,11 +4254,11 @@ mod tests {
     async fn a_graver_family_found_at_fire_time_settles_instead_of_dialing() {
         let (mut set, _feed) = a_set();
         let incarnation = a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-late-family.sock");
-        let armed = set.ssh["h1"].request;
+        let armed = set.ssh("h1").request;
 
         // A retryable one still dials: the re-check refuses, it does not
         // simply distrust anything it finds.
-        set.outages.get_mut("h1").expect("an outage").dead_tunnel = Some(DeadTunnel::Recorded {
+        set.outage_mut("h1").dead_tunnel = Some(DeadTunnel::Recorded {
             generation: 9,
             failure: SshFailure::Transport(Some("broken pipe".into())),
             truncated: false,
@@ -4030,8 +4268,8 @@ mod tests {
 
         // Re-arm, then let a changed host key land in the same slot.
         set.apply_state(incarnation, dropped("the connection closed"));
-        let armed = set.ssh["h1"].request;
-        set.outages.get_mut("h1").expect("an outage").dead_tunnel = Some(DeadTunnel::Recorded {
+        let armed = set.ssh("h1").request;
+        set.outage_mut("h1").dead_tunnel = Some(DeadTunnel::Recorded {
             generation: 9,
             failure: SshFailure::ChangedHostKey,
             truncated: false,
@@ -4041,7 +4279,7 @@ mod tests {
             set.reconnect_due("h1", armed).is_none(),
             "a possible machine-in-the-middle is not dialed again"
         );
-        assert!(!set.outages.contains_key("h1"));
+        assert!(!set.has_outage("h1"));
         assert_eq!(
             band_reason(&set, "h1"),
             SshFailure::ChangedHostKey.message("workbox")
@@ -4070,31 +4308,21 @@ mod tests {
             assert!(retry_once(&mut set));
             refuse(&mut set, unreachable());
         }
-        assert_eq!(
-            set.outages["h1"].ladder.attempts(),
-            3,
-            "deep enough to tell"
-        );
-        let deep = set.outages["h1"].armed.as_ref().expect("armed").delay;
+        assert_eq!(set.outage("h1").ladder.attempts(), 3, "deep enough to tell");
+        let deep = set.outage("h1").armed.as_ref().expect("armed").delay;
         assert!(deep > Duration::from_secs(1), "{deep:?} is off the base");
 
         // The machine slept.
-        let armed = set
-            .outages
-            .get_mut("h1")
-            .expect("an outage")
-            .armed
-            .as_mut()
-            .expect("armed");
+        let armed = set.outage_mut("h1").armed.as_mut().expect("armed");
         armed.at = SystemTime::now() - Duration::from_secs(3_600);
-        let stamp = set.ssh["h1"].request;
+        let stamp = set.ssh("h1").request;
 
         assert!(
             set.reconnect_due("h1", stamp).is_none(),
             "a woken ladder gives the network its beat before dialing"
         );
-        assert_eq!(set.outages["h1"].ladder.attempts(), 1, "a new outage");
-        let rearmed = set.outages["h1"].armed.as_ref().expect("re-armed");
+        assert_eq!(set.outage("h1").ladder.attempts(), 1, "a new outage");
+        let rearmed = set.outage("h1").armed.as_ref().expect("re-armed");
         assert!(
             rearmed.delay <= Duration::from_secs(1),
             "{:?} is not the base delay",
@@ -4124,10 +4352,10 @@ mod tests {
         let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-terminal.sock");
         set.apply_lease(incarnation, "lease-1".into());
         set.apply_state(incarnation, dropped("the connection closed"));
-        assert!(set.outages.contains_key("h1"));
+        assert!(set.has_outage("h1"));
 
         set.apply_state(incarnation, HostConnState::TakenOver);
-        assert!(!set.outages.contains_key("h1"));
+        assert!(!set.has_outage("h1"));
         assert!(set
             .carried_lease("h1", AttemptCause::AutoReconnect)
             .is_none());
@@ -4143,13 +4371,15 @@ mod tests {
         let (mut set, _feed) = a_set();
         a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-exit.sock");
 
-        let timer = set.outages["h1"]
+        let timer = set
+            .outage("h1")
             .armed
             .as_ref()
             .expect("a retry is waiting")
             .handle
             .clone();
-        let establish = set.ssh["h1"]
+        let establish = set
+            .ssh("h1")
             .establish
             .clone()
             .expect("an establish is in flight");
@@ -4165,8 +4395,8 @@ mod tests {
             establish.is_finished(),
             "and the handshake stops where it is"
         );
-        assert!(set.outages.is_empty());
-        assert!(set.ssh["h1"].establish.is_none());
+        assert!(set.entries.values().all(|e| e.outage.is_none()));
+        assert!(set.ssh("h1").establish.is_none());
     }
 
     /// The half of the teardown the walk over `ssh` cannot see.
@@ -4194,7 +4424,7 @@ mod tests {
         set.disconnect("h2");
 
         assert!(!superseded.is_finished() && !disconnected.is_finished());
-        assert!(!set.ssh.contains_key("h2"), "the entry went with the host");
+        assert!(!set.has_ssh("h2"), "the entry went with the host");
 
         set.abandon_reconnects();
         // Every handle is aborted before anything is polled, which is
@@ -4264,7 +4494,7 @@ mod tests {
     async fn an_establish_answering_during_shutdown_is_discarded_rather_than_dialed() {
         let (mut set, _feed) = a_set();
         ask_ssh(&mut set, "h1");
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         // Nothing in this suite may dial a real host, and this case has
         // to let the runtime run: stop the handshake `open_ssh` spawned
         // before anything is polled. The spent handle stays on the
@@ -4290,11 +4520,11 @@ mod tests {
         });
 
         assert!(
-            !set.conns.contains_key("h1"),
+            !set.has_conn("h1"),
             "a tunnel that lands during shutdown must not dial a session"
         );
         assert!(
-            set.ssh["h1"].establish.is_none(),
+            set.ssh("h1").establish.is_none(),
             "and the spent handle comes off the entry"
         );
         // Retired on the engine runtime rather than dropped here — the
@@ -4351,7 +4581,7 @@ mod tests {
     }
 
     fn in_flight(set: &HostConnSet, host: &str) -> AbortHandle {
-        set.ssh[host]
+        set.ssh(host)
             .establish
             .clone()
             .expect("an establish is in flight")
@@ -4375,8 +4605,8 @@ mod tests {
             RequestOrigin::Ipc,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h1"].request;
-        assert!(set.ssh["h1"].attended);
+        let request = set.ssh("h1").request;
+        assert!(set.ssh("h1").attended);
         assert_eq!(
             set.tunnel_ready(failed("h1", request, "workbox is unreachable"))
                 .as_deref(),
@@ -4392,8 +4622,8 @@ mod tests {
             RequestOrigin::Ipc,
             AttemptCause::AutoReconnect,
         );
-        let request = set.ssh["h2"].request;
-        assert!(!set.ssh["h2"].attended);
+        let request = set.ssh("h2").request;
+        assert!(!set.ssh("h2").attended);
         assert_eq!(
             set.tunnel_ready(failed("h2", request, "workbox is unreachable")),
             None,
@@ -4415,7 +4645,7 @@ mod tests {
         set.set_bootstrap_note("h1", Some("checking one…".into()));
         set.apply_state(incarnation, dropped("the connection closed"));
 
-        assert!(set.outages.contains_key("h1"), "the ladder started anyway");
+        assert!(set.has_outage("h1"), "the ladder started anyway");
         assert_eq!(
             band_reason(&set, "h1"),
             "checking one…",
@@ -4461,7 +4691,7 @@ mod tests {
         // origin is the only gate still standing.
         a_dropped_ssh_host(&mut set, "/nonexistent/roost-set-consent.sock");
         let budget = budget(&set);
-        while set.outages["h1"].ladder.attempts() < budget - 1 {
+        while set.outage("h1").ladder.attempts() < budget - 1 {
             assert!(retry_once(&mut set));
             assert!(
                 !set.ssh_reached_connected("h1"),
@@ -4497,7 +4727,7 @@ mod tests {
             RequestOrigin::User,
             AttemptCause::Explicit,
         );
-        let request = set.ssh["h1"].request;
+        let request = set.ssh("h1").request;
         assert!(set.establishing("h1"), "the establish is in flight");
         set.tunnel_ready(failed("h1", request, "workbox refused authentication"));
         assert!(
@@ -4524,17 +4754,18 @@ mod tests {
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
-        set.conns.get_mut("h1").expect("conn").focus_sent = Some(Some(5));
+        set.conn_mut("h1").focus_sent = Some(Some(5));
 
         assert!(
             !set.focus_claim_disagrees(incarnation, 5),
             "the claim's own echo is not a disagreement"
         );
-        assert_eq!(set.conns["h1"].focus_sent, Some(Some(5)));
+        assert_eq!(set.conn("h1").focus_sent, Some(Some(5)));
 
         assert!(set.focus_claim_disagrees(incarnation, 9));
         assert_eq!(
-            set.conns["h1"].focus_sent, None,
+            set.conn("h1").focus_sent,
+            None,
             "a disagreement clears the dedup so the re-push goes out"
         );
         assert!(
@@ -4594,7 +4825,7 @@ mod tests {
         assert!(!set.owns(HostId::new(9_999)));
 
         // Replaced: the outgoing task can still publish for a while.
-        let replaced = set.minter.mint("h1", set.conns["h1"].generation - 1);
+        let replaced = set.minter.mint("h1", set.conn("h1").generation - 1);
         assert!(!set.owns(replaced));
 
         // Removed: the host is gone, and so is every id it minted.
@@ -4740,6 +4971,77 @@ mod tests {
         assert!(
             set.section("h1").is_none(),
             "a forgotten host has no section to keep rows in"
+        );
+    }
+
+    /// The representation invariant the six parallel maps could not
+    /// state: an entry appears only where something is *inserted*, and
+    /// goes only at `remove`.
+    ///
+    /// Each half is a real hazard of the one-entry shape. Routing a
+    /// clearing write through the entry API would leave a phantom entry
+    /// for a host nothing ever touched; pruning an entry once its
+    /// fields are gone would take the generation with it, and a poller
+    /// watching that number across a disconnect would see it fall back
+    /// to `0` and count the next attempt twice; and reading `is_empty`
+    /// off the map rather than off the live connections would call a
+    /// host with an establish in flight "connected".
+    #[tokio::test]
+    async fn an_entry_is_created_only_by_an_insert_and_removed_only_by_remove() {
+        let (mut set, _feed) = a_set();
+
+        // Clearing what a host does not have is a no-op, not a create.
+        set.set_bootstrap_note("h9", None);
+        set.clear_outage("h9");
+        assert!(
+            !set.entries.contains_key("h9"),
+            "clearing a note or an outage on an unknown host conjured an entry"
+        );
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        // Nothing in this suite may dial a real host: stop the handshake
+        // `open_ssh` spawned before anything is polled.
+        for entry in set.entries.values_mut().filter_map(|e| e.ssh.as_mut()) {
+            if let Some(establish) = entry.establish.take() {
+                establish.abort();
+            }
+        }
+
+        // An ssh-only entry is not a connection.
+        assert!(
+            set.is_empty(),
+            "a host with an establish in flight and no connection reads as connected"
+        );
+        let minted = set.generation("h1");
+        assert!(minted > 0, "the attempt was never numbered");
+
+        set.disconnect("h1");
+        assert!(
+            set.entries.contains_key("h1"),
+            "disconnect took the entry the generation has to outlive"
+        );
+        assert_eq!(
+            set.generation("h1"),
+            minted,
+            "a disconnect reset the number a poller counts edges on"
+        );
+
+        set.remove("h1");
+        assert!(
+            !set.entries.contains_key("h1"),
+            "remove left the host's entry behind"
+        );
+        assert_eq!(
+            set.generation("h1"),
+            0,
+            "a removed host still remembers an attempt"
         );
     }
 
