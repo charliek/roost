@@ -22,8 +22,10 @@ release workflow asserts they agree).
   ops also accept the host-qualified `h<incarnation>.<id>` spelling on the
   UI socket now, the same form `tab.focus` and `tab.dump` already use, so
   the drag isn't the only way to drive it; `app.sidebar_dump` gained an
-  additive `hosts` array reporting each connected host's own project/tab
-  order. A refusal that crosses from the session onto the UI socket with no
+  additive `hosts` array reporting every *saved* host's own project/tab
+  order, each entry carrying that host's connection state — a disconnected
+  section lists the rows it retained, a never-connected one lists none.
+  A refusal that crosses from the session onto the UI socket with no
   code the UI socket already speaks (a latched `session.stop`, say) now
   reports as the new `host-unavailable`, with the session's own sentence
   kept in the message.

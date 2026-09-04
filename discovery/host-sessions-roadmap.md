@@ -970,8 +970,8 @@ seam collision) both shipped, along with the `reason`-overwrite wrinkle
 (filed as #399 mid-plan) — see their entries below and the closure
 paragraph above for #399. **#387** (a far side that is merely
 restarting should not need a manual ↻) was costed alongside them and
-stays open by decision, not by oversight — see its entry below. Next:
-#383 + #386 together; then the #381 conversation; HS-4c stays after
+stays open by decision, not by oversight — see its entry below. Next up
+are #383 + #386 together; then the #381 conversation; HS-4c stays after
 that; #351 remains the top non-host post-release item.
 
 - **[#381](https://github.com/charliek/roost/issues/381) Session takeover is best-effort; needs an atomic

@@ -887,6 +887,89 @@ fn reorder_op_result(
     }
 }
 
+/// `None` rejects the press, the sibling of [`arm_project_drag_preview`]:
+/// no gesture is armed against a list the strip no longer renders.
+/// `scope_is_current` is the tab strip's own extra condition — its scope
+/// is one project, so a press published for another one is not this
+/// strip's to arm.
+fn arm_tab_drag_preview(
+    authoritative_ids: &[i64],
+    scope_is_current: bool,
+    strip_generation: u64,
+    context: TabDragContext,
+    original_ids: Vec<i64>,
+) -> Option<TabDragPreview> {
+    let armable = context.generation == strip_generation
+        && scope_is_current
+        && authoritative_ids == original_ids
+        && stable_ids(&original_ids)
+        && original_ids.contains(&context.source_id);
+    armable.then(|| TabDragPreview {
+        context,
+        ordered_ids: original_ids.clone(),
+        original_ids,
+        dragging: false,
+        pending_op: None,
+        held_since: None,
+    })
+}
+
+/// A press on the tab strip, against whatever is in the one slot: what a
+/// held preview does about it ([`hold_verdict`]), then the arm. `true`
+/// means a hold on the press's own section absorbed it, so the slot —
+/// and the other axis's preview — are left alone.
+///
+/// A hold on the press's own instance absorbs it, because arming against
+/// an order the authority has not caught up with is the snap the hold
+/// exists to prevent; a hold on another instance gives the slot up
+/// instead. That eviction is the honest cost of one preview slot per
+/// axis — the snap it causes lands on the *other* section and ends when
+/// that section's own reorder event does.
+///
+/// A rejected press burns the generation exactly as the
+/// [`App::cancel_tab_drag`] this replaced did: the slot is never held by
+/// the time the arm runs (`Arms` means it is not, `Evicts` emptied it),
+/// so that cancel's held-preview exemption could never have applied here.
+fn press_tab_strip(
+    preview: &mut Option<TabDragPreview>,
+    generation: &mut u64,
+    authoritative_ids: &[i64],
+    scope_is_current: bool,
+    context: TabDragContext,
+    original_ids: Vec<i64>,
+) -> bool {
+    if let Some(current) = preview.as_ref() {
+        match hold_verdict(current.context.host, current.held_since, context.host) {
+            HoldVerdict::Arms => {}
+            HoldVerdict::Absorbs => return true,
+            // The one clear that must NOT burn the generation, so it
+            // cannot go through `cancel_drag_preview` — whose "always"
+            // is about *cancels*. This press carries the current
+            // generation and the arm right below checks it, so burning
+            // would reject the very gesture the eviction exists to
+            // admit: `Evicts` silently making the drag inert, which is
+            // exactly what it promises not to do. Nothing is left to
+            // invalidate either — a held preview's own generation was
+            // burned when it dispatched (`TabDragSettlement::Dispatched`),
+            // so no widget can still own it.
+            HoldVerdict::Evicts => {
+                preview.take();
+            }
+        }
+    }
+    match arm_tab_drag_preview(
+        authoritative_ids,
+        scope_is_current,
+        *generation,
+        context,
+        original_ids,
+    ) {
+        Some(armed) => *preview = Some(armed),
+        None => cancel_drag_preview(preview, generation),
+    }
+    false
+}
+
 /// Threshold crossing for the tab strip, the sibling of
 /// `mark_project_drag_dragging`: only the gesture that armed the live
 /// preview, under the current generation, may promote it to dragging.
@@ -960,7 +1043,7 @@ impl App {
     /// It ends at a reconcile ([`Self::reconcile_tab_drag_preview`]:
     /// the authoritative order moved, the host stopped being live, or
     /// the belt expired) or when a same-axis gesture on another instance
-    /// takes the slot ([`Self::tab_hold_absorbs`]).
+    /// takes the slot ([`press_tab_strip`]).
     pub(super) fn cancel_tab_drag(&mut self) {
         if self.tab_preview_is_held() {
             return;
@@ -992,29 +1075,23 @@ impl App {
     }
 
     fn begin_tab_drag_preview(&mut self, context: TabDragContext, original_ids: Vec<i64>) {
-        if self.tab_hold_absorbs(context.host) {
-            return;
-        }
-        self.cancel_project_drag();
         let project = context.project();
         let authoritative = self.tab_ids_for(project);
-        if context.generation != self.tab_strip_generation
-            || self.active_project_key() != project
-            || authoritative != original_ids
-            || !stable_ids(&original_ids)
-            || !original_ids.contains(&context.source_id)
-        {
-            self.cancel_tab_drag();
-            return;
-        }
-        self.tab_drag_preview = Some(TabDragPreview {
+        let scope_is_current = self.active_project_key() == project;
+        let absorbed = press_tab_strip(
+            &mut self.tab_drag_preview,
+            &mut self.tab_strip_generation,
+            &authoritative,
+            scope_is_current,
             context,
-            ordered_ids: original_ids.clone(),
             original_ids,
-            dragging: false,
-            pending_op: None,
-            held_since: None,
-        });
+        );
+        // The strips cancel each other, and this runs after the press
+        // rather than before it — the same thing, since the two axes'
+        // slots and generations are disjoint state.
+        if !absorbed {
+            self.cancel_project_drag();
+        }
     }
 
     /// The gesture crossed the drag threshold: from here the carried pill
@@ -1035,27 +1112,6 @@ impl App {
         self.tab_drag_preview
             .as_ref()
             .is_some_and(|preview| preview_is_held(preview.held_since))
-    }
-
-    /// What a fresh tab gesture does about a held preview: one on the
-    /// same instance is absorbed (arming against an order the authority
-    /// has not caught up with is the snap the hold exists to prevent),
-    /// one on another instance takes the slot instead. That eviction is
-    /// the honest cost of one preview slot per axis — the snap it causes
-    /// lands on the *other* section and ends when that section's own
-    /// reorder event does.
-    fn tab_hold_absorbs(&mut self, host: HostId) -> bool {
-        let Some(preview) = self.tab_drag_preview.as_ref() else {
-            return false;
-        };
-        match hold_verdict(preview.context.host, preview.held_since, host) {
-            HoldVerdict::Arms => false,
-            HoldVerdict::Absorbs => true,
-            HoldVerdict::Evicts => {
-                self.drop_tab_drag_preview();
-                false
-            }
-        }
     }
 
     fn preview_tab_drag(
@@ -1522,6 +1578,33 @@ fn arm_project_drag_preview(
     })
 }
 
+/// [`press_tab_strip`]'s twin, down to the eviction that must not burn
+/// the generation — see that function for why.
+fn press_project_strip(
+    preview: &mut Option<ProjectDragPreview>,
+    generation: &mut u64,
+    authoritative_ids: &[i64],
+    context: ProjectDragContext,
+    original_ids: Vec<i64>,
+) -> bool {
+    if let Some(current) = preview.as_ref() {
+        match hold_verdict(current.context.host, current.held_since, context.host) {
+            HoldVerdict::Arms => {}
+            HoldVerdict::Absorbs => return true,
+            // Clears without burning, and must not be consolidated back
+            // into `cancel_drag_preview` — see `press_tab_strip`.
+            HoldVerdict::Evicts => {
+                preview.take();
+            }
+        }
+    }
+    match arm_project_drag_preview(authoritative_ids, *generation, context, original_ids) {
+        Some(armed) => *preview = Some(armed),
+        None => cancel_drag_preview(preview, generation),
+    }
+    false
+}
+
 fn mark_project_drag_dragging(
     preview: &mut Option<ProjectDragPreview>,
     strip_generation: u64,
@@ -1649,19 +1732,17 @@ impl App {
     }
 
     fn begin_project_drag_preview(&mut self, context: ProjectDragContext, original_ids: Vec<i64>) {
-        if self.project_hold_absorbs(context.host) {
-            return;
-        }
-        self.cancel_tab_drag();
         let authoritative = self.project_ids_for(context.host);
-        match arm_project_drag_preview(
+        let absorbed = press_project_strip(
+            &mut self.project_drag_preview,
+            &mut self.project_strip_generation,
             &authoritative,
-            self.project_strip_generation,
             context,
             original_ids,
-        ) {
-            Some(preview) => self.project_drag_preview = Some(preview),
-            None => self.cancel_project_drag(),
+        );
+        // See `begin_tab_drag_preview` on the ordering.
+        if !absorbed {
+            self.cancel_tab_drag();
         }
     }
 
@@ -1670,21 +1751,6 @@ impl App {
         self.project_drag_preview
             .as_ref()
             .is_some_and(|preview| preview_is_held(preview.held_since))
-    }
-
-    /// [`App::tab_hold_absorbs`]'s twin.
-    fn project_hold_absorbs(&mut self, host: HostId) -> bool {
-        let Some(preview) = self.project_drag_preview.as_ref() else {
-            return false;
-        };
-        match hold_verdict(preview.context.host, preview.held_since, host) {
-            HoldVerdict::Arms => false,
-            HoldVerdict::Absorbs => true,
-            HoldVerdict::Evicts => {
-                self.drop_project_drag_preview();
-                false
-            }
-        }
     }
 
     fn begin_project_drag(&mut self, context: ProjectDragContext) {
@@ -3495,6 +3561,84 @@ mod tests {
         }
     }
 
+    /// A held tab preview mid-hold, as a completion leaves it: its own
+    /// generation is already behind the strip's, burned when it
+    /// dispatched.
+    fn held_tab_preview() -> TabDragPreview {
+        TabDragPreview {
+            pending_op: Some(9),
+            held_since: Some(Instant::now()),
+            ..tab_drag_preview_on(HOST, 3, vec![20, 30, 10])
+        }
+    }
+
+    /// The eviction hands the slot over *without* burning the
+    /// generation, so the press that caused it still arms. Burning would
+    /// reject it one line later — [`HoldVerdict::Evicts`] silently making
+    /// the drag inert, which is exactly what it promises not to do.
+    #[test]
+    fn an_evicting_tab_press_arms_in_the_slot_it_took() {
+        let ids = vec![10, 20, 30];
+        let local = TabDragContext {
+            host: HostId::LOCAL,
+            project_id: 7,
+            source_id: 10,
+            generation: 4,
+        };
+
+        let mut preview = Some(held_tab_preview());
+        let mut generation = 4;
+        assert!(!press_tab_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            true,
+            local,
+            ids.clone()
+        ));
+        let armed = preview.expect("the evicting press arms rather than going inert");
+        assert_eq!(
+            generation, 4,
+            "the eviction must not burn the generation the evicting press carries"
+        );
+        assert_eq!(armed.context, local);
+        assert_eq!(armed.original_ids, ids);
+        assert!(!armed.dragging && armed.held_since.is_none());
+
+        // The same press on the hold's *own* section is absorbed
+        // instead, leaving slot and generation alone.
+        let mut preview = Some(held_tab_preview());
+        let mut generation = 4;
+        assert!(press_tab_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            true,
+            TabDragContext {
+                host: HOST,
+                ..local
+            },
+            ids.clone()
+        ));
+        assert_eq!(preview.map(|preview| preview.context.host), Some(HOST));
+        assert_eq!(generation, 4);
+
+        // A press the arm rejects still burns, exactly as the cancel this
+        // path replaced did.
+        let mut preview = Some(held_tab_preview());
+        let mut generation = 4;
+        assert!(!press_tab_strip(
+            &mut preview,
+            &mut generation,
+            &[10, 20],
+            true,
+            local,
+            ids
+        ));
+        assert!(preview.is_none());
+        assert_eq!(generation, 5);
+    }
+
     /// The belt needs a clock of its own: nothing else wakes an idle
     /// app, so this predicate is what arms the timer — and it must be
     /// false for every preview that is not held, or an ordinary local
@@ -3951,6 +4095,72 @@ mod tests {
             ids.clone()
         )
         .is_none());
+    }
+
+    /// [`an_evicting_tab_press_arms_in_the_slot_it_took`]'s twin, and for
+    /// the same reason: the sidebar's eviction must not burn the
+    /// generation the evicting press carries.
+    #[test]
+    fn an_evicting_project_press_arms_in_the_slot_it_took() {
+        fn held() -> ProjectDragPreview {
+            ProjectDragPreview {
+                context: ProjectDragContext {
+                    host: HOST,
+                    source_id: 10,
+                    generation: 3,
+                },
+                pending_op: Some(9),
+                held_since: Some(Instant::now()),
+                ..project_drag_preview(true)
+            }
+        }
+        let ids = vec![10, 20, 30];
+        let local = local_project_context(10, 4);
+
+        let mut preview = Some(held());
+        let mut generation = 4;
+        assert!(!press_project_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            local,
+            ids.clone()
+        ));
+        let armed = preview.expect("the evicting press arms rather than going inert");
+        assert_eq!(
+            generation, 4,
+            "the eviction must not burn the generation the evicting press carries"
+        );
+        assert_eq!(armed.context, local);
+        assert_eq!(armed.original_ids, ids);
+        assert!(!armed.dragging && armed.held_since.is_none());
+
+        let mut preview = Some(held());
+        let mut generation = 4;
+        assert!(press_project_strip(
+            &mut preview,
+            &mut generation,
+            &ids,
+            ProjectDragContext {
+                host: HOST,
+                ..local
+            },
+            ids.clone()
+        ));
+        assert_eq!(preview.map(|preview| preview.context.host), Some(HOST));
+        assert_eq!(generation, 4);
+
+        let mut preview = Some(held());
+        let mut generation = 4;
+        assert!(!press_project_strip(
+            &mut preview,
+            &mut generation,
+            &[10, 20],
+            local,
+            ids
+        ));
+        assert!(preview.is_none());
+        assert_eq!(generation, 5);
     }
 
     #[test]
