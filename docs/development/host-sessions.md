@@ -105,6 +105,12 @@ See [`reference/ipc.md`](../reference/ipc.md#events) for the full event catalog 
 
 HS-3 adds one more in the same spirit — [`session.set_focus`](../reference/ipc.md#sessionset_focus), the client's real focus (window focus + which tab is selected), pushed down so the session suppresses notifications for the tab the user is actually looking at rather than for whichever tab its headless workspace defaulted to. It is lease-gated like `set_theme`, and deliberately short-lived: a new lease, the connection that reported it closing, or the live lease's last connection closing all revert the session to "nobody is looking", because a focus is a statement about a window that may no longer exist. An older session answers `unknown-op` and keeps the HS-2 behavior described under [Known limitations](#known-limitations).
 
+## Reordering a host's sidebar section
+
+A host's projects and tabs drag-reorder the same way LOCAL's always could ([#398](https://github.com/charliek/roost/issues/398), plan 044): the drop dispatches over that host's own connection as an ordinary `project.reorder` / `tab.reorder` call, rather than mutating the local workspace, and the sidebar's new order comes back through the `projects.reordered` / `tabs.reordered` events on the mirror, never from the op's own reply. That's the subtle half: the reply and the event ride separate connections with no ordering between them, so a successful drop *holds* its preview rather than clearing it, until the mirror's order actually moves (or a short belt expires) — clearing on the reply alone would snap the row back and then re-order it a moment later.
+
+Both reorder ops also take the host-qualified `h<host>.<id>` spelling on the **UI socket** now — see [`tab.reorder`](../reference/ipc.md#tabreorder) and [`project.reorder`](../reference/ipc.md#projectreorder) for the wire form and the full routing matrix — so the drag gesture isn't the only way to drive it. `app.sidebar_dump`'s additive [`hosts`](../reference/ipc.md#hosts-the-sections-below-local) array reports a host section's authoritative (mirror) order using those same keys, which is also how `test_host_client.py`'s reorder cases read a host's tab/project order without probing for the incarnation first.
+
 ## Transport: SSH hosts
 
 A saved host whose target classifies as an SSH destination (`workbox`, `user@host`, `ssh://user@host:port` — the rule table lives on `crates/roost-ipc/src/ssh.rs`'s `classify`) is not a socket forward. The client drives a local Unix-domain-socket bridge of its own — one per connected host — that reaches the remote session over `ssh` directly:
@@ -311,7 +317,7 @@ throughout, because the socket never moves with this variable:
 
 | Lane | What it drives | What it holds up |
 |---|---|---|
-| `test_host_client.py` (`make e2e-host-client`) | a UI beside a real `roost-session` | HS-2's client half: attach fidelity, disconnect-vs-stop, takeover, `needs-restart` and the restart composition, the attention surfaces |
+| `test_host_client.py` (`make e2e-host-client`) | a UI beside a real `roost-session` | HS-2's client half: attach fidelity, disconnect-vs-stop, takeover, `needs-restart` and the restart composition, the attention surfaces, and (#398) that a host-qualified `tab.reorder`/`project.reorder` reaches the session and the local workspace stays untouched |
 | `test_host_ssh.py` (`make e2e-host-ssh`) | the same, with only `ssh` faked (`fixtures/fake-ssh.sh`) | the transport and the reconnect ladder — the armed band's format agreement against the same row's `retry` numbers, a give-up with `retry` gone, the classified failures |
 | `test_host_bootstrap.py` (`make e2e-host-bootstrap`) | the same fixture in `run-remote` mode, jailed, so the generated remote scripts really execute | the install/upgrade job end to end; its verdicts are read out of `reason` and `generation` |
 | `test_host_local_missing_daemon.py` (`make e2e-host-missing-daemon`) | a UI whose `ROOST_SESSION_BIN` points at nothing | the settle-once rule above: `generation` reaching 1 and staying there, `retry` absent, the rollup and `detail` held flat for 3s |
