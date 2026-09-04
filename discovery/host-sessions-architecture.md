@@ -53,7 +53,7 @@ client-side Terminal.
           │
           │ localhost: UDS        HS-3: UDS ↔ ssh -T stdio bridge
           ▼
- roost-session (Linux host)
+ roost-session (Linux or Mac host; ssh reaches Linux only)
  ├─ roost-engine (headless): Workspace, PtySupervisor, OSC drain,
  │    state.json, agent axes                          [exists]
  ├─ per-tab server Terminal (roost-vt, feature `server-vt`)  [new]
@@ -64,6 +64,13 @@ client-side Terminal.
  └─ lifecycle: setsid daemon, flock single-instance, stale-socket
       probe, explicit stop                            [exists]
 ```
+
+**Amended by HS-4b (plan 041, shipped):** the daemon box said "Linux
+host" when this was written because no macOS `roost-session` existed.
+One now ships inside `Roost-Iced.app`, so a Mac runs a session for its
+own `localhost` exactly as Linux does. What stays Linux-only is being
+the *far* end of an ssh hop — the bootstrap's `check_os` refuses a
+Darwin remote (HS-4c).
 
 One session per host (for now). The client holds, per connected
 host: **one control connection** (serial request→response — the
@@ -680,6 +687,13 @@ deviation is the client-notification step of Stop, noted inline.
   offering a spawn that cannot work — HS-2 must not ship a visible
   dead end on one of its two client platforms. SSH targets appear
   on both platforms at HS-3.
+  **Superseded by HS-4b (plan 041, shipped):** the gate lifted
+  unconditionally once `roost-session` shipped inside
+  `Roost-Iced.app` — every build now offers the seeded Connect row,
+  spawn-if-missing, and launch auto-reconnect. What HS-4b did *not*
+  lift is the far side: connecting *to* a Mac over ssh is still
+  refused (HS-4c). See
+  [`docs/development/vision.md` → DL-19](../docs/development/vision.md#dl-19-macos-ships-roost-session-too-the-mac-gate-lifts-2026-09-01).
 - Reconnect/backoff: on connection loss, host marked disconnected
   with a retry affordance; automatic retry only for localhost.
   **Superseded by HS-4 slice 1 (plan 040, shipped):** a saved SSH host
@@ -901,6 +915,20 @@ ported off log needles onto it, `test_host_local_missing_daemon.py` was
 added for the localhost launch failure, and the SSH-severance harness
 that had lived outside the repo came in as `tools/session/live/` on the
 same rule (by hand in a shed, still not a CI lane).
+
+**Post plan 044 (2026-09-04), the same rule with one more field under
+it:** `host.status`'s `retry` now carries a `reason` — the classified
+ssh failure that armed the rung, previously overwritten by the armed-rung
+line and readable only once the ladder settled. That is what let the live
+harness (L5) stop asserting the cause as an *OS* fact — "the port
+refuses, therefore the app must be seeing a refusal" — and read what the
+app actually classified. The pytest side fences the same field off a real
+socket out of a real UI. Two lanes joined the set since 042:
+`test_host_local_spawn.py` (a UI under `ROOST_STATE_DIR` really spawning
+its localhost daemon, #397) and, inside `test_host_client.py`, the
+reorder cases (#398) — which read a host section's order through
+`app.sidebar_dump`'s additive `hosts` array rather than any log or pixel,
+the same rule one level out from connection state.
 
 ## 13. Open questions (carried, not blocking)
 

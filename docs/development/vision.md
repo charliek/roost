@@ -595,6 +595,84 @@ user-facing shape, including the new [launchd supervision
 recipe](../guides/host-sessions.md#surviving-reboots-launchd) for
 surviving a Mac's own reboots.
 
+### DL-20: a UI socket may route a mutation to a session (2026-09-04)
+
+Plan 044 (#398) made `tab.reorder` and `project.reorder` accept the
+host-qualified `h<host>.<id>` spelling on a **UI socket**, and that is a
+first worth writing down. Every earlier host-qualified op on a UI socket
+— `tab.dump`, `tab.focus` and their siblings — answers from **client**
+state: a terminal this client has already hydrated, a selection this
+client owns. The two reorder ops are the first to forward a **mutation**
+to another process and answer with *its* verdict. Two consequences fall
+straight out of that and are otherwise unexplainable. The App's arm
+cannot answer inside `update` the way every other host request does,
+because it has to await a network round trip — so it moves the reply
+into the spawned future and answers from there (a dropped one surfaces
+as `internal: UI dropped reply`, deliberately loud). And
+`host-unavailable` had to exist at all: a UI socket that forwards can
+now fail in a way no local op can, by not reaching the far side.
+
+**This does not reopen
+[DL-4](#dl-4-each-ui-owns-its-own-workspace-revised-2026-05-23).** The
+UI still owns exactly one workspace — its own — and a host-routed
+reorder never touches it (a lane asserts precisely that). The qualified
+id does not fold a session's workspace into this UI; it names a
+workspace this UI is a *client* of, which
+[DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)
+already carved out. Ownership is unmoved: the session decides, the reply
+is the session's, and the sidebar's new order arrives on the session's
+own `tabs.reordered` / `projects.reordered` event rather than from the
+reply. The client never mints an order of its own.
+
+**Nor
+[DL-11](#dl-11-one-command-core-thin-per-surface-adapters-2026-05-26).**
+It is one op set: one op name, one param shape, one set of partial-order
+rules, honoured identically at both ends. The routing *is* the thin
+adapter — a request is read, its id-space is decided, and it goes to the
+one instance that owns it. And it closes an asymmetry DL-11 explicitly
+forbids: before 044 a host section's order was reachable by mouse and by
+nothing else — no op, therefore no `roostctl`, no script, and no test.
+The tension a reader feels is real but narrow, and worth naming so
+nobody has to rediscover it: one op name now resolves against two
+different workspaces depending on how an id is spelled. The spelling is
+the entire disambiguator, which is why it must be canonical, why a
+request may carry only one id-space, and why a mixed one is refused
+rather than guessed at.
+
+**The rule for the next op that wants to route this way** — stated as a
+rule because the second one will not get the same review the first did:
+
+- **One id-space per request.** All-bare goes local; all-qualified on
+  one incarnation goes to that host. Anything mixed is `invalid-param`
+  naming the rule — never a partial application, never a guess. Decide
+  what an **empty** list means and write it down, because "all bare" and
+  "all qualified" are both vacuously true of one: for these two ops an
+  empty `project_ids` routes local, while an empty `tab_ids` follows its
+  `project_id`, which is the only ref that can carry an id-space. See
+  [ipc.md's routing matrix](../reference/ipc.md#the-reorder-routing-matrix).
+- **A session socket refuses the qualified form** (`invalid-param`), so
+  the spelling means "client, route this" and can never mean anything
+  else.
+- **Answer from the spawned future, not from `update`.** A routed op is
+  a round trip; replying before the far side has spoken is answering
+  for it.
+- **Display state follows the session's event, not the reply.** The two
+  ride separate connections with no ordering between them. The held drag
+  preview is the corollary, not a special case.
+- **Which codes may cross.** A session's own refusal keeps its code when
+  that code is one of the ten both sockets share, so a caller matching
+  `invalid-param` sees the same thing whichever end refused. A
+  session-scoped code must **fold**: `shutting-down` is session-socket
+  only, and so is anything a newer session invents — both become
+  `host-unavailable` with the original code and sentence kept in
+  `message`. A UI socket must never answer a code its own list does not
+  name. A connection that is not there is `host-unavailable`; an
+  incarnation this client is not connected to is `not-found`.
+
+See [`development/host-sessions.md`](host-sessions.md) for how a
+reorder actually travels and why the preview is held, and
+[`reference/ipc.md`](../reference/ipc.md#tabreorder) for the wire form.
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

@@ -1,19 +1,37 @@
 # Host sessions — roadmap
 
-Status: **roadmap, in flight** — direction agreed 2026-08-26; HS-0,
-HS-1 (plans 035 + 036), HS-2 (plan 037, PR #374), HS-3 in full —
-transport (plan 038, C1-C6) and bootstrap (plan 039, detect/install/
-verify a remote `roost-session`) — and HS-4a (SSH auto-reconnect,
-plan 040, PR #380) and HS-4b (Mac-local persist, plan 041, PR #389)
-have shipped. **Next: the pre-release follow-ups** — see the
-[sequencing call](#sequencing-toward-the-first-release-proposed-2026-09-01).
-Both platforms now run a local session; what is still Linux-only is
-being an SSH *host* (HS-4c). None of it is released yet —
-the first release carrying host sessions gates on the
-[pre-release follow-ups](#tracked-follow-ups-pre--post-initial-release)
-plus the sequencing call recorded under
-[HS-4](#hs-4--make-the-primitive-feel-inevitable). This
-refines [`host-sessions.md`](host-sessions.md) (the
+Status: **released; the milestone track continues.** Direction agreed
+2026-08-26. HS-0, HS-1 (plans 035 + 036), HS-2 (plan 037, PR #374),
+HS-3 in full — transport (plan 038, C1-C6) and bootstrap (plan 039,
+detect/install/verify a remote `roost-session`) — HS-4a (SSH
+auto-reconnect, plan 040, PR #380) and HS-4b (Mac-local persist, plan
+041, PR #389) have shipped, followed by the pre-release sweep (plans
+042 + 043, PRs #396 + #394). **v0.0.19 shipped host sessions on
+2026-09-04** — the first release carrying the feature. It went out on
+the [sequencing call](#sequencing-toward-the-first-release-proposed-2026-09-01)
+recorded under [HS-4](#hs-4--make-the-primitive-feel-inevitable), which
+closed the pre-release list by *decision* rather than by completion;
+[the follow-up map](#tracked-follow-ups-pre--post-initial-release)
+carries what moved and why.
+
+**Since the release,** plan 044 (PR #400) closed the two items that
+topped the post-release list plus one it filed as it went — a remote
+host's projects and tabs now drag-reorder, routed to the session
+([#398](https://github.com/charliek/roost/issues/398)); a spawned
+localhost daemon gets a state dir derived from `ROOST_STATE_DIR` instead
+of colliding with the launcher's
+([#397](https://github.com/charliek/roost/issues/397)); and
+`host.status`'s `retry` now says *which* classified ssh failure armed the
+rung, not only when the next one fires
+([#399](https://github.com/charliek/roost/issues/399)) — and gave the Add
+Host dialog a Tab ring (D11 below). Both platforms run a local session;
+what is still Linux-only is being an SSH *host* (HS-4c). **Next:
+[#383](https://github.com/charliek/roost/issues/383) +
+[#386](https://github.com/charliek/roost/issues/386) together, then the
+[#381](https://github.com/charliek/roost/issues/381) conversation**, with
+HS-4c after that.
+
+This refines [`host-sessions.md`](host-sessions.md) (the
 discovery note, which stays the rationale document) into an ordered set
 of milestones with pinned design decisions. Per-milestone implementation
 plans are written when a milestone starts; this file records the
@@ -364,8 +382,27 @@ shape.
   `Remove Host: <label>` (disconnected-only), `New Project on… <label>`
   — one row per (verb, host) pair, appearing only where it applies.
   Add Host is the one flow needing free text: a small modal dialog
-  (Name + Socket) validating by dialing `session.identify` before it
-  saves.
+  (Name + Target) validating by dialing `session.identify` before it
+  saves. *(This bullet said "Socket" as written; it has been a target
+  since HS-3, plan 038 — an ssh destination (`workbox` / `user@host` /
+  `ssh://user@host:port`), a Unix socket path, or `localhost`, through
+  the same classifier `roostctl host add --target` uses. Corrected in
+  place rather than annotated, because it is a mislabelled field, not a
+  superseded decision.)*
+  **Amended by plan 044 (2026-09-04):** Tab traverses the dialog like a
+  web form. The ring is Name → Target → Add & Connect → Cancel and back,
+  Shift+Tab reverses it, and Enter or Space activates the button it is
+  on. That ring has to live in app state rather than in the toolkit:
+  iced cannot focus a button at all, so its own traversal can never
+  reach one, and there is no widget-level ring to borrow. The cost of
+  owning it is that a mouse click moves widget focus without telling the
+  app, so Tab — which a focused field does not capture — asks the widget
+  tree who really has focus before it steps, and a left press inside the
+  dialog re-syncs the same way; Enter and Space need no such query,
+  because a focused field captures both and they reach the app only when
+  no field holds the caret. Traversal skips the primary while a validation
+  dial is in flight, and draws no ring on it, rather than advertising a
+  stop that cannot be activated.
 - **The Mac gate.** No macOS `roost-session` exists, so the Roost-Iced
   Mac client hides the `localhost` surface (no seeded connect row, no
   launch auto-reconnect, no spawn-if-missing) — refining rather than
@@ -905,6 +942,12 @@ after users have sessions running means each one must restart its daemon
 or its attaches fail the exact-match gate — cleanly, with
 `build-mismatch`, so the wire fails safe rather than corrupting a
 snapshot, but it still fails and would need release-note guidance.
+
+**Released 2026-09-04 (v0.0.19).** The paragraph below is the record of
+the call as it stood before the tag, kept rather than rewritten: the
+release went out from the pre-list *decision*, not its completion, so
+that the two items left open (#381 and #383) moved to post-v0.0.19 on
+that basis. Read it as history.
 
 HS-4b shipped 2026-09-01 (plan 041, PR #389),
 so **what stands between here and the first release is the pre-release

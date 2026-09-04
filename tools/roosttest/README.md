@@ -21,6 +21,10 @@ make e2e-mac-ci     # CI parity (DESTRUCTIVE: force-quits any running Roost.app)
 make e2e-session    # the headless host-session lane (no UI, no display)
 make e2e-host-client # HS-2: a roost-session daemon beside the Iced UI (needs both)
 make e2e-host-ssh   # HS-3: the same pair with a real SshTunnel between them (fake ssh)
+make e2e-host-missing-daemon  # a localhost session that cannot start settles once, no retry
+make e2e-host-local-spawn     # its positive twin: the UI really spawns the daemon (#397)
+make e2e-host-bootstrap       # HS-3 slice 2: installing/starting roost-session over the fake ssh
+# The five host lanes run ONE AT A TIME — never two at once, locally or in CI.
 # or directly:
 uv run --group test pytest tools/roosttest --roost-target mac -v
 uv run --group test pytest tools/roosttest --roost-target iced -v

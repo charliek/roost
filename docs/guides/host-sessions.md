@@ -127,6 +127,8 @@ roostctl host status --json       # the same, for a script
 
 It prints the state the sidebar's band is showing you: the host's `state`, the band's own line (`disconnected — reconnecting in 8s (3/10)`, or an agent count while connected), and — indented underneath, when there is one — the full `reason` if the band's 60-character line had to cut it short (a changed-host-key sentence, say), followed by the `detail` the band has no room for, which is where a failed local session start spells out what it actually tried. `roostctl host list` carries an abbreviated `state=` column for the same reason. If you're scripting against it, watch the `--json` `generation` field: it counts connection attempts *started*, so it moves even when two attempts fail identically.
 
+If the band just says it's retrying and you want to know **why**, that answer is in `--json` only: `retry.reason` carries the classified failure that armed the current rung (`connecting to workbox failed: …`), rendered the same way the give-up line renders one. The two can name different failures, though: this field is about the drop that armed *this* rung, while a give-up names the drop that exhausted the ladder — and if that last one was a bare disconnect with nothing to classify, the give-up carries no cause at all while the rung before it did. The human form can't show it — while a rung is armed the band's line is the countdown, which is exactly the stretch where the cause is otherwise invisible. Read the field whenever it's there rather than waiting for a particular attempt number; it's absent on the first rung of an outage often enough (a live connection dropping has nothing to classify yet) that its absence means "not known yet", not "no reason".
+
 This is a question about the **client**: which hosts this Roost is connected to. `roostctl session status` is the other half — run on the machine hosting a session, it says whether a daemon is listening there at all.
 
 ### Keybinds and creation routing
@@ -149,6 +151,14 @@ These are deliberately different actions:
 - **Stop Session** actually ends them — every PTY is hung up, the layout is flushed, and reconnecting after a Stop starts every tab over as a fresh shell in its saved directory (same "layout, not live state" contract normal Roost restarts use).
 
 If all you want is to close your laptop for the night, disconnect (or just quit) — don't stop.
+
+## Reordering a host's projects and tabs
+
+Inside a connected host's section you drag a project row or a tab pill exactly as you do in LOCAL — same gesture, same drop targets, no separate verb.
+
+The difference is where the new order lives. It is saved **on the session**, not on this Roost — so it survives a disconnect and reconnect, and it is what another client attaching to that host sees. That's also why the row settles a beat after you let go: the session is the one that decides, and the sidebar takes its new order from the session rather than from your drop.
+
+A **disconnected** section's rows stay listed and dimmed, and they can't be dragged — there is nothing to route the change to. Reconnect first (the section's inline **↻ Reconnect**, or the palette's Connect), then drag.
 
 ## Takeover
 
@@ -240,7 +250,7 @@ Point this at your real install (`/Applications/Roost-Iced.app`), not a dev/debu
 
 **A host stays "disconnected" and won't come back (a stale socket).** The socket file can outlive the process that created it — the daemon crashed, was killed, or the machine rebooted without cleaning up. On `localhost`, Roost retries a session that *dropped* — one that was running and went away — with a capped backoff (you'll see the amber dot briefly, then grey); a session that cannot *start* is the case above and settles instead of retrying. If a dropped one never recovers, run `roostctl session status` (or, over SSH, run it on the remote machine) to check whether anything is actually listening, and `roostctl session start` if not. A host reached over Roost's own SSH transport does the same once it's actually connected at least once — a mid-session drop retries on its own (`reconnecting in Ns (k/10)`, capped at 30 seconds between tries) and settles with a "gave up after 10 tries" message if the far side genuinely isn't coming back; ↻ Reconnect is still right there either way. On a remote host reached over the [fallback `ssh -L` forward](#scripted-fallback-forwarding-with-ssh-n-l) instead — a plain socket path, not Roost's SSH transport — none of that applies: first check the tunnel itself is still up, since a dropped SSH connection there looks identical to a dead session from Roost's side.
 
-**Connecting over a native SSH target fails outright (a classified reason).** Every SSH connect attempt is bounded, and a failure is classified into one of six families — its exact copy lands in the sidebar band as `disconnected — <reason>`, and in the log; an attempt you asked for (a palette Connect, `roostctl host connect`) also raises a toast, a background retry does not. The families, and what they mean:
+**Connecting over a native SSH target fails outright (a classified reason).** Every SSH connect attempt is bounded, and a failure is classified into one of six families — its exact copy lands in the sidebar band as `disconnected — <reason>`, and in the log; an attempt you asked for (a palette Connect, `roostctl host connect`) also raises a toast, a background retry does not. That's what happens whenever an attempt **settles**, which on a *first* connect is every one of these families, transport included. Where it differs is a host that had already reached connected and then lost the link: only there does transport re-dial on the retry ladder, and the band then shows the countdown (`reconnecting in 8s (3/10)`) instead of the copy — so while a rung is armed, read the family from `roostctl host status --json`, in `retry.reason`. The other five never retry, whether the host had connected before or not. The families, and what they mean:
 
 | Family | Copy (target interpolated) | What to do |
 |---|---|---|
