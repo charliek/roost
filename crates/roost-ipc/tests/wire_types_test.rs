@@ -15,11 +15,12 @@ use std::path::PathBuf;
 
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ClipboardEffectTarget, EventBatch, EventEnvelope, ResponseError, SessionBinaryIdentity,
-    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
-    SessionSetFocusParams, SessionSetThemeParams, SessionSetThemeResult, SessionStopParams,
-    SessionStopResult, SessionStoppingEvent, TabAttachParams, TabAttachResult, TabEffect,
-    TabEffectEvent, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    ClipboardEffectTarget, EventBatch, EventEnvelope, ProjectReorderParams, ResponseError,
+    SessionBinaryIdentity, SessionConnectParams, SessionConnectResult, SessionIdentify,
+    SessionIdentifyParams, SessionSetFocusParams, SessionSetThemeParams, SessionSetThemeResult,
+    SessionStopParams, SessionStopResult, SessionStoppingEvent, TabAttachParams, TabAttachResult,
+    TabEffect, TabEffectEvent, TabReorderParams, WireProjectRef, WireTabRef,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -845,4 +846,190 @@ fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
         }))
         .is_err()
     );
+}
+
+// ============================================================================
+// The reorder ops' host-qualified form (plan 044 §3.1 d6)
+// ============================================================================
+
+/// `WireProjectRef` is `WireTabRef`'s twin down to the parser's
+/// strictness: `parse(s)?.to_string() == s`, so the local instance is
+/// always bare and nothing is normalized on the way in.
+#[test]
+fn wire_project_ref_round_trips_exactly() {
+    for text in ["0", "4", "-1", "9223372036854775807", "h1.4", "h3.0"] {
+        let parsed = WireProjectRef::parse(text).unwrap_or_else(|| panic!("{text} must parse"));
+        assert_eq!(parsed.to_string(), text);
+        let json = serde_json::to_value(parsed).expect("serialize");
+        assert_eq!(json, serde_json::Value::String(text.into()));
+        let back: WireProjectRef = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, parsed);
+    }
+
+    assert_eq!(WireProjectRef::default(), WireProjectRef::Local(0));
+    assert_eq!(WireProjectRef::Local(4).local(), Some(4));
+    assert_eq!(
+        WireProjectRef::Host {
+            host: 3,
+            project: 4
+        }
+        .local(),
+        None,
+        "a qualified ref narrows to nothing, which is what every \
+         host-unaware consumer checks"
+    );
+}
+
+/// The rejections are the round-trip rule doing its work: a spelling
+/// that would come back out differently never comes in.
+#[test]
+fn wire_project_ref_rejects_non_canonical_spellings() {
+    for text in [
+        "h0.4",  // the local instance is always bare
+        "+4",    // parses as 4, prints as "4"
+        "04",    // leading zero
+        "h1.04", // ... on either half
+        "h01.4", "h3",  // no id
+        "h.4", // no host
+        "h3.", "", "four", "h-1.4", // a host id is unsigned
+        "3.4",   // the `h` is not optional
+    ] {
+        assert!(
+            WireProjectRef::parse(text).is_none(),
+            "{text} must not parse"
+        );
+        assert!(
+            serde_json::from_value::<WireProjectRef>(serde_json::Value::String(text.into()))
+                .is_err(),
+            "{text} must not decode"
+        );
+    }
+    assert!(
+        serde_json::from_value::<WireProjectRef>(serde_json::json!(4)).is_err(),
+        "a bare number is not the wire form; ids are string-wrapped"
+    );
+}
+
+/// The bare form is byte-identical to what it was before the qualified
+/// one existed — string-wrapped ids, same field names, no extra keys.
+/// This is the whole compatibility claim for local traffic.
+#[test]
+fn local_reorder_params_are_byte_identical() {
+    let tabs = TabReorderParams {
+        project_id: WireProjectRef::Local(1),
+        tab_ids: vec![
+            WireTabRef::Local(5),
+            WireTabRef::Local(3),
+            WireTabRef::Local(1),
+        ],
+    };
+    assert_eq!(
+        serde_json::to_string(&tabs).expect("serialize"),
+        r#"{"project_id":"1","tab_ids":["5","3","1"]}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<TabReorderParams>(r#"{"project_id":"1","tab_ids":["5","3","1"]}"#)
+            .expect("decode"),
+        tabs
+    );
+
+    let projects = ProjectReorderParams {
+        project_ids: vec![WireProjectRef::Local(2), WireProjectRef::Local(1)],
+    };
+    assert_eq!(
+        serde_json::to_string(&projects).expect("serialize"),
+        r#"{"project_ids":["2","1"]}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ProjectReorderParams>(r#"{"project_ids":["2","1"]}"#)
+            .expect("decode"),
+        projects
+    );
+}
+
+/// The host form on the wire, and the strictness that comes with it:
+/// unknown fields are still refused, and a junk ref is a decode failure
+/// rather than a zero.
+#[test]
+fn host_qualified_reorder_params_decode() {
+    let tabs: TabReorderParams =
+        serde_json::from_str(r#"{"project_id":"h3.4","tab_ids":["h3.9","h3.7"]}"#).expect("decode");
+    assert_eq!(
+        tabs.project_id,
+        WireProjectRef::Host {
+            host: 3,
+            project: 4
+        }
+    );
+    assert_eq!(
+        tabs.tab_ids,
+        vec![
+            WireTabRef::Host { host: 3, tab: 9 },
+            WireTabRef::Host { host: 3, tab: 7 }
+        ]
+    );
+    assert_eq!(
+        serde_json::to_string(&tabs).expect("re-serialize"),
+        r#"{"project_id":"h3.4","tab_ids":["h3.9","h3.7"]}"#
+    );
+
+    let projects: ProjectReorderParams =
+        serde_json::from_str(r#"{"project_ids":["h3.4","h3.2"]}"#).expect("decode");
+    assert_eq!(
+        projects.project_ids,
+        vec![
+            WireProjectRef::Host {
+                host: 3,
+                project: 4
+            },
+            WireProjectRef::Host {
+                host: 3,
+                project: 2
+            }
+        ]
+    );
+
+    // The mixed form decodes — it is the *engine* that refuses it, with
+    // a message naming the rule, so the refusal can say which rule.
+    assert!(
+        serde_json::from_str::<TabReorderParams>(r#"{"project_id":"1","tab_ids":["h3.7"]}"#)
+            .is_ok()
+    );
+
+    assert!(
+        serde_json::from_str::<TabReorderParams>(r#"{"project_id":"1","tab_ids":[],"extra":true}"#)
+            .is_err(),
+        "deny_unknown_fields survives the type change"
+    );
+    assert!(
+        serde_json::from_str::<ProjectReorderParams>(r#"{"project_ids":["h0.4"]}"#).is_err(),
+        "a non-canonical ref is a decode failure, not a silent Local(0)"
+    );
+}
+
+/// A negative *id* on a remote instance (`h3.-4`) parses, on both
+/// twins. The choice, stated: engine ids are `i64` and the parser's job
+/// is canonical spelling, not range — a ref no instance ever minted is
+/// refused where ids are actually resolved (`not-found` from the
+/// session), which is the same answer `h3.999999` gets. A negative
+/// *host* does not parse, because incarnations are `u32`.
+#[test]
+fn a_negative_id_is_the_answering_instances_business() {
+    assert_eq!(
+        WireProjectRef::parse("h3.-4"),
+        Some(WireProjectRef::Host {
+            host: 3,
+            project: -4
+        })
+    );
+    assert_eq!(
+        WireTabRef::parse("h3.-4"),
+        Some(WireTabRef::Host { host: 3, tab: -4 })
+    );
+    assert_eq!(WireProjectRef::parse("-4"), Some(WireProjectRef::Local(-4)));
+
+    // The host half is unsigned, so its negative spelling is refused by
+    // the parser rather than deferred.
+    assert!(WireProjectRef::parse("h-3.4").is_none());
+    assert!(WireTabRef::parse("h-3.4").is_none());
 }

@@ -295,8 +295,12 @@ fn malformed_agent_payload_decodes_to_none_not_error() {
 #[test]
 fn reorder_tab_ids_serialize_as_string_array() {
     let p = TabReorderParams {
-        project_id: 1,
-        tab_ids: vec![5, 3, 1],
+        project_id: WireProjectRef::Local(1),
+        tab_ids: vec![
+            WireTabRef::Local(5),
+            WireTabRef::Local(3),
+            WireTabRef::Local(1),
+        ],
     };
     let json = serde_json::to_value(&p).unwrap();
     assert_eq!(

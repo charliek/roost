@@ -1131,20 +1131,26 @@ pub struct ProjectDeleteParams {
 // Reorder
 // ============================================================================
 
+/// Both reorder ops take the **whole** new order, and on a UI socket
+/// both accept the host-qualified spelling: `{"project_id": "h3.4",
+/// "tab_ids": ["h3.7", "h3.9"]}` reorders that host's tabs through its
+/// session instead of the local workspace (plan 044 §3.1 d6). Every ref
+/// in one request must name the same instance — see `docs/reference/
+/// ipc.md` for the routing matrix. Bare ids decode to `Local` and
+/// serialize bare, so local traffic is byte-identical to what it was
+/// before the qualified form existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabReorderParams {
-    #[serde(with = "string_int64")]
-    pub project_id: i64,
-    #[serde(with = "vec_string_int64")]
-    pub tab_ids: Vec<i64>,
+    pub project_id: WireProjectRef,
+    pub tab_ids: Vec<WireTabRef>,
 }
 
+/// See [`TabReorderParams`] for the host-qualified form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectReorderParams {
-    #[serde(with = "vec_string_int64")]
-    pub project_ids: Vec<i64>,
+    pub project_ids: Vec<WireProjectRef>,
 }
 
 // ============================================================================
@@ -2718,6 +2724,79 @@ impl<'de> Deserialize<'de> for WireTabRef {
     }
 }
 
+/// [`WireTabRef`]'s project twin: the bare string-wrapped engine id
+/// (`"4"`) or the host-qualified `h<host>.<id>` spelling (`"h3.4"`) —
+/// plan 044 §3.1 d6, which gave the reorder ops their host form.
+///
+/// Everything the tab twin says applies here, including the canonical
+/// parser: `parse(s)?.to_string() == s`, so `h0.4` (the local instance
+/// is always bare), `+4` and leading zeros are rejected rather than
+/// normalized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireProjectRef {
+    Local(i64),
+    Host { host: u32, project: i64 },
+}
+
+/// `Local(0)` — the same "no project named" a defaulted string-wrapped
+/// id decoded to before this type existed.
+impl Default for WireProjectRef {
+    fn default() -> Self {
+        Self::Local(0)
+    }
+}
+
+impl WireProjectRef {
+    /// The bare engine id, or `None` for a host-qualified ref — the
+    /// narrowing every host-unaware consumer applies.
+    pub fn local(self) -> Option<i64> {
+        match self {
+            Self::Local(project) => Some(project),
+            Self::Host { .. } => None,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let parsed = match text.strip_prefix('h') {
+            Some(qualified) => {
+                let (host, project) = qualified.split_once('.')?;
+                Self::Host {
+                    host: host.parse().ok()?,
+                    project: project.parse().ok()?,
+                }
+            }
+            None => Self::Local(text.parse().ok()?),
+        };
+        if let Self::Host { host: 0, .. } = parsed {
+            return None;
+        }
+        (parsed.to_string() == text).then_some(parsed)
+    }
+}
+
+impl fmt::Display for WireProjectRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(project) => write!(f, "{project}"),
+            Self::Host { host, project } => write!(f, "h{host}.{project}"),
+        }
+    }
+}
+
+impl Serialize for WireProjectRef {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for WireProjectRef {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        Self::parse(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid project reference: {raw}")))
+    }
+}
+
 pub mod vec_string_int64 {
     use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -3045,7 +3124,7 @@ mod tests {
 
     #[test]
     fn vec_string_int64_round_trips() {
-        let p = TabReorderParams {
+        let p = TabsReorderedEvent {
             project_id: 1,
             tab_ids: vec![3, 2, 1],
         };

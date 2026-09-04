@@ -842,21 +842,23 @@ pub(super) fn host_reorder_params(target: ReorderTarget, ordered_ids: &[i64]) ->
 /// One host reorder, ready to await. `None` when that incarnation has no
 /// op queue — the host is not accepting operations, which the caller
 /// answers rather than drops.
+///
+/// The failure stays a [`crate::host_conn::HostOpError`] rather than a
+/// string: the gesture path wants its `Display` for the status banner,
+/// while the UI-socket op wants the session's own wire code out of
+/// `Rejected` (plan 044 §3.1 d6). Flattening here would lose the second.
 pub(super) fn host_reorder_call(
     hosts: &crate::host_conn::HostConnSet,
     host: HostId,
     target: ReorderTarget,
     ordered_ids: &[i64],
-) -> Option<impl std::future::Future<Output = Result<(), String>> + Send + 'static> {
+) -> Option<
+    impl std::future::Future<Output = Result<(), crate::host_conn::HostOpError>> + Send + 'static,
+> {
     let ops = hosts.ops_for(host)?.clone();
     let params = host_reorder_params(target, ordered_ids);
     let wire_op = target.wire_op();
-    Some(async move {
-        ops.call(wire_op, params, false)
-            .await
-            .map(drop)
-            .map_err(|error| error.to_string())
-    })
+    Some(async move { ops.call(wire_op, params, false).await.map(drop) })
 }
 
 /// The completion a reorder dispatch answers with, whichever axis and
@@ -1154,9 +1156,10 @@ impl App {
         op: u64,
     ) -> UiTask {
         match host_reorder_call(&self.hosts, host, target, &ordered_ids) {
-            Some(call) => self.engine_op(call, move |result| {
-                reorder_op_result(target, host, op, ordered_ids, result)
-            }),
+            Some(call) => self.engine_op(
+                async move { call.await.map_err(|error| error.to_string()) },
+                move |result| reorder_op_result(target, host, op, ordered_ids, result),
+            ),
             None => self.engine_op(
                 async move { Err("that host is not accepting operations".to_string()) },
                 move |result| reorder_op_result(target, host, op, ordered_ids, result),

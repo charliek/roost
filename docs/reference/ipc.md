@@ -94,9 +94,18 @@ terminal from. It shares the socket path but not the framing; see
 * **Errors:** stable kebab-case codes. Current set:
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
-  `not-implemented`, `internal`, `shutting-down`. Clients should treat
-  unknown codes as fatal for the request and surface `message` to the
-  user. `shutting-down` is **session-socket only**: once
+  `not-implemented`, `internal`, `shutting-down`, `host-unavailable`.
+  Clients should treat unknown codes as fatal for the request and
+  surface `message` to the user. `host-unavailable` is
+  `shutting-down`'s mirror image — **UI-socket only** — and says a
+  host-routed op could not reach the session it named: the connection
+  is gone, died mid-op, or its queue is full. A session's own refusal
+  crossing to a UI socket keeps its code when that code is one of the
+  ten above that both sockets share; a session-scoped code (including
+  `shutting-down`) or one a newer session invents folds onto
+  `host-unavailable`, its own code and sentence kept in `message`, so a
+  UI socket never answers a code this list does not name.
+  `shutting-down` is **session-socket only**: once
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
   same session gets it too instead of a fresh reap report. Session
@@ -518,15 +527,60 @@ Request:
 
 Order is leftmost first. Ids not belonging to `project_id` are rejected
 with `invalid-param`. Tabs in the project not listed keep their
-relative order after the listed ones.
+relative order after the listed ones. Ids are the **canonical**
+spelling: a non-canonical integer (`"+4"`, `"04"`) is refused rather
+than normalized, as it is everywhere the `h<host>.<id>` form is
+accepted.
 
 Response: `{}`.
+
+On a **UI socket**, both ids also accept the host-qualified
+`h<host>.<id>` spelling (plan 044 §3.1) — `{"project_id": "h3.4",
+"tab_ids": ["h3.9", "h3.7"]}` reorders project `4`'s tabs on whichever
+connected host this UI process has minted connection id `3` for, by
+sending the session the same op over its op queue. It is the drag
+gesture's own path, as an op. The session is authoritative: the
+sidebar's new order comes from the `tabs.reordered` event that follows,
+not from this reply, and the local workspace is untouched.
 
 ### `project.reorder`
 
 Request: `{"params": {"project_ids": ["2", "1", "3"]}}`. Order is
 topmost first. Same partial-order rules as `tab.reorder`. Response:
 `{}`.
+
+Takes the same host-qualified form: `{"project_ids": ["h3.4", "h3.2"]}`
+reorders that host's sidebar section, and the same canonical-spelling
+rule.
+
+### The reorder routing matrix
+
+Both reorder ops carry a whole order in one id-space, so a request names
+one instance or the other and never both:
+
+| Request | Goes to |
+|---|---|
+| every ref bare (an empty list included) | the local workspace, exactly as before |
+| a `Host` project with every tab `Host` on the **same** incarnation (an empty `tab_ids` included) | that host's session |
+| every `project_id` `Host` on one incarnation | that host's session |
+| two different incarnations; a `Host` project with a bare tab; a **bare** project with a qualified tab; a bare project among qualified ones | `invalid-param`, naming the rule |
+| any qualified ref on a **session socket** | `invalid-param` ("host-qualified … refs are a UI-socket form") |
+| the host form on a socket with no UI | `invalid-param` ("needs a UI: host connections are client state") |
+
+A host-routed request answers with the session's own error code when
+that code is one a UI socket also speaks, so `invalid-param` from a
+session's partial-order rules reads the same as the local engine's. A
+connection that is not there (disconnected, dropped mid-op, its queue
+full) is `host-unavailable`, and so is a refusal whose code a UI socket
+does not speak — a session with a latched `session.stop` answers
+`shutting-down`, which is session-socket-only, so it folds with its own
+code and sentence kept in `message`. An incarnation this client is not
+connected to is `not-found`.
+Duplicates and unlisted rows keep whatever the answering instance
+decides — the partial-order rules above apply unchanged on both sides.
+
+`roostctl tab reorder` / `project reorder` take numeric ids and always
+build the local form; the host form is reachable through the op.
 
 ### `tab.focus`
 
