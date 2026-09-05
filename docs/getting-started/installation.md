@@ -91,7 +91,8 @@ log paths every previous Linux release used. See
 
 `mac/scripts/bundle.sh` embeds `target/<config>/roostctl` under
 `Roost.app/Contents/Resources/bin/roostctl` so a packaged .app is
-self-contained for `claude install`.
+self-contained: that is the binary each tab's `$ROOST_AGENT_HOOK` points
+at, and the one the shell integration and agent hooks run.
 
 ## Prerequisites
 

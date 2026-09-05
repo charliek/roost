@@ -123,12 +123,31 @@ impl Outcome {
 }
 
 /// Where an agent stands right now, without changing anything.
-#[derive(Debug)]
+///
+/// Two independent sources, deliberately kept apart. [`Self::wired`] is
+/// what Roost's own state record *claims*; [`Self::entries_on_disk`] and
+/// [`Self::up_to_date`] are read off the agent's own files. They can
+/// disagree — a wiped `~/.config/roost`, a record restored from a backup,
+/// a hand-edited settings file — and a reader that trusts either one
+/// alone reports a healthy install as broken or a broken one as healthy.
+/// Callers render the disagreement; nothing here resolves it.
+#[derive(Debug, Clone)]
 pub struct Status {
     pub agent: Agent,
     pub present: bool,
-    /// The integration version the record says is wired.
+    /// The integration version the record says is wired. `None` means
+    /// the record has no entry — which is **not** the same as "nothing
+    /// is wired"; that is [`Self::entries_on_disk`].
     pub wired: Option<u32>,
+    /// Whether the agent's own config actually carries a Roost entry
+    /// right now, at any integration version.
+    ///
+    /// Derived from an *uninstall* plan: it has edits iff there is
+    /// something of Roost's in those files to take back out. The install
+    /// plan cannot answer this — it is empty only when the entries are
+    /// present **and current**, so an older version's entry looks
+    /// identical to no entry at all.
+    pub entries_on_disk: bool,
     /// True when a fresh `plan` would make no edits.
     pub up_to_date: bool,
     pub noticed: bool,
@@ -342,10 +361,18 @@ pub fn status(home: &Home) -> Result<Vec<Status>, InstallError> {
             } else {
                 None
             };
+            // The disk half of the answer. Skipped either way when the
+            // agent is absent: there are no files to read.
+            let removal = if present {
+                Some(plan_for(agent, home, Intent::Uninstall)?)
+            } else {
+                None
+            };
             Ok(Status {
                 agent,
                 present,
                 wired: entry.map(|e| e.integration_version),
+                entries_on_disk: removal.is_some_and(|p| !p.is_noop()),
                 up_to_date: plan.as_ref().is_some_and(InstallPlan::is_noop),
                 noticed: entry.is_some_and(|e| e.noticed),
                 skipped: match &plan {
@@ -632,6 +659,87 @@ mod tests {
             vec![Agent::Claude],
             "nothing but mark_noticed may spend a local toast"
         );
+    }
+
+    fn claude_row(home: &Home) -> Status {
+        status(home)
+            .expect("status")
+            .into_iter()
+            .find(|row| row.agent == Agent::Claude)
+            .expect("claude row")
+    }
+
+    /// The record and the agent's own files are two sources, and
+    /// `status` has to answer for both. Wiring the entries and then
+    /// deleting `~/.config/roost/agent-hooks.json` leaves a machine that
+    /// is *fully wired* — anything reading only the record calls it "not
+    /// wired" and sends the user to reinstall something already there.
+    #[test]
+    fn a_lost_state_record_does_not_make_installed_entries_disappear() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        install(&home, &[Agent::Claude], "local", Guard::PERMITTED).expect("install");
+
+        let wired = claude_row(&home);
+        assert_eq!(wired.wired, Some(crate::command::INTEGRATION_VERSION));
+        assert!(wired.entries_on_disk);
+        assert!(wired.up_to_date);
+
+        std::fs::remove_file(dir.path().join(".config/roost/agent-hooks.json")).unwrap();
+
+        let orphaned = claude_row(&home);
+        assert_eq!(orphaned.wired, None, "the record really is gone");
+        assert!(
+            orphaned.entries_on_disk,
+            "the entries are still in ~/.claude/settings.json"
+        );
+        assert!(orphaned.up_to_date);
+    }
+
+    /// The mirror image: a record that survives the file it describes.
+    /// `wired` still says v2 because that is what the record claims —
+    /// `entries_on_disk` is what says the claim is empty.
+    #[test]
+    fn a_record_that_outlives_the_entries_reports_nothing_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        install(&home, &[Agent::Claude], "local", Guard::PERMITTED).expect("install");
+        std::fs::write(dir.path().join(".claude/settings.json"), "{}\n").unwrap();
+
+        let row = claude_row(&home);
+        assert_eq!(row.wired, Some(crate::command::INTEGRATION_VERSION));
+        assert!(!row.entries_on_disk, "the settings file was emptied");
+        assert!(!row.up_to_date);
+    }
+
+    /// An older integration version's entry is still *wired* — it is the
+    /// install plan that is non-empty, not the file. Deriving "wired"
+    /// from `up_to_date` would report v1 entries as absent.
+    #[test]
+    fn an_older_versions_entry_still_counts_as_wired_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        install(&home, &[Agent::Claude], "local", Guard::PERMITTED).expect("install");
+
+        // The commands are JSON string values, so the file spells their
+        // inner quotes escaped.
+        let escaped = |s: &str| s.replace('"', "\\\"");
+        let settings = dir.path().join(".claude/settings.json");
+        let v1 = crate::command::owned_commands(Agent::Claude)
+            .last()
+            .unwrap()
+            .clone();
+        let before = std::fs::read_to_string(&settings).unwrap();
+        let after = before.replace(
+            &escaped(&crate::command::installed_command(Agent::Claude)),
+            &escaped(&v1),
+        );
+        assert_ne!(before, after, "the v1 rewrite matched nothing");
+        std::fs::write(&settings, after).unwrap();
+
+        let row = claude_row(&home);
+        assert!(row.entries_on_disk, "a v1 entry is still an entry");
+        assert!(!row.up_to_date, "but it is not current");
     }
 
     #[test]

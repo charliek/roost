@@ -38,6 +38,7 @@ nav = [
   ] },
   { "Guides" = [
     { "Notifications" = "guides/notifications.md" },
+    { "Agent Hooks" = "guides/agents.md" },
     { "Claude Code Hooks" = "guides/claude-code.md" },
     { "Working Directory Tracking" = "guides/cwd-tracking.md" },
     { "Extending Roost" = "guides/extending.md" },

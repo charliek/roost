@@ -107,6 +107,138 @@ fn our_hashes(event: &str) -> Vec<String> {
         .collect()
 }
 
+/// The identity codex will hash for the handler at
+/// `hooks.<event>[group].hooks[handler]`: the group's `matcher` and the
+/// handler object **as the file actually spells it**.
+///
+/// Reading the file rather than re-deriving the canonical entry is the
+/// whole point. A `timeout` edited from 10 to 20 leaves the command
+/// byte-identical, so the handler is still Roost's — and codex hashes
+/// the 20. Anything that re-derived the expected hash from
+/// [`crate::command::installed_command`] would compare two hashes of the
+/// *same* canonical handler and report a match through the review dialog
+/// codex is about to show. The same goes for a v1 command still on disk
+/// under a v2 hash, and for a `matcher` the user added to our group.
+fn on_disk_identity(
+    doc: &Json,
+    event: &str,
+    group: usize,
+    handler: usize,
+) -> Option<(Option<String>, Handler)> {
+    let group = doc.get("hooks")?.get(event)?.as_array()?.get(group)?;
+    let entry = group.get("hooks")?.as_array()?.get(handler)?;
+    let matcher = group
+        .get("matcher")
+        .and_then(Json::as_str)
+        .map(str::to_string);
+    Some((
+        matcher,
+        Handler {
+            command: entry.get("command")?.as_str()?.to_string(),
+            timeout_sec: number(entry.get("timeout")),
+            // Absent is `false`, which is also what codex's own
+            // deserialization defaults it to.
+            is_async: matches!(entry.get("async"), Some(Json::Bool(true))),
+            status_message: entry
+                .get("statusMessage")
+                .and_then(Json::as_str)
+                .map(str::to_string),
+            additional_context_limit: number(entry.get("additionalContextLimit")),
+        },
+    ))
+}
+
+/// A JSON number as the file spelled it. [`crate::json::Number`] keeps
+/// the token rather than a parsed value (so a write cannot restyle it),
+/// so reading one back is a parse.
+fn number<T: std::str::FromStr>(value: Option<&Json>) -> Option<T> {
+    match value? {
+        Json::Number(n) => n.as_str().parse().ok(),
+        _ => None,
+    }
+}
+
+/// One codex hook event's trust comparison: what codex would compute for
+/// the handler Roost has installed right now, against what
+/// `config.toml`'s `[hooks.state]` currently records — doctor's
+/// `agent.codex.trust` read, not something `plan`/`apply` consult (they
+/// always rewrite the expected hash; this is the diagnosis of what
+/// happens if nobody does).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustEntry {
+    pub event: &'static str,
+    pub expected: String,
+    /// `None` when `config.toml` carries no state entry at this key at
+    /// all — wired in `hooks.json` but never trusted, which reads to
+    /// codex exactly like a hash mismatch: a review dialog.
+    pub present: Option<String>,
+}
+
+/// One entry per hook event codex has a Roost handler wired for right
+/// now (empty when it has none — nothing to trust yet, which is
+/// different from a handler that is trusted incorrectly).
+///
+/// `Err` only when `hooks.json` / `config.toml` cannot be read or
+/// parsed at all — the same [`SkipReason`]-shaped findings
+/// [`plan_install`] reports for the same failures.
+pub fn trust_entries(home: &Home) -> Result<Vec<TrustEntry>, SkipReason> {
+    let hooks_path = hooks_path(home);
+    let config_path = config_path(home);
+
+    let config_image =
+        write::read_image(&config_path, PRIVATE_MODE).map_err(|e| SkipReason::Unparseable {
+            path: config_path.clone(),
+            detail: e.to_string(),
+        })?;
+    let config = open_config(&config_image)?;
+    let key_source = key_source(home, allow_symlinked(&config));
+
+    let hooks_doc = match jsonedit::open(&hooks_path, PRIVATE_MODE) {
+        Ok(Opened::Ready(file)) => file.doc.clone(),
+        Ok(Opened::Skip(reason)) => return Err(reason),
+        Err(e) => {
+            return Err(SkipReason::Unparseable {
+                path: hooks_path.clone(),
+                detail: e.to_string(),
+            })
+        }
+    };
+
+    let state = config
+        .get("hooks")
+        .and_then(Item::as_table_like)
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(Item::as_table_like);
+
+    let mut entries = Vec::new();
+    for event in CODEX_HOOK_EVENTS {
+        let Some((group, handler)) = jsonedit::locate_grouped(&hooks_doc, AGENT, event) else {
+            continue;
+        };
+        let Some((matcher, on_disk)) = on_disk_identity(&hooks_doc, event, group, handler) else {
+            continue;
+        };
+        let (Some(key), Some(expected)) = (
+            codex_hash::state_key(&key_source, event, group, handler),
+            codex_hash::trusted_hash(event, matcher.as_deref(), &on_disk),
+        ) else {
+            continue;
+        };
+        let present = state
+            .and_then(|s| s.get(key.as_str()))
+            .and_then(Item::as_table_like)
+            .and_then(|t| t.get("trusted_hash"))
+            .and_then(Item::as_str)
+            .map(str::to_string);
+        entries.push(TrustEntry {
+            event,
+            expected,
+            present,
+        });
+    }
+    Ok(entries)
+}
+
 /// Parse `config.toml`, treating an absent file as an empty document.
 ///
 /// Bytes that are not UTF-8 are a skip, not a lossy decode: substituting
@@ -213,15 +345,24 @@ pub fn plan_install(home: &Home) -> Result<InstallPlan, InstallError> {
 
     // The trust keys are index-based, so they are computed from the
     // *final* document — including when the merge changed nothing but a
-    // group the user inserted moved ours along.
+    // group the user inserted moved ours along. The hash is read off
+    // that document too: `merge_grouped` refreshes an older entry **in
+    // place**, so a `matcher` the user put on our group survives the
+    // merge, and codex hashes it. Deriving the hash from the canonical
+    // handler alone would write a hash for a group shape that is not the
+    // one on disk — a review dialog no `ensure` could ever clear.
     let mut trust: Vec<(String, String)> = Vec::new();
     for event in CODEX_HOOK_EVENTS {
         let Some((group, handler)) = jsonedit::locate_grouped(&hooks_file.doc, AGENT, event) else {
             continue;
         };
+        let Some((matcher, on_disk)) = on_disk_identity(&hooks_file.doc, event, group, handler)
+        else {
+            continue;
+        };
         let (Some(key), Some(hash)) = (
             codex_hash::state_key(&key_source, event, group, handler),
-            codex_hash::trusted_hash(event, None, &Handler::roost(&command, HOOK_TIMEOUT_SECS)),
+            codex_hash::trusted_hash(event, matcher.as_deref(), &on_disk),
         ) else {
             continue;
         };
@@ -737,5 +878,250 @@ mod tests {
 
         let config = std::fs::read_to_string(config_path(&home)).unwrap();
         assert!(config.contains("sha256:deadbeef"), "{config}");
+    }
+
+    /// Freshly wired: every trust entry's `present` matches its
+    /// `expected` — the state doctor's `agent.codex.trust` reads as
+    /// clean.
+    #[test]
+    fn trust_entries_match_right_after_a_fresh_install() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+
+        let entries = trust_entries(&home).unwrap();
+        assert_eq!(entries.len(), CODEX_HOOK_EVENTS.len(), "{entries:?}");
+        for entry in &entries {
+            assert_eq!(
+                entry.present.as_deref(),
+                Some(entry.expected.as_str()),
+                "{entry:?}"
+            );
+        }
+    }
+
+    /// A hand-edited (or stale) `trusted_hash` shows up as drift: present
+    /// disagrees with expected, without touching anything on disk.
+    #[test]
+    fn trust_entries_reports_drift_against_a_hand_edited_hash() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+        let key_source = key_source(&home, false);
+        let key = codex_hash::state_key(&key_source, "SessionStart", 0, 0).unwrap();
+
+        let mut config = std::fs::read_to_string(config_path(&home)).unwrap();
+        let needle = format!("[hooks.state.\"{key}\"]\ntrusted_hash = ");
+        let at = config.find(&needle).unwrap() + needle.len();
+        let rest_start = config[at..].find('\n').unwrap() + at;
+        config.replace_range(at..rest_start, "\"sha256:deadbeef\"");
+        std::fs::write(config_path(&home), &config).unwrap();
+
+        let entries = trust_entries(&home).unwrap();
+        let drifted = entries.iter().find(|e| e.event == "SessionStart").unwrap();
+        assert_eq!(drifted.present.as_deref(), Some("sha256:deadbeef"));
+        assert_ne!(drifted.present.as_deref(), Some(drifted.expected.as_str()));
+    }
+
+    /// Nothing wired yet: no group matches any event, so there is
+    /// nothing to compare — an empty list, not an error.
+    #[test]
+    fn trust_entries_is_empty_before_anything_is_wired() {
+        let (_dir, home) = home_with_codex();
+        assert!(trust_entries(&home).unwrap().is_empty());
+    }
+
+    fn read_hooks(home: &Home) -> Json {
+        let text = std::fs::read_to_string(hooks_path(home)).unwrap();
+        Json::parse(text.as_bytes()).unwrap()
+    }
+
+    fn write_hooks(home: &Home, doc: &Json) {
+        std::fs::write(hooks_path(home), doc.render(&crate::json::Style::default())).unwrap();
+    }
+
+    /// The one handler Roost owns for `event`, for a test to edit.
+    fn our_handler<'a>(doc: &'a mut Json, event: &str) -> &'a mut Json {
+        doc.get_mut("hooks")
+            .unwrap()
+            .get_mut(event)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .get_mut("hooks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .get_mut(0)
+            .unwrap()
+    }
+
+    /// The regression the fabricated-input tests could not reach: doctor
+    /// has to hash the handler that is **on disk**. An edited `timeout`
+    /// leaves the command byte-identical — so the entry is still ours,
+    /// and `locate_grouped` still finds it — while codex hashes the new
+    /// timeout and opens the review dialog. Re-deriving the expected
+    /// hash from the canonical command compares two hashes of the same
+    /// timeout-10 handler and reports `ok` straight through that dialog.
+    #[test]
+    fn an_edited_timeout_reads_as_trust_drift() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+        assert!(trust_entries(&home)
+            .unwrap()
+            .iter()
+            .all(|e| e.present.as_deref() == Some(e.expected.as_str())));
+
+        let mut doc = read_hooks(&home);
+        our_handler(&mut doc, "Stop").insert("timeout", Json::Number(20u64.into()));
+        write_hooks(&home, &doc);
+
+        let entries = trust_entries(&home).unwrap();
+        let stop = entries.iter().find(|e| e.event == "Stop").unwrap();
+        assert_ne!(
+            stop.present.as_deref(),
+            Some(stop.expected.as_str()),
+            "an edited timeout must read as drift: {stop:?}"
+        );
+        // Only that event. The rest of the file is untouched, and a
+        // check that painted the whole agent red would be as useless as
+        // one that painted it green.
+        for entry in entries.iter().filter(|e| e.event != "Stop") {
+            assert_eq!(
+                entry.present.as_deref(),
+                Some(entry.expected.as_str()),
+                "{entry:?}"
+            );
+        }
+    }
+
+    /// The other half of the same defect: a handler flipped to `async`,
+    /// or given a `statusMessage`, is still ours by command — and codex
+    /// hashes both fields.
+    #[test]
+    fn an_edited_async_or_status_message_reads_as_trust_drift() {
+        for (key, value) in [
+            ("async", Json::Bool(true)),
+            ("statusMessage", Json::String("mine".into())),
+        ] {
+            let (_dir, home) = home_with_codex();
+            wire(&home);
+            let mut doc = read_hooks(&home);
+            our_handler(&mut doc, "SessionStart").insert(key, value);
+            write_hooks(&home, &doc);
+
+            let entries = trust_entries(&home).unwrap();
+            let entry = entries.iter().find(|e| e.event == "SessionStart").unwrap();
+            assert_ne!(
+                entry.present.as_deref(),
+                Some(entry.expected.as_str()),
+                "{key}: {entry:?}"
+            );
+        }
+    }
+
+    /// A v1 command still on disk under the hash a v1 install wrote is
+    /// **not** drift: codex hashes what is there, matches, and asks
+    /// nothing. Reporting drift here would send the user to `agent
+    /// ensure` for a dialog that was never going to appear — the
+    /// out-of-date wiring is `agent.codex.wired`'s to report, not this
+    /// check's.
+    #[test]
+    fn a_v1_command_under_its_own_v1_hash_is_not_drift() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+        let v1 = owned_commands(AGENT).last().unwrap().clone();
+        assert_ne!(v1, installed_command(AGENT));
+
+        // Rewrite both sides the way an older Roost left them: the v1
+        // command, and the hash that command hashes to.
+        let mut doc = read_hooks(&home);
+        for event in CODEX_HOOK_EVENTS {
+            our_handler(&mut doc, event).insert("command", Json::String(v1.clone()));
+        }
+        write_hooks(&home, &doc);
+
+        let key_source = key_source(&home, false);
+        let mut config = std::fs::read_to_string(config_path(&home)).unwrap();
+        for event in CODEX_HOOK_EVENTS {
+            let key = codex_hash::state_key(&key_source, event, 0, 0).unwrap();
+            let old = codex_hash::trusted_hash(
+                event,
+                None,
+                &Handler::roost(installed_command(AGENT), HOOK_TIMEOUT_SECS),
+            )
+            .unwrap();
+            let new =
+                codex_hash::trusted_hash(event, None, &Handler::roost(&v1, HOOK_TIMEOUT_SECS))
+                    .unwrap();
+            config = config.replace(&old, &new);
+            assert!(config.contains(&key), "{key}");
+        }
+        std::fs::write(config_path(&home), &config).unwrap();
+
+        for entry in trust_entries(&home).unwrap() {
+            assert_eq!(
+                entry.present.as_deref(),
+                Some(entry.expected.as_str()),
+                "{entry:?}"
+            );
+        }
+    }
+
+    /// And the inverse, which is the shape the review named: a v1
+    /// command left on disk while `config.toml` carries the *current*
+    /// hash. codex hashes the v1 command, misses, and opens the dialog —
+    /// so doctor has to call it drift.
+    #[test]
+    fn a_v1_command_under_a_current_hash_is_drift() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+        let v1 = owned_commands(AGENT).last().unwrap().clone();
+
+        let mut doc = read_hooks(&home);
+        our_handler(&mut doc, "Stop").insert("command", Json::String(v1));
+        write_hooks(&home, &doc);
+
+        let entries = trust_entries(&home).unwrap();
+        let stop = entries.iter().find(|e| e.event == "Stop").unwrap();
+        assert_ne!(stop.present.as_deref(), Some(stop.expected.as_str()));
+    }
+
+    /// A `matcher` the user put on our group survives `merge_grouped`
+    /// (it refreshes the handler in place), and codex hashes it on every
+    /// event that keeps one. So the hash the install *writes* has to
+    /// come off the merged document too — otherwise `ensure` writes a
+    /// hash for a group shape that is not on disk, and no number of
+    /// `ensure` runs ever clears the dialog.
+    #[test]
+    fn a_user_matcher_on_our_group_is_hashed_by_install_and_by_doctor() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+
+        let mut doc = read_hooks(&home);
+        doc.get_mut("hooks")
+            .unwrap()
+            .get_mut("SessionStart")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .insert("matcher", Json::String("*".into()));
+        write_hooks(&home, &doc);
+
+        // Before a re-ensure the stored hash is the matcher-less one.
+        let entries = trust_entries(&home).unwrap();
+        let entry = entries.iter().find(|e| e.event == "SessionStart").unwrap();
+        assert_ne!(entry.present.as_deref(), Some(entry.expected.as_str()));
+
+        // And `ensure` is the remedy it claims to be.
+        wire(&home);
+        for entry in trust_entries(&home).unwrap() {
+            assert_eq!(
+                entry.present.as_deref(),
+                Some(entry.expected.as_str()),
+                "{entry:?}"
+            );
+        }
+        assert!(std::fs::read_to_string(hooks_path(&home))
+            .unwrap()
+            .contains("\"matcher\""));
     }
 }

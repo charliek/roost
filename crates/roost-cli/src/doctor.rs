@@ -28,7 +28,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use roost_agent::claude::{canonical_hook_event, CLAUDE_HOOK_EVENTS};
+use roost_agent::claude::CLAUDE_HOOK_EVENTS;
+use roost_agent::Agent;
+use roost_agent_install::{
+    owned_commands, Home as AgentHome, Status as AgentInstallStatus, TrustEntry,
+    ALL_AGENTS as ALL_INSTALL_AGENTS,
+};
 use roost_ipc::agent::{
     effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, ShellState,
 };
@@ -42,6 +47,9 @@ use roost_ipc::{ClientError, IpcClient};
 /// check, not a hung doctor.
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long `collect_agent_status` waits on its detached thread — see
+/// that function for why the read happens off-thread at all.
+const AGENT_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 /// A timeout bounds time, not memory. Version banners are one line.
 const OUTPUT_CAP: u64 = 8 * 1024;
 /// `claude-settings.json` is a handful of hook entries; anything past this
@@ -137,13 +145,29 @@ const DOC_TARGETS: &[(&str, Doc)] = &[
         "claude.binary",
         doc!("guides/claude-code", "troubleshooting"),
     ),
-    ("claude.settings", doc!("guides/claude-code", "install")),
-    ("claude.hook_events", doc!("guides/claude-code", "install")),
-    ("claude.hook_command", doc!("guides/claude-code", "install")),
+    ("claude.settings", doc!("guides/agents", "install")),
+    ("claude.hook_events", doc!("guides/agents", "install")),
+    ("claude.hook_command", doc!("guides/agents", "install")),
     (
         "claude.observed",
         doc!("guides/claude-code", "troubleshooting"),
     ),
+    ("agent.hook_binary", doc!("reference/cli", "environment")),
+    ("agent.claude.wired", doc!("guides/agents", "install")),
+    ("agent.claude.owning", doc!("guides/agents", "ownership")),
+    (
+        "agent.claude.legacy_settings",
+        doc!("guides/agents", "legacy-claude-settings"),
+    ),
+    ("agent.codex.wired", doc!("guides/agents", "install")),
+    ("agent.codex.trust", doc!("guides/agents", "codex-trust")),
+    ("agent.codex.owning", doc!("guides/agents", "ownership")),
+    ("agent.grok.wired", doc!("guides/agents", "install")),
+    ("agent.grok.owning", doc!("guides/agents", "ownership")),
+    ("agent.cursor.wired", doc!("guides/agents", "install")),
+    ("agent.cursor.owning", doc!("guides/agents", "ownership")),
+    ("agent.opencode.wired", doc!("guides/agents", "install")),
+    ("agent.opencode.owning", doc!("guides/agents", "ownership")),
 ];
 
 fn docs_for(check_id: &str) -> Option<&'static str> {
@@ -563,22 +587,26 @@ pub enum SettingsProbe {
     Parsed,
 }
 
-/// One `command` hook entry out of `claude-settings.json`, with the
-/// filesystem questions about its argv[0] already answered.
+/// One `command` hook entry out of Claude's `settings.json`, already
+/// compared against every command string Roost has ever installed for
+/// Claude (`roost_agent_install::owned_commands`) — byte equality, never
+/// a substring test, matching the install engine's own ownership rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookCommand {
     pub event: String,
     pub raw: String,
-    /// `None` when the command's quoting doesn't parse.
-    pub argv: Option<Vec<String>>,
-    pub exe_executable: bool,
-    pub exe_canonical: Option<PathBuf>,
+    /// Byte-equal to some integration version of Roost's own Claude
+    /// command.
+    pub owned: bool,
+    /// Byte-equal to the *current* integration version specifically.
+    /// `owned && !current` is what `hook_command_check` warns about:
+    /// wired, but by an older Roost.
+    pub current: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Inputs {
     pub roostctl_version: String,
-    pub roostctl_exe: Option<PathBuf>,
     pub now_unix: i64,
 
     pub env_tab_id: Option<String>,
@@ -586,6 +614,16 @@ pub struct Inputs {
     pub env_shell_integration: Option<String>,
     pub env_shell_features: Option<String>,
     pub env_resources_dir: Option<String>,
+    /// `ROOST_AGENT_HOOK`, read from this process's own environment —
+    /// only ever set inside a Roost tab (or a host-session tab), same as
+    /// the two above.
+    pub env_agent_hook: Option<String>,
+    /// Whether [`Self::env_agent_hook`] resolves to an executable
+    /// regular file, decided here rather than in `evaluate` — `collect`
+    /// does *all* the I/O (plan §3.1's split), and a filesystem check
+    /// re-run at judgement time is untestable without touching a real
+    /// disk.
+    pub env_agent_hook_executable: bool,
     pub explicit_tab: Option<i64>,
 
     pub shell_path: Option<String>,
@@ -613,19 +651,44 @@ pub struct Inputs {
     pub claude_settings: SettingsProbe,
     pub claude_hook_events: Vec<String>,
     pub claude_hook_commands: Vec<HookCommand>,
+
+    /// `roost_agent_install::status` against `Home::from_env()` — read
+    /// only, never a write, so this is safe to collect even when doctor
+    /// is not running inside a Roost tab and even on a machine with real
+    /// agent config on it. Empty when `$HOME` could not be resolved or
+    /// the probe itself failed; [`Self::agent_status_error`] carries why.
+    pub agent_status: Vec<AgentInstallStatus>,
+    pub agent_status_error: Option<String>,
+    /// `roost_agent_install::trust_entries` for codex specifically —
+    /// kept apart from `agent_status` because it is the one agent whose
+    /// wiring carries a *comparable* hash, not just a wired/unwired fact.
+    pub agent_codex_trust: Vec<TrustEntry>,
+    pub agent_codex_trust_error: Option<String>,
+
+    /// The legacy `~/.config/roost/claude-settings.json` this crate
+    /// wrote before plan 046. `Some(true)` when it still exists.
+    pub legacy_claude_settings_present: bool,
+    /// Whether any readable shell rc (`.bashrc`, `.zshrc`,
+    /// `.bash_profile`, fish's `config.fish` / `alias --save` output)
+    /// still contains `--settings …claude-settings.json` — the other
+    /// half of "delivered twice" (plan 046 §3.5). An unreadable or
+    /// absent rc file is not distinguished from a clean one: there is
+    /// nothing actionable to say about either.
+    pub legacy_claude_alias_in_rc: bool,
 }
 
 impl Default for Inputs {
     fn default() -> Self {
         Inputs {
             roostctl_version: env!("CARGO_PKG_VERSION").to_string(),
-            roostctl_exe: None,
             now_unix: 0,
             env_tab_id: None,
             env_socket: None,
             env_shell_integration: None,
             env_shell_features: None,
             env_resources_dir: None,
+            env_agent_hook: None,
+            env_agent_hook_executable: false,
             explicit_tab: None,
             shell_path: None,
             shell_usable: false,
@@ -645,6 +708,12 @@ impl Default for Inputs {
             claude_settings: SettingsProbe::LocationUnknown,
             claude_hook_events: Vec::new(),
             claude_hook_commands: Vec::new(),
+            agent_status: Vec::new(),
+            agent_status_error: None,
+            agent_codex_trust: Vec::new(),
+            agent_codex_trust_error: None,
+            legacy_claude_settings_present: false,
+            legacy_claude_alias_in_rc: false,
         }
     }
 }
@@ -674,6 +743,17 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
     let (claude_settings, claude_hook_events, claude_hook_commands) =
         read_claude_settings(claude_settings_path.as_deref());
 
+    let (agent_status, agent_status_error, agent_codex_trust, agent_codex_trust_error) =
+        collect_agent_status().await;
+    let legacy_claude_settings_present = crate::legacy_claude_settings_path()
+        .map(|p| p.is_file())
+        .unwrap_or(false);
+    let zdotdir = non_empty_env("ZDOTDIR");
+    let legacy_claude_alias_in_rc = std::env::var("HOME")
+        .map(|home| legacy_claude_alias_present(&home, zdotdir.as_deref()))
+        .unwrap_or(false);
+
+    let env_agent_hook = non_empty_env("ROOST_AGENT_HOOK");
     let env_resources_dir = non_empty_env("ROOST_RESOURCES_DIR");
     let resources_script = shipped_script_path(
         env_resources_dir.as_deref(),
@@ -687,13 +767,16 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
 
     Inputs {
         roostctl_version: env!("CARGO_PKG_VERSION").to_string(),
-        roostctl_exe: crate::self_exe(),
         now_unix: unix_now(),
         env_tab_id: non_empty_env("ROOST_TAB_ID"),
         env_socket: non_empty_env("ROOST_SOCKET"),
         env_shell_integration: non_empty_env("ROOST_SHELL_INTEGRATION"),
         env_shell_features: non_empty_env("ROOST_SHELL_FEATURES"),
         env_resources_dir,
+        env_agent_hook: env_agent_hook.clone(),
+        env_agent_hook_executable: env_agent_hook
+            .as_deref()
+            .is_some_and(|p| is_executable_regular_file(Path::new(p))),
         explicit_tab,
         resources_script,
         resources_script_readable,
@@ -713,7 +796,149 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
         claude_settings,
         claude_hook_events,
         claude_hook_commands,
+        agent_status,
+        agent_status_error,
+        agent_codex_trust,
+        agent_codex_trust_error,
+        legacy_claude_settings_present,
+        legacy_claude_alias_in_rc,
     }
+}
+
+/// `roost_agent_install::status` + `trust_entries` against
+/// `Home::from_env()` — both read-only, so this runs unconditionally
+/// (plan 046 §3.7): a machine with real agent config on it gets a real
+/// report, and one without gets five `not installed` rows.
+type AgentStatusResult = (
+    Vec<AgentInstallStatus>,
+    Option<String>,
+    Vec<TrustEntry>,
+    Option<String>,
+);
+
+/// `roost_agent_install::status`/`trust_entries` read files doctor does
+/// not control the shape of, and neither guards against a non-regular
+/// file the way [`read_regular_file_capped`] does for Claude's own
+/// settings — a FIFO where `~/.codex/hooks.json` belongs would otherwise
+/// block `open` forever (plan §3.1: doctor must be safe to run blind).
+///
+/// So this runs on a **raw, detached thread** rather than
+/// `tokio::task::spawn_blocking`: a blocking-pool task that never
+/// returns is what a runtime's `Drop` waits on, and `roostctl doctor`'s
+/// own exit path (`std::process::exit`) skips that wait in production,
+/// but a `#[tokio::test]`'s runtime does not — a thread nothing ever
+/// joins cannot hang either one. The timeout gives up on the channel,
+/// never on the thread.
+async fn collect_agent_status() -> AgentStatusResult {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(collect_agent_status_blocking());
+    });
+    match tokio::time::timeout(AGENT_STATUS_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => {
+            let msg = format!(
+                "agent status probe did not answer within {AGENT_STATUS_TIMEOUT:?} — a config \
+                 file may be a FIFO or otherwise non-regular"
+            );
+            (Vec::new(), Some(msg.clone()), Vec::new(), Some(msg))
+        }
+    }
+}
+
+fn collect_agent_status_blocking() -> AgentStatusResult {
+    let home = match AgentHome::from_env() {
+        Ok(home) => home,
+        Err(e) => {
+            let msg = e.to_string();
+            return (Vec::new(), Some(msg.clone()), Vec::new(), Some(msg));
+        }
+    };
+    let (status, status_error) = match roost_agent_install::status(&home) {
+        Ok(rows) => (rows, None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    let (trust, trust_error) = match roost_agent_install::trust_entries(&home) {
+        Ok(entries) => (entries, None),
+        Err(reason) => (Vec::new(), Some(reason.to_string())),
+    };
+    (status, status_error, trust, trust_error)
+}
+
+/// Every place a leftover pre-046 shell alias could still be sitting,
+/// checked for `--settings …claude-settings.json` (plan 046 §3.5).
+///
+/// **One line, and not a commented one.** The two substrings anywhere in
+/// the same file is not evidence of anything: a `# roostctl claude
+/// install` note the user pasted above their own config, or the two
+/// words landing on unrelated lines, would raise a warning telling them
+/// every Claude hook fires twice when nothing fires at all. A warning
+/// that is wrong is worse than no warning, so this asks for what an
+/// active alias actually looks like — both on one line, with nothing
+/// but whitespace before a `#`.
+///
+/// Still presence, not a parse: a line inside a heredoc, or one guarded
+/// by an `if` that never fires, still counts. The remedy is "look at
+/// this line and delete it if it is live", which stays useful either
+/// way — where a *commented* line does not, since the user already did
+/// that.
+///
+/// The file list is every rc a login or interactive shell reads without
+/// being told to, including `$ZDOTDIR` when zsh has been pointed
+/// somewhere else. What it cannot follow is a `source` into a file of
+/// the user's own naming; the residual is named in
+/// `agent_claude_legacy_settings_check`'s remedy rather than guessed at.
+/// Fish keeps a saved alias as a function file rather than a line in
+/// `config.fish`, hence the directory scan.
+fn legacy_claude_alias_present(home: &str, zdotdir: Option<&str>) -> bool {
+    let home = Path::new(home);
+    let mut candidates: Vec<PathBuf> = [
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_aliases",
+        ".profile",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".zlogin",
+    ]
+    .iter()
+    .map(|name| home.join(name))
+    .collect();
+    candidates.push(home.join(".config").join("fish").join("config.fish"));
+
+    // zsh reads its dot-files from `$ZDOTDIR` when it is set, so the
+    // `~/.zshrc` above is the wrong file on exactly the machines whose
+    // owner went to the trouble of moving it.
+    if let Some(dir) = zdotdir.filter(|d| !d.trim().is_empty()) {
+        let dir = Path::new(dir);
+        if dir != home {
+            candidates.extend(
+                [".zshrc", ".zshenv", ".zprofile", ".zlogin"]
+                    .iter()
+                    .map(|name| dir.join(name)),
+            );
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(home.join(".config").join("fish").join("functions")) {
+        candidates.extend(entries.flatten().map(|e| e.path()));
+    }
+    candidates.iter().any(
+        |path| match read_regular_file_capped(path, SETTINGS_READ_CAP) {
+            FileRead::Text(text) => text.lines().any(is_legacy_alias_line),
+            _ => false,
+        },
+    )
+}
+
+/// One line of a shell rc that would actually point Claude at the legacy
+/// file: both halves of `--settings …claude-settings.json` on it, and
+/// not commented out.
+fn is_legacy_alias_line(line: &str) -> bool {
+    let line = line.trim_start();
+    !line.starts_with('#') && line.contains("--settings") && line.contains("claude-settings.json")
 }
 
 const NO_SOCKET: &str = "target resolution found no socket to dial";
@@ -809,26 +1034,6 @@ fn is_executable_regular_file(path: &Path) -> bool {
         Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
         Err(_) => false,
     }
-}
-
-/// Resolve a command word the way a shell would: a word containing a
-/// slash is used as a path, anything else is searched on `PATH`.
-///
-/// Doctor never runs these — it only reports whether Claude's hook
-/// command *could* run. A bare `roostctl claude-hook SessionStart` works
-/// whenever `roostctl` is on Claude's PATH (the Linux `.deb` installs
-/// `/usr/bin/roostctl`), so rejecting non-absolute words outright would
-/// fail a healthy install — exactly the false positive §3.3's
-/// applicability rule exists to prevent.
-fn resolve_program(word: &str) -> Option<PathBuf> {
-    if word.contains('/') {
-        let p = Path::new(word);
-        return is_executable_regular_file(p).then(|| p.to_path_buf());
-    }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join(word))
-        .find(|candidate| is_executable_regular_file(candidate))
 }
 
 /// Doctor must be safe to run blind, so it never opens a path it has not
@@ -1089,9 +1294,22 @@ fn read_claude_settings(path: Option<&Path>) -> (SettingsProbe, Vec<String>, Vec
             )
         }
     };
-    let Some(hooks) = doc.get("hooks").and_then(|h| h.as_object()) else {
+    let Some(obj) = doc.as_object() else {
         return (
-            SettingsProbe::Unparseable("no `hooks` object".into()),
+            SettingsProbe::Unparseable("the document is not a JSON object".into()),
+            Vec::new(),
+            Vec::new(),
+        );
+    };
+    // Unlike the retired Roost-only file, a real `settings.json`
+    // routinely has no `hooks` key at all until something registers
+    // one — that is "not wired yet", not a parse failure.
+    let Some(hooks_value) = obj.get("hooks") else {
+        return (SettingsProbe::Parsed, Vec::new(), Vec::new());
+    };
+    let Some(hooks) = hooks_value.as_object() else {
+        return (
+            SettingsProbe::Unparseable("`hooks` is present but is not an object".into()),
             Vec::new(),
             Vec::new(),
         );
@@ -1117,20 +1335,19 @@ fn read_claude_settings(path: Option<&Path>) -> (SettingsProbe, Vec<String>, Vec
     (SettingsProbe::Parsed, events, commands)
 }
 
+/// Ownership is exact match, never a substring — the same rule the
+/// install engine writes by (`roost_agent_install::command`'s module
+/// doc). The installed command is a fixed `sh -c '…'` wrapper around
+/// `$ROOST_AGENT_HOOK`, so there is no argv to parse or exe to resolve
+/// any more: a command either is one Roost has ever produced for
+/// Claude, or it is the user's own and doctor has nothing to say about
+/// it beyond "not ours".
 fn resolve_hook_command(event: &str, raw: &str) -> HookCommand {
-    let argv = shell_split(raw);
-    let resolved = argv
-        .as_ref()
-        .and_then(|a| a.first())
-        .and_then(|word| resolve_program(word));
     HookCommand {
         event: event.to_string(),
         raw: raw.to_string(),
-        argv,
-        exe_executable: resolved.is_some(),
-        // Canonicalized on both sides so a relocated `Roost.app` (or a
-        // symlinked install) is not a false positive.
-        exe_canonical: resolved.and_then(|p| std::fs::canonicalize(p).ok()),
+        owned: owned_commands(Agent::Claude).iter().any(|c| c == raw),
+        current: raw == roost_agent_install::installed_command(Agent::Claude),
     }
 }
 
@@ -1198,10 +1415,14 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default().trim()
 }
 
-/// POSIX-ish word split — enough to read back what `claude_install`
-/// wrote, including its `'…'` quoting of paths with spaces. `None` when
-/// the quoting doesn't close.
-fn shell_split(input: &str) -> Option<Vec<String>> {
+/// POSIX-ish word split — enough to read back what the retired
+/// `claude_install` wrote, including its `'…'` quoting of paths with
+/// spaces. `None` when the quoting doesn't close.
+///
+/// `pub(crate)`: `main.rs`'s `legacy_claude_settings_matches_generated_shape`
+/// reads a legacy `claude-settings.json` with it, to decide whether
+/// `agent uninstall claude` may delete the file.
+pub(crate) fn shell_split(input: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut started = false;
@@ -1548,6 +1769,14 @@ pub fn evaluate(inputs: &Inputs) -> Report {
                 Kind::Check,
                 "claude.hook_events",
                 claude_checks(inputs, selection, selected, tabs.is_some(), model),
+            ),
+            section(
+                "agents",
+                "Agents",
+                "process",
+                Kind::Check,
+                "agent.hook_binary",
+                agent_checks(inputs, tabs, model),
             ),
         ],
     }
@@ -2615,14 +2844,14 @@ fn claude_checks(
             Status::Fail,
             format!(
                 "{path} is absent, yet the selected tab is owned by `claude` — something is \
-                 half-wired; run `roostctl claude install --force`"
+                 half-wired; run `roostctl agent install claude`"
             ),
         ),
         SettingsProbe::Absent => check(
             "claude.settings",
             "Settings file",
             Status::Skipped,
-            format!("{path} is absent — run `roostctl claude install`"),
+            format!("{path} is absent — run `roostctl agent install claude`"),
         ),
         SettingsProbe::Unreadable(e) => check(
             "claude.settings",
@@ -2724,160 +2953,406 @@ fn hook_events_check(inputs: &Inputs) -> Check {
         TITLE,
         Status::Fail,
         format!(
-            "missing {}; run `roostctl claude install --force`",
+            "missing {}; run `roostctl agent install claude`",
             missing.join(", ")
         ),
     )
 }
 
-/// Fold `(event, reason)` pairs into one line per *distinct* reason.
-///
-/// A real install fails the same way on every event — a relocated
-/// `Roost.app` makes every command resolve elsewhere — and printing
-/// the identical sentence once per event produced a ~500-character wall that
-/// buried the one fact worth reading. Distinct reasons stay distinct;
-/// only exact repeats collapse. First-appearance order is preserved so
-/// the text tracks the settings file's own key order.
-fn group_by_reason(entries: &[(String, String)], total: usize) -> String {
-    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
-    for (event, reason) in entries {
-        match groups.iter_mut().find(|(seen, _)| *seen == reason) {
-            Some((_, events)) => events.push(event),
-            None => groups.push((reason, vec![event])),
-        }
-    }
-    groups
-        .into_iter()
-        .map(|(reason, events)| match events.as_slice() {
-            [only] => format!("{only}: {reason}"),
-            many => format!(
-                "{} of {total} commands ({}): {reason}",
-                many.len(),
-                many.join(", ")
-            ),
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
+/// The commands `settings.json` registers, judged by byte equality
+/// against Roost's own strings — never by parsing argv, since the
+/// installed command is a fixed `sh -c '…'` wrapper with nothing left to
+/// resolve (plan 046 §3.5). Coexistence with a foreign hook (herdr, a
+/// user's own script) is normal here: a command that is not ours simply
+/// does not count toward coverage, and doctor has nothing to say about
+/// it.
 fn hook_command_check(inputs: &Inputs) -> Check {
     const ID: &str = "claude.hook_command";
     const TITLE: &str = "Hook commands";
     if !matches!(inputs.claude_settings, SettingsProbe::Parsed) {
         return check(ID, TITLE, Status::Skipped, unparsed_settings_reason(inputs));
     }
-    if inputs.claude_hook_commands.is_empty() {
-        return check(
-            ID,
-            TITLE,
-            Status::Fail,
-            "the settings file registers no command hooks",
-        );
-    }
 
-    let total = inputs.claude_hook_commands.len();
-    let mut failures: Vec<(String, String)> = Vec::new();
-    let mut warnings: Vec<(String, String)> = Vec::new();
-    // Which canonical events a *usable* command actually reaches. Key
-    // presence is not enough: `"StopFailure": []` keeps the key while
-    // guaranteeing the event can never arrive (§3.12's whole point).
-    let mut reached: Vec<&'static str> = Vec::new();
-    for cmd in &inputs.claude_hook_commands {
-        let event = redact(&cmd.event);
-        let Some(argv) = &cmd.argv else {
-            failures.push((event, "command quoting does not parse".to_string()));
-            continue;
-        };
-        // The installer's shape is `<exe> claude-hook <token>`; the token
-        // is where the legacy spellings live, so it — not the key — is
-        // what needs the normalizer.
-        let canonical = match argv.as_slice() {
-            [_, sub, token] if sub == "claude-hook" => match canonical_hook_event(token) {
-                Some(canonical) if canonical == cmd.event => canonical,
-                Some(canonical) => {
-                    failures.push((
-                        event,
-                        format!(
-                            "trailing token `{}` normalizes to {canonical}, not its key",
-                            redact(token)
-                        ),
-                    ));
-                    continue;
-                }
-                None => {
-                    failures.push((
-                        event,
-                        format!("trailing token `{}` is not a hook event", redact(token)),
-                    ));
-                    continue;
-                }
-            },
-            _ => {
-                failures.push((
-                    event,
-                    format!(
-                        "expected `<roostctl> claude-hook <event>`, got `{}`",
-                        redact(&cmd.raw)
-                    ),
-                ));
-                continue;
-            }
-        };
-        if !cmd.exe_executable {
-            let word = argv.first().map_or_else(String::new, |a| redact(a));
-            let reason = if word.contains('/') {
-                format!("`{word}` is missing or not executable")
-            } else {
-                format!("`{word}` is not on PATH and is not an executable file")
-            };
-            failures.push((event, reason));
-            continue;
-        }
-        // A command that runs the wrong binary still reaches the event —
-        // it is a warning, not a hole in the coverage below.
-        reached.push(canonical);
-        if let (Some(theirs), Some(ours)) = (&cmd.exe_canonical, &inputs.roostctl_exe) {
-            if theirs != ours {
-                warnings.push((
-                    event,
-                    format!(
-                        "resolves to {} rather than the running roostctl at {}",
-                        redact_path(theirs),
-                        redact_path(ours)
-                    ),
-                ));
-            }
-        }
-    }
-
+    // Which canonical events a *current* Roost command actually reaches.
+    // Key presence is not enough: `"StopFailure": []` keeps the key
+    // while guaranteeing the event can never arrive.
+    let reached: Vec<&str> = inputs
+        .claude_hook_commands
+        .iter()
+        .filter(|c| c.owned)
+        .map(|c| c.event.as_str())
+        .collect();
+    let stale: Vec<&str> = inputs
+        .claude_hook_commands
+        .iter()
+        .filter(|c| c.owned && !c.current)
+        .map(|c| c.event.as_str())
+        .collect();
     let unreached: Vec<&str> = CLAUDE_HOOK_EVENTS
         .iter()
         .copied()
         .filter(|want| !reached.contains(want))
         .collect();
 
-    let mut fatal = Vec::new();
-    if !failures.is_empty() {
-        fatal.push(group_by_reason(&failures, total));
-    }
     if !unreached.is_empty() {
-        fatal.push(format!(
-            "no usable command for {}; run `roostctl claude install --force`",
-            unreached.join(", ")
-        ));
+        return check(
+            ID,
+            TITLE,
+            Status::Fail,
+            format!(
+                "no Roost-owned command for {}; run `roostctl agent install claude`",
+                unreached.join(", ")
+            ),
+        );
     }
-    if !fatal.is_empty() {
-        return check(ID, TITLE, Status::Fail, fatal.join("; "));
-    }
-    if !warnings.is_empty() {
-        return check(ID, TITLE, Status::Warn, group_by_reason(&warnings, total));
+    if !stale.is_empty() {
+        return check(
+            ID,
+            TITLE,
+            Status::Warn,
+            format!(
+                "wired at an older integration version for {}; run `roostctl agent ensure`",
+                stale.join(", ")
+            ),
+        );
     }
     check(
         ID,
         TITLE,
         Status::Ok,
-        format!("all {total} hook commands point at this roostctl"),
+        format!(
+            "all {} events have a current Roost command",
+            CLAUDE_HOOK_EVENTS.len()
+        ),
     )
+}
+
+// -------------------------------------------------------------- agents
+
+/// The `id`/title pair for `<agent>`'s wiring check. A match rather than
+/// a `format!` because [`Check::id`] is `&'static str` — the whole point
+/// of §3.6's constructors is that a check id cannot be invented at
+/// runtime, and building one from `agent.source()` would defeat that.
+fn agent_wired_ids(agent: Agent) -> (&'static str, &'static str) {
+    match agent {
+        Agent::Claude => ("agent.claude.wired", "Claude Code — wired"),
+        Agent::Codex => ("agent.codex.wired", "Codex — wired"),
+        Agent::Grok => ("agent.grok.wired", "Grok — wired"),
+        Agent::Cursor => ("agent.cursor.wired", "Cursor — wired"),
+        Agent::Opencode => ("agent.opencode.wired", "OpenCode — wired"),
+    }
+}
+
+fn agent_owning_ids(agent: Agent) -> (&'static str, &'static str) {
+    match agent {
+        Agent::Claude => ("agent.claude.owning", "Claude Code — owning a tab"),
+        Agent::Codex => ("agent.codex.owning", "Codex — owning a tab"),
+        Agent::Grok => ("agent.grok.owning", "Grok — owning a tab"),
+        Agent::Cursor => ("agent.cursor.owning", "Cursor — owning a tab"),
+        Agent::Opencode => ("agent.opencode.owning", "OpenCode — owning a tab"),
+    }
+}
+
+fn agent_status_row(inputs: &Inputs, agent: Agent) -> Option<&AgentInstallStatus> {
+    inputs.agent_status.iter().find(|s| s.agent == agent)
+}
+
+/// `warning`s a [`AgentInstallStatus`] carries, redacted and joined —
+/// the readable line the plan asks for behind "a modified Roost entry"
+/// and "the state record was unreadable".
+fn agent_warnings_suffix(warnings: &[roost_agent_install::Warning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; {}",
+        warnings
+            .iter()
+            .map(|w| redact(&w.to_string()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// `present`, whether the entries are actually in the agent's own files,
+/// the integration version Roost's state record claims, and any skip
+/// reason or warning the install engine already computed — doctor never
+/// recomputes any of it, only renders it (plan 046 §3.7).
+///
+/// The record and the disk are **two sources**, and this reports them as
+/// two. A record deleted with `~/.config/roost` while the entries are
+/// still installed is not "not wired", and a record still saying v1 over
+/// entries that are current is not a clean `wired@v1`. Either one
+/// rendered alone is a check that reads healthy while the thing it names
+/// is wrong, so a disagreement is named rather than resolved — the
+/// remedy for all of them is the same `agent ensure`.
+fn agent_wired_check(inputs: &Inputs, agent: Agent) -> Check {
+    let (id, title) = agent_wired_ids(agent);
+    let Some(row) = agent_status_row(inputs, agent) else {
+        return match &inputs.agent_status_error {
+            Some(e) => check(
+                id,
+                title,
+                Status::Fail,
+                format!("could not probe: {}", redact(e)),
+            ),
+            None => check(id, title, Status::Skipped, "not probed"),
+        };
+    };
+    if !row.present {
+        return check(id, title, Status::Skipped, "not installed");
+    }
+    let suffix = agent_warnings_suffix(&row.warnings);
+    if let Some(reason) = &row.skipped {
+        return check(
+            id,
+            title,
+            Status::Fail,
+            format!("{}{suffix}", redact(&reason.to_string())),
+        );
+    }
+    let (status, detail) = match (row.entries_on_disk, row.wired, row.up_to_date) {
+        (false, None, _) => (
+            Status::Warn,
+            format!(
+                "present, not wired — run `roostctl agent install {}` (or check `agent-hooks` \
+                 in config.conf)",
+                agent.source()
+            ),
+        ),
+        (false, Some(v), _) => (
+            Status::Warn,
+            format!(
+                "the state record says wired@v{v}, but no Roost entry is in {}'s own config — \
+                 run `roostctl agent ensure`",
+                agent.source()
+            ),
+        ),
+        (true, None, _) => (
+            Status::Warn,
+            format!(
+                "wired in {}'s own config, but Roost's state record has no entry for it — run \
+                 `roostctl agent ensure`",
+                agent.source()
+            ),
+        ),
+        (true, Some(v), false) => (
+            Status::Warn,
+            format!("wired@v{v}, out of date — run `roostctl agent ensure`"),
+        ),
+        (true, Some(v), true) if v != roost_agent_install::INTEGRATION_VERSION => (
+            Status::Warn,
+            format!(
+                "the entries in {}'s own config are current (v{}), but Roost's state record \
+                 still says v{v} — run `roostctl agent ensure`",
+                agent.source(),
+                roost_agent_install::INTEGRATION_VERSION
+            ),
+        ),
+        (true, Some(v), true) => (Status::Ok, format!("wired@v{v}")),
+    };
+    // A modified-entry or unreadable-record warning is worth surfacing
+    // even when the wiring itself is otherwise current.
+    let status = if status == Status::Ok && !row.warnings.is_empty() {
+        Status::Warn
+    } else {
+        status
+    };
+    check(id, title, status, format!("{detail}{suffix}"))
+}
+
+/// `ROOST_AGENT_HOOK` resolvable and executable from *this* tab's
+/// environment — the one fact every agent's installed command depends
+/// on, so it is reported once rather than five times.
+fn hook_binary_check(inputs: &Inputs) -> Check {
+    const ID: &str = "agent.hook_binary";
+    const TITLE: &str = "Hook binary";
+    if !inside_roost_tab(inputs) {
+        return not_in_tab(ID, TITLE);
+    }
+    match &inputs.env_agent_hook {
+        None => check(
+            ID,
+            TITLE,
+            Status::Fail,
+            "ROOST_AGENT_HOOK is unset inside this tab — every installed agent hook falls back \
+             to its inert branch (empty JSON, exit 0), so nothing reaches Roost",
+        ),
+        Some(path) if inputs.env_agent_hook_executable => check(
+            ID,
+            TITLE,
+            Status::Ok,
+            format!("{} is executable", redact_path(Path::new(path))),
+        ),
+        Some(path) => check(
+            ID,
+            TITLE,
+            Status::Fail,
+            format!(
+                "ROOST_AGENT_HOOK={} does not resolve to an executable regular file",
+                redact_path(Path::new(path))
+            ),
+        ),
+    }
+}
+
+/// Expected vs present `trusted_hash`, per event codex has a Roost
+/// handler wired for right now. Codex-only: it is the one agent whose
+/// trust store can drift independently of the handler it guards.
+fn agent_codex_trust_check(inputs: &Inputs) -> Check {
+    const ID: &str = "agent.codex.trust";
+    const TITLE: &str = "Codex — trust hash";
+    if let Some(err) = &inputs.agent_codex_trust_error {
+        return check(ID, TITLE, Status::Warn, redact(err));
+    }
+    if inputs.agent_codex_trust.is_empty() {
+        return check(ID, TITLE, Status::Skipped, "nothing wired for codex yet");
+    }
+    let drifted: Vec<&str> = inputs
+        .agent_codex_trust
+        .iter()
+        .filter(|e| e.present.as_deref() != Some(e.expected.as_str()))
+        .map(|e| e.event)
+        .collect();
+    if drifted.is_empty() {
+        return check(
+            ID,
+            TITLE,
+            Status::Ok,
+            format!(
+                "{} trusted hash{} match what codex would compute",
+                inputs.agent_codex_trust.len(),
+                if inputs.agent_codex_trust.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                }
+            ),
+        );
+    }
+    check(
+        ID,
+        TITLE,
+        Status::Fail,
+        format!(
+            "trusted_hash drift for {} — codex will ask to review the hook again; run \
+             `roostctl agent ensure`",
+            drifted.join(", ")
+        ),
+    )
+}
+
+/// That `agent`'s source currently owns a tab **on this UI** — a
+/// snapshot, not a durable "ever observed" store, hence "owning" and
+/// not "observed" (plan 046, amended during C9).
+fn agent_owning_check(tabs: Option<&TabListResult>, model: AgentModel, agent: Agent) -> Check {
+    let (id, title) = agent_owning_ids(agent);
+    let unavailable = match (tabs, model) {
+        (None, _) => Some("unavailable (no tab.list from a running UI)"),
+        (_, AgentModel::Malformed) => {
+            Some("unavailable (the UI's tab.list response did not decode)")
+        }
+        (_, AgentModel::Absent) => Some("unavailable (server predates the agent state model)"),
+        _ => None,
+    };
+    if let Some(reason) = unavailable {
+        return check(id, title, Status::Skipped, reason);
+    }
+    let owns = tabs
+        .into_iter()
+        .flat_map(|t| &t.projects)
+        .flat_map(|p| &p.tabs)
+        .any(|t| {
+            t.ownership
+                .as_ref()
+                .is_some_and(|o| o.source == agent.source())
+        });
+    if owns {
+        check(
+            id,
+            title,
+            Status::Ok,
+            format!("`{}` owns a tab on this UI right now", agent.source()),
+        )
+    } else {
+        check(
+            id,
+            title,
+            Status::Skipped,
+            format!(
+                "no tab on this UI is currently owned by `{}`",
+                agent.source()
+            ),
+        )
+    }
+}
+
+/// The legacy `~/.config/roost/claude-settings.json` this crate wrote
+/// before plan 046, and the shell alias that pointed Claude at it.
+/// Warns rather than fails: neither is harmful to state, only wasteful
+/// (every event fires twice) and wrong on a second machine (the old
+/// alias bakes in an absolute path).
+///
+/// The two halves are reported **separately**, because only having both
+/// costs anything. A file nobody points at delivers nothing; an alias
+/// pointing at a file that is gone delivers nothing either (and may
+/// stop `claude` from starting). Saying "delivered twice" for either one
+/// alone would be a diagnostic that is simply wrong about what is
+/// happening, which is the failure mode this whole section exists to
+/// avoid.
+fn agent_claude_legacy_settings_check(inputs: &Inputs) -> Check {
+    const ID: &str = "agent.claude.legacy_settings";
+    const TITLE: &str = "Legacy Claude settings";
+    const REMOVE_FILE: &str = "delete ~/.config/roost/claude-settings.json (`roostctl agent \
+                               uninstall claude` does it when the file still matches what \
+                               `claude install` wrote)";
+    const REMOVE_ALIAS: &str = "remove the `alias claude=…` line from your shell rc \
+                                (.bashrc/.zshrc/.bash_profile/.profile, `$ZDOTDIR` if you set \
+                                one, anything they source, or fish's config.fish / `alias \
+                                --save` output)";
+    let detail = match (
+        inputs.legacy_claude_settings_present,
+        inputs.legacy_claude_alias_in_rc,
+    ) {
+        (false, false) => {
+            return check(
+                ID,
+                TITLE,
+                Status::Ok,
+                "no leftover ~/.config/roost/claude-settings.json or shell alias found",
+            )
+        }
+        (true, true) => format!(
+            "~/.config/roost/claude-settings.json still exists and a shell rc still passes \
+             `--settings` at it — so every Claude hook event is delivered twice once agent \
+             hooks are also wired into ~/.claude/settings.json. Remove both: {REMOVE_FILE}, and \
+             {REMOVE_ALIAS}"
+        ),
+        (true, false) => format!(
+            "~/.config/roost/claude-settings.json still exists, but no shell rc points Claude at \
+             it, so nothing is reading it — {REMOVE_FILE}"
+        ),
+        (false, true) => format!(
+            "a shell rc still passes `--settings …claude-settings.json`, but that file is gone — \
+             the alias now points Claude at a path that does not exist; {REMOVE_ALIAS}"
+        ),
+    };
+    check(ID, TITLE, Status::Warn, detail)
+}
+
+fn agent_checks(inputs: &Inputs, tabs: Option<&TabListResult>, model: AgentModel) -> Vec<Check> {
+    let mut out = vec![hook_binary_check(inputs)];
+    for agent in ALL_INSTALL_AGENTS {
+        out.push(agent_wired_check(inputs, agent));
+        if agent == Agent::Codex {
+            out.push(agent_codex_trust_check(inputs));
+        }
+        out.push(agent_owning_check(tabs, model, agent));
+        if agent == Agent::Claude {
+            out.push(agent_claude_legacy_settings_check(inputs));
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -3287,13 +3762,14 @@ mod tests {
     /// A healthy zsh session inside tab 7 of a current UI.
     fn healthy() -> Inputs {
         Inputs {
-            roostctl_exe: Some(PathBuf::from("/usr/local/bin/roostctl")),
             now_unix: 1_700_000_100,
             env_tab_id: Some("7".into()),
             env_socket: Some("/tmp/roost.sock".into()),
             env_shell_integration: Some("1".into()),
             env_shell_features: Some("cwd,title,marks,prompt,ssh-env".into()),
             env_resources_dir: Some("/opt/roost".into()),
+            env_agent_hook: Some("/opt/roost/bin/roostctl".into()),
+            env_agent_hook_executable: true,
             shell_path: Some("/bin/zsh".into()),
             shell_usable: true,
             shell_version: SubprocessOutcome::Output("zsh 5.9 (arm-apple-darwin24.0)".into()),
@@ -3357,8 +3833,8 @@ mod tests {
         assert_eq!(c.status, Some(want), "{id}: {}", c.detail);
     }
 
-    /// The fixed inventory (§3.7): 18 checks + 8 observations.
-    const CHECK_COUNT: usize = 26;
+    /// The fixed inventory (§3.7): 31 checks + 8 observations.
+    const CHECK_COUNT: usize = 39;
 
     // ------------------------------------------------- applicability (AC 7)
 
@@ -4076,7 +4552,7 @@ mod tests {
             }])),
             claude_settings: SettingsProbe::Parsed,
             claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
-            claude_hook_commands: hook_commands(&["/usr/local/bin/roostctl"]),
+            claude_hook_commands: hook_commands(HookKind::Current),
             ..healthy()
         };
         let report = evaluate(&inputs);
@@ -4228,20 +4704,29 @@ mod tests {
 
     // ------------------------------------------------------------- claude
 
-    fn hook_commands(exes: &[&str]) -> Vec<HookCommand> {
+    /// The three states a settings-file command can be in, under the
+    /// byte-equality model `hook_command_check` judges by: `Current`
+    /// (this integration version, exactly), `Stale` (an older Roost
+    /// spelling — still owned, still counted as reached, but warned
+    /// about), and `Foreign` (not ours at all — a herdr-style
+    /// coexistence entry, or anything else).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HookKind {
+        Current,
+        Stale,
+        Foreign,
+    }
+
+    fn hook_commands(kind: HookKind) -> Vec<HookCommand> {
         CLAUDE_HOOK_EVENTS
             .iter()
-            .zip(exes.iter().cycle())
-            .map(|(event, exe)| HookCommand {
-                event: (*event).to_string(),
-                raw: format!("{exe} claude-hook {event}"),
-                argv: Some(vec![
-                    (*exe).to_string(),
-                    "claude-hook".into(),
-                    (*event).to_string(),
-                ]),
-                exe_executable: true,
-                exe_canonical: Some(PathBuf::from(*exe)),
+            .map(|event| {
+                let raw = match kind {
+                    HookKind::Current => roost_agent_install::installed_command(Agent::Claude),
+                    HookKind::Stale => owned_commands(Agent::Claude)[1].clone(),
+                    HookKind::Foreign => format!("/opt/other/roostctl claude-hook {event}"),
+                };
+                resolve_hook_command(event, &raw)
             })
             .collect()
     }
@@ -4258,28 +4743,25 @@ mod tests {
 
     #[test]
     fn a_fully_installed_claude_passes() {
-        let report = evaluate(&configured(hook_commands(&["/usr/local/bin/roostctl"])));
+        let report = evaluate(&configured(hook_commands(HookKind::Current)));
         for id in ["claude.binary", "claude.settings", "claude.hook_events"] {
             assert_status(&report, id, Status::Ok);
         }
         assert_status(&report, "claude.hook_command", Status::Ok);
     }
 
-    /// The one token `EventKind::parse` used to reject. Every already
-    /// installed settings file on disk carries it, so it must pass.
+    /// A settings file coexisting with a foreign tool (herdr, a user's
+    /// own script) is normal, not a fault: doctor has nothing to say
+    /// about an entry that was never Roost's.
     #[test]
-    fn the_legacy_prompt_submit_token_passes() {
-        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
-        for cmd in &mut commands {
-            if cmd.event == "UserPromptSubmit" {
-                cmd.raw = "/usr/local/bin/roostctl claude-hook prompt-submit".into();
-                cmd.argv = Some(vec![
-                    "/usr/local/bin/roostctl".into(),
-                    "claude-hook".into(),
-                    "prompt-submit".into(),
-                ]);
-            }
-        }
+    fn foreign_commands_alongside_ours_do_not_count_against_it() {
+        let mut commands = hook_commands(HookKind::Current);
+        commands.push(HookCommand {
+            event: "Stop".to_string(),
+            raw: "herdr --hook stop".to_string(),
+            owned: false,
+            current: false,
+        });
         assert_status(
             &evaluate(&configured(commands)),
             "claude.hook_command",
@@ -4287,96 +4769,63 @@ mod tests {
         );
     }
 
+    /// An event whose only command is not ours at all is unreachable —
+    /// the coverage hole is reported and the event is named.
     #[test]
-    fn a_token_that_does_not_normalize_to_its_key_fails() {
-        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
-        commands[0].argv = Some(vec![
-            "/usr/local/bin/roostctl".into(),
-            "claude-hook".into(),
-            "Stop".into(),
-        ]);
+    fn an_event_with_only_a_foreign_command_fails() {
+        let mut commands = hook_commands(HookKind::Current);
+        commands[0] = resolve_hook_command(&commands[0].event, "herdr --hook stop");
         let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
         assert_eq!(c.status, Some(Status::Fail));
-        assert!(c.detail.contains("not its key"), "{}", c.detail);
-        assert!(c.docs_url.is_some());
-    }
-
-    #[test]
-    fn a_missing_or_non_executable_hook_binary_fails() {
-        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
-        commands[0].exe_executable = false;
-        commands[0].exe_canonical = None;
-        let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
-        assert_eq!(c.status, Some(Status::Fail));
-        assert!(c.detail.contains("not executable"), "{}", c.detail);
-    }
-
-    #[test]
-    fn a_hook_pointing_at_a_different_binary_warns() {
-        let c = find(
-            &evaluate(&configured(hook_commands(&["/opt/other/roostctl"]))),
-            "claude.hook_command",
-        )
-        .clone();
-        assert_eq!(c.status, Some(Status::Warn));
-        assert!(c.detail.contains("/opt/other/roostctl"), "{}", c.detail);
-    }
-
-    /// The common shape — a relocated binary breaks every command the
-    /// same way — must read as one sentence naming the count and the
-    /// events, not as one near-identical sentence per event.
-    #[test]
-    fn one_reason_shared_by_every_command_collapses_to_one_line() {
-        let n = CLAUDE_HOOK_EVENTS.len();
-        let c = find(
-            &evaluate(&configured(hook_commands(&["/opt/other/roostctl"]))),
-            "claude.hook_command",
-        )
-        .clone();
-        assert_eq!(
-            c.detail.matches("rather than the running roostctl").count(),
-            1,
-            "the shared reason should appear once: {}",
+        assert!(c.detail.contains("no Roost-owned command"), "{}", c.detail);
+        assert!(
+            c.detail.contains(CLAUDE_HOOK_EVENTS[0]),
+            "the unreached event must be named: {}",
             c.detail
         );
         assert!(
-            c.detail.starts_with(&format!("{n} of {n} commands (")),
+            c.detail.contains("roostctl agent install claude"),
             "{}",
             c.detail
         );
+        assert!(c.docs_url.is_some());
+    }
+
+    /// Nothing Roost's is registered at all — every event foreign — and
+    /// every one of them is named in the one failure.
+    #[test]
+    fn every_event_foreign_fails_and_names_all_of_them() {
+        let c = find(
+            &evaluate(&configured(hook_commands(HookKind::Foreign))),
+            "claude.hook_command",
+        )
+        .clone();
+        assert_eq!(c.status, Some(Status::Fail), "{}", c.detail);
         for event in CLAUDE_HOOK_EVENTS {
             assert!(c.detail.contains(event), "{event} missing: {}", c.detail);
         }
     }
 
-    /// …but two different faults must not be merged into one.
+    /// Wired, but by an older Roost: every event still reaches Roost
+    /// (`owned`), so this is a warning naming every stale event, not a
+    /// failure.
     #[test]
-    fn distinct_reasons_stay_distinct() {
-        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
-        commands[0].argv = None;
-        commands[1].argv = Some(vec![
-            "/usr/local/bin/roostctl".into(),
-            "claude-hook".into(),
-            "not-an-event".into(),
-        ]);
-        let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
-        assert_eq!(c.status, Some(Status::Fail));
-        assert!(c.detail.contains("does not parse"), "{}", c.detail);
-        assert!(c.detail.contains("is not a hook event"), "{}", c.detail);
-        // Two events, two reasons — each named individually, no grouping.
-        assert!(!c.detail.contains(" commands ("), "{}", c.detail);
-    }
-
-    #[test]
-    fn unparseable_hook_quoting_fails() {
-        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
-        commands[0].argv = None;
-        commands[0].raw = "'/unterminated claude-hook SessionStart".into();
-        assert_status(
-            &evaluate(&configured(commands)),
+    fn a_stale_integration_version_warns() {
+        let c = find(
+            &evaluate(&configured(hook_commands(HookKind::Stale))),
             "claude.hook_command",
-            Status::Fail,
+        )
+        .clone();
+        assert_eq!(c.status, Some(Status::Warn), "{}", c.detail);
+        assert!(
+            c.detail.contains("older integration version"),
+            "{}",
+            c.detail
         );
+        assert!(c.detail.contains("roostctl agent ensure"), "{}", c.detail);
+        for event in CLAUDE_HOOK_EVENTS {
+            assert!(c.detail.contains(event), "{event} missing: {}", c.detail);
+        }
     }
 
     /// The keys can all be present and an event still be unreachable —
@@ -4384,7 +4833,7 @@ mod tests {
     /// checks `ok` on a settings file no `StopFailure` can ever traverse.
     #[test]
     fn an_event_with_no_usable_command_fails_even_with_every_key_present() {
-        let commands: Vec<HookCommand> = hook_commands(&["/usr/local/bin/roostctl"])
+        let commands: Vec<HookCommand> = hook_commands(HookKind::Current)
             .into_iter()
             .filter(|c| c.event != "StopFailure")
             .collect();
@@ -4394,25 +4843,12 @@ mod tests {
         let c = find(&report, "claude.hook_command");
         assert_eq!(c.status, Some(Status::Fail), "{}", c.detail);
         assert!(c.detail.contains("StopFailure"), "{}", c.detail);
-        assert!(c.detail.contains("--force"), "{}", c.detail);
-        assert!(c.docs_url.is_some());
-    }
-
-    /// An event whose only command is broken is unreachable too — the
-    /// per-command failure and the coverage hole are both reported.
-    #[test]
-    fn a_broken_command_leaves_its_event_unreached() {
-        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
-        commands[0].exe_executable = false;
-        commands[0].exe_canonical = None;
-        let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
-        assert_eq!(c.status, Some(Status::Fail));
-        assert!(c.detail.contains("not executable"), "{}", c.detail);
         assert!(
-            c.detail.contains(CLAUDE_HOOK_EVENTS[0]),
-            "the unreached event must be named: {}",
+            c.detail.contains("roostctl agent install claude"),
+            "{}",
             c.detail
         );
+        assert!(c.docs_url.is_some());
     }
 
     #[test]
@@ -4423,12 +4859,16 @@ mod tests {
                 .filter(|e| **e != "StopFailure")
                 .map(|e| e.to_string())
                 .collect(),
-            ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
+            ..configured(hook_commands(HookKind::Current))
         };
         let c = find(&evaluate(&inputs), "claude.hook_events").clone();
         assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("StopFailure"), "{}", c.detail);
-        assert!(c.detail.contains("--force"), "{}", c.detail);
+        assert!(
+            c.detail.contains("roostctl agent install claude"),
+            "{}",
+            c.detail
+        );
     }
 
     #[test]
@@ -4481,7 +4921,7 @@ mod tests {
             claude_version: SubprocessOutcome::TimedOut,
             claude_settings: SettingsProbe::Parsed,
             claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
-            claude_hook_commands: hook_commands(&["/usr/local/bin/roostctl"]),
+            claude_hook_commands: hook_commands(HookKind::Current),
             ..healthy()
         };
         let c = find(&evaluate(&slow), "claude.binary").clone();
@@ -4510,7 +4950,7 @@ mod tests {
                     ..tab(9)
                 },
             ])),
-            ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
+            ..configured(hook_commands(HookKind::Current))
         };
         let c = find(&evaluate(&inputs), "claude.observed").clone();
         assert_eq!(c.status, Some(Status::Skipped));
@@ -4701,11 +5141,12 @@ mod tests {
                 claude_settings_path: Some(PathBuf::from(format!("/home/u/settings.json{forge}"))),
                 claude_settings: SettingsProbe::Parsed,
                 claude_version: SubprocessOutcome::Output("2.1.220".into()),
-                claude_hook_commands: {
-                    let mut c = hook_commands(&["/usr/local/bin/roostctl"]);
-                    c[0].exe_canonical = Some(PathBuf::from(format!("/other/roostctl{forge}")));
-                    c
-                },
+                // `claude.hook_command` no longer echoes any part of a
+                // command string into its detail (byte equality against
+                // a fixed set of Roost strings has nothing left to
+                // report per-command) — this fixture is exercised via
+                // `claude_settings_path` above instead.
+                claude_hook_commands: hook_commands(HookKind::Current),
                 claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
                 ..healthy()
             }
@@ -4756,7 +5197,6 @@ mod tests {
                 "ui.identify",
                 "claude.settings",
                 "shell.resources",
-                "claude.hook_command",
             ] {
                 assert!(find(&report, id).detail.contains("\\n"), "{id}");
             }
@@ -5145,6 +5585,7 @@ mod tests {
         ("shell", "shell.marks_observed"),
         ("tab", "tab.derived"),
         ("claude", "claude.hook_events"),
+        ("agents", "agent.hook_binary"),
     ];
 
     fn section_of<'a>(report: &'a Report, id: &str) -> &'a Section {
@@ -5170,7 +5611,49 @@ mod tests {
                 }),
                 ..tab(7)
             }])),
-            ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
+            ..configured(hook_commands(HookKind::Current))
+        }
+    }
+
+    /// Every agent wired at the current version, trusted (codex), owning
+    /// a tab of its own, and no legacy Claude leftovers — the one
+    /// fixture where the whole `agents` section rolls up to `ok`. Five
+    /// tabs, one per agent, because ownership is one source per tab.
+    fn agents_fully_wired() -> Inputs {
+        let tabs: Vec<Tab> = ALL_INSTALL_AGENTS
+            .iter()
+            .enumerate()
+            .map(|(i, agent)| Tab {
+                ownership: Some(Ownership {
+                    source: agent.source().to_string(),
+                    session_id: "s-1".into(),
+                    last_event_at: 1_700_000_040,
+                    ..Ownership::default()
+                }),
+                ..tab(100 + i as i64)
+            })
+            .collect();
+        Inputs {
+            tab_list: Ok(tab_list(&tabs)),
+            agent_status: ALL_INSTALL_AGENTS
+                .iter()
+                .map(|agent| AgentInstallStatus {
+                    agent: *agent,
+                    present: true,
+                    entries_on_disk: true,
+                    wired: Some(roost_agent_install::INTEGRATION_VERSION),
+                    up_to_date: true,
+                    noticed: true,
+                    skipped: None,
+                    warnings: Vec::new(),
+                })
+                .collect(),
+            agent_codex_trust: vec![TrustEntry {
+                event: "Stop",
+                expected: "sha256:aaaa".into(),
+                present: Some("sha256:aaaa".into()),
+            }],
+            ..healthy()
         }
     }
 
@@ -5308,7 +5791,7 @@ mod tests {
             ),
             (
                 "claude warn",
-                configured(hook_commands(&["/opt/other/roostctl"])),
+                configured(hook_commands(HookKind::Stale)),
                 "claude",
                 Some(Status::Warn),
                 "claude.hook_command",
@@ -5323,14 +5806,38 @@ mod tests {
             (
                 "claude fail",
                 configured({
-                    let mut c = hook_commands(&["/usr/local/bin/roostctl"]);
-                    c[0].exe_executable = false;
-                    c[0].exe_canonical = None;
+                    let mut c = hook_commands(HookKind::Current);
+                    c[0].owned = false;
+                    c[0].current = false;
                     c
                 }),
                 "claude",
                 Some(Status::Fail),
                 "claude.hook_command",
+            ),
+            (
+                "agents ok",
+                agents_fully_wired(),
+                "agents",
+                Some(Status::Ok),
+                "agent.hook_binary",
+            ),
+            (
+                "agents skipped",
+                Inputs::default(),
+                "agents",
+                Some(Status::Skipped),
+                "agent.hook_binary",
+            ),
+            (
+                "agents fail",
+                Inputs {
+                    agent_status_error: Some("boom".into()),
+                    ..healthy()
+                },
+                "agents",
+                Some(Status::Fail),
+                "agent.claude.wired",
             ),
         ];
 
@@ -5490,14 +5997,14 @@ mod tests {
     }
 
     /// "One line per section" against a real overlong detail:
-    /// `claude.hook_command`'s warn names every event and two absolute
-    /// paths — past 200 characters in the field, which wraps to three or
-    /// four lines in an 80-column terminal and destroys the scan the
+    /// `claude.hook_command`'s stale-version warning names every event —
+    /// past 200 characters in the field, which wraps to three or four
+    /// lines in an 80-column terminal and destroys the scan the
     /// rolled-up view exists to provide. `-v` and `--json` keep the whole
     /// sentence, and the header line names `-v`.
     #[test]
     fn an_overlong_headline_is_clipped_in_the_summary_but_whole_in_v_and_json() {
-        let report = evaluate(&configured(hook_commands(&["/opt/other/roostctl"])));
+        let report = evaluate(&configured(hook_commands(HookKind::Stale)));
         let claude = section_of(&report, "claude");
         let (_, headline_w) = summary_columns(&report);
         assert!(
@@ -5817,6 +6324,19 @@ mod tests {
             ("claude.hook_events", "Registered events"),
             ("claude.hook_command", "Hook commands"),
             ("claude.observed", "Hooks reaching Roost"),
+            ("agent.hook_binary", "Hook binary"),
+            ("agent.claude.wired", "Claude Code — wired"),
+            ("agent.claude.owning", "Claude Code — owning a tab"),
+            ("agent.claude.legacy_settings", "Legacy Claude settings"),
+            ("agent.codex.wired", "Codex — wired"),
+            ("agent.codex.trust", "Codex — trust hash"),
+            ("agent.codex.owning", "Codex — owning a tab"),
+            ("agent.grok.wired", "Grok — wired"),
+            ("agent.grok.owning", "Grok — owning a tab"),
+            ("agent.cursor.wired", "Cursor — wired"),
+            ("agent.cursor.owning", "Cursor — owning a tab"),
+            ("agent.opencode.wired", "OpenCode — wired"),
+            ("agent.opencode.owning", "OpenCode — owning a tab"),
         ];
         assert_eq!(EXPECTED.len(), CHECK_COUNT);
         // Every fixture the suite has, so a check whose title differs
@@ -5923,8 +6443,9 @@ mod tests {
     /// branch a check can take. Shared by the two invariant tests below
     /// so a newly added check is exercised by both.
     fn doc_url_battery() -> Vec<Inputs> {
-        let mut commands = hook_commands(&["/opt/other/roostctl"]);
-        commands[0].exe_executable = false;
+        let mut commands = hook_commands(HookKind::Stale);
+        commands[0].owned = false;
+        commands[0].current = false;
         vec![
             Inputs::default(),
             healthy(),
@@ -6228,33 +6749,547 @@ mod tests {
         assert_eq!(crate::parse_tab_id("7"), Some(7));
     }
 
-    /// F5: a bare `roostctl claude-hook …` works whenever `roostctl` is
-    /// on Claude's PATH — the Linux `.deb` puts one at `/usr/bin` — so
-    /// rejecting every non-absolute word failed a healthy install.
+    /// `resolve_hook_command`'s whole judgement is byte equality against
+    /// [`owned_commands`] — no argv, no PATH, nothing left to resolve
+    /// once the installed command is a fixed `sh -c '…'` wrapper.
     #[test]
-    fn a_hook_command_word_resolves_through_path() {
-        // Reads `PATH`, which the `collect` tests below overwrite. libtest
-        // runs them on separate threads and concurrent setenv/getenv is
-        // UB, so this takes the same mutex they do. `blocking_lock` is
-        // safe here precisely because this test has no runtime.
-        let _env = ENV.blocking_lock();
-        // `sh` is on PATH and at an absolute path on every platform this
-        // ships to; nothing else about it matters here.
-        let bare = resolve_program("sh").expect("`sh` must resolve through PATH");
-        assert!(bare.is_absolute(), "{}", bare.display());
-        assert_eq!(resolve_program("/bin/sh"), Some(PathBuf::from("/bin/sh")));
-        assert_eq!(resolve_program("roostctl-does-not-exist-xyz"), None);
-        assert_eq!(resolve_program("/nope/roostctl"), None);
-        // A word with a slash is never PATH-searched, even a bare-looking
-        // relative one.
-        assert_eq!(resolve_program("./sh"), None);
+    fn resolve_hook_command_is_byte_equality_against_owned_commands() {
+        let current = roost_agent_install::installed_command(Agent::Claude);
+        let stale = owned_commands(Agent::Claude)[1].clone();
 
-        let cmd = resolve_hook_command("Stop", "sh claude-hook stop");
+        let c = resolve_hook_command("Stop", &current);
+        assert!(c.owned && c.current, "{c:?}");
+
+        let s = resolve_hook_command("Stop", &stale);
+        assert!(s.owned && !s.current, "{s:?}");
+
+        let f = resolve_hook_command("Stop", "herdr --hook stop");
+        assert!(!f.owned && !f.current, "{f:?}");
+
+        // A near-miss — one byte off the real string — is foreign, not
+        // "close enough": ownership is exact match, never a substring.
+        let near = resolve_hook_command("Stop", &format!("{current} "));
+        assert!(!near.owned, "{near:?}");
+    }
+
+    // ------------------------------------------------------------- agents
+
+    /// `entries_on_disk` is deliberately its own parameter rather than
+    /// something derived from `wired`: the pair disagreeing is the state
+    /// this renderer exists to describe, and a fixture that could not
+    /// spell the disagreement is how the previous version of these tests
+    /// passed while doctor reported a fully wired machine as unwired.
+    /// The install engine's own `ensure::tests` cover that the two are
+    /// read from the record and from the disk respectively.
+    fn make_agent_status(
+        agent: Agent,
+        present: bool,
+        entries_on_disk: bool,
+        wired: Option<u32>,
+        up_to_date: bool,
+        skipped: Option<roost_agent_install::SkipReason>,
+        warnings: Vec<roost_agent_install::Warning>,
+    ) -> AgentInstallStatus {
+        AgentInstallStatus {
+            agent,
+            present,
+            entries_on_disk,
+            wired,
+            up_to_date,
+            noticed: true,
+            skipped,
+            warnings,
+        }
+    }
+
+    #[test]
+    fn hook_binary_check_covers_unset_missing_and_ok() {
+        let unset = evaluate(&healthy_without_hook_binary()).clone();
+        assert_status(&unset, "agent.hook_binary", Status::Fail);
         assert!(
-            cmd.exe_executable,
-            "a PATH-resolved hook must not read as missing"
+            find(&unset, "agent.hook_binary").detail.contains("unset"),
+            "{}",
+            find(&unset, "agent.hook_binary").detail
         );
-        assert!(cmd.exe_canonical.is_some());
+
+        let not_executable = Inputs {
+            env_agent_hook: Some("/opt/roost/bin/roostctl".into()),
+            env_agent_hook_executable: false,
+            ..healthy()
+        };
+        let c = find(&evaluate(&not_executable), "agent.hook_binary").clone();
+        assert_eq!(c.status, Some(Status::Fail));
+        assert!(c.detail.contains("does not resolve"), "{}", c.detail);
+
+        assert_status(&evaluate(&healthy()), "agent.hook_binary", Status::Ok);
+
+        // Outside a tab, ROOST_AGENT_HOOK is meaningless — skipped, not
+        // failed, same as every other in-tab-only check.
+        assert_status(
+            &evaluate(&Inputs::default()),
+            "agent.hook_binary",
+            Status::Skipped,
+        );
+    }
+
+    fn healthy_without_hook_binary() -> Inputs {
+        Inputs {
+            env_agent_hook: None,
+            env_agent_hook_executable: false,
+            ..healthy()
+        }
+    }
+
+    #[test]
+    fn agent_wired_check_covers_every_status() {
+        // Not probed at all (the fixture never populated `agent_status`).
+        assert_status(&evaluate(&healthy()), "agent.claude.wired", Status::Skipped);
+        assert_eq!(
+            find(&evaluate(&healthy()), "agent.claude.wired").detail,
+            "not probed"
+        );
+
+        // The probe itself failed (e.g. $HOME unset).
+        let probe_failed = Inputs {
+            agent_status_error: Some("no home directory".into()),
+            ..healthy()
+        };
+        let c = find(&evaluate(&probe_failed), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Fail));
+        assert!(c.detail.contains("could not probe"), "{}", c.detail);
+
+        // Not installed.
+        let not_present = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                false,
+                false,
+                None,
+                false,
+                None,
+                vec![],
+            )],
+            ..healthy()
+        };
+        assert_status(
+            &evaluate(&not_present),
+            "agent.claude.wired",
+            Status::Skipped,
+        );
+        assert_eq!(
+            find(&evaluate(&not_present), "agent.claude.wired").detail,
+            "not installed"
+        );
+
+        // Present, never wired.
+        let unwired = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                false,
+                None,
+                false,
+                None,
+                vec![],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&unwired), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(c.detail.contains("not wired"), "{}", c.detail);
+
+        // Wired, stale integration version.
+        let stale = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                true,
+                Some(1),
+                false,
+                None,
+                vec![],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&stale), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(c.detail.contains("out of date"), "{}", c.detail);
+
+        // Wired and current.
+        let current = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                true,
+                Some(2),
+                true,
+                None,
+                vec![],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&current), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Ok));
+        assert_eq!(c.detail, "wired@v2");
+
+        // Record and disk disagreeing, both ways round. Neither may
+        // render as `ok`, and neither may render as the plain "present,
+        // not wired" that sends the user to reinstall.
+        let record_lost = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                true,
+                None,
+                true,
+                None,
+                vec![],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&record_lost), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(
+            c.detail.contains("state record has no entry"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            !c.detail.contains("present, not wired"),
+            "the entries are right there: {}",
+            c.detail
+        );
+
+        let record_only = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                false,
+                Some(2),
+                false,
+                None,
+                vec![],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&record_only), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(c.detail.contains("no Roost entry is in"), "{}", c.detail);
+
+        // Current entries under a stale record version. `up_to_date`
+        // alone would paint this green at the version the record
+        // happens to remember.
+        let stale_record = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                true,
+                Some(1),
+                true,
+                None,
+                vec![],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&stale_record), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Warn), "{}", c.detail);
+        assert!(c.detail.contains("still says v1"), "{}", c.detail);
+
+        // A skip reason from the install engine (unparseable, foreign
+        // file, …) is a doctor-visible Fail, not a silent no-op.
+        let skip = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                false,
+                None,
+                false,
+                Some(roost_agent_install::SkipReason::ForeignFile {
+                    path: PathBuf::from("/home/u/.claude/settings.json"),
+                }),
+                vec![],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&skip), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Fail));
+        assert!(c.detail.contains("not written by Roost"), "{}", c.detail);
+
+        // A modified-Roost-entry warning downgrades an otherwise-current
+        // wiring from ok to warn, and the warning text is readable.
+        let modified = Inputs {
+            agent_status: vec![make_agent_status(
+                Agent::Claude,
+                true,
+                true,
+                Some(2),
+                true,
+                None,
+                vec![roost_agent_install::Warning::ModifiedRoostEntry {
+                    path: PathBuf::from("/home/u/.claude/settings.json"),
+                    event: "Stop".into(),
+                }],
+            )],
+            ..healthy()
+        };
+        let c = find(&evaluate(&modified), "agent.claude.wired").clone();
+        assert_eq!(c.status, Some(Status::Warn), "{}", c.detail);
+        assert!(c.detail.contains("wired@v2"), "{}", c.detail);
+        assert!(c.detail.contains("modified Roost entry"), "{}", c.detail);
+    }
+
+    #[test]
+    fn agent_codex_trust_check_covers_every_status() {
+        assert_status(&evaluate(&healthy()), "agent.codex.trust", Status::Skipped);
+
+        let errored = Inputs {
+            agent_codex_trust_error: Some("hooks.json: not valid UTF-8".into()),
+            ..healthy()
+        };
+        let c = find(&evaluate(&errored), "agent.codex.trust").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(c.detail.contains("not valid UTF-8"), "{}", c.detail);
+
+        let matching = Inputs {
+            agent_codex_trust: vec![TrustEntry {
+                event: "Stop",
+                expected: "sha256:aaaa".into(),
+                present: Some("sha256:aaaa".into()),
+            }],
+            ..healthy()
+        };
+        assert_status(&evaluate(&matching), "agent.codex.trust", Status::Ok);
+
+        let drifted = Inputs {
+            agent_codex_trust: vec![
+                TrustEntry {
+                    event: "Stop",
+                    expected: "sha256:aaaa".into(),
+                    present: Some("sha256:aaaa".into()),
+                },
+                TrustEntry {
+                    event: "SessionStart",
+                    expected: "sha256:bbbb".into(),
+                    present: Some("sha256:cccc".into()),
+                },
+            ],
+            ..healthy()
+        };
+        let c = find(&evaluate(&drifted), "agent.codex.trust").clone();
+        assert_eq!(c.status, Some(Status::Fail));
+        assert!(c.detail.contains("SessionStart"), "{}", c.detail);
+        assert!(
+            !c.detail.contains("Stop,"),
+            "only the drifted event: {}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn agent_owning_check_covers_every_status() {
+        let owned = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                ownership: Some(Ownership {
+                    source: "codex".into(),
+                    ..Ownership::default()
+                }),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        assert_status(&evaluate(&owned), "agent.codex.owning", Status::Ok);
+        // A different agent's tab does not count.
+        assert_status(&evaluate(&owned), "agent.grok.owning", Status::Skipped);
+
+        assert_status(&evaluate(&healthy()), "agent.codex.owning", Status::Skipped);
+        assert_status(
+            &evaluate(&Inputs::default()),
+            "agent.codex.owning",
+            Status::Skipped,
+        );
+        assert_eq!(
+            find(&evaluate(&Inputs::default()), "agent.codex.owning").detail,
+            "unavailable (no tab.list from a running UI)"
+        );
+
+        let legacy_server = Inputs {
+            tab_list: Ok(legacy_tab_list(&[7])),
+            ..healthy()
+        };
+        let c = find(&evaluate(&legacy_server), "agent.codex.owning").clone();
+        assert_eq!(c.status, Some(Status::Skipped));
+        assert!(c.detail.contains("predates"), "{}", c.detail);
+    }
+
+    /// Three genuinely different findings, and only one of them is
+    /// "delivered twice". A check that said so for all three would be
+    /// telling the user something untrue about two of them.
+    #[test]
+    fn agent_claude_legacy_settings_check_covers_every_combination() {
+        assert_status(
+            &evaluate(&healthy()),
+            "agent.claude.legacy_settings",
+            Status::Ok,
+        );
+
+        let file_only = Inputs {
+            legacy_claude_settings_present: true,
+            ..healthy()
+        };
+        let c = find(&evaluate(&file_only), "agent.claude.legacy_settings").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(
+            c.detail.contains("claude-settings.json still exists"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("nothing is reading it"),
+            "an unreferenced file delivers nothing: {}",
+            c.detail
+        );
+        assert!(
+            !c.detail.contains("delivered twice"),
+            "no alias points at it: {}",
+            c.detail
+        );
+
+        let rc_only = Inputs {
+            legacy_claude_alias_in_rc: true,
+            ..healthy()
+        };
+        let c = find(&evaluate(&rc_only), "agent.claude.legacy_settings").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(c.detail.contains("shell rc"), "{}", c.detail);
+        assert!(
+            c.detail.contains("that file is gone"),
+            "the alias points at nothing: {}",
+            c.detail
+        );
+        assert!(
+            !c.detail.contains("delivered twice"),
+            "there is no second delivery: {}",
+            c.detail
+        );
+
+        let both = Inputs {
+            legacy_claude_settings_present: true,
+            legacy_claude_alias_in_rc: true,
+            ..healthy()
+        };
+        let c = find(&evaluate(&both), "agent.claude.legacy_settings").clone();
+        assert_eq!(c.status, Some(Status::Warn));
+        assert!(
+            c.detail.contains("still exists") && c.detail.contains("shell rc"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("delivered twice"), "{}", c.detail);
+        assert!(
+            c.detail.contains("roostctl agent uninstall claude"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// The scan asks for an alias, not for two words in the same file.
+    /// A commented-out example — the exact thing the retired docs told
+    /// people to paste — is not an active alias, and a warning that
+    /// claims every Claude event fires twice because of one is a
+    /// diagnostic doing harm.
+    #[test]
+    fn the_legacy_alias_line_test_wants_a_live_line() {
+        for live in [
+            "alias claude='claude --settings '/home/u/.config/roost/claude-settings.json",
+            "  alias claude=\"claude --settings /home/u/.config/roost/claude-settings.json\"",
+            "alias c='claude --settings ~/.config/roost/claude-settings.json'",
+        ] {
+            assert!(is_legacy_alias_line(live), "{live}");
+        }
+        for inert in [
+            "# alias claude='claude --settings '/home/u/.config/roost/claude-settings.json",
+            "   # roostctl claude install writes --settings …claude-settings.json",
+            "alias claude='claude --settings /home/u/.claude/settings.json'",
+            "# claude-settings.json",
+            "echo claude-settings.json",
+            "claude --resume",
+        ] {
+            assert!(!is_legacy_alias_line(inert), "{inert}");
+        }
+    }
+
+    /// And the file walk: the two substrings on *different* lines of one
+    /// rc are not an alias either, the wider rc list is actually read,
+    /// and `$ZDOTDIR` is where zsh's dot-files are when the user moved
+    /// them.
+    #[test]
+    fn the_legacy_alias_scan_reads_the_files_a_shell_reads() {
+        let root = TmpDir::new("alias-scan");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".config/fish")).unwrap();
+        let home_str = home.to_str().unwrap().to_string();
+
+        assert!(!legacy_claude_alias_present(&home_str, None), "empty home");
+
+        // The two halves apart, in the same file: not an alias.
+        std::fs::write(
+            home.join(".bashrc"),
+            "# how this used to work:\n#   --settings\nexport FOO=claude-settings.json\n",
+        )
+        .unwrap();
+        assert!(
+            !legacy_claude_alias_present(&home_str, None),
+            "two unrelated lines are not an alias"
+        );
+
+        // Every rc a shell reads on its own, one at a time.
+        for name in [
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".bash_aliases",
+            ".profile",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
+            ".config/fish/config.fish",
+        ] {
+            let path = home.join(name);
+            std::fs::write(
+                &path,
+                "alias claude='claude --settings /home/u/.config/roost/claude-settings.json'\n",
+            )
+            .unwrap();
+            assert!(legacy_claude_alias_present(&home_str, None), "{name}");
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        // fish's `alias --save` writes a function file, not a line.
+        let functions = home.join(".config/fish/functions");
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("claude.fish"),
+            "function claude\n  command claude --settings ~/.config/roost/claude-settings.json $argv\nend\n",
+        )
+        .unwrap();
+        assert!(legacy_claude_alias_present(&home_str, None));
+        std::fs::remove_file(functions.join("claude.fish")).unwrap();
+        assert!(!legacy_claude_alias_present(&home_str, None));
+
+        // `$ZDOTDIR` is the blind spot: `~/.zshrc` is not the file this
+        // machine's zsh reads.
+        let zdotdir = root.join("zdot");
+        std::fs::create_dir_all(&zdotdir).unwrap();
+        std::fs::write(
+            zdotdir.join(".zshrc"),
+            "alias claude='claude --settings /home/u/.config/roost/claude-settings.json'\n",
+        )
+        .unwrap();
+        assert!(!legacy_claude_alias_present(&home_str, None));
+        assert!(legacy_claude_alias_present(&home_str, zdotdir.to_str()));
+        // An empty one means "not set", not "$HOME/.zshrc twice".
+        assert!(!legacy_claude_alias_present(&home_str, Some("  ")));
     }
 
     #[test]
@@ -6587,13 +7622,10 @@ mod tests {
     async fn collect_leaves_home_byte_identical() {
         let _env = ENV.lock().await;
         let home = TmpDir::new("home");
-        let config = home.join(".config/roost");
-        std::fs::create_dir_all(&config).expect("mkdir");
-        std::fs::write(
-            config.join("claude-settings.json"),
-            r#"{"hooks":{"Stop":[]}}"#,
-        )
-        .expect("write settings");
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        std::fs::write(claude_dir.join("settings.json"), r#"{"hooks":{"Stop":[]}}"#)
+            .expect("write settings");
 
         let _home = EnvVar::set("HOME", &home.0);
         // The three subprocesses are out of doctor's control — `claude`
@@ -6627,9 +7659,9 @@ mod tests {
     async fn a_fifo_settings_file_is_a_finding_not_a_hang() {
         let _env = ENV.lock().await;
         let home = TmpDir::new("fifo-home");
-        let config = home.join(".config/roost");
-        std::fs::create_dir_all(&config).expect("mkdir");
-        let fifo = config.join("claude-settings.json");
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let fifo = claude_dir.join("settings.json");
         assert!(std::process::Command::new("/usr/bin/mkfifo")
             .arg(&fifo)
             .status()

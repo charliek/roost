@@ -101,6 +101,7 @@ mod opencode;
 #[cfg(test)]
 mod acceptance;
 
+pub use codex::{trust_entries, TrustEntry};
 pub use command::{installed_command, is_roost_command, owned_commands, INTEGRATION_VERSION};
 pub use ensure::{
     agent_names, ensure, ensure_on_behalf, install, plan, skip_list, status, Mode, Outcome, Status,

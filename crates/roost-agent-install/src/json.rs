@@ -10,11 +10,10 @@
 //! available to us: Cargo unifies features across the workspace, so
 //! turning it on here would swap `Map` for an `IndexMap` in *every*
 //! crate of the build — including `roost-ipc`'s wire output. It already
-//! breaks a shipped byte contract:
-//! `roost-cli`'s `claude_settings_document_matches_the_shipped_file`
-//! pins a frozen `to_string_pretty` literal whose keys are in sorted
-//! order, which only holds while the map is a `BTreeMap`. Changing the
-//! JSON key order of the IPC wire to make an install crate tidier is
+//! breaks a shipped byte contract: the golden vectors under
+//! `tests/ipc-vectors/` pin exact serialized JSON whose key order only
+//! holds while the map is a `BTreeMap`. Changing the JSON key order of
+//! the IPC wire to make an install crate tidier is
 //! not a trade worth making, so the ordered representation lives here
 //! and stops at this crate's edge.
 //!

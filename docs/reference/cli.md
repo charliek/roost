@@ -29,7 +29,8 @@ roostctl [--socket <PATH>] <COMMAND>
 | `tab clear-notification` | Clear a tab's pending-attention flag |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
 | `project list` / `create` / `rename` / `delete` / `reorder` | Project lifecycle |
-| `claude install` | Generate Claude Code hook settings + print the alias snippet |
+| `agent ensure` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
+| `claude install` | Alias of `agent install claude` |
 | `claude-hook` | Internal: invoked by Claude on each hook event |
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, Claude hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
@@ -240,14 +241,37 @@ roostctl palette dismiss
 
 `--kind` is `commands` (default), `launcher`, `custom`, or `agents`; any other value errors `invalid-param`. `palette activate <id>` errors `not-found` if no palette is open or no visible row has that id. Backed by the `palette.*` IPC ops — see [ipc.md](ipc.md).
 
-## `claude install`
+## `agent` subcommands
 
-Writes `~/.config/roost/claude-settings.json` pointing at this binary's `claude-hook` subcommand for each Claude Code lifecycle event, then prints a bash alias snippet (`alias claude='claude --settings ...'`) to stdout. See the [Claude Code Hooks](../guides/claude-code.md) guide for the full workflow.
+Wire Roost's hook entries into each supported agent's own configuration
+file, and take them back out. None of these dials a running UI — they
+read and write dotfiles, so they work with nothing running.
 
 ```bash
-roostctl claude install >> ~/.bashrc
-roostctl claude install --force   # overwrite an existing file
+roostctl agent status              # per agent: installed, wired, up to date
+roostctl agent ensure              # what the UIs run at startup
+roostctl agent install claude      # or --all; explicit wins over `agent-hooks = off`
+roostctl agent uninstall claude    # or --all
 ```
+
+See the [Agent Hooks](../guides/agents.md) guide.
+
+## `claude install`
+
+An alias of `roostctl agent install claude`, kept so the command
+existing scripts already run keeps working. It no longer writes
+`~/.config/roost/claude-settings.json` and no longer prints a shell
+alias snippet — wiring goes into Claude's own `~/.claude/settings.json`,
+and the installed command finds `roostctl` through `$ROOST_AGENT_HOOK`
+rather than a baked-in absolute path.
+
+```bash
+roostctl claude install
+```
+
+If you followed the old instructions, `roostctl doctor`'s
+`agent.claude.legacy_settings` check will tell you what is left over and
+how to remove it. There is no `--force`; it exits 2.
 
 ## `claude-hook`
 
@@ -441,7 +465,7 @@ Roost UI (ui)
 
 Claude Code (process)
   ok      claude.binary            2.1.220 (Claude Code)
-  ok      claude.settings          /Users/charliek/.config/roost/claude-settings.json parses
+  ok      claude.settings          /Users/charliek/.claude/settings.json parses
   ok      claude.hook_events       all 6 events registered
   warn    claude.hook_command      6 of 6 commands (Notification, SessionEnd, SessionStart, Stop, StopFailure, UserPromptSubmit): resolves to /Users/charliek/projects/roost/mac/build/Roost.app/Contents/Resources/bin/roostctl rather than the running roostctl at /Users/charliek/projects/roost/target/debug/roostctl
                                    → https://charliek.github.io/roost/guides/claude-code/#install

@@ -23,47 +23,50 @@ An event that carries Claude's own `agent_id` field (i.e. it fired from inside a
 
 ## Install
 
-Inside a Roost tab:
+Nothing to do: Roost wires Claude Code's hooks itself the first time the
+UI starts (`agent-hooks = auto` in `config.conf`). See the
+[Agent Hooks](agents.md) guide for the mechanism, the `roostctl agent`
+verbs, and how to turn it off.
+
+To do it by hand — on a machine where the UI has not run yet, or after
+turning `agent-hooks` off:
 
 ```bash
-roostctl claude install
+roostctl agent install claude
 ```
 
-This writes `~/.config/roost/claude-settings.json` with entries for all six lifecycle events above — `SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`, `StopFailure`, `SessionEnd` — each pointing at the absolute path of `roostctl`, and prints a bash alias snippet to stdout. `StopFailure` is new: an already-installed settings file from before this hook existed keeps working (it simply never sees error-state turns until you rerun `install --force`). `roostctl claude-hook` itself accepts both this canonical spelling and the older kebab-case one (`session-start`, `prompt-submit`, `notification`, `stop`, `session-end`) that earlier versions of `claude install` wrote, so an existing settings file is never broken by an upgrade. Add the snippet to your shell rc:
+That merges one hook entry per lifecycle event into Claude's own
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`),
+beside whatever else is already in it. The entry invokes `roostctl`
+through the `$ROOST_AGENT_HOOK` environment variable every Roost tab
+exports, so it carries no absolute path and keeps working after a
+relocated install, on a second machine, or over a host session. Take it
+back out with `roostctl agent uninstall claude`.
 
-```bash
-roostctl claude install >> ~/.bashrc
-source ~/.bashrc
-```
+`roostctl claude install` still works and does exactly the same thing —
+it is now an alias of `agent install claude`. What it no longer does is
+write `~/.config/roost/claude-settings.json` or print an
+`alias claude=…` snippet. If you followed those older instructions, the
+file and the alias are both still on your machine: `roostctl doctor`'s
+`agent.claude.legacy_settings` check says so and names the two removal
+steps (the [Agent Hooks](agents.md#legacy-claude-settings) guide has
+them too).
 
-The generated alias looks like:
-
-```bash
-alias claude='claude --settings /Users/you/.config/roost/claude-settings.json'
-```
-
-`claude --help` documents `--settings` as "load additional settings from" — meaning the file is *merged* into Claude's other settings sources (user, project, local). Your `~/.claude/settings.json` (model, permissions, MCP servers, etc.) keeps working untouched.
-
-To overwrite an existing settings file, pass `--force`:
-
-```bash
-roostctl claude install --force
-```
-
-To uninstall, remove the alias from your shell rc and delete the file:
-
-```bash
-rm ~/.config/roost/claude-settings.json
-```
+`roostctl claude-hook` accepts both the canonical event spellings and
+the older kebab-case ones (`session-start`, `prompt-submit`,
+`notification`, `stop`, `session-end`) that early versions wrote, so an
+existing settings file is never broken by an upgrade.
 
 Run `roostctl doctor` any time to check the install without guessing.
 By default it prints one line for the whole `Claude Code` section;
 `roostctl doctor -v` breaks it into the individual checks —
-`claude.hook_events` confirms the settings file registers all six
-lifecycle events (naming any it's missing), and `claude.hook_command`
+`claude.hook_events` confirms the settings file registers each
+lifecycle event (naming any it's missing), and `claude.hook_command`
 confirms each one resolves to a runnable `roostctl` — `fail` if a
 command's path is missing or not executable, `warn` if it resolves to a
-different `roostctl` than the one you're running.
+different `roostctl` than the one you're running. The `Agents` section
+adds `agent.claude.wired`, which reports the integration version the
+entries were written at.
 
 ## Verifying
 

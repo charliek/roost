@@ -25,7 +25,7 @@
 //!   roostctl agent-hook AGENT
 //!   roostctl agent {ensure,install,uninstall,status}
 //!   roostctl claude-hook EVENT
-//!   roostctl claude install [--force]
+//!   roostctl claude install        (alias of `agent install claude`)
 //!   roostctl session {start,stop,status}
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
@@ -54,9 +54,10 @@ use anyhow::{anyhow, Result};
 use base64::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
 
-use roost_agent::claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};
+use roost_agent::claude::{canonical_hook_event, claude_event_to_reports};
 use roost_agent::hook::{self, hook_payload, parse_tab_id, payload_event_name};
 use roost_agent::Agent;
+use roost_agent_install::Guard;
 use roost_ipc::agent::TabAgentReportParams;
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
@@ -238,7 +239,8 @@ enum Cmd {
     /// work with nothing running.
     #[command(subcommand)]
     Agent(agent_install::AgentCmd),
-    /// Claude Code subcommands (install hook settings file).
+    /// Claude Code subcommands — `install` is a bare alias of `agent
+    /// install claude` (plan 046 §3.5).
     #[command(subcommand)]
     Claude(ClaudeCmd),
     /// Headless host-session subcommands: start, stop, and inspect the
@@ -287,14 +289,11 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum ClaudeCmd {
-    /// Write `~/.config/roost/claude-settings.json` pointing at
-    /// this binary's `claude-hook` subcommand for each Claude
-    /// Code lifecycle event, then print an `alias claude=…`
-    /// snippet the user pastes into their shell rc.
-    Install {
-        #[arg(long)]
-        force: bool,
-    },
+    /// Alias of `roostctl agent install claude` (plan 046 §3.5). Kept as
+    /// its own verb so the command existing scripts already run keeps
+    /// working; it no longer writes
+    /// `~/.config/roost/claude-settings.json` or prints a shell alias.
+    Install,
 }
 
 #[derive(Subcommand, Debug)]
@@ -570,11 +569,10 @@ async fn main() -> Result<()> {
         std::process::exit(agent_install::run(cmd));
     }
 
-    // claude install doesn't dial the UI either — it just writes a
-    // settings file pointing at this binary's claude-hook
-    // subcommand.
-    if let Cmd::Claude(ClaudeCmd::Install { force }) = args.command {
-        return claude_install(force);
+    // `claude install` doesn't dial the UI either — it is a bare alias
+    // of `agent install claude`, which only reads and writes dotfiles.
+    if let Cmd::Claude(ClaudeCmd::Install) = args.command {
+        std::process::exit(claude_install());
     }
 
     // `session` addresses the session profile's own socket, which no
@@ -1410,10 +1408,40 @@ fn hook_debug(message: &str) {
     }
 }
 
-/// `~/.config/roost/claude-settings.json` — written by `claude install`,
-/// read by `doctor`. One definition so the writer and the reader cannot
-/// drift about where the file lives.
+/// `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) —
+/// Claude's own global settings file. `agent install claude` / `agent
+/// ensure` merge Roost's hook entries into it; `doctor`'s `claude.*`
+/// checks read it back. One definition so the two cannot drift about
+/// where it lives, and the same resolution
+/// `roost_agent_install::home::Home` uses, so `CLAUDE_CONFIG_DIR` means
+/// one thing everywhere.
+///
+/// Before plan 046, `claude install` wrote a Roost-owned file at
+/// `~/.config/roost/claude-settings.json` instead — `doctor`'s
+/// `agent.claude.legacy_settings` check is what still knows about that
+/// retired path.
 fn claude_settings_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+    let dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| {
+            let p = PathBuf::from(v);
+            if p.is_absolute() {
+                p
+            } else {
+                PathBuf::from(&home).join(p)
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from(&home).join(".claude"));
+    Ok(dir.join("settings.json"))
+}
+
+/// The legacy path `claude install` used to write, before plan 046.
+/// Kept as its own function (rather than inlining the join) so
+/// `agent.claude.legacy_settings` and `legacy_claude_uninstall` cannot
+/// spell it two ways.
+fn legacy_claude_settings_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
     Ok(PathBuf::from(home)
         .join(".config")
@@ -1421,92 +1449,32 @@ fn claude_settings_path() -> Result<PathBuf> {
         .join("claude-settings.json"))
 }
 
-/// This binary's canonical path. `std::env::current_exe()` returns the
-/// canonical path on macOS/Linux (modulo symlinks); `canonicalize`
-/// resolves any remaining symlink layer (e.g. when the .app's
-/// `Contents/Resources/bin/roostctl` is the entry).
-///
-/// `claude install` bakes this into the hook commands and `doctor`
-/// compares those commands against it, so both must resolve it the same
-/// way or a healthy install reads as a mismatch.
-fn self_exe() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
-}
-
-/// Write `~/.config/roost/claude-settings.json` and print the
-/// `alias claude=…` snippet. The hook command paths point at this
-/// binary's canonical path so they survive PATH changes.
-fn claude_install(force: bool) -> Result<()> {
-    let settings_path = claude_settings_path()?;
-    if let Some(dir) = settings_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-
-    if !force && settings_path.exists() {
-        eprintln!(
-            "roostctl claude install: {} already exists; use --force to overwrite",
-            settings_path.display()
-        );
-        std::process::exit(1);
-    }
-
-    let exe = self_exe().ok_or_else(|| anyhow!("cannot resolve this binary's path"))?;
-    let exe_str = exe.to_string_lossy().to_string();
-    let exe_quoted = quote_for_shell(&exe_str);
-
-    let doc = claude_settings_document(&exe_quoted);
-    let body = serde_json::to_string_pretty(&doc)? + "\n";
-    std::fs::write(&settings_path, body)?;
-
-    eprintln!("# Wrote {}", settings_path.display());
-    eprintln!("# Add the line below to your shell rc (e.g. ~/.bashrc), then `source ~/.bashrc`.");
-    eprintln!("# Fish/zsh: adapt the alias syntax for your shell.");
-    println!();
-    println!("# Roost: route Claude Code hooks to the running UI.");
-    // Form is `alias claude='claude --settings '<quoted_path>`.
-    // The trailing close-quote before the path looks weird but is
-    // correct bash quote-concat: the single-quoted prefix
-    // `'claude --settings '` is adjacent-concatenated with
-    // `quote_for_shell`'s result (also single-quoted when needed),
-    // producing one alias value. A double-quoted outer wrapper
-    // (the M4c-polish "fix" that this comment reverts) re-exposes
-    // `$`, backticks, and backslashes in the path to shell
-    // expansion before the inner single quotes can protect them —
-    // sub-agent review of M6-M9 caught a working
-    // `alias claude="claude --settings '/has \`whoami\`/y'"`
-    // example that expanded `whoami` to `charliek`. The
-    // adjacent-quote form is safe; keep it.
-    println!(
-        "alias claude='claude --settings '{}",
-        quote_for_shell(&settings_path.to_string_lossy())
+/// `claude install` is now a bare alias of `agent install claude` (plan
+/// 046 §3.5). It no longer writes `~/.config/roost/claude-settings.json`
+/// or prints a shell alias snippet — wiring happens automatically
+/// (`agent-hooks = auto`) via `$ROOST_AGENT_HOOK`, so there is nothing
+/// left for a shell alias to route. Exit code follows `agent install`:
+/// 0 whether this run wired Claude or found it already wired, matching
+/// every other agent verb's "explicit wins" idempotency.
+fn claude_install() -> i32 {
+    eprintln!(
+        "roostctl claude install: alias of `roostctl agent install claude` — it no longer \
+         writes ~/.config/roost/claude-settings.json or prints a shell alias. Run `roostctl \
+         agent status` to see what is wired, or `roostctl agent uninstall claude` to remove it."
     );
-    Ok(())
+    agent_install::run(&agent_install::AgentCmd::Install {
+        agent: Some("claude".to_string()),
+        all: false,
+    })
 }
 
-/// The `claude-settings.json` document: one command hook per canonical
-/// event in [`CLAUDE_HOOK_EVENTS`], each dialing back into this binary's
-/// `claude-hook` subcommand. `exe_quoted` is already shell-quoted.
-///
-/// A freshly written file uses Claude's own `hook_event_name` spellings;
-/// the legacy kebab-case aliases an already-installed file carries keep
-/// working through `canonical_hook_event`.
-fn claude_settings_document(exe_quoted: &str) -> serde_json::Value {
-    let hooks: serde_json::Map<String, serde_json::Value> = CLAUDE_HOOK_EVENTS
-        .iter()
-        .map(|event| {
-            let entry = serde_json::json!([{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{exe_quoted} claude-hook {event}"),
-                }]
-            }]);
-            ((*event).to_string(), entry)
-        })
-        .collect();
-    serde_json::json!({ "hooks": hooks })
-}
-
+/// Test-only now: production code stopped writing quoted commands when
+/// `claude install` became a bare alias (plan 046 §3.5). Kept for
+/// `legacy_claude_settings_matches_generated_shape`'s own tests, which
+/// still need to build a fixture shaped like what a pre-046 install
+/// wrote — the same shell quoting `roost-cli`'s `doctor::shell_split`
+/// has to read back.
+#[cfg(test)]
 fn quote_for_shell(s: &str) -> String {
     let needs_quote = s
         .chars()
@@ -1525,6 +1493,205 @@ fn quote_for_shell(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Every **complete** event set a shipped `claude install` ever wrote,
+/// in canonical spellings. The list is closed: plan 046 retires the
+/// writer, so no future release can add a fourth entry, and hard-coding
+/// them (rather than pointing at `CLAUDE_HOOK_EVENTS`, which is free to
+/// keep growing) is what keeps a real legacy file matching after the
+/// adapter learns a new event.
+///
+/// A file whose event set is not one of these is a file somebody edited
+/// — most obviously one trimmed down to the events they cared about —
+/// and it is not Roost's to delete.
+const LEGACY_GENERATED_EVENT_SETS: [&[&str]; 3] = [
+    // `bde60c4` — the first writer. CamelCase keys, kebab-case command
+    // tokens; `canonical_hook_event` resolves both.
+    &[
+        "SessionStart",
+        "UserPromptSubmit",
+        "Notification",
+        "Stop",
+        "SessionEnd",
+    ],
+    // `489b220` added `StopFailure`. This is the set every release up to
+    // and including v0.0.19 wrote, so it is the one almost every file in
+    // the wild carries.
+    &[
+        "SessionStart",
+        "UserPromptSubmit",
+        "Notification",
+        "Stop",
+        "StopFailure",
+        "SessionEnd",
+    ],
+    // `1f5e9b7` added the five tool events. Never released — only a
+    // development build between it and this commit wrote this set.
+    &[
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PermissionDenied",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "Notification",
+        "Stop",
+        "StopFailure",
+        "SessionEnd",
+    ],
+];
+
+/// Whether a parsed legacy `claude-settings.json` still holds exactly
+/// the shape a previous `claude install` wrote: one top-level key
+/// (`hooks`), one of [`LEGACY_GENERATED_EVENT_SETS`] as its complete
+/// event set, and under each event exactly one group whose only key is
+/// `hooks`, holding exactly one entry whose only keys are `type` and
+/// `command` — with that command's trailing token normalizing to its own
+/// event through [`canonical_hook_event`].
+///
+/// Path-agnostic on purpose — the exe path baked into the command varies
+/// per machine, which is one of the two reasons plan 046 retires this
+/// file — so a match here only claims the *layout* is untouched, not
+/// that any particular path is current.
+///
+/// Everything else about it is deliberately exact, because
+/// `agent uninstall claude` **deletes** the file when this returns
+/// `true`. A subset of the events, a `timeout` added to an entry, a
+/// `matcher` added to a group, a second handler, a foreign top-level
+/// key: each of those is somebody's edit, and the promise is that an
+/// edited file is left alone and reported rather than removed.
+fn legacy_claude_settings_matches_generated_shape(doc: &serde_json::Value) -> bool {
+    let Some(obj) = doc.as_object() else {
+        return false;
+    };
+    let [(key, hooks_value)] = obj.iter().collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    if key != "hooks" {
+        return false;
+    }
+    let Some(hooks) = hooks_value.as_object() else {
+        return false;
+    };
+
+    let mut events: Vec<&'static str> = Vec::with_capacity(hooks.len());
+    for (event, groups) in hooks {
+        let Some(canonical) = canonical_hook_event(event) else {
+            return false;
+        };
+        // Two spellings of one event is not a shape any writer produced,
+        // and it would let a set of the right size pass with an event
+        // missing from it.
+        if events.contains(&canonical) || !legacy_event_matches(groups, canonical) {
+            return false;
+        }
+        events.push(canonical);
+    }
+    events.sort_unstable();
+    LEGACY_GENERATED_EVENT_SETS.iter().any(|set| {
+        let mut set = set.to_vec();
+        set.sort_unstable();
+        set == events
+    })
+}
+
+/// One event's value, against what the writer put there: `[{ "hooks":
+/// [{ "type": "command", "command": "<exe> claude-hook <event>" }] }]`
+/// and nothing besides.
+fn legacy_event_matches(groups: &serde_json::Value, event: &'static str) -> bool {
+    let Some([group]) = groups.as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    let Some(group) = group.as_object() else {
+        return false;
+    };
+    let [(group_key, entries)] = group.iter().collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    if group_key != "hooks" {
+        return false;
+    }
+    let Some([entry]) = entries.as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    if entry.len() != 2 || entry.get("type").and_then(|t| t.as_str()) != Some("command") {
+        return false;
+    }
+    let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    let Some(argv) = doctor::shell_split(command) else {
+        return false;
+    };
+    matches!(
+        argv.as_slice(),
+        [_, sub, token] if sub == "claude-hook" && canonical_hook_event(token) == Some(event)
+    )
+}
+
+/// `agent uninstall claude` also retires
+/// `~/.config/roost/claude-settings.json` — but only when it still holds
+/// exactly what `claude install` used to write
+/// ([`legacy_claude_settings_matches_generated_shape`]). A file a human
+/// has since edited is not Roost's to delete; this leaves it and says
+/// so, the same posture the install engine takes toward every other
+/// file it does not fully recognize.
+///
+/// Resolves the path, then defers to [`legacy_claude_uninstall_at`] —
+/// which is the whole of the logic, and testable against a temporary
+/// directory rather than the developer's own `$HOME`.
+fn legacy_claude_uninstall(guard: Guard) {
+    let Ok(path) = legacy_claude_settings_path() else {
+        return;
+    };
+    legacy_claude_uninstall_at(&path, guard);
+}
+
+/// This is a **delete**, so it takes the same harness jail every other
+/// write in the agent-hooks path does. `roost_agent_install` refuses to
+/// touch a real dotfile under `ROOST_TEST_MODE=1` without an explicit
+/// `ROOST_AGENT_HOOKS_FORCE=1`; a cleanup that ran outside that fence
+/// would delete the one file the engine's own guard cannot see.
+fn legacy_claude_uninstall_at(path: &Path, guard: Guard) {
+    if guard.check().is_err() {
+        return;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!("roostctl agent uninstall: {}: {e}", path.display());
+            return;
+        }
+    };
+    let doc: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "roostctl agent uninstall: {} no longer matches the shape `claude install` \
+                 wrote; left in place",
+                path.display()
+            );
+            return;
+        }
+    };
+    if !legacy_claude_settings_matches_generated_shape(&doc) {
+        eprintln!(
+            "roostctl agent uninstall: {} no longer matches the shape `claude install` wrote; \
+             left in place — remove it by hand if you no longer need it",
+            path.display()
+        );
+        return;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => eprintln!("roostctl agent uninstall: removed {}", path.display()),
+        Err(e) => eprintln!("roostctl agent uninstall: {}: {e}", path.display()),
+    }
 }
 
 /// Decode common Rust-style string escapes from `tab send --bytes`
@@ -1793,129 +1960,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn claude_settings_document_matches_the_shipped_file() {
-        // Frozen literal, not a re-derivation: an already-installed
-        // `claude-settings.json` is only equivalent to a fresh one if
-        // these exact bytes keep coming out.
-        let doc = claude_settings_document("/usr/local/bin/roostctl");
-        let expected = r#"{
-  "hooks": {
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook Notification",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "PermissionDenied": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook PermissionDenied",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "PermissionRequest": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook PermissionRequest",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook PostToolUse",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook PostToolUseFailure",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook PreToolUse",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook SessionEnd",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook SessionStart",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook Stop",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "StopFailure": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook StopFailure",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "command": "/usr/local/bin/roostctl claude-hook UserPromptSubmit",
-            "type": "command"
-          }
-        ]
-      }
-    ]
-  }
-}"#;
-        assert_eq!(serde_json::to_string_pretty(&doc).unwrap(), expected);
-    }
-
     /// The two hook verbs, as the installed configs spell them.
     /// `agent-hook` takes the *agent*, never an event — the event comes
     /// from the payload, which is what lets one command string serve
@@ -1933,13 +1977,306 @@ mod tests {
         assert!(matches!(legacy.command, Cmd::ClaudeHook { event } if event == "Stop"));
     }
 
+    /// The exact document a shipped writer produced — the complete
+    /// event set, one group and one entry per event, every command
+    /// `<exe> claude-hook <its own key>` — matches, whatever the exe
+    /// path is (the path is the thing that varies per machine), and for
+    /// every set that ever shipped.
     #[test]
-    fn claude_settings_document_embeds_the_quoted_exe_verbatim() {
-        let doc = claude_settings_document("'/Apps/My Roost.app/roostctl'");
-        assert_eq!(
-            doc["hooks"]["Stop"][0]["hooks"][0]["command"],
-            serde_json::json!("'/Apps/My Roost.app/roostctl' claude-hook Stop")
+    fn every_generated_event_set_matches() {
+        for events in LEGACY_GENERATED_EVENT_SETS {
+            for exe in ["/usr/local/bin/roostctl", "/Apps/My Roost.app/roostctl"] {
+                let doc = legacy_document(exe, events, |event| event.to_string());
+                assert!(
+                    legacy_claude_settings_matches_generated_shape(&doc),
+                    "{exe}: {doc}"
+                );
+            }
+        }
+    }
+
+    /// The kebab-case command tokens the first writer (`bde60c4`) used
+    /// under CamelCase keys normalize through `canonical_hook_event` the
+    /// same as the canonical ones, so the oldest file in the wild still
+    /// matches.
+    #[test]
+    fn the_first_writers_kebab_case_commands_still_match() {
+        let doc = legacy_document(
+            "/usr/local/bin/roostctl",
+            LEGACY_GENERATED_EVENT_SETS[0],
+            |event| match event {
+                "SessionStart" => "session-start".into(),
+                "UserPromptSubmit" => "prompt-submit".into(),
+                "Notification" => "notification".into(),
+                "Stop" => "stop".into(),
+                "SessionEnd" => "session-end".into(),
+                other => other.to_string(),
+            },
         );
+        assert!(
+            legacy_claude_settings_matches_generated_shape(&doc),
+            "{doc}"
+        );
+    }
+
+    /// A generated document over `events`, with each event's command
+    /// token spelled by `token`.
+    fn legacy_document(
+        exe: &str,
+        events: &[&str],
+        token: impl Fn(&str) -> String,
+    ) -> serde_json::Value {
+        let exe_quoted = quote_for_shell(exe);
+        let hooks: serde_json::Map<String, serde_json::Value> = events
+            .iter()
+            .map(|event| {
+                (
+                    (*event).to_string(),
+                    serde_json::json!([{
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("{exe_quoted} claude-hook {}", token(event)),
+                        }]
+                    }]),
+                )
+            })
+            .collect();
+        serde_json::json!({ "hooks": hooks })
+    }
+
+    /// The whole point of the tightening: a file trimmed to the events
+    /// its owner cared about is a **hand-edited** file, and
+    /// `agent uninstall claude` may not delete it. A subset of a
+    /// generated set — including the single-event case a looser matcher
+    /// accepted — is the commonest edit there is.
+    #[test]
+    fn an_event_set_no_writer_produced_does_not_match() {
+        let full = LEGACY_GENERATED_EVENT_SETS[1];
+        let cases: &[&[&str]] = &[
+            // Trimmed to one event, and to a few.
+            &["Stop"],
+            &["Stop", "SessionEnd"],
+            &full[..full.len() - 1],
+            // A complete set plus an event that set never carried.
+            &[
+                "SessionStart",
+                "UserPromptSubmit",
+                "Notification",
+                "Stop",
+                "StopFailure",
+                "SessionEnd",
+                "PreToolUse",
+            ],
+        ];
+        for events in cases {
+            let doc = legacy_document("/usr/local/bin/roostctl", events, |e| e.to_string());
+            assert!(
+                !legacy_claude_settings_matches_generated_shape(&doc),
+                "{events:?} should not match: {doc}"
+            );
+        }
+    }
+
+    /// Two spellings of one event fill a set to the right size while an
+    /// event is actually missing from it.
+    #[test]
+    fn one_event_under_two_spellings_does_not_match() {
+        let mut doc = legacy_document(
+            "/usr/local/bin/roostctl",
+            LEGACY_GENERATED_EVENT_SETS[1],
+            |e| e.to_string(),
+        );
+        let hooks = doc["hooks"].as_object_mut().unwrap();
+        hooks.remove("SessionEnd");
+        hooks.insert(
+            "session-end".into(),
+            serde_json::json!([{"hooks": [{
+                "type": "command",
+                "command": "/usr/local/bin/roostctl claude-hook session-end",
+            }]}]),
+        );
+        // That one is still a real generated file, spelled the old way.
+        assert!(
+            legacy_claude_settings_matches_generated_shape(&doc),
+            "{doc}"
+        );
+
+        // But both spellings at once is not.
+        doc["hooks"].as_object_mut().unwrap().insert(
+            "SessionEnd".into(),
+            serde_json::json!([{"hooks": [{
+                "type": "command",
+                "command": "/usr/local/bin/roostctl claude-hook SessionEnd",
+            }]}]),
+        );
+        assert!(
+            !legacy_claude_settings_matches_generated_shape(&doc),
+            "{doc}"
+        );
+    }
+
+    /// A field added anywhere inside the generated shape is an edit: a
+    /// `timeout` or a `matcher` are the two Claude's own docs invite,
+    /// and the writer emitted neither.
+    #[test]
+    fn a_field_the_writer_never_emitted_does_not_match() {
+        let inject: &[(&str, &str, serde_json::Value)] = &[
+            ("entry", "timeout", serde_json::json!(30)),
+            ("entry", "note", serde_json::json!("mine")),
+            ("group", "matcher", serde_json::json!("*")),
+            ("group", "note", serde_json::json!("mine")),
+        ];
+        for (where_, key, value) in inject {
+            let mut doc = legacy_document(
+                "/usr/local/bin/roostctl",
+                LEGACY_GENERATED_EVENT_SETS[1],
+                |e| e.to_string(),
+            );
+            assert!(legacy_claude_settings_matches_generated_shape(&doc));
+            let group = &mut doc["hooks"]["Stop"][0];
+            let target = match *where_ {
+                "entry" => &mut group["hooks"][0],
+                _ => group,
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert((*key).to_string(), value.clone());
+            assert!(
+                !legacy_claude_settings_matches_generated_shape(&doc),
+                "{where_}.{key} should not match: {doc}"
+            );
+        }
+    }
+
+    /// Every other way a human (or a foreign tool) touching the file
+    /// stops it from matching: an extra top-level key, a second group, a
+    /// second handler, a non-command type, a command pointing at the
+    /// wrong event or at another subcommand entirely, and a key
+    /// `roost-agent` cannot resolve at all.
+    #[test]
+    fn a_hand_edited_or_foreign_document_does_not_match() {
+        let full = |mutate: &dyn Fn(&mut serde_json::Value)| {
+            let mut doc = legacy_document(
+                "/usr/local/bin/roostctl",
+                LEGACY_GENERATED_EVENT_SETS[1],
+                |e| e.to_string(),
+            );
+            mutate(&mut doc);
+            doc
+        };
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({}),
+            serde_json::json!({"hooks": {}}),
+            full(&|doc| {
+                doc.as_object_mut()
+                    .unwrap()
+                    .insert("permissions".into(), serde_json::json!({}));
+            }),
+            full(&|doc| {
+                doc["hooks"]["Stop"].as_array_mut().unwrap().push(
+                    serde_json::json!({"hooks": [{"type": "command", "command": "echo mine"}]}),
+                );
+            }),
+            full(&|doc| {
+                doc["hooks"]["Stop"][0]["hooks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"type": "command", "command": "echo mine"}));
+            }),
+            full(&|doc| {
+                doc["hooks"]["Stop"][0]["hooks"][0]["type"] = serde_json::json!("prompt");
+            }),
+            full(&|doc| {
+                doc["hooks"]["Stop"][0]["hooks"][0]["command"] =
+                    serde_json::json!("/usr/local/bin/roostctl claude-hook SessionEnd");
+            }),
+            full(&|doc| {
+                doc["hooks"]["Stop"][0]["hooks"][0]["command"] =
+                    serde_json::json!("/usr/local/bin/roostctl tab list");
+            }),
+            full(&|doc| {
+                let hooks = doc["hooks"].as_object_mut().unwrap();
+                let stop = hooks.remove("Stop").unwrap();
+                hooks.insert("NotAnEvent".into(), stop);
+            }),
+        ];
+        for (i, doc) in cases.iter().enumerate() {
+            assert!(
+                !legacy_claude_settings_matches_generated_shape(doc),
+                "case {i} should not match: {doc}"
+            );
+        }
+    }
+
+    /// The delete is real, so it takes the same harness fence every
+    /// other agent-hooks write does. `ROOST_TEST_MODE=1` without an
+    /// explicit force leaves the file exactly where it is — the install
+    /// engine's own guard never sees this file, so nothing else would
+    /// stop it.
+    /// A unique scratch directory, the same way `session::tests` makes
+    /// one: this crate has no tempdir dependency, and one test file is
+    /// not a reason to take one.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "roostctl-legacy-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_legacy_delete_honours_the_harness_jail() {
+        let dir = scratch("jail");
+        let path = dir.join("claude-settings.json");
+        let doc = legacy_document(
+            "/usr/local/bin/roostctl",
+            LEGACY_GENERATED_EVENT_SETS[1],
+            |e| e.to_string(),
+        );
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        legacy_claude_uninstall_at(
+            &path,
+            Guard {
+                test_mode: true,
+                forced: false,
+            },
+        );
+        assert!(path.exists(), "a jailed run deleted a real dotfile");
+
+        legacy_claude_uninstall_at(
+            &path,
+            Guard {
+                test_mode: true,
+                forced: true,
+            },
+        );
+        assert!(
+            !path.exists(),
+            "an explicitly forced run must still clean up"
+        );
+    }
+
+    /// And a file that no longer matches survives a permitted run — the
+    /// shape check, not the guard, is what stopped it.
+    #[test]
+    fn the_legacy_delete_leaves_a_hand_edited_file_alone() {
+        let dir = scratch("hand-edited");
+        let path = dir.join("claude-settings.json");
+        let doc = legacy_document("/usr/local/bin/roostctl", &["Stop"], |e| e.to_string());
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        legacy_claude_uninstall_at(&path, Guard::PERMITTED);
+        assert!(path.exists(), "a trimmed file is not Roost's to delete");
+
+        // Not even a file that is no longer JSON at all.
+        std::fs::write(&path, "# my notes\n").unwrap();
+        legacy_claude_uninstall_at(&path, Guard::PERMITTED);
+        assert!(path.exists());
     }
 
     /// Every spelling a previously shipped `claude_install` wrote into

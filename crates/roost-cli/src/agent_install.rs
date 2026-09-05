@@ -84,7 +84,29 @@ pub fn run(cmd: &AgentCmd) -> i32 {
             Err(code) => code,
         },
         AgentCmd::Uninstall { agent, all } => match targets(agent.as_deref(), *all) {
-            Ok(agents) => report(uninstall(&home, &agents, guard), false),
+            Ok(agents) => {
+                let outcome = uninstall(&home, &agents, guard);
+                // The legacy `claude-settings.json` this crate never
+                // touches — it predates this crate — so `agent
+                // uninstall claude` cleans it up as a side effect,
+                // never in place of the ordinary uninstall above.
+                //
+                // "As a side effect" is load-bearing: a run that never
+                // unwired Claude has no business deleting Claude's
+                // legacy file. `uninstall` returns `Err` when the
+                // harness guard refused it or the lock could not be
+                // taken, and names a per-agent error when the write
+                // failed — either way the delete is off, or a refused
+                // `agent uninstall claude` would exit 1 while reporting
+                // it had removed the file it just deleted.
+                let cleanup = agents.contains(&Agent::Claude)
+                    && matches!(&outcome, Ok(o) if o.errors.iter().all(|e| e.agent != Agent::Claude));
+                let code = report(outcome, false);
+                if cleanup {
+                    crate::legacy_claude_uninstall(guard);
+                }
+                code
+            }
             Err(code) => code,
         },
         AgentCmd::Status { json } => match status(&home) {
@@ -240,6 +262,7 @@ fn print_status(rows: &[Status], json: bool) {
                     "agent": row.agent.source(),
                     "present": row.present,
                     "wired": row.wired,
+                    "entries_on_disk": row.entries_on_disk,
                     "up_to_date": row.up_to_date,
                     "noticed": row.noticed,
                     "skipped": row.skipped.as_ref().map(ToString::to_string),
@@ -251,12 +274,24 @@ fn print_status(rows: &[Status], json: bool) {
         return;
     }
 
+    // `wired` is the state record's claim and `entries_on_disk` is the
+    // agent's own files; they can disagree, and saying which is which is
+    // the difference between a status line and a guess.
     for row in rows {
-        let state = match (row.present, row.wired, row.up_to_date) {
-            (false, _, _) => "not installed".to_string(),
-            (true, Some(version), true) => format!("wired@v{version}"),
-            (true, Some(version), false) => format!("wired@v{version}, out of date"),
-            (true, None, _) => "present, not wired".to_string(),
+        let state = match (row.present, row.entries_on_disk, row.wired, row.up_to_date) {
+            (false, _, _, _) => "not installed".to_string(),
+            (true, false, None, _) => "present, not wired".to_string(),
+            (true, false, Some(version), _) => {
+                format!("record says wired@v{version}, nothing wired on disk")
+            }
+            (true, true, None, _) => "wired on disk, not in the state record".to_string(),
+            (true, true, Some(version), false) => format!("wired@v{version}, out of date"),
+            (true, true, Some(version), true)
+                if version != roost_agent_install::INTEGRATION_VERSION =>
+            {
+                format!("wired and current on disk, record still says v{version}")
+            }
+            (true, true, Some(version), true) => format!("wired@v{version}"),
         };
         println!("{:<9} {state}", row.agent.source());
         if let Some(reason) = &row.skipped {
