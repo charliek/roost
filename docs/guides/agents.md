@@ -367,6 +367,17 @@ arbitrary commands there via `tab.open`.
 - **codex re-trusts on reordering or a moved path.** See [Codex
   trust](#codex-trust) above — either one costs a single review dialog,
   cleared by the next `ensure`.
+- **codex `/rename` doesn't reach the tab label on codex 0.153 and
+  earlier.** Roost's tab label mirrors whatever the program writes into
+  the terminal title, and codex's default title items on those versions
+  are only `activity` and `project` — the thread name isn't in it, so a
+  rename changes nothing. Add `terminal_title = ["activity",
+  "thread-title", "project-name"]` under `[tui]` in `config.toml` and the
+  rename lands in the label at once (an unnamed thread then shows its
+  UUID until you name it). Newer codex adds a `thread-name` item that's
+  omitted when unnamed and puts it in the default set, so no config is
+  needed there. Claude, grok and cursor already put the session name in
+  the title.
 - **gx shares grok's file.** grok and its fork gx read the same
   `$GROK_HOME`, so one install (`roostctl agent install grok`) wires
   both binaries at once; there is no separate `gx` source or adapter,
