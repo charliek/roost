@@ -104,9 +104,9 @@ use self::interactions::{
 pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
 use self::palettes::{
-    apply_with_rollback, ellipsize_palette_text, palette_agent_left_text, palette_row_id,
-    palette_title_runs, FontSizeTransition, PaletteReplyRoute, PaletteVisibilityRequest,
-    PALETTE_AGENT_PROJECT_MAX_COLUMNS,
+    apply_with_rollback, palette_agent_segments, palette_row_id, palette_title_runs,
+    FontSizeTransition, PaletteAgentColumn, PaletteAgentSegment, PaletteReplyRoute,
+    PaletteVisibilityRequest,
 };
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
@@ -1163,6 +1163,34 @@ fn sidebar_band_label(label: &str) -> Element<'_, Message> {
         .color(chrome::MUTED_TEXT)
         .font(chrome::chrome_font(font::Weight::Semibold))
         .into()
+}
+
+/// One column of an agents-palette row, in the treatment its role
+/// carries: the project stays the bold anchor, the agent's own name sits
+/// a step quieter ahead of it, and the status wears the lifecycle
+/// colour. Exhaustive over [`PaletteAgentColumn`] on purpose — the
+/// columns are enumerated in `palette_agent_segments` and nowhere else,
+/// so neither side can drop one silently.
+fn palette_agent_segment<'a>(
+    segment: PaletteAgentSegment,
+    primary: Color,
+    muted: Color,
+    lifecycle: Color,
+) -> Element<'a, Message> {
+    let label = text(segment.text).wrapping(iced::widget::text::Wrapping::None);
+    match segment.column {
+        PaletteAgentColumn::Agent => label.size(14).color(muted).into(),
+        PaletteAgentColumn::Project => container(
+            label
+                .size(14)
+                .font(chrome::chrome_font(font::Weight::Semibold))
+                .color(primary),
+        )
+        .max_width(140)
+        .into(),
+        PaletteAgentColumn::Name => label.size(14).color(primary).into(),
+        PaletteAgentColumn::Status => label.size(13).color(lifecycle).into(),
+    }
 }
 
 fn accel_label(accel: &Accel) -> Option<String> {
@@ -4360,43 +4388,38 @@ impl App {
                             .background(lifecycle_color)
                             .border(iced::border::rounded(4))
                     });
+                // The muted role dims with the rest of the row when the
+                // row can't be activated — `primary_color` is already
+                // the dimmed shade in that case.
+                let muted_color = if actionable {
+                    chrome::MUTED_TEXT
+                } else {
+                    primary_color
+                };
+                let mut left = row![dot].spacing(8).align_y(Alignment::Center);
+                for segment in palette_agent_segments(&agent) {
+                    left = left.push(palette_agent_segment(
+                        segment,
+                        primary_color,
+                        muted_color,
+                        lifecycle_color,
+                    ));
+                }
                 let metrics = agent.metrics_text.unwrap_or_default();
-                let project =
-                    ellipsize_palette_text(&agent.project, PALETTE_AGENT_PROJECT_MAX_COLUMNS);
-                let (name, status) = palette_agent_left_text(&agent.name, &agent.status_text);
-                row![
-                    dot,
-                    container(
-                        text(project)
-                            .size(14)
-                            .font(chrome::chrome_font(font::Weight::Semibold))
-                            .color(primary_color)
-                            .wrapping(iced::widget::text::Wrapping::None)
+                left.push(iced::widget::Space::new().width(Fill))
+                    .push(
+                        text(metrics)
+                            .size(12)
+                            .font(Font::MONOSPACE)
+                            .color(chrome::MUTED_TEXT),
                     )
-                    .max_width(140),
-                    container(
-                        text(name)
-                            .size(14)
-                            .color(primary_color)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                    ),
-                    text(status)
-                        .size(13)
-                        .color(lifecycle_color)
-                        .wrapping(iced::widget::text::Wrapping::None),
-                    iced::widget::Space::new().width(Fill),
-                    text(metrics)
-                        .size(12)
-                        .font(Font::MONOSPACE)
-                        .color(chrome::MUTED_TEXT),
-                    text(agent.time_text)
-                        .size(12)
-                        .font(Font::MONOSPACE)
-                        .color(chrome::MUTED_TEXT)
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .into()
+                    .push(
+                        text(agent.time_text)
+                            .size(12)
+                            .font(Font::MONOSPACE)
+                            .color(chrome::MUTED_TEXT),
+                    )
+                    .into()
             } else {
                 let spans = palette_title_runs(&item.title, &matched.ranges)
                     .into_iter()

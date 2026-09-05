@@ -18,6 +18,12 @@ const PALETTE_AGENT_LEFT_MAX_COLUMNS: usize = 58;
 
 const PALETTE_AGENT_STATUS_FLOOR_COLUMNS: usize = 18;
 
+// The agent display name's own share of that budget. "Claude Code" is
+// the longest of the five known names at 11 columns; an unknown
+// `ownership.source` renders verbatim (plan 046 AD-8) and so arrives
+// with no bound of its own, which is what this cap is for.
+const PALETTE_AGENT_NAME_MAX_COLUMNS: usize = 14;
+
 /// The `palette.activate` reply for a palette that is closed — what
 /// `palette_state_result` answers whenever no palette is open, and what an
 /// activation whose row dispatched an engine op answers with when that op
@@ -123,22 +129,70 @@ pub(super) fn ellipsize_palette_text(value: &str, max_columns: usize) -> String 
     result
 }
 
-pub(super) fn palette_agent_left_text(name: &str, status: &str) -> (String, String) {
+fn palette_agent_left_text(agent: &str, name: &str, status: &str) -> (String, String, String) {
+    let agent_width = UnicodeWidthStr::width(agent);
     let name_width = UnicodeWidthStr::width(name);
     let status_width = UnicodeWidthStr::width(status);
-    if name_width + status_width <= PALETTE_AGENT_LEFT_MAX_COLUMNS {
-        return (name.to_string(), status.to_string());
+    if agent_width + name_width + status_width <= PALETTE_AGENT_LEFT_MAX_COLUMNS {
+        return (agent.to_string(), name.to_string(), status.to_string());
     }
 
+    // The agent name is settled first: it is the one segment with a
+    // cap of its own, so what it doesn't spend stays with name+status.
+    let agent_text = ellipsize_palette_text(agent, agent_width.min(PALETTE_AGENT_NAME_MAX_COLUMNS));
+    let remaining =
+        PALETTE_AGENT_LEFT_MAX_COLUMNS.saturating_sub(UnicodeWidthStr::width(agent_text.as_str()));
     let status_floor = status_width
         .min(PALETTE_AGENT_STATUS_FLOOR_COLUMNS)
-        .min(PALETTE_AGENT_LEFT_MAX_COLUMNS);
-    let name_budget = name_width.min(PALETTE_AGENT_LEFT_MAX_COLUMNS - status_floor);
-    let status_budget = status_width.min(PALETTE_AGENT_LEFT_MAX_COLUMNS - name_budget);
+        .min(remaining);
+    let name_budget = name_width.min(remaining - status_floor);
+    let status_budget = status_width.min(remaining - name_budget);
     (
+        agent_text,
         ellipsize_palette_text(name, name_budget),
         ellipsize_palette_text(status, status_budget),
     )
+}
+
+/// Which column of the agent row a rendered segment is — the styling
+/// role the renderer resolves it against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaletteAgentColumn {
+    Agent,
+    Project,
+    Name,
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PaletteAgentSegment {
+    pub(super) column: PaletteAgentColumn,
+    pub(super) text: String,
+}
+
+/// The agent row's left half, in render order and already fitted to the
+/// row's width budget: agent display name, project, tab name, status.
+///
+/// The single place those columns are enumerated. `App::view` walks this
+/// list and styles each segment by its `column` rather than reaching for
+/// named fields, so a column cannot go missing from the rendered row
+/// without this function losing it (or the exhaustive match on
+/// [`PaletteAgentColumn`] failing to compile). An empty segment is
+/// dropped instead of rendering as a gap in the row's spacing.
+pub(super) fn palette_agent_segments(agent: &palette::AgentRowData) -> Vec<PaletteAgentSegment> {
+    let (agent_name, name, status) =
+        palette_agent_left_text(&agent.agent, &agent.name, &agent.status_text);
+    let project = ellipsize_palette_text(&agent.project, PALETTE_AGENT_PROJECT_MAX_COLUMNS);
+    [
+        (PaletteAgentColumn::Agent, agent_name),
+        (PaletteAgentColumn::Project, project),
+        (PaletteAgentColumn::Name, name),
+        (PaletteAgentColumn::Status, status),
+    ]
+    .into_iter()
+    .filter(|(_, text)| !text.is_empty())
+    .map(|(column, text)| PaletteAgentSegment { column, text })
+    .collect()
 }
 
 /// The command frame's `PaletteFrame` id, and the "New Project on…"
@@ -2368,29 +2422,130 @@ mod tests {
         assert!(UnicodeWidthStr::width(ellipsize_palette_text("東京都市", 5).as_str()) <= 5);
     }
 
+    fn agent_row(agent: &str, project: &str, name: &str, status: &str) -> palette::AgentRowData {
+        palette::AgentRowData {
+            effective_lifecycle: roost_ipc::agent::AgentLifecycle::Waiting,
+            agent: agent.to_string(),
+            project: project.to_string(),
+            name: name.to_string(),
+            status_text: status.to_string(),
+            time_text: "3m".to_string(),
+            metrics_text: None,
+        }
+    }
+
+    fn left_width(agent: &str, name: &str, status: &str) -> usize {
+        UnicodeWidthStr::width(agent)
+            + UnicodeWidthStr::width(name)
+            + UnicodeWidthStr::width(status)
+    }
+
     #[test]
-    fn palette_agent_name_and_status_share_only_the_width_they_need() {
-        let working = "Working through an intentionally long agent name";
+    fn palette_agent_columns_share_only_the_width_they_need() {
+        let name = "Working through a long-ish name";
         assert_eq!(
-            palette_agent_left_text(working, "Working"),
-            (working.to_string(), "Working".to_string())
+            palette_agent_left_text("Claude Code", name, "Working"),
+            (
+                "Claude Code".to_string(),
+                name.to_string(),
+                "Working".to_string()
+            )
         );
 
-        let failed = "Failed · an intentionally long failure detail fo…";
-        assert_eq!(
-            palette_agent_left_text("Failed", failed),
-            ("Failed".to_string(), failed.to_string())
-        );
-
-        let (name, status) = palette_agent_left_text(
+        let (agent, name, status) = palette_agent_left_text(
+            "Claude Code",
             &"界".repeat(40),
             "Failed · an intentionally long failure detail",
         );
+        assert_eq!(agent, "Claude Code");
         assert!(name.ends_with('…'));
         assert!(status.ends_with('…'));
+        assert!(UnicodeWidthStr::width(status.as_str()) >= PALETTE_AGENT_STATUS_FLOOR_COLUMNS);
+        assert!(left_width(&agent, &name, &status) <= PALETTE_AGENT_LEFT_MAX_COLUMNS);
+
+        // A third-party `ownership.source` renders verbatim, so only this
+        // cap keeps it from eating the row — and what it doesn't spend
+        // stays with the other two columns.
+        let (agent, name, status) = palette_agent_left_text(&"z".repeat(60), "tab", "Working");
+        assert!(agent.ends_with('…'));
+        assert!(UnicodeWidthStr::width(agent.as_str()) <= PALETTE_AGENT_NAME_MAX_COLUMNS);
+        assert_eq!((name.as_str(), status.as_str()), ("tab", "Working"));
+        assert!(left_width(&agent, &name, &status) <= PALETTE_AGENT_LEFT_MAX_COLUMNS);
+    }
+
+    /// The rendered row's columns, in order. `App::view` builds the row by
+    /// walking exactly this list, so a display name that stops reaching
+    /// the user has to stop appearing here first.
+    #[test]
+    fn palette_agent_row_leads_with_the_agent_display_name() {
+        let segments = palette_agent_segments(&agent_row(
+            "Claude Code",
+            "agents-demo",
+            "Roost demo file",
+            "Waiting for input",
+        ));
+        assert_eq!(
+            segments,
+            vec![
+                PaletteAgentSegment {
+                    column: PaletteAgentColumn::Agent,
+                    text: "Claude Code".to_string(),
+                },
+                PaletteAgentSegment {
+                    column: PaletteAgentColumn::Project,
+                    text: "agents-demo".to_string(),
+                },
+                PaletteAgentSegment {
+                    column: PaletteAgentColumn::Name,
+                    text: "Roost demo file".to_string(),
+                },
+                PaletteAgentSegment {
+                    column: PaletteAgentColumn::Status,
+                    text: "Waiting for input".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn palette_agent_row_ellipsizes_and_drops_columns_rather_than_growing() {
+        let segments = palette_agent_segments(&agent_row(
+            "an-unreasonably-long-third-party-source",
+            "a-project-name-that-runs-well-past-the-column-budget",
+            "a-tab-name",
+            "Waiting for input",
+        ));
+        assert_eq!(segments[0].column, PaletteAgentColumn::Agent);
+        assert!(segments[0].text.ends_with('…'));
         assert!(
-            UnicodeWidthStr::width(name.as_str()) + UnicodeWidthStr::width(status.as_str())
-                <= PALETTE_AGENT_LEFT_MAX_COLUMNS
+            UnicodeWidthStr::width(segments[0].text.as_str()) <= PALETTE_AGENT_NAME_MAX_COLUMNS
+        );
+        assert_eq!(segments[1].column, PaletteAgentColumn::Project);
+        assert!(
+            UnicodeWidthStr::width(segments[1].text.as_str()) <= PALETTE_AGENT_PROJECT_MAX_COLUMNS
+        );
+        // Every left column together still fits the budget the row had
+        // before the agent name joined it.
+        let left = segments
+            .iter()
+            .filter(|segment| segment.column != PaletteAgentColumn::Project)
+            .map(|segment| UnicodeWidthStr::width(segment.text.as_str()))
+            .sum::<usize>();
+        assert!(left <= PALETTE_AGENT_LEFT_MAX_COLUMNS);
+
+        // An empty column is dropped, not rendered as a hole in the row's
+        // spacing — a tab an unnamed source owns keeps its three columns.
+        let columns = palette_agent_segments(&agent_row("", "agents-demo", "shell", "Working"))
+            .into_iter()
+            .map(|segment| segment.column)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            vec![
+                PaletteAgentColumn::Project,
+                PaletteAgentColumn::Name,
+                PaletteAgentColumn::Status,
+            ]
         );
     }
 
