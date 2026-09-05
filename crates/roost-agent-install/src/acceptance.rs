@@ -18,7 +18,11 @@ use std::path::{Path, PathBuf};
 use roost_agent::Agent;
 use tempfile::TempDir;
 
-use crate::command::{installed_command, is_roost_command, looks_edited};
+use crate::codex_hash::{self, Handler};
+use crate::command::{
+    installed_command, is_roost_command, looks_edited, owned_commands, HOOK_TIMEOUT_SECS,
+    INTEGRATION_VERSION,
+};
 use crate::error::SkipReason;
 use crate::home::{Home, ALL_AGENTS};
 use crate::json::{Json, Style};
@@ -84,6 +88,56 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 fn parse_file(path: &Path) -> Json {
     Json::parse(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// Every object anywhere in a JSON document that carries a string
+/// `command` — i.e. every hook handler, whatever shape the agent's file
+/// uses (Claude's grouped, cursor's flat, grok's whole-file).
+fn handlers(value: &Json, out: &mut Vec<Json>) {
+    match value {
+        Json::Object(entries) => {
+            if entries
+                .iter()
+                .any(|(key, child)| key == "command" && child.as_str().is_some())
+            {
+                out.push(value.clone());
+            } else {
+                for (_, child) in entries {
+                    handlers(child, out);
+                }
+            }
+        }
+        Json::Array(items) => items.iter().for_each(|item| handlers(item, out)),
+        _ => {}
+    }
+}
+
+/// The `command` strings of every handler in `agent`'s JSON files,
+/// split into Roost's and everybody else's.
+fn commands_on_disk(home: &Home, agent: Agent) -> (Vec<String>, Vec<String>) {
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    for file in crate::owned_files(home, agent) {
+        if file.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let mut found = Vec::new();
+        handlers(&parse_file(&file), &mut found);
+        for handler in found {
+            let command = handler
+                .get("command")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            if is_roost_command(agent, &command) {
+                ours.push(command);
+            } else {
+                theirs.push(command);
+            }
+        }
+    }
+    (ours, theirs)
 }
 
 fn keys(value: &Json) -> Vec<String> {
@@ -239,6 +293,257 @@ fn ensure_wires_every_present_agent_and_says_which_were_new() {
         "herdr's entry moved, or ours is not the exact string"
     );
     drop(dir);
+}
+
+/// Every `command` string that lands **on disk** resolves for an agent
+/// that interpolates before executing.
+///
+/// The constant is fenced in `command.rs`, but the constant is not what
+/// grok reads — the file is, and each agent's file is composed by a
+/// different writer: claude and cursor merge into the user's document,
+/// codex merges a grouped one and then hashes it, and grok renders a
+/// whole file it owns. A fix applied to the constant while one of those
+/// writers kept composing its own variant would put the red rows
+/// straight back, and only this test would notice.
+///
+/// opencode is the deliberate exception: its plugin is JavaScript that
+/// reads `process.env` and spawns, so there is no command string to
+/// check — the assertion for it is that it has none.
+#[test]
+fn no_agents_file_carries_a_reference_an_agent_cannot_resolve() {
+    let (dir, home) = fixture("all");
+    wire_all(&home);
+
+    for agent in ALL_AGENTS.iter().filter(|a| **a != Agent::Opencode) {
+        // codex's second file is `config.toml`, which carries hashes
+        // rather than commands; `commands_on_disk` reads only the JSON.
+        let (ours, _) = commands_on_disk(&home, *agent);
+        for command in &ours {
+            assert!(
+                crate::command::every_reference_has_a_default(command),
+                "{}: carries a bare reference: {command}",
+                agent.source(),
+            );
+        }
+        // Vacuity guard: a walk that matched nothing would pass above
+        // for every agent, including one whose writer had broken.
+        assert!(
+            !ours.is_empty(),
+            "{}: no Roost command found",
+            agent.source()
+        );
+    }
+
+    // opencode's exemption is checked, not assumed: the plugin spawns
+    // the hook itself, so the moment its file grows a shell command it
+    // belongs in the loop above instead.
+    let plugin = std::fs::read_to_string(&crate::owned_files(&home, Agent::Opencode)[0]).unwrap();
+    assert!(plugin.contains("process.env"), "{plugin}");
+    assert!(!plugin.contains("sh -c"), "opencode grew a shell command");
+    drop(dir);
+}
+
+/// The upgrade path, end to end. A machine wired by the previous
+/// release looks like this right now: the previous command spelling in
+/// four JSON files, the previous hashes and the uniform timeout on
+/// codex's side, the previous version in the plugin header and in the
+/// state record. A plain `ensure` — the one the UIs run at startup —
+/// has to bring all of it to the current version, for every agent,
+/// without duplicating an entry, touching a foreign one, or leaving a
+/// stale trust hash behind for codex to put a dialog on. That is the
+/// only way a fix like v3's ever reaches a user.
+///
+/// Written against "the previous version", not "v2", so the next bump
+/// keeps it honest without an edit; the rewind asserts it matched
+/// something in every file, so a bump that forgets to keep the old
+/// spelling in `owned_commands` fails here rather than orphaning
+/// entries in the field.
+#[test]
+fn ensure_refreshes_an_install_left_by_the_previous_version() {
+    let (dir, home) = fixture("all");
+    wire_all(&home);
+    let previous_version = INTEGRATION_VERSION - 1;
+    let escaped = |s: &str| s.replace('"', "\\\"");
+    let hash = |command: &str, event: &str| {
+        let timeout = codex_hash::normalize_timeout(event, Some(HOOK_TIMEOUT_SECS));
+        codex_hash::trusted_hash(event, None, &Handler::roost(command, timeout)).unwrap()
+    };
+    let per_agent = |home: &Home| -> Vec<(Agent, Vec<String>, Vec<String>)> {
+        ALL_AGENTS
+            .iter()
+            .filter(|a| **a != Agent::Opencode)
+            .map(|a| {
+                let (ours, theirs) = commands_on_disk(home, *a);
+                (*a, ours, theirs)
+            })
+            .collect()
+    };
+    let fresh = per_agent(&home);
+
+    // Rewind every file to what the previous release wrote.
+    for agent in ALL_AGENTS {
+        let now = installed_command(agent);
+        let then = owned_commands(agent)[1].clone();
+        for file in crate::owned_files(&home, agent) {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let rewound = match (agent, file.extension().and_then(|e| e.to_str())) {
+                (Agent::Opencode, _) => text.replacen(
+                    &format!("integration version {INTEGRATION_VERSION}"),
+                    &format!("integration version {previous_version}"),
+                    1,
+                ),
+                (Agent::Codex, Some("toml")) => roost_agent::codex::CODEX_HOOK_EVENTS
+                    .iter()
+                    .fold(text.clone(), |t, event| {
+                        t.replace(&hash(&now, event), &hash(&then, event))
+                    }),
+                (Agent::Codex, _) => {
+                    // The previous release also wrote the uniform
+                    // timeout — the one codex clamps and warns about.
+                    let mut doc = Json::parse(text.as_bytes()).unwrap();
+                    set_roost_timeouts(&mut doc, agent, HOOK_TIMEOUT_SECS);
+                    doc.render(&Style::detect(&text))
+                        .replace(&escaped(&now), &escaped(&then))
+                }
+                _ => text.replace(&escaped(&now), &escaped(&then)),
+            };
+            assert_ne!(
+                rewound,
+                text,
+                "{}: the rewind matched nothing in {}",
+                agent.source(),
+                file.display()
+            );
+            std::fs::write(&file, rewound).unwrap();
+        }
+    }
+    let (mut record, _) = state::load(&home).unwrap();
+    for entry in record.values_mut() {
+        entry.integration_version = previous_version;
+    }
+    state::save(&home, &record).unwrap();
+
+    // The rewind is what an out-of-date machine looks like: wired, on
+    // disk, not current — the row `roostctl agent status` prints as
+    // "wired@vN, out of date".
+    for row in ensure::status(&home).unwrap() {
+        assert_eq!(row.wired, Some(previous_version), "{}", row.agent.source());
+        assert!(row.entries_on_disk, "{}", row.agent.source());
+        assert!(!row.up_to_date, "{}", row.agent.source());
+    }
+
+    let outcome = wire_all(&home);
+    let mut refreshed: Vec<&str> = outcome.refreshed.iter().map(|a| a.source()).collect();
+    refreshed.sort_unstable();
+    let mut all: Vec<&str> = ALL_AGENTS.iter().map(|a| a.source()).collect();
+    all.sort_unstable();
+    assert_eq!(refreshed, all, "every agent is refreshed, none wired anew");
+    assert!(outcome.wired.is_empty(), "{:?}", outcome.wired);
+
+    // Every file carries the current spelling exactly as many times as
+    // a fresh install writes it — no stale copy, no duplicate — and the
+    // foreign entries are untouched.
+    for ((agent, ours, theirs), (_, fresh_ours, fresh_theirs)) in
+        per_agent(&home).iter().zip(fresh.iter())
+    {
+        let name = agent.source();
+        assert_eq!(ours.len(), fresh_ours.len(), "{name}: entry count moved");
+        for command in ours {
+            assert_eq!(command, &installed_command(*agent), "{name}");
+        }
+        assert_eq!(theirs, fresh_theirs, "{name}: a foreign entry changed");
+    }
+
+    // codex: the current hashes are in, the previous ones are gone,
+    // herdr's is still there, and the two capped events carry the cap.
+    let config = std::fs::read_to_string(codex::config_path(&home)).unwrap();
+    let now = installed_command(Agent::Codex);
+    let then = owned_commands(Agent::Codex)[1].clone();
+    for event in roost_agent::codex::CODEX_HOOK_EVENTS {
+        assert!(
+            config.contains(&hash(&now, event)),
+            "{event}: current hash missing"
+        );
+        assert!(
+            !config.contains(&hash(&then, event)),
+            "{event}: stale hash kept"
+        );
+    }
+    assert!(config.contains(&fixture_trusted_hash()));
+    let hooks = parse_file(&codex::hooks_path(&home))
+        .get("hooks")
+        .cloned()
+        .unwrap();
+    for (event, expected) in [
+        ("SessionEnd", 3u64),
+        ("Interrupt", 3),
+        ("Stop", HOOK_TIMEOUT_SECS),
+    ] {
+        let mut found = Vec::new();
+        handlers(hooks.get(event).unwrap(), &mut found);
+        let ours: Vec<&Json> = found
+            .iter()
+            .filter(|h| is_roost_command(Agent::Codex, h.get("command").unwrap().as_str().unwrap()))
+            .collect();
+        assert_eq!(ours.len(), 1, "{event}");
+        assert_eq!(
+            ours[0].get("timeout"),
+            Some(&Json::Number(expected.into())),
+            "{event}"
+        );
+    }
+
+    // opencode's header and the record both say current.
+    let plugin = std::fs::read_to_string(opencode::plugin_path(&home)).unwrap();
+    assert!(
+        plugin
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(&format!("integration version {INTEGRATION_VERSION}")),
+        "{plugin}"
+    );
+    let (record, _) = state::load(&home).unwrap();
+    for agent in ALL_AGENTS {
+        assert_eq!(
+            state::entry(&record, agent).unwrap().integration_version,
+            INTEGRATION_VERSION,
+            "{}",
+            agent.source()
+        );
+    }
+
+    // And it is done: a second ensure has nothing left to write.
+    for agent in ALL_AGENTS {
+        let plan = ensure::plan(agent, &home, ensure::Mode::Auto).unwrap();
+        assert!(plan.is_noop(), "{} would edit again", agent.source());
+    }
+    drop(dir);
+}
+
+/// Set the `timeout` of every Roost handler in `value` — the rewind's
+/// way of writing what the previous release wrote.
+fn set_roost_timeouts(value: &mut Json, agent: Agent, timeout: u64) {
+    match value {
+        Json::Object(entries) => {
+            let ours = entries.iter().any(|(key, child)| {
+                key == "command" && child.as_str().is_some_and(|c| is_roost_command(agent, c))
+            });
+            if ours {
+                if let Some((_, slot)) = entries.iter_mut().find(|(key, _)| key == "timeout") {
+                    *slot = Json::Number(timeout.into());
+                }
+            } else {
+                for (_, child) in entries.iter_mut() {
+                    set_roost_timeouts(child, agent, timeout);
+                }
+            }
+        }
+        Json::Array(items) => items
+            .iter_mut()
+            .for_each(|item| set_roost_timeouts(item, agent, timeout)),
+        _ => {}
+    }
 }
 
 /// The toast list is the record's, not the run's.
