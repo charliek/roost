@@ -71,7 +71,13 @@
 //! `plan` reads and decides; [`apply`] writes. A plan with no edits is
 //! the idempotency assertion — a second `ensure` plans nothing.
 //! [`ensure`] holds one advisory lock across both, because the UI, the
-//! Swift app, `roostctl` and a remote connect can all run at once.
+//! Swift app, `roostctl` and a remote connect can all run at once. The
+//! wait for that lock is bounded ([`write::LOCK_DEADLINE`]): a caller
+//! that cannot get it hears [`InstallError::LockBusy`], because the one
+//! thing worse than two writers is a daemon that can never shut down.
+//! A run made on somebody else's behalf ([`ensure_on_behalf`]) re-asks
+//! their authority *inside* that lock, which is the only place the
+//! answer stays true until the write.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -96,7 +102,9 @@ mod opencode;
 mod acceptance;
 
 pub use command::{installed_command, is_roost_command, owned_commands, INTEGRATION_VERSION};
-pub use ensure::{agent_names, ensure, install, plan, skip_list, status, Mode, Outcome, Status};
+pub use ensure::{
+    agent_names, ensure, ensure_on_behalf, install, plan, skip_list, status, Mode, Outcome, Status,
+};
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
 pub use home::{Home, ALL_AGENTS};
 pub use plan::{apply, Applied, FileEdit, Guard, InstallPlan, Intent};

@@ -2506,6 +2506,82 @@ impl App {
         self.pending_agent_hooks_toast = Some((toast, result.unnoticed));
     }
 
+    /// Ask a host that has just connected to bring its agent hooks in
+    /// line with this client's config (plan 046 §3.4).
+    ///
+    /// The config is read here, on every connect, rather than captured
+    /// when the connection was opened: a reconnect after the user edited
+    /// `agent-hooks` has to carry the new answer, and this is the only
+    /// place that runs on both the first connect and every retry.
+    fn wire_host_agent_hooks(&mut self, host: &str) {
+        let (mode, skip) = agent_hooks::remote_request(&self.config);
+        self.hosts
+            .wire_agent_hooks(host, mode, &skip, &agent_hooks::client_label());
+    }
+
+    /// A host answered `session.set_agent_hooks`.
+    ///
+    /// The toast is the local one with `on <host>: ` in front of it, and
+    /// it is at most once per agent per *host*: the session flips its own
+    /// record's `noticed` for whatever it reports as wired, so a second
+    /// client — or this one after a reconnect — hears nothing.
+    ///
+    /// Nothing here is fatal. A session that predates the op, a `$HOME`
+    /// the daemon could not read, a codex file it refused to parse: each
+    /// is a log line, and the attachment the user actually asked for is
+    /// untouched.
+    fn host_agent_hooks_set(&mut self, reply: agent_hooks::HostAgentHooks) {
+        let result = match reply.outcome {
+            Ok(result) => result,
+            Err(error) => {
+                // The connection task already said its one line for an
+                // `unknown-op`, so this level would be a second copy of
+                // it on every reconnect.
+                if matches!(
+                    error,
+                    crate::host_conn::HostOpError::Rejected {
+                        code: roost_ipc::client::ServerCode::UnknownOp,
+                        ..
+                    }
+                ) {
+                    tracing::debug!(host = %reply.label, %error, "agent hooks");
+                } else {
+                    tracing::warn!(host = %reply.label, %error, "could not set a host's agent hooks");
+                }
+                return;
+            }
+        };
+        for failure in &result.errors {
+            tracing::warn!(
+                host = %reply.label,
+                agent = %failure.agent,
+                error = %failure.error,
+                "agent hooks"
+            );
+        }
+        tracing::info!(
+            host = %reply.label,
+            unannounced = result.wired.len(),
+            refreshed = result.refreshed.len(),
+            removed = result.removed.len(),
+            errors = result.errors.len(),
+            "a host set its agent hooks"
+        );
+        let agents: Vec<roost_agent::Agent> = result
+            .wired
+            .iter()
+            .filter_map(|name| roost_agent::Agent::parse(name))
+            .collect();
+        let Some(toast) = agent_hooks::wired_toast(&agents, Some(&reply.label)) else {
+            return;
+        };
+        // Shown straight away rather than held to the end of the drain
+        // like the local one: there is no `noticed` flag on this side to
+        // spend, so a line that gets replaced costs nothing but itself.
+        tracing::info!(host = %reply.label, toast, "host agent hooks toast shown");
+        self.set_status(toast);
+    }
+
     /// Put the held agent-hooks toast on the banner, last in its drain.
     ///
     /// Called from the tail of `service_engine`, after every other

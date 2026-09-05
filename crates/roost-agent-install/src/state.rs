@@ -216,6 +216,12 @@ pub fn now_secs() -> i64 {
 /// The UI calls this **after** the toast is on screen. A crash in
 /// between loses the toast rather than repeating it, which is the right
 /// way round for something that says "Roost just changed your files".
+///
+/// A host session does **not** use this: it has no screen to put a toast
+/// on and answers a client in one round trip, so its flip happens inside
+/// the ensure's own lock ([`crate::ensure_on_behalf`]). Re-acquiring the
+/// lock here would leave two clients connecting at once both reading the
+/// same agent as unannounced.
 pub fn mark_noticed(home: &Home, agents: &[Agent]) -> Result<bool, InstallError> {
     let _lock = write::lock(&home.lock_path())?;
     let (mut record, _) = load(home)?;

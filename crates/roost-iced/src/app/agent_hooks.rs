@@ -30,9 +30,11 @@
 
 use roost_agent::Agent;
 use roost_agent_install::{Guard, Home, Mode};
+use roost_ipc::messages::{AgentHooksMode, SessionSetAgentHooksResult};
 use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
+use crate::host_conn::queue::HostOpError;
 
 /// How this UI identifies itself in the state record. The same label
 /// `roostctl` writes: both are this machine acting on its own behalf,
@@ -180,6 +182,54 @@ pub(crate) fn spawn_mark_noticed(runtime: &tokio::runtime::Handle, agents: Vec<A
     });
 }
 
+/// What one host answered `session.set_agent_hooks` with, on its way to
+/// the toast (plan 046 §3.4).
+pub(crate) struct HostAgentHooks {
+    /// The host's label, for the toast prefix and the log.
+    pub label: String,
+    pub outcome: Result<SessionSetAgentHooksResult, HostOpError>,
+}
+
+/// What this client asks a host to do, read fresh from its config.
+///
+/// Sent after **every** `session.connect`, values and all: the op is
+/// idempotent, and a config edit made since the last connect has no
+/// other way to reach the host.
+///
+/// **`off` is not silence here.** Locally it means "wire nothing" and
+/// the UI never opens an agent's file; remotely it means "unwire", and
+/// the difference is not an inconsistency — a host has no `config.conf`
+/// of its own, so the client is the only authority that can tell it to
+/// come clean. Off is off everywhere (§3.4, and §3.6's C7 amendment for
+/// the local half).
+///
+/// The skip list travels as the user typed it. The host resolves the
+/// names and reports the ones it does not know, which is the only place
+/// that can tell a typo from an agent a newer client knows about.
+pub(crate) fn remote_request(config: &RoostConfig) -> (AgentHooksMode, Vec<String>) {
+    let mode = match config.agent_hooks {
+        AgentHooks::Auto => AgentHooksMode::Auto,
+        AgentHooks::Off => AgentHooksMode::Off,
+    };
+    (mode, config.agent_hooks_skip.clone())
+}
+
+/// How this client names itself in a host's state record.
+///
+/// The machine name, because `by` exists so that two clients of one host
+/// — a Mac on `auto`, a Linux box on `off`, flipping the files past each
+/// other — are tellable apart in `roostctl agent status` on the host.
+pub(crate) fn client_label() -> String {
+    let name = gethostname::gethostname();
+    let name = name.to_string_lossy();
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        "roost".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// The one-time toast, per §3.7. `host` names the machine when the
 /// wiring happened over a host connection, and is `None` for this one.
 pub(crate) fn wired_toast(agents: &[Agent], host: Option<&str>) -> Option<String> {
@@ -222,6 +272,32 @@ mod tests {
         assert_eq!(mode, Mode::Off);
         assert_eq!(skip, vec![Agent::Cursor]);
         assert_eq!(unknown, vec!["gemini"]);
+    }
+
+    /// The remote half sends `off` rather than staying quiet, which is
+    /// the whole of "off is off everywhere": the host has no config of
+    /// its own to read, so silence would leave its files wired forever.
+    #[test]
+    fn off_travels_to_a_host_instead_of_being_withheld() {
+        let (mode, skip) = remote_request(&config(
+            "agent-hooks = off\nagent-hooks-skip = cursor, gemini",
+        ));
+        assert_eq!(mode, AgentHooksMode::Off);
+        // Unresolved on purpose: only the host can say which names it
+        // knows, and a client that dropped `gemini` here would leave the
+        // typo undiagnosable from either end.
+        assert_eq!(skip, vec!["cursor".to_string(), "gemini".to_string()]);
+
+        let (mode, skip) = remote_request(&config(""));
+        assert_eq!(mode, AgentHooksMode::Auto);
+        assert!(skip.is_empty());
+    }
+
+    /// It goes into the host's state record, so it has to be a name and
+    /// never an empty string.
+    #[test]
+    fn the_client_label_is_never_empty() {
+        assert!(!client_label().is_empty());
     }
 
     /// The text is what the user is left with after Roost has edited

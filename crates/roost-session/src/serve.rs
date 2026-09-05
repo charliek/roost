@@ -207,7 +207,11 @@ pub async fn serve(
         config.app_label.clone(),
         config.app_id.clone(),
     )
-    .with_session(session, stop_handle(&stop));
+    .with_session(session, stop_handle(&stop))
+    // The install engine lives on this side of the seam and only this
+    // side: `roost-engine` decodes and lease-gates the op, the daemon
+    // owns the `$HOME` it writes (plan 046 §3.4).
+    .with_agent_hooks(crate::agent_hooks::handle());
 
     let server = IpcServer::bind(&config.socket_path, handler)
         .await

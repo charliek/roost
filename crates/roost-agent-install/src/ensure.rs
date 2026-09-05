@@ -30,6 +30,25 @@ pub enum Mode {
     Off,
 }
 
+/// Who flips the state record's `noticed` flag for what a run reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Notice {
+    /// The caller shows the toast and then calls [`crate::mark_noticed`].
+    /// The order is deliberate on a machine with a screen: a crash
+    /// between the two loses the toast rather than repeating it (plan
+    /// 046 §3.3).
+    #[default]
+    Caller,
+    /// This run flips it, in the same record write that recorded the
+    /// wiring. A host has no screen and no second step — it reports
+    /// `wired` in an op reply it cannot take back — so the flag has to
+    /// move under the same lock that decided it. Flipping afterwards
+    /// re-acquires the lock, and two clients connecting at once would
+    /// both read the agent as unannounced and both be told (§3.3: "on a
+    /// host the session flips `noticed` itself when it reports `wired`").
+    Here,
+}
+
 /// Resolve `agent-hooks-skip`'s names against the agents this crate can
 /// wire: the ones it recognises, and the spellings it does not.
 ///
@@ -173,8 +192,52 @@ pub fn ensure(
     by: &str,
     guard: Guard,
 ) -> Result<Outcome, InstallError> {
+    ensure_with(home, mode, skip, by, guard, Notice::Caller, None)
+}
+
+/// [`ensure`] run for somebody who is not this machine — a host session
+/// acting on a connected client's config (plan 046 §3.4).
+///
+/// Two things differ, and both follow from the caller being remote.
+///
+/// `authority` is re-asked **once the lock is in hand**, and a `false`
+/// answer is [`InstallError::Unauthorized`] with nothing written. The
+/// caller's permission was checked at the door, but the door can be a
+/// long way from the effect: this call can sit behind another writer's
+/// lock for the whole of [`crate::write::LOCK_DEADLINE`], and the client
+/// that asked may have lost the session's lease to somebody else in the
+/// meantime. The lock is the serialization point for every Roost writer,
+/// so it is the last moment at which "may I still write?" is a question
+/// whose answer still holds when the rename lands.
+///
+/// And the run flips `noticed` itself, in the same record write —
+/// see [`Notice::Here`].
+pub fn ensure_on_behalf(
+    home: &Home,
+    mode: Mode,
+    skip: &[Agent],
+    by: &str,
+    guard: Guard,
+    authority: &dyn Fn() -> bool,
+) -> Result<Outcome, InstallError> {
+    ensure_with(home, mode, skip, by, guard, Notice::Here, Some(authority))
+}
+
+fn ensure_with(
+    home: &Home,
+    mode: Mode,
+    skip: &[Agent],
+    by: &str,
+    guard: Guard,
+    notice: Notice,
+    authority: Option<&dyn Fn() -> bool>,
+) -> Result<Outcome, InstallError> {
     guard.check()?;
     let _lock = crate::write::lock(&home.lock_path())?;
+    // Under the lock and before the first read: see `ensure_on_behalf`.
+    if authority.is_some_and(|still| !still()) {
+        return Err(InstallError::Unauthorized);
+    }
     let (mut record, warning) = state::load(home)?;
     let mut outcome = Outcome::default();
     if let Some(warning) = warning {
@@ -207,6 +270,13 @@ pub fn ensure(
     }
 
     outcome.unnoticed = unnoticed(&record);
+    if notice == Notice::Here {
+        for agent in &outcome.unnoticed {
+            if let Some(entry) = record.get_mut(agent.source()) {
+                entry.noticed = true;
+            }
+        }
+    }
     outcome.wrote |= state::save(home, &record)?;
     Ok(outcome)
 }
@@ -457,6 +527,111 @@ mod tests {
         let (known, unknown) = skip_list(["gx"]);
         assert!(known.is_empty());
         assert_eq!(unknown, vec!["gx"]);
+    }
+
+    fn a_home(root: &std::path::Path) -> Home {
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        Home::rooted(root)
+    }
+
+    /// The authority is asked **while the lock is held**, and that is the
+    /// whole of the fix.
+    ///
+    /// A caller can wait the length of [`crate::write::LOCK_DEADLINE`]
+    /// behind another writer, and a remote caller's permission can expire
+    /// inside that wait (its session lease taken over by a client that
+    /// asked for the opposite). Asked at the door, the answer is stale by
+    /// the time it matters; asked under the lock, no other Roost writer
+    /// can slip between the answer and the write.
+    #[test]
+    fn the_authority_is_asked_under_the_lock_not_at_the_door() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        let asked = std::cell::Cell::new(0u32);
+        let held_while_asked = std::cell::Cell::new(false);
+
+        let refused = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| {
+            asked.set(asked.get() + 1);
+            held_while_asked.set(
+                crate::write::lock_within(&home.lock_path(), std::time::Duration::ZERO).is_err(),
+            );
+            false
+        })
+        .expect_err("a caller without authority must not write");
+
+        assert_eq!(asked.get(), 1);
+        assert!(
+            held_while_asked.get(),
+            "the authority was asked before the run took its lock"
+        );
+        assert!(matches!(refused, InstallError::Unauthorized), "{refused:?}");
+        assert!(
+            !dir.path().join(".claude/settings.json").exists(),
+            "an unauthorised run wrote an agent's file"
+        );
+        assert!(
+            !dir.path().join(".config/roost/agent-hooks.json").exists(),
+            "an unauthorised run wrote the state record"
+        );
+    }
+
+    /// A caller that still holds its authority is not slowed down by
+    /// having one: the same run wires, records, and reports.
+    #[test]
+    fn an_authorised_delegate_wires_exactly_as_ensure_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+
+        let done = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| true)
+            .expect("ensure");
+        assert_eq!(done.wired, vec![Agent::Claude]);
+        assert_eq!(done.unnoticed, vec![Agent::Claude]);
+    }
+
+    /// The `noticed` flip happens in the run's own record write, so the
+    /// agent is announced to exactly one caller.
+    ///
+    /// Flipping it afterwards — a second `mark_noticed` under a
+    /// re-acquired lock — leaves a window in which two clients connecting
+    /// at once both read the agent as unannounced and both get told that
+    /// Roost changed the user's files. The local UI keeps the
+    /// show-then-mark order on purpose (a crash there should lose the
+    /// toast, not repeat it); a host has no toast to lose.
+    #[test]
+    fn a_delegated_run_spends_the_notice_in_the_same_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+
+        let first = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| true)
+            .expect("ensure");
+        assert_eq!(first.unnoticed, vec![Agent::Claude]);
+        // Read straight off the record: no `mark_noticed` ran in between,
+        // which is exactly the point.
+        let recorded = std::fs::read_to_string(dir.path().join(".config/roost/agent-hooks.json"))
+            .expect("state record");
+        assert!(recorded.contains("\"noticed\": true"), "{recorded}");
+
+        let second = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| true)
+            .expect("ensure again");
+        assert!(second.unnoticed.is_empty(), "{second:?}");
+    }
+
+    /// …and a local `ensure` still leaves the flag for its caller to
+    /// spend, because the toast has to be on screen before it is.
+    #[test]
+    fn a_local_ensure_leaves_the_notice_for_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+
+        let first = ensure(&home, Mode::Auto, &[], "local", Guard::PERMITTED).expect("ensure");
+        assert_eq!(first.unnoticed, vec![Agent::Claude]);
+        let second =
+            ensure(&home, Mode::Auto, &[], "local", Guard::PERMITTED).expect("ensure again");
+        assert_eq!(
+            second.unnoticed,
+            vec![Agent::Claude],
+            "nothing but mark_noticed may spend a local toast"
+        );
     }
 
     #[test]

@@ -54,6 +54,15 @@ pub(crate) enum EngineFeed {
     /// near the event-loop thread, while the toast it produces can only
     /// be set there.
     AgentHooks(crate::app::agent_hooks::AgentHooksEnsured),
+    /// One host answered `session.set_agent_hooks` (plan 046 §3.4).
+    ///
+    /// It rides the feed rather than being awaited anywhere because the
+    /// op is *queued* after a connect, never chained into it: the reply
+    /// can arrive many seconds later (a network-mounted `$HOME`), and
+    /// whatever it says must not be able to delay — or fail — the
+    /// attachment that asked for it. Boxed: the result carries five
+    /// vectors, and every feed item pays for the largest variant.
+    HostAgentHooks(Box<crate::app::agent_hooks::HostAgentHooks>),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
     /// The user picked an item off the native macOS menu bar. Not an

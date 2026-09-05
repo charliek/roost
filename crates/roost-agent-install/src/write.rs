@@ -38,6 +38,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -319,8 +320,32 @@ impl Drop for HooksLock {
     }
 }
 
-/// Block until this process owns `path`'s lock.
+/// How long [`lock`] waits for the current holder before it gives up.
+///
+/// Bounded rather than blocking, because of who waits behind it: an
+/// `ensure` on a host session runs holding that session's mutation
+/// barrier, and `session.stop` takes the same barrier for write — so an
+/// unbounded `flock` on a `$HOME` that may be network-mounted was a
+/// wedge that no client disconnect and no shutdown could clear. Ten
+/// seconds is far longer than an honest ensure (five small files) and
+/// comfortably shorter than the 15 s a client gives
+/// `session.set_agent_hooks`, so the caller hears
+/// [`InstallError::LockBusy`] instead of timing out on the wire.
+pub const LOCK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How often a waiter re-asks. Short enough that the normal hand-off is
+/// imperceptible, long enough that a full deadline is 400 syscalls
+/// rather than a spin.
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// Take `path`'s lock, waiting at most [`LOCK_DEADLINE`].
 pub fn lock(path: &Path) -> Result<HooksLock, InstallError> {
+    lock_within(path, LOCK_DEADLINE)
+}
+
+/// [`lock`] with the deadline stated, for the tests that need a short
+/// one.
+pub fn lock_within(path: &Path, deadline: Duration) -> Result<HooksLock, InstallError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| InstallError::io(dir, e))?;
     let file = OpenOptions::new()
@@ -331,13 +356,80 @@ pub fn lock(path: &Path) -> Result<HooksLock, InstallError> {
         .mode(PRIVATE_MODE)
         .open(path)
         .map_err(|e| InstallError::io(path, e))?;
-    file.lock().map_err(|e| InstallError::io(path, e))?;
-    Ok(HooksLock { _file: file })
+
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(HooksLock { _file: file }),
+            // `flock` is per open file description, so this is reached
+            // by a second writer *in this process* too — which is what
+            // lets a test prove a check ran while the lock was held.
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(InstallError::io(path, e)),
+        }
+        let waited = started.elapsed();
+        if waited >= deadline {
+            return Err(InstallError::LockBusy {
+                path: path.to_path_buf(),
+                waited: deadline,
+            });
+        }
+        std::thread::sleep(LOCK_POLL.min(deadline - waited));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lock waits, and then stops waiting.
+    ///
+    /// Blocking forever was the defect, not the waiting: an `ensure` on a
+    /// host session runs holding that session's mutation barrier, and
+    /// `session.stop` takes the same barrier for write — so a holder that
+    /// never releases (a crashed writer, a stale `flock` on a network
+    /// home) meant the daemon never flushed, never reaped and never
+    /// answered. Both halves are asserted: a busy lock is still waited
+    /// for, and the wait ends in a named refusal rather than never.
+    #[test]
+    fn a_lock_nobody_releases_is_refused_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-hooks.lock");
+        // `flock` belongs to the open file description, so a second
+        // holder in *this* process contends exactly like another one.
+        let held = lock(&path).expect("take the lock");
+
+        let started = Instant::now();
+        let refused = lock_within(&path, Duration::from_millis(200))
+            .expect_err("a lock that never frees must not be waited on forever");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(refused, InstallError::LockBusy { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("agent-hooks lock"),
+            "{refused}"
+        );
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        assert!(
+            waited < Duration::from_secs(5),
+            "the bound did not hold: {waited:?}"
+        );
+
+        drop(held);
+        lock_within(&path, Duration::from_millis(200)).expect("free again once the holder is gone");
+    }
+
+    /// The production default is the one the callers reason about: long
+    /// enough that an honest ensure never reaches it, short enough that a
+    /// client's own 15 s budget for `session.set_agent_hooks` is not what
+    /// gives up first.
+    #[test]
+    fn the_default_deadline_stays_inside_the_op_budget() {
+        assert_eq!(LOCK_DEADLINE, Duration::from_secs(10));
+    }
 
     #[test]
     fn a_write_replaces_contents_and_leaves_no_temp_behind() {

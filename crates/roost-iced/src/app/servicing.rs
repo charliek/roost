@@ -1375,6 +1375,11 @@ impl App {
                             // edge where the lease exists and the queue
                             // is draining.
                             self.push_host_focus();
+                            // Same edge, same reason: the lease exists
+                            // and the queue is draining. Every connect,
+                            // with this client's current config — see
+                            // `HostConnSet::wire_agent_hooks`.
+                            self.wire_host_agent_hooks(host);
                         }
                         // Attributed (not a stale task's publication): the
                         // app-side purge follows the set's — everything
@@ -1411,6 +1416,7 @@ impl App {
                     self.exit_state.request();
                 }
                 EngineFeed::AgentHooks(result) => self.agent_hooks_ensured(result),
+                EngineFeed::HostAgentHooks(reply) => self.host_agent_hooks_set(*reply),
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {

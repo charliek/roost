@@ -50,6 +50,31 @@ pub enum InstallError {
     #[error("{}: not writable", .path.display())]
     ReadOnly { path: PathBuf },
 
+    /// Another writer held this home's lock for the whole deadline.
+    ///
+    /// Waiting forever was the defect: an `ensure` on a host session
+    /// runs holding that session's mutation barrier, and `session.stop`
+    /// waits on the barrier — so a lock nobody releases (a dead holder
+    /// on a network-mounted `$HOME`, a stale `flock` an NFS server has
+    /// not reclaimed) stopped the daemon from ever flushing, reaping or
+    /// answering. A bounded wait turns that into a refusal that names
+    /// itself.
+    #[error(
+        "{}: another Roost held this home's agent-hooks lock for {:.0?}; nothing was written",
+        .path.display(), .waited
+    )]
+    LockBusy {
+        path: PathBuf,
+        waited: std::time::Duration,
+    },
+
+    /// The caller's authority to write this home was gone by the time
+    /// the lock was in hand. Only a *delegated* ensure can reach this
+    /// — see [`crate::ensure_on_behalf`] — and reaching it means nothing
+    /// was written, which is the whole point of asking twice.
+    #[error("the client that asked for this no longer holds the session; nothing was written")]
+    Unauthorized,
+
     #[error("{}: {source}", .path.display())]
     Io {
         path: PathBuf,

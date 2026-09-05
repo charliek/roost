@@ -63,6 +63,7 @@ from dataclasses import dataclass
 import pytest
 import session as sessionlib
 import ui
+from agent_jail import INSTALLABLE_AGENTS
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
@@ -1610,3 +1611,134 @@ def test_reordering_a_hosts_projects_routes_to_the_session_and_the_mirror_follow
             "a fresh incarnation to republish the host's project rows",
         )
         assert [bare(p["key"]) for p in fresh["projects"]] == [bare(key) for key in wanted]
+
+
+# ---------------------------------------------------------------------------
+# 13. Plan 046 C8 — `session.set_agent_hooks`, and `off` reaching a host
+#
+# THIS SECTION WRITES AGENT CONFIG FILES. Everything above it drives
+# terminals; this one drives an install engine, and a bug in it would
+# otherwise land in the developer's own `~/.claude/settings.json`. The
+# fences are `test_agent_hooks.py`'s, applied to the *session* side:
+#
+#   1. `SessionEnv.jail_agents()` puts `HOME`, `XDG_CONFIG_HOME` and all
+#      five agent-directory variables inside the session's own temp root,
+#      and every launch from then on asserts the merged environment
+#      before spawning (`session.command_env`).
+#   2. `roost-agent-install` refuses to run under `ROOST_TEST_MODE=1`
+#      unless `ROOST_AGENT_HOOKS_FORCE=1` is set. Only the fixture below
+#      sets it, and only for a session that is already jailed.
+#   3. The *client* here is the ordinary harness UI, whose `launcher.conf`
+#      says `agent-hooks = off`. That is not a limitation — it is the
+#      assertion: a client on `off` must take a host's entries back out.
+#
+# What is NOT here: the old-session tolerance path. A session that
+# predates the op cannot be produced from this harness — there is no
+# version knob on the fake-`ssh` fixture or anywhere else that removes an
+# op from a live daemon's dispatcher — so the client's side of it (one
+# log line per connection, no toast, connection unaffected) is covered by
+# `roost-iced`'s inline `an_old_session_is_noted_once_per_op_and_never_again`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def jailed_host(roost, session_env):
+    """A running session whose agent dotfiles are inside its own root,
+    saved as a host, not yet connected."""
+    require_test_mode(roost)
+    jail = session_env.jail_agents()
+    start_session(session_env, ROOST_AGENT_HOOKS_FORCE="1")
+    with saved_host(roost, session_env) as under_test:
+        yield under_test, jail
+
+
+def wired_agents(jail) -> set:
+    """Which agents the host's state record currently claims."""
+    try:
+        return set(jail.read_record())
+    except FileNotFoundError:
+        return set()
+
+
+def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host):
+    """The remote half of plan 046: a client's `agent-hooks` config is
+    what decides whether a host is wired.
+
+    Two clients, deliberately. The **scripted** one sends `auto` and is
+    the only place the op's reply is readable, since no IPC op on the UI
+    side reports what a host answered. The **real** one is the harness UI,
+    which runs on `agent-hooks = off` and connects afterwards — so the
+    unwiring is not something this test asks for, it is what the client
+    does on its own after `session.connect`, which is the whole claim of
+    §3.4 ("off is off everywhere") and the only way to see that the client
+    really queues the op.
+    """
+    host, jail = jailed_host
+    claude_settings = jail.agent_dirs["claude"] / "settings.json"
+    assert not jail.record.exists(), "the session wired something before a client asked"
+
+    with host.client() as scripted:
+        lease = HostUnderTest.lease(scripted)
+        reply = scripted.call(
+            "session.set_agent_hooks",
+            {
+                "lease": lease,
+                "mode": "auto",
+                "skip": ["cursor", "gemini"],
+                "client": "roosttest",
+            },
+        )
+
+    expected = [a for a in INSTALLABLE_AGENTS if a != "cursor"]
+    assert sorted(reply["wired"]) == sorted(expected), reply
+    assert reply["errors"] == [], reply
+    skipped = {row["agent"]: row["reason"] for row in reply["skipped"]}
+    assert skipped.get("cursor") == "skip-list", reply
+    assert "no agent named that" in skipped.get("gemini", ""), (
+        "a skip name no agent answers to is reported, never fatal"
+    )
+
+    # The files, not just the reply — and every one of them inside the
+    # jail, which is the assertion the whole section exists for.
+    record = jail.read_record()
+    assert sorted(record) == sorted(expected), record
+    for agent in expected:
+        assert record[agent]["by"] == "roosttest", record[agent]
+        for path in jail.owned_files(agent):
+            assert path.is_relative_to(jail.root), f"{agent} wrote outside the jail: {path}"
+            assert path.exists(), f"{agent}: {path} was recorded but not written"
+    assert "ROOST_AGENT_HOOK" in claude_settings.read_text()
+
+    # A second client asking the same thing is told nothing new: the
+    # session flipped `noticed` for what it reported, so the toast is at
+    # most once per agent per host.
+    with host.client() as second:
+        again = second.call(
+            "session.set_agent_hooks",
+            {
+                "lease": HostUnderTest.lease(second, takeover=True),
+                "mode": "auto",
+                "skip": ["cursor"],
+                "client": "roosttest",
+            },
+        )
+    assert again["wired"] == [], again
+    assert again["removed"] == [], again
+
+    # Now the real client. Nothing below asks for an unwiring — the UI
+    # reads `agent-hooks = off` out of the harness config and sends it
+    # after its own `session.connect`.
+    host.connect_and_wait()
+    wait_until(
+        lambda: wired_agents(jail) == set(),
+        30.0,
+        "the connected client to unwire the host it reads `agent-hooks = off` for",
+    )
+    # Gone, because Roost created it and the record says so; a
+    # `settings.json` that was already there comes back without the
+    # entry instead. Both are "clean", and the record is what tells them
+    # apart — so both are accepted here and neither may still name the
+    # hook.
+    assert not claude_settings.exists() or (
+        "ROOST_AGENT_HOOK" not in claude_settings.read_text()
+    ), "off removed the record but left the entry in the file"

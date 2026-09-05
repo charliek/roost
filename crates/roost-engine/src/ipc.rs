@@ -41,15 +41,16 @@ use roost_ipc::messages::{
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
     SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionSetFocusParams, SessionSetThemeParams,
-    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
-    SidebarSetWidthParams, TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
-    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    SessionIdentify, SessionIdentifyParams, SessionSetAgentHooksParams, SessionSetAgentHooksResult,
+    SessionSetFocusParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams, WireProjectRef, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
@@ -646,6 +647,128 @@ impl std::fmt::Debug for StopHandle {
     }
 }
 
+/// What a session does when a client sends `session.set_agent_hooks`.
+///
+/// The dependency direction is the point (plan 046 §3.4): this crate
+/// decodes the op and gates it on the lease, and the *daemon* — which is
+/// the process that links `roost-agent-install` and owns the `$HOME`
+/// being written — supplies the doing. `roost-engine` is linked into the
+/// UI processes too, and a UI has no business carrying a dotfile writer.
+///
+/// A handler built without one answers `not-supported`, which is the
+/// honest answer for any socket that is not a host session's.
+#[derive(Clone)]
+pub struct AgentHooksHandle(Arc<dyn Fn(AgentHooksRequest) -> AgentHooksFuture + Send + Sync>);
+
+/// The op's params minus the credential. The lease is this crate's to
+/// check and nobody else's to hold.
+#[derive(Debug, Clone)]
+pub struct AgentHooksRequest {
+    pub mode: roost_ipc::messages::AgentHooksMode,
+    pub skip: Vec<String>,
+    /// How the asking client names itself, for the host's state record.
+    pub client: String,
+    /// Whether the client that asked *still* holds the session — asked
+    /// again at the point of effect. See [`AgentHooksAuthority`].
+    pub authority: AgentHooksAuthority,
+}
+
+/// "Is the client that asked for this still the lease holder?", callable
+/// from the thread doing the work.
+///
+/// The lease gate at the door is not enough on its own. The install
+/// engine takes a per-home `flock` and can wait behind another writer
+/// for seconds; the client's own 15 s budget makes a *timed-out* client
+/// reconnect while the host work carries on. In that window another
+/// client can take the lease over and state the opposite policy — and
+/// the displaced request would then run afterwards and rewrite the files
+/// it was no longer allowed to touch. So the answer travels with the
+/// request and is re-asked where it counts (`roost-agent-install`'s
+/// `ensure_on_behalf` asks it under the lock).
+///
+/// It is a closure rather than a lease string because the registry that
+/// can answer lives in this module and nothing outside it should be able
+/// to read or forge a lease token.
+#[derive(Clone)]
+pub struct AgentHooksAuthority(Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl AgentHooksAuthority {
+    pub fn new(f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// For a caller with no authority to lose — the tests, and any
+    /// future backend that is not driven by a lease.
+    pub fn always() -> Self {
+        Self::new(|| true)
+    }
+
+    pub fn holds(&self) -> bool {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for AgentHooksAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AgentHooksAuthority")
+    }
+}
+
+/// Why a session could not run an install at all.
+///
+/// Typed rather than a string because the two answers instruct
+/// differently on the wire: `Unauthorized` is `taken-over` (stop driving
+/// this session), everything else is `internal` (the wiring failed, the
+/// session is fine). A *per-agent* failure is neither — it rides back in
+/// the reply's `errors`.
+#[derive(Debug)]
+pub enum AgentHooksError {
+    /// The lease that asked had been taken over by the time the install
+    /// could act. Nothing was written.
+    Unauthorized,
+    /// A whole-run failure: no `$HOME`, an unwritable state record, a
+    /// lock another writer never released.
+    Failed(String),
+}
+
+impl std::fmt::Display for AgentHooksError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentHooksError::Unauthorized => f.write_str(
+                "the lease that asked for this was taken over before the install could run; \
+                 nothing was written",
+            ),
+            AgentHooksError::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
+type AgentHooksFuture =
+    Pin<Box<dyn Future<Output = Result<SessionSetAgentHooksResult, AgentHooksError>> + Send>>;
+
+impl AgentHooksHandle {
+    pub fn new<F, Fut>(f: F) -> Self
+    where
+        F: Fn(AgentHooksRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<SessionSetAgentHooksResult, AgentHooksError>> + Send + 'static,
+    {
+        Self(Arc::new(move |request| Box::pin(f(request))))
+    }
+
+    async fn run(
+        &self,
+        request: AgentHooksRequest,
+    ) -> Result<SessionSetAgentHooksResult, AgentHooksError> {
+        (self.0)(request).await
+    }
+}
+
+impl std::fmt::Debug for AgentHooksHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AgentHooksHandle")
+    }
+}
+
 /// Session-socket state: the identity, the stop tail, and the two
 /// primitives that make `session.stop` a clean cut.
 struct SessionState {
@@ -1093,6 +1216,24 @@ impl SessionState {
         }
     }
 
+    /// Is `lease` still the live one?
+    ///
+    /// A read, with none of [`Self::require_lease`]'s registration: it is
+    /// asked from the thread doing an op's *work*, where the question is
+    /// "may this still take effect", not "count me as a connection". A
+    /// stop counts as a loss of authority for the same reason it refuses
+    /// mutations — a session that has flushed and reaped must not gain
+    /// new entries pointing at the socket it is about to unlink.
+    fn holds_lease(&self, lease: &str) -> bool {
+        if lease.is_empty() || self.stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        lock(&self.clients)
+            .current
+            .as_ref()
+            .is_some_and(|current| current.token == lease)
+    }
+
     /// One connection under the lease has ended. `true` when the focus
     /// the workspace is holding went away with it.
     fn forget_connection(&self, conn_id: u64) -> bool {
@@ -1210,6 +1351,12 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::SESSION_CONNECT
             | ops::SESSION_SET_THEME
             | ops::SESSION_SET_FOCUS
+            // Not workspace state, but authority-bearing all the same:
+            // it writes hook entries into the session user's dotfiles,
+            // pointing them at a `roostctl` that reports to a socket
+            // this session is about to unlink. Listed so a stop latches
+            // it out along with everything else that changes the world.
+            | ops::SESSION_SET_AGENT_HOOKS
             | ops::TAB_ATTACH
             | ops::TAB_FEED_PTY_BYTES
             | ops::HOST_ADD
@@ -1244,6 +1391,11 @@ pub struct IpcHandler {
     /// session socket ever serves that op, so this is inert on a UI
     /// socket.
     push_limits: PushLimits,
+    /// Set by the host-session daemon: what `session.set_agent_hooks`
+    /// actually does. `None` everywhere else, and the op answers
+    /// `not-supported` — see [`AgentHooksHandle`] for why this crate
+    /// holds a callback rather than the install engine itself.
+    agent_hooks: Option<AgentHooksHandle>,
 }
 
 impl IpcHandler {
@@ -1263,7 +1415,21 @@ impl IpcHandler {
             ui_tx: None,
             session: None,
             push_limits: PushLimits::default(),
+            agent_hooks: None,
         }
+    }
+
+    /// Teach a session socket how to wire the host's agent hooks.
+    ///
+    /// Separate from [`Self::with_session`] because the two answer
+    /// different questions — "is this a session?" and "can this session
+    /// write the user's dotfiles?" — and only the daemon can answer the
+    /// second. A session built without it serves the op as
+    /// `not-supported` rather than pretending it wired anything.
+    #[must_use]
+    pub fn with_agent_hooks(mut self, handle: AgentHooksHandle) -> Self {
+        self.agent_hooks = Some(handle);
+        self
     }
 
     /// Wire the UI request channel so main-thread-only ops (activate,
@@ -1893,6 +2059,15 @@ async fn dispatch_outcome(
         return session_set_focus(h, session, ctx, &p).map(HandlerOutcome::Reply);
     }
 
+    // Connection-scoped like its neighbours, for the same reason: the
+    // lease rides in the params and belongs to *this* connection.
+    if op == ops::SESSION_SET_AGENT_HOOKS {
+        let p: SessionSetAgentHooksParams = decode(params)?;
+        return session_set_agent_hooks(h, session, ctx, p)
+            .await
+            .map(HandlerOutcome::Reply);
+    }
+
     // Same reason as `session.connect`: the token is bound to the lease
     // presented on *this* connection, which `dispatch` cannot see.
     if op == ops::TAB_ATTACH {
@@ -2112,6 +2287,73 @@ fn session_set_focus(
     // never established.
     session.claim_focus(ctx, p.focused_tab_id.is_some());
     Ok(serde_json::json!({}))
+}
+
+/// `session.set_agent_hooks`: bring the host's agent hook entries in
+/// line with the connected client's config (plan 046 §3.4).
+///
+/// Everything this function does is admission. The work — reading and
+/// rewriting five agents' config files under the session user's `$HOME`
+/// — belongs to the daemon, which is the only process here that links
+/// the install engine; this crate only decides *whether* it may run.
+///
+/// Lease-gated because it writes authority-bearing files on the host,
+/// and in [`is_mutating_op`] because a session that has latched
+/// `session.stop` has already flushed and reaped: entries pointing at a
+/// socket about to be unlinked are worse than no entries at all.
+///
+/// A per-agent install failure is a *reported* failure, never an error
+/// frame: the reply's `errors` list carries it, so a client hears which
+/// agent broke and still keeps the session it just attached to. Only a
+/// whole-run failure — no `$HOME`, an unwritable record, a lock another
+/// writer never released — is an error frame.
+///
+/// **The lease is checked twice, and the second one is the real one.**
+/// `require_lease` here is the door; the install engine can then sit
+/// behind another writer's `flock` for seconds, and neither closing the
+/// client's connection nor its own 15 s timeout cancels the handler that
+/// is already running. So the credential travels on as an
+/// [`AgentHooksAuthority`] the backend re-asks at the point of effect —
+/// once it owns the lock, before it plans. Without that, a client that
+/// had *lost* the lease could still rewrite the host's files and the
+/// state record afterwards, undoing the policy of whoever displaced it.
+/// Two clients that each legitimately hold the lease in turn are
+/// last-writer-wins by design (plan 046 §3.4); one acting after it lost
+/// the lease is not.
+async fn session_set_agent_hooks(
+    h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: SessionSetAgentHooksParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+    let handle = h.agent_hooks.as_ref().ok_or_else(|| {
+        HandlerError::new(
+            "not-supported",
+            "this session cannot wire agent hooks: it was built without an install backend",
+        )
+    })?;
+    let authority = {
+        let session = Arc::clone(session);
+        let lease = p.lease.clone();
+        AgentHooksAuthority::new(move || session.holds_lease(&lease))
+    };
+    let result = handle
+        .run(AgentHooksRequest {
+            mode: p.mode,
+            skip: p.skip,
+            client: p.client,
+            authority,
+        })
+        .await
+        .map_err(|error| match error {
+            // The same code any other lease-gated op would answer this
+            // client with now, so a client that hears it reacts the one
+            // documented way: stop driving this session.
+            AgentHooksError::Unauthorized => HandlerError::new("taken-over", error.to_string()),
+            AgentHooksError::Failed(_) => HandlerError::new("internal", error.to_string()),
+        })?;
+    encode(&result)
 }
 
 /// Wire colors → the engine's theme seed.

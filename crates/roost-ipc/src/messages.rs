@@ -2390,6 +2390,82 @@ pub struct SessionSetFocusParams {
     pub focused_tab_id: Option<i64>,
 }
 
+/// Whether the client wants Roost's hook entries on the host at all.
+///
+/// The same two values `agent-hooks` takes in `config.conf`, spelled the
+/// same way, because the client sends its own config value verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentHooksMode {
+    Auto,
+    Off,
+}
+
+/// [`ops::SESSION_SET_AGENT_HOOKS`] params: bring the host's agent hook
+/// entries in line with the connected client's configuration.
+///
+/// Lease-gated, like every other interactive session op — and for a
+/// sharper reason than most: this one writes files under the session
+/// user's `$HOME`.
+///
+/// The client sends it after **every** `session.connect`, with its own
+/// `agent-hooks` / `agent-hooks-skip` values, because the op is
+/// idempotent and a config change made since the last connect has to
+/// reach the host. That is also why [`AgentHooksMode::Off`] *removes*
+/// Roost's entries here rather than meaning "do nothing": on the client's
+/// own machine `off` is an opt-out of future wiring, but a host has no
+/// config of its own to consult — the client is the authority, so `off`
+/// on the client means the host comes clean (plan 046 §3.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSetAgentHooksParams {
+    pub lease: String,
+    pub mode: AgentHooksMode,
+    /// Agent names never wired, from the client's `agent-hooks-skip`. A
+    /// name the host does not recognise is reported as a skip and
+    /// otherwise ignored: a newer client's agent must not break an older
+    /// session.
+    #[serde(default)]
+    pub skip: Vec<String>,
+    /// Who is asking, for the host's state record and its log. Required:
+    /// the record's `by` exists so two clients that disagree about
+    /// `agent-hooks` are tellable apart, and a guessed value would be
+    /// worse than none.
+    pub client: String,
+}
+
+/// One agent [`SessionSetAgentHooksParams`] did not act on, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHooksSkipped {
+    pub agent: String,
+    pub reason: String,
+}
+
+/// One agent the host tried and failed to wire. Reported, never
+/// swallowed — and never fatal to the connection that asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHooksFailed {
+    pub agent: String,
+    pub error: String,
+}
+
+/// [`ops::SESSION_SET_AGENT_HOOKS`] result: what the host did.
+///
+/// `wired` is the **toast list** — the agents this host has wired and
+/// never announced to any client — not merely the ones this call
+/// happened to write. That is what keeps the sentence "Roost wired agent
+/// hooks on ‹host›" at most once per agent per host: the session flips
+/// the record's `noticed` for exactly what it reports here, so the next
+/// client to connect hears nothing (plan 046 §3.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetAgentHooksResult {
+    pub wired: Vec<String>,
+    pub refreshed: Vec<String>,
+    pub removed: Vec<String>,
+    pub skipped: Vec<AgentHooksSkipped>,
+    pub errors: Vec<AgentHooksFailed>,
+}
+
 // ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
@@ -2446,6 +2522,12 @@ pub mod ops {
     /// the lease is (a new lease, or the last connection under it
     /// closing, reverts the session to "nobody is looking").
     pub const SESSION_SET_FOCUS: &str = "session.set_focus";
+    /// Bring the host's agent hook entries in line with the connected
+    /// client's `agent-hooks` configuration — wiring them, refreshing
+    /// them, or taking them back out. Lease-gated, and served only by a
+    /// session that was built with an install callback: the engine
+    /// decodes and gates it, `roost-session` does the work.
+    pub const SESSION_SET_AGENT_HOOKS: &str = "session.set_agent_hooks";
     /// Ask for a ticket to open a data connection for one tab. The
     /// control-plane half of an attach: it negotiates payload kind,
     /// build identity, and geometry on stable JSON, and hands back a
