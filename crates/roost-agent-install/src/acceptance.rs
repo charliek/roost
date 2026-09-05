@@ -122,6 +122,69 @@ fn the_json_fixtures_are_in_the_layout_the_printer_writes() {
     }
 }
 
+/// herdr's `trusted_hash`, as the `all` fixture's `config.toml` spells
+/// it.
+fn fixture_trusted_hash() -> String {
+    std::fs::read_to_string(fixture_root("all").join(".codex/config.toml"))
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("trusted_hash = ")
+                .map(|value| value.trim_matches('"').to_string())
+        })
+        .expect("the fixture carries herdr's trust entry")
+}
+
+/// The same guard, for the one fixture value nothing at runtime can
+/// check: the `all` home's `[hooks.state]` entry has to be the hash
+/// codex would compute for the handler in that home's own
+/// `hooks.json`.
+///
+/// Nothing compares them during a test — the tree is copied into a
+/// tempdir, so the key's `/home/fixture` path never matches the
+/// `key_source` the code derives — which is exactly why a wrong value
+/// can sit here indefinitely while the fixture claims to be a machine
+/// whose other tool is already trusted.
+#[test]
+fn the_codex_fixture_trusts_its_own_handler() {
+    let root = fixture_root("all");
+    let hooks = parse_file(&root.join(".codex/hooks.json"));
+    let entry = hooks
+        .get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .and_then(Json::as_array)
+        .and_then(|groups| groups.first())
+        .and_then(|group| group.get("hooks"))
+        .and_then(Json::as_array)
+        .and_then(|handlers| handlers.first())
+        .expect("the fixture has one SessionStart handler");
+
+    let handler = crate::codex_hash::Handler {
+        command: entry
+            .get("command")
+            .and_then(Json::as_str)
+            .unwrap()
+            .to_string(),
+        timeout_sec: match entry.get("timeout") {
+            Some(Json::Number(n)) => n.as_str().parse().ok(),
+            _ => None,
+        },
+        is_async: matches!(entry.get("async"), Some(Json::Bool(true))),
+        status_message: None,
+        additional_context_limit: None,
+    };
+    let expected = crate::codex_hash::trusted_hash("SessionStart", None, &handler).unwrap();
+
+    let config = std::fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    assert_eq!(
+        fixture_trusted_hash(),
+        expected,
+        "the fixture's trusted_hash is not the one codex would compute for the \
+         handler in its own hooks.json (want {expected}):\n{config}"
+    );
+}
+
 #[test]
 fn ensure_wires_every_present_agent_and_says_which_were_new() {
     let (dir, home) = fixture("all");
@@ -301,13 +364,18 @@ fn an_install_adds_only_roosts_entries() {
     );
 
     // codex: comments and unrelated tables come through `toml_edit`
-    // untouched, and somebody else's trust entry is still there.
+    // untouched, and somebody else's trust entry is still there. The
+    // hash is read out of the fixture rather than copied here: a second
+    // literal is a second thing to keep in step with the fixture's own
+    // `hooks.json`, and that is precisely how the fixture's value came
+    // to be a hash of a command it does not contain.
+    let foreign_trust = fixture_trusted_hash();
     let after = std::fs::read_to_string(codex::config_path(&home)).unwrap();
     for kept in [
         "# Hand-edited, comment-bearing, and none of Roost's business.",
         "# herdr turned this on; Roost must leave it on when it unwires.",
         "js_repl = false",
-        "sha256:ab18589eb919ffabefe9d58b389f357d5cf79b4eebed39cf3a15af9ad93e1b91",
+        foreign_trust.as_str(),
         "[projects.\"/private/tmp\"]",
     ] {
         assert!(after.contains(kept), "lost from config.toml: {kept}");

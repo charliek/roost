@@ -17,7 +17,7 @@ hooks = true
 js_repl = false
 
 [hooks.state."/home/fixture/.codex/hooks.json:session_start:0:0"]
-trusted_hash = "sha256:ab18589eb919ffabefe9d58b389f357d5cf79b4eebed39cf3a15af9ad93e1b91"
+trusted_hash = "sha256:bd2745c74cb4941b94942c4f78cd5c3eb28de99f95da5b4ba05eff2f5cf3eeef"
 
 [tui]
 status_line_use_colors = true

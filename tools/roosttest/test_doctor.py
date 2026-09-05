@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -205,8 +206,11 @@ def write_claude_settings(home: Path, events: tuple[str, ...]) -> Path:
     shape has nothing left to parse an event out of — see
     `HookKind`/`resolve_hook_command` in `doctor.rs`), so this only
     exercises `claude.hook_events` (which event *keys* are registered);
-    `claude.hook_command` needs a real install and is covered by
-    `test_claude_install_alias_wires_settings_json_and_agent_uninstall_cleans_up_the_legacy_file`.
+    `claude.hook_command` needs a real install, which
+    `test_claude_section_isolated_by_home` drives (phase 3 runs
+    `roostctl claude install` into the throwaway `HOME`). The legacy
+    file's own shape-match and removal are
+    `test_legacy_claude_settings_warns_and_uninstall_cleans_it_up`.
     """
     path = home / ".claude" / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,7 +220,7 @@ def write_claude_settings(home: Path, events: tuple[str, ...]) -> Path:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": f"{roostctl_path()} claude-hook {event}",
+                        "command": f"{shlex.quote(roostctl_path())} claude-hook {event}",
                     }
                 ]
             }
@@ -700,7 +704,15 @@ def _write_legacy_settings(jail: Jail, events) -> Path:
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": f"{roostctl_path()} claude-hook {event}",
+                                    # Quoted for the same reason `roostctl`
+                                    # quotes it when it writes one: doctor
+                                    # reads the line back through
+                                    # `doctor::shell_split`, and an
+                                    # unquoted path with a space in it
+                                    # splits into extra argv, so the
+                                    # generated-shape match misses and the
+                                    # file is never offered for deletion.
+                                    "command": f"{shlex.quote(roostctl_path())} claude-hook {event}",
                                 }
                             ]
                         }

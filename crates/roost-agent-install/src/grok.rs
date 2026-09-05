@@ -39,14 +39,34 @@ fn desired(home: &Home) -> Json {
     doc
 }
 
-/// Everything in this file is a command Roost wrote, **and there is at
-/// least one** — so replacing it loses nothing of the user's.
+/// The keys a handler object Roost wrote can carry. A file an older
+/// Roost wrote may hold **fewer** — ownership has to survive a shape
+/// change, or an upgrade orphans the file it is meant to refresh — but
+/// never more.
+const HANDLER_FIELDS: [&str; 4] = ["type", "command", "timeout", "async"];
+
+/// This whole file is Roost's own work, **and there is at least one
+/// command in it** — so replacing it, and then deleting it, loses
+/// nothing of the user's.
 ///
-/// The second half is not pedantry. "Every command in here is ours" is
-/// vacuously true of a file with no commands in it at all, and this
-/// answer decides whether Roost overwrites and then *deletes* a file of
-/// that name. A `{}`, a `{"hooks":{}}` or an empty event array is
-/// somebody's half-finished edit, not a Roost install.
+/// Every part of that is load-bearing, because this answer is what
+/// stands between a user's file and an overwrite followed by an
+/// `unlink`:
+///
+/// * **At least one Roost command.** "Every command in here is ours" is
+///   vacuously true of a file with no commands in it at all. A `{}`, a
+///   `{"hooks":{}}` or an empty event array is somebody's half-finished
+///   edit, not a Roost install.
+/// * **Nothing but the shape Roost writes.** A Roost command sitting in
+///   the file does not make the *rest* of it Roost's: a `matcher` on the
+///   group, a note on the handler, an event name Roost never installs —
+///   each is the user's work, and each is gone the moment `desired()` is
+///   written over the top of it. So every event name has to be one of
+///   [`GROK_HOOK_EVENTS`], every group may hold `hooks` and nothing
+///   else, and every handler is limited to [`HANDLER_FIELDS`].
+///
+/// Answering `false` costs the user a `ForeignFile` skip and a doctor
+/// line; answering `true` wrongly costs them the file.
 fn is_ours(doc: &Json) -> bool {
     let Some(entries) = doc.as_object() else {
         return false;
@@ -54,22 +74,28 @@ fn is_ours(doc: &Json) -> bool {
     if entries.iter().any(|(key, _)| key != "hooks") {
         return false;
     }
-    let Some(hooks) = doc.get("hooks") else {
-        return false;
-    };
-    let Some(events) = hooks.as_object() else {
+    let Some(events) = doc.get("hooks").and_then(Json::as_object) else {
         return false;
     };
     let mut ours = 0usize;
-    for (_, groups) in events {
+    for (event, groups) in events {
+        if !GROK_HOOK_EVENTS.contains(&event.as_str()) {
+            return false;
+        }
         let Some(groups) = groups.as_array() else {
             return false;
         };
         for group in groups {
+            if !only_keys(group, &["hooks"]) {
+                return false;
+            }
             let Some(handlers) = group.get("hooks").and_then(Json::as_array) else {
                 return false;
             };
             for handler in handlers {
+                if !only_keys(handler, &HANDLER_FIELDS) {
+                    return false;
+                }
                 match handler.get("command").and_then(Json::as_str) {
                     Some(command) if is_roost_command(AGENT, command) => ours += 1,
                     _ => return false,
@@ -78,6 +104,15 @@ fn is_ours(doc: &Json) -> bool {
         }
     }
     ours > 0
+}
+
+/// Is `value` an object whose keys are all drawn from `allowed`?
+fn only_keys(value: &Json, allowed: &[&str]) -> bool {
+    value.as_object().is_some_and(|entries| {
+        entries
+            .iter()
+            .all(|(key, _)| allowed.contains(&key.as_str()))
+    })
 }
 
 pub fn plan_install(home: &Home) -> Result<InstallPlan, InstallError> {
@@ -217,5 +252,53 @@ mod tests {
         let mut mixed = desired(&Home::rooted("/home/u"));
         mixed.insert("note", Json::String("mine".into()));
         assert!(!is_ours(&mixed));
+    }
+
+    /// A file that still holds a Roost command but is no longer only
+    /// Roost's work. Each of these is a user edit that a claim would
+    /// overwrite on the next `ensure` and `unlink` on the next
+    /// uninstall, so each one has to end the claim.
+    #[test]
+    fn a_roost_command_beside_a_user_edit_does_not_claim_the_file() {
+        let home = Home::rooted("/home/u");
+
+        let mut group_field = desired(&home);
+        group_field
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut("Stop")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .insert("matcher", Json::String("Bash".into()));
+        assert!(!is_ours(&group_field), "group field");
+
+        let mut handler_field = desired(&home);
+        handler_field
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut("Stop")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .get_mut("hooks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .insert("description", Json::String("mine".into()));
+        assert!(!is_ours(&handler_field), "handler field");
+
+        let mut unknown_event = desired(&home);
+        let ours = unknown_event
+            .get("hooks")
+            .unwrap()
+            .get("Stop")
+            .unwrap()
+            .clone();
+        unknown_event
+            .get_mut("hooks")
+            .unwrap()
+            .insert("MyOwnEvent", ours);
+        assert!(!is_ours(&unknown_event), "unknown event");
     }
 }

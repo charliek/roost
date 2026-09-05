@@ -66,22 +66,24 @@ falls back to).
 
 **`off` means two different things, deliberately.** On the machine
 whose `config.conf` says `off`, the UI does nothing at all — it never
-opens an agent's config file, at startup or ever. Turning the key off
-does not by itself remove anything already wired; for that, run the
-explicit verb:
+opens an agent's config file, at startup or ever. That is the whole of
+what the key does locally, and it is worth being exact about the part
+that surprises people: **restarting the UI removes nothing.** Entries
+already on disk stay exactly where they are until you run one of the two
+commands that take them out:
 
 ```bash
-roostctl agent uninstall --all      # or a single agent name
+roostctl agent uninstall --all   # or a single agent name
+roostctl agent ensure            # reads the same key; on `off`, unwires
 ```
 
-`roostctl agent ensure` also reads the same key, and *does* unwire when
-it sees `off` — that's what makes flipping the config key and letting
-the UI restart (or running `agent ensure` yourself) enough to fully back
-out. The split exists so a config switch can mean "stop wiring from now
-on" without every process that merely *reads* the config key being
-trusted to also *rewrite* dotfiles on its own — see [Remote
-hosts](#remote-hosts) for how this plays out over a host session, where
-the split reverses.
+`agent ensure` is the same verb the UIs run under `auto`; run by hand
+while the key says `off`, it removes Roost's entries from every agent it
+can see. Nothing else does. The split exists so a config switch can mean
+"stop wiring from now on" without every process that merely *reads* the
+config key being trusted to also *rewrite* dotfiles on its own — see
+[Remote hosts](#remote-hosts) for how this plays out over a host session,
+where the split reverses.
 
 ## How to override
 

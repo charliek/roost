@@ -21,6 +21,7 @@
 //! matters even so, because codex *hashes* the declared timeout: Roost's
 //! uniform `timeout: 10` hashes as `3` on `SessionEnd` and `Interrupt`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use roost_agent::{Agent, CODEX_HOOK_EVENTS};
@@ -96,15 +97,52 @@ pub fn observed_features_flag(home: &Home) -> PriorFlag {
     }
 }
 
-/// The hashes a `trusted_hash` may carry and still be one Roost wrote —
-/// every integration version's command, for this event.
-fn our_hashes(event: &str) -> Vec<String> {
-    owned_commands(AGENT)
+/// The hashes a `trusted_hash` may carry and still be one Roost wrote.
+///
+/// Two sources, and the second is the one that matters. The canonical
+/// set — every integration version's command in the shape this module
+/// writes — covers a `hooks.json` nobody has touched. But the hash
+/// `plan_install` *stores* comes off [`on_disk_identity`], which carries
+/// the group's `matcher` and the handler as the file spells it. A
+/// `matcher` the user added to Roost's group therefore lands in the
+/// stored hash, and a set built only from the canonical shape would not
+/// recognise Roost's own key — orphaning it in the user's `config.toml`
+/// on every uninstall. So the identity on disk is a candidate too,
+/// whenever its command is one of ours.
+fn our_hashes(event: &str, on_disk: Option<&(Option<String>, Handler)>) -> Vec<String> {
+    let mut hashes: Vec<String> = owned_commands(AGENT)
         .iter()
         .filter_map(|command| {
             codex_hash::trusted_hash(event, None, &Handler::roost(command, HOOK_TIMEOUT_SECS))
         })
-        .collect()
+        .collect();
+    if let Some((matcher, handler)) = on_disk {
+        if let Some(hash) = codex_hash::trusted_hash(event, matcher.as_deref(), handler) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+/// The Roost-owned handler each event carries in `doc` right now, as the
+/// file spells it — the identity codex hashes, and therefore the
+/// identity an already-stored `trusted_hash` was computed from.
+///
+/// Read **before** a removal, never after: `remove_grouped` takes the
+/// handler out, and the matcher it was hashed with goes with it.
+fn owned_on_disk(doc: &Json) -> BTreeMap<&'static str, (Option<String>, Handler)> {
+    let mut found = BTreeMap::new();
+    for event in CODEX_HOOK_EVENTS {
+        // `locate_grouped` matches on the command, so anything it finds
+        // is already one of ours.
+        let Some((group, handler)) = jsonedit::locate_grouped(doc, AGENT, event) else {
+            continue;
+        };
+        if let Some(identity) = on_disk_identity(doc, event, group, handler) {
+            found.insert(event, identity);
+        }
+    }
+    found
 }
 
 /// The identity codex will hash for the handler at
@@ -288,7 +326,11 @@ fn table_mut<'a>(
 /// current ones — which is what lets `ensure` rewrite them instead of
 /// leaving codex asking about a hook it already trusts under a different
 /// index.
-fn owned_state_keys(state: &Table, key_source: &str) -> Vec<String> {
+fn owned_state_keys(
+    state: &Table,
+    key_source: &str,
+    on_disk: &BTreeMap<&'static str, (Option<String>, Handler)>,
+) -> Vec<String> {
     state
         .iter()
         .filter_map(|(key, item)| {
@@ -298,7 +340,7 @@ fn owned_state_keys(state: &Table, key_source: &str) -> Vec<String> {
             }
             let event = codex_hash::event_for_label(label)?;
             let present = item.get("trusted_hash")?.as_str()?;
-            our_hashes(event)
+            our_hashes(event, on_disk.get(event))
                 .iter()
                 .any(|ours| ours == present)
                 .then(|| key.to_string())
@@ -371,7 +413,8 @@ pub fn plan_install(home: &Home) -> Result<InstallPlan, InstallError> {
 
     let before = config.to_string();
 
-    if let Err(reason) = wire_config(&mut config, &config_path, &key_source, &trust) {
+    let on_disk = owned_on_disk(&hooks_file.doc);
+    if let Err(reason) = wire_config(&mut config, &config_path, &key_source, &trust, &on_disk) {
         return Ok(InstallPlan::skip(AGENT, Intent::Install, reason));
     }
 
@@ -414,6 +457,7 @@ fn wire_config(
     path: &std::path::Path,
     key_source: &str,
     trust: &[(String, String)],
+    on_disk: &BTreeMap<&'static str, (Option<String>, Handler)>,
 ) -> Result<(), SkipReason> {
     // Written only when it is not already what we want. `Table::insert`
     // over an occupied key resets the key's decoration, which is where
@@ -431,7 +475,7 @@ fn wire_config(
     // behind, and codex would keep asking about the entry it no longer
     // matches.
     let wanted: Vec<&str> = trust.iter().map(|(key, _)| key.as_str()).collect();
-    for stale in owned_state_keys(state, key_source) {
+    for stale in owned_state_keys(state, key_source, on_disk) {
         if !wanted.contains(&stale.as_str()) {
             state.remove(&stale);
         }
@@ -460,6 +504,10 @@ pub fn plan_uninstall(home: &Home, prior: &Prior) -> Result<InstallPlan, Install
         Opened::Skip(reason) => return Ok(InstallPlan::skip(AGENT, Intent::Uninstall, reason)),
         Opened::Ready(file) => file,
     };
+    // Before the removal: the matcher a user put on Roost's group is
+    // part of the hash `config.toml` is carrying, and `remove_grouped`
+    // takes the handler that identifies the group away with it.
+    let on_disk = owned_on_disk(&hooks_file.doc);
     if hooks_file.existed() {
         if let Err(reason) = jsonedit::remove_grouped(&mut hooks_file.doc, &hooks_path, AGENT) {
             return Ok(InstallPlan::skip(AGENT, Intent::Uninstall, reason));
@@ -478,6 +526,7 @@ pub fn plan_uninstall(home: &Home, prior: &Prior) -> Result<InstallPlan, Install
             &mut config,
             &config_path,
             &key_source,
+            &on_disk,
             others_remain,
             prior.codex_features_hooks,
         ) {
@@ -512,6 +561,7 @@ fn unwire_config(
     config: &mut DocumentMut,
     path: &std::path::Path,
     key_source: &str,
+    on_disk: &BTreeMap<&'static str, (Option<String>, Handler)>,
     others_remain: bool,
     prior_flag: Option<PriorFlag>,
 ) -> Result<(), SkipReason> {
@@ -522,7 +572,7 @@ fn unwire_config(
         if hooks.get("state").is_some() {
             let state_emptied = {
                 let state = table_mut(hooks, "state", true, path)?;
-                for key in owned_state_keys(state, key_source) {
+                for key in owned_state_keys(state, key_source, on_disk) {
                     state.remove(&key);
                     removed_state = true;
                 }
@@ -1123,5 +1173,37 @@ mod tests {
         assert!(std::fs::read_to_string(hooks_path(&home))
             .unwrap()
             .contains("\"matcher\""));
+    }
+
+    /// The same `matcher`, followed all the way to an uninstall.
+    ///
+    /// The hash `ensure` stores comes off the merged document, so it
+    /// carries the matcher. Recognising ownership by the *canonical*
+    /// hash alone would fail to match Roost's own key here and leave it
+    /// in the user's `config.toml` forever — a dead entry pointing at a
+    /// handler that no longer exists. (`hooks.json` deliberately keeps
+    /// the annotated group; that is the user's note, not our leftover.)
+    #[test]
+    fn a_matcher_on_our_group_does_not_orphan_the_trust_key() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+
+        let mut doc = read_hooks(&home);
+        doc.get_mut("hooks")
+            .unwrap()
+            .get_mut("SessionStart")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .insert("matcher", Json::String("*".into()));
+        write_hooks(&home, &doc);
+        wire(&home);
+
+        unwire(&home);
+        let left = std::fs::read_to_string(config_path(&home)).unwrap_or_default();
+        assert!(
+            !left.contains("trusted_hash"),
+            "an orphaned trust key survived the uninstall:\n{left}"
+        );
     }
 }

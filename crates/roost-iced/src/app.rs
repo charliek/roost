@@ -2595,11 +2595,19 @@ impl App {
             errors = result.errors.len(),
             "a host set its agent hooks"
         );
-        let agents: Vec<roost_agent::Agent> = result
-            .wired
-            .iter()
-            .filter_map(|name| roost_agent::Agent::parse(name))
-            .collect();
+        let (agents, unknown) = agent_hooks::split_known(&result.wired);
+        // A name this client cannot parse is a *newer host* wiring an
+        // agent this Roost predates. The host has already spent the
+        // record's `noticed` flag on it, so it will never be reported
+        // again — dropping it silently would lose the only announcement
+        // that Roost edited that machine's dotfiles.
+        if !unknown.is_empty() {
+            tracing::warn!(
+                host = %reply.label,
+                agents = unknown.join(", "),
+                "a host wired an agent this Roost does not know; it will not be reported again"
+            );
+        }
         let Some(toast) = agent_hooks::wired_toast(&agents, Some(&reply.label)) else {
             return;
         };

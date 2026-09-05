@@ -6,7 +6,7 @@
     "source": "claude",
     "session_id": "abc123",
     "ownership_action": "preserve",
-    "lifecycle": "waiting",
+    "lifecycle": "finished",
     "lifecycle_if": [
       "working"
     ],

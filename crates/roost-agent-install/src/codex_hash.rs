@@ -252,7 +252,10 @@ mod tests {
     /// at `773f0b0` and no more than that. The file records which is
     /// which in `verified_against_real_codex_state`, and this test
     /// asserts at least one is true so the honest one cannot quietly
-    /// disappear.
+    /// disappear. A **lower** bound, deliberately: proving a second
+    /// vector against a real codex is strictly better evidence, and a
+    /// gate that turned red for it would be a gate arguing against its
+    /// own purpose.
     #[test]
     fn the_golden_vectors_from_codex_773f0b0_all_reproduce() {
         let raw = include_str!("../tests/fixtures/codex-golden-vectors.json");
@@ -305,7 +308,11 @@ mod tests {
                 verified += 1;
             }
         }
-        assert_eq!(verified, 1, "exactly one vector is empirically proven");
+        assert!(
+            verified >= 1,
+            "no vector is empirically proven any more — the one hash a real \
+             codex wrote has been dropped or unflagged"
+        );
     }
 
     /// The canonicalization rests on `serde_json::Map` being a

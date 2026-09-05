@@ -232,6 +232,27 @@ pub(crate) fn client_label() -> String {
 
 /// The one-time toast, per §3.7. `host` names the machine when the
 /// wiring happened over a host connection, and is `None` for this one.
+/// Split the agent names a host reported into the ones this client can
+/// name and the ones it cannot.
+///
+/// The second list is not a rounding error. A host running a newer Roost
+/// can wire an agent this client predates, and by the time the name
+/// arrives the host has already flipped that agent's `noticed` flag —
+/// there is no second telling. Filtering the name away would make the
+/// one announcement that Roost edited that machine's dotfiles vanish
+/// permanently, so the caller keeps it and says so.
+pub(crate) fn split_known(names: &[String]) -> (Vec<Agent>, Vec<&str>) {
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names {
+        match Agent::parse(name) {
+            Some(agent) => known.push(agent),
+            None => unknown.push(name.as_str()),
+        }
+    }
+    (known, unknown)
+}
+
 pub(crate) fn wired_toast(agents: &[Agent], host: Option<&str>) -> Option<String> {
     if agents.is_empty() {
         return None;
@@ -254,6 +275,21 @@ mod tests {
 
     fn config(body: &str) -> RoostConfig {
         RoostConfig::parse(body)
+    }
+
+    /// A name this client cannot parse survives as a name. The host has
+    /// already spent its `noticed` flag on it, so anything that dropped
+    /// it here would lose the announcement for good.
+    #[test]
+    fn an_agent_name_this_client_does_not_know_is_kept_not_dropped() {
+        let names = vec![
+            "claude".to_string(),
+            "gemini".to_string(),
+            "codex".to_string(),
+        ];
+        let (known, unknown) = split_known(&names);
+        assert_eq!(known, vec![Agent::Claude, Agent::Codex]);
+        assert_eq!(unknown, vec!["gemini"]);
     }
 
     #[test]

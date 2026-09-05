@@ -35,10 +35,10 @@ the launcher with deterministic commands.
 | `keybind` | `<trigger> = <action>` | (see [Keybindings](../getting-started/keybindings.md)) | Append a custom keybinding. Repeatable; later entries override earlier ones. |
 | `command` | `label="…" run="…" [hold=…]` | none | Launcher entry (⌘⇧T / Alt+Shift+T) that runs a fixed command in a new tab. Repeatable. See [Extending Roost](../guides/extending.md#2-the-command-launcher). |
 | `provider` | `label="…" run="…" [timeout=…] [limit=…]` | none | Dynamic, script-backed menu in the custom palette (⌘⇧E / Alt+Shift+E). The script generates rows on demand and acts on the choice. Repeatable; executables in `providers/` (beside this file) are also discovered. See [Extending Roost](../guides/extending.md#3-dynamic-providers). |
-| `copy-on-select` | `off | true | clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
-| `clipboard-write` | `allow | deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
-| `link-modifier` | `ctrl | alt | super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
-| `agent-hooks` | `auto | off` | `auto` | Whether Roost wires the supported coding agents' (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) hook entries into their own config files at startup. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
+| `copy-on-select` | `off \| true \| clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
+| `clipboard-write` | `allow \| deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
+| `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
+| `agent-hooks` | `auto \| off` | `auto` | Whether Roost wires the supported coding agents' (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) hook entries into their own config files at startup. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `agent-hooks-skip` | comma list | (empty) | Agent names (`claude`, `codex`, `grok`, `cursor`, `opencode`) never wired even when `agent-hooks = auto`. See [below](#agent-hooks). |
 
 ## `copy-on-select`

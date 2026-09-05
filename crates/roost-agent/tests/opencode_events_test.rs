@@ -98,6 +98,22 @@ fn a_child_session_created_is_dropped() {
     }
 }
 
+/// The mirror image, and the one that costs the tab an owner: an
+/// **empty** `parentID` is not a parent. A root `session.created` read
+/// as a child is dropped, no claim is ever made, and nothing later in
+/// the session repairs it.
+#[test]
+fn a_root_session_created_with_an_empty_parent_id_still_claims() {
+    for payload in [
+        json!({ "sessionID": SESSION, "parentID": "" }),
+        json!({ "sessionID": SESSION, "info": { "parentID": "" } }),
+        json!({ "sessionID": SESSION, "parentID": null }),
+    ] {
+        let report = only("session.created", &payload);
+        assert_eq!(report.ownership_action, OwnershipAction::Claim, "{payload}");
+    }
+}
+
 #[test]
 fn chat_message_works_and_clears_attention() {
     let report = only(

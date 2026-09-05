@@ -218,7 +218,12 @@ e2e:  ## pytest E2E suite dispatch (ROOST_TARGET=mac|iced, default iced) -> e2e-
 		*) echo "ROOST_TARGET=$${ROOST_TARGET} is not supported by 'make e2e' (want mac or iced)"; exit 1 ;; \
 	esac
 
+# `roostctl` is built first because `tools/roosttest/util.py` only builds
+# one when the binary is *missing*: without this the lane either charges
+# the first test's timeout for a cold cargo build, or — worse — silently
+# runs whatever stale binary is already in target/debug.
 e2e-iced:  ## Required functional E2E against Iced
+	cargo build -p roost-cli
 	@tests='$(ICED_E2E_TESTS)'; \
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
@@ -315,6 +320,7 @@ e2e-host-bootstrap-ci: $(GHOSTTY_LIB)  ## HS-3 slice-2 bootstrap E2E at CI parit
 	ROOST_TEST_MODE=1 uv run --group test pytest $(BOOTSTRAP_E2E_TESTS) --roost-target iced --roost-fresh
 
 e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
+	cargo build -p roost-cli
 	@tests='$(ICED_E2E_TESTS)'; \
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \

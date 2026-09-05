@@ -81,7 +81,7 @@ use roost_ipc::agent::{
 };
 use serde_json::Value;
 
-use crate::common::{field, field_alias, has_field, non_empty, parse_normalized};
+use crate::common::{field, field_alias, non_empty, parse_normalized};
 
 pub const SOURCE: &str = "opencode";
 
@@ -175,10 +175,21 @@ pub fn opencode_event_to_reports(
 /// bus also spreads session fields at the top level on some events, so
 /// both spellings count.
 fn has_parent(payload: &Value) -> bool {
-    has_field(payload, "parentID")
-        || payload
-            .get("info")
-            .is_some_and(|info| has_field(info, "parentID"))
+    names_a_parent(payload) || payload.get("info").is_some_and(names_a_parent)
+}
+
+/// A `parentID` that actually names a session.
+///
+/// Absent, `null` and `""` all say the same thing — no parent — and the
+/// empty string is the one a plain presence check gets wrong. Reading it
+/// as a parent drops a **root** `session.created`, which is the only
+/// event that claims the tab: no claim is made, no later event makes
+/// one, and the tab stays unowned for the rest of the session.
+fn names_a_parent(value: &Value) -> bool {
+    value
+        .get("parentID")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
 }
 
 /// A dotted path of string-keyed lookups, or `""` if any hop is missing
