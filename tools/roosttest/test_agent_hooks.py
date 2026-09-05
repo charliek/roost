@@ -647,6 +647,11 @@ def test_a_payload_over_the_cap_is_drained_rather_than_abandoned():
                 proc.stdin.close()
             except BrokenPipeError:
                 broken = broken or BrokenPipeError()
+            # `communicate` flushes `proc.stdin` again if it is still set,
+            # and flushing an already-closed file raises `ValueError` on
+            # Linux/CPython 3.12. Detaching it is the documented way to
+            # say "stdin is already dealt with".
+            proc.stdin = None
         stdout, _ = proc.communicate(timeout=scaled_timeout(HOOK_DEADLINE))
         named = f"roostctl {' '.join(verb)} (ROOST_TAB_ID={tab_id})"
         assert broken is None, f"{named} stopped reading and broke the writer's pipe"
