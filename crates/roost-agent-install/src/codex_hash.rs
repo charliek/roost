@@ -141,9 +141,15 @@ impl Handler {
 
 /// `normalize_command_hook` (`discovery.rs:742-764`).
 ///
-/// The clamp is the reason Roost's uniform `timeout: 10` still hashes
-/// correctly: on `SessionEnd` and `Interrupt` codex hashes **3**, not 10.
-fn normalize_timeout(event: &str, timeout_sec: Option<u64>) -> u64 {
+/// The clamp is why the timeout Roost *writes* is free to differ from
+/// the one it used to write: on `SessionEnd` and `Interrupt` codex
+/// hashes **3** whatever the file declares above it, so a declared 10
+/// and a declared 3 land on the same `trusted_hash`.
+///
+/// It is also what `codex::hook_timeout_secs` writes with — running the
+/// declared value through codex's own normalizer is what makes "write
+/// it, then hash it" a fixed point rather than a coincidence.
+pub fn normalize_timeout(event: &str, timeout_sec: Option<u64>) -> u64 {
     if event == "SessionEnd" || event == "Interrupt" {
         return timeout_sec
             .unwrap_or(SESSION_END_DEFAULT_TIMEOUT_SEC)

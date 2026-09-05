@@ -212,12 +212,17 @@ fn edited_warnings(hooks: &Json, agent: Agent, path: &Path, grouped: bool) -> Ve
 }
 
 /// Put one Roost group per event into a grouped `hooks` object.
+///
+/// `entry` is per event because codex's timeout is: it clamps
+/// `SessionEnd` and `Interrupt` and warns about anything larger. Agents
+/// with one shape for every event pass a closure that ignores its
+/// argument.
 pub fn merge_grouped(
     doc: &mut Json,
     path: &Path,
     agent: Agent,
     events: &[&str],
-    entry: &Json,
+    entry: impl Fn(&str) -> Json,
 ) -> Result<Vec<Warning>, SkipReason> {
     let warnings = doc
         .get("hooks")
@@ -252,12 +257,12 @@ pub fn merge_grouped(
                     .and_then(Json::as_array_mut)
                     .and_then(|handlers| handlers.get_mut(hi))
                 {
-                    *slot = entry.clone();
+                    *slot = entry(event);
                 }
             }
             None => groups.push(Json::Object(vec![(
                 "hooks".to_string(),
-                Json::Array(vec![entry.clone()]),
+                Json::Array(vec![entry(event)]),
             )])),
         }
     }
@@ -451,7 +456,7 @@ mod tests {
             Path::new("/x"),
             Agent::Claude,
             &["SessionStart"],
-            &ours(),
+            |_| ours(),
         )
         .unwrap();
         assert!(warnings.is_empty());
@@ -482,9 +487,15 @@ mod tests {
     #[test]
     fn a_second_merge_changes_nothing() {
         let mut doc = parse(r#"{"hooks":{}}"#);
-        merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], &ours()).unwrap();
+        merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], |_| {
+            ours()
+        })
+        .unwrap();
         let once = doc.clone();
-        merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], &ours()).unwrap();
+        merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], |_| {
+            ours()
+        })
+        .unwrap();
         assert_eq!(doc, once);
     }
 
@@ -497,7 +508,10 @@ mod tests {
             cmd = serde_json::Value::String(installed_command(Agent::Claude))
         ));
         // Same command, stale timeout: still ours, so it is rewritten.
-        merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], &ours()).unwrap();
+        merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], |_| {
+            ours()
+        })
+        .unwrap();
         let groups = doc
             .get("hooks")
             .unwrap()
@@ -535,8 +549,10 @@ mod tests {
         );
 
         let mut doc = parse(&text);
-        let warnings =
-            merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], &ours()).unwrap();
+        let warnings = merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], |_| {
+            ours()
+        })
+        .unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         // Still there, beside the fresh entry Roost added.
         let groups = doc
@@ -654,7 +670,9 @@ mod tests {
     fn a_hooks_key_that_is_not_an_object_is_a_shape_skip() {
         let mut doc = parse(r#"{"hooks":[1,2,3]}"#);
         assert!(matches!(
-            merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], &ours()),
+            merge_grouped(&mut doc, Path::new("/x"), Agent::Claude, &["Stop"], |_| {
+                ours()
+            }),
             Err(SkipReason::UnexpectedShape { .. })
         ));
         assert!(matches!(
@@ -691,6 +709,32 @@ mod tests {
         );
     }
 
+    /// The entry is built per event, not once: codex needs a smaller
+    /// timeout on the two events it clamps.
+    #[test]
+    fn each_event_gets_the_entry_built_for_it() {
+        let mut doc = parse(r#"{}"#);
+        let command = installed_command(Agent::Codex);
+        merge_grouped(
+            &mut doc,
+            Path::new("/x"),
+            Agent::Codex,
+            &["Stop", "SessionEnd"],
+            |event| handler(&command, if event == "SessionEnd" { 3 } else { 10 }, None),
+        )
+        .unwrap();
+
+        let timeout = |event: &str| {
+            doc.get("hooks")?.get(event)?.as_array()?[0]
+                .get("hooks")?
+                .as_array()?[0]
+                .get("timeout")
+                .cloned()
+        };
+        assert_eq!(timeout("Stop"), Some(Json::Number(10u64.into())));
+        assert_eq!(timeout("SessionEnd"), Some(Json::Number(3u64.into())));
+    }
+
     #[test]
     fn locate_reports_the_position_codex_will_count() {
         let mut doc = parse(r#"{"hooks":{"SessionStart":[{"hooks":[{"command":"herdr"}]}]}}"#);
@@ -700,7 +744,7 @@ mod tests {
             Path::new("/x"),
             Agent::Codex,
             &["SessionStart"],
-            &entry,
+            |_| entry.clone(),
         )
         .unwrap();
         assert_eq!(

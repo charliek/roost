@@ -6921,7 +6921,7 @@ mod tests {
                 Agent::Claude,
                 true,
                 true,
-                Some(2),
+                Some(roost_agent_install::INTEGRATION_VERSION),
                 true,
                 None,
                 vec![],
@@ -6930,7 +6930,10 @@ mod tests {
         };
         let c = find(&evaluate(&current), "agent.claude.wired").clone();
         assert_eq!(c.status, Some(Status::Ok));
-        assert_eq!(c.detail, "wired@v2");
+        assert_eq!(
+            c.detail,
+            format!("wired@v{}", roost_agent_install::INTEGRATION_VERSION)
+        );
 
         // Record and disk disagreeing, both ways round. Neither may
         // render as `ok`, and neither may render as the plain "present,
@@ -6965,7 +6968,7 @@ mod tests {
                 Agent::Claude,
                 true,
                 false,
-                Some(2),
+                Some(roost_agent_install::INTEGRATION_VERSION),
                 false,
                 None,
                 vec![],
@@ -7022,7 +7025,7 @@ mod tests {
                 Agent::Claude,
                 true,
                 true,
-                Some(2),
+                Some(roost_agent_install::INTEGRATION_VERSION),
                 true,
                 None,
                 vec![roost_agent_install::Warning::ModifiedRoostEntry {
@@ -7034,7 +7037,14 @@ mod tests {
         };
         let c = find(&evaluate(&modified), "agent.claude.wired").clone();
         assert_eq!(c.status, Some(Status::Warn), "{}", c.detail);
-        assert!(c.detail.contains("wired@v2"), "{}", c.detail);
+        assert!(
+            c.detail.contains(&format!(
+                "wired@v{}",
+                roost_agent_install::INTEGRATION_VERSION
+            )),
+            "{}",
+            c.detail
+        );
         assert!(c.detail.contains("modified Roost entry"), "{}", c.detail);
     }
 

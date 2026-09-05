@@ -535,17 +535,17 @@ Claude Code (process)
 
 Agents (process)
   skipped agent.hook_binary        not running inside a Roost tab
-  ok      agent.claude.wired       wired@v2
+  ok      agent.claude.wired       wired@v3
   skipped agent.claude.owning      unavailable (no tab.list from a running UI)
   ok      agent.claude.legacy_settings no leftover ~/.config/roost/claude-settings.json or shell alias found
-  ok      agent.codex.wired        wired@v2
+  ok      agent.codex.wired        wired@v3
   ok      agent.codex.trust        8 trusted hashes match what codex would compute
   skipped agent.codex.owning       unavailable (no tab.list from a running UI)
-  ok      agent.grok.wired         wired@v2
+  ok      agent.grok.wired         wired@v3
   skipped agent.grok.owning        unavailable (no tab.list from a running UI)
-  ok      agent.cursor.wired       wired@v2
+  ok      agent.cursor.wired       wired@v3
   skipped agent.cursor.owning      unavailable (no tab.list from a running UI)
-  ok      agent.opencode.wired     wired@v2
+  ok      agent.opencode.wired     wired@v3
   skipped agent.opencode.owning    unavailable (no tab.list from a running UI)
 
 • 2 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):

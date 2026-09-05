@@ -260,10 +260,23 @@ The installed command is unconditional — it's the same string whether
 or not Roost is running:
 
 ```sh
-sh -c 'if [ -n "$ROOST_AGENT_HOOK" ] && out=$("$ROOST_AGENT_HOOK" agent-hook <agent> 2>/dev/null); then [ -n "$out" ] || out="{}"; printf "%s" "$out"; else cat >/dev/null; printf "{}"; fi'
+sh -c 'if [ -n "${ROOST_AGENT_HOOK:-}" ] && out=$("${ROOST_AGENT_HOOK:-}" agent-hook <agent> 2>/dev/null); then [ -n "${out:-}" ] || out="{}"; printf "%s" "${out:-}"; else cat >/dev/null; printf "{}"; fi'
 ```
 
-Outside a Roost tab, `$ROOST_AGENT_HOOK` is unset: the command drains
+Every variable carries a `:-` default deliberately, the local `out`
+included. grok doesn't hand the command to a shell unexamined — it
+checks every `$` reference against its environment first and refuses
+to run the hook at all when one is unset, drawing a red `hook not
+executed: required env var(s) not set` row on every tool call in any
+terminal that isn't Roost. The `${NAME:-}` form passes that check and
+reaches the shell unchanged, so grok runs the command and the fallback
+below answers quietly. It's identical POSIX shell for `sh`, `dash` and
+`bash`, so no other agent notices. Not every agent shells out, so this
+guarantee is only as good as the last time each agent was actually run
+in a plain terminal — which is why that run is part of the release
+checklist, per agent.
+
+Outside a Roost tab, `ROOST_AGENT_HOOK` is unset: the command drains
 stdin, prints `{}`, and exits 0 — inert, and safe for the agent (a
 decision hook like Claude's `PermissionRequest` needs exactly this
 shape to avoid blocking the dialog), but **not free**. Every hook event,

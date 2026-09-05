@@ -37,7 +37,9 @@ pub fn plan_install(home: &Home) -> Result<InstallPlan, InstallError> {
 
     let entry = jsonedit::handler(&installed_command(AGENT), HOOK_TIMEOUT_SECS, None);
     let warnings =
-        match jsonedit::merge_grouped(&mut file.doc, &path, AGENT, &CLAUDE_HOOK_EVENTS, &entry) {
+        match jsonedit::merge_grouped(&mut file.doc, &path, AGENT, &CLAUDE_HOOK_EVENTS, |_| {
+            entry.clone()
+        }) {
             Ok(warnings) => warnings,
             Err(reason) => return Ok(InstallPlan::skip(AGENT, Intent::Install, reason)),
         };

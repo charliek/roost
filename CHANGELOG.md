@@ -42,7 +42,12 @@ release workflow asserts they agree).
   every tab gets rather than a baked-in absolute path — so the exact same
   entry works after a relocated install, on a second machine, or over a
   host session, and is inert (drains stdin, answers `{}`) on a machine
-  where Roost isn't running. `roostctl agent ensure/install/uninstall/status`
+  where Roost isn't running — every reference in it is spelled
+  `${NAME:-}`, because grok checks a hook's variables itself before it
+  spawns a shell and would otherwise draw a red "hook not executed" row per
+  tool call in any non-Roost terminal; codex's `SessionEnd`/`Interrupt`
+  entries carry its 3 s cap so it stops warning about clamping them on
+  every launch. `roostctl agent ensure/install/uninstall/status`
   are the manual controls; `agent-hooks-skip` opts individual agents out;
   `agent-hooks = off` stops future wiring, and `roostctl agent uninstall
   --all` (or a fresh `agent ensure`, which reads the same key) takes

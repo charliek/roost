@@ -34,7 +34,7 @@ fn desired(home: &Home) -> Json {
     let mut doc = Json::object();
     let entry = jsonedit::handler(&installed_command(AGENT), HOOK_TIMEOUT_SECS, None);
     let path = hooks_path(home);
-    jsonedit::merge_grouped(&mut doc, &path, AGENT, &GROK_HOOK_EVENTS, &entry)
+    jsonedit::merge_grouped(&mut doc, &path, AGENT, &GROK_HOOK_EVENTS, |_| entry.clone())
         .expect("a fresh object always merges");
     doc
 }

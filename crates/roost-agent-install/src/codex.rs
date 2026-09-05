@@ -18,8 +18,8 @@
 //! process, and a `PostToolUse` landing after `Stop` would flip a
 //! finished tab back to working — `apply_report` has no sequence
 //! numbers and the wire makes no ordering promise. The clamp still
-//! matters even so, because codex *hashes* the declared timeout: Roost's
-//! uniform `timeout: 10` hashes as `3` on `SessionEnd` and `Interrupt`.
+//! matters even so, because codex *hashes* the declared timeout — see
+//! [`hook_timeout_secs`] for the one place that decides it.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,6 +38,25 @@ use crate::state::{Prior, PriorFlag};
 use crate::write::{self, PRIVATE_MODE};
 
 const AGENT: Agent = Agent::Codex;
+
+/// The `timeout` Roost declares for one codex event.
+///
+/// codex caps `SessionEnd` and `Interrupt` at 3 s, and prints
+/// `⚠ clamping <Event> hook timeout to 3s in …/hooks.json` on **every
+/// launch** for anything above it. A uniform [`HOOK_TIMEOUT_SECS`]
+/// therefore buys nothing and costs a user two warning lines forever, so
+/// those two events are written at the cap. Three seconds is ample: the
+/// `agent-hook` verb's own budget is 2 s, and the timeout only exists so
+/// a wedged machine cannot leave codex waiting.
+///
+/// Running the value through codex's own normalizer is what keeps this
+/// free: `normalize_timeout` clamps before hashing, so 10 and 3 produce
+/// the *same* `trusted_hash` on both events. Existing installs keep
+/// their `[hooks.state]` entries — `hooks.json` is rewritten,
+/// `config.toml` is not, and codex shows no review dialog.
+fn hook_timeout_secs(event: &str) -> u64 {
+    codex_hash::normalize_timeout(event, Some(HOOK_TIMEOUT_SECS))
+}
 
 pub fn hooks_path(home: &Home) -> PathBuf {
     home.agent_dir(AGENT).join("hooks.json")
@@ -113,7 +132,11 @@ fn our_hashes(event: &str, on_disk: Option<&(Option<String>, Handler)>) -> Vec<S
     let mut hashes: Vec<String> = owned_commands(AGENT)
         .iter()
         .filter_map(|command| {
-            codex_hash::trusted_hash(event, None, &Handler::roost(command, HOOK_TIMEOUT_SECS))
+            codex_hash::trusted_hash(
+                event,
+                None,
+                &Handler::roost(command, hook_timeout_secs(event)),
+            )
         })
         .collect();
     if let Some((matcher, handler)) = on_disk {
@@ -373,13 +396,12 @@ pub fn plan_install(home: &Home) -> Result<InstallPlan, InstallError> {
         Opened::Ready(file) => file,
     };
     let command = crate::command::installed_command(AGENT);
-    let entry = jsonedit::handler(&command, HOOK_TIMEOUT_SECS, Some(false));
     let warnings = match jsonedit::merge_grouped(
         &mut hooks_file.doc,
         &hooks_path,
         AGENT,
         &CODEX_HOOK_EVENTS,
-        &entry,
+        |event| jsonedit::handler(&command, hook_timeout_secs(event), Some(false)),
     ) {
         Ok(warnings) => warnings,
         Err(reason) => return Ok(InstallPlan::skip(AGENT, Intent::Install, reason)),
@@ -678,12 +700,73 @@ mod tests {
         let expected = codex_hash::trusted_hash(
             "SessionEnd",
             None,
-            &Handler::roost(installed_command(AGENT), HOOK_TIMEOUT_SECS),
+            &Handler::roost(installed_command(AGENT), hook_timeout_secs("SessionEnd")),
         )
         .unwrap();
         assert!(config.contains(&expected), "{config}");
 
         assert!(plan_install(&home).unwrap().is_noop(), "not idempotent");
+    }
+
+    /// codex prints `⚠ clamping <Event> hook timeout to 3s` on every
+    /// launch for a `SessionEnd` or `Interrupt` handler declared above
+    /// its 3 s cap. Roost caused exactly that noise by writing 10
+    /// everywhere, so the written file has to carry the cap on those two
+    /// events — and the full 10 on the six that have no cap.
+    #[test]
+    fn the_written_timeout_is_the_cap_only_where_codex_would_warn() {
+        let (_dir, home) = home_with_codex();
+        wire(&home);
+
+        let doc = read_hooks(&home);
+        for event in CODEX_HOOK_EVENTS {
+            let (group, handler) = jsonedit::locate_grouped(&doc, AGENT, event).unwrap();
+            let (_, on_disk) = on_disk_identity(&doc, event, group, handler).unwrap();
+            let expected = match event {
+                "SessionEnd" | "Interrupt" => 3,
+                _ => HOOK_TIMEOUT_SECS,
+            };
+            assert_eq!(on_disk.timeout_sec, Some(expected), "{event}");
+        }
+    }
+
+    /// The reason lowering that timeout was safe to ship, and the fence
+    /// against anyone "simplifying" it back to a constant.
+    ///
+    /// codex clamps before it hashes, so on `SessionEnd` and `Interrupt`
+    /// a declared 10 and a declared 3 are the *same* `trusted_hash`.
+    /// That is what lets an existing install keep every `[hooks.state]`
+    /// entry it already has when `hooks.json` is rewritten and
+    /// `config.toml` is not — no review dialog, for anybody. Change the
+    /// written timeout on an event codex does not clamp and this test
+    /// goes red, which is the whole point: there it *would* be a dialog.
+    #[test]
+    fn lowering_the_clamped_timeout_moves_no_trust_hash() {
+        let command = installed_command(AGENT);
+        for event in CODEX_HOOK_EVENTS {
+            assert_eq!(
+                codex_hash::trusted_hash(
+                    event,
+                    None,
+                    &Handler::roost(&command, hook_timeout_secs(event))
+                ),
+                codex_hash::trusted_hash(event, None, &Handler::roost(&command, HOOK_TIMEOUT_SECS)),
+                "{event}: the timeout Roost writes now hashes differently \
+                 from the uniform {HOOK_TIMEOUT_SECS} it used to write — \
+                 every existing install gets a re-trust dialog"
+            );
+        }
+
+        // Not vacuous on either side: the two events really are written
+        // with a different number, and on an unclamped event that same
+        // difference really does move the hash.
+        assert_eq!(hook_timeout_secs("SessionEnd"), 3);
+        assert_eq!(hook_timeout_secs("Interrupt"), 3);
+        assert_eq!(hook_timeout_secs("Stop"), HOOK_TIMEOUT_SECS);
+        assert_ne!(
+            codex_hash::trusted_hash("Stop", None, &Handler::roost(&command, 3)),
+            codex_hash::trusted_hash("Stop", None, &Handler::roost(&command, HOOK_TIMEOUT_SECS)),
+        );
     }
 
     /// The comment-bearing, hand-edited file the `toml_edit` dependency
@@ -1096,12 +1179,15 @@ mod tests {
             let old = codex_hash::trusted_hash(
                 event,
                 None,
-                &Handler::roost(installed_command(AGENT), HOOK_TIMEOUT_SECS),
+                &Handler::roost(installed_command(AGENT), hook_timeout_secs(event)),
             )
             .unwrap();
-            let new =
-                codex_hash::trusted_hash(event, None, &Handler::roost(&v1, HOOK_TIMEOUT_SECS))
-                    .unwrap();
+            let new = codex_hash::trusted_hash(
+                event,
+                None,
+                &Handler::roost(&v1, hook_timeout_secs(event)),
+            )
+            .unwrap();
             config = config.replace(&old, &new);
             assert!(config.contains(&key), "{key}");
         }
