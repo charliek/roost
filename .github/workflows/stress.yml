@@ -1,0 +1,156 @@
+name: Stress
+
+# workflow_dispatch-only lane for plan 047 W1: loop one cargo test binary N
+# times on a real runner to prove a race fixed (or catch one reproducing) —
+# a laptop's core count and scheduler don't match these runners, and that
+# gap is exactly what F1-F4 hid behind. Deliberately a separate file from
+# ci.yml: no push/pull_request trigger, and no job here is added to
+# ci-success's `needs` list, so its `required_jobs` floor stays untouched —
+# a lane nobody auto-dispatches must never become something the merge gate
+# silently starts counting on.
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Runner
+        type: choice
+        options: [ubuntu-latest, macos-latest]
+        default: ubuntu-latest
+      test:
+        description: "cargo test selector, e.g. '-p roost-ipc --test bootstrap_test' (features ride inside this string; there is no separate features input)"
+        type: string
+        required: true
+      filter:
+        description: cargo's substring test filter (optional; default runs the whole binary)
+        type: string
+        default: ''
+      exact:
+        description: exact-match filter (adds --exact)
+        type: boolean
+        default: false
+      iterations:
+        description: iterations (1..1000)
+        type: string
+        default: '30'
+      scale:
+        description: "ROOST_TEST_TIMEOUT_SCALE for the test process — 1 is what rust-build itself runs at; 3 is offered here for a deliberately loaded probe (plan 047 R2), not the default"
+        type: choice
+        options: ['1', '3']
+        default: '1'
+      hogs:
+        description: CPU hog processes competing for the runner, 0..16
+        type: string
+        default: '0'
+      run_timeout:
+        description: per-iteration wall-clock cap, seconds
+        type: string
+        default: '600'
+
+run-name: "stress: ${{ inputs.test }} (${{ inputs.os }}, N=${{ inputs.iterations }})"
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    runs-on: ${{ inputs.os }}
+    # bootstrap_test spends ~30s per iteration on its own purposeful
+    # teardown-timeout test; 30 iterations of that one test alone is ~20
+    # min at scale 1 (the `filter` input is how to skip it when the target
+    # is a sibling test in the same binary). 120 leaves headroom for a
+    # larger N or scale 3 without turning into a silent no-op on a genuine
+    # hang — RUN_TIMEOUT already bounds any single iteration underneath.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install libclang (Linux)
+        if: runner.os == 'Linux'
+        # libclang-dev is needed by bindgen when roost-vt is built with
+        # `--features ffi`. macOS gets it via Xcode's command-line tools.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      # `cache/restore`, never the read-write `cache` action rust-build
+      # uses for either key here: this lane runs the same binary under
+      # deliberate hogs/scale far more times than any real build, and none
+      # of that should ever be able to feed back into rust-build's cache.
+      - name: Cache cargo registry + target
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: make flake-stress
+        # `${{ }}` inside a `run:` body is textual substitution before the
+        # shell ever sees it — ci-success's own comment (ci.yml) calls this
+        # out as a script-injection surface. Every input below reaches the
+        # process through `env:` instead, so something like `$(rm -rf /)`
+        # typed into `test` or `filter` is just a literal string in the
+        # environment, never parsed as shell.
+        env:
+          TEST: ${{ inputs.test }}
+          FILTER: ${{ inputs.filter }}
+          EXACT: ${{ inputs.exact && '1' || '0' }}
+          N: ${{ inputs.iterations }}
+          SCALE: ${{ inputs.scale }}
+          HOGS: ${{ inputs.hogs }}
+          RUN_TIMEOUT: ${{ inputs.run_timeout }}
+        run: make flake-stress
+
+      - name: Step summary
+        # flake-stress.sh writes summary.txt as its last act before its
+        # final pass/fail check, so a run that got that far — pass, fail,
+        # or timeout — always has one. A `die` earlier (build failure, or a
+        # selector that matched zero tests) exits first and leaves no
+        # file; that path already fails loud on the step's own log, so a
+        # missing summary here is reported, not silently skipped.
+        if: always()
+        run: |
+          if [ -f target/flake-stress/summary.txt ]; then
+            {
+              echo '```'
+              cat target/flake-stress/summary.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'flake-stress produced no summary.txt — see the make flake-stress step log' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload flake-stress output
+        # The failing case is the interesting one, so this must still run
+        # (and the per-run logs still upload) after the step above fails
+        # the job; `continue-on-error` only means a flaky artifact-service
+        # hiccup here can't mask that real failure.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: flake-stress-${{ inputs.os }}
+          path: target/flake-stress/
+          if-no-files-found: ignore
