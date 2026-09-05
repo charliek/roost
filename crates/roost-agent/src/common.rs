@@ -26,6 +26,25 @@ pub(crate) fn non_empty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
+/// A string field read snake_case first, falling back to camelCase when
+/// the snake key is absent or empty.
+///
+/// grok/gx pay every field it borrows from Claude's vocabulary twice,
+/// once per casing, but not every field is a *pair*: `notification_type`
+/// has no snake_case form at all (camelCase-only), and grok's
+/// `tool_response` is not `toolResponse` under another name — it is a
+/// different word from the camelCase `toolResult` that carries the same
+/// value. This helper only ever takes the two exact keys a caller
+/// passes; it does not derive one spelling from the other.
+pub(crate) fn field_alias<'a>(payload: &'a Value, snake: &str, camel: &str) -> &'a str {
+    let value = field(payload, snake);
+    if !value.is_empty() {
+        value
+    } else {
+        field(payload, camel)
+    }
+}
+
 pub(crate) fn array_len(payload: &Value, key: &str) -> usize {
     payload
         .get(key)
@@ -74,6 +93,24 @@ mod tests {
         assert_eq!(array_len(&payload, "arr"), 2);
         assert_eq!(array_len(&payload, "n"), 0);
         assert_eq!(array_len(&payload, "missing"), 0);
+    }
+
+    #[test]
+    fn field_alias_prefers_snake_and_falls_back_to_camel() {
+        let both = json!({ "session_id": "s1", "sessionId": "s2" });
+        assert_eq!(field_alias(&both, "session_id", "sessionId"), "s1");
+
+        let camel_only = json!({ "notificationType": "idle_prompt" });
+        assert_eq!(
+            field_alias(&camel_only, "notification_type", "notificationType"),
+            "idle_prompt"
+        );
+
+        let empty_snake = json!({ "session_id": "", "sessionId": "s2" });
+        assert_eq!(field_alias(&empty_snake, "session_id", "sessionId"), "s2");
+
+        let neither = json!({ "other": "x" });
+        assert_eq!(field_alias(&neither, "session_id", "sessionId"), "");
     }
 
     #[test]

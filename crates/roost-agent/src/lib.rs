@@ -23,8 +23,12 @@
 mod common;
 
 pub mod claude;
+pub mod codex;
+pub mod grok;
 
 pub use claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};
+pub use codex::{codex_event_to_reports, CODEX_HOOK_EVENTS};
+pub use grok::{grok_event_to_reports, GROK_HOOK_EVENTS};
 
 use roost_ipc::agent::TabAgentReportParams;
 use serde_json::Value;
@@ -36,9 +40,14 @@ use serde_json::Value;
 /// nothing here can map, and the caller takes its "no adapter" path —
 /// drain stdin, answer `{}`, exit 0 — instead of hitting a silent no-op
 /// arm that looks like a working install.
+///
+/// gx shares grok's `$GROK_HOME` and reports under the same `source`,
+/// so it has no variant of its own — `Agent::Grok` covers both binaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Claude,
+    Grok,
+    Codex,
 }
 
 impl Agent {
@@ -46,7 +55,14 @@ impl Agent {
     /// and separators are normalized away, matching how every adapter
     /// reads its own event names.
     pub fn parse(name: &str) -> Option<Agent> {
-        common::parse_normalized(name, &[(claude::SOURCE, Agent::Claude)])
+        common::parse_normalized(
+            name,
+            &[
+                (claude::SOURCE, Agent::Claude),
+                (grok::SOURCE, Agent::Grok),
+                (codex::SOURCE, Agent::Codex),
+            ],
+        )
     }
 
     /// The ownership `source` every report from this agent carries. It
@@ -54,6 +70,8 @@ impl Agent {
     pub fn source(self) -> &'static str {
         match self {
             Agent::Claude => claude::SOURCE,
+            Agent::Grok => grok::SOURCE,
+            Agent::Codex => codex::SOURCE,
         }
     }
 
@@ -61,6 +79,8 @@ impl Agent {
     pub fn events(self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &CLAUDE_HOOK_EVENTS,
+            Agent::Grok => &GROK_HOOK_EVENTS,
+            Agent::Codex => &CODEX_HOOK_EVENTS,
         }
     }
 
@@ -76,6 +96,8 @@ impl Agent {
     ) -> Vec<TabAgentReportParams> {
         match self {
             Agent::Claude => claude::claude_event_to_reports(event, payload, tab_id),
+            Agent::Grok => grok::grok_event_to_reports(event, payload, tab_id),
+            Agent::Codex => codex::codex_event_to_reports(event, payload, tab_id),
         }
     }
 }
@@ -90,6 +112,20 @@ mod tests {
         for spelling in ["claude", "Claude", "CLAUDE"] {
             assert_eq!(Agent::parse(spelling), Some(Agent::Claude), "{spelling}");
         }
+        for spelling in ["grok", "Grok", "GROK"] {
+            assert_eq!(Agent::parse(spelling), Some(Agent::Grok), "{spelling}");
+        }
+        for spelling in ["codex", "Codex", "CODEX"] {
+            assert_eq!(Agent::parse(spelling), Some(Agent::Codex), "{spelling}");
+        }
+    }
+
+    /// `gx` has no `Agent` variant of its own: it shares grok's config
+    /// and reports as `grok`, so `roostctl agent-hook gx` is never a
+    /// thing — only `agent-hook grok` is installed for either binary.
+    #[test]
+    fn gx_has_no_variant_of_its_own() {
+        assert_eq!(Agent::parse("gx"), None);
     }
 
     /// An agent whose adapter has not been written must not resolve:
@@ -97,31 +133,57 @@ mod tests {
     /// `parse` says so.
     #[test]
     fn parse_rejects_everything_without_a_module() {
-        for name in [
-            "",
-            "codex",
-            "grok",
-            "cursor",
-            "opencode",
-            "claude-code",
-            "🙂",
-        ] {
+        for name in ["", "gx", "cursor", "opencode", "claude-code", "🙂"] {
             assert_eq!(Agent::parse(name), None, "{name}");
         }
     }
 
-    #[test]
-    fn dispatch_reaches_the_same_answer_as_the_module() {
-        let payload = json!({ "session_id": "s-1", "source": "startup" });
-        let agent = Agent::parse("claude").unwrap();
-        assert_eq!(agent.source(), claude::SOURCE);
-        assert_eq!(agent.events(), &CLAUDE_HOOK_EVENTS);
+    /// One arm of the dispatch table, checked against the module it
+    /// delegates to. `payload` is whatever that adapter's own gate
+    /// requires of a `SessionStart`.
+    fn dispatch_matches(
+        source: &str,
+        events: &[&str],
+        adapter: fn(&str, &Value, i64) -> Vec<TabAgentReportParams>,
+        payload: &Value,
+    ) {
+        let agent = Agent::parse(source).unwrap();
+        assert_eq!(agent.source(), source);
+        assert_eq!(agent.events(), events);
+
+        // Non-emptiness first: two empty vectors compare equal, so this
+        // would pass if dispatch and the module regressed together.
+        let via_dispatch = agent.event_to_reports("SessionStart", payload, 7);
+        assert!(!via_dispatch.is_empty(), "{source}");
         assert_eq!(
-            agent.event_to_reports("SessionStart", &payload, 7),
-            claude_event_to_reports("SessionStart", &payload, 7),
+            via_dispatch,
+            adapter("SessionStart", payload, 7),
+            "{source}"
         );
-        assert!(!agent
-            .event_to_reports("SessionStart", &payload, 7)
-            .is_empty());
+    }
+
+    /// Every arm of the table, so an agent that lands later joins by
+    /// adding a line rather than by copying a test.
+    #[test]
+    fn dispatch_reaches_the_same_answer_as_each_module() {
+        dispatch_matches(
+            claude::SOURCE,
+            &CLAUDE_HOOK_EVENTS,
+            claude_event_to_reports,
+            &json!({ "session_id": "s-1", "source": "startup" }),
+        );
+        dispatch_matches(
+            grok::SOURCE,
+            &GROK_HOOK_EVENTS,
+            grok_event_to_reports,
+            // grok's gate: the camelCase twin has to be present.
+            &json!({ "session_id": "s-1", "source": "new", "hookEventName": "session_start" }),
+        );
+        dispatch_matches(
+            codex::SOURCE,
+            &CODEX_HOOK_EVENTS,
+            codex_event_to_reports,
+            &json!({ "session_id": "s-1", "source": "startup" }),
+        );
     }
 }
