@@ -24,11 +24,15 @@ mod common;
 
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod grok;
+pub mod opencode;
 
 pub use claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};
 pub use codex::{codex_event_to_reports, CODEX_HOOK_EVENTS};
+pub use cursor::{cursor_event_to_reports, CURSOR_HOOK_EVENTS};
 pub use grok::{grok_event_to_reports, GROK_HOOK_EVENTS};
+pub use opencode::{opencode_event_to_reports, OPENCODE_HOOK_EVENTS};
 
 use roost_ipc::agent::TabAgentReportParams;
 use serde_json::Value;
@@ -48,6 +52,8 @@ pub enum Agent {
     Claude,
     Grok,
     Codex,
+    Cursor,
+    Opencode,
 }
 
 impl Agent {
@@ -61,6 +67,8 @@ impl Agent {
                 (claude::SOURCE, Agent::Claude),
                 (grok::SOURCE, Agent::Grok),
                 (codex::SOURCE, Agent::Codex),
+                (cursor::SOURCE, Agent::Cursor),
+                (opencode::SOURCE, Agent::Opencode),
             ],
         )
     }
@@ -72,6 +80,8 @@ impl Agent {
             Agent::Claude => claude::SOURCE,
             Agent::Grok => grok::SOURCE,
             Agent::Codex => codex::SOURCE,
+            Agent::Cursor => cursor::SOURCE,
+            Agent::Opencode => opencode::SOURCE,
         }
     }
 
@@ -81,6 +91,8 @@ impl Agent {
             Agent::Claude => &CLAUDE_HOOK_EVENTS,
             Agent::Grok => &GROK_HOOK_EVENTS,
             Agent::Codex => &CODEX_HOOK_EVENTS,
+            Agent::Cursor => &CURSOR_HOOK_EVENTS,
+            Agent::Opencode => &OPENCODE_HOOK_EVENTS,
         }
     }
 
@@ -98,6 +110,8 @@ impl Agent {
             Agent::Claude => claude::claude_event_to_reports(event, payload, tab_id),
             Agent::Grok => grok::grok_event_to_reports(event, payload, tab_id),
             Agent::Codex => codex::codex_event_to_reports(event, payload, tab_id),
+            Agent::Cursor => cursor::cursor_event_to_reports(event, payload, tab_id),
+            Agent::Opencode => opencode::opencode_event_to_reports(event, payload, tab_id),
         }
     }
 }
@@ -118,6 +132,12 @@ mod tests {
         for spelling in ["codex", "Codex", "CODEX"] {
             assert_eq!(Agent::parse(spelling), Some(Agent::Codex), "{spelling}");
         }
+        for spelling in ["cursor", "Cursor", "CURSOR"] {
+            assert_eq!(Agent::parse(spelling), Some(Agent::Cursor), "{spelling}");
+        }
+        for spelling in ["opencode", "OpenCode", "OPENCODE"] {
+            assert_eq!(Agent::parse(spelling), Some(Agent::Opencode), "{spelling}");
+        }
     }
 
     /// `gx` has no `Agent` variant of its own: it shares grok's config
@@ -133,18 +153,20 @@ mod tests {
     /// `parse` says so.
     #[test]
     fn parse_rejects_everything_without_a_module() {
-        for name in ["", "gx", "cursor", "opencode", "claude-code", "🙂"] {
+        for name in ["", "gx", "amp", "gemini", "claude-code", "🙂"] {
             assert_eq!(Agent::parse(name), None, "{name}");
         }
     }
 
     /// One arm of the dispatch table, checked against the module it
-    /// delegates to. `payload` is whatever that adapter's own gate
-    /// requires of a `SessionStart`.
+    /// delegates to. `event` is that agent's own claiming event and
+    /// `payload` whatever its gate requires of one — opencode's
+    /// vocabulary is its own, not a variant of Claude's.
     fn dispatch_matches(
         source: &str,
         events: &[&str],
         adapter: fn(&str, &Value, i64) -> Vec<TabAgentReportParams>,
+        event: &str,
         payload: &Value,
     ) {
         let agent = Agent::parse(source).unwrap();
@@ -153,13 +175,9 @@ mod tests {
 
         // Non-emptiness first: two empty vectors compare equal, so this
         // would pass if dispatch and the module regressed together.
-        let via_dispatch = agent.event_to_reports("SessionStart", payload, 7);
+        let via_dispatch = agent.event_to_reports(event, payload, 7);
         assert!(!via_dispatch.is_empty(), "{source}");
-        assert_eq!(
-            via_dispatch,
-            adapter("SessionStart", payload, 7),
-            "{source}"
-        );
+        assert_eq!(via_dispatch, adapter(event, payload, 7), "{source}");
     }
 
     /// Every arm of the table, so an agent that lands later joins by
@@ -170,12 +188,14 @@ mod tests {
             claude::SOURCE,
             &CLAUDE_HOOK_EVENTS,
             claude_event_to_reports,
+            "SessionStart",
             &json!({ "session_id": "s-1", "source": "startup" }),
         );
         dispatch_matches(
             grok::SOURCE,
             &GROK_HOOK_EVENTS,
             grok_event_to_reports,
+            "SessionStart",
             // grok's gate: the camelCase twin has to be present.
             &json!({ "session_id": "s-1", "source": "new", "hookEventName": "session_start" }),
         );
@@ -183,7 +203,23 @@ mod tests {
             codex::SOURCE,
             &CODEX_HOOK_EVENTS,
             codex_event_to_reports,
+            "SessionStart",
             &json!({ "session_id": "s-1", "source": "startup" }),
+        );
+        dispatch_matches(
+            cursor::SOURCE,
+            &CURSOR_HOOK_EVENTS,
+            cursor_event_to_reports,
+            "sessionStart",
+            // cursor's gate: its own version stamp has to be present.
+            &json!({ "session_id": "s-1", "cursor_version": "2026.09.02-c22c1a3" }),
+        );
+        dispatch_matches(
+            opencode::SOURCE,
+            &OPENCODE_HOOK_EVENTS,
+            opencode_event_to_reports,
+            "session.created",
+            &json!({ "sessionID": "ses_1" }),
         );
     }
 }

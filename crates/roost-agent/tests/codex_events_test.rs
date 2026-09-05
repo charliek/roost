@@ -275,3 +275,22 @@ fn every_report_carries_source_codex_and_the_payload_session_id() {
         assert_eq!(report.session_id, "s-42", "{event}");
     }
 }
+
+/// Plan §4 keeps the ids a later "resume this session" feature would
+/// need. codex's `turn_id` is the only one of them that is not already
+/// `ownership.session_id`, so it rides in `metadata` on every event
+/// that carries it — and on none that do not.
+#[test]
+fn a_turn_id_is_recorded_wherever_codex_sends_one() {
+    let with_turn = only("Stop", &json!({ "session_id": "s-1", "turn_id": "turn-1" }));
+    assert_eq!(
+        with_turn.metadata.get("turn_id").map(String::as_str),
+        Some("turn-1")
+    );
+
+    let without = only("Stop", &json!({ "session_id": "s-1" }));
+    assert!(!without.metadata.contains_key("turn_id"));
+
+    let empty = only("Stop", &json!({ "session_id": "s-1", "turn_id": "" }));
+    assert!(!empty.metadata.contains_key("turn_id"));
+}

@@ -109,7 +109,7 @@ pub fn codex_event_to_reports(
         ..TabAgentReportParams::sessionless(tab_id, SOURCE, OwnershipAction::Preserve, None)
     };
 
-    let report = match kind {
+    let mut report = match kind {
         EventKind::SessionStart => session_start(base, payload),
         EventKind::UserPromptSubmit => user_prompt_submit(base),
         EventKind::PreToolUse => tool_progress(base, "pre_tool_use"),
@@ -119,6 +119,16 @@ pub fn codex_event_to_reports(
         EventKind::Interrupt => interrupt(base),
         EventKind::SessionEnd => session_end(base),
     };
+
+    // Plan §4: a later "resume this agent's session" feature needs the
+    // ids the agents use themselves, and codex's `turn_id` is the one
+    // that is not already `ownership.session_id`. Recorded wherever it
+    // appears rather than mapped, since nothing consumes it yet.
+    if let Some(turn_id) = non_empty(field(payload, "turn_id")) {
+        report
+            .metadata
+            .insert("turn_id".to_string(), turn_id.to_string());
+    }
 
     vec![report]
 }

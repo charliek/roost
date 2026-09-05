@@ -7,7 +7,13 @@
 //! replaced and session ids kept. The Claude file holds two back-to-back
 //! sessions (the second hit a permission dialog); the grok file holds
 //! five back-to-back sessions (the third hit a plan-mode permission
-//! prompt); gx and codex each hold one.
+//! prompt); gx, codex and cursor each hold one.
+//!
+//! `opencode.jsonl` is a different animal: opencode has no hooks, so
+//! this is its raw plugin **event bus** log, all 862 records of it. Only
+//! 19 are events the plugin forwards; the other 843 are the
+//! `message.part.delta` flood and its friends, kept whole because they
+//! are the evidence that the whitelist earns its place.
 //!
 //! Every emitted report is applied through
 //! [`roost_ipc::agent::apply_report`] rather than merely inspected,
@@ -20,7 +26,9 @@ use std::path::PathBuf;
 
 use roost_agent::claude::claude_event_to_reports;
 use roost_agent::codex::codex_event_to_reports;
+use roost_agent::cursor::cursor_event_to_reports;
 use roost_agent::grok::grok_event_to_reports;
+use roost_agent::opencode::{opencode_event_to_reports, OPENCODE_HOOK_EVENTS};
 use roost_ipc::agent::{
     apply_report, validate_report, AgentLifecycle, AgentTabState, AttentionEffect, OwnershipAction,
     Severity, TabAgentReportParams,
@@ -43,6 +51,10 @@ const GROK_SESSION_FIVE: &str = "01a06e47-9664-74f3-abe5-8d5e188f3780";
 const GX_SESSION: &str = "01a06e35-1139-7931-8a33-a8c5f007b745";
 
 const CODEX_SESSION: &str = "01a06e4d-b178-7f53-bbc3-f9e551c3b56b";
+
+const CURSOR_SESSION: &str = "206da977-c2d4-4b1f-a280-29c6e27ea973";
+
+const OPENCODE_SESSION: &str = "ses_f91cef768ffeTI8TEd0E4v53Ov";
 
 /// The shape every `<agent>_event_to_reports` function has (plan 046
 /// §3.1's "one module per agent, one shape").
@@ -437,6 +449,251 @@ fn the_codex_session_start_records_model_and_permission_mode() {
 }
 
 // ---------------------------------------------------------------------
+// The cursor probe, start to finish
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_cursor_probe_replays_to_the_pinned_lifecycle_sequence() {
+    use AgentLifecycle::{Finished, Inactive, Working};
+
+    // Cursor never reaches `Waiting`: it has no permission hook at all
+    // (`cursor.rs`'s module doc). The three zero-report lines are the
+    // events Roost deliberately does not register.
+    let tab = replay(
+        cursor_event_to_reports,
+        "cursor",
+        &[
+            ("sessionStart", 1, Inactive, Some(CURSOR_SESSION)),
+            ("beforeSubmitPrompt", 1, Working, Some(CURSOR_SESSION)),
+            ("afterAgentThought", 0, Working, Some(CURSOR_SESSION)),
+            ("preToolUse", 1, Working, Some(CURSOR_SESSION)),
+            ("afterAgentThought", 0, Working, Some(CURSOR_SESSION)),
+            // The pair that would be cursor's blocked signal if it could
+            // mean one: 0.1 s apart, because the command was
+            // auto-approved.
+            ("beforeShellExecution", 0, Working, Some(CURSOR_SESSION)),
+            ("afterShellExecution", 0, Working, Some(CURSOR_SESSION)),
+            ("postToolUse", 1, Working, Some(CURSOR_SESSION)),
+            ("afterAgentThought", 0, Working, Some(CURSOR_SESSION)),
+            ("afterAgentThought", 0, Working, Some(CURSOR_SESSION)),
+            // Precedes `stop` rather than ending the turn.
+            ("afterAgentResponse", 1, Working, Some(CURSOR_SESSION)),
+            ("stop", 1, Finished, Some(CURSOR_SESSION)),
+            ("beforeSubmitPrompt", 1, Working, Some(CURSOR_SESSION)),
+            // Esc: `aborted` ends the turn…
+            ("stop", 1, Finished, Some(CURSOR_SESSION)),
+            // …and the `error` that follows it
+            // is the same interrupt reported twice, so the guard vetoes
+            // it. Reading `error` as a failure here would paint every
+            // interrupted turn red.
+            ("stop", 1, Finished, Some(CURSOR_SESSION)),
+            ("sessionEnd", 1, Inactive, None),
+        ],
+    );
+
+    // Two banners for two turns, not three for three `stop`s — the
+    // whole reason `stop` carries `lifecycle_if`.
+    assert_eq!(
+        tab.banners,
+        vec![
+            (Severity::Info, "Turn complete".to_string()),
+            (Severity::Info, "Turn complete".to_string()),
+        ],
+    );
+    assert!(!tab.pending, "the trailing sessionEnd clears attention");
+}
+
+/// The `status` of each `stop` reaches the owner record even where the
+/// lifecycle patch is vetoed, which is what makes an interrupted turn
+/// distinguishable after the fact despite every status mapping to
+/// `finished`.
+#[test]
+fn every_cursor_stop_status_is_recorded_including_the_vetoed_one() {
+    let records = fixture("cursor");
+    let mut tab = Tab::default();
+    for (event, payload) in records.iter().take(14) {
+        tab.feed_via(cursor_event_to_reports, event, payload);
+    }
+    assert_eq!(tab.detail(), Some("aborted"));
+
+    tab.feed_via(cursor_event_to_reports, &records[14].0, &records[14].1);
+    assert_eq!(tab.lifecycle(), AgentLifecycle::Finished);
+    assert_eq!(tab.detail(), Some("error"), "a vetoed report still merges");
+    assert_eq!(tab.banners.len(), 2, "and it does not banner");
+}
+
+#[test]
+fn the_cursor_session_start_records_model_and_version() {
+    let mut tab = Tab::default();
+    let (event, payload) = &fixture("cursor")[0];
+    tab.feed_via(cursor_event_to_reports, event, payload);
+    assert_eq!(tab.metadata("model"), Some("cursor-grok-4.6-high-fast"));
+    assert_eq!(tab.metadata("cursor_version"), Some("2026.09.02-c22c1a3"));
+}
+
+// ---------------------------------------------------------------------
+// The opencode probe, start to finish
+// ---------------------------------------------------------------------
+
+/// One forwarded line of `opencode.jsonl`: its 1-based line number in
+/// the raw bus log, then the same four columns every other replay pins.
+/// The line number is a column here because the forwarded events are
+/// scattered through 862 records — a row has to be able to name which
+/// one it is.
+type BusRow = (
+    usize,
+    &'static str,
+    usize,
+    AgentLifecycle,
+    Option<&'static str>,
+);
+
+/// Replay only the records the plugin forwards. The rest are fed too —
+/// through [`the_bus_noise_the_plugin_filters_maps_to_nothing`] — but
+/// they are cost, not policy, so they do not get a row here.
+fn replay_forwarded(rows: &[BusRow]) -> Tab {
+    let forwarded: Vec<(usize, String, Value)> = fixture("opencode")
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (event, _))| OPENCODE_HOOK_EVENTS.contains(&event.as_str()))
+        .map(|(i, (event, payload))| (i + 1, event, payload))
+        .collect();
+    assert_eq!(forwarded.len(), rows.len(), "opencode.jsonl changed shape");
+
+    let mut tab = Tab::default();
+    for (
+        (line, event, payload),
+        (want_line, want_event, want_reports, want_lifecycle, want_owner),
+    ) in forwarded.iter().zip(rows.iter().copied())
+    {
+        assert_eq!(*line, want_line, "opencode.jsonl: {event} moved");
+        assert_eq!(event, want_event, "opencode.jsonl:{line}");
+        assert_eq!(
+            tab.feed_via(opencode_event_to_reports, event, payload),
+            want_reports,
+            "opencode.jsonl:{line} {event} report count"
+        );
+        assert_eq!(
+            tab.lifecycle(),
+            want_lifecycle,
+            "opencode.jsonl:{line} {event} lifecycle"
+        );
+        assert_eq!(
+            tab.owner_session(),
+            want_owner,
+            "opencode.jsonl:{line} {event} owner"
+        );
+    }
+    tab
+}
+
+#[test]
+fn the_opencode_probe_replays_to_the_pinned_lifecycle_sequence() {
+    use AgentLifecycle::{Finished, Inactive, Waiting, Working};
+
+    const SES: Option<&str> = Some(OPENCODE_SESSION);
+
+    let tab = replay_forwarded(&[
+        (51, "session.created", 1, Inactive, SES),
+        (52, "chat.message", 1, Working, SES),
+        (56, "session.status", 1, Working, SES),
+        (110, "session.status", 1, Working, SES),
+        // opencode's blocked signal, observed live.
+        (140, "permission.asked", 1, Waiting, SES),
+        (141, "permission.replied", 1, Working, SES),
+        (147, "session.status", 1, Working, SES),
+        (152, "session.status", 1, Working, SES),
+        (160, "session.status", 1, Working, SES),
+        // `session.status idle` is a level, not an edge: `session.idle`
+        // is what ends a turn, so this maps to nothing.
+        (161, "session.status", 0, Working, SES),
+        (162, "session.idle", 1, Finished, SES),
+        (166, "chat.message", 1, Working, SES),
+        (170, "session.status", 1, Working, SES),
+        (175, "session.status", 1, Working, SES),
+        // Esc. `MessageAbortedError` arrives on the same channel as a
+        // real failure and is the one value that must not read as one.
+        (853, "session.error", 1, Finished, SES),
+        (854, "session.status", 0, Finished, SES),
+        // Still one report each — a vetoed report is accepted, it just
+        // carries no patch and no banner.
+        (855, "session.idle", 1, Finished, SES),
+        (858, "session.status", 0, Finished, SES),
+        (859, "session.idle", 1, Finished, SES),
+    ]);
+
+    // One banner per real turn, and none for the interrupt. opencode
+    // fires `session.idle` three times in this run: once for the turn
+    // that completed, and twice trailing the Esc — after
+    // `session.error` had already ended the turn and cleared attention.
+    // `session_idle`'s `["working", "waiting"]` guard vetoes those two,
+    // the same way cursor's `stop` guard silences its repeats, so
+    // §3.1's "an interrupt does not banner" rule holds here too.
+    assert_eq!(
+        tab.banners,
+        vec![
+            (
+                Severity::Warn,
+                "Needs permission: `external_directory`".to_string()
+            ),
+            (Severity::Info, "Turn complete".to_string()),
+        ],
+    );
+    // No `dispose` in the capture: the plugin hook that would release
+    // ownership was never observed, so the tab is still owned at the end
+    // of the run (`opencode.rs`'s module doc).
+    assert_eq!(tab.owner_session(), Some(OPENCODE_SESSION));
+}
+
+/// The whitelist is a cost control, not a correctness boundary: the 843
+/// records the plugin never forwards map to nothing here either, so a
+/// future opencode build that forwards more cannot silently start
+/// driving a tab.
+#[test]
+fn the_bus_noise_the_plugin_filters_maps_to_nothing() {
+    let mut filtered = 0;
+    for (event, payload) in fixture("opencode") {
+        if OPENCODE_HOOK_EVENTS.contains(&event.as_str()) {
+            continue;
+        }
+        filtered += 1;
+        assert!(
+            opencode_event_to_reports(&event, &payload, TAB).is_empty(),
+            "{event} is not forwarded but maps to a report"
+        );
+    }
+    assert_eq!(filtered, 843, "opencode.jsonl changed shape");
+}
+
+/// A child session must not claim the tab from its parent: a claim is
+/// unconditional, so a subagent would evict the session the user is
+/// looking at. The probe has no child session, so this is synthetic —
+/// built from the real `session.created` record by giving it a parent.
+#[test]
+fn a_child_session_created_never_claims_the_tab() {
+    let (event, payload) = fixture("opencode")
+        .into_iter()
+        .find(|(event, _)| event == "session.created")
+        .expect("opencode.jsonl has a session.created");
+    assert_eq!(opencode_event_to_reports(&event, &payload, TAB).len(), 1);
+
+    // Both spellings: the probe only ever nested `parentID` inside
+    // `info`, but opencode's bus spreads session fields at the top level
+    // on some events.
+    let mut top_level = payload.clone();
+    top_level["parentID"] = json!("ses_parent");
+    let mut nested = payload.clone();
+    nested["info"]["parentID"] = json!("ses_parent");
+
+    for (spelling, child) in [("top-level", top_level), ("nested in info", nested)] {
+        assert!(
+            opencode_event_to_reports(&event, &child, TAB).is_empty(),
+            "a session.created with a {spelling} parentID claimed the tab"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
 // Cross-adapter isolation (plan 046 §3.1, §9)
 // ---------------------------------------------------------------------
 
@@ -460,11 +717,14 @@ fn foreign_fixtures_never_claim_ownership_through_the_wrong_adapter() {
         ("grok", "grok"),
         ("gx", "grok"),
         ("codex", "codex"),
+        ("opencode", "opencode"),
     ];
     const ADAPTERS: &[(&str, Adapter)] = &[
         ("claude", claude_event_to_reports),
         ("grok", grok_event_to_reports),
         ("codex", codex_event_to_reports),
+        ("cursor", cursor_event_to_reports),
+        ("opencode", opencode_event_to_reports),
     ];
 
     for (fixture_name, native) in FIXTURES {
@@ -544,6 +804,23 @@ fn mapped_without_discriminators(adapter: Adapter, agent: &str) -> usize {
         .count()
 }
 
+/// The mirror of [`mapped_without_discriminators`], for the two gates
+/// that *require* a key rather than rejecting one: how many of `agent`'s
+/// captured records map through `adapter` once `key` is grafted onto
+/// every payload.
+fn mapped_with_grafted(adapter: Adapter, agent: &str, key: &str) -> usize {
+    fixture(agent)
+        .into_iter()
+        .filter(|(event, payload)| {
+            let mut grafted = payload.clone();
+            if let Some(object) = grafted.as_object_mut() {
+                object.insert(key.to_string(), json!("x"));
+            }
+            !adapter(event, &grafted, TAB).is_empty()
+        })
+        .count()
+}
+
 /// …and the fence is not vacuous. Both agents fire events whose names
 /// normalize onto Claude's own vocabulary — grok's `SessionStart`,
 /// cursor's `sessionStart`/`stop`/`preToolUse` — so with the foreign
@@ -568,18 +845,8 @@ fn the_same_payloads_map_once_their_discriminators_are_removed() {
 /// satisfied.
 #[test]
 fn the_grok_gate_is_not_vacuous() {
-    let mapped = fixture("claude")
-        .into_iter()
-        .filter(|(event, payload)| {
-            let mut grafted = payload.clone();
-            if let Some(object) = grafted.as_object_mut() {
-                object.insert("hookEventName".to_string(), json!("x"));
-            }
-            !grok_event_to_reports(event, &grafted, TAB).is_empty()
-        })
-        .count();
     assert!(
-        mapped > 0,
+        mapped_with_grafted(grok_event_to_reports, "claude", "hookEventName") > 0,
         "claude.jsonl no longer overlaps grok's vocabulary once hookEventName \
          is present; the isolation test would pass for the wrong reason"
     );
@@ -598,6 +865,69 @@ fn the_codex_gate_is_not_vacuous() {
             "{agent}.jsonl no longer overlaps codex's vocabulary; the isolation \
              test would pass for the wrong reason"
         );
+    }
+}
+
+/// Cursor's fence runs grok's direction, not Claude's: it *requires*
+/// `cursor_version`, because the two keys Claude and codex reject on are
+/// cursor's own and the event vocabulary alone would let a Claude
+/// `SessionStart` claim a cursor tab. Proved not vacuous the same way
+/// grok's is — grafting that one key onto the fixtures that never carry
+/// it makes the very same payloads map.
+#[test]
+fn the_cursor_gate_is_not_vacuous() {
+    for agent in ["claude", "codex", "grok", "gx"] {
+        assert!(
+            mapped_with_grafted(cursor_event_to_reports, agent, "cursor_version") > 0,
+            "{agent}.jsonl no longer overlaps cursor's vocabulary once cursor_version \
+             is present; the isolation test would pass for the wrong reason"
+        );
+    }
+}
+
+/// opencode has no content gate at all, and needs none: its vocabulary
+/// is its own. That claim is the whole isolation argument for this
+/// adapter, so it is asserted directly against the four other event
+/// lists rather than left to the fixtures to demonstrate — a future
+/// opencode event named `stop` would be caught here, not in production.
+#[test]
+fn opencodes_vocabulary_is_disjoint_from_every_other_agents() {
+    use roost_agent::claude::CLAUDE_HOOK_EVENTS;
+    use roost_agent::codex::CODEX_HOOK_EVENTS;
+    use roost_agent::cursor::CURSOR_HOOK_EVENTS;
+    use roost_agent::grok::GROK_HOOK_EVENTS;
+
+    // Permissive enough to satisfy every other adapter's gate at once,
+    // so only the event name can be what rejects it.
+    let payload = json!({
+        "session_id": "s-1",
+        "sessionID": "ses_1",
+        "source": "startup",
+        "hookEventName": "x",
+        "conversation_id": "c-1",
+        "cursor_version": "v",
+    });
+
+    let others: &[(&str, Adapter, &[&str])] = &[
+        ("claude", claude_event_to_reports, &CLAUDE_HOOK_EVENTS),
+        ("grok", grok_event_to_reports, &GROK_HOOK_EVENTS),
+        ("codex", codex_event_to_reports, &CODEX_HOOK_EVENTS),
+        ("cursor", cursor_event_to_reports, &CURSOR_HOOK_EVENTS),
+    ];
+
+    for (name, adapter, events) in others {
+        for event in OPENCODE_HOOK_EVENTS {
+            assert!(
+                adapter(event, &payload, TAB).is_empty(),
+                "{name} maps opencode's {event}"
+            );
+        }
+        for event in *events {
+            assert!(
+                opencode_event_to_reports(event, &payload, TAB).is_empty(),
+                "opencode maps {name}'s {event}"
+            );
+        }
     }
 }
 

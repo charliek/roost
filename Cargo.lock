@@ -2735,6 +2735,7 @@ version = "0.0.19"
 dependencies = [
  "roost-ipc",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
