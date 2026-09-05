@@ -1,0 +1,171 @@
+{
+  "source": "openai/codex @ 773f0b081de689b0d54f2809e7b17bfdb4c9f341 (2026-09-04)",
+  "formula": "trusted_hash = \"sha256:\" + hex(sha256(compact_json(recursively key-sorted {event_name, [matcher], hooks:[handler]}))). Compact = serde_json::to_vec: `,`/`:` separators, no non-ASCII escaping.",
+  "key_format": "<abs hooks.json path>:<snake_case event label>:<group index>:<handler index>  (indices 0-based)",
+  "vectors": [
+    {
+      "id": "a-real-herdr-session-start",
+      "note": "VERIFIED against the live trusted_hash in Charlie's ~/.codex/config.toml (2026-09-04). Sync, no matcher, explicit timeout 10 on SessionStart (default 600 -> kept as 10, no clamp).",
+      "verified_against_real_codex_state": true,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "SessionStart",
+        "group_index": 0,
+        "handler_index": 0,
+        "command": "bash '/Users/charliek/.codex/herdr-agent-state.sh' session",
+        "timeout": 10
+      },
+      "canonical_json": "{\"event_name\":\"session_start\",\"hooks\":[{\"async\":false,\"command\":\"bash '/Users/charliek/.codex/herdr-agent-state.sh' session\",\"timeout\":10,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:session_start:0:0",
+      "expected_hash": "sha256:ab18589eb919ffabefe9d58b389f357d5cf79b4eebed39cf3a15af9ad93e1b91"
+    },
+    {
+      "id": "b-session-end-async-clamped",
+      "note": "Synthetic. SessionEnd with async:true and timeout:10 -> the hashed timeout is 3 (clamp), while the hashed `async` stays the DECLARED true even though discovery.rs:531 runs SessionEnd synchronously.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "SessionEnd",
+        "group_index": 0,
+        "handler_index": 0,
+        "command": "\"$ROOST_AGENT_HOOK\" agent-hook codex",
+        "timeout": 10,
+        "async": true
+      },
+      "canonical_json": "{\"event_name\":\"session_end\",\"hooks\":[{\"async\":true,\"command\":\"\\\"$ROOST_AGENT_HOOK\\\" agent-hook codex\",\"timeout\":3,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:session_end:0:0",
+      "expected_hash": "sha256:f1b65df76b11442318b66aeadbd0379fad5d864a578ea096b63f67478a307f09"
+    },
+    {
+      "id": "c-pre-tool-use-with-matcher",
+      "note": "Synthetic. PreToolUse supports matchers, so `matcher` is emitted and sorts AFTER `hooks` in the canonical object.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "PreToolUse",
+        "group_index": 1,
+        "handler_index": 0,
+        "command": "\"$ROOST_AGENT_HOOK\" agent-hook codex",
+        "matcher": "Bash|Edit",
+        "timeout": 10
+      },
+      "canonical_json": "{\"event_name\":\"pre_tool_use\",\"hooks\":[{\"async\":false,\"command\":\"\\\"$ROOST_AGENT_HOOK\\\" agent-hook codex\",\"timeout\":10,\"type\":\"command\"}],\"matcher\":\"Bash|Edit\"}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:pre_tool_use:1:0",
+      "expected_hash": "sha256:2845680edf67f318a88691cf84c8e1c462abb7f186c0942962dd6fcf15e29941"
+    },
+    {
+      "id": "d-unicode-path-and-command",
+      "note": "Synthetic. The path affects only the KEY (never the hash); the non-ASCII bytes in the command must be emitted raw (serde_json does not escape non-ASCII), so a Rust port must not ensure_ascii.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/chärlie/Ünicøde 目录/.codex/hooks.json",
+        "event_name": "UserPromptSubmit",
+        "group_index": 0,
+        "handler_index": 2,
+        "command": "bash '/Users/chärlie/Ünicøde 目录/hook.sh' — ✓",
+        "timeout": 10
+      },
+      "canonical_json": "{\"event_name\":\"user_prompt_submit\",\"hooks\":[{\"async\":false,\"command\":\"bash '/Users/chärlie/Ünicøde 目录/hook.sh' — ✓\",\"timeout\":10,\"type\":\"command\"}]}",
+      "expected_key": "/Users/chärlie/Ünicøde 目录/.codex/hooks.json:user_prompt_submit:0:2",
+      "expected_hash": "sha256:a87e89333db3bb00261028b65195c848faad4eff4264e75659c16d90032179d6"
+    },
+    {
+      "id": "e-reordered-group-index-shift",
+      "note": "Synthetic. Same handler as (a) but a user inserted a group ahead of it: identical hash, different key (group_index 0 -> 1). This is the drift case ensure/doctor must detect.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "SessionStart",
+        "group_index": 1,
+        "handler_index": 0,
+        "command": "bash '/Users/charliek/.codex/herdr-agent-state.sh' session",
+        "timeout": 10
+      },
+      "canonical_json": "{\"event_name\":\"session_start\",\"hooks\":[{\"async\":false,\"command\":\"bash '/Users/charliek/.codex/herdr-agent-state.sh' session\",\"timeout\":10,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:session_start:1:0",
+      "expected_hash": "sha256:ab18589eb919ffabefe9d58b389f357d5cf79b4eebed39cf3a15af9ad93e1b91"
+    },
+    {
+      "id": "f-second-handler-in-same-group",
+      "note": "Synthetic. handler_index is per-group and 0-based.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "SessionStart",
+        "group_index": 0,
+        "handler_index": 1,
+        "command": "\"$ROOST_AGENT_HOOK\" agent-hook codex",
+        "timeout": 10
+      },
+      "canonical_json": "{\"event_name\":\"session_start\",\"hooks\":[{\"async\":false,\"command\":\"\\\"$ROOST_AGENT_HOOK\\\" agent-hook codex\",\"timeout\":10,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:session_start:0:1",
+      "expected_hash": "sha256:84f823f8d339891e1315e0db99bc02aae112d06cdd6587dbb38f9ed7c6f91a96"
+    },
+    {
+      "id": "g-no-timeout-defaults-600",
+      "note": "Synthetic. Omitted timeout on a normal event hashes as 600.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "Stop",
+        "group_index": 0,
+        "handler_index": 0,
+        "command": "\"$ROOST_AGENT_HOOK\" agent-hook codex"
+      },
+      "canonical_json": "{\"event_name\":\"stop\",\"hooks\":[{\"async\":false,\"command\":\"\\\"$ROOST_AGENT_HOOK\\\" agent-hook codex\",\"timeout\":600,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:stop:0:0",
+      "expected_hash": "sha256:a12ea25a6839ce2637deb630feff8ebf537f1452ff785004497c82e1536ff533"
+    },
+    {
+      "id": "h-interrupt-matcher-dropped",
+      "note": "Synthetic. Interrupt is NOT a matcher event, so a matcher present in hooks.json is dropped before hashing; timeout defaults to 1 when omitted (SessionEnd/Interrupt default) — this hash is identical to the same entry written without any matcher.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "Interrupt",
+        "group_index": 0,
+        "handler_index": 0,
+        "command": "\"$ROOST_AGENT_HOOK\" agent-hook codex",
+        "matcher": "Bash"
+      },
+      "canonical_json": "{\"event_name\":\"interrupt\",\"hooks\":[{\"async\":false,\"command\":\"\\\"$ROOST_AGENT_HOOK\\\" agent-hook codex\",\"timeout\":1,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:interrupt:0:0",
+      "expected_hash": "sha256:1d9ad27888d279498305f2d516c474a94bd3c124e1831f2ddb8efc116b72bc5c"
+    },
+    {
+      "id": "i-status-message-and-context-limit",
+      "note": "Synthetic. statusMessage is emitted when present; additionalContextLimit is emitted only for PreToolUse/PostToolUse/SessionStart/UserPromptSubmit/SubagentStart AND only when != 2500.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "PostToolUse",
+        "group_index": 0,
+        "handler_index": 0,
+        "command": "\"$ROOST_AGENT_HOOK\" agent-hook codex",
+        "timeout": 10,
+        "statusMessage": "Roost",
+        "additionalContextLimit": 0
+      },
+      "canonical_json": "{\"event_name\":\"post_tool_use\",\"hooks\":[{\"additionalContextLimit\":0,\"async\":false,\"command\":\"\\\"$ROOST_AGENT_HOOK\\\" agent-hook codex\",\"statusMessage\":\"Roost\",\"timeout\":10,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:post_tool_use:0:0",
+      "expected_hash": "sha256:a501bf77e4155cc817811ce02acf2a0547b1cd0d01d2cbce16798e3f31c1dc5e"
+    },
+    {
+      "id": "j-context-limit-at-default-omitted",
+      "note": "Synthetic. additionalContextLimit == 2500 is filtered out, so this hashes identically to the same entry with the field absent.",
+      "verified_against_real_codex_state": false,
+      "input": {
+        "hooks_json_path": "/Users/charliek/.codex/hooks.json",
+        "event_name": "SessionStart",
+        "group_index": 0,
+        "handler_index": 0,
+        "command": "\"$ROOST_AGENT_HOOK\" agent-hook codex",
+        "timeout": 10,
+        "additionalContextLimit": 2500
+      },
+      "canonical_json": "{\"event_name\":\"session_start\",\"hooks\":[{\"async\":false,\"command\":\"\\\"$ROOST_AGENT_HOOK\\\" agent-hook codex\",\"timeout\":10,\"type\":\"command\"}]}",
+      "expected_key": "/Users/charliek/.codex/hooks.json:session_start:0:0",
+      "expected_hash": "sha256:84f823f8d339891e1315e0db99bc02aae112d06cdd6587dbb38f9ed7c6f91a96"
+    }
+  ]
+}

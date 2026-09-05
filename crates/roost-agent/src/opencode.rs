@@ -85,6 +85,18 @@ use crate::common::{field, field_alias, has_field, non_empty, parse_normalized};
 
 pub const SOURCE: &str = "opencode";
 
+/// The forwarding plugin, compiled in.
+///
+/// It ships beside the adapter rather than beside the install engine so
+/// the whitelist below and the one in the file cannot be edited apart:
+/// `every_forwarded_event_is_in_the_plugin` reads these same bytes.
+/// `roost-agent-install` writes them out under its own header.
+pub const PLUGIN_SOURCE: &str = include_str!("../assets/opencode/roost-agent-state.js");
+
+/// What the plugin is called on disk. opencode loads every `.js` in its
+/// `plugins/` directory, so the name is only an identity, not a hook.
+pub const PLUGIN_FILE_NAME: &str = "roost-agent-state.js";
+
 /// The bus events the plugin forwards, plus its own `dispose` teardown.
 ///
 /// Unlike the other four agents this list is not written into a config
@@ -373,7 +385,7 @@ mod tests {
 
     /// The shipped plugin, read at compile time so the fence below can
     /// never drift from what the install engine will write out.
-    const PLUGIN: &str = include_str!("../assets/opencode/roost-agent-state.js");
+    const PLUGIN: &str = PLUGIN_SOURCE;
 
     /// Same discipline as the other four adapters' twin tests.
     #[test]

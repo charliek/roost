@@ -23,6 +23,7 @@
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl render-stats [--reset]
 //!   roostctl agent-hook AGENT
+//!   roostctl agent {ensure,install,uninstall,status}
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
 //!   roostctl session {start,stop,status}
@@ -41,6 +42,7 @@
 //! addresses its socket directly (see [`session`]), and a generic op
 //! reaches a session only through an explicit `--socket`.
 
+mod agent_install;
 mod doctor;
 mod host;
 mod session;
@@ -229,6 +231,13 @@ enum Cmd {
         /// gx reports as `grok` and has no name of its own.
         agent: String,
     },
+    /// Agent-hook install subcommands: wire Roost's hook entries into
+    /// the supported agents' own config files, and take them out again.
+    ///
+    /// These never dial a UI — they read and write dotfiles — so they
+    /// work with nothing running.
+    #[command(subcommand)]
+    Agent(agent_install::AgentCmd),
     /// Claude Code subcommands (install hook settings file).
     #[command(subcommand)]
     Claude(ClaudeCmd),
@@ -552,6 +561,13 @@ async fn main() -> Result<()> {
     if let Cmd::AgentHook { agent } = &args.command {
         let _ = run_agent_hook(agent, &args).await;
         return hook_answer();
+    }
+
+    // The `agent` verbs write dotfiles and never dial a UI, so they run
+    // before the connect prologue — wiring an agent has to work with
+    // nothing running, which is exactly when a user reaches for it.
+    if let Cmd::Agent(cmd) = &args.command {
+        std::process::exit(agent_install::run(cmd));
     }
 
     // claude install doesn't dial the UI either — it just writes a
@@ -1091,6 +1107,7 @@ async fn main() -> Result<()> {
         // Already handled above before client connect.
         Cmd::ClaudeHook { .. }
         | Cmd::AgentHook { .. }
+        | Cmd::Agent(_)
         | Cmd::Claude(_)
         | Cmd::Doctor { .. }
         | Cmd::Session(_) => {

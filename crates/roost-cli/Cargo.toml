@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 roost-ipc   = { path = "../roost-ipc" }
 roost-agent = { path = "../roost-agent" }
+# `roostctl agent {ensure,install,uninstall,status}`: the only thing in
+# this tree that writes into the user's own agent configs.
+roost-agent-install = { path = "../roost-agent-install" }
 
 tokio   = { workspace = true }
 anyhow  = { workspace = true }

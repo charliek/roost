@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "afterAgentResponse": [
+      {
+        "command": "if [ -f '/home/fixture/.orca/agent-hooks/cursor-hook.sh' ] && [ -x '/home/fixture/.orca/agent-hooks/cursor-hook.sh' ]; then /bin/sh '/home/fixture/.orca/agent-hooks/cursor-hook.sh'; else cat >/dev/null 2>&1 || :; fi",
+        "timeout": 10
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "if [ -f '/home/fixture/.orca/agent-hooks/cursor-hook.sh' ] && [ -x '/home/fixture/.orca/agent-hooks/cursor-hook.sh' ]; then /bin/sh '/home/fixture/.orca/agent-hooks/cursor-hook.sh'; else cat >/dev/null 2>&1 || :; fi",
+        "timeout": 10
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "bash '/home/fixture/.cursor/herdr-agent-state.sh' session"
+      }
+    ]
+  },
+  "version": 1
+}

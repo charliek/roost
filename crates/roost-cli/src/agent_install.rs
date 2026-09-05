@@ -1,0 +1,311 @@
+//! `roostctl agent` — wire Roost's hook entries into the supported
+//! agents' own config files, and take them out again.
+//!
+//! Four verbs over `roost-agent-install`. None of them dials a UI: they
+//! read and write dotfiles, so they work with nothing running, which is
+//! exactly when a user reaches for them.
+//!
+//! `ensure` is what the UIs run at startup and what a host session runs
+//! on connect; the other three are the manual controls the toast points
+//! at. Mode and skip list are **parameters** to the engine, not config
+//! reads: `roostctl` learns them from `agent-hooks` / `agent-hooks-skip`
+//! in a later commit, and until then the verbs here pass what the user
+//! typed.
+
+use clap::Subcommand;
+use roost_agent::Agent;
+use roost_agent_install::{
+    ensure, install, status, uninstall, AgentSkip, Guard, Home, Mode, Outcome, Status, ALL_AGENTS,
+};
+
+/// How this client identifies itself in the state record.
+const BY: &str = "local";
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCmd {
+    /// Wire every present agent whose entries are missing or stale.
+    /// What the UIs run at startup; safe to run any number of times, and
+    /// a run with nothing to do writes nothing.
+    Ensure {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Wire one agent, or all of them. Explicit wins: this works even
+    /// when `agent-hooks = off` would otherwise leave the agent alone.
+    Install {
+        /// `claude`, `codex`, `grok`, `cursor`, or `opencode`.
+        agent: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// Remove Roost's entries from one agent, or all of them. Only what
+    /// Roost wrote comes out — a hook you wrote that happens to mention
+    /// `$ROOST_AGENT_HOOK` stays exactly where it is.
+    Uninstall {
+        agent: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// Per agent: installed, wired at which integration version, and
+    /// whether anything is out of date.
+    Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+/// Exit code, not a `Result`: a partial failure still has an outcome
+/// worth printing, so the report goes to stdout and the code says
+/// whether anything in it failed.
+pub fn run(cmd: &AgentCmd) -> i32 {
+    let home = match Home::from_env() {
+        Ok(home) => home,
+        Err(e) => {
+            eprintln!("roostctl agent: {e}");
+            return 1;
+        }
+    };
+    let guard = Guard::from_env();
+
+    match cmd {
+        AgentCmd::Ensure { json } => report(ensure(&home, Mode::Auto, &[], BY, guard), *json),
+        AgentCmd::Install { agent, all } => match targets(agent.as_deref(), *all) {
+            Ok(agents) => report(install(&home, &agents, BY, guard), false),
+            Err(code) => code,
+        },
+        AgentCmd::Uninstall { agent, all } => match targets(agent.as_deref(), *all) {
+            Ok(agents) => report(uninstall(&home, &agents, guard), false),
+            Err(code) => code,
+        },
+        AgentCmd::Status { json } => match status(&home) {
+            Ok(rows) => {
+                print_status(&rows, *json);
+                0
+            }
+            Err(e) => {
+                eprintln!("roostctl agent status: {e}");
+                1
+            }
+        },
+    }
+}
+
+fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, i32> {
+    match (agent, all) {
+        (Some(_), true) => {
+            eprintln!("roostctl agent: pass an agent name or --all, not both");
+            Err(2)
+        }
+        (None, false) => {
+            eprintln!(
+                "roostctl agent: name an agent ({}) or pass --all",
+                ALL_AGENTS
+                    .iter()
+                    .map(|a| a.source())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Err(2)
+        }
+        (None, true) => Ok(ALL_AGENTS.to_vec()),
+        (Some(name), false) => match Agent::parse(name) {
+            Some(agent) => Ok(vec![agent]),
+            None => {
+                eprintln!("roostctl agent: unknown agent: {name}");
+                Err(2)
+            }
+        },
+    }
+}
+
+fn report(outcome: Result<Outcome, roost_agent_install::InstallError>, json: bool) -> i32 {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("roostctl agent: {e}");
+            return 1;
+        }
+    };
+
+    if json {
+        println!("{}", outcome_json(&outcome));
+    } else {
+        print_outcome(&outcome);
+    }
+    i32::from(!outcome.is_clean())
+}
+
+fn names(agents: &[Agent]) -> Vec<&'static str> {
+    agents.iter().map(|a| a.source()).collect()
+}
+
+fn skip_pairs(skipped: &[AgentSkip]) -> Vec<(&'static str, String)> {
+    skipped
+        .iter()
+        .map(|skip| (skip.agent.source(), skip.reason.to_string()))
+        .collect()
+}
+
+fn outcome_json(outcome: &Outcome) -> serde_json::Value {
+    serde_json::json!({
+        "wired": names(&outcome.wired),
+        "refreshed": names(&outcome.refreshed),
+        "current": names(&outcome.current),
+        "removed": names(&outcome.removed),
+        "skipped": skip_pairs(&outcome.skipped)
+            .into_iter()
+            .map(|(agent, reason)| serde_json::json!({ "agent": agent, "reason": reason }))
+            .collect::<Vec<_>>(),
+        "warnings": outcome.warnings.iter()
+            .map(|w| serde_json::json!({
+                "agent": w.agent.source(),
+                "warning": w.warning.to_string(),
+            }))
+            .collect::<Vec<_>>(),
+        "errors": outcome.errors.iter()
+            .map(|e| serde_json::json!({
+                "agent": e.agent.source(),
+                "error": e.error.to_string(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn print_outcome(outcome: &Outcome) {
+    for (label, agents) in [
+        ("wired", &outcome.wired),
+        ("refreshed", &outcome.refreshed),
+        ("already current", &outcome.current),
+        ("removed", &outcome.removed),
+    ] {
+        if !agents.is_empty() {
+            println!("{label}: {}", names(agents).join(", "));
+        }
+    }
+    for (agent, reason) in skip_pairs(&outcome.skipped) {
+        println!("skipped {agent}: {reason}");
+    }
+    for warning in &outcome.warnings {
+        println!("warning {}: {}", warning.agent.source(), warning.warning);
+    }
+    for error in &outcome.errors {
+        eprintln!("error {}: {}", error.agent.source(), error.error);
+    }
+    if outcome.wired.is_empty()
+        && outcome.refreshed.is_empty()
+        && outcome.removed.is_empty()
+        && outcome.current.is_empty()
+    {
+        println!("nothing to do");
+    }
+}
+
+fn print_status(rows: &[Status], json: bool) {
+    if json {
+        let body: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "agent": row.agent.source(),
+                    "present": row.present,
+                    "wired": row.wired,
+                    "up_to_date": row.up_to_date,
+                    "noticed": row.noticed,
+                    "skipped": row.skipped.as_ref().map(ToString::to_string),
+                    "warnings": row.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(body));
+        return;
+    }
+
+    for row in rows {
+        let state = match (row.present, row.wired, row.up_to_date) {
+            (false, _, _) => "not installed".to_string(),
+            (true, Some(version), true) => format!("wired@v{version}"),
+            (true, Some(version), false) => format!("wired@v{version}, out of date"),
+            (true, None, _) => "present, not wired".to_string(),
+        };
+        println!("{:<9} {state}", row.agent.source());
+        if let Some(reason) = &row.skipped {
+            if row.present {
+                println!("          skipped: {reason}");
+            }
+        }
+        for warning in &row.warnings {
+            println!("          warning: {warning}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Wrapper {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    }
+
+    fn parse(args: &[&str]) -> AgentCmd {
+        Wrapper::try_parse_from(std::iter::once("agent").chain(args.iter().copied()))
+            .unwrap()
+            .cmd
+    }
+
+    #[test]
+    fn the_four_verbs_parse_the_way_the_docs_spell_them() {
+        assert!(matches!(
+            parse(&["ensure"]),
+            AgentCmd::Ensure { json: false }
+        ));
+        assert!(matches!(
+            parse(&["ensure", "--json"]),
+            AgentCmd::Ensure { json: true }
+        ));
+        assert!(matches!(
+            parse(&["status"]),
+            AgentCmd::Status { json: false }
+        ));
+        assert!(matches!(
+            parse(&["install", "--all"]),
+            AgentCmd::Install { all: true, .. }
+        ));
+        assert!(
+            matches!(parse(&["uninstall", "codex"]), AgentCmd::Uninstall { agent: Some(name), .. } if name == "codex")
+        );
+    }
+
+    /// The argument shapes that are mistakes rather than instructions.
+    /// Each has to be refused before anything is written, not resolved
+    /// to a guess about what the user meant.
+    #[test]
+    fn an_ambiguous_or_empty_target_is_refused() {
+        assert_eq!(targets(Some("codex"), false), Ok(vec![Agent::Codex]));
+        assert_eq!(targets(None, true), Ok(ALL_AGENTS.to_vec()));
+        assert_eq!(targets(Some("codex"), true), Err(2));
+        assert_eq!(targets(None, false), Err(2));
+        assert_eq!(targets(Some("gemini"), false), Err(2));
+        // gx reports as grok and has no name of its own.
+        assert_eq!(targets(Some("gx"), false), Err(2));
+    }
+
+    #[test]
+    fn the_json_outcome_carries_every_list_even_when_empty() {
+        let value = outcome_json(&Outcome::default());
+        for key in [
+            "wired",
+            "refreshed",
+            "current",
+            "removed",
+            "skipped",
+            "warnings",
+            "errors",
+        ] {
+            assert!(value.get(key).unwrap().is_array(), "{key}");
+        }
+    }
+}
