@@ -2837,6 +2837,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.2",
  "libc",
+ "roost-agent",
  "roost-engine",
  "roost-ipc",
  "roost-vt",

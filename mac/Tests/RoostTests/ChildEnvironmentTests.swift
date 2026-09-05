@@ -3,14 +3,17 @@ import Testing
 @testable import Roost
 
 @Suite struct ChildEnvironmentTests {
-    private func env(base: [String: String]) -> [String: String] {
+    private func env(base: [String: String], agentHook: String? = "/opt/roost/roostctl")
+        -> [String: String]
+    {
         childEnvironment(
             base: base,
             tabID: 7,
             socketPath: "/tmp/roost-test.sock",
             argv: ["/usr/bin/env"],
             resourcesDir: "/nonexistent-resources",
-            version: "test"
+            version: "test",
+            agentHook: agentHook
         )
     }
 
@@ -33,5 +36,21 @@ import Testing
         #expect(out["ROOST_TAB_ID"] == "7")
         #expect(out["ROOST_SOCKET"] == "/tmp/roost-test.sock")
         #expect(out["TERM_PROGRAM"] == "Roost")
+    }
+
+    @Test func carriesTheAgentHookEntrypoint() {
+        let out = env(base: ["HOME": "/Users/u"])
+        #expect(out["ROOST_AGENT_HOOK"] == "/opt/roost/roostctl")
+    }
+
+    /// A `swift run` build has no embedded CLI. The variable is then
+    /// **omitted**, and an inherited one is removed rather than passed
+    /// through: it must always describe *this* Roost, never an outer one
+    /// this build happens to be nested inside.
+    @Test func omitsTheAgentHookWhenNoCliIsBundled() {
+        let out = env(
+            base: ["HOME": "/Users/u", "ROOST_AGENT_HOOK": "/stale/outer/roostctl"],
+            agentHook: nil)
+        #expect(out["ROOST_AGENT_HOOK"] == nil)
     }
 }

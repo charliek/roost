@@ -20,6 +20,10 @@ path = "src/main.rs"
 # the vendored libghostty-vt archive (`third_party/ghostty/build.sh`).
 roost-engine = { path = "../roost-engine", features = ["server-vt"] }
 roost-ipc    = { path = "../roost-ipc" }
+# `agent-hook <agent>` on the host side: the session binary carries the
+# verb itself so a bootstrapped host needs no second file, and the
+# adapter cannot drift from the daemon it reports to (plan 046 §3.2).
+roost-agent  = { path = "../roost-agent" }
 # For `libghostty_build()` alone — the pin identity `session.identify`
 # advertises and `tab.attach` matches against.
 roost-vt     = { path = "../roost-vt", features = ["ffi"] }

@@ -1551,7 +1551,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         ctx.socket = socketPath
         ctx.selectedID = selectedID
         ctx.query = palette?.driveSnapshot().query ?? ""
-        ctx.roostctl = resolveBundledRoostctl()
+        ctx.roostctl = bundledRoostctl()
         if let pid = activeProjectID {
             ctx.activeProjectID = pid
             ctx.activeCwd = activeLaunchCwd(projectID: pid)
@@ -1561,17 +1561,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
         }
         return ctx
-    }
-
-    /// Roost's bundled `roostctl` (`Roost.app/Contents/Resources/bin/roostctl`),
-    /// handed to providers as `ROOST_ROOSTCTL` so they don't need it on PATH.
-    /// `nil` when not present (e.g. a `swift run` dev build with no embedded
-    /// CLI) — the provider then falls back to a PATH `roostctl`.
-    private func resolveBundledRoostctl() -> String? {
-        guard let url = Bundle.main.resourceURL?.appendingPathComponent("bin/roostctl"),
-            FileManager.default.isExecutableFile(atPath: url.path)
-        else { return nil }
-        return url.path
     }
 
     /// Run one provider phase as a subprocess (off the main actor, with

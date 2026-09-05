@@ -22,6 +22,7 @@
 //!   roostctl palette {open,state,query,activate,dismiss}
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl render-stats [--reset]
+//!   roostctl agent-hook AGENT
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
 //!   roostctl session {start,stop,status}
@@ -45,13 +46,16 @@ mod host;
 mod session;
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use base64::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use roost_agent::claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};
+use roost_agent::hook::{self, hook_payload, parse_tab_id, payload_event_name};
+use roost_agent::Agent;
+use roost_ipc::agent::TabAgentReportParams;
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
     AppRenderStatsParams, AppRenderStatsResult, IdentifyParams, IdentifyResult,
@@ -64,6 +68,7 @@ use roost_ipc::messages::{
     TabState, TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
+use roost_ipc::session_launch::timeout_scale;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
 use roost_ipc::IpcClient;
 
@@ -205,6 +210,24 @@ enum Cmd {
         /// every already-installed settings file uses those.
         /// `roost_agent::canonical_hook_event` resolves them all.
         event: String,
+    },
+    /// The one hook entrypoint every supported agent invokes.
+    ///
+    /// Reads the agent's JSON event payload from stdin, takes the event
+    /// name from the payload's own `hook_event_name` (there is no
+    /// `--event` flag: one installed command string serves every event),
+    /// dispatches state + notification ops to the running UI, and ALWAYS
+    /// exits 0 with `{}` on stdout — Claude's and codex's
+    /// `PermissionRequest` are decision hooks whose dialog waits on this
+    /// process, and a hook that answers with anything else may be read
+    /// as a block.
+    ///
+    /// An agent Roost has no adapter for drains stdin and answers `{}`
+    /// like every other path, so a stale config never breaks a turn.
+    AgentHook {
+        /// `claude`, `grok`, `codex`, `cursor`, or `opencode`.
+        /// gx reports as `grok` and has no name of its own.
+        agent: String,
     },
     /// Claude Code subcommands (install hook settings file).
     #[command(subcommand)]
@@ -512,14 +535,23 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // claude-hook is fire-and-forget — any failure path must exit
-    // 0 with `{}` on stdout. Split it out before resolving the
-    // target so an offline UI doesn't make the hook itself fail.
+    // Both hook verbs are fire-and-forget — any failure path must exit
+    // 0 with `{}` on stdout, written fallibly: Rust ignores SIGPIPE, so
+    // a `println!` into a pipe whose reader has gone would panic with
+    // 101 and no JSON at all, which a decision hook may read as a block.
+    // Split them out before resolving the target so an offline UI
+    // doesn't make the hook itself fail.
+    //
+    // `claude-hook EVENT` is the alias `agent-hook claude` grew out of:
+    // it takes its event from argv instead of the payload, which is what
+    // every already-installed `claude-settings.json` writes.
     if let Cmd::ClaudeHook { event } = &args.command {
-        let event = event.clone();
-        let _ = run_claude_hook(&event, &args).await;
-        println!("{{}}");
-        return Ok(());
+        let _ = run_claude_hook(event, &args).await;
+        return hook_answer();
+    }
+    if let Cmd::AgentHook { agent } = &args.command {
+        let _ = run_agent_hook(agent, &args).await;
+        return hook_answer();
     }
 
     // claude install doesn't dial the UI either — it just writes a
@@ -1057,7 +1089,11 @@ async fn main() -> Result<()> {
             std::process::exit(host::run(&cmd, &mut client).await);
         }
         // Already handled above before client connect.
-        Cmd::ClaudeHook { .. } | Cmd::Claude(_) | Cmd::Doctor { .. } | Cmd::Session(_) => {
+        Cmd::ClaudeHook { .. }
+        | Cmd::AgentHook { .. }
+        | Cmd::Claude(_)
+        | Cmd::Doctor { .. }
+        | Cmd::Session(_) => {
             unreachable!()
         }
     }
@@ -1164,6 +1200,13 @@ async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult> {
 /// `tab.agent_report`. Best-effort — failures don't surface to Claude
 /// (caller wraps in `let _ = ...` and always exits 0).
 async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
+    // Drained first and unconditionally, exactly as in
+    // [`run_agent_hook`]: Claude is writing into this pipe right now,
+    // and returning on an unset `ROOST_TAB_ID` without consuming a byte
+    // would hand it an EPIPE from a hook that is supposed to be
+    // invisible.
+    let stdin_buf = drain_stdin();
+
     let Some(tab_id) = std::env::var("ROOST_TAB_ID")
         .ok()
         .as_deref()
@@ -1171,15 +1214,10 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     else {
         return Ok(());
     };
-
-    // Drain stdin to a bounded buffer so Claude doesn't block on
-    // a closed reader, even though only some events use the payload.
-    let mut stdin_buf = Vec::with_capacity(4096);
-    let _ = std::io::stdin().take(1 << 20).read_to_end(&mut stdin_buf);
     let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
-        if std::env::var("ROOST_DEBUG").is_ok() {
-            eprintln!("roostctl claude-hook: unparseable payload for event: {event}");
-        }
+        hook_debug(&format!(
+            "claude-hook: unparseable payload for event: {event}"
+        ));
         return Ok(());
     };
 
@@ -1187,93 +1225,172 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
         .map(|name| claude_event_to_reports(name, &payload, tab_id))
         .unwrap_or_default();
     if reports.is_empty() {
-        if std::env::var("ROOST_DEBUG").is_ok() {
-            eprintln!("roostctl claude-hook: no reports for event: {event}");
-        }
+        hook_debug(&format!("claude-hook: no reports for event: {event}"));
         return Ok(());
     }
 
-    // `probe_alive=false` so the resolver returns the default Mac
-    // path even when no UI is listening — the dial below will fail
-    // and we silently swallow. Matches the gRPC-era hook semantics
-    // (always exits 0).
-    let target = match resolve_target(args, false).await {
-        Ok(t) => t,
-        Err(_) => return Ok(()),
+    // `claude install` writes a `PermissionRequest` entry on this verb,
+    // so it carries a decision hook too and is held to the same budget
+    // as `agent-hook` — see [`hook::CONNECT_TIMEOUT`].
+    //
+    // The target resolver, though, is the general one: unlike
+    // `agent-hook` this verb is documented as a by-hand debugging tool
+    // (`docs/development/claude-testing.md`) that is driven outside a
+    // Roost tab, where the default profile path is the only answer
+    // there is.
+    let Ok(target) = resolve_target(args, false).await else {
+        return Ok(());
     };
-    let mut client = match IpcClient::connect(&target.socket_path).await {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
-
-    for report in reports {
-        let _ = client
-            .call::<_, serde_json::Value>(ops::TAB_AGENT_REPORT, report)
-            .await;
-    }
+    deliver_reports(reports, &target.socket_path).await;
     Ok(())
 }
 
-/// Decode a hook's stdin into the payload the adapter should see, or
-/// `None` when the body must map to nothing.
+/// Read stdin to the shared cap **and keep reading past it**.
 ///
-/// Stdin that arrived but does not parse is corrupt or foreign traffic.
-/// Without this, [`with_default_session`] would hand the adapter a
-/// synthesized `manual:<tab>` object with none of the sending agent's
-/// discriminators left in it, and a `SessionStart` would claim the tab
-/// away from its real owner — grok and cursor both execute
-/// Claude-format hooks, so that traffic is not hypothetical. Genuinely
-/// absent stdin is the different, documented by-hand case, so only a
-/// non-empty unparseable body is rejected.
-fn hook_payload(stdin_buf: &[u8], tab_id: i64) -> Option<serde_json::Value> {
-    let payload = if stdin_buf.iter().all(u8::is_ascii_whitespace) {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(stdin_buf).ok()?
-    };
-    Some(with_default_session(payload, tab_id))
+/// `take(CAP).read_to_end(..)` alone declares EOF at exactly the cap and
+/// leaves the rest in the pipe, so a payload one byte over the line
+/// hands the writing agent an EPIPE the moment this process exits — the
+/// one outcome a hook must never produce. Everything past the cap is
+/// discarded (the truncated head no longer parses anyway); what matters
+/// is that the writer's `write` returns.
+fn drain_stdin() -> Vec<u8> {
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = Vec::with_capacity(4096);
+    let _ = (&mut stdin).take(hook::STDIN_CAP).read_to_end(&mut buf);
+    let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+    buf
 }
 
-/// Give a payload without a `session_id` a deterministic per-tab one.
+/// `{}` on stdout, whatever happened, and never a panic on the way.
 ///
-/// Claude always sends `session_id`, but the hook is also driven by hand
-/// with no stdin at all — `docs/development/claude-testing.md` documents
-/// exactly that. The adapter refuses to claim ownership for an empty
-/// session id (a claim supersedes unconditionally, so an id nothing can
-/// match would strand the tab), which would make those bare invocations
-/// silently no-op. Synthesizing one keeps the manual flow self-consistent
-/// — `SessionStart` claims `manual:7` and `SessionEnd` releases the same
-/// — while leaving the adapter strict for real traffic.
-fn with_default_session(payload: serde_json::Value, tab_id: i64) -> serde_json::Value {
-    let has_session = payload
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty());
-    if has_session {
-        return payload;
+/// A locked fallible writer rather than `println!`: Rust ignores
+/// SIGPIPE, so `println!` turns a reader that has already gone into a
+/// panic — exit 101 with no JSON, which is precisely the shape a
+/// decision hook may read as a block.
+fn hook_answer() -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(b"{}\n").and_then(|()| stdout.flush());
+    Ok(())
+}
+
+/// The generic agent hook entrypoint: `roostctl agent-hook <agent>`.
+///
+/// The event name comes from the payload (`hook_event_name`, or its
+/// camelCase twin) rather than from argv, so one installed command
+/// string serves every event an agent has. Everything else matches
+/// [`run_claude_hook`]: a drained stdin, the `ROOST_TAB_ID` gate, a
+/// bounded best-effort dial, and `{}` on stdout whatever happens — the
+/// one exception being how the socket is found ([`agent_hook_socket`]).
+///
+/// Failures are deliberately swallowed rather than returned. The whole
+/// contract of this path is exit 0 with `{}` on stdout — a hook that
+/// reports its own trouble to a decision dialog may be read as a block —
+/// so the only diagnostic channel is `ROOST_DEBUG` on stderr.
+async fn run_agent_hook(agent: &str, args: &Args) -> Result<()> {
+    // Drained first and unconditionally: the agent is writing into this
+    // pipe right now, and every early return below would otherwise leave
+    // it with an EPIPE from a hook that is supposed to be invisible.
+    let stdin_buf = drain_stdin();
+
+    let Some(adapter) = Agent::parse(agent) else {
+        hook_debug(&format!("agent-hook: no adapter for agent: {agent}"));
+        return Ok(());
+    };
+    let Some(tab_id) = std::env::var("ROOST_TAB_ID")
+        .ok()
+        .as_deref()
+        .and_then(parse_tab_id)
+    else {
+        return Ok(());
+    };
+    let Some(socket) = agent_hook_socket(args) else {
+        hook_debug(&format!("agent-hook {agent}: no ROOST_SOCKET"));
+        return Ok(());
+    };
+    let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
+        hook_debug(&format!("agent-hook {agent}: unparseable payload"));
+        return Ok(());
+    };
+
+    let event = payload_event_name(&payload);
+    if event.is_empty() {
+        hook_debug(&format!("agent-hook {agent}: payload names no event"));
+        return Ok(());
     }
-    let mut obj = match payload {
-        serde_json::Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-    obj.insert(
-        "session_id".into(),
-        serde_json::Value::String(format!("manual:{tab_id}")),
-    );
-    serde_json::Value::Object(obj)
+    let reports = adapter.event_to_reports(event, &payload, tab_id);
+    if reports.is_empty() {
+        hook_debug(&format!(
+            "agent-hook {agent}: no reports for event: {event}"
+        ));
+        return Ok(());
+    }
+
+    deliver_reports(reports, &socket).await;
+    Ok(())
 }
 
-/// `ROOST_TAB_ID` as a usable tab id — the one parse the Claude hook and
-/// `doctor` share, so doctor cannot report `ok` on a value the hook
-/// silently drops.
+/// The socket `agent-hook` reports into — `ROOST_SOCKET` and nothing
+/// else, with `--socket` as the one explicit override.
 ///
-/// Deliberately does **not** trim: every other per-tab command reads the
-/// same variable through clap, whose `i64` parser rejects surrounding
-/// whitespace outright, so accepting `" 7 "` here would make doctor bless
-/// a value that exits 2 everywhere else. `0` and negatives are the same
-/// silent no-op as an unparseable value.
-fn parse_tab_id(raw: &str) -> Option<i64> {
-    raw.parse::<i64>().ok().filter(|id| *id > 0)
+/// Deliberately **not** [`resolve_target`]. That ladder falls back to
+/// the bundle profile's default path, and this verb runs inside a tab
+/// whose `ROOST_TAB_ID` is only meaningful to the Roost that spawned it:
+/// with the variable stripped (`env -i`, a sanitized launcher) but the
+/// tab id kept, a `SessionStart` would claim tab 7 of some *other*
+/// running Roost and evict whatever really owns it. No socket therefore
+/// means no report — the drain and `{}` still happen.
+///
+/// `claude-hook` keeps the general resolver on purpose: it is documented
+/// as a by-hand debugging verb driven from outside a tab
+/// (`docs/development/claude-testing.md`), where the default path is the
+/// only answer there is.
+fn agent_hook_socket(args: &Args) -> Option<PathBuf> {
+    args.socket.clone().or_else(|| {
+        std::env::var_os("ROOST_SOCKET")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+/// Dial the UI and send every report — the tail both hook verbs end in,
+/// under one budget.
+///
+/// Separate from its callers so the total budget covers exactly the
+/// socket work: the stdin drain above it is a blocking read no timeout
+/// could cancel anyway, and draining it is the contract.
+///
+/// Both verbs are bounded, and by the same numbers: `claude install`
+/// writes a `PermissionRequest` entry for `claude-hook` too, so a socket
+/// that accepts and never answers would hold a decision dialog open on
+/// either path.
+async fn deliver_reports(reports: Vec<TabAgentReportParams>, socket: &Path) {
+    let scale = timeout_scale();
+    let _ = tokio::time::timeout(hook::TOTAL_BUDGET.mul_f64(scale), async move {
+        let dialed = tokio::time::timeout(
+            hook::CONNECT_TIMEOUT.mul_f64(scale),
+            IpcClient::connect(socket),
+        )
+        .await;
+        let Ok(Ok(mut client)) = dialed else {
+            return;
+        };
+        for report in reports {
+            let _ = client
+                .call::<_, serde_json::Value>(ops::TAB_AGENT_REPORT, report)
+                .await;
+        }
+    })
+    .await;
+}
+
+/// `ROOST_DEBUG`'s one channel — fallible for the same reason
+/// [`hook_answer`] is: `eprintln!` panics when stderr has been closed,
+/// and it would do so *before* the `{}` this process owes stdout.
+fn hook_debug(message: &str) {
+    if std::env::var("ROOST_DEBUG").is_ok() {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "roostctl {message}");
+    }
 }
 
 /// `~/.config/roost/claude-settings.json` — written by `claude install`,
@@ -1540,7 +1657,6 @@ fn order_with_after(ids: &[i64], new: i64, after: i64) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roost_ipc::agent::OwnershipAction;
 
     /// `--tab` is the one flag that can name a tab on another machine,
     /// so what it accepts is a contract: both spellings parse, and a
@@ -1783,98 +1899,29 @@ mod tests {
         assert_eq!(serde_json::to_string_pretty(&doc).unwrap(), expected);
     }
 
+    /// The two hook verbs, as the installed configs spell them.
+    /// `agent-hook` takes the *agent*, never an event — the event comes
+    /// from the payload, which is what lets one command string serve
+    /// every event an agent has.
+    #[test]
+    fn both_hook_verbs_parse_from_argv() {
+        let args = Args::try_parse_from(["roostctl", "agent-hook", "claude"]).unwrap();
+        assert!(matches!(args.command, Cmd::AgentHook { agent } if agent == "claude"));
+        // An agent with no adapter still parses: refusing here would
+        // make a stale config exit non-zero at a decision dialog.
+        assert!(Args::try_parse_from(["roostctl", "agent-hook", "amp"]).is_ok());
+        assert!(Args::try_parse_from(["roostctl", "agent-hook"]).is_err());
+
+        let legacy = Args::try_parse_from(["roostctl", "claude-hook", "Stop"]).unwrap();
+        assert!(matches!(legacy.command, Cmd::ClaudeHook { event } if event == "Stop"));
+    }
+
     #[test]
     fn claude_settings_document_embeds_the_quoted_exe_verbatim() {
         let doc = claude_settings_document("'/Apps/My Roost.app/roostctl'");
         assert_eq!(
             doc["hooks"]["Stop"][0]["hooks"][0]["command"],
             serde_json::json!("'/Apps/My Roost.app/roostctl' claude-hook Stop")
-        );
-    }
-
-    #[test]
-    fn a_payloadless_hook_invocation_still_claims_and_releases() {
-        // `docs/development/claude-testing.md` drives the hook by hand
-        // with no stdin. Without a synthesized session id the adapter
-        // drops SessionStart, nothing owns the tab, and every later
-        // manual event is rejected by the server's ownership check.
-        for raw in [
-            serde_json::Value::Null,
-            serde_json::json!({}),
-            serde_json::json!({ "session_id": "" }),
-            serde_json::json!("not an object"),
-        ] {
-            let payload = with_default_session(raw.clone(), 7);
-            assert_eq!(
-                payload.get("session_id").and_then(|v| v.as_str()),
-                Some("manual:7"),
-                "no session synthesized for {raw}"
-            );
-
-            let start = claude_event_to_reports("session-start", &payload, 7);
-            assert_eq!(start.len(), 1, "SessionStart dropped for {raw}");
-            assert_eq!(start[0].ownership_action, OwnershipAction::Claim);
-            assert_eq!(start[0].session_id, "manual:7");
-
-            // The release has to carry the same identity or it won't match.
-            let end = claude_event_to_reports("session-end", &payload, 7);
-            assert_eq!(end[0].ownership_action, OwnershipAction::Release);
-            assert_eq!(end[0].session_id, "manual:7");
-        }
-    }
-
-    /// Truncated or foreign stdin must map to nothing. grok and cursor
-    /// both execute Claude-format hooks, so a body that fails to parse
-    /// is real traffic from another agent — and synthesizing a session
-    /// for it would hand `SessionStart` an unconditional claim that
-    /// evicts that agent's own owner, permanently: no release it ever
-    /// sends can match `manual:7`.
-    #[test]
-    fn stdin_that_does_not_parse_yields_no_payload() {
-        for body in [
-            &br#"{"hookEventName":"session_start""#[..],
-            &b"not json at all"[..],
-            &b"{"[..],
-        ] {
-            assert!(
-                hook_payload(body, 7).is_none(),
-                "unparseable body accepted: {}",
-                String::from_utf8_lossy(body)
-            );
-        }
-    }
-
-    /// The by-hand flow `docs/development/claude-testing.md` documents
-    /// runs the hook with no stdin at all. That is absence, not
-    /// corruption, and must keep working.
-    #[test]
-    fn absent_stdin_still_gets_a_synthesized_session() {
-        for body in [&b""[..], &b"  \n\t "[..]] {
-            let payload = hook_payload(body, 7).expect("absent stdin rejected");
-            assert_eq!(
-                payload.get("session_id").and_then(|v| v.as_str()),
-                Some("manual:7")
-            );
-            let start = claude_event_to_reports("session-start", &payload, 7);
-            assert_eq!(start[0].ownership_action, OwnershipAction::Claim);
-        }
-    }
-
-    #[test]
-    fn a_well_formed_payload_reaches_the_adapter_unchanged() {
-        let payload = hook_payload(br#"{"session_id":"abc123"}"#, 7).expect("rejected");
-        assert_eq!(
-            payload.get("session_id").and_then(|v| v.as_str()),
-            Some("abc123")
-        );
-    }
-
-    #[test]
-    fn a_real_session_id_is_never_overwritten() {
-        let payload = with_default_session(serde_json::json!({ "session_id": "abc123" }), 7);
-        assert_eq!(
-            payload.get("session_id").and_then(|v| v.as_str()),
-            Some("abc123")
         );
     }
 

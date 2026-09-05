@@ -34,13 +34,11 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 
 import pytest
 
 import ui
-from client import scaled_timeout
-from util import BARE_SHELL_ARGV, roostctl_path, wait_tab_attached
+from util import BARE_SHELL_ARGV, run_hook, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -66,36 +64,15 @@ def claude_hook(
     `docs/development/claude-testing.md` documents driving the hook by
     hand. Both forms must work.
 
-    `claude-hook` is fire-and-forget by contract (it always exits 0 so a
-    Roost problem can never break the turn it fired from), so the only
-    proof it worked is the state assertions the caller makes after."""
-    env = {
-        **os.environ,
-        "ROOST_TAB_ID": str(tab_id),
-        "ROOST_SOCKET": str(ui.socket_path(target)),
-    }
+    `util.run_hook` holds the rest of the contract (always exit 0, always
+    `{}` on stdout), so the only proof this worked is the state
+    assertions the caller makes after."""
     if payload is None:
         stdin = b""
     else:
         body = {"cwd": "/tmp", "transcript_path": "/tmp/transcript.jsonl", **payload}
         stdin = json.dumps(body).encode()
-    proc = subprocess.run(
-        [roostctl_path(), "claude-hook", event],
-        input=stdin,
-        capture_output=True,
-        env=env,
-        # Scaled like every in-band wait: the hook subprocess crosses a
-        # process spawn + an IPC round-trip under the same CI load
-        # profile the suite budgets for.
-        timeout=scaled_timeout(30),
-    )
-    assert proc.returncode == 0, (
-        f"roostctl claude-hook {event} exited {proc.returncode}: "
-        f"{proc.stderr.decode(errors='replace')}"
-    )
-    # Claude parses the hook's stdout as JSON, so every path — including
-    # "no UI is listening" — must answer with an empty object.
-    assert proc.stdout.strip() == b"{}", proc.stdout
+    run_hook(["claude-hook", event], tab_id, ui.socket_path(target), stdin)
 
 
 def agent_tab(roost, project) -> int:

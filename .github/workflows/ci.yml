@@ -636,6 +636,7 @@ jobs:
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
           tools/roosttest/test_agent_lifecycle.py
+          tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_tab_strip_pixels.py
@@ -845,6 +846,7 @@ jobs:
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
           tools/roosttest/test_agent_lifecycle.py
+          tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_tab_strip_pixels.py
@@ -1009,6 +1011,7 @@ jobs:
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
           tools/roosttest/test_agent_lifecycle.py
+          tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_tab_strip_pixels.py

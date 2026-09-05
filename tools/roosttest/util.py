@@ -65,6 +65,76 @@ def roostctl_path() -> str:
     return str(REPO_ROOT / "target/debug/roostctl")
 
 
+# The wall-clock budget one hook invocation may take, before
+# `ROOST_TEST_TIMEOUT_SCALE`.
+#
+# MIRRORS `roost_agent::hook::TOTAL_BUDGET` (2 s from the first socket
+# call through the last report), plus 3 s for the one thing that budget
+# deliberately excludes: this process's own spawn — a cold `execve` +
+# dynamic link, and on macOS a Gatekeeper first-exec check.
+#
+# It is an assertion, not a convenience. Claude's and codex's
+# `PermissionRequest` are decision hooks whose dialog is blocked on this
+# process, so "it eventually answered" is not the contract — "it
+# answered inside the budget" is. A generic 30 s ceiling would let a
+# 20 s hook pass.
+HOOK_DEADLINE = 5.0
+
+
+def run_hook(
+    verb: list[str],
+    tab_id: int,
+    socket: str | Path | None,
+    stdin: bytes,
+) -> float:
+    """Run one of `roostctl`'s hook verbs (`agent-hook AGENT`,
+    `claude-hook EVENT`) exactly as an installed hook would: the payload
+    on stdin, the tab + socket in the environment, nothing else.
+    `socket=None` runs with `ROOST_SOCKET` **unset**, which is how an
+    `env -i` wrapper leaves it.
+
+    Both verbs are fire-and-forget by contract — they always exit 0 with
+    `{}` on stdout, inside [`HOOK_DEADLINE`], because Claude's and
+    codex's `PermissionRequest` are decision hooks whose dialog blocks on
+    this process and parses that stdout as JSON. That contract is
+    asserted here, once, so the two lanes that drive hooks
+    (`test_agent_lifecycle`, `test_agent_hooks`) cannot hold it to
+    different standards. Everything else — including "no UI is listening"
+    and "no adapter for that agent" — is silent, so the only proof a hook
+    *did* something is the state assertions the caller makes after.
+
+    Returns the elapsed seconds, so a caller driving a socket that never
+    answers can pin the budget more tightly than the deadline below."""
+    env = {**os.environ, "ROOST_TAB_ID": str(tab_id)}
+    if socket is None:
+        env.pop("ROOST_SOCKET", None)
+    else:
+        env["ROOST_SOCKET"] = str(socket)
+    named = " ".join(verb)
+    deadline = scaled_timeout(HOOK_DEADLINE)
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [roostctl_path(), *verb],
+            input=stdin,
+            capture_output=True,
+            env=env,
+            timeout=deadline,
+        )
+    except subprocess.TimeoutExpired as expired:
+        raise AssertionError(
+            f"roostctl {named} did not answer within its {deadline:.1f}s budget "
+            f"(HOOK_DEADLINE, scaled) — a decision hook's dialog waits this long"
+        ) from expired
+    elapsed = time.monotonic() - started
+    assert proc.returncode == 0, (
+        f"roostctl {named} exited {proc.returncode}: "
+        f"{proc.stderr.decode(errors='replace')}"
+    )
+    assert proc.stdout.strip() == b"{}", proc.stdout
+    return elapsed
+
+
 def is_fresh() -> bool:
     """Whether the harness owns a fresh, hermetic UI this session
     (`--roost-fresh` / `ROOST_TEST_FRESH=1`). In fresh mode the harness

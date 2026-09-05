@@ -32,10 +32,13 @@
 //! * [`socket_guard`] — unlink our socket, never a successor's.
 //! * [`bridge`] — the far side of the SSH transport: stdio ↔ this
 //!   machine's session socket, one process per accepted connection.
+//! * [`agent_hook`] — the host's copy of the one agent hook entrypoint,
+//!   and the path tabs are handed as `ROOST_AGENT_HOOK`.
 //! * [`identity`], [`logging`], [`consts`] — session id + timestamp,
 //!   this build's offline identity (`roost-session identify`), the file
 //!   appender, and every named constant.
 
+pub mod agent_hook;
 pub mod bridge;
 pub mod consts;
 pub mod daemonize;

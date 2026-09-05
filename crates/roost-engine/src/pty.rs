@@ -1512,6 +1512,20 @@ fn build_command(
     // wider env discovery.
     cmd.env("ROOST_TAB_ID", tab_id.to_string());
     cmd.env("ROOST_SOCKET", socket_path.as_os_str());
+    // The one hook entrypoint every installed agent config invokes
+    // (plan 046 §3.2). Indirecting through the environment is what keeps
+    // the written config identical on every machine and on every host —
+    // it names no path of Roost's. Omitted rather than guessed when
+    // nothing resolves: the installed command's fallback branch reads an
+    // *unset* variable as "not inside Roost", and a path that does not
+    // exist would instead exec-fail with no JSON on stdout.
+    // An inherited value is dropped rather than passed through — it must
+    // always describe *this* Roost, never an outer one this build
+    // happens to be running inside.
+    match crate::process::agent_hook_binary() {
+        Some(hook) => cmd.env("ROOST_AGENT_HOOK", hook),
+        None => cmd.env_remove("ROOST_AGENT_HOOK"),
+    }
     // Roost shell-integration contract (parity with the Mac UI). TERM
     // stays xterm-256color (above). ROOST_SHELL_FEATURES is overridable.
     cmd.env("TERM_PROGRAM", "Roost");

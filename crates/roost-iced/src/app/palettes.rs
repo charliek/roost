@@ -2062,7 +2062,7 @@ impl App {
                 String::new()
             },
             active_title,
-            roostctl: process::sibling_executable("roostctl"),
+            roostctl: process::roostctl_path(),
         }
     }
 

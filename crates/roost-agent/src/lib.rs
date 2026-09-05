@@ -16,7 +16,9 @@
 //!
 //! One module per agent, one shape: `SOURCE`, the event list, and an
 //! `<agent>_event_to_reports` function. [`Agent`] is the dispatch table
-//! `roostctl agent-hook <agent>` reaches them through (plan 046 §3.1).
+//! `roostctl agent-hook <agent>` reaches them through (plan 046 §3.1),
+//! and [`hook`] holds what an entrypoint decides *before* an adapter
+//! runs, so `roostctl` and `roost-session` cannot drift on it.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -26,6 +28,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod grok;
+pub mod hook;
 pub mod opencode;
 
 pub use claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};

@@ -48,6 +48,17 @@ enum Command {
     /// §3.1) execs this to compare a remote candidate's build against
     /// the client's before installing or starting anything.
     Identify,
+    /// The one agent hook entrypoint, on the host side (plan 046 §3.2).
+    ///
+    /// Reads the agent's JSON payload from stdin, takes the event name
+    /// from the payload, reports it to the session named by
+    /// `ROOST_SOCKET`, and always prints `{}` and exits 0. The session
+    /// binary carries this itself so a host needs no second file and the
+    /// adapter cannot drift from the daemon it reports to.
+    AgentHook {
+        /// `claude`, `grok`, `codex`, `cursor`, or `opencode`.
+        agent: String,
+    },
 }
 
 fn main() -> ! {
@@ -57,9 +68,13 @@ fn main() -> ! {
         // for the bridge stdout *is* the wire: one stray line on it
         // corrupts the client's stream. `identify` gets the same
         // early-exit treatment for the same reason — its stdout is a
-        // machine-read contract too.
+        // machine-read contract too. So does `agent-hook`, on a third
+        // reason: it fires inside a *running* session's tabs, where a
+        // readiness line would be read as a start verdict and the log
+        // file already has the live daemon's appender on it.
         Command::ClientBridge => std::process::exit(roost_session::bridge::run()),
         Command::Identify => std::process::exit(roost_session::identity::run()),
+        Command::AgentHook { agent } => std::process::exit(roost_session::agent_hook::run(&agent)),
         Command::Start { foreground } => foreground,
     };
 
