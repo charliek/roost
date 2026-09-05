@@ -300,6 +300,29 @@ pub fn compose_title(project: &str, name: &str) -> String {
     notification_inbox::compose_title(project, name)
 }
 
+/// A human-friendly name for an ownership `source` (plan 046 §3.7,
+/// W7). Matched against the five adapters' own `SOURCE` constants in
+/// `crates/roost-agent/src/*.rs` — spelled out here rather than
+/// imported, since `roost-agent` parses hook JSON and has no reason to
+/// depend on this crate's rendering, or vice versa.
+///
+/// `source` is an open string by design (AD-8): a third-party adapter
+/// that isn't one of the five renders **verbatim** rather than being
+/// hidden or mislabeled, so this table can never gate whether an
+/// agent's row appears — only how its name is spelled. Mirrored by
+/// `mac/Sources/Roost/AgentPalette.swift`'s `agentDisplayName`, tested
+/// against the same fixture (`tests/agent-display-name-fixtures/`).
+pub fn agent_display_name(source: &str) -> &str {
+    match source {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "grok" => "Grok",
+        "cursor" => "Cursor",
+        other => other,
+    }
+}
+
 /// The colour role of one segment of the git-metrics column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsRole {
@@ -398,12 +421,14 @@ fn row_for(
         _ => project_name,
     };
     let name = row_name(tab, owner);
+    let agent_name = agent_display_name(&owner.source).to_string();
     let item = PaletteItem::new(
         format!("{ROW_ID_PREFIX}{key}"),
-        compose_title(&project_name, &name),
+        compose_title(&agent_name, &compose_title(&project_name, &name)),
     )
     .with_agent(AgentRowData {
         effective_lifecycle: effective,
+        agent: agent_name,
         project: project_name,
         name,
         status_text: status_text(effective, tab.agent_lifecycle, &owner.detail),
@@ -609,10 +634,10 @@ mod tests {
         );
         assert_eq!(items.len(), 2);
         assert_eq!(agent_of(&items[0]).project, "roost");
-        assert_eq!(items[0].title, "roost · plan-037");
+        assert_eq!(items[0].title, "Claude Code · roost · plan-037");
         assert_eq!(agent_of(&items[1]).project, "blogd · pop-os");
         assert_eq!(
-            items[1].title, "blogd · pop-os · rss feed",
+            items[1].title, "Claude Code · blogd · pop-os · rss feed",
             "the fuzzy filter matches exactly what the row shows"
         );
         // Same numeric tab id on two instances, two distinct row ids.
@@ -1081,7 +1106,10 @@ mod tests {
         assert_eq!(agent_of(&by_id("agent:2")).name, "zsh");
         assert_eq!(agent_of(&by_id("agent:3")).name, "Tab 3");
         // Title composition is the filter input, verbatim.
-        assert_eq!(by_id("agent:1").title, "roost · slauth-refactor");
+        assert_eq!(
+            by_id("agent:1").title,
+            "Claude Code · roost · slauth-refactor"
+        );
     }
 
     #[test]
@@ -1113,13 +1141,48 @@ mod tests {
         let row = agent_of(&items[0]);
         assert_eq!(row.name, "line oneline two x");
         assert_eq!(row.project, "roostnope");
-        assert_eq!(items[0].title, "roostnope · line oneline two x");
+        assert_eq!(
+            items[0].title,
+            "Claude Code · roostnope · line oneline two x"
+        );
     }
 
     #[test]
     fn compose_title_without_a_project_is_just_the_name() {
         assert_eq!(compose_title("", "claude"), "claude");
         assert_eq!(compose_title("roost", "claude"), "roost · claude");
+    }
+
+    #[test]
+    fn agent_display_name_covers_the_five_source_constants() {
+        // Exact spellings from each adapter's own `SOURCE` const
+        // (`crates/roost-agent/src/{claude,codex,opencode,grok,cursor}.rs`),
+        // not assumed.
+        assert_eq!(agent_display_name("claude"), "Claude Code");
+        assert_eq!(agent_display_name("codex"), "Codex");
+        assert_eq!(agent_display_name("opencode"), "OpenCode");
+        assert_eq!(agent_display_name("grok"), "Grok");
+        assert_eq!(agent_display_name("cursor"), "Cursor");
+    }
+
+    #[test]
+    fn agent_display_name_is_case_sensitive_to_the_source_constants() {
+        // A near-miss casing must NOT match — the table keys on the
+        // adapters' exact lowercase `SOURCE` spelling, so a caller that
+        // typos casing gets the passthrough, not a silently wrong label.
+        assert_eq!(agent_display_name("Claude"), "Claude");
+        assert_eq!(agent_display_name("CODEX"), "CODEX");
+        assert_eq!(agent_display_name("OpenCode"), "OpenCode");
+    }
+
+    #[test]
+    fn agent_display_name_passes_through_an_unknown_source_verbatim() {
+        // AD-8: a sixth, third-party adapter must render as-is rather
+        // than needing this table edited to show up.
+        assert_eq!(agent_display_name("aider"), "aider");
+        assert_eq!(agent_display_name(""), "");
+        assert_eq!(agent_display_name("manual"), "manual");
+        assert_eq!(agent_display_name("legacy"), "legacy");
     }
 
     // ----- ordering -------------------------------------------------

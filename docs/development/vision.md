@@ -304,8 +304,10 @@ structural feature parity.
 ### DL-9: CLI is `roostctl`
 
 `crates/roost-cli` ships a `roostctl` binary. The Mac bundle embeds it
-under `Contents/Resources/bin/roostctl` so `claude install` invoked from
-inside `Roost.app` writes hook paths that point at the bundled location.
+under `Contents/Resources/bin/roostctl`, and each tab's
+`$ROOST_AGENT_HOOK` points at that copy — so an agent hook installed
+from inside `Roost.app` runs the bundled binary without any absolute
+path being written into the agent's own config.
 
 ### DL-10: Ghostty SHA pinned in `third_party/ghostty/build.sh`
 

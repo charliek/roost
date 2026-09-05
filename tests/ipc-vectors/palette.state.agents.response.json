@@ -9,9 +9,10 @@
     "items": [
       {
         "id": "agent:3",
-        "title": "roost · slauth-refactor",
+        "title": "Claude Code · roost · slauth-refactor",
         "agent": {
           "effective_lifecycle": "waiting",
+          "agent": "Claude Code",
           "project": "roost",
           "name": "slauth-refactor",
           "status_text": "Waiting for input",

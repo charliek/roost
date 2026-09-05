@@ -550,7 +550,9 @@ final class PtySupervisor {
             socketPath: socketPath,
             argv: argv,
             resourcesDir: Bundle.roostResources.bundleURL.path,
-            version: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
+            version: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
+                ?? "dev",
+            agentHook: bundledRoostctl()
         )
         var out: [UnsafeMutablePointer<CChar>?] = env.map { strdup("\($0)=\($1)") }
         out.append(nil)
@@ -573,13 +575,26 @@ func shouldBashBootstrap(_ resolvedArgv: [String], resourcesDir: String) -> Bool
 /// The environment a Roost tab's child process sees: `base` (the parent's
 /// environment) overlaid with Roost's injected vars. Pure so tests can
 /// assert the contract without spawning a PTY.
+/// Roost's bundled `roostctl` (`Roost.app/Contents/Resources/bin/roostctl`),
+/// handed to providers as `ROOST_ROOSTCTL` and to every spawned tab as
+/// `ROOST_AGENT_HOOK`. `nil` when not present (e.g. a `swift run` dev build
+/// with no embedded CLI) — the provider then falls back to a PATH
+/// `roostctl`, and the tab simply doesn't get the variable.
+func bundledRoostctl() -> String? {
+    guard let url = Bundle.main.resourceURL?.appendingPathComponent("bin/roostctl"),
+        FileManager.default.isExecutableFile(atPath: url.path)
+    else { return nil }
+    return url.path
+}
+
 func childEnvironment(
     base: [String: String],
     tabID: Int64,
     socketPath: String,
     argv: [String],
     resourcesDir: String,
-    version: String
+    version: String,
+    agentHook: String?
 ) -> [String: String] {
     var env = base
     // Advertise the terminal Roost provides — force TERM rather than
@@ -603,6 +618,20 @@ func childEnvironment(
     env["FORCE_HYPERLINK"] = "1"
     env["ROOST_TAB_ID"] = String(tabID)
     env["ROOST_SOCKET"] = socketPath
+    // The one hook entrypoint every installed agent config invokes
+    // (plan 046 §3.2). Indirecting through the environment is what keeps
+    // the written config identical on every machine and on every host —
+    // it names no path of Roost's. Omitted rather than guessed when the
+    // bundled CLI is absent: the installed command's fallback branch
+    // reads an *unset* variable as "not inside Roost", where a path that
+    // does not exist would exec-fail with no JSON on stdout. An
+    // inherited value is dropped rather than passed through — it must
+    // always describe *this* Roost, never an outer one.
+    if let agentHook {
+        env["ROOST_AGENT_HOOK"] = agentHook
+    } else {
+        env.removeValue(forKey: "ROOST_AGENT_HOOK")
+    }
     // Roost shell-integration contract: identify the terminal and
     // point shells at the shipped scripts (under
     // $ROOST_RESOURCES_DIR/shell-integration). TERM stays

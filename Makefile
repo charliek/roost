@@ -69,7 +69,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 .PHONY: test test-rust test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
-ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
+ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_palette.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_sparkle.py`'s two classes split by lane: the bare-binary class
 # runs here (no framework beside a cargo binary ⇒ updater unavailable)
 # and its bundle class self-skips — `make e2e-iced-sparkle` is where the
@@ -218,7 +218,12 @@ e2e:  ## pytest E2E suite dispatch (ROOST_TARGET=mac|iced, default iced) -> e2e-
 		*) echo "ROOST_TARGET=$${ROOST_TARGET} is not supported by 'make e2e' (want mac or iced)"; exit 1 ;; \
 	esac
 
+# `roostctl` is built first because `tools/roosttest/util.py` only builds
+# one when the binary is *missing*: without this the lane either charges
+# the first test's timeout for a cold cargo build, or — worse — silently
+# runs whatever stale binary is already in target/debug.
 e2e-iced:  ## Required functional E2E against Iced
+	cargo build -p roost-cli
 	@tests='$(ICED_E2E_TESTS)'; \
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
@@ -315,6 +320,7 @@ e2e-host-bootstrap-ci: $(GHOSTTY_LIB)  ## HS-3 slice-2 bootstrap E2E at CI parit
 	ROOST_TEST_MODE=1 uv run --group test pytest $(BOOTSTRAP_E2E_TESTS) --roost-target iced --roost-fresh
 
 e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
+	cargo build -p roost-cli
 	@tests='$(ICED_E2E_TESTS)'; \
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \

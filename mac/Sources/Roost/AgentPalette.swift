@@ -254,6 +254,29 @@ enum AgentPalette {
         return NotificationInbox.composeTitle(project: project, tab: name)
     }
 
+    /// A human-friendly name for an ownership `source` (plan 046 §3.7,
+    /// W7). Matched against the five adapters' own `SOURCE` constants in
+    /// `crates/roost-agent/src/*.rs` — spelled out here rather than
+    /// imported, since that crate is Rust-only.
+    ///
+    /// `source` is an open string by design (AD-8): a third-party
+    /// adapter that isn't one of the five renders **verbatim** rather
+    /// than being hidden or mislabeled, so this table can never gate
+    /// whether an agent's row appears — only how its name is spelled.
+    /// Mirrors `crates/roost-ui-model/src/agent_palette.rs`'s
+    /// `agent_display_name`, tested against the same fixture
+    /// (`tests/agent-display-name-fixtures/`).
+    static func agentDisplayName(_ source: String) -> String {
+        switch source {
+        case "claude": return "Claude Code"
+        case "codex": return "Codex"
+        case "opencode": return "OpenCode"
+        case "grok": return "Grok"
+        case "cursor": return "Cursor"
+        default: return source
+        }
+    }
+
     /// The colour role of one segment of the git-metrics column.
     enum MetricsRole {
         case muted
@@ -359,11 +382,13 @@ enum AgentPalette {
     ) -> Row {
         let projectName = normalizeLine(project.name)
         let name = rowName(tab: tab, owner: owner)
+        let agentName = agentDisplayName(owner.source)
         let item = PaletteItem(
             id: "\(rowIDPrefix)\(tab.id)",
-            title: composeTitle(project: projectName, name: name),
+            title: composeTitle(project: agentName, name: composeTitle(project: projectName, name: name)),
             agent: AgentRowData(
                 effectiveLifecycle: effective,
+                agent: agentName,
                 project: projectName,
                 name: name,
                 statusText: statusText(

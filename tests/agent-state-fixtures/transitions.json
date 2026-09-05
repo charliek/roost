@@ -471,7 +471,7 @@
         "shell": "at_prompt",
         "lifecycle": "working",
         "ownership": {
-          "source": "caf\u00e9",
+          "source": "café",
           "session_id": "s1",
           "last_event_at": 1700000000,
           "detail": "",
@@ -480,7 +480,7 @@
       },
       "report": {
         "tab_id": "3",
-        "source": "cafe\u0301",
+        "source": "café",
         "session_id": "s1",
         "ownership_action": "release"
       },
@@ -495,7 +495,7 @@
           "shell": "at_prompt",
           "lifecycle": "working",
           "ownership": {
-            "source": "caf\u00e9",
+            "source": "café",
             "session_id": "s1",
             "last_event_at": 1700000000,
             "detail": "",
@@ -789,6 +789,335 @@
           }
         },
         "effective": "needs_input"
+      }
+    },
+    {
+      "name": "lifecycle-if-applies-the-patch-when-the-guard-passes",
+      "now": 1700001000,
+      "current": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "prompt_submit",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "finished",
+        "lifecycle_if": [
+          "working"
+        ],
+        "attention": "set",
+        "severity": "info",
+        "title": "Claude Code",
+        "body": "Turn complete",
+        "detail": "stop"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "set",
+          "title": "Claude Code",
+          "body": "Turn complete",
+          "severity": "info"
+        },
+        "state": {
+          "shell": "foreground_process",
+          "lifecycle": "finished",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "stop",
+            "metadata": {}
+          }
+        },
+        "effective": "idle"
+      }
+    },
+    {
+      "name": "lifecycle-if-veto-drops-the-patch-and-the-attention-set",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "finished",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "stop",
+          "metadata": {
+            "model": "claude-opus-5"
+          }
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "waiting",
+        "lifecycle_if": [
+          "working"
+        ],
+        "attention": "set",
+        "severity": "warn",
+        "title": "Claude Code",
+        "body": "Claude is waiting for your input",
+        "detail": "idle_prompt",
+        "metadata": {
+          "nag": "1"
+        }
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "finished",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "idle_prompt",
+            "metadata": {
+              "model": "claude-opus-5",
+              "nag": "1"
+            }
+          }
+        },
+        "effective": "idle"
+      }
+    },
+    {
+      "name": "lifecycle-if-veto-still-clears-attention",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "finished",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "stop",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "waiting",
+        "lifecycle_if": [
+          "working"
+        ],
+        "attention": "clear",
+        "detail": "permission_decision"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "clear"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "finished",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "permission_decision",
+            "metadata": {}
+          }
+        },
+        "effective": "idle"
+      }
+    },
+    {
+      "name": "lifecycle-if-cannot-veto-a-release",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "finished",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "stop",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "release",
+        "lifecycle_if": [
+          "working"
+        ]
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "inactive",
+          "ownership": null
+        },
+        "effective": "none"
+      }
+    },
+    {
+      "name": "lifecycle-if-veto-drops-a-releases-attention-set",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "finished",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "stop",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "release",
+        "lifecycle_if": [
+          "working"
+        ],
+        "attention": "set",
+        "severity": "info",
+        "title": "Claude Code",
+        "body": "Session ended",
+        "detail": "session_end"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "inactive",
+          "ownership": null
+        },
+        "effective": "none"
+      }
+    },
+    {
+      "name": "lifecycle-if-veto-on-a-claim-takes-the-tab-without-the-patch",
+      "now": 1700001000,
+      "current": {
+        "shell": "unknown",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s2",
+        "ownership_action": "claim",
+        "lifecycle": "working",
+        "lifecycle_if": [
+          "working"
+        ]
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "unknown",
+          "lifecycle": "inactive",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s2",
+            "last_event_at": 1700001000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "none"
+      }
+    },
+    {
+      "name": "prompt-mark-failsafe-then-a-guarded-nag-no-ops",
+      "now": 1700001000,
+      "current": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "prompt_submit",
+          "metadata": {}
+        }
+      },
+      "shell_mark": "D;0",
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "waiting",
+        "lifecycle_if": [
+          "working"
+        ],
+        "attention": "set",
+        "severity": "warn",
+        "title": "Claude Code",
+        "body": "Claude is waiting for your input",
+        "detail": "idle_prompt"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "inactive",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "idle_prompt",
+            "metadata": {}
+          }
+        },
+        "effective": "none"
       }
     }
   ]

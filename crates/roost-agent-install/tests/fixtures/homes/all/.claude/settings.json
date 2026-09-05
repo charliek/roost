@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "defaultMode": "auto"
+  },
+  "model": "opus",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/home/fixture/.claude/hooks/herdr-agent-state.sh' session",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/home/fixture/.claude/hooks/herdr-agent-state.sh' stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/home/fixture/.claude/statusline.sh"
+  },
+  "enabledPlugins": {
+    "planning@cc-plugins": true,
+    "codex@openai-codex": true
+  },
+  "effortLevel": "high",
+  "tui": "fullscreen"
+}

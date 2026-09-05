@@ -176,24 +176,22 @@ UI edit rather than infer it from log lines.
 
 ## Permanent hook setup (Claude Code)
 
-To wire the actual Claude Code CLI so it drives these events
-automatically when you run a session:
+The Roost UI wires the actual Claude Code CLI itself the first time it
+starts (`agent-hooks = auto`), so on a normal machine there is nothing
+to do. To do it by hand:
 
 ```bash
-roostctl claude install
+roostctl agent install claude
 ```
 
-This writes `~/.config/roost/claude-settings.json` with hook commands
-for each of the six lifecycle events — `SessionStart`,
-`UserPromptSubmit`, `Notification`, `Stop`, `StopFailure`,
-`SessionEnd` — then prints an alias line:
+That merges one hook command per lifecycle event into Claude's own
+`~/.claude/settings.json`, invoked through the `$ROOST_AGENT_HOOK`
+variable every Roost tab exports — no shell alias, and no absolute path
+baked into the entry. `roostctl agent status` says what is wired and
+`roostctl agent uninstall claude` takes it back out.
 
-```bash
-alias claude='claude --settings ~/.config/roost/claude-settings.json'
-```
-
-Add that alias to your shell rc. Now every `claude` session inside a
-Roost tab automatically drives the integration — see
+Now every `claude` session inside a Roost tab automatically drives the
+integration — see
 [Claude Code Hooks](../guides/claude-code.md) for the full event →
 effect mapping, including the `background_tasks` / `StopFailure` /
 unrecognized-`notification_type` cases the manual cheatsheet above

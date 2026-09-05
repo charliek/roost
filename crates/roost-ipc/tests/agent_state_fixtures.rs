@@ -103,6 +103,12 @@ struct TransitionCase {
     name: String,
     now: i64,
     current: AgentTabState,
+    /// Optional OSC 133 mark applied to `current` **before** the report,
+    /// so a case can state a sequence the real world produces — the
+    /// prompt-mark failsafe dropping the lifecycle, then a guarded
+    /// report landing on what it left behind.
+    #[serde(default)]
+    shell_mark: Option<String>,
     report: TabAgentReportParams,
     expect: TransitionExpect,
 }
@@ -173,7 +179,7 @@ fn every_group_is_represented_and_non_trivial() {
     let want: BTreeMap<&str, usize> = [
         ("derivation", 12),
         ("rank", 5),
-        ("transitions", 12),
+        ("transitions", 18),
         ("shell_marks", 7),
     ]
     .into_iter()
@@ -255,7 +261,13 @@ fn every_agent_state_fixture_matches_the_rust_implementation() {
                 for case in list {
                     cases += 1;
                     let at = format!("{file}[{}]", case.name);
-                    let out = apply_report(&case.current, &case.report, case.now);
+                    let current = match &case.shell_mark {
+                        Some(body) => apply_shell_mark(&case.current, body).unwrap_or_else(|| {
+                            panic!("{at}: shell_mark {body:?} is not a defined mark")
+                        }),
+                        None => case.current.clone(),
+                    };
+                    let out = apply_report(&current, &case.report, case.now);
                     let (f, o, e) = (&mut failures, &out, &case.expect);
                     check(f, &at, "accepted", &o.accepted, &e.accepted);
                     check(
@@ -275,7 +287,7 @@ fn every_agent_state_fixture_matches_the_rust_implementation() {
                     check(f, &at, "attention", &o.attention, &e.attention);
                     check(f, &at, "state", &o.state, &e.state);
                     check(f, &at, "effective", &effective(&o.state), &e.effective);
-                    if !case.expect.accepted && out.state != case.current {
+                    if !case.expect.accepted && out.state != current {
                         failures.push(format!(
                             "{at}: a dropped report must leave state untouched, got {:?}",
                             out.state

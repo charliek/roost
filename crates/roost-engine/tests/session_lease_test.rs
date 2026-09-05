@@ -10,9 +10,13 @@
 
 use std::sync::Arc;
 
-use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
+use roost_engine::ipc::{
+    AgentHooksError, AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle,
+};
 use roost_engine::{AttentionSource, PtySupervisor, Workspace};
-use roost_ipc::messages::{ops, SessionConnectResult};
+use roost_ipc::messages::{
+    ops, AgentHooksMode, AgentHooksSkipped, SessionConnectResult, SessionSetAgentHooksResult,
+};
 use roost_ipc::{CloseReason, ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome};
 use tempfile::TempDir;
 
@@ -23,9 +27,13 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(None)
+}
+
+fn fixture_with(agent_hooks: Option<AgentHooksHandle>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Arc::new(Workspace::open(dir.path().join("state.json")));
-    let handler = IpcHandler::new(
+    let mut handler = IpcHandler::new(
         Arc::clone(&workspace),
         Arc::new(PtySupervisor::new()),
         dir.path().join("roost.sock"),
@@ -44,6 +52,9 @@ fn fixture() -> Fixture {
         },
         StopHandle::new(|| async {}),
     );
+    if let Some(handle) = agent_hooks {
+        handler = handler.with_agent_hooks(handle);
+    }
     Fixture {
         handler,
         workspace,
@@ -558,5 +569,224 @@ async fn a_ui_sockets_connection_ending_changes_nothing() {
             .raise_attention(tab, "Roost", "body", AttentionSource::Structured)
             .unwrap(),
         "a UI's own focus is the UI's to report, not this hook's to clear"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// session.set_agent_hooks (plan 046 C8)
+// ---------------------------------------------------------------------------
+
+/// An install backend that records what it was asked for and answers a
+/// fixed result. What the engine owes this op is admission and decoding,
+/// so a recorder is the whole of the far side.
+fn recording_backend() -> (
+    AgentHooksHandle,
+    Arc<std::sync::Mutex<Vec<AgentHooksRequest>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let handle = AgentHooksHandle::new(move |request: AgentHooksRequest| {
+        sink.lock().unwrap().push(request);
+        async {
+            Ok(SessionSetAgentHooksResult {
+                wired: vec!["claude".into()],
+                skipped: vec![AgentHooksSkipped {
+                    agent: "cursor".into(),
+                    reason: "skip-list".into(),
+                }],
+                ..SessionSetAgentHooksResult::default()
+            })
+        }
+    });
+    (handle, seen)
+}
+
+async fn set_agent_hooks(
+    f: &Fixture,
+    c: &Conn,
+    lease: &str,
+    mode: &str,
+) -> Result<SessionSetAgentHooksResult, String> {
+    let params = serde_json::json!({
+        "lease": lease,
+        "mode": mode,
+        "skip": ["cursor"],
+        "client": "charlie-mbp",
+    });
+    match f
+        .handler
+        .handle(&c.ctx, ops::SESSION_SET_AGENT_HOOKS, params)
+        .await
+    {
+        Ok(outcome) => Ok(serde_json::from_value(reply(outcome)).expect("typed result")),
+        Err(e) => {
+            assert!(
+                !e.message.contains(lease) || lease.is_empty(),
+                "a lease is a credential and must not be echoed back: {}",
+                e.message
+            );
+            Err(e.code)
+        }
+    }
+}
+
+/// The gate is the lease, and what gets through carries the client's own
+/// values verbatim — including `off`, which on a host means *remove*.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_agent_hooks_needs_the_lease_and_hands_the_client_values_on() {
+    let (handle, seen) = recording_backend();
+    let f = fixture_with(Some(handle));
+    let holder = conn(1);
+
+    assert_eq!(
+        set_agent_hooks(&f, &holder, "not-a-lease", "auto").await,
+        Err("connect-required".into()),
+        "writing the host's dotfiles is not something an unleased client does"
+    );
+    assert!(seen.lock().unwrap().is_empty(), "a refusal must not run it");
+
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+    let result = set_agent_hooks(&f, &holder, &lease, "auto")
+        .await
+        .expect("the lease holder may wire the host");
+    assert_eq!(result.wired, vec!["claude".to_string()]);
+    assert_eq!(result.skipped[0].agent, "cursor");
+
+    set_agent_hooks(&f, &holder, &lease, "off")
+        .await
+        .expect("off is a value of the same op");
+
+    {
+        let asked = seen.lock().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0].mode, AgentHooksMode::Auto);
+        assert_eq!(asked[0].skip, vec!["cursor".to_string()]);
+        assert_eq!(asked[0].client, "charlie-mbp");
+        assert_eq!(asked[1].mode, AgentHooksMode::Off);
+    }
+
+    // A second client taking the lease over is the only holder left, and
+    // the displaced one may no longer rewrite the host's files.
+    let usurper = conn(2);
+    connect(&f, &usurper, true).await.expect("takeover");
+    assert_eq!(
+        set_agent_hooks(&f, &holder, &lease, "auto").await,
+        Err("taken-over".into())
+    );
+}
+
+/// A session built without an install backend answers honestly rather
+/// than reporting an empty success — the same posture a UI socket takes
+/// by not serving `session.*` at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_without_an_install_backend_says_not_supported() {
+    let f = fixture();
+    let holder = conn(1);
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+    assert_eq!(
+        set_agent_hooks(&f, &holder, &lease, "auto").await,
+        Err("not-supported".into())
+    );
+}
+
+/// The backend's own failure is an error frame with a code the client can
+/// act on, not a panic and not a silent empty reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_install_backend_surfaces_as_internal() {
+    let handle = AgentHooksHandle::new(|_: AgentHooksRequest| async {
+        Err(AgentHooksError::Failed(
+            "no HOME in this session's environment".to_string(),
+        ))
+    });
+    let f = fixture_with(Some(handle));
+    let holder = conn(1);
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+    assert_eq!(
+        set_agent_hooks(&f, &holder, &lease, "auto").await,
+        Err("internal".into())
+    );
+}
+
+/// A backend that found its caller's authority gone answers `taken-over`,
+/// not `internal`: the two instruct differently, and only one of them
+/// means "stop driving this session".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_that_lost_its_authority_answers_taken_over() {
+    let handle =
+        AgentHooksHandle::new(|_: AgentHooksRequest| async { Err(AgentHooksError::Unauthorized) });
+    let f = fixture_with(Some(handle));
+    let holder = conn(1);
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+    assert_eq!(
+        set_agent_hooks(&f, &holder, &lease, "auto").await,
+        Err("taken-over".into())
+    );
+}
+
+/// **The door is not the point of effect.** The lease is validated when
+/// the op is admitted, and then the install runs — on a per-home `flock`,
+/// on a `$HOME` that may be network-mounted, for as long as that takes.
+/// Closing the asking connection does not cancel the running handler and
+/// neither does the client's own 15 s timeout, so a request admitted
+/// under a lease that has since been taken over would otherwise go on to
+/// rewrite the host's files and overwrite the state record — undoing the
+/// policy of the client that displaced it.
+///
+/// So the credential travels with the request and is re-asked where it
+/// matters. This drives the shape exactly: a backend parked mid-run, a
+/// takeover while it is parked, and the authority it is holding answering
+/// `false` afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_install_that_outlives_its_lease_is_told_so_at_the_point_of_effect() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let answered = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+
+    let handle = {
+        let (entered, release, answered) = (
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&answered),
+        );
+        AgentHooksHandle::new(move |request: AgentHooksRequest| {
+            let (entered, release, answered) = (
+                Arc::clone(&entered),
+                Arc::clone(&release),
+                Arc::clone(&answered),
+            );
+            async move {
+                // The install engine asks this once it owns the lock;
+                // parking here is that wait, made deterministic.
+                entered.notify_one();
+                release.notified().await;
+                answered.lock().unwrap().push(request.authority.holds());
+                Ok(SessionSetAgentHooksResult::default())
+            }
+        })
+    };
+
+    let f = fixture_with(Some(handle));
+    let holder = conn(1);
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+
+    // Uncontested first: the authority is real, and says yes.
+    release.notify_one();
+    set_agent_hooks(&f, &holder, &lease, "auto")
+        .await
+        .expect("the lease holder may wire the host");
+    assert_eq!(*answered.lock().unwrap(), vec![true]);
+
+    // Now the race the fix exists for. The second op is parked inside the
+    // backend while another client takes the session over.
+    let usurper = conn(2);
+    let (_, ()) = tokio::join!(set_agent_hooks(&f, &holder, &lease, "auto"), async {
+        entered.notified().await;
+        connect(&f, &usurper, true).await.expect("takeover");
+        release.notify_one();
+    });
+    assert_eq!(
+        *answered.lock().unwrap(),
+        vec![true, false],
+        "a displaced client's install must not still be authorised to write"
     );
 }

@@ -27,6 +27,11 @@ name = "roost-iced"
 path = "src/main.rs"
 
 [dependencies]
+# The `Agent` inventory the toast names, and the engine that writes the
+# hook entries at startup (plan 046 §3.7). The install crate is all I/O,
+# so every call it gets from here goes to the blocking pool.
+roost-agent = { path = "../roost-agent" }
+roost-agent-install = { path = "../roost-agent-install" }
 roost-engine = { path = "../roost-engine" }
 roost-ipc = { path = "../roost-ipc" }
 roost-ui-model = { path = "../roost-ui-model" }
@@ -60,6 +65,12 @@ arboard = { version = "3.6", default-features = false, features = [
     "wayland-data-control",
 ] }
 png = "=0.18.1"
+# The machine name this client puts in a host's agent-hooks record, so
+# two clients of one host are tellable apart (plan 046 §3.4). Already in
+# the workspace's graph (winit's x11rb pulls it), pure Rust, and one
+# `uname(2)` behind a safe API — the alternative here is a hand-rolled
+# unsafe `libc::gethostname` for the same three lines.
+gethostname = "1"
 # Trait-only: the host op queue's replies are `serde_json::Value`, and the
 # typed decode of one needs `DeserializeOwned` to be nameable. No derives
 # live in this crate — the wire types are `roost-ipc`'s.

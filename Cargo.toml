@@ -9,6 +9,9 @@
 #                   roost-osc test fixtures.
 #   * roost-agent — pure agent adapters: hook event JSON in,
 #                   `tab.agent_report` params out. No I/O.
+#   * roost-agent-install — writes Roost's hook entries into the agents'
+#                   own config files (and takes them out). Separate from
+#                   roost-agent so that crate keeps its no-I/O charter.
 #   * roost-engine — toolkit-neutral workspace, persistence, PTY runtime,
 #                    application commands/events, and IPC dispatch.
 #   * roost-ui-model — toolkit-neutral config, theme, palette, keybind,
@@ -30,6 +33,7 @@ members = [
     "crates/roost-osc",
     "crates/roost-url",
     "crates/roost-agent",
+    "crates/roost-agent-install",
     "crates/roost-engine",
     "crates/roost-ui-model",
     "crates/roost-cli",

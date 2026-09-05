@@ -46,8 +46,22 @@ private struct TransitionCase: Decodable {
     let name: String
     let now: Int64
     let current: AgentTabState
+    /// Optional OSC 133 mark applied to `current` **before** the report,
+    /// so a case can state a sequence the real world produces — the
+    /// prompt-mark failsafe dropping the lifecycle, then a guarded
+    /// report landing on what it left behind.
+    let shellMark: String?
     let report: AgentReport
     let expect: Expect
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case now
+        case current
+        case shellMark = "shell_mark"
+        case report
+        case expect
+    }
 
     struct Expect: Decodable {
         let accepted: Bool
@@ -237,7 +251,7 @@ func everyAgentStateFixtureGroupIsRepresentedAndNonTrivial() throws {
     let want: [String: Int] = [
         "derivation": 12,
         "rank": 5,
-        "transitions": 12,
+        "transitions": 18,
         "shell_marks": 7,
     ]
 
@@ -287,7 +301,17 @@ func everyAgentStateFixtureMatchesTheSwiftImplementation() throws {
             for c in f.cases {
                 cases += 1
                 let at = "\(file)[\(c.name)]"
-                let out = Agent.applyReport(c.current, c.report, now: c.now)
+                let current: AgentTabState
+                if let body = c.shellMark {
+                    guard let marked = Agent.applyShellMark(c.current, body: body) else {
+                        failures.append("\(at): shell_mark \"\(body)\" is not a defined mark")
+                        continue
+                    }
+                    current = marked
+                } else {
+                    current = c.current
+                }
+                let out = Agent.applyReport(current, c.report, now: c.now)
                 check(&failures, at, "accepted", out.accepted, c.expect.accepted)
                 check(
                     &failures, at, "ownershipChanged",
@@ -300,7 +324,7 @@ func everyAgentStateFixtureMatchesTheSwiftImplementation() throws {
                 check(&failures, at, "attention", out.attention, c.expect.attention)
                 check(&failures, at, "state", out.state, c.expect.state)
                 check(&failures, at, "effective", Agent.effective(out.state), c.expect.effective)
-                if !c.expect.accepted && out.state != c.current {
+                if !c.expect.accepted && out.state != current {
                     failures.append(
                         "\(at): a dropped report must leave state untouched, got \(out.state)"
                     )

@@ -1,0 +1,1 @@
+{ "hooks": { "stop": [ { "command": "trailing comma below" }, ] } }

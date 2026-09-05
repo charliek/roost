@@ -124,6 +124,7 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
         ops::SESSION_IDENTIFY,
         ops::SESSION_STOP,
         ops::SESSION_SET_FOCUS,
+        ops::SESSION_SET_AGENT_HOOKS,
     ] {
         let err = call(&f.handler, op, serde_json::json!({}))
             .await
@@ -273,6 +274,23 @@ async fn session_stop_reaps_latches_and_finalizes() {
     )
     .await
     .expect_err("session.set_focus after stop");
+    assert_eq!(err.code, "shutting-down");
+
+    // Same latch, and this one matters more than a focus: the entries it
+    // writes point at a `roostctl` reporting to a socket this session is
+    // about to unlink, so a wiring that lands after the stop is a wiring
+    // nothing on the far side can honour.
+    let err = call(
+        &f.handler,
+        ops::SESSION_SET_AGENT_HOOKS,
+        serde_json::json!({
+            "lease": "0".repeat(32),
+            "mode": "auto",
+            "client": "charlie-mbp",
+        }),
+    )
+    .await
+    .expect_err("session.set_agent_hooks after stop");
     assert_eq!(err.code, "shutting-down");
 
     // Idempotent-reject: a second stop gets the same answer, and never

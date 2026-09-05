@@ -2735,6 +2735,20 @@ version = "0.0.19"
 dependencies = [
  "roost-ipc",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "roost-agent-install"
+version = "0.0.19"
+dependencies = [
+ "roost-agent",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "toml_edit",
 ]
 
 [[package]]
@@ -2746,7 +2760,9 @@ dependencies = [
  "clap",
  "libc",
  "roost-agent",
+ "roost-agent-install",
  "roost-ipc",
+ "roost-ui-model",
  "serde",
  "serde_json",
  "tokio",
@@ -2781,6 +2797,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "block2 0.6.2",
+ "gethostname",
  "iced",
  "libc",
  "objc2 0.6.4",
@@ -2789,6 +2806,8 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-user-notifications 0.3.2",
  "png",
+ "roost-agent",
+ "roost-agent-install",
  "roost-engine",
  "roost-ipc",
  "roost-ui-model",
@@ -2836,6 +2855,8 @@ dependencies = [
  "clap",
  "getrandom 0.4.2",
  "libc",
+ "roost-agent",
+ "roost-agent-install",
  "roost-engine",
  "roost-ipc",
  "roost-vt",
@@ -3567,6 +3588,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -3578,6 +3600,12 @@ checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tracing"

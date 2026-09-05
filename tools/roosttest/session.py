@@ -32,6 +32,14 @@ derived from it. `validate_runtime_dir` rejects a socket directory with
 a symlinked component, and both `/tmp` (Linux) and `$TMPDIR`
 (`/var/folders/...` on macOS) reach the real path through one.
 
+`HOME` alone is not the whole story once a client can send
+`session.set_agent_hooks`: the five agent config directories are each
+relocatable by an absolute path in the environment, so they are stripped
+from every launch here and `SessionEnv.jail_agents()` re-points them
+inside the profile's root. A test that wants a session to write hook
+entries calls it, and from then on every launch asserts the jail before
+spawning (plan 046 §3.9).
+
 The runtime directory's *parent* is pre-created here rather than left to
 the daemon: `validate_runtime_dir` creates only the leaf (non-recursive,
 `0700`), which is right for a real machine where `$XDG_RUNTIME_DIR` and
@@ -63,6 +71,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import agent_jail
 from client import Roost, RoostError, scaled_timeout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -102,6 +111,18 @@ _SANITIZE = (
     # libghostty build no client can match, so the cases that want it
     # pass it per launch and nothing else inherits one.
     "ROOST_SESSION_FAKE_BUILD",
+    # The install engine's test-mode override. A developer who exported
+    # it in their own shell would otherwise hand every session in this
+    # module a licence to write real dotfiles; the one case that wants it
+    # sets it per launch.
+    "ROOST_AGENT_HOOKS_FORCE",
+    # The five agent config directories (plan 046 §3.9). `HOME` below is
+    # already inside the fixture's root, so a default `~/.claude` cannot
+    # escape — but each of these can name an ABSOLUTE path outside it,
+    # and `session.set_agent_hooks` is an op a client can send to any
+    # session this module starts. Stripped so the jail is complete, then
+    # re-set by `jail_agents`.
+    *agent_jail.AGENT_CONFIG_DIR_ENV.values(),
 )
 
 
@@ -263,6 +284,8 @@ class SessionEnv:
     binary: Path
     _pids: list[int] = field(default_factory=list)
     _procs: list[subprocess.Popen] = field(default_factory=list)
+    #: Installed by `jail_agents()`; once set, every launch asserts on it.
+    agents: "agent_jail.Jail | None" = None
 
     # -- paths ------------------------------------------------------------
     @property
@@ -350,10 +373,33 @@ class SessionEnv:
         self._procs.append(proc)
         return proc
 
+    # -- the agent-hooks jail ---------------------------------------------
+    def jail_agents(self) -> "agent_jail.Jail":
+        """Point this session's five agent config directories inside its
+        own root, so `session.set_agent_hooks` cannot reach a real
+        dotfile (plan 046 §3.9).
+
+        The same `Jail` `test_agent_hooks.py` uses, rooted at this
+        profile's root — which is where `HOME` already lives, so the
+        jail's home IS the session's home and nothing about the socket /
+        state / log resolution moves. From here on every launch asserts
+        the merged environment before spawning (`command_env`), which is
+        what makes the fence an assertion rather than a convention.
+        """
+        jail = agent_jail.Jail(self.root)
+        assert str(jail.home) == self.env["HOME"], (
+            f"the jail's home {jail.home} is not the session's {self.env['HOME']}"
+        )
+        self.env.update(jail.env)
+        self.agents = jail
+        return jail
+
     # -- launching --------------------------------------------------------
     def command_env(self, **overrides: str) -> dict[str, str]:
         env = dict(self.env)
         env.update(overrides)
+        if self.agents is not None:
+            self.agents.assert_jailed(env)
         return env
 
     def start_daemonized(self, *, timeout: float = 90.0, **overrides: str) -> "Launch":

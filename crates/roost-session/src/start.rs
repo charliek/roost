@@ -23,6 +23,10 @@
 //!    recorded rather than merely returned.
 //! 6. **Locks before the runtime**, so a losing racer costs one process
 //!    start and nothing else.
+//! 7. **The agent-hook path before the fork**, because it is derived
+//!    from `current_exe()` and the fork `chdir`s away from the directory
+//!    a relative one would need — see [`crate::agent_hook`] for the
+//!    other half of the reason.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -87,6 +91,14 @@ pub fn start(
     launch_cwd: PathBuf,
     readiness: &mut Readiness,
 ) -> Result<Outcome> {
+    // Step 0, and it has to be step 0: before the fork (which `chdir`s
+    // to `/`, so a relative `current_exe` would stop resolving) and
+    // long before any tab is spawned. Bootstrap replaces this binary by
+    // an atomic rename, and a still-running old session's
+    // `/proc/self/exe` then reads `… (deleted)` — resolving lazily at
+    // the first spawn would hand tabs a path that no longer exists.
+    roost_engine::process::set_agent_hook_binary(crate::agent_hook::hook_binary());
+
     if !foreground {
         *readiness = daemonize::daemonize()?;
     }

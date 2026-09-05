@@ -75,6 +75,7 @@ use crate::{chrome, input};
 // `mod palette` would collide with the `roost_ui_model::palette` import in
 // this module's namespace, so the palette-overlay half of App lives in
 // `palettes` (it hosts the command/agent/provider/notification palettes).
+pub(crate) mod agent_hooks;
 pub(crate) mod bootstrap;
 mod host_dialog;
 pub(crate) mod host_lifecycle;
@@ -103,9 +104,9 @@ use self::interactions::{
 pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
 use self::palettes::{
-    apply_with_rollback, ellipsize_palette_text, palette_agent_left_text, palette_row_id,
-    palette_title_runs, FontSizeTransition, PaletteReplyRoute, PaletteVisibilityRequest,
-    PALETTE_AGENT_PROJECT_MAX_COLUMNS,
+    apply_with_rollback, palette_agent_segments, palette_row_id, palette_title_runs,
+    FontSizeTransition, PaletteAgentColumn, PaletteAgentSegment, PaletteReplyRoute,
+    PaletteVisibilityRequest,
 };
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
@@ -1164,6 +1165,34 @@ fn sidebar_band_label(label: &str) -> Element<'_, Message> {
         .into()
 }
 
+/// One column of an agents-palette row, in the treatment its role
+/// carries: the project stays the bold anchor, the agent's own name sits
+/// a step quieter ahead of it, and the status wears the lifecycle
+/// colour. Exhaustive over [`PaletteAgentColumn`] on purpose — the
+/// columns are enumerated in `palette_agent_segments` and nowhere else,
+/// so neither side can drop one silently.
+fn palette_agent_segment<'a>(
+    segment: PaletteAgentSegment,
+    primary: Color,
+    muted: Color,
+    lifecycle: Color,
+) -> Element<'a, Message> {
+    let label = text(segment.text).wrapping(iced::widget::text::Wrapping::None);
+    match segment.column {
+        PaletteAgentColumn::Agent => label.size(14).color(muted).into(),
+        PaletteAgentColumn::Project => container(
+            label
+                .size(14)
+                .font(chrome::chrome_font(font::Weight::Semibold))
+                .color(primary),
+        )
+        .max_width(140)
+        .into(),
+        PaletteAgentColumn::Name => label.size(14).color(primary).into(),
+        PaletteAgentColumn::Status => label.size(13).color(lifecycle).into(),
+    }
+}
+
 fn accel_label(accel: &Accel) -> Option<String> {
     if accel.key.is_empty() {
         return None;
@@ -1902,6 +1931,16 @@ pub struct App {
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: StatusBanner,
+    /// The one startup agent-hooks ensure has been started (plan 046
+    /// §3.7). `window_opened` also runs on every focus change, so this
+    /// is what keeps a startup act from becoming a focus act.
+    agent_hooks_started: bool,
+    /// The agent-hooks toast, waiting for the end of the drain that
+    /// produced it. Held rather than set on arrival so nothing later in
+    /// the same batch — a PTY error, an OSC action — can replace it
+    /// before a frame ever renders it. See
+    /// [`Self::show_agent_hooks_toast`].
+    pending_agent_hooks_toast: Option<(String, Vec<roost_agent::Agent>)>,
     rename_editor: Option<RenameEditor>,
     rename_input_id: Id,
     rename_focus_requested: bool,
@@ -2254,6 +2293,8 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode,
             status: StatusBanner::default(),
+            agent_hooks_started: false,
+            pending_agent_hooks_toast: None,
             rename_editor: None,
             rename_input_id: Id::unique(),
             rename_focus_requested: false,
@@ -2450,7 +2491,147 @@ impl App {
         // disabled and shows nothing — by design, and vanishingly rare:
         // policy B only fires for an unfocused window.
         self.init_notifications();
+        // Last, and off this thread: the agent-hooks ensure reads and
+        // writes the user's dotfiles under an advisory lock (plan 046
+        // §3.7). The window is up by the time its toast can land, which
+        // is the whole reason it is started from here rather than from
+        // `bootstrap`. Once per process — this function also runs on
+        // every focus and unfocus.
+        agent_hooks::spawn_ensure(
+            &mut self.agent_hooks_started,
+            &self.runtime_handle,
+            &self.feed_tx,
+            &self.config,
+        );
         opened.task
+    }
+
+    /// The startup ensure came back. The toast names the agents the
+    /// record says have never been announced — a refresh on upgrade is
+    /// silent because those are already noticed — and `mark_noticed`
+    /// follows the toast, never precedes it.
+    ///
+    /// The toast is *held*, not shown: it goes up at the end of the
+    /// drain (see [`Self::show_agent_hooks_toast`]) so a PTY error in
+    /// the same batch cannot replace it before any frame has rendered
+    /// it, which would consume `noticed` for a line nobody read.
+    fn agent_hooks_ensured(&mut self, result: agent_hooks::AgentHooksEnsured) {
+        for error in &result.errors {
+            tracing::warn!(error, "agent hooks");
+        }
+        // One line per launch, whether or not there is anything to say —
+        // it is what a support reader (and the E2E) has to tell "the
+        // ensure ran and found nothing to announce" from "the ensure
+        // never ran".
+        tracing::info!(
+            unannounced = result.unnoticed.len(),
+            errors = result.errors.len(),
+            "agent hooks startup ensure finished"
+        );
+        let Some(toast) = agent_hooks::wired_toast(&result.unnoticed, None) else {
+            return;
+        };
+        self.pending_agent_hooks_toast = Some((toast, result.unnoticed));
+    }
+
+    /// Ask a host that has just connected to bring its agent hooks in
+    /// line with this client's config (plan 046 §3.4).
+    ///
+    /// The config is read here, on every connect, rather than captured
+    /// when the connection was opened: a reconnect after the user edited
+    /// `agent-hooks` has to carry the new answer, and this is the only
+    /// place that runs on both the first connect and every retry.
+    fn wire_host_agent_hooks(&mut self, host: &str) {
+        let (mode, skip) = agent_hooks::remote_request(&self.config);
+        self.hosts
+            .wire_agent_hooks(host, mode, &skip, &agent_hooks::client_label());
+    }
+
+    /// A host answered `session.set_agent_hooks`.
+    ///
+    /// The toast is the local one with `on <host>: ` in front of it, and
+    /// it is at most once per agent per *host*: the session flips its own
+    /// record's `noticed` for whatever it reports as wired, so a second
+    /// client — or this one after a reconnect — hears nothing.
+    ///
+    /// Nothing here is fatal. A session that predates the op, a `$HOME`
+    /// the daemon could not read, a codex file it refused to parse: each
+    /// is a log line, and the attachment the user actually asked for is
+    /// untouched.
+    fn host_agent_hooks_set(&mut self, reply: agent_hooks::HostAgentHooks) {
+        let result = match reply.outcome {
+            Ok(result) => result,
+            Err(error) => {
+                // The connection task already said its one line for an
+                // `unknown-op`, so this level would be a second copy of
+                // it on every reconnect.
+                if matches!(
+                    error,
+                    crate::host_conn::HostOpError::Rejected {
+                        code: roost_ipc::client::ServerCode::UnknownOp,
+                        ..
+                    }
+                ) {
+                    tracing::debug!(host = %reply.label, %error, "agent hooks");
+                } else {
+                    tracing::warn!(host = %reply.label, %error, "could not set a host's agent hooks");
+                }
+                return;
+            }
+        };
+        for failure in &result.errors {
+            tracing::warn!(
+                host = %reply.label,
+                agent = %failure.agent,
+                error = %failure.error,
+                "agent hooks"
+            );
+        }
+        tracing::info!(
+            host = %reply.label,
+            unannounced = result.wired.len(),
+            refreshed = result.refreshed.len(),
+            removed = result.removed.len(),
+            errors = result.errors.len(),
+            "a host set its agent hooks"
+        );
+        let (agents, unknown) = agent_hooks::split_known(&result.wired);
+        // A name this client cannot parse is a *newer host* wiring an
+        // agent this Roost predates. The host has already spent the
+        // record's `noticed` flag on it, so it will never be reported
+        // again — dropping it silently would lose the only announcement
+        // that Roost edited that machine's dotfiles.
+        if !unknown.is_empty() {
+            tracing::warn!(
+                host = %reply.label,
+                agents = unknown.join(", "),
+                "a host wired an agent this Roost does not know; it will not be reported again"
+            );
+        }
+        let Some(toast) = agent_hooks::wired_toast(&agents, Some(&reply.label)) else {
+            return;
+        };
+        // Shown straight away rather than held to the end of the drain
+        // like the local one: there is no `noticed` flag on this side to
+        // spend, so a line that gets replaced costs nothing but itself.
+        tracing::info!(host = %reply.label, toast, "host agent hooks toast shown");
+        self.set_status(toast);
+    }
+
+    /// Put the held agent-hooks toast on the banner, last in its drain.
+    ///
+    /// Called from the tail of `service_engine`, after every other
+    /// `set_status` that batch can reach — the mechanism that makes
+    /// "shown" true before `mark_noticed` makes it permanent. The log
+    /// line is deliberate: no IPC op carries the status banner, so it is
+    /// the only thing the E2E can read the toast text out of.
+    pub(super) fn show_agent_hooks_toast(&mut self) {
+        let Some((toast, agents)) = self.pending_agent_hooks_toast.take() else {
+            return;
+        };
+        tracing::info!(toast, "agent hooks toast shown");
+        self.set_status(toast);
+        agent_hooks::spawn_mark_noticed(&self.runtime_handle, agents);
     }
 
     /// Bring [`App::pill_labels`] up to date with the active project's
@@ -4215,43 +4396,38 @@ impl App {
                             .background(lifecycle_color)
                             .border(iced::border::rounded(4))
                     });
+                // The muted role dims with the rest of the row when the
+                // row can't be activated — `primary_color` is already
+                // the dimmed shade in that case.
+                let muted_color = if actionable {
+                    chrome::MUTED_TEXT
+                } else {
+                    primary_color
+                };
+                let mut left = row![dot].spacing(8).align_y(Alignment::Center);
+                for segment in palette_agent_segments(&agent) {
+                    left = left.push(palette_agent_segment(
+                        segment,
+                        primary_color,
+                        muted_color,
+                        lifecycle_color,
+                    ));
+                }
                 let metrics = agent.metrics_text.unwrap_or_default();
-                let project =
-                    ellipsize_palette_text(&agent.project, PALETTE_AGENT_PROJECT_MAX_COLUMNS);
-                let (name, status) = palette_agent_left_text(&agent.name, &agent.status_text);
-                row![
-                    dot,
-                    container(
-                        text(project)
-                            .size(14)
-                            .font(chrome::chrome_font(font::Weight::Semibold))
-                            .color(primary_color)
-                            .wrapping(iced::widget::text::Wrapping::None)
+                left.push(iced::widget::Space::new().width(Fill))
+                    .push(
+                        text(metrics)
+                            .size(12)
+                            .font(Font::MONOSPACE)
+                            .color(chrome::MUTED_TEXT),
                     )
-                    .max_width(140),
-                    container(
-                        text(name)
-                            .size(14)
-                            .color(primary_color)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                    ),
-                    text(status)
-                        .size(13)
-                        .color(lifecycle_color)
-                        .wrapping(iced::widget::text::Wrapping::None),
-                    iced::widget::Space::new().width(Fill),
-                    text(metrics)
-                        .size(12)
-                        .font(Font::MONOSPACE)
-                        .color(chrome::MUTED_TEXT),
-                    text(agent.time_text)
-                        .size(12)
-                        .font(Font::MONOSPACE)
-                        .color(chrome::MUTED_TEXT)
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .into()
+                    .push(
+                        text(agent.time_text)
+                            .size(12)
+                            .font(Font::MONOSPACE)
+                            .color(chrome::MUTED_TEXT),
+                    )
+                    .into()
             } else {
                 let spans = palette_title_runs(&item.title, &matched.ranges)
                     .into_iter()

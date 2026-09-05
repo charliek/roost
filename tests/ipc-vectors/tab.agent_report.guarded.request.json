@@ -1,0 +1,19 @@
+{
+  "id": "10",
+  "op": "tab.agent_report",
+  "params": {
+    "tab_id": "5",
+    "source": "claude",
+    "session_id": "abc123",
+    "ownership_action": "preserve",
+    "lifecycle": "finished",
+    "lifecycle_if": [
+      "working"
+    ],
+    "attention": "set",
+    "severity": "info",
+    "title": "Claude Code",
+    "body": "Claude is waiting for your input",
+    "detail": "idle_prompt"
+  }
+}

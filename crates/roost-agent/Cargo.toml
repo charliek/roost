@@ -15,5 +15,10 @@ path = "src/lib.rs"
 roost-ipc  = { path = "../roost-ipc" }
 serde_json = "1.0"
 
+[dev-dependencies]
+# A scratch tree for the opencode plugin's behavioural test, which runs
+# the shipped JS under `node` when one is present.
+tempfile = "3"
+
 [lints]
 workspace = true

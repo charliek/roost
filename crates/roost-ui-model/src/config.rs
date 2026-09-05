@@ -4,8 +4,10 @@
 //! normalization: same lenient-line parsing (blank lines and
 //! `#`-comments dropped), same forward-compat (unknown keys silently
 //! ignored), same raw-vs-unquoted split per key. The recognized-key
-//! sets are not identical — `link-modifier` is Rust-UI-only,
-//! `tab-min-width` / `tab-max-width` are Mac-only.
+//! sets are not identical — `link-modifier` and `agent-hooks-skip` are
+//! Rust-only (the Mac app's `roostctl agent ensure` spawn reads the
+//! latter through *this* parser), `tab-min-width` / `tab-max-width` are
+//! Mac-only.
 
 use std::fs;
 use std::io;
@@ -66,6 +68,18 @@ pub struct RoostConfig {
     /// keybind / palette row / Mac View menu item, which writes the
     /// live value straight back here through `set_key`.
     pub show_sidebar_agents: bool,
+
+    /// `agent-hooks` — whether Roost wires the supported coding agents'
+    /// hook entries into their own config files (plan 046). Defaults to
+    /// [`AgentHooks::Auto`].
+    pub agent_hooks: AgentHooks,
+
+    /// `agent-hooks-skip` — agent names never wired, lowercased and in
+    /// source order. Kept as written rather than resolved to a typed
+    /// agent here: this crate has no agent inventory, so the caller that
+    /// does (`roost-agent-install`) is also the one that can name the
+    /// spellings it did not recognise.
+    pub agent_hooks_skip: Vec<String>,
 }
 
 impl Default for RoostConfig {
@@ -82,8 +96,54 @@ impl Default for RoostConfig {
             word_break_chars: DEFAULT_EXTRA_WORD_CHARS.to_string(),
             link_modifier: None,
             show_sidebar_agents: true,
+            agent_hooks: AgentHooks::default(),
+            agent_hooks_skip: Vec::new(),
         }
     }
+}
+
+/// Two-state `agent-hooks` policy (plan 046 §3.6).
+///
+/// * `Auto` (default) — every present agent that is not in
+///   `agent-hooks-skip` gets Roost's hook entries, refreshed on launch.
+/// * `Off` — the UIs wire nothing at startup. It does not *remove*
+///   anything on its own; an explicit `roostctl agent ensure` reads the
+///   same key and takes Roost's entries back out, which is what the
+///   startup toast points at alongside `agent uninstall --all`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AgentHooks {
+    #[default]
+    Auto,
+    Off,
+}
+
+impl AgentHooks {
+    /// Parse a config value. `auto` and `off` are the documented
+    /// spellings; the boolean-ish forms are accepted for the same reason
+    /// [`ClipboardWrite::parse`] accepts them — the key reads like a
+    /// switch and users write it like one. Any other value returns
+    /// `None` so the caller can warn and keep the default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "on" | "true" | "yes" => Some(Self::Auto),
+            "off" | "false" | "no" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Split an `agent-hooks-skip` value into lowercased names, in source
+/// order, without empties or repeats. Names are not validated here —
+/// see [`RoostConfig::agent_hooks_skip`].
+fn parse_agent_skip_list(value: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for name in value.split(',') {
+        let name = name.trim().to_ascii_lowercase();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// Two-state policy for OSC 52 program-initiated clipboard writes.
@@ -258,6 +318,31 @@ impl RoostConfig {
                             "unknown show-sidebar-agents value; falling back to default `true`"
                         );
                     }
+                }
+                "agent-hooks" => {
+                    // A value that does not parse — the empty one
+                    // included — resolves to the *default*, not to
+                    // whatever an earlier line set. The key is last-wins
+                    // like every other scalar here, and the failure it
+                    // must never have is a stray line leaving `off`
+                    // quietly in force: nothing then wires, and nothing
+                    // says why.
+                    cfg.agent_hooks = match AgentHooks::parse(value) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                value,
+                                "unknown agent-hooks value; falling back to default `auto`"
+                            );
+                            AgentHooks::default()
+                        }
+                    };
+                }
+                "agent-hooks-skip" => {
+                    // Empty value is a deliberate "skip nothing", and it
+                    // has to clear an earlier line for the key to stay
+                    // last-wins like every other scalar here.
+                    cfg.agent_hooks_skip = parse_agent_skip_list(value);
                 }
                 "word-break-chars" => {
                     // Empty value is a deliberate user choice meaning
@@ -750,6 +835,118 @@ mod tests {
     fn show_sidebar_agents_unknown_value_keeps_default() {
         let cfg = RoostConfig::parse("show-sidebar-agents = pancakes");
         assert!(cfg.show_sidebar_agents);
+    }
+
+    // ----- agent-hooks / agent-hooks-skip (plan 046 §3.6) ------------
+    // Mirrored 1:1 by `mac/Sources/Roost/Config.swift`'s
+    // `ConfigAgentHooksTests`.
+
+    #[test]
+    fn agent_hooks_defaults_to_auto() {
+        let cfg = RoostConfig::parse("");
+        assert_eq!(cfg.agent_hooks, AgentHooks::Auto);
+        assert!(cfg.agent_hooks_skip.is_empty());
+    }
+
+    #[test]
+    fn agent_hooks_accepts_auto_and_off() {
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = auto").agent_hooks,
+            AgentHooks::Auto
+        );
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = off").agent_hooks,
+            AgentHooks::Off
+        );
+        // Switch spellings, same as `clipboard-write`.
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = false").agent_hooks,
+            AgentHooks::Off
+        );
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = no").agent_hooks,
+            AgentHooks::Off
+        );
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = on").agent_hooks,
+            AgentHooks::Auto
+        );
+    }
+
+    // Quoted and CRLF forms must agree with the Swift mirror.
+    #[test]
+    fn agent_hooks_accepts_quoted_and_crlf_values() {
+        for line in [
+            "agent-hooks = \"off\"",
+            "agent-hooks = 'off'",
+            "agent-hooks = off\r\n",
+            "agent-hooks = \"off\"\r\n",
+            "agent-hooks = OFF",
+        ] {
+            assert_eq!(
+                RoostConfig::parse(line).agent_hooks,
+                AgentHooks::Off,
+                "{line}"
+            );
+        }
+    }
+
+    /// An unknown value must not read as `off`: silently disabling the
+    /// wiring on a typo is the failure that is hardest to notice.
+    #[test]
+    fn agent_hooks_unknown_value_keeps_default() {
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = pancakes").agent_hooks,
+            AgentHooks::Auto
+        );
+    }
+
+    /// …and "keeps the default" has to mean the *default*, not "keeps
+    /// whatever an earlier line said". The key is last-wins like every
+    /// other scalar here, so a repeat that does not parse — including
+    /// the empty one, which for its sibling `agent-hooks-skip` is a
+    /// deliberate "nothing" — returns to `auto` rather than leaving an
+    /// earlier `off` silently in force. Mirrored in
+    /// `ConfigAgentHooksTests.repeatedKeyReturnsToTheDefault`.
+    #[test]
+    fn agent_hooks_is_last_wins_including_an_empty_or_invalid_repeat() {
+        for body in [
+            "agent-hooks = off\nagent-hooks =",
+            "agent-hooks = off\nagent-hooks = \"\"",
+            "agent-hooks = off\nagent-hooks = pancakes",
+        ] {
+            assert_eq!(
+                RoostConfig::parse(body).agent_hooks,
+                AgentHooks::Auto,
+                "{body:?} left the earlier `off` in force"
+            );
+        }
+        // The reverse repeat is ordinary last-wins and must still work.
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = auto\nagent-hooks = off").agent_hooks,
+            AgentHooks::Off
+        );
+    }
+
+    #[test]
+    fn agent_hooks_skip_is_a_lowercased_comma_list_in_source_order() {
+        let cfg = RoostConfig::parse("agent-hooks-skip = Codex, cursor ,, codex,grok");
+        assert_eq!(cfg.agent_hooks_skip, vec!["codex", "cursor", "grok"]);
+    }
+
+    /// The key is scalar, so a later line replaces an earlier one —
+    /// including with the empty list, which is how a user turns an
+    /// inherited skip list back off.
+    #[test]
+    fn agent_hooks_skip_is_last_wins_including_empty() {
+        let cfg = RoostConfig::parse("agent-hooks-skip = codex\nagent-hooks-skip =");
+        assert!(cfg.agent_hooks_skip.is_empty());
+    }
+
+    #[test]
+    fn agent_hooks_skip_accepts_a_quoted_value() {
+        let cfg = RoostConfig::parse("agent-hooks-skip = \"codex, grok\"");
+        assert_eq!(cfg.agent_hooks_skip, vec!["codex", "grok"]);
     }
 
     // ----- unquote semantic (mirrors Config.swift's `unquote`) -------

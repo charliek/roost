@@ -687,11 +687,12 @@ Request:
 | `session_id` | string | opaque per-source session id; empty for sources with no session concept (`manual`, `legacy`). Ownership identity is the **pair** `(source, session_id)` — not `session_id` alone, since two agents could otherwise collide on an opaque id |
 | `ownership_action` | `"claim"` \| `"preserve"` \| `"release"` | **required, no default** — "take the tab" and "I already own it" have opposite failure modes, so there's no safe implicit choice |
 | `lifecycle` | `AgentLifecycle` | **optional; omitted means "leave the current lifecycle unchanged."** Present only on events that actually move it |
+| `lifecycle_if` | array of `AgentLifecycle` | **optional; omitted means unconditional** (every pre-046 client). A guard on the tab's *current* lifecycle — see [Guarded reports](#guarded-reports) below |
 | `attention` | `"set"` \| `"clear"` \| `"preserve"` | defaults to `"preserve"` |
 | `severity` | `"info"` \| `"warn"` \| `"error"` | defaults to `"info"`. Carried on the model now so a later policy revision can have `failed` interrupt regardless of focus; v1's notification policy does not yet consult it |
 | `title` / `body` | string | required when `attention == "set"` (`invalid-param` if missing), ignored otherwise |
 | `detail` | string | free-form reason for the report (`"permission_prompt"`, `"background_tasks:2"`, an error name…); recorded onto the ownership record when non-empty |
-| `metadata` | map<string, string> | **open extension channel.** The params struct carries `#[serde(deny_unknown_fields)]` per repo convention, so a new *named* field on this op would not actually be additive — both server implementations would need to change. `metadata` is the channel that genuinely is |
+| `metadata` | map<string, string> | **open extension channel** — the one field a client may extend without coordinating with the server. The params struct carries `#[serde(deny_unknown_fields)]` per the strict-server convention above, so a new *named* field on this op is a **request-schema change**, not an additive one: an older UI or `roost-session` answers `unknown-field` and drops the whole report, attention included. `lifecycle_if` was added that way in plan 046 — both server implementations changed together, and `protocol_version` did not move because `roostctl` and the UI ship as one build. Anything an adapter can express as data belongs in `metadata` instead |
 
 `ownership_action` semantics, enforced under one lock so the check and
 the mutation can't race a concurrent report:
@@ -709,6 +710,49 @@ the mutation can't race a concurrent report:
 * **`release`** also requires a match; it clears ownership and forces
   `lifecycle` to `"inactive"`.
 
+#### Guarded reports
+
+`lifecycle_if` makes a report conditional on where the tab already
+stands, so an adapter can say "this only means something if the turn was
+still running" without reading state first:
+
+```json
+{"id": "10", "op": "tab.agent_report", "params": {
+  "tab_id": "5",
+  "source": "claude",
+  "session_id": "abc123",
+  "ownership_action": "preserve",
+  "lifecycle": "waiting",
+  "lifecycle_if": ["working"],
+  "attention": "set",
+  "severity": "info",
+  "title": "Claude Code",
+  "body": "Claude is waiting for your input",
+  "detail": "idle_prompt"
+}}
+```
+
+* Current lifecycle **in** the set — the report applies in full.
+* Current lifecycle **not in** the set — the `lifecycle` patch **and**
+  any `attention: "set"` are dropped. A transition that did not happen
+  is not news: agents nag on a timer (Claude's `idle_prompt` ~60s after
+  a turn ended, cursor's repeated `stop`), and an unguarded nag
+  re-banners a turn the user already saw finish. `detail` and `metadata`
+  still merge, and `attention: "clear"` still applies.
+* A `release`'s **lifecycle** is exempt: it clears ownership and forces
+  `"inactive"` wherever the lifecycle stood — a guard cannot keep a
+  departed agent's dot alive. Its `attention: "set"` is **not** exempt
+  and is gated like any other, so an adapter can say "announce the
+  session ending only if the turn was still running".
+* An omitted `lifecycle_if` is unconditional — the behaviour every
+  client had before plan 046.
+
+The interaction worth knowing: the OSC 133 failsafe (`A`/`B`/`D` drops
+the lifecycle to `"inactive"` while keeping ownership as a label) leaves
+a tab whose agent is gone but still owned. A later report guarded on
+`["working"]` then correctly no-ops instead of re-lighting a dead
+agent's dot.
+
 Response:
 ```json
 {"id": "9", "ok": true, "result": {
@@ -721,6 +765,12 @@ Response:
 check above — `tab` is then the tab **unchanged**. The full `Tab` is
 always returned so an adapter never needs a follow-up `tab.list` to
 see what its own report did.
+
+A report vetoed by `lifecycle_if` is **not** a rejected one: `accepted`
+stays `true` (the ownership check passed) and the returned `tab` simply
+shows the unchanged `agent_lifecycle`. `accepted` answers "did this
+report belong to the tab's owner", never "did the lifecycle move" —
+compare the returned `agent_lifecycle` for that.
 
 ### `notification.create`
 
@@ -1267,12 +1317,18 @@ tabs Roost itself claimed via `manual`/`legacy` ownership). Its rows carry
 an additional `agent` object, absent on every other frame's rows:
 
 ```json
-{"id": "agent:3", "title": "roost · slauth-refactor",
- "agent": {"effective_lifecycle": "waiting", "project": "roost",
-           "name": "slauth-refactor", "status_text": "Waiting for input",
-           "time_text": "2m", "metrics_text": "4f +86 -12"}}
+{"id": "agent:3", "title": "Claude Code · roost · slauth-refactor",
+ "agent": {"effective_lifecycle": "waiting", "agent": "Claude Code",
+           "project": "roost", "name": "slauth-refactor",
+           "status_text": "Waiting for input", "time_text": "2m",
+           "metrics_text": "4f +86 -12"}}
 ```
 
+`agent` is the display name derived from the tab's ownership source —
+`Claude Code` / `Codex` / `OpenCode` / `Grok` / `Cursor` for the five
+built-in adapters, and the raw source string verbatim for anything
+else (adding a sixth adapter never requires touching this table) —
+folded into `title` as its leading `·`-separated segment.
 `effective_lifecycle` is one of `working` / `waiting` / `finished` /
 `failed` / `inactive` — the same value the tab pill and sidebar rollup
 render, so this row can never disagree with them. `metrics_text` is
@@ -1447,13 +1503,17 @@ apart.
 
 The order a client runs them in is `session.identify` →
 `session.connect` → `session.set_theme` / `session.set_focus` →
-`events.subscribe` / `tab.attach`. Only the lease part of that is
+`events.subscribe` / `tab.attach`, with `session.set_agent_hooks`
+queued behind them. Only the lease part of that is
 enforced: `identify` is a stateless read and nothing requires it first,
 but the lease *is* required, and the ops that need it say so by name.
-The two `set_*` ops are placed where they are because both state
-something the session would otherwise guess wrong — its palette and
-whose window is looking at it — and both are re-stated whenever the
-client's own answer changes.
+The three `set_*` ops are placed where they are because each states
+something the session would otherwise guess wrong — its palette, whose
+window is looking at it, and whether the user wants agent hooks on this
+machine — and each is re-stated whenever the client's own answer
+changes. `set_agent_hooks` is last and off the critical path on purpose:
+it is the only one that touches the filesystem, so a client queues it
+rather than waiting on it.
 
 ### Session sockets
 
@@ -1739,6 +1799,48 @@ The middle one is what keeps the reset independent of ordering: a client re-dial
 A client therefore re-states its focus right after `session.connect`, and again whenever its window focus or selection moves — including when the session's own `active.changed` reports a move away from the stated focus (a lease-free `tab.focus` from a script would otherwise park the suppressed slot on a tab nobody is watching until the client's next natural edge). A session one release older answers `unknown-op`, which is a refusal like any other: the connection is unaffected and the client keeps HS-2's behavior (the attached tab suppresses its own notifications). The reverse pairing — a session with this op driven by an older client that never sends it — errs the loud way: the connect-time reset leaves the session unfocused, so nothing is suppressed and the attached tab's notifications fire rather than vanish.
 
 Like `session.connect`, this answers `shutting-down` once `session.stop` has latched — the latch is checked *before* the lease gate, so a stopping session says so rather than sending a client off to reconnect.
+
+### `session.set_agent_hooks`
+
+Bring the host's agent hook entries in line with the connected client's `agent-hooks` configuration. Lease-gated: this one writes files under the session user's `$HOME`, so only the client driving the session may send it.
+
+Request:
+```json
+{"id": "11", "op": "session.set_agent_hooks", "params": {
+  "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+  "mode": "auto",
+  "skip": ["cursor"],
+  "client": "charlie-mbp"
+}}
+```
+
+Response:
+```json
+{"wired": ["claude", "codex"], "refreshed": [], "removed": [],
+ "skipped": [{"agent": "cursor", "reason": "skip-list"},
+             {"agent": "grok", "reason": "not installed"}],
+ "errors": []}
+```
+
+`mode` is `auto` or `off` — the same two values `agent-hooks` takes in [`config.md`](config.md#agent-hooks); any other spelling is `invalid-param` rather than a silent default in either direction. `skip` is the client's `agent-hooks-skip` list **verbatim**: the host resolves the names and reports back any it does not recognise as a skip with reason `no agent named that (…)`, because only the host can tell a typo from an agent a newer client knows about, and neither is a reason to refuse the run. `skip` may be omitted (an empty list); `client` may not — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
+
+**`off` removes, it does not abstain.** On the client's own machine `agent-hooks = off` means "wire nothing", and the UI never opens an agent's config file. Here it means "unwire": a host has no `config.conf` of its own to consult, so the client is the only authority that can tell it to come clean, and an `off` that did nothing remotely would leave a host's entries in place with no way to remove them short of an ssh session. Off is off everywhere.
+
+**`wired` is the toast list, not this call's writes.** It names the agents this host has wired and has never announced to *any* client — the session flips its record's `noticed` for exactly what it reports here, in the same locked write that recorded the wiring, so the sentence "Roost wired agent hooks on ‹host›" appears at most once per agent per host even when two clients connect at the same moment, and including for a wiring done by `roostctl agent ensure` on the host itself. A reconnect, or a second client, gets an empty `wired`. `refreshed` and `removed` *are* this call's writes.
+
+**A per-agent failure is reported, never raised.** A `config.toml` the host could not parse, a read-only file, a file that changed underneath the plan: each is an entry in `errors` beside a successful reply, because the wiring is not what the client dialed in for and must not cost it the session it just attached to. Only a whole-run failure — no `$HOME`, an unwritable state record, an install lock another writer held past its deadline — is an error frame (`internal`).
+
+**The lease is checked again at the point of effect, and a displaced client hears `taken-over`.** The install engine holds one advisory lock per home across plan and apply, so this op can wait behind another writer; neither dropping the client's connection nor the client's own 15 s timeout cancels a run already under way on the host. A request admitted under a lease that has since been taken over would otherwise finish afterwards and rewrite the files — and the state record — against the policy of whoever displaced it. So the session re-asks whose lease is live once it owns the lock and before it plans anything: still current, the run proceeds; taken over, nothing is written and the reply is `taken-over` like any other lease-gated op. Two clients that each *hold* the lease in turn are still last-writer-wins (below); one acting after it lost the lease is not. The wait for that lock is itself bounded — a lock nobody releases is a whole-run `internal` failure rather than a request that never answers, because this op holds the mutation barrier [`session.stop`](#sessionstop) waits on.
+
+**A client sends this after every `session.connect`**, with its own config values, because the op is idempotent and a config edit made since the last connect has no other way to reach the host. It is *queued* rather than chained into the connect: an error in the chain fails the whole attempt, and an ensure on a network-mounted `$HOME` would hold hydration up behind file I/O nothing is waiting on. A session that predates the op answers `unknown-op`, which is a refusal like any other — the connection is unaffected, and the client logs one line, once, for as long as it keeps dialling that host. It is deliberately not one line per connection: the op is re-sent on every connect and a dropped localhost session reconnects on a 250 ms ladder, so the latch outlives the connection, exactly like the fact it records.
+
+**Two clients that disagree flip the files on every reconnect.** Last writer wins, by design: the record stores `by` and `wired_at`, the session logs each run, and `roostctl agent status` on the host shows who did what. Reconciling them is future work.
+
+No new authority: a client that holds this session's lease can already [`tab.open`](#tabopen) an arbitrary command on the host.
+
+Served only by a session built with an install backend. A session without one answers `not-supported` rather than reporting an empty success; a UI socket answers `unknown-op` like every other `session.*` op.
+
+Like `session.connect`, this answers `shutting-down` once `session.stop` has latched — and it is in the latched set deliberately, because entries wired after a stop would point at a `roostctl` reporting to a socket the session is about to unlink.
 
 ### `tab.attach`
 

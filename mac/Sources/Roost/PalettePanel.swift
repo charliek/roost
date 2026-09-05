@@ -612,13 +612,18 @@ private final class PaletteCellView: NSView {
     }
 }
 
-/// The agents-frame row (plan 005 §3.4): status dot, bold project, name,
-/// colored status, then right-aligned monospace metrics + elapsed time.
-/// Its own cell class — and so its own `NSTableView` reuse queue —
-/// because it shares no widget with the generic title/subtitle row.
-private final class PaletteAgentCellView: NSView {
+/// The agents-frame row (plan 005 §3.4, plan 046 §3.7): status dot, the
+/// agent's display name, bold project, name, colored status, then
+/// right-aligned monospace metrics + elapsed time. Its own cell class —
+/// and so its own `NSTableView` reuse queue — because it shares no
+/// widget with the generic title/subtitle row.
+///
+/// Internal (not `private`) so `PaletteAgentCellTests` can configure one
+/// and read its rendered left column back.
+final class PaletteAgentCellView: NSView {
     static let id = NSUserInterfaceItemIdentifier("PaletteAgentCell")
     private let dot = NSView()
+    private let agentName = NSTextField(labelWithString: "")
     private let project = NSTextField(labelWithString: "")
     private let name = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
@@ -630,8 +635,23 @@ private final class PaletteAgentCellView: NSView {
     /// Diameter of the leading status dot. Matches the now-removed GTK
     /// UI's `AGENT_DOT_PX`.
     private static let dotSize: CGFloat = 8
+    /// The agent name's ceiling, the AppKit counterpart of the iced
+    /// row's `PALETTE_AGENT_NAME_MAX_COLUMNS`: a third-party
+    /// `ownership.source` renders verbatim (plan 046 AD-8), so without a
+    /// bound it would push the project out of the row.
+    private static let agentMaxWidth: CGFloat = 110
     private static let metricsFont = NSFont.monospacedSystemFont(
         ofSize: 12, weight: .regular)
+
+    /// The left column as it is actually laid out, in order — read off
+    /// the live stack rather than from stored copies, so a label that
+    /// never reaches the row can't pass for a rendered one.
+    var renderedLeftColumn: [String] {
+        left.arrangedSubviews.compactMap { view in
+            guard let label = view as? NSTextField, !label.isHidden else { return nil }
+            return label.stringValue
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -640,6 +660,12 @@ private final class PaletteAgentCellView: NSView {
         dot.wantsLayer = true
         dot.layer?.cornerRadius = Self.dotSize / 2
 
+        // One step quieter than the project, which stays the row's
+        // anchor — the same muted role the metrics column wears, and the
+        // counterpart of iced's `chrome::MUTED_TEXT` on that segment.
+        agentName.font = .systemFont(ofSize: 14)
+        agentName.textColor = AgentPalette.metricsColor(.muted)
+        agentName.lineBreakMode = .byTruncatingTail
         project.font = .systemFont(ofSize: 14, weight: .bold)
         project.textColor = .white
         name.font = .systemFont(ofSize: 14)
@@ -657,12 +683,13 @@ private final class PaletteAgentCellView: NSView {
             label.alignment = .right
         }
 
-        // The left group reads dot → project → name → status; the slack
-        // sits between the status and the right column, so status trails
-        // the name instead of floating away from it. The name truncates
-        // first, then the status; project, metrics, and time are never
-        // truncated (§3.2).
+        // The left group reads dot → agent → project → name → status;
+        // the slack sits between the status and the right column, so
+        // status trails the name instead of floating away from it. The
+        // name truncates first, then the agent name and the status;
+        // project, metrics, and time are never truncated (§3.2).
         project.setContentCompressionResistancePriority(.required, for: .horizontal)
+        agentName.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         status.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         for label in [metrics, time] {
@@ -675,6 +702,7 @@ private final class PaletteAgentCellView: NSView {
         left.alignment = .centerY
         left.spacing = 8
         left.addArrangedSubview(dot)
+        left.addArrangedSubview(agentName)
         left.addArrangedSubview(project)
         left.addArrangedSubview(name)
         left.addArrangedSubview(status)
@@ -691,6 +719,7 @@ private final class PaletteAgentCellView: NSView {
         NSLayoutConstraint.activate([
             dot.widthAnchor.constraint(equalToConstant: Self.dotSize),
             dot.heightAnchor.constraint(equalToConstant: Self.dotSize),
+            agentName.widthAnchor.constraint(lessThanOrEqualToConstant: Self.agentMaxWidth),
             left.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             left.centerYAnchor.constraint(equalTo: centerYAnchor),
             left.trailingAnchor.constraint(lessThanOrEqualTo: right.leadingAnchor, constant: -12),
@@ -707,9 +736,15 @@ private final class PaletteAgentCellView: NSView {
     ///
     /// A nil `metricsText` is the *pending* state and renders nothing; a
     /// resolved probe renders its string (which may itself be `"—"`).
+    ///
+    /// An empty agent display name (a source that is itself empty) drops
+    /// the label out of the stack rather than leaving a gap, the way the
+    /// pending metrics column does.
     func configure(_ agent: AgentRowData) {
         let color = AgentPalette.statusColor(for: agent.effectiveLifecycle)
         dot.layer?.backgroundColor = color.cgColor
+        agentName.stringValue = agent.agent
+        agentName.isHidden = agent.agent.isEmpty
         project.stringValue = agent.project
         name.stringValue = agent.name
         status.stringValue = agent.statusText

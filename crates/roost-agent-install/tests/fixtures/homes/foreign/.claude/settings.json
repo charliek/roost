@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"stopped: $ROOST_AGENT_HOOK\" >> /home/fixture/hooks.log",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"$ROOST_AGENT_HOOK\" ] && \"$ROOST_AGENT_HOOK\" agent-hook claude 2>>/home/fixture/hook.log; then :; else cat >/dev/null; printf \"{}\"; fi'",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

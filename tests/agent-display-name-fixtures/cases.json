@@ -1,0 +1,30 @@
+{
+  "cases": [
+    { "name": "claude", "source": "claude", "expect": "Claude Code" },
+    { "name": "codex", "source": "codex", "expect": "Codex" },
+    { "name": "opencode", "source": "opencode", "expect": "OpenCode" },
+    { "name": "grok", "source": "grok", "expect": "Grok" },
+    { "name": "cursor", "source": "cursor", "expect": "Cursor" },
+    {
+      "name": "unrecognized-third-party-source-renders-verbatim",
+      "source": "aider",
+      "expect": "aider"
+    },
+    {
+      "name": "wrong-casing-does-not-match-and-passes-through",
+      "source": "Claude",
+      "expect": "Claude"
+    },
+    {
+      "name": "roosts-own-internal-manual-source-is-not-special-cased-here",
+      "source": "manual",
+      "expect": "manual"
+    },
+    {
+      "name": "roosts-own-internal-legacy-source-is-not-special-cased-here",
+      "source": "legacy",
+      "expect": "legacy"
+    },
+    { "name": "empty-source-passes-through-empty", "source": "", "expect": "" }
+  ]
+}

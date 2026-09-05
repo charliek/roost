@@ -29,6 +29,43 @@ release workflow asserts they agree).
   code the UI socket already speaks (a latched `session.stop`, say) now
   reports as the new `host-unavailable`, with the session's own sentence
   kept in the message.
+- **Five coding agents get the tab dot, automatically (plan 046)** — Claude
+  Code, Codex, grok (and its fork gx), cursor-agent, and OpenCode all now
+  drive the running/needs-input/idle/failed indicator, the sidebar rollup,
+  and the desktop banner, on local tabs and on host-session tabs alike.
+  Wiring happens by itself the first time Roost starts (`agent-hooks = auto`
+  in `config.conf`, the default): Roost merges one hook entry per event into
+  each present agent's own config file (`~/.claude/settings.json`,
+  `~/.codex/hooks.json` + `config.toml`, `$GROK_HOME/hooks/roost.json`,
+  `~/.cursor/hooks.json`, an OpenCode plugin) beside whatever else is
+  already there, pointed at a new `$ROOST_AGENT_HOOK` environment variable
+  every tab gets rather than a baked-in absolute path — so the exact same
+  entry works after a relocated install, on a second machine, or over a
+  host session, and is inert (drains stdin, answers `{}`) on a machine
+  where Roost isn't running — every reference in it is spelled
+  `${NAME:-}`, because grok checks a hook's variables itself before it
+  spawns a shell and would otherwise draw a red "hook not executed" row per
+  tool call in any non-Roost terminal; codex's `SessionEnd`/`Interrupt`
+  entries carry its 3 s cap so it stops warning about clamping them on
+  every launch. `roostctl agent ensure/install/uninstall/status`
+  are the manual controls; `agent-hooks-skip` opts individual agents out;
+  `agent-hooks = off` stops future wiring, and `roostctl agent uninstall
+  --all` (or a fresh `agent ensure`, which reads the same key) takes
+  Roost's entries back out — to the byte where the format allows it
+  (TOML), or semantically where it can't (JSON — see the [Agent
+  Hooks](docs/guides/agents.md#the-guarantee) guide for the guarantee
+  stated in full). A connecting host session gets
+  the same treatment via a new `session.set_agent_hooks` op, sent after
+  every connect with the client's own config — `off` on a host means
+  unwire, since there's no one there to clean up by hand otherwise. Riding
+  along: the long-standing defect where approving a Claude permission
+  prompt left the dot orange until the whole turn ended is fixed (Claude
+  now hears `PreToolUse`/`PostToolUse`, so the dot returns to blue when the
+  approved tool finishes); `roostctl doctor` gains a per-agent `Agents`
+  section (wired version, ownership, codex's hook-trust hash, a warning if
+  the retired `~/.config/roost/claude-settings.json` is still around); and
+  the agents palette (`Cmd-Shift-O` / `Alt-Shift-O`) now names which agent
+  owns each row instead of just `project · tab`.
 
 ### Changed
 
@@ -38,6 +75,25 @@ release workflow asserts they agree).
   silently accepted, are now refused. Every first-party caller already
   writes the canonical form; this should only bite a caller that relied
   on the old laxness.
+- **Claude's post-turn nag no longer banners a session you already saw
+  finish (plan 046).** The `idle_prompt` notification Claude fires ~60
+  seconds after a turn goes quiet used to raise an info banner
+  unconditionally, including for a turn that had already reported
+  `finished` (or `failed`, or `waiting`) by other means. It's now guarded
+  to only fire from a `working` tab, so it can move a genuinely-still-open
+  turn to finished but can no longer re-announce, or overwrite, a state you
+  already saw. Cursor's `stop` (fired up to three times per turn) and
+  grok/gx's own idle nag are guarded the same way, for the same reason.
+- **`roostctl claude install` merges directly into `~/.claude/settings.json`
+  instead of writing a separate settings file and a shell alias (plan
+  046)** — it's now a bare alias of the new `roostctl agent install claude`.
+  It no longer writes `~/.config/roost/claude-settings.json` or prints an
+  `alias claude='claude --settings ...'` snippet, and it exits 0 rather
+  than 1 when Claude is already wired (there is no `--force` any more). If
+  you're on the old alias, `roostctl doctor`'s new
+  `agent.claude.legacy_settings` check names the two cleanup steps — see
+  the [Agent Hooks](docs/guides/agents.md#legacy-claude-settings)
+  guide.
 
 ### Fixed
 

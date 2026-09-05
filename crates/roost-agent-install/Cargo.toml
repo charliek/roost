@@ -1,0 +1,36 @@
+[package]
+name        = "roost-agent-install"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Writes Roost's hook entries into the supported agents' own config files, and takes them out again. Plan/apply split, exact-match ownership, atomic writes."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+roost-agent = { path = "../roost-agent" }
+
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+thiserror  = { workspace = true }
+
+# The codex trust hash (`crates/roost-agent-install/src/codex_hash.rs`).
+sha2 = { workspace = true }
+
+# `~/.codex/config.toml` is the user's own file: comment-bearing,
+# hand-edited, and full of tables Roost has no business reformatting. A
+# `serde` round-trip through a value type drops every comment in it, so
+# the codex writer edits the document in place instead.
+toml_edit = "0.25"
+
+[dev-dependencies]
+# Fixture home trees are copied out of `tests/fixtures/homes/` before
+# `apply` touches them, so no test ever writes into the source tree.
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -37,7 +37,7 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 | `Cmd-Shift-P`    | Open the command palette (fuzzy-find + run any command) |
 | `Cmd-Shift-T`    | Open the command launcher (run a configured `command =` entry in a new tab) |
 | `Cmd-Shift-E`    | Open the custom palette (script-backed `provider =` menus — see [Extending Roost](../guides/extending.md)) |
-| `Cmd-Shift-O`    | Open the agent palette (jump to a running agent, listed by urgency with status, elapsed time, and git metrics) |
+| `Cmd-Shift-O`    | Open the agent palette (jump to a running agent, listed by urgency, each row naming the agent alongside status, elapsed time, and git metrics) |
 
 ### Clipboard
 
@@ -93,7 +93,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-Shift-P`    | Open the command palette (fuzzy-find + run any command) |
 | `Alt-Shift-T`    | Open the command launcher (run a configured `command =` entry in a new tab) |
 | `Alt-Shift-E`    | Open the custom palette (script-backed `provider =` menus — see [Extending Roost](../guides/extending.md)) |
-| `Alt-Shift-O`    | Open the agent palette (jump to a running agent, listed by urgency with status, elapsed time, and git metrics) |
+| `Alt-Shift-O`    | Open the agent palette (jump to a running agent, listed by urgency, each row naming the agent alongside status, elapsed time, and git metrics) |
 
 ### Clipboard
 

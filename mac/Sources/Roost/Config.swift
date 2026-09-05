@@ -76,6 +76,31 @@ enum ClipboardWrite: Sendable {
     }
 }
 
+/// Two-state `agent-hooks` policy (plan 046 §3.6).
+///
+/// `.auto` (the default) lets Roost wire the supported coding agents'
+/// hook entries into their own config files. `.off` means this app
+/// wires nothing at launch — it does not *remove* anything on its own;
+/// `roostctl agent ensure` reads the same key and is the explicit verb
+/// that takes Roost's entries back out.
+///
+/// Mirrors `crates/roost-ui-model/src/config.rs::AgentHooks`, including
+/// the switch spellings.
+enum AgentHooks: Sendable {
+    case auto
+    case off
+
+    static let `default`: AgentHooks = .auto
+
+    static func parse(_ s: String) -> AgentHooks? {
+        switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "auto", "on", "true", "yes": return .auto
+        case "off", "false", "no": return .off
+        default: return nil
+        }
+    }
+}
+
 /// Parse a plain boolean config value (`true | yes` / `false | no`).
 /// Mirrors `ClipboardWrite.parse` / `CopyOnSelect.parse`'s
 /// optional-returning shape so every boolean key in `parse(_:)` below
@@ -148,6 +173,18 @@ struct RoostConfig: Sendable {
     /// `crates/roost-ui-model/src/config.rs::RoostConfig::show_sidebar_agents`
     /// (shared by iced).
     var showSidebarAgents: Bool = true
+    /// `agent-hooks` — whether Roost wires the supported coding
+    /// agents' hook entries into their own config files (plan 046
+    /// §3.6). `.off` stops the launch-time `roostctl agent ensure`
+    /// spawn in `applicationDidFinishLaunching`. Mirrors
+    /// `crates/roost-ui-model/src/config.rs::RoostConfig::agent_hooks`.
+    ///
+    /// Its companion key `agent-hooks-skip` has no Swift mirror on
+    /// purpose: the only thing on this platform that acts on it is the
+    /// `roostctl` this app spawns, and that process reads the same
+    /// `config.conf` through the Rust parser. A second copy here could
+    /// only disagree with it.
+    var agentHooks: AgentHooks = .default
 
     static let empty = RoostConfig(
         themeName: nil,
@@ -161,7 +198,8 @@ struct RoostConfig: Sendable {
         copyOnSelect: .default,
         clipboardWrite: .default,
         wordBreakChars: WordSelection.defaultWordChars,
-        showSidebarAgents: true
+        showSidebarAgents: true,
+        agentHooks: .default
     )
 
     /// Read `~/.config/roost/config.conf`. Returns `.empty` when
@@ -401,6 +439,21 @@ func parse(_ text: String) -> RoostConfig {
             } else {
                 NSLog(
                     "roost-mac: unknown show-sidebar-agents value '%@'; keeping default 'true'",
+                    value
+                )
+            }
+        case "agent-hooks":
+            // A value that does not parse — the empty one included —
+            // resolves to the *default*, not to whatever an earlier line
+            // set. Last-wins like every other scalar here, and the
+            // failure it must never have is a stray line leaving `off`
+            // quietly in force. Mirrors the Rust parser.
+            if let v = AgentHooks.parse(value) {
+                cfg.agentHooks = v
+            } else {
+                cfg.agentHooks = .default
+                NSLog(
+                    "roost-mac: unknown agent-hooks value '%@'; falling back to default 'auto'",
                     value
                 )
             }

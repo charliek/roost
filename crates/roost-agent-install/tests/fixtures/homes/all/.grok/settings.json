@@ -1,0 +1,6 @@
+{
+  "model": "grok-4-fast",
+  "hook_global_sources": [
+    "settings_file"
+  ]
+}

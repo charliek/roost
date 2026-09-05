@@ -14,10 +14,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use roost_ipc::messages::{
-    AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ClipboardEffectTarget, EventBatch, EventEnvelope, ProjectReorderParams, ResponseError,
-    RetrySchedule, SessionBinaryIdentity, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionSetFocusParams, SessionSetThemeParams,
+    AgentHooksMode, AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode,
+    AttachPayloadKind, ClipboardEffectTarget, EventBatch, EventEnvelope, ProjectReorderParams,
+    ResponseError, RetrySchedule, SessionBinaryIdentity, SessionConnectParams,
+    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetAgentHooksParams,
+    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams,
     SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent,
     TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, TabReorderParams, WireProjectRef,
     WireTabRef, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
@@ -845,6 +846,120 @@ fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
             "focused_tab_id": 5,
         }))
         .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// session.set_agent_hooks (plan 046 C8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_set_agent_hooks_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("session.set_agent_hooks.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(
+        request.op,
+        roost_ipc::messages::ops::SESSION_SET_AGENT_HOOKS
+    );
+    let params: SessionSetAgentHooksParams =
+        serde_json::from_value(request.params).expect("decode set_agent_hooks params");
+    assert_eq!(params.lease, LEASE);
+    assert_eq!(params.mode, AgentHooksMode::Auto);
+    assert_eq!(params.skip, vec!["cursor".to_string()]);
+    assert_eq!(params.client, "charlie-mbp");
+    round_trip(&params);
+
+    // The other half of the pin: `off` on the client is `off` on the
+    // host, and it travels as a value of this same op rather than as an
+    // absence of it.
+    let raw = read_vector("session.set_agent_hooks.off.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    let params: SessionSetAgentHooksParams =
+        serde_json::from_value(request.params).expect("decode an off request");
+    assert_eq!(params.mode, AgentHooksMode::Off);
+    assert!(params.skip.is_empty());
+    round_trip(&params);
+
+    let raw = read_vector("session.set_agent_hooks.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: SessionSetAgentHooksResult = serde_json::from_value(resp.result.expect("result"))
+        .expect("decode set_agent_hooks result");
+    assert_eq!(
+        result.wired,
+        vec!["claude".to_string(), "codex".to_string()]
+    );
+    assert!(result.refreshed.is_empty());
+    assert!(result.removed.is_empty());
+    assert!(result.errors.is_empty());
+    let reasons: Vec<(&str, &str)> = result
+        .skipped
+        .iter()
+        .map(|s| (s.agent.as_str(), s.reason.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![("cursor", "skip-list"), ("grok", "not installed")]
+    );
+    round_trip(&result);
+}
+
+/// `mode` is the whole decision, so it is a closed set rather than a
+/// string: a typo has to be `invalid-param` on the wire, not a silent
+/// `auto` that wires a host the user asked to leave alone — nor a silent
+/// `off` that strips one.
+#[test]
+fn session_set_agent_hooks_params_are_strict_about_mode_and_shape() {
+    let ok = serde_json::json!({
+        "lease": LEASE,
+        "mode": "off",
+        "skip": [],
+        "client": "charlie-mbp",
+    });
+    assert!(serde_json::from_value::<SessionSetAgentHooksParams>(ok).is_ok());
+
+    for bad in [
+        serde_json::json!({"lease": LEASE, "mode": "Auto", "client": "c"}),
+        serde_json::json!({"lease": LEASE, "mode": "on", "client": "c"}),
+        serde_json::json!({"lease": LEASE, "mode": true, "client": "c"}),
+    ] {
+        assert!(
+            serde_json::from_value::<SessionSetAgentHooksParams>(bad.clone()).is_err(),
+            "{bad} must not decode"
+        );
+    }
+
+    // `client` is required — the host's record has to name who asked.
+    let missing = serde_json::from_value::<SessionSetAgentHooksParams>(serde_json::json!({
+        "lease": LEASE,
+        "mode": "auto",
+    }))
+    .expect_err("an omitted client must not decode");
+    assert!(missing.to_string().contains("missing field"), "{missing}");
+
+    // `skip` is the one field a client may omit: no skip list is the
+    // ordinary case, and demanding an empty array would break nothing
+    // except hand-written requests.
+    let bare: SessionSetAgentHooksParams = serde_json::from_value(serde_json::json!({
+        "lease": LEASE,
+        "mode": "auto",
+        "client": "charlie-mbp",
+    }))
+    .expect("an omitted skip list is an empty one");
+    assert!(bare.skip.is_empty());
+
+    assert!(
+        serde_json::from_value::<SessionSetAgentHooksParams>(serde_json::json!({
+            "lease": LEASE,
+            "mode": "auto",
+            "client": "charlie-mbp",
+            "tab_id": "5",
+        }))
+        .is_err(),
+        "strict like every other request type"
     );
 }
 

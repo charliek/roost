@@ -2215,6 +2215,59 @@ impl HostConnSet {
         }
     }
 
+    /// Ask one host to bring its agent hooks in line with this client's
+    /// config (plan 046 §3.4).
+    ///
+    /// **Queued, not chained.** It rides the ordinary op queue — the same
+    /// road `session.set_theme` and `session.set_focus` take — rather
+    /// than joining the connect chain in `task::attempt`, and the two
+    /// reasons are both about the attachment: an error there fails the
+    /// whole attempt, and an ensure on a network-mounted `$HOME` would
+    /// hold hydration up behind file I/O this client is not waiting on.
+    /// So the reply comes back on the feed, where a failure costs a log
+    /// line and a toast that does not appear.
+    ///
+    /// Sent on **every** connect with the client's own values, because
+    /// the op is idempotent and a config edit since the last connect has
+    /// no other way to reach the host.
+    pub(crate) fn wire_agent_hooks(
+        &self,
+        host: &str,
+        mode: roost_ipc::messages::AgentHooksMode,
+        skip: &[String],
+        client: &str,
+    ) {
+        let Some(conn) = self.entries.get(host).and_then(|entry| entry.conn.as_ref()) else {
+            return;
+        };
+        let label = conn.label.clone();
+        let reply = conn.ops.call(
+            ops::SESSION_SET_AGENT_HOOKS,
+            serde_json::json!({ "mode": mode, "skip": skip, "client": client }),
+            true,
+        );
+        let feed = self.feed.clone();
+        self.runtime.spawn(async move {
+            let outcome = reply.await.and_then(|value| {
+                serde_json::from_value(value).map_err(|error| {
+                    // A reply this client cannot read is the host's
+                    // answer all the same, so it is reported as a
+                    // refusal rather than dropped.
+                    HostOpError::Rejected {
+                        code: roost_ipc::client::ServerCode::Internal,
+                        message: format!(
+                            "undecodable {} reply: {error}",
+                            ops::SESSION_SET_AGENT_HOOKS
+                        ),
+                    }
+                })
+            });
+            feed.send(crate::engine_feed::EngineFeed::HostAgentHooks(Box::new(
+                crate::app::agent_hooks::HostAgentHooks { label, outcome },
+            )));
+        });
+    }
+
     /// Tell every connected host which of its tabs this client is
     /// looking at — `claim` is the one host tab that is on screen in a
     /// focused window, if any, so at most one host hears a tab and every
