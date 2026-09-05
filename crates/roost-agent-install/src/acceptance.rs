@@ -178,6 +178,62 @@ fn ensure_wires_every_present_agent_and_says_which_were_new() {
     drop(dir);
 }
 
+/// The toast list is the record's, not the run's.
+///
+/// The gap this closes: wire on a machine through one surface that
+/// cannot toast (the Mac app, which has no transient status line and so
+/// leaves `noticed` false on purpose), then start the UI that can. That
+/// second run wires nothing — every agent is already current — so a
+/// toast driven by `outcome.wired` would never fire, and `noticed` would
+/// stay false forever. `unnoticed` is read off the record, so the second
+/// run has something to say and the third does not.
+#[test]
+fn the_second_ensure_still_has_the_unannounced_agents_to_toast() {
+    let (dir, home) = fixture("all");
+
+    let first = wire_all(&home);
+    let mut expected = ALL_AGENTS.to_vec();
+    expected.sort_by_key(|a| a.source());
+    let mut unnoticed = first.unnoticed.clone();
+    unnoticed.sort_by_key(|a| a.source());
+    assert_eq!(unnoticed, expected, "{first:?}");
+
+    // Nobody said anything. A second ensure wires nothing at all — and
+    // still owes the user the sentence.
+    let second = ensure::ensure(&home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    assert!(second.wired.is_empty(), "{second:?}");
+    assert_eq!(second.current.len(), ALL_AGENTS.len(), "{second:?}");
+    let mut unnoticed = second.unnoticed.clone();
+    unnoticed.sort_by_key(|a| a.source());
+    assert_eq!(unnoticed, expected, "{second:?}");
+
+    // Once it has been said, it is never said again — including across
+    // the refresh a version bump would drive.
+    assert!(state::mark_noticed(&home, &ALL_AGENTS).unwrap());
+    let third = ensure::ensure(&home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    assert!(third.unnoticed.is_empty(), "{third:?}");
+    drop(dir);
+}
+
+/// A skipped agent has no record entry, so it is not on the toast list
+/// either — the sentence names what Roost actually wired.
+#[test]
+fn a_skipped_agent_is_never_on_the_toast_list() {
+    let (dir, home) = fixture("all");
+    let outcome = ensure::ensure(
+        &home,
+        ensure::Mode::Auto,
+        &[Agent::Codex],
+        "local",
+        Guard::PERMITTED,
+    )
+    .unwrap();
+    assert!(outcome.is_clean(), "{:?}", outcome.errors);
+    assert!(!outcome.unnoticed.contains(&Agent::Codex), "{outcome:?}");
+    assert!(outcome.unnoticed.contains(&Agent::Claude), "{outcome:?}");
+    drop(dir);
+}
+
 /// W3's first half: on a home with all five agents present, an install
 /// adds Roost's entries and changes nothing else. Comments, key order,
 /// foreign hooks and unrelated settings all survive.

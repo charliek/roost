@@ -20,6 +20,10 @@ roost-agent = { path = "../roost-agent" }
 # `roostctl agent {ensure,install,uninstall,status}`: the only thing in
 # this tree that writes into the user's own agent configs.
 roost-agent-install = { path = "../roost-agent-install" }
+# `agent-hooks` / `agent-hooks-skip`. One parser for the two UIs and the
+# CLI beats a second one that can disagree with it, which is worth the
+# featureless `roost-vt` this drags in (plan 046 §3.6).
+roost-ui-model = { path = "../roost-ui-model" }
 
 tokio   = { workspace = true }
 anyhow  = { workspace = true }

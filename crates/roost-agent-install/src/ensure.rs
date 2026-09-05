@@ -30,11 +30,60 @@ pub enum Mode {
     Off,
 }
 
+/// Resolve `agent-hooks-skip`'s names against the agents this crate can
+/// wire: the ones it recognises, and the spellings it does not.
+///
+/// The unknown half is returned rather than dropped because the only
+/// thing a user gets from a typo'd skip entry is an agent that keeps
+/// being wired, with nothing to say why. Every caller reports the list
+/// on its own surface; none of them treats it as fatal, so a name added
+/// by a newer Roost does not break an older one's config.
+pub fn skip_list<'a>(names: impl IntoIterator<Item = &'a str>) -> (Vec<Agent>, Vec<String>) {
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match Agent::parse(trimmed) {
+            Some(agent) if !known.contains(&agent) => known.push(agent),
+            Some(_) => {}
+            None => unknown.push(trimmed.to_string()),
+        }
+    }
+    (known, unknown)
+}
+
+/// The agent names [`skip_list`] accepts, for a caller's error message.
+pub fn agent_names() -> String {
+    ALL_AGENTS
+        .iter()
+        .map(|agent| agent.source())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// What one `ensure` / `install` / `uninstall` did.
 #[derive(Debug, Default)]
 pub struct Outcome {
-    /// Wired for the first time on this machine — the toast list.
+    /// Wired for the first time **in this run**.
     pub wired: Vec<Agent>,
+    /// Wired on this machine and never announced — every record entry
+    /// whose `noticed` is false, after this run's writes. **This is the
+    /// toast list**, and it is deliberately not [`Self::wired`]: what
+    /// the user has been told is a property of the machine, not of the
+    /// run that happens to be looking (plan 046 §3.3).
+    ///
+    /// Two cases `wired` gets wrong, and this one gets right. The Mac
+    /// app wires through `roostctl` and has no transient status surface,
+    /// so it leaves `noticed` false for the first iced launch to say —
+    /// which that launch would classify as `current` and never mention.
+    /// And a `mark_noticed` that fails leaves the flag false, which is
+    /// the whole retry the design promises.
+    ///
+    /// Only ever set by [`ensure`]; the explicit verbs do not toast.
+    pub unnoticed: Vec<Agent>,
     /// Already wired, brought up to the current integration version.
     pub refreshed: Vec<Agent>,
     /// Wired and current; nothing to do.
@@ -157,8 +206,22 @@ pub fn ensure(
         }
     }
 
+    outcome.unnoticed = unnoticed(&record);
     outcome.wrote |= state::save(home, &record)?;
     Ok(outcome)
+}
+
+/// Every agent the record says is wired and has never been announced.
+///
+/// Read off the record rather than off this run's `wired` list, which is
+/// the difference between "Roost has told you about this agent" and
+/// "this particular process is the one that wired it". See
+/// [`Outcome::unnoticed`].
+fn unnoticed(record: &Record) -> Vec<Agent> {
+    ALL_AGENTS
+        .into_iter()
+        .filter(|agent| state::entry(record, *agent).is_some_and(|entry| !entry.noticed))
+        .collect()
 }
 
 /// Wire exactly these agents, whatever the mode says.
@@ -373,5 +436,37 @@ fn collect_warnings(agent: Agent, plan: &InstallPlan, outcome: &mut Outcome) {
             agent,
             warning: warning.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_skip_list_resolves_names_and_keeps_the_ones_it_cannot() {
+        let (known, unknown) = skip_list(["codex", "Cursor", "gemini", "codex"]);
+        assert_eq!(known, vec![Agent::Codex, Agent::Cursor]);
+        assert_eq!(unknown, vec!["gemini"]);
+    }
+
+    /// gx shares grok's file and reports as grok; it is not a name of
+    /// its own, so skipping by it has to be visible rather than silent.
+    #[test]
+    fn a_name_no_agent_answers_to_is_unknown() {
+        let (known, unknown) = skip_list(["gx"]);
+        assert!(known.is_empty());
+        assert_eq!(unknown, vec!["gx"]);
+    }
+
+    #[test]
+    fn every_agent_can_be_skipped_by_the_name_status_prints() {
+        let names: Vec<&str> = ALL_AGENTS.iter().map(|a| a.source()).collect();
+        let (known, unknown) = skip_list(names);
+        assert_eq!(known, ALL_AGENTS.to_vec());
+        assert!(unknown.is_empty());
+        for agent in ALL_AGENTS {
+            assert!(agent_names().contains(agent.source()), "{}", agent.source());
+        }
     }
 }

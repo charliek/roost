@@ -75,6 +75,7 @@ use crate::{chrome, input};
 // `mod palette` would collide with the `roost_ui_model::palette` import in
 // this module's namespace, so the palette-overlay half of App lives in
 // `palettes` (it hosts the command/agent/provider/notification palettes).
+pub(crate) mod agent_hooks;
 pub(crate) mod bootstrap;
 mod host_dialog;
 pub(crate) mod host_lifecycle;
@@ -1902,6 +1903,16 @@ pub struct App {
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: StatusBanner,
+    /// The one startup agent-hooks ensure has been started (plan 046
+    /// §3.7). `window_opened` also runs on every focus change, so this
+    /// is what keeps a startup act from becoming a focus act.
+    agent_hooks_started: bool,
+    /// The agent-hooks toast, waiting for the end of the drain that
+    /// produced it. Held rather than set on arrival so nothing later in
+    /// the same batch — a PTY error, an OSC action — can replace it
+    /// before a frame ever renders it. See
+    /// [`Self::show_agent_hooks_toast`].
+    pending_agent_hooks_toast: Option<(String, Vec<roost_agent::Agent>)>,
     rename_editor: Option<RenameEditor>,
     rename_input_id: Id,
     rename_focus_requested: bool,
@@ -2254,6 +2265,8 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode,
             status: StatusBanner::default(),
+            agent_hooks_started: false,
+            pending_agent_hooks_toast: None,
             rename_editor: None,
             rename_input_id: Id::unique(),
             rename_focus_requested: false,
@@ -2450,7 +2463,63 @@ impl App {
         // disabled and shows nothing — by design, and vanishingly rare:
         // policy B only fires for an unfocused window.
         self.init_notifications();
+        // Last, and off this thread: the agent-hooks ensure reads and
+        // writes the user's dotfiles under an advisory lock (plan 046
+        // §3.7). The window is up by the time its toast can land, which
+        // is the whole reason it is started from here rather than from
+        // `bootstrap`. Once per process — this function also runs on
+        // every focus and unfocus.
+        agent_hooks::spawn_ensure(
+            &mut self.agent_hooks_started,
+            &self.runtime_handle,
+            &self.feed_tx,
+            &self.config,
+        );
         opened.task
+    }
+
+    /// The startup ensure came back. The toast names the agents the
+    /// record says have never been announced — a refresh on upgrade is
+    /// silent because those are already noticed — and `mark_noticed`
+    /// follows the toast, never precedes it.
+    ///
+    /// The toast is *held*, not shown: it goes up at the end of the
+    /// drain (see [`Self::show_agent_hooks_toast`]) so a PTY error in
+    /// the same batch cannot replace it before any frame has rendered
+    /// it, which would consume `noticed` for a line nobody read.
+    fn agent_hooks_ensured(&mut self, result: agent_hooks::AgentHooksEnsured) {
+        for error in &result.errors {
+            tracing::warn!(error, "agent hooks");
+        }
+        // One line per launch, whether or not there is anything to say —
+        // it is what a support reader (and the E2E) has to tell "the
+        // ensure ran and found nothing to announce" from "the ensure
+        // never ran".
+        tracing::info!(
+            unannounced = result.unnoticed.len(),
+            errors = result.errors.len(),
+            "agent hooks startup ensure finished"
+        );
+        let Some(toast) = agent_hooks::wired_toast(&result.unnoticed, None) else {
+            return;
+        };
+        self.pending_agent_hooks_toast = Some((toast, result.unnoticed));
+    }
+
+    /// Put the held agent-hooks toast on the banner, last in its drain.
+    ///
+    /// Called from the tail of `service_engine`, after every other
+    /// `set_status` that batch can reach — the mechanism that makes
+    /// "shown" true before `mark_noticed` makes it permanent. The log
+    /// line is deliberate: no IPC op carries the status banner, so it is
+    /// the only thing the E2E can read the toast text out of.
+    pub(super) fn show_agent_hooks_toast(&mut self) {
+        let Some((toast, agents)) = self.pending_agent_hooks_toast.take() else {
+            return;
+        };
+        tracing::info!(toast, "agent hooks toast shown");
+        self.set_status(toast);
+        agent_hooks::spawn_mark_noticed(&self.runtime_handle, agents);
     }
 
     /// Bring [`App::pill_labels`] up to date with the active project's

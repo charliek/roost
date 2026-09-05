@@ -1410,6 +1410,7 @@ impl App {
                     tracing::info!("signal requested a graceful quit");
                     self.exit_state.request();
                 }
+                EngineFeed::AgentHooks(result) => self.agent_hooks_ensured(result),
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -1487,6 +1488,12 @@ impl App {
             }
             self.tabs.remove(&key);
         }
+        // Dead last, and after every other `set_status` this drain can
+        // reach: the agent-hooks toast is the one status line whose
+        // being *seen* is then written to disk (`noticed`), so it may
+        // not be quietly overwritten by, say, a PTY error that landed in
+        // the same batch (plan 046 §3.3).
+        self.show_agent_hooks_toast();
         // Idle ticks would otherwise bury every informative record under
         // ~60 empty ones a second.
         if !batch.is_empty() {

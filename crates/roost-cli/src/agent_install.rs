@@ -7,25 +7,32 @@
 //!
 //! `ensure` is what the UIs run at startup and what a host session runs
 //! on connect; the other three are the manual controls the toast points
-//! at. Mode and skip list are **parameters** to the engine, not config
-//! reads: `roostctl` learns them from `agent-hooks` / `agent-hooks-skip`
-//! in a later commit, and until then the verbs here pass what the user
-//! typed.
+//! at.
+//!
+//! Only `ensure` reads the config, and it reads the **same** file and
+//! the same parser the UIs do (`roost-ui-model`), so `agent-hooks = off`
+//! means one thing on this machine rather than one thing per surface.
+//! `install` and `uninstall` are explicit instructions and deliberately
+//! ignore it — `agent install codex` while the key says `off` still
+//! wires codex — and `status` changes nothing at all.
 
 use clap::Subcommand;
 use roost_agent::Agent;
 use roost_agent_install::{
-    ensure, install, status, uninstall, AgentSkip, Guard, Home, Mode, Outcome, Status, ALL_AGENTS,
+    agent_names, ensure, install, skip_list, status, uninstall, AgentSkip, Guard, Home, Mode,
+    Outcome, Status, ALL_AGENTS,
 };
+use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 /// How this client identifies itself in the state record.
 const BY: &str = "local";
 
 #[derive(Subcommand, Debug)]
 pub enum AgentCmd {
-    /// Wire every present agent whose entries are missing or stale.
-    /// What the UIs run at startup; safe to run any number of times, and
-    /// a run with nothing to do writes nothing.
+    /// Wire every present agent whose entries are missing or stale, per
+    /// `agent-hooks` / `agent-hooks-skip` in `config.conf`. Safe to run
+    /// any number of times, and a run with nothing to do writes nothing.
+    /// With `agent-hooks = off` it takes Roost's entries back out.
     Ensure {
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -68,7 +75,10 @@ pub fn run(cmd: &AgentCmd) -> i32 {
     let guard = Guard::from_env();
 
     match cmd {
-        AgentCmd::Ensure { json } => report(ensure(&home, Mode::Auto, &[], BY, guard), *json),
+        AgentCmd::Ensure { json } => {
+            let (mode, skip) = configured();
+            report(ensure(&home, mode, &skip, BY, guard), *json)
+        }
         AgentCmd::Install { agent, all } => match targets(agent.as_deref(), *all) {
             Ok(agents) => report(install(&home, &agents, BY, guard), false),
             Err(code) => code,
@@ -88,6 +98,27 @@ pub fn run(cmd: &AgentCmd) -> i32 {
             }
         },
     }
+}
+
+/// `agent-hooks` / `agent-hooks-skip`, as `ensure` wants them.
+///
+/// A skip name no agent answers to is reported and otherwise ignored:
+/// refusing to run would turn one typo into "no agent is wired and
+/// nothing says why", and silence would do the same without the line.
+fn configured() -> (Mode, Vec<Agent>) {
+    let config = RoostConfig::load_default();
+    let (skip, unknown) = skip_list(config.agent_hooks_skip.iter().map(String::as_str));
+    for name in unknown {
+        eprintln!(
+            "roostctl agent: agent-hooks-skip: no agent named {name:?} ({})",
+            agent_names()
+        );
+    }
+    let mode = match config.agent_hooks {
+        AgentHooks::Auto => Mode::Auto,
+        AgentHooks::Off => Mode::Off,
+    };
+    (mode, skip)
 }
 
 fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, i32> {

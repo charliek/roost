@@ -27,6 +27,11 @@ name = "roost-iced"
 path = "src/main.rs"
 
 [dependencies]
+# The `Agent` inventory the toast names, and the engine that writes the
+# hook entries at startup (plan 046 §3.7). The install crate is all I/O,
+# so every call it gets from here goes to the blocking pool.
+roost-agent = { path = "../roost-agent" }
+roost-agent-install = { path = "../roost-agent-install" }
 roost-engine = { path = "../roost-engine" }
 roost-ipc = { path = "../roost-ipc" }
 roost-ui-model = { path = "../roost-ui-model" }

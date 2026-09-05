@@ -700,6 +700,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 }
             }
         }
+
+        // Last, and off this thread: `roostctl agent ensure` writes into
+        // the user's agent dotfiles under an advisory lock, which is not
+        // something AppKit may wait on (plan 046 §3.7).
+        startAgentHooksEnsure(config: config)
     }
 
     // MARK: - Layout
@@ -5515,7 +5520,11 @@ private final class PresentResumeBox: @unchecked Sendable {
 
 /// `@unchecked Sendable` box so the timeout watchdog (on a background
 /// queue) can terminate the `Process` (which isn't `Sendable`).
-private final class ProcBox: @unchecked Sendable {
+///
+/// Internal rather than file-private: `AgentHooksLaunch.swift` runs the
+/// same spawn-with-a-watchdog shape, and a second copy of these three
+/// boxes would be three more places to get the locking wrong.
+final class ProcBox: @unchecked Sendable {
     let p: Process
     init(_ p: Process) { self.p = p }
 }
@@ -5524,7 +5533,7 @@ private final class ProcBox: @unchecked Sendable {
 /// be read concurrently (a child that fills one pipe while we block on the
 /// other can't deadlock). `@unchecked Sendable` (NSLock-guarded) so it
 /// crosses the dispatch closure boundary.
-private final class PipeDrain: @unchecked Sendable {
+final class PipeDrain: @unchecked Sendable {
     private let fh: FileHandle
     private let lock = NSLock()
     private var data = Data()
@@ -5543,7 +5552,7 @@ private final class PipeDrain: @unchecked Sendable {
 }
 
 /// Tiny thread-safe flag for "the watchdog fired".
-private final class TimeoutFlag: @unchecked Sendable {
+final class TimeoutFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
     func set() {

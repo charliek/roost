@@ -29,23 +29,28 @@ bare `bash --norc --noprofile` so no OSC 133 mark the test did not send
 can move the lifecycle, and every read is a condition wait rather than a
 sleep.
 
-**Not here yet:** the `agent ensure` half — installing into a jailed
-`$HOME`, and the config-off path — lands with plan 046's C7 under the
-marked section at the bottom of this file. The harness already runs with
-`agent-hooks = off` (`fixtures/launcher.conf`), so no lane touches a real
-dotfile in the meantime.
+The second half of the file is the other direction entirely: `roostctl
+agent ensure` and a UI's own startup wiring, driven against a **jailed
+`$HOME`** (plan 046 §3.9). Those lanes write agent config files, so read
+the fence comment above them before adding to them — nothing in this
+suite may reach a real dotfile.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import platform
+import shutil
 import socket as socketlib
 import subprocess
 import tempfile
+from pathlib import Path
 
+import pytest
 import ui
-from client import scaled_timeout
+from client import Roost, RoostError, scaled_timeout
 from test_agent_lifecycle import agent_tab
 from util import HOOK_DEADLINE, REPO_ROOT, roostctl_path, run_hook
 
@@ -682,8 +687,572 @@ def test_a_spawned_tab_carries_the_hook_entrypoint(roost, project):
 # ---------------------------------------------------------------------------
 # `roostctl agent ensure` against a jailed $HOME — plan 046 C7.
 #
-# Lands here, not elsewhere: the install engine (C6) and the config keys
-# (C7) do not exist yet, and the harness runs with `agent-hooks = off`
-# (`fixtures/launcher.conf`) so nothing above can touch a real dotfile in
-# the meantime.
+# THE JAIL IS THE POINT OF THIS SECTION. Everything above drives hooks at
+# a running UI and writes nothing; everything below writes into agent
+# config files, and a bug in any of it would otherwise land in the
+# developer's own `~/.claude/settings.json`. Three fences, all required:
+#
+#   1. The harness's `fixtures/launcher.conf` says `agent-hooks = off`,
+#      so no UI the suite launches wires anything (plan 046 §3.9).
+#   2. `roost-agent-install` refuses to run under `ROOST_TEST_MODE=1`
+#      unless `ROOST_AGENT_HOOKS_FORCE=1` is also set. This file is the
+#      one place in the tree that sets the override, and
+#      `test_the_test_mode_fence_refuses_without_the_override` is what
+#      proves the fence is still there for everyone else.
+#   3. Every process started below runs with `HOME`, `XDG_CONFIG_HOME`
+#      and all five agent-directory variables pointed inside a tempdir,
+#      **asserted immediately before the spawn** by `Jail.assert_jailed`
+#      — on the merged environment, not on the overrides, so an inherited
+#      value that survived the merge is caught rather than assumed away.
 # ---------------------------------------------------------------------------
+
+# Agent name → the environment variable that relocates its config dir.
+# MIRRORS `roost_agent_install::home::config_dir_env`; the five are what
+# make the jail complete.
+AGENT_CONFIG_DIR_ENV = {
+    "claude": "CLAUDE_CONFIG_DIR",
+    "codex": "CODEX_HOME",
+    "grok": "GROK_HOME",
+    "cursor": "CURSOR_CONFIG_DIR",
+    "opencode": "OPENCODE_CONFIG_DIR",
+}
+
+# Report order of `roost_agent_install::ALL_AGENTS`.
+INSTALLABLE_AGENTS = ("claude", "codex", "grok", "cursor", "opencode")
+
+# The seven variables §3.9 pins. `XDG_CONFIG_HOME` is belt and braces:
+# Roost's own state record is `$HOME/.config/roost/agent-hooks.json`
+# whatever XDG says, so `HOME` already covers it — but a future move to
+# the XDG dir must not silently unjail this suite.
+JAIL_ENV_KEYS = ("HOME", "XDG_CONFIG_HOME", *AGENT_CONFIG_DIR_ENV.values())
+
+
+class Jail:
+    """A throwaway home with its own `config.conf`, its own agent config
+    directories, and the environment that points every relevant tool at
+    them."""
+
+    def __init__(
+        self,
+        root,
+        *,
+        agent_hooks: str = "auto",
+        skip: str | None = None,
+        present=INSTALLABLE_AGENTS,
+    ):
+        self.root = root.resolve()
+        self.home = self.root / "home"
+        self.config = self.home / ".config/roost/config.conf"
+        self.record = self.home / ".config/roost/agent-hooks.json"
+        self.state_dir = self.root / "state"
+        self.runtime_dir = self.root / "run"
+        self.agent_dirs = {name: self.root / "agents" / name for name in AGENT_CONFIG_DIR_ENV}
+        # Distinct log file per launch, so a relaunch's boot output does
+        # not overwrite the evidence of the launch before it.
+        self.launches = 0
+
+        for name in present:
+            self.agent_dirs[name].mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._make_runtime_dir()
+        self.write_config(agent_hooks=agent_hooks, skip=skip)
+
+        self.env = {
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
+            **{
+                AGENT_CONFIG_DIR_ENV[name]: str(path)
+                for name, path in self.agent_dirs.items()
+            },
+        }
+
+    def _make_runtime_dir(self) -> None:
+        """A private `XDG_RUNTIME_DIR` for a jailed UI, so its socket and
+        single-instance locks cannot collide with the session UI's.
+
+        On the Wayland lane that also moves the compositor out of reach —
+        `WAYLAND_DISPLAY` is a socket *name*, resolved against
+        `XDG_RUNTIME_DIR` — so the real one is linked back in. Without
+        this the jailed UI would fail to open a window on the weston
+        lane, and only there."""
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_dir.chmod(0o700)
+        display = os.environ.get("WAYLAND_DISPLAY", "")
+        if not display or os.path.isabs(display):
+            return
+        real = Path(os.environ.get("XDG_RUNTIME_DIR", "")) / display
+        link = self.runtime_dir / display
+        if real.exists() and not link.exists():
+            link.symlink_to(real)
+
+    def write_config(self, *, agent_hooks: str, skip: str | None = None) -> None:
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        body = f"agent-hooks = {agent_hooks}\n"
+        if skip is not None:
+            body += f"agent-hooks-skip = {skip}\n"
+        self.config.write_text(body)
+
+    def assert_jailed(self, env: dict) -> None:
+        """Every jail variable is set, absolute, and inside this root.
+
+        Run on the *merged* environment a spawn is about to get, right
+        before the spawn. An assertion on `self.env` would prove only
+        that the dict was built correctly."""
+        for key in JAIL_ENV_KEYS:
+            value = env.get(key)
+            assert value, f"{key} is not set: the jail is not in force"
+            path = Path(value)
+            assert path.is_absolute(), f"{key}={value} is not absolute"
+            assert path.resolve().is_relative_to(self.root), (
+                f"{key}={value} escapes the jail at {self.root}"
+            )
+
+    def read_record(self) -> dict:
+        return json.loads(self.record.read_text())
+
+    def owned_files(self, agent: str) -> list:
+        """The files the state record says Roost wrote for `agent` — read
+        back rather than hardcoded here, so the five per-agent layouts
+        live in exactly one place (the install crate)."""
+        return [Path(p) for p in self.read_record()[agent]["files"]]
+
+
+def run_agent(jail: Jail, *args: str, force: bool = True):
+    """`roostctl agent …` inside `jail`. Never `check=True`: several
+    cases assert on a non-zero exit, and a failure's stdout is the most
+    useful thing in the report."""
+    env = {**os.environ, **jail.env}
+    env["ROOST_TEST_MODE"] = "1"
+    if force:
+        env["ROOST_AGENT_HOOKS_FORCE"] = "1"
+    else:
+        env.pop("ROOST_AGENT_HOOKS_FORCE", None)
+    # `roostctl` inherits the harness's environment; a tab id or socket
+    # left in it would point these verbs at the running UI.
+    for leaked in ("ROOST_TAB_ID", "ROOST_SOCKET"):
+        env.pop(leaked, None)
+    env["ROOST_CONFIG"] = str(jail.config)
+    jail.assert_jailed(env)
+    return subprocess.run(
+        [roostctl_path(), "agent", *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(60),
+    )
+
+
+def ensure_json(jail: Jail) -> dict:
+    done = run_agent(jail, "ensure", "--json")
+    assert done.returncode == 0, f"agent ensure failed: {done.stdout}{done.stderr}"
+    return json.loads(done.stdout)
+
+
+def test_agent_ensure_wires_a_jailed_home(tmp_path):
+    """The install engine driven end to end through the real binary: five
+    present agents wired, the state record written, a second run planning
+    nothing, and `uninstall --all` taking it back out.
+
+    The per-agent file *shapes* are the install crate's own inline tests
+    (plan 046 §3.9). What this adds is that `roostctl agent` — argument
+    parsing, config read, `Home::from_env`, the lock, the record — works
+    as one program against a real filesystem."""
+    jail = Jail(tmp_path)
+    assert not jail.record.exists()
+
+    first = ensure_json(jail)
+    assert sorted(first["wired"]) == sorted(INSTALLABLE_AGENTS), first
+    assert first["errors"] == [], first
+
+    record = jail.read_record()
+    assert sorted(record) == sorted(INSTALLABLE_AGENTS), record
+    for agent in INSTALLABLE_AGENTS:
+        entry = record[agent]
+        # False until a UI has shown the toast. Nothing here shows one.
+        assert entry["noticed"] is False, entry
+        assert entry["by"] == "local", entry
+        assert entry["files"], entry
+        for path in jail.owned_files(agent):
+            assert path.is_relative_to(jail.root), f"{agent} wrote outside the jail: {path}"
+            assert path.exists(), f"{agent}: {path} was recorded but not written"
+
+    # The command Roost installs names the env-indirected entrypoint and
+    # the agent it speaks for — never an absolute Roost path (W2).
+    claude_settings = (jail.agent_dirs["claude"] / "settings.json").read_text()
+    assert "ROOST_AGENT_HOOK" in claude_settings
+    assert "agent-hook claude" in claude_settings
+    assert str(REPO_ROOT) not in claude_settings
+
+    # Idempotent: everything is current, nothing is wired again, and the
+    # record is not rewritten (mtime, because "wrote nothing" is the
+    # claim — the plan's own assertion is zero planned edits).
+    stamp = jail.record.stat().st_mtime_ns
+    second = ensure_json(jail)
+    assert second["wired"] == [], second
+    assert sorted(second["current"]) == sorted(INSTALLABLE_AGENTS), second
+    assert jail.record.stat().st_mtime_ns == stamp
+
+    rows = {row["agent"]: row for row in json.loads(run_agent(jail, "status", "--json").stdout)}
+    for agent in INSTALLABLE_AGENTS:
+        assert rows[agent]["present"] is True, rows[agent]
+        assert rows[agent]["wired"] is not None, rows[agent]
+        assert rows[agent]["up_to_date"] is True, rows[agent]
+        assert rows[agent]["noticed"] is False, rows[agent]
+
+    # Read the file list off the record before it is dropped: it is the
+    # only thing that knows which of the five layouts wrote what.
+    wrote = {agent: jail.owned_files(agent) for agent in INSTALLABLE_AGENTS}
+    removed = run_agent(jail, "uninstall", "--all")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert jail.read_record() == {}, "uninstall left entries behind"
+    for agent, paths in wrote.items():
+        for path in paths:
+            if path.exists():
+                assert "ROOST_AGENT_HOOK" not in path.read_text(), (
+                    f"{agent}: uninstall left Roost's entry in {path}"
+                )
+
+
+def test_agent_hooks_off_wires_nothing_and_unwires_on_request(tmp_path):
+    """`agent-hooks = off`, read from a real `config.conf` by the real
+    binary.
+
+    Two halves, and they differ deliberately. With nothing wired, `off`
+    writes **nothing at all** — not even an empty state record, which is
+    what makes the key safe to leave in the harness's own config. Asked
+    explicitly (`agent install`), Roost still wires: explicit wins over
+    the config. A later `ensure` then reads the same `off` and removes
+    what it put there — which is the difference between a config switch
+    (opt out of future wiring) and the verb (take it out now)."""
+    jail = Jail(tmp_path, agent_hooks="off")
+
+    quiet = ensure_json(jail)
+    assert quiet["wired"] == [] and quiet["removed"] == [], quiet
+    assert not jail.record.exists(), "`off` with nothing to remove still wrote the record"
+    assert not (jail.agent_dirs["claude"] / "settings.json").exists()
+
+    forced = run_agent(jail, "install", "codex")
+    assert forced.returncode == 0, forced.stdout + forced.stderr
+    assert "codex" in jail.read_record(), "explicit `agent install` did not win over off"
+    assert (jail.agent_dirs["codex"] / "hooks.json").exists()
+
+    swept = ensure_json(jail)
+    assert swept["removed"] == ["codex"], swept
+    assert jail.read_record() == {}, "off left the record naming an agent it unwired"
+    hooks = jail.agent_dirs["codex"] / "hooks.json"
+    assert not hooks.exists() or "ROOST_AGENT_HOOK" not in hooks.read_text()
+
+
+def test_agent_hooks_skip_is_honoured_and_a_typo_is_reported(tmp_path):
+    """`agent-hooks-skip` keeps a named agent unwired; a name no agent
+    answers to is reported on stderr and otherwise ignored.
+
+    Ignoring it is the deliberate half: refusing to run would turn one
+    typo into "nothing is wired and nothing says why", and a newer
+    Roost's agent name must not break an older one's config."""
+    jail = Jail(tmp_path, skip="codex, gemini")
+
+    outcome = ensure_json(jail)
+    assert "codex" not in outcome["wired"], outcome
+    assert sorted(outcome["wired"]) == sorted(
+        a for a in INSTALLABLE_AGENTS if a != "codex"
+    ), outcome
+    skipped = {row["agent"]: row["reason"] for row in outcome["skipped"]}
+    assert "codex" in skipped, outcome
+    assert not (jail.agent_dirs["codex"] / "hooks.json").exists()
+    assert "codex" not in jail.read_record()
+
+    done = run_agent(jail, "ensure")
+    assert "gemini" in done.stderr, done.stderr
+
+
+def test_the_test_mode_fence_refuses_without_the_override(tmp_path):
+    """`ROOST_TEST_MODE=1` alone must stop the install engine dead.
+
+    This is the fence that protects every OTHER lane in this suite — none
+    of them sets `ROOST_AGENT_HOOKS_FORCE`, so if this ever stops being
+    true, a harness UI could reach a real dotfile. Asserted inside the
+    jail, so proving it costs nothing."""
+    jail = Jail(tmp_path)
+    refused = run_agent(jail, "ensure", force=False)
+    assert refused.returncode != 0, refused.stdout
+    assert not jail.record.exists(), "the refusal still wrote the state record"
+    assert not (jail.agent_dirs["claude"] / "settings.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# The UI's own startup ensure — plan 046 C7, §3.7.
+#
+# These launch a SECOND, fully jailed Roost rather than driving the
+# harness's session UI, because the thing under test is what a UI does at
+# *launch* and the session UI launched before the test existed. The jail
+# moves the socket too (`$HOME/Library/Caches` on macOS,
+# `$XDG_RUNTIME_DIR` on Linux), so the second instance has its own
+# socket, its own single-instance locks and its own `state.json`, and
+# cannot disturb the one every other module in this file is driving.
+# ---------------------------------------------------------------------------
+
+
+def jailed_ui_env(jail: Jail) -> dict:
+    """The environment a jailed UI launch gets: the agent jail, XDG dirs
+    inside it (so the socket, the log and the caches land there too), and
+    the two variables that let the install engine run under
+    `ROOST_TEST_MODE`."""
+    env = {**os.environ}
+    # Same list `ui.launch` strips, and for the same reason: per-tab
+    # values Roost injects itself, plus the selectors set explicitly
+    # below. Stripped first so the explicit values cannot be undone.
+    for leaked in ui._UI_ENV_SANITIZE:
+        env.pop(leaked, None)
+    env.update(jail.env)
+    env.update(
+        {
+            "XDG_RUNTIME_DIR": str(jail.runtime_dir),
+            "XDG_DATA_HOME": str(jail.home / ".local/share"),
+            "XDG_STATE_HOME": str(jail.home / ".local/state"),
+            "XDG_CACHE_HOME": str(jail.home / ".cache"),
+            "ROOST_BUNDLE_PROFILE": ui.TARGET_SPECS["iced"].profile,
+            "ROOST_CONFIG": str(jail.config),
+            "ROOST_STATE_DIR": str(jail.state_dir),
+            "ROOST_TEST_MODE": "1",
+            # The one place in the tree that lifts the install engine's
+            # test-mode refusal. Everything it can reach is in the jail.
+            "ROOST_AGENT_HOOKS_FORCE": "1",
+            "RUST_LOG": os.environ.get("RUST_LOG", "warn") + ",roost_iced=info",
+        }
+    )
+    return env
+
+
+def jailed_socket(jail: Jail) -> Path:
+    """Where a UI launched with `jailed_ui_env` binds. MIRRORS
+    `ui.socket_path`, rooted in the jail rather than in `$HOME` /
+    `$XDG_RUNTIME_DIR`."""
+    spec = ui.TARGET_SPECS["iced"]
+    if platform.system() == "Darwin":
+        return jail.home / f"Library/Caches/{spec.mac_label}/roost.sock"
+    return jail.runtime_dir / spec.linux_namespace / "roost.sock"
+
+
+@contextlib.contextmanager
+def jailed_ui(jail: Jail):
+    """Launch a jailed iced UI, yield `(process, log path)`, and stop it.
+
+    Teardown waits for the process to *exit* before the caller's
+    assertions run against the jail. That is what makes "nothing was
+    written" an assertion rather than a race: a dead process has no more
+    writes left in it."""
+    binary, explicit = ui.rust_binary_path("iced")
+    if not binary.is_file():
+        if explicit:
+            pytest.skip(f"explicit iced binary does not exist: {binary}")
+        subprocess.run(["cargo", "build", "-p", "roost-iced"], cwd=REPO_ROOT, check=True)
+
+    env = jailed_ui_env(jail)
+    jail.assert_jailed(env)
+    log = jail.root / f"ui-{jail.launches}.log"
+    jail.launches += 1
+    with open(log, "wb") as handle:
+        proc = subprocess.Popen(
+            [str(binary)],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    try:
+        yield proc, log
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=scaled_timeout(20))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=scaled_timeout(10))
+
+
+def wait_for_jailed_window(jail: Jail, proc, log: Path) -> None:
+    """Block until the jailed UI has a window on screen.
+
+    `app.screenshot` is answered only once `window_id` is set, and that
+    happens inside the same `window_opened` handler that decides whether
+    to start the agent-hooks ensure — *before* it returns. So a
+    screenshot that comes back proves the decision has been made, which
+    is what lets the `off` case assert on an empty jail instead of racing
+    a write that was never going to happen."""
+    sock = jailed_socket(jail)
+
+    def windowed() -> bool:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"jailed UI exited {proc.returncode} before opening a window:\n"
+                f"{log.read_text(errors='replace')}"
+            )
+        if not sock.exists():
+            return False
+        try:
+            with Roost(str(sock), timeout=scaled_timeout(10)) as roost:
+                roost.screenshot()
+            return True
+        except (OSError, RoostError):
+            return False
+
+    Roost._wait(windowed, 60.0, f"the jailed UI to open a window ({sock})")
+
+
+def wait_for_log_line(log: Path, needle: str, what: str) -> str:
+    """Block until a line of the jailed UI's log contains `needle`, and
+    return that line.
+
+    The log is how this module reads the status banner. No IPC op
+    carries it — `app.*` exposes the menu, the dialogs and the sidebar's
+    last-rendered rows, and `tab.dump` is the terminal grid; the
+    transient line is drawn straight from `App::status` in `view` and is
+    exposed nowhere else — so a test that wants to know what the banner
+    says has the UI's own log and nothing better."""
+    found: list[str] = []
+
+    def seen() -> bool:
+        for line in log.read_text(errors="replace").splitlines():
+            if needle in line:
+                found.append(line)
+                return True
+        return False
+
+    Roost._wait(seen, 30.0, what)
+    return found[0]
+
+
+@pytest.fixture
+def iced_only(target):
+    if target != "iced":
+        pytest.skip("the startup ensure is asserted against the iced UI's own launch")
+
+
+@pytest.fixture
+def short_root():
+    """A jail root short enough to hold a Unix socket path.
+
+    `sun_path` is 104 bytes on macOS, and pytest's `tmp_path` spends
+    ~70 of them before this test adds
+    `home/Library/Caches/Roost-iced/roost.sock` — the jailed UI then
+    refuses to bind. `/tmp` is the only root with room, and it is short
+    on Linux too."""
+    root = Path(tempfile.mkdtemp(prefix="roost-jail-", dir="/tmp"))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root, iced_only):
+    """Plan 046 W6/W7 against a real launch: the UI wires every present
+    agent in a jailed home, says so once, and flips `noticed`.
+
+    The toast is read out of the UI's log, not inferred from `noticed`.
+    `noticed` alone would be a circular assertion — the UI writes it
+    itself, right beside the line it is supposed to be evidence for — so
+    the text is asserted directly. `agent hooks toast shown` is logged
+    at the one place the banner takes the message
+    (`App::show_agent_hooks_toast`), which runs at the **end** of the
+    engine-feed drain, after every other `set_status` that batch can
+    reach. So the line is also the proof the sentence survived its own
+    drain instead of being replaced by, say, a PTY error that arrived
+    with it.
+
+    What it does not prove is that a frame was painted; nothing
+    observable from here does (the status banner reaches no IPC op, and
+    the screenshot harness reads pixels, not text). `noticed` then
+    carries the once-per-machine half: `ensure` reports an agent as
+    unannounced only while the record says so."""
+    jail = Jail(short_root)
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        toast = wait_for_log_line(
+            log,
+            "agent hooks toast shown",
+            "the jailed UI to put the agent-hooks toast on the banner",
+        )
+        # Agent order is `ALL_AGENTS`, which `INSTALLABLE_AGENTS` mirrors.
+        assert f"for {', '.join(INSTALLABLE_AGENTS)}" in toast, toast
+        # Roost has just edited five of the user's config files. Both
+        # ways back out have to be in the sentence that says so.
+        assert "roostctl agent uninstall --all" in toast, toast
+        assert "agent-hooks = off" in toast, toast
+        Roost._wait(
+            lambda: jail.record.exists()
+            and all(
+                entry.get("noticed") is True for entry in jail.read_record().values()
+            ),
+            30.0,
+            f"the jailed UI to record the toast in {jail.record}",
+        )
+        # Read after the process is gone (the context manager waits for
+        # its exit), so the flip cannot still be in flight.
+
+    record = jail.read_record()
+    assert sorted(record) == sorted(INSTALLABLE_AGENTS), record
+    for agent in INSTALLABLE_AGENTS:
+        assert record[agent]["noticed"] is True, (
+            f"{agent} was wired but the toast was never recorded as shown: {record[agent]}"
+        )
+        assert record[agent]["by"] == "local", record[agent]
+        for path in jail.owned_files(agent):
+            assert path.is_relative_to(jail.root), f"{agent} wrote outside the jail: {path}"
+            assert path.exists(), f"{agent}: {path} was recorded but not written"
+
+    settings = (jail.agent_dirs["claude"] / "settings.json").read_text()
+    assert "ROOST_AGENT_HOOK" in settings and "agent-hook claude" in settings
+
+    # One ensure per process, however many window events the compositor
+    # sent: `window_opened` also runs on every focus *and* unfocus, so
+    # without the latch a launch that gets a Focused event runs the whole
+    # five-agent wiring twice. How many window events arrive is the
+    # compositor's business, which is why the latch itself is pinned
+    # deterministically in `agent_hooks.rs`
+    # (`the_startup_ensure_runs_once_per_process`); this is the same
+    # claim against a real one.
+    body = log.read_text(errors="replace")
+    assert body.count("agent hooks startup ensure finished") == 1, body
+
+    # And the second launch of the same machine says nothing at all. This
+    # is the other half of "once": the ensure finds every agent current,
+    # and `noticed` is what keeps it quiet. Asserted after the process is
+    # gone, so an absent line is an absence rather than a race.
+    with jailed_ui(jail) as (proc, second_log):
+        wait_for_jailed_window(jail, proc, second_log)
+        # The ensure is off-thread, so wait for the line it logs whether
+        # or not it has anything to announce — the drain that reports it
+        # is the same one that would toast.
+        Roost._wait(
+            lambda: "agent hooks startup ensure finished"
+            in second_log.read_text(errors="replace"),
+            30.0,
+            "the jailed UI's second startup ensure to report",
+        )
+    body = second_log.read_text(errors="replace")
+    assert "agent hooks toast shown" not in body, body
+    assert jail.read_record() == record, "a silent relaunch rewrote the record"
+
+
+def test_the_ui_wires_nothing_when_agent_hooks_is_off(short_root, iced_only):
+    """`agent-hooks = off` stops the startup ensure before it opens a
+    file (W6).
+
+    This is the key the harness's own `fixtures/launcher.conf` sets, so
+    it is what stands between every other lane in this suite and the
+    developer's real `~/.claude/settings.json`. `off` at startup does not
+    *remove* anything either — a launch is not an instruction — which the
+    empty jail also shows: the record is never created."""
+    jail = Jail(short_root, agent_hooks="off")
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+
+    assert not jail.record.exists(), "`agent-hooks = off` still wrote the state record"
+    for agent in INSTALLABLE_AGENTS:
+        contents = sorted(p.name for p in jail.agent_dirs[agent].iterdir())
+        assert contents == [], f"`off` wrote into {agent}'s config dir: {contents}"

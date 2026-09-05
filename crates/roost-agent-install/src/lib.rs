@@ -96,7 +96,7 @@ mod opencode;
 mod acceptance;
 
 pub use command::{installed_command, is_roost_command, owned_commands, INTEGRATION_VERSION};
-pub use ensure::{ensure, install, plan, status, Mode, Outcome, Status};
+pub use ensure::{agent_names, ensure, install, plan, skip_list, status, Mode, Outcome, Status};
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
 pub use home::{Home, ALL_AGENTS};
 pub use plan::{apply, Applied, FileEdit, Guard, InstallPlan, Intent};

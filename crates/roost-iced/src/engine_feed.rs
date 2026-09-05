@@ -48,6 +48,12 @@ pub(crate) enum EngineFeed {
     /// the per-tab attach state on the main thread (plan 037 §3.3).
     HostTab(TabKey, crate::app::host_tab::HostTabFrame),
     UiRequest(UiRequest),
+    /// The startup agent-hooks ensure finished on the blocking pool
+    /// (plan 046 §3.7). It rides the feed for the reason a git-metrics
+    /// probe does: the work is file I/O under a `flock` and cannot go
+    /// near the event-loop thread, while the toast it produces can only
+    /// be set there.
+    AgentHooks(crate::app::agent_hooks::AgentHooksEnsured),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
     /// The user picked an item off the native macOS menu bar. Not an
