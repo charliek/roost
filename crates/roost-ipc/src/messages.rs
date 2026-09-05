@@ -450,10 +450,15 @@ where
 /// status text, and rank can never disagree with them. `metrics_text` is
 /// absent while a git-metrics probe is still pending and always present
 /// once resolved (`"—"` or the formatted string), so pending vs. resolved
-/// is observable on the wire.
+/// is observable on the wire. `agent` (plan 046 §3.7) is the display
+/// name derived from `ownership.source` — `roost_ui_model::agent_palette
+/// ::agent_display_name` — folded into the row's own `title` too, so a
+/// caller that only reads the palette's flat item list still sees which
+/// agent a row belongs to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaletteAgentRow {
     pub effective_lifecycle: AgentLifecycle,
+    pub agent: String,
     pub project: String,
     pub name: String,
     pub status_text: String,

@@ -65,8 +65,8 @@ private func agentOf(_ item: PaletteItem) -> AgentRowData {
     guard let agent = item.agent else {
         Issue.record("expected an agent row payload on \(item.id)")
         return AgentRowData(
-            effectiveLifecycle: .inactive, project: "", name: "", statusText: "", timeText: "",
-            metricsText: nil)
+            effectiveLifecycle: .inactive, agent: "", project: "", name: "", statusText: "",
+            timeText: "", metricsText: nil)
     }
     return agent
 }
@@ -390,7 +390,7 @@ func agentNamePrefersSessionTitleThenTabTitleThenPlaceholder() {
     #expect(agentOf(byID("agent:2")).name == "zsh")
     #expect(agentOf(byID("agent:3")).name == "Tab 3")
     // Title composition is the filter input, verbatim.
-    #expect(byID("agent:1").title == "roost · slauth-refactor")
+    #expect(byID("agent:1").title == "Claude Code · roost · slauth-refactor")
 }
 
 @Test
@@ -409,13 +409,42 @@ func agentNamesAreNormalizedToOneLine() {
     let rows = items([project(1, "roost\nnope")], [t])
     #expect(agentOf(rows[0]).name == "line oneline two x")
     #expect(agentOf(rows[0]).project == "roostnope")
-    #expect(rows[0].title == "roostnope · line oneline two x")
+    #expect(rows[0].title == "Claude Code · roostnope · line oneline two x")
 }
 
 @Test
 func agentComposeTitleWithoutAProjectIsJustTheName() {
     #expect(AgentPalette.composeTitle(project: "", name: "claude") == "claude")
     #expect(AgentPalette.composeTitle(project: "roost", name: "claude") == "roost · claude")
+}
+
+@Test
+func agentDisplayNameCoversTheFiveSourceConstants() {
+    // Exact spellings from each adapter's own `SOURCE` const
+    // (`crates/roost-agent/src/{claude,codex,opencode,grok,cursor}.rs`),
+    // not assumed.
+    #expect(AgentPalette.agentDisplayName("claude") == "Claude Code")
+    #expect(AgentPalette.agentDisplayName("codex") == "Codex")
+    #expect(AgentPalette.agentDisplayName("opencode") == "OpenCode")
+    #expect(AgentPalette.agentDisplayName("grok") == "Grok")
+    #expect(AgentPalette.agentDisplayName("cursor") == "Cursor")
+}
+
+@Test
+func agentDisplayNameIsCaseSensitiveToTheSourceConstants() {
+    #expect(AgentPalette.agentDisplayName("Claude") == "Claude")
+    #expect(AgentPalette.agentDisplayName("CODEX") == "CODEX")
+    #expect(AgentPalette.agentDisplayName("OpenCode") == "OpenCode")
+}
+
+@Test
+func agentDisplayNamePassesThroughAnUnknownSourceVerbatim() {
+    // AD-8: a sixth, third-party adapter must render as-is rather than
+    // needing this table edited to show up.
+    #expect(AgentPalette.agentDisplayName("aider") == "aider")
+    #expect(AgentPalette.agentDisplayName("") == "")
+    #expect(AgentPalette.agentDisplayName("manual") == "manual")
+    #expect(AgentPalette.agentDisplayName("legacy") == "legacy")
 }
 
 // MARK: - Ordering

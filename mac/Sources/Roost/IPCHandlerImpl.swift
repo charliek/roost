@@ -1625,6 +1625,10 @@ private struct IPCPaletteActivateParams: Codable {
 /// reaching the wire.
 struct IPCPaletteAgentRow: Codable, Equatable, Sendable {
     let effectiveLifecycle: AgentLifecycle
+    /// Display name derived from `ownership.source` (plan 046 §3.7) —
+    /// `AgentPalette.agentDisplayName` — folded into the row's own
+    /// `title` too.
+    let agent: String
     let project: String
     let name: String
     let statusText: String
@@ -1636,6 +1640,7 @@ struct IPCPaletteAgentRow: Codable, Equatable, Sendable {
     var metricsText: String?
     enum CodingKeys: String, CodingKey {
         case effectiveLifecycle = "effective_lifecycle"
+        case agent
         case project
         case name
         case statusText = "status_text"

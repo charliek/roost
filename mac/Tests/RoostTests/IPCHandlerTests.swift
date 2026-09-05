@@ -459,14 +459,15 @@ struct IPCPaletteItemViewTests {
 
     @Test func decodesAndReencodesAFullAgentPayload() throws {
         let json = """
-        {"id":"agent:3","title":"roost · slauth-refactor",
-         "agent":{"effective_lifecycle":"waiting","project":"roost",
+        {"id":"agent:3","title":"Claude Code · roost · slauth-refactor",
+         "agent":{"effective_lifecycle":"waiting","agent":"Claude Code","project":"roost",
                   "name":"slauth-refactor","status_text":"Waiting for input",
                   "time_text":"2m","metrics_text":"4f +86 -12"}}
         """
         let item = try JSONDecoder().decode(IPCPaletteItemView.self, from: Data(json.utf8))
         let agent = try #require(item.agent)
         #expect(agent.effectiveLifecycle == .waiting)
+        #expect(agent.agent == "Claude Code")
         #expect(agent.project == "roost")
         #expect(agent.name == "slauth-refactor")
         #expect(agent.statusText == "Waiting for input")
@@ -500,8 +501,8 @@ struct IPCPaletteItemViewTests {
     /// on this to show a row before its git metrics resolve.
     @Test func pendingMetricsOmitsTheKeyOnReencode() throws {
         let json = """
-        {"id":"agent:4","title":"roost · pending-metrics",
-         "agent":{"effective_lifecycle":"working","project":"roost",
+        {"id":"agent:4","title":"Claude Code · roost · pending-metrics",
+         "agent":{"effective_lifecycle":"working","agent":"Claude Code","project":"roost",
                   "name":"pending-metrics","status_text":"Working","time_text":"41s"}}
         """
         let item = try JSONDecoder().decode(IPCPaletteItemView.self, from: Data(json.utf8))

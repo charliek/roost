@@ -206,10 +206,12 @@ def test_seed_four_lifecycles_ranked_with_exact_status_and_title(roost, project)
         t_failed = roost.open_tab(p2, cwd="/tmp", argv=BARE_SHELL_ARGV)
         t_finished = roost.open_tab(p2, cwd="/tmp", argv=BARE_SHELL_ARGV)
 
-        _seed(roost, t_waiting, lifecycle="waiting", name="waiting-agent")
-        _seed(roost, t_working, lifecycle="working", name="working-agent")
-        _seed(roost, t_failed, lifecycle="failed", name="failed-agent", detail="rate_limit")
-        _seed(roost, t_finished, lifecycle="finished", name="finished-agent")
+        src_waiting = _seed(roost, t_waiting, lifecycle="waiting", name="waiting-agent")
+        src_working = _seed(roost, t_working, lifecycle="working", name="working-agent")
+        src_failed = _seed(
+            roost, t_failed, lifecycle="failed", name="failed-agent", detail="rate_limit"
+        )
+        src_finished = _seed(roost, t_finished, lifecycle="finished", name="finished-agent")
 
         proj1_name = roost.project(project)["name"]
         proj2_name = roost.project(p2)["name"]
@@ -217,15 +219,19 @@ def test_seed_four_lifecycles_ranked_with_exact_status_and_title(roost, project)
         items = roost.palette_items("agents")
         by_id = {it["id"]: it for it in items}
 
-        # (tab, project name, expected tab name, expected status_text),
-        # in the expected urgency order: failed > waiting > working > finished.
+        # (tab, seed source, project name, expected tab name, expected
+        # status_text), in the expected urgency order: failed > waiting >
+        # working > finished. `_seed`'s synthetic sources (`e2e-...`) are
+        # not one of the five known adapters, so the display name is the
+        # AD-8 verbatim passthrough of the source itself — pinned here
+        # alongside the rest of the row content.
         expect = [
-            (t_failed, proj2_name, "failed-agent", "Failed · rate_limit"),
-            (t_waiting, proj1_name, "waiting-agent", "Waiting for input"),
-            (t_working, proj1_name, "working-agent", "Working"),
-            (t_finished, proj2_name, "finished-agent", "Finished"),
+            (t_failed, src_failed, proj2_name, "failed-agent", "Failed · rate_limit"),
+            (t_waiting, src_waiting, proj1_name, "waiting-agent", "Waiting for input"),
+            (t_working, src_working, proj1_name, "working-agent", "Working"),
+            (t_finished, src_finished, proj2_name, "finished-agent", "Finished"),
         ]
-        ids = [f"agent:{t}" for t, _, _, _ in expect]
+        ids = [f"agent:{t}" for t, _, _, _, _ in expect]
         missing = [rid for rid in ids if rid not in by_id]
         assert not missing, f"seeded rows missing: {missing}; got {sorted(by_id)}"
 
@@ -235,16 +241,46 @@ def test_seed_four_lifecycles_ranked_with_exact_status_and_title(roost, project)
         seen_order = [it["id"] for it in items if it["id"] in set(ids)]
         assert seen_order == ids, seen_order
 
-        for tab_id, proj_name, name, status in expect:
+        for tab_id, src, proj_name, name, status in expect:
             row = by_id[f"agent:{tab_id}"]
             agent = row["agent"]
             assert agent["status_text"] == status, agent
-            assert row["title"] == f"{proj_name} · {name}", row
+            assert agent["agent"] == src, agent
+            assert row["title"] == f"{src} · {proj_name} · {name}", row
             assert agent["project"] == proj_name, agent
             assert agent["name"] == name, agent
             assert TIME_TEXT_RE.match(agent["time_text"]), agent["time_text"]
     finally:
         roost.delete_project(p2)
+
+
+def test_known_agent_source_names_the_row(roost, project):
+    """The five built-in adapters (plan 046 §3.7) map their `SOURCE` to a
+    human display name that leads the row's `title` — the wire-level
+    assertion the iced palette's title composition is built from."""
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    _seed(roost, tab, lifecycle="working", name="claude-agent", source="claude")
+    proj_name = roost.project(project)["name"]
+
+    row = roost.palette_row("agents", f"agent:{tab}")
+    assert row is not None
+    assert row["agent"]["agent"] == "Claude Code", row["agent"]
+    assert row["title"] == f"Claude Code · {proj_name} · claude-agent", row
+
+
+def test_unrecognized_agent_source_renders_verbatim(roost, project):
+    """AD-8: a source that is none of the five built-ins is presumed a
+    third-party adapter and names its row with the source string itself,
+    never hidden or mislabeled."""
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    source = f"sixth-agent-{uuid.uuid4().hex[:8]}"
+    _seed(roost, tab, lifecycle="working", name="sixth-agent-tab", source=source)
+    proj_name = roost.project(project)["name"]
+
+    row = roost.palette_row("agents", f"agent:{tab}")
+    assert row is not None
+    assert row["agent"]["agent"] == source, row["agent"]
+    assert row["title"] == f"{source} · {proj_name} · sixth-agent-tab", row
 
 
 def test_working_with_background_tasks_detail(roost, project):
@@ -369,13 +405,21 @@ def test_subagent_event_via_real_claude_hook_leaves_row_unchanged(roost, project
 
 def test_idle_prompt_and_permission_prompt_diverge_in_palette(roost, project, target):
     """The plan 006 §3.1 declassification, read off the rows a user
-    actually scans: two finished sessions, one nagged by `idle_prompt`
-    and one genuinely blocked by `permission_prompt`. Before the fix both
-    rows read "Waiting for input", so a real block was indistinguishable
-    from a timer. Now the idle nag leaves its row "Finished" while the
-    permission prompt still escalates — asserted in a SINGLE palette
-    state read, so the divergence is pinned in one frame rather than
-    across two snapshots."""
+    actually scans: one session nagged by `idle_prompt` after its turn
+    ended, and one genuinely blocked by `permission_prompt` mid-turn.
+    Before that fix both rows read "Waiting for input", so a real block
+    was indistinguishable from a timer. The idle nag leaves its row
+    "Finished" while the permission prompt escalates — asserted in a
+    SINGLE palette state read, so the divergence is pinned in one frame
+    rather than across two snapshots.
+
+    Plan 046 changed the preconditions, not the point. Both notifications
+    are now guarded on `lifecycle_if: ["working"]`, so the blocked tab
+    must still be *in* its turn when the prompt arrives — which is the
+    only way it happens for real, since Claude opens a permission dialog
+    mid-turn and cancels its 6 s notification timer once the dialog is
+    answered. A `permission_prompt` arriving after `Stop` is a stale
+    timer, and vetoing it is the point of the guard."""
     tab_a = agent_tab(roost, project)
     tab_b = agent_tab(roost, project)
     sess_a = f"sess-idle-nag-{uuid.uuid4().hex[:6]}"
@@ -386,8 +430,11 @@ def test_idle_prompt_and_permission_prompt_diverge_in_palette(roost, project, ta
         claude_hook(target, tab, "SessionStart", {"session_id": session, "source": "startup"})
         claude_hook(target, tab, "UserPromptSubmit", {"session_id": session, "prompt": "go"})
         roost.wait_lifecycle(tab, "working")
-        claude_hook(target, tab, "Stop", {"session_id": session, "stop_hook_active": False})
-        roost.wait_lifecycle(tab, "finished")
+
+    # Only A's turn ends. B stays mid-turn, which is where a real
+    # permission dialog opens.
+    claude_hook(target, tab_a, "Stop", {"session_id": sess_a, "stop_hook_active": False})
+    roost.wait_lifecycle(tab_a, "finished")
 
     # A: the nag. `wait_notification` is no barrier here — the preceding
     # Stop already set the pending bit — but the adapter stamps `detail`
@@ -405,7 +452,8 @@ def test_idle_prompt_and_permission_prompt_diverge_in_palette(roost, project, ta
     row = roost.palette_row("agents", row_a)
     assert row is not None and row["agent"]["status_text"] == "Finished", row
 
-    # B: the real block, same shape of event, opposite outcome.
+    # B: the real block — same shape of event, opposite outcome, because
+    # its turn is still running.
     claude_hook(target, tab_b, "Notification", {
         "session_id": sess_b,
         "notification_type": "permission_prompt",

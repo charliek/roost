@@ -1317,12 +1317,18 @@ tabs Roost itself claimed via `manual`/`legacy` ownership). Its rows carry
 an additional `agent` object, absent on every other frame's rows:
 
 ```json
-{"id": "agent:3", "title": "roost · slauth-refactor",
- "agent": {"effective_lifecycle": "waiting", "project": "roost",
-           "name": "slauth-refactor", "status_text": "Waiting for input",
-           "time_text": "2m", "metrics_text": "4f +86 -12"}}
+{"id": "agent:3", "title": "Claude Code · roost · slauth-refactor",
+ "agent": {"effective_lifecycle": "waiting", "agent": "Claude Code",
+           "project": "roost", "name": "slauth-refactor",
+           "status_text": "Waiting for input", "time_text": "2m",
+           "metrics_text": "4f +86 -12"}}
 ```
 
+`agent` is the display name derived from the tab's ownership source —
+`Claude Code` / `Codex` / `OpenCode` / `Grok` / `Cursor` for the five
+built-in adapters, and the raw source string verbatim for anything
+else (adding a sixth adapter never requires touching this table) —
+folded into `title` as its leading `·`-separated segment.
 `effective_lifecycle` is one of `working` / `waiting` / `finished` /
 `failed` / `inactive` — the same value the tab pill and sidebar rollup
 render, so this row can never disagree with them. `metrics_text` is

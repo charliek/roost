@@ -123,10 +123,11 @@ fn tab_state_enum_values() {
 fn palette_state_agent_rows_round_trip_and_omit_absent_fields() {
     let with_agent = PaletteItemView {
         id: "agent:3".into(),
-        title: "roost · slauth-refactor".into(),
+        title: "Claude Code · roost · slauth-refactor".into(),
         subtitle: None,
         agent: Some(PaletteAgentRow {
             effective_lifecycle: AgentLifecycle::Waiting,
+            agent: "Claude Code".into(),
             project: "roost".into(),
             name: "slauth-refactor".into(),
             status_text: "Waiting for input".into(),
@@ -136,10 +137,11 @@ fn palette_state_agent_rows_round_trip_and_omit_absent_fields() {
     };
     let pending_metrics = PaletteItemView {
         id: "agent:4".into(),
-        title: "roost · pending-metrics".into(),
+        title: "Claude Code · roost · pending-metrics".into(),
         subtitle: None,
         agent: Some(PaletteAgentRow {
             effective_lifecycle: AgentLifecycle::Working,
+            agent: "Claude Code".into(),
             project: "roost".into(),
             name: "pending-metrics".into(),
             status_text: "Working".into(),
@@ -197,6 +199,7 @@ fn agents_vector_file_decodes_as_typed_palette_state() {
     assert_eq!(result.frame.as_deref(), Some("agents"));
     let agent = result.items[0].agent.as_ref().expect("agent payload");
     assert_eq!(agent.effective_lifecycle, AgentLifecycle::Waiting);
+    assert_eq!(agent.agent, "Claude Code");
     assert_eq!(agent.status_text, "Waiting for input");
     assert_eq!(agent.time_text, "2m");
     assert_eq!(agent.metrics_text.as_deref(), Some("4f +86 -12"));
@@ -294,7 +297,8 @@ fn malformed_agent_payload_decodes_to_none_not_error() {
     }
     let ok: PaletteItemView = serde_json::from_str(
         r#"{"id": "x", "title": "t", "agent": {"effective_lifecycle": "waiting",
-            "project": "p", "name": "n", "status_text": "s", "time_text": "1s"}}"#,
+            "agent": "Claude Code", "project": "p", "name": "n", "status_text": "s",
+            "time_text": "1s"}}"#,
     )
     .unwrap();
     assert!(ok.agent.is_some(), "well-formed agent must still decode");
