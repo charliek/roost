@@ -1,72 +1,61 @@
 # Claude Code Hooks
 
-Wire Claude Code's hook system to Roost so each tab gets a sticky agent-state indicator (running / needs-input / idle / failed), a click-through desktop banner when Claude is blocked, done, or errors out, and noise-free output (raw-OSC suppression while Claude owns the tab).
+Claude Code is one of five agents the [Agent Hooks](agents.md) guide
+covers — that page is the mechanism (how wiring works, how to opt out,
+the guarantee about what a merge does and doesn't touch, the
+`roostctl agent` verbs), the remote behavior, and the troubleshooting
+path shared by all five. This page is what's specific to Claude: three
+notes worth knowing plus the day-one verification walk.
 
-## How it works
+Nothing to install by hand: Roost wires Claude's hooks itself the first
+time the UI starts (`agent-hooks = auto` in `config.conf`, the default).
+See [Agent Hooks → Install](agents.md#install) to do it manually, and
+[Agent Hooks → How to opt out](agents.md#how-to-opt-out) to turn it off.
 
-Roost ships a `roostctl claude-hook EVENT` subcommand that Claude Code invokes for each lifecycle event. The hook reads Claude's JSON payload from stdin, looks up `$ROOST_TAB_ID` (auto-set in every Roost tab), and translates the event into a `tab.agent_report` — a claim/preserve/release of ownership plus an optional lifecycle change and notification, all under the `claude` source (see [`ipc.md`](../reference/ipc.md#tabagent_report) for the wire shape). The hook is a silent no-op when run outside a Roost tab (no `$ROOST_TAB_ID`) or for an event this adapter doesn't map, so installing it doesn't break Claude when you launch it from a regular terminal.
+## Three things specific to Claude
 
-| Hook event | Roost's mapping | Effect |
-|---|---|---|
-| `SessionStart` | Claims ownership as `claude`; lifecycle → inactive | No visible dot change yet, but raw OSC 9/99/777 from inside the shell is now suppressed while this session owns the tab |
-| `UserPromptSubmit` | Lifecycle → running; clears pending notification | Blue dot |
-| `Notification` — `permission_prompt`, `agent_needs_input`, `elicitation_dialog` | Lifecycle → needs-input; fires a warn-severity banner | Orange dot + banner |
-| `Notification` — `idle_prompt` (the post-turn idle nag — deliberately non-blocking so a finished session doesn't re-render as blocked), `auth_success`, `elicitation_complete`, `elicitation_response`, `agent_completed`, or any **other/unrecognized** `notification_type` | Lifecycle **unchanged**; fires an info-severity banner | The banner still reaches you, but the dot doesn't move — see below for why |
-| `Stop`, no in-flight `background_tasks` | Lifecycle → idle ("finished"); fires an info banner ("Turn complete") | Gray dot |
-| `Stop`, **non-empty** `background_tasks` | Lifecycle **stays running** ("working"), not idle; banner names the in-flight count | Distinguishes "the turn is done" from "paused, will resume when background work wakes it" — a scheduled `session_crons` entry alone does *not* count as in-flight |
-| `StopFailure` | Lifecycle → failed; fires an error-severity banner naming Claude's reported `error` | Red dot — distinct from needs-input everywhere except on the legacy wire `state` field, which has no fifth value (see [`ipc.md`](../reference/ipc.md)) |
-| `SessionEnd` | Releases ownership; lifecycle → inactive; clears pending notification | Dot disappears; tab falls back to shell-derived state |
+**`PermissionRequest` vs. the 6-second `permission_prompt` notification.**
+Claude actually fires two different blocked signals, and Roost only
+needs the first one. `PermissionRequest` fires the instant the approval
+dialog opens — that's the immediate, reliable "needs input" signal.
+Separately, a `Notification` with `notification_type: permission_prompt`
+fires roughly 6 seconds later if the dialog is still open (cancelled the
+moment you answer it). Because `PermissionRequest` already moved the tab
+to `waiting`, that second notification is guarded
+(`lifecycle_if: [working]`) so it fires vetoed rather than banner you
+twice for the same prompt — it still does the job on an older,
+hand-installed settings file that has no `PermissionRequest` hook at
+all.
 
-`notification_type` is a free string Claude Code controls, not a closed enum Roost can validate against, so an **unrecognized value is a first-class case, not an error**: the hook fires the notification (you should still hear about it) but leaves the lifecycle dot alone, because a false `needs-input` is worse than a missed one — the dot is sticky, so guessing wrong would leave a tab reading "blocked" long after Claude moved on.
+**`idle_prompt` is the only signal after an Esc interrupt, and it's
+guarded.** Claude has no interrupt hook — pressing Esc mid-turn produces
+no event of its own. The one later signal is `idle_prompt`, a
+`Notification` that fires about 60 seconds after a turn goes quiet. It's
+guarded to `lifecycle_if: [working]` so it can only ever move a tab from
+"still working" to "finished" — a genuinely `waiting` or `failed` tab is
+left alone, and (as of this release) it no longer banners "Turn
+complete" for a session that already reported finished by other means;
+see the changelog if you're used to seeing that banner every time.
 
-An event that carries Claude's own `agent_id` field (i.e. it fired from inside a subagent, not the top-level turn) never mutates ownership or lifecycle — only its notification, if any, still fires. In practice this is defense-in-depth rather than a live fix: subagent completion arrives as a distinct `SubagentStop` event that Roost doesn't register a handler for, so this path isn't reachable through any hook Roost currently wires up.
+**`background_tasks` distinguishes "done" from "paused, will resume."**
+`Stop` with an empty `background_tasks` array means the turn is over —
+gray dot, "Turn complete" banner. `Stop` with a *non-empty*
+`background_tasks` keeps the tab at `working` instead, because the
+session isn't actually idle: it'll wake back up when that work finishes.
+A scheduled `session_crons` entry alone does **not** count as in-flight
+— only actual running/pending background work does.
 
-## Install
-
-Nothing to do: Roost wires Claude Code's hooks itself the first time the
-UI starts (`agent-hooks = auto` in `config.conf`). See the
-[Agent Hooks](agents.md) guide for the mechanism, the `roostctl agent`
-verbs, and how to turn it off.
-
-To do it by hand — on a machine where the UI has not run yet, or after
-turning `agent-hooks` off:
-
-```bash
-roostctl agent install claude
-```
-
-That merges one hook entry per lifecycle event into Claude's own
-`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`),
-beside whatever else is already in it. The entry invokes `roostctl`
-through the `$ROOST_AGENT_HOOK` environment variable every Roost tab
-exports, so it carries no absolute path and keeps working after a
-relocated install, on a second machine, or over a host session. Take it
-back out with `roostctl agent uninstall claude`.
-
-`roostctl claude install` still works and does exactly the same thing —
-it is now an alias of `agent install claude`. What it no longer does is
-write `~/.config/roost/claude-settings.json` or print an
-`alias claude=…` snippet. If you followed those older instructions, the
-file and the alias are both still on your machine: `roostctl doctor`'s
-`agent.claude.legacy_settings` check says so and names the two removal
-steps (the [Agent Hooks](agents.md#legacy-claude-settings) guide has
-them too).
-
-`roostctl claude-hook` accepts both the canonical event spellings and
-the older kebab-case ones (`session-start`, `prompt-submit`,
-`notification`, `stop`, `session-end`) that early versions wrote, so an
-existing settings file is never broken by an upgrade.
-
-Run `roostctl doctor` any time to check the install without guessing.
-By default it prints one line for the whole `Claude Code` section;
-`roostctl doctor -v` breaks it into the individual checks —
-`claude.hook_events` confirms the settings file registers each
-lifecycle event (naming any it's missing), and `claude.hook_command`
-confirms each one resolves to a runnable `roostctl` — `fail` if a
-command's path is missing or not executable, `warn` if it resolves to a
-different `roostctl` than the one you're running. The `Agents` section
-adds `agent.claude.wired`, which reports the integration version the
-entries were written at.
+Beyond those three, Claude also reports `PreToolUse`/`PostToolUse`
+(keeps the dot blue through a tool call — and specifically, after you
+approve a permission prompt, the dot returns to blue when the approved
+tool *finishes*, not the instant you click Approve, since there's no
+second `PreToolUse` to catch), `PermissionDenied`/`PostToolUseFailure`
+(the turn keeps running), and `StopFailure` (red dot, naming Claude's
+reported error). `roostctl claude-hook` also still accepts the
+kebab-case event spellings an early Roost version wrote
+(`session-start`, `prompt-submit`, `notification`, `stop`,
+`session-end`), so a hand-installed settings file from before this
+adapter existed keeps working across an upgrade.
 
 ## Verifying
 
@@ -88,31 +77,23 @@ Now run `claude` and submit a prompt. Watch the tab indicator:
 
 If a project has multiple tabs running Claude, the project's sidebar row picks up a left-edge stripe in the most actionable color across its tabs, ranked `failed > needs-input > running > idle`.
 
-## Other shells (fish, zsh)
-
-The install command emits a bash alias by default. For other shells, adapt the syntax:
-
-- **zsh**: same as bash — paste into `~/.zshrc`.
-- **fish**: replace `alias claude='...'` with `alias claude '...'` (no `=`) in `~/.config/fish/config.fish`, or use `alias --save`.
-- **POSIX `sh`**: same as bash.
-
-## Why an alias and not editing the global settings file?
-
-Roost deliberately doesn't edit your `~/.claude/settings.json`. The alias approach:
-
-- Leaves the user's global config untouched (no merge logic, no marker comments, no risk of clobbering existing hooks).
-- Is trivially reversible (unset the alias, delete one file).
-- Lets the user run `claude` without Roost integration just by typing `command claude` or unsetting the alias.
-
 ## Troubleshooting
 
 Run `roostctl doctor` first. It's read-only, covers most of the cases
 below in one pass, and names exactly which check is unhappy instead of
-you guessing from the symptom.
+you guessing from the symptom — see [Agent Hooks →
+Troubleshooting](agents.md#troubleshooting) for the full per-agent
+`Agents` section.
 
-- **Hooks don't fire** — check `which claude`. If it points to the real binary instead of the alias, the alias didn't take effect (rc not sourced, or running in a non-interactive shell). Doctor's `claude.hook_events` and `claude.hook_command` checks confirm the settings file itself is correct; `claude.observed` says whether Roost has actually seen a hook fire on this tab.
+- **Hooks don't fire** — check `roostctl doctor -v`'s `agent.hook_binary`
+  check: a wrapper that strips the tab's environment (`env -i`, a `sudo`
+  re-exec, a sanitizing launcher) makes the installed hook silently
+  inert even though the settings file is correct. `claude.hook_events`
+  and `claude.hook_command` confirm the settings file itself registers
+  every event and resolves to a runnable `roostctl`; `claude.observed`
+  says whether Roost has actually seen a hook fire on this tab.
 - **Click-through doesn't focus** — on Linux, your notification daemon must support default actions (mako, dunst, GNOME Shell all do). On Wayland without an XDG-activation token, the window may only request attention rather than raise.
 - **OSC 9 banners still appear from inside Claude** — that means the `SessionStart` hook didn't reach Roost (no ownership claimed, so raw OSC isn't suppressed). Doctor's `tab.raw_osc` check reports whether suppression is currently active on the tab; check `roostctl identify` and re-source your rc if it isn't.
 - **The dot stopped moving after Claude errored out mid-session** — if Claude was killed or crashed without a `SessionEnd`, an OSC 133 prompt mark from the shell (reaching a fresh prompt) automatically releases the stale lifecycle and falls back to shell state; typing a command and pressing enter should clear it. See [Notifications → Hook-session OSC suppression](notifications.md#hook-session-osc-suppression) for the mechanism.
 
-See [Notifications](notifications.md) for the full pipeline architecture.
+See [Agent Hooks](agents.md) for the mechanism every agent shares, and [Notifications](notifications.md) for the full pipeline architecture.

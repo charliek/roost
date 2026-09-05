@@ -38,6 +38,8 @@ the launcher with deterministic commands.
 | `copy-on-select` | `off | true | clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow | deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
 | `link-modifier` | `ctrl | alt | super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
+| `agent-hooks` | `auto | off` | `auto` | Whether Roost wires the supported coding agents' (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) hook entries into their own config files at startup. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
+| `agent-hooks-skip` | comma list | (empty) | Agent names (`claude`, `codex`, `grok`, `cursor`, `opencode`) never wired even when `agent-hooks = auto`. See [below](#agent-hooks). |
 
 ## `copy-on-select`
 
@@ -230,6 +232,56 @@ keybind = ctrl+w = close_tab
 See [Keybindings](../getting-started/keybindings.md) for the full action
 list and trigger syntax.
 
+## `agent-hooks`
+
+Whether Roost wires the supported coding agents' hook entries into
+their own config files. Both UIs read this at startup, and `roostctl
+agent ensure` (the same verb the UIs run) reads it too — see the [Agent
+Hooks](../guides/agents.md) guide for the full mechanism, what gets
+written where, and the guarantee about what a merge does and doesn't
+touch.
+
+```conf
+agent-hooks = auto        # auto (default) | off
+agent-hooks-skip = cursor, codex
+```
+
+| Value | Effect |
+|---|---|
+| `auto` *(default)* — also accepts `on`, `true`, `yes` | Every present agent not named in `agent-hooks-skip` gets Roost's hook entries, refreshed on launch if they're stale. |
+| `off` — also accepts `false`, `no` | The UIs wire nothing at startup; an agent's config file is never opened. This does **not** remove anything already wired on its own — see below. |
+
+An unrecognized value (a typo, say) falls back to `auto`, never `off` —
+silently disabling the feature on a typo is the failure mode hardest to
+notice, so an unparseable value keeps the safer default instead. A
+repeated key is last-wins, including when the repeat is empty or
+unparseable (it still resolves to the default, `auto`, not to whatever
+an earlier line in the file said).
+
+`agent-hooks-skip` is a comma-separated list of agent names — `claude`,
+`codex`, `grok`, `cursor`, `opencode` — that are never wired regardless
+of `agent-hooks`. Names are lowercased and de-duplicated; a name that
+isn't one of the five is reported (by whichever tool is reading the
+config) and otherwise ignored, never fatal.
+
+**`off` stops future wiring; it does not itself remove anything.** This
+split is deliberate, not an oversight: flipping the key to `off` and
+relaunching means the UI won't wire anything *new*, but entries already
+on disk stay there until something explicit takes them out —
+`roostctl agent uninstall --all`, or running `roostctl agent ensure`
+yourself (which reads this same key and, seeing `off`, does perform the
+removal). The UIs themselves never rewrite an agent's config file just
+because the key changed to `off` — they simply stop touching it. Over a
+connected host session the split is reversed: the client is the only
+authority a session has, so an `agent-hooks = off` client tells the
+host to actively unwire on every connect. See [Agent Hooks → Remote
+hosts](../guides/agents.md#remote-hosts).
+
+`agent-hooks-skip` has no separate Swift mirror: on macOS, only the
+`roostctl` the app spawns acts on it, and that binary reads this same
+file through the same parser, so a second copy in `Config.swift` could
+only disagree with it.
+
 ## Example
 
 ```
@@ -269,9 +321,18 @@ command = label="Claude" run="claude --resume"
 # A dynamic, script-backed menu (⌘⇧E / Alt+Shift+E). The script prints
 # its rows on `list` and acts on the choice on `activate`:
 provider = label="Open shed" run="~/.config/roost/providers/shed.sh"
+
+# Default: Roost wires Claude Code, Codex, grok/gx, cursor-agent and
+# OpenCode's own hook files automatically. Skip one or two, or turn the
+# whole thing off (which stops future wiring — it doesn't by itself
+# remove what's already there; see docs/guides/agents.md).
+agent-hooks = auto
+agent-hooks-skip = cursor
 ```
 
 See [Extending Roost](../guides/extending.md) for the full `command =` /
 `provider =` contract (with bash / Python / TypeScript examples),
-[`paths.md`](paths.md) for where the file lives on each platform, and
-[`themes.md`](themes.md) for the `theme` value enumeration.
+[`paths.md`](paths.md) for where the file lives on each platform,
+[`themes.md`](themes.md) for the `theme` value enumeration, and the
+[Agent Hooks](../guides/agents.md) guide for `agent-hooks` /
+`agent-hooks-skip` in full.

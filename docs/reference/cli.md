@@ -5,9 +5,9 @@ a Unix-domain socket directly to the UI process — no daemon by
 default. The one exception is opt-in: `roostctl session` starts,
 stops, and inspects a headless `roost-session` daemon (see
 [`session` subcommands](#session-subcommands) below).
-Intended to be invoked from inside a Roost tab (typically by
-Claude Code hooks) but works from any shell that can reach the
-socket. See [`docs/reference/ipc.md`](ipc.md) for the wire
+Intended to be invoked from inside a Roost tab (typically by an
+[agent hook](../guides/agents.md)) but works from any shell that can
+reach the socket. See [`docs/reference/ipc.md`](ipc.md) for the wire
 format.
 
 Crate: `crates/roost-cli` (binary `roostctl`).
@@ -30,9 +30,10 @@ roostctl [--socket <PATH>] <COMMAND>
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
 | `project list` / `create` / `rename` / `delete` / `reorder` | Project lifecycle |
 | `agent ensure` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
+| `agent-hook <agent>` | Internal: the one hook entrypoint every supported agent invokes |
 | `claude install` | Alias of `agent install claude` |
-| `claude-hook` | Internal: invoked by Claude on each hook event |
-| `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, Claude hooks) |
+| `claude-hook` | Internal: invoked by Claude on each hook event (kept for settings files an earlier Roost wrote) |
+| `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, agent hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
@@ -249,12 +250,43 @@ read and write dotfiles, so they work with nothing running.
 
 ```bash
 roostctl agent status              # per agent: installed, wired, up to date
-roostctl agent ensure              # what the UIs run at startup
+roostctl agent ensure [--json]     # what the UIs run at startup
 roostctl agent install claude      # or --all; explicit wins over `agent-hooks = off`
 roostctl agent uninstall claude    # or --all
 ```
 
-See the [Agent Hooks](../guides/agents.md) guide.
+`ensure` reads `agent-hooks` / `agent-hooks-skip` from `config.conf`
+([`config.md`](config.md#agent-hooks)) — the same values the UIs act on
+at startup, through the same parser (`roost-cli` depends on
+`roost-ui-model` for exactly this). `install` and `uninstall` take an
+agent name (`claude`, `codex`, `grok`, `cursor`, `opencode`) or `--all`,
+and deliberately ignore `agent-hooks = off` — an explicit verb always
+wins. `status` changes nothing on disk; each row names the agent,
+whether its config directory is present, whether Roost's entries are
+wired, and whether they're at the current integration version.
+
+See the [Agent Hooks](../guides/agents.md) guide for the mechanism, the
+wire format each agent gets, and the guarantee about what a merge does
+and doesn't touch.
+
+## `agent-hook`
+
+Internal: the one hook entrypoint every supported agent's installed
+command invokes — `roostctl agent-hook <agent>`, where `<agent>` is
+`claude`, `codex`, `grok`, `cursor`, or `opencode` (gx reports through
+`grok`; there's no separate name for it). Reads the agent's JSON event
+payload from stdin, takes the event name from the payload itself
+(`hook_event_name` — there is no `--event` flag, since one installed
+command string has to serve every event), dials `ROOST_SOCKET` for the
+tab named by `ROOST_TAB_ID`, and translates the event into a
+`tab.agent_report`. **Always** exits 0 with `{}` on stdout, whatever
+happens — an agent Roost has no adapter for, a malformed payload, an
+unreachable socket, all drain stdin and answer the same inert `{}`,
+because Claude's and codex's `PermissionRequest` are *decision* hooks
+whose dialog blocks on this process, and anything else may be read as a
+block. Unlike `claude-hook` below, it never falls back to the default
+bundle-profile socket when `--socket`/`ROOST_SOCKET` is absent — that
+could otherwise deliver an event into an unrelated running Roost.
 
 ## `claude install`
 
@@ -275,7 +307,19 @@ how to remove it. There is no `--force`; it exits 2.
 
 ## `claude-hook`
 
-Internal: invoked by Claude Code via the generated settings file. Reads the hook payload from stdin, looks up `$ROOST_TAB_ID`, and translates lifecycle events into IPC calls. Always exits 0 with `{}` on stdout (Claude treats nonzero hooks as failures). Silently no-ops when run outside a Roost tab.
+A thin alias of `agent-hook claude`, kept so a `~/.claude/settings.json`
+an earlier Roost wrote (or a hand-installed one following
+[`docs/development/claude-testing.md`](../development/claude-testing.md))
+keeps working. It accepts the canonical event names plus the older
+kebab-case ones (`session-start`, `prompt-submit`, `notification`,
+`stop`, `session-end`) an early Roost wrote. Unlike `agent-hook`, it
+falls back to the ordinary target resolver (`--target` /
+`ROOST_BUNDLE_PROFILE` / auto-detect) when no explicit socket is given,
+matching the by-hand invocation that doc describes. Reads the hook
+payload from stdin, looks up `$ROOST_TAB_ID`, and translates lifecycle
+events into a `tab.agent_report`. Always exits 0 with `{}` on stdout
+(Claude treats nonzero hooks as failures). Silently no-ops when run
+outside a Roost tab.
 
 ## `session` subcommands
 
@@ -375,10 +419,10 @@ roostctl doctor --color=always
 |---|---|---|---|
 | `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Read directly from the env var rather than clap's `env = "ROOST_TAB_ID"`, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of a silent clap exit 2 |
 | `--json` | flag | `false` | Machine-readable report |
-| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 26 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
+| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 39 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
-The report is five sections. Each declares one of three scopes: **process**
+The report is six sections. Each declares one of three scopes: **process**
 (the shell/process that invoked doctor), **ui** (the Roost instance doctor
 reached), **tab** (the selected tab) — a *process* fact is never used to
 judge a *tab* fact unless the selected tab is doctor's own tab.
@@ -389,7 +433,8 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `ui` | ui | Which UI did target resolution pick, is its socket reachable, does `identify` succeed, does its version match `roostctl`'s, and does it speak the current agent-state wire format? |
 | `shell` | process (`shell.marks_observed` is tab-scoped) | Is the shell-integration contract offered, can this shell/version emit the OSC 133 marks that drive the running dot, and has a mark actually been observed on doctor's own tab? |
 | `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, and whether raw OSC 9/99/777 is currently suppressed. Those six are observations, not verdicts. |
-| `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does the hook settings file parse and register all six lifecycle events, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? |
+| `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse and register every lifecycle event Roost maps, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? Pre-046 checks, kept for the settings-file shape they've always covered — see the `agents` section below for the other four agents and for Claude's newer, agent-hooks-specific facts |
+| `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent Hooks](../guides/agents.md) guide |
 
 Every entry carries a stable `id` (`env.tab_id`, `ui.socket`,
 `shell.marks_capability`, `claude.hook_command`, …) and a `kind`: `check`
@@ -415,75 +460,105 @@ Every `fail`/`warn` still prints a link to the doc page that explains
 it; `skipped` entries and observations do not — there's nothing to go
 read about a fact.
 
-Real output, captured on a dev checkout with no Roost UI running and
-`ROOST_SOCKET` / `ROOST_TAB_ID` unset. This is the default view — one
-line per section, clipped to a fixed width so it stays scannable in a
-narrow terminal:
+Real output, captured on a dev checkout with `ROOST_TAB_ID` unset and
+`--target mac` pinning the target at a stale Roost.app socket left over
+from an earlier crash (so the example doesn't depend on whatever else
+happens to be running on the capture machine — an ordinary `roostctl
+doctor` with nothing running looks the same, just with `ui.target`
+saying `auto-detect` instead of `--target`). This is the default
+view — one line per section, clipped to a fixed width so it stays
+scannable in a narrow terminal:
 
 ```text
-roostctl doctor — roostctl 0.0.18 (run `roostctl doctor -v` for the full report)
+roostctl doctor — roostctl 0.0.19 (run `roostctl doctor -v` for the full report)
 
 [–] Environment         not running inside a Roost tab
-[✗] Roost UI            no Roost UI is listening (tried: /Users/charliek/Library/Caches/Roost/roost…
+[✗] Roost UI            /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket file ou…
 [–] Shell integration   not running inside a Roost tab
 [–] Selected tab        no tab selected — pass --tab, set ROOST_TAB_ID, or give the UI an active tab
-[!] Claude Code         6 of 6 commands (Notification, SessionEnd, SessionStart, Stop, StopFailure,…
+[–] Claude Code         the selected tab's ownership is unavailable (no tab.list from a running UI)
+[–] Agents              not running inside a Roost tab
 
-• 4 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
-    ✗ ui.target            → https://charliek.github.io/roost/reference/cli/#environment
-    ✗ ui.socket            → https://charliek.github.io/roost/reference/cli/#environment
-    ✗ ui.identify          → https://charliek.github.io/roost/reference/cli/#identify
-    ! claude.hook_command  → https://charliek.github.io/roost/guides/claude-code/#install
+• 2 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
+    ✗ ui.socket    → https://charliek.github.io/roost/reference/cli/#environment
+    ✗ ui.identify  → https://charliek.github.io/roost/reference/cli/#identify
 ```
 
-`-v` prints all 26 entries grouped by section, with the status column
+Notice `Claude Code` and `Agents` read `skipped`/`–`, not `fail`, even
+though no UI is reachable: everything in the `agents` section that
+doesn't need a live tab (`wired`, `trust`, `legacy_settings`) is read
+straight off the agents' own config files on disk, so it still has
+something to say with nothing running — only the tab-scoped `owning`
+checks and `agent.hook_binary` (which needs to be inside a tab at all)
+come back `skipped` here.
+
+`-v` prints all 39 entries grouped by section, with the status column
 blank for `null`-status observations (not for `skipped` — that word
 still prints, because it *is* a status) and a doc link under every
 `fail`/`warn`. Same capture, `-v`, trimmed with `[…]` to the sections
-that show every row shape — the elided ones are "Shell integration" and
-"Selected tab", both all `skipped` here because nothing is inside a
-Roost tab:
+that show every row shape — the elided one is "Shell integration",
+all `skipped` here because nothing is inside a Roost tab:
 
 ```text
-roostctl doctor — roostctl 0.0.18
+roostctl doctor — roostctl 0.0.19
 
 Environment (process)
   skipped env.tab_id               not running inside a Roost tab
           env.socket               unset — target resolution falls through to --socket / --target / auto-detect
 
 Roost UI (ui)
-  fail    ui.target                no Roost UI is listening (tried: /Users/charliek/Library/Caches/Roost/roost.sock, /Users/charliek/Library/Caches/Roost-linux/roost.sock, /Users/charliek/Library/Caches/Roost-iced/roost.sock)
+  ok      ui.target                --target → /Users/charliek/Library/Caches/Roost/roost.sock (auto-detect would try: /Users/charliek/Library/Caches/Roost/roost.sock, /Users/charliek/Library/Caches/Roost-linux/roost.sock, /Users/charliek/Library/Caches/Roost-iced/roost.sock)
+  fail    ui.socket                /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed
                                    → https://charliek.github.io/roost/reference/cli/#environment
-  fail    ui.socket                mac /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed; linux /Users/charliek/Library/Caches/Roost-linux/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed; iced /Users/charliek/Library/Caches/Roost-iced/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed
-                                   → https://charliek.github.io/roost/reference/cli/#environment
-  fail    ui.identify              no connection: target resolution found no socket to dial
+  fail    ui.identify              no connection: io error: Connection refused (os error 61)
                                    → https://charliek.github.io/roost/reference/cli/#identify
-  skipped ui.version               roostctl 0.0.18 — no UI reached, nothing to compare
-  skipped ui.agent_model           undetermined — tab.list failed: target resolution found no socket to dial
+  skipped ui.version               roostctl 0.0.19 — no UI reached, nothing to compare
+  skipped ui.agent_model           undetermined — tab.list failed: no connection: io error: Connection refused (os error 61)
 
   […]
 
+Selected tab (tab)
+  skipped tab.selection            no tab selected — pass --tab, set ROOST_TAB_ID, or give the UI an active tab
+  skipped tab.shell_state          unavailable (no tab.list from a running UI)
+  skipped tab.agent_lifecycle      unavailable (no tab.list from a running UI)
+  skipped tab.attention            unavailable (no tab.list from a running UI)
+  skipped tab.ownership            unavailable (no tab.list from a running UI)
+  skipped tab.derived              unavailable (no tab.list from a running UI)
+  skipped tab.raw_osc              unavailable (no tab.list from a running UI)
+
 Claude Code (process)
-  ok      claude.binary            2.1.220 (Claude Code)
+  ok      claude.binary            2.1.261 (Claude Code)
   ok      claude.settings          /Users/charliek/.claude/settings.json parses
-  ok      claude.hook_events       all 6 events registered
-  warn    claude.hook_command      6 of 6 commands (Notification, SessionEnd, SessionStart, Stop, StopFailure, UserPromptSubmit): resolves to /Users/charliek/projects/roost/mac/build/Roost.app/Contents/Resources/bin/roostctl rather than the running roostctl at /Users/charliek/projects/roost/target/debug/roostctl
-                                   → https://charliek.github.io/roost/guides/claude-code/#install
+  ok      claude.hook_events       all 11 events registered
+  ok      claude.hook_command      all 11 events have a current Roost command
   skipped claude.observed          the selected tab's ownership is unavailable (no tab.list from a running UI)
 
-• 4 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
-    ✗ ui.target            → https://charliek.github.io/roost/reference/cli/#environment
-    ✗ ui.socket            → https://charliek.github.io/roost/reference/cli/#environment
-    ✗ ui.identify          → https://charliek.github.io/roost/reference/cli/#identify
-    ! claude.hook_command  → https://charliek.github.io/roost/guides/claude-code/#install
+Agents (process)
+  skipped agent.hook_binary        not running inside a Roost tab
+  ok      agent.claude.wired       wired@v2
+  skipped agent.claude.owning      unavailable (no tab.list from a running UI)
+  ok      agent.claude.legacy_settings no leftover ~/.config/roost/claude-settings.json or shell alias found
+  ok      agent.codex.wired        wired@v2
+  ok      agent.codex.trust        8 trusted hashes match what codex would compute
+  skipped agent.codex.owning       unavailable (no tab.list from a running UI)
+  ok      agent.grok.wired         wired@v2
+  skipped agent.grok.owning        unavailable (no tab.list from a running UI)
+  ok      agent.cursor.wired       wired@v2
+  skipped agent.cursor.owning      unavailable (no tab.list from a running UI)
+  ok      agent.opencode.wired     wired@v2
+  skipped agent.opencode.owning    unavailable (no tab.list from a running UI)
+
+• 2 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
+    ✗ ui.socket    → https://charliek.github.io/roost/reference/cli/#environment
+    ✗ ui.identify  → https://charliek.github.io/roost/reference/cli/#identify
 ```
 
 Paths are this machine's own (`/Users/charliek/...`) — expect your own
-absolute paths, not these. The `claude.hook_command` warning above is
-this dev checkout's own noise, not a real problem: the installed hook
-settings still point at a `mac/build/Roost.app` bundle from an earlier
-session, not this session's `target/debug/roostctl` — a release install
-wouldn't show it.
+absolute paths, not these. The five `agent.*.wired`/`agent.codex.trust`
+`ok`s above reflect this dev checkout's own machine already having run
+`roostctl agent ensure` for real — an agent whose config directory
+doesn't exist at all shows `skipped: not installed` instead, and a
+present-but-never-wired agent shows `warn: not wired` rather than `ok`.
 
 `--json` carries the same facts as JSON — a top-level `schema_version: 2`,
 an explicit `exit_code` (so a script never has to re-derive "did
@@ -492,7 +567,7 @@ anything fail" from the check list), and every entry's stable `id`,
 observations, one of `ok`/`warn`/`fail`/`skipped` for checks. That's the
 shape to script against; the text output's column widths are not.
 `--json` is also unaffected by `-v` and `--color`: it always carries all
-26 entries and never contains a color escape, regardless of either
+39 entries and never contains a color escape, regardless of either
 flag.
 
 ## Environment
@@ -502,11 +577,13 @@ flag.
 | `ROOST_SOCKET` | Override the UI socket the CLI dials |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
 | `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl`. Best-effort — may be absent if the UI can't resolve its bundled/sibling CLI, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
-| `ROOST_DEBUG` | If set, `claude-hook` writes failure messages to stderr |
+| `ROOST_AGENT_HOOK` | Set by the UI (or `roost-session`) on every tab: absolute path of the `roostctl` (or `roost-session`) that understands `agent-hook <agent>`. Every hook entry Roost installs into an agent's config reads this indirectly through a shell fallback rather than calling `roostctl` directly, which is what keeps the installed command host-independent — see [Agent Hooks](../guides/agents.md#inert-outside-roost). Resolved the same sibling → bundled-`Resources/bin` → `PATH` ladder as `ROOST_ROOSTCTL`; omitted, like that variable, when nothing resolves |
+| `ROOST_DEBUG` | If set, `claude-hook` and `agent-hook` write failure messages to stderr |
+| `ROOST_AGENT_HOOKS_FORCE` | Set to `1` to let `agent ensure`/`install`/`uninstall` write real dotfiles while `ROOST_TEST_MODE=1` is also set — without it, the agent-hooks install engine refuses to run at all under `ROOST_TEST_MODE=1`, belt and braces against a test writing into a real machine's dotfiles |
 | `ROOST_SESSION_BIN` | Overrides where `session start` looks for the `roost-session` binary (default: next to `roostctl`, then `PATH`) |
 | `ROOST_SSH_BIN` | Overrides the `ssh` binary a host's SSH transport execs (default: `ssh` on `PATH`) — read by `host add --verify` against an SSH target and by the UI's own tunnel. See [`paths.md`](paths.md#ssh-scratch-directories). |
 
-`ROOST_SOCKET` / `ROOST_TAB_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back.
+`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back.
 
 ## Exit codes
 
