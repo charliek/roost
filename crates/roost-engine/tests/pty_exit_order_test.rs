@@ -70,7 +70,7 @@ async fn trailing_output_arrives_before_exit() {
     let mut lagged = 0;
     let mut tab_id = 600;
     let mut stats: Vec<String> = Vec::new();
-    while completed + lagged < 40 {
+    while (completed + lagged) < 2 * ORDERING_RUNS {
         let run = completed;
         EVENTS.store(0, std::sync::atomic::Ordering::Relaxed);
         tab_id += 1;
@@ -132,7 +132,7 @@ async fn trailing_output_arrives_before_exit() {
         completed += 1;
     }
     panic!(
-        "SCRATCH-MEASUREMENT clean={completed} lagged={lagged} of 40\n{}",
+        "SCRATCH-MEASUREMENT clean={completed} lagged={lagged} of {}\n{}", 2 * ORDERING_RUNS,
         stats.join("\n")
     );
 }
