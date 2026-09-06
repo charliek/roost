@@ -2287,7 +2287,17 @@ Schema-only fields that survive but rename:
 
 ## Versioning
 
-`identify.protocol_version` is the integer schema version. M0 ships
-version `1`. Additive changes (new optional fields, new ops, new
-events) do not bump the version. Breaking changes coordinate a major
-version bump and updated clients.
+Two integers version this wire independently. `identify.protocol_version`
+is the UI socket's schema version — currently **`1`**
+(`roost_ipc::PROTOCOL_VERSION`); it is reported by
+[`identify`](#identify) but nothing compares it, so the UI socket has no
+handshake gate. `session.identify.session_protocol` is the session
+sockets' — currently **`2`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
+covering both the session JSON ops and the binary [data
+plane](#data-plane); conforming clients check it for equality before
+anything else and the [attach handshake](#tabattach) refuses a mismatch.
+
+**The consumption and compatibility policy lives in
+[`ipc-compatibility.md`](ipc-compatibility.md)** — what is additive in
+which direction, which enums are closed, when either integer bumps, and
+how an external project depends on `roost-ipc`.
