@@ -242,12 +242,18 @@ bump anything.
 ## Fixtures are the contract
 
 [`tests/ipc-vectors/`](https://github.com/charliek/roost/blob/main/tests/ipc-vectors/README.md)
-holds a canonical JSON exemplar per op and event. Both the Rust tests
-(`cargo test -p roost-ipc`) and the Swift tests load the same files and
-assert decode → re-encode → byte-equal, which is what keeps two
-independent implementations of the same wire from drifting. Byte-exactness
-is a cross-language pinning device, not a claim that JSON key order is
-wire-meaningful.
+holds a canonical JSON exemplar per op and event, pinned in three
+layers. Every vector is schema-agnostically round-tripped through
+`serde_json::Value` (`crates/roost-ipc/tests/vectors.rs`), which catches
+a vector that stops parsing. Selected vectors are decoded into the typed
+structs on both sides — Rust (`roundtrip.rs`, `wire_types_test.rs`) and
+Swift (`IPCSessionTypesTests.swift`) — which is what pins field names
+and shapes across two independent implementations of the same wire.
+And for the session types, `wire_types_test.rs` additionally asserts
+serialization byte-exactly against in-file literal exemplars. No test
+byte-compares the on-disk files themselves: JSON key order and
+whitespace are not wire-meaningful, and the corpus README's whitespace
+rules exist for diff hygiene, not compatibility.
 
 For a consumer, the corpus is the most useful thing in this repository:
 it is the executable form of the protocol, and it can be vendored or
