@@ -1621,7 +1621,31 @@ fn pty_reader_loop(mut reader: File, tab_id: i64, mut sink: impl FnMut(Vec<u8>) 
                 return;
             }
             Ok(n) => {
-                if !sink(buf[..n].to_vec()) {
+                // Top the chunk up with whatever is already waiting
+                // before publishing. A streaming child hands the line
+                // discipline one line at a time and a reader woken per
+                // line publishes ~40-byte events, which is what fills the
+                // 256-slot broadcast on a slow consumer; the non-blocking
+                // master makes the extra reads free (WouldBlock at once
+                // when nothing is there), so this adds no latency.
+                let mut filled = n;
+                while filled < buf.len() {
+                    match reader.read(&mut buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(m) => filled += m,
+                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            if !matches!(
+                                wait_readable_for(reader.as_raw_fd(), COALESCE_WAIT_MS),
+                                Ok(true)
+                            ) {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !sink(buf[..filled].to_vec()) {
                     return;
                 }
             }
@@ -1659,12 +1683,21 @@ fn pty_reader_loop(mut reader: File, tab_id: i64, mut sink: impl FnMut(Vec<u8>) 
     }
 }
 
+/// How long a partially filled chunk waits for more output before it is
+/// published. A streaming child fills the chunk well inside this; an
+/// interactive echo pays it once.
+const COALESCE_WAIT_MS: i32 = 1;
+
 /// `true` once there is input to read; `false` on a hang-up or error
 /// with no input pending.
-///
-/// The timeout is infinite, so `poll` never reports one and the loop
-/// exists only to retry `EINTR`.
 fn wait_readable(fd: RawFd) -> std::io::Result<bool> {
+    wait_readable_for(fd, -1)
+}
+
+/// `wait_readable` with a timeout in milliseconds (`-1` = none): `Ok(false)`
+/// also when the timeout expires with nothing to read. The loop exists
+/// only to retry `EINTR`.
+fn wait_readable_for(fd: RawFd, timeout_ms: i32) -> std::io::Result<bool> {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -1673,7 +1706,7 @@ fn wait_readable(fd: RawFd) -> std::io::Result<bool> {
     loop {
         // SAFETY: one `pollfd`, passed with a count of one; the fd is
         // owned by the caller's `File` for the duration of the call.
-        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == ErrorKind::Interrupted {
@@ -1681,7 +1714,7 @@ fn wait_readable(fd: RawFd) -> std::io::Result<bool> {
             }
             return Err(err);
         }
-        return Ok(pfd.revents & libc::POLLIN != 0);
+        return Ok(rc > 0 && pfd.revents & libc::POLLIN != 0);
     }
 }
 
