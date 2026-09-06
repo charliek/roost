@@ -48,7 +48,10 @@ fn vectors_directory_is_non_empty() {
     let v = collect_vectors(&dir);
     assert!(
         !v.is_empty(),
-        "no JSON vectors found in {} — did you delete them?",
+        "no JSON vectors found in {} — did you delete them? These vectors are a \
+         compatibility contract: never edit an existing vector to bless a wire \
+         change (additive changes add new vectors) — see \
+         docs/reference/ipc-compatibility.md.",
         dir.display()
     );
 }
@@ -96,7 +99,12 @@ fn every_vector_round_trips_through_serde_json() {
         }
     }
     if !errors.is_empty() {
-        panic!("vector failures:\n{}", errors.join("\n"));
+        panic!(
+            "vector failures (these vectors are a compatibility contract — never edit \
+             an existing vector to bless a wire change, additive changes add new \
+             vectors; see docs/reference/ipc-compatibility.md):\n{}",
+            errors.join("\n")
+        );
     }
 }
 

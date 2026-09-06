@@ -8,7 +8,10 @@
 //! `mac/Sources/Roost/IPCMessages.swift` consumes too. The
 //! assertions are deliberately byte-exact against literal JSON:
 //! a field rename or a reordering that a `round_trip` would happily
-//! accept is a cross-language break.
+//! accept is a cross-language break. These fixtures are a
+//! compatibility contract — never edit an existing vector to bless a
+//! wire change (additive changes add new vectors); see
+//! `docs/reference/ipc-compatibility.md`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -75,7 +78,12 @@ where
 {
     let json = serde_json::to_string(value).expect("serialize");
     let back: T = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(value, &back, "round-trip mismatch via {json}");
+    assert_eq!(
+        value, &back,
+        "round-trip mismatch via {json} — these vectors are a compatibility \
+         contract, never edit an existing one to bless a wire change (additive \
+         changes add new vectors); see docs/reference/ipc-compatibility.md"
+    );
 }
 
 /// HS-1b's breaking bump: `events.subscribe` and `tab.attach` are

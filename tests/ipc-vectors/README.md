@@ -3,6 +3,12 @@
 Canonical wire-format exemplars for the JSON IPC protocol defined in
 [`docs/reference/ipc.md`](../../docs/reference/ipc.md).
 
+This corpus is the compatibility contract: an existing vector is never
+semantically edited to bless a wire change, and additive changes add new
+vectors instead. The policy — what "additive" means, the four-direction
+compatibility matrix, and what enforces this — lives in
+[`docs/reference/ipc-compatibility.md`](../../docs/reference/ipc-compatibility.md).
+
 Each file is one JSON object — either a request envelope, a response
 envelope, or an event envelope. The naming convention is:
 
