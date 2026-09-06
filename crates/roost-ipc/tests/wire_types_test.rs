@@ -18,13 +18,15 @@ use std::path::PathBuf;
 
 use roost_ipc::messages::{
     AgentHooksMode, AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode,
-    AttachPayloadKind, ClipboardEffectTarget, EventBatch, EventEnvelope, ProjectReorderParams,
-    ResponseError, RetrySchedule, SessionBinaryIdentity, SessionConnectParams,
-    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetAgentHooksParams,
+    AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope,
+    ProjectReorderParams, ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity,
+    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
     SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams,
-    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent,
-    TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, TabReorderParams, WireProjectRef,
-    WireTabRef, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
+    TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, TabReorderParams,
+    TabSendFileParams, TabSendFileResult, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -86,13 +88,14 @@ where
     );
 }
 
-/// HS-1b's breaking bump: `events.subscribe` and `tab.attach` are
-/// lease-gated now, so a client written against `1` is rejected rather
-/// than silently served. The request/response wire version did not move
-/// with it — the two version different things.
+/// Plan 047's bump, under the rule stated on the constant: a pre-047
+/// session answers `session.put_file` with `unknown-op`, which is not a
+/// refusal a client can act on per paste, so the number moves. The
+/// request/response wire version did not move with it — the two version
+/// different things.
 #[test]
-fn session_protocol_version_is_two() {
-    assert_eq!(SESSION_PROTOCOL_VERSION, 2);
+fn session_protocol_version_is_three() {
+    assert_eq!(SESSION_PROTOCOL_VERSION, 3);
     assert_eq!(roost_ipc::PROTOCOL_VERSION, 1);
 }
 
@@ -145,7 +148,7 @@ fn unknown_attach_payload_kind_survives_a_round_trip() {
 #[test]
 fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.18","session_protocol":2,"#,
+        r#"{"app_version":"0.0.18","session_protocol":3,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
@@ -166,7 +169,7 @@ fn session_identify_matches_its_golden_json() {
 #[test]
 fn session_binary_identity_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.19","session_protocol":2,"#,
+        r#"{"app_version":"0.0.19","session_protocol":3,"#,
         r#""libghostty_build":"ghostty-abcdef0123456789+snapshot.v1"}"#,
     );
 
@@ -443,9 +446,9 @@ fn tab_attach_result_matches_its_golden_json() {
 
 #[test]
 fn attach_handshake_matches_its_golden_json() {
-    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":2}"#;
+    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":3}"#;
     const RESUME: &str = concat!(
-        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":2,"#,
+        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":3,"#,
         r#""resume_from_seq":901,"server_epoch":6032428321756423947,"#,
         r#""tab_generation":3}"#,
     );
@@ -1214,4 +1217,199 @@ fn a_retry_schedules_reason_is_additive() {
         .unwrap(),
         r#"{"delay_ms":250}"#
     );
+}
+
+// ============================================================================
+// Files across a host boundary (plan 047 §3.1, §3.4, §3.5)
+// ============================================================================
+
+/// The raw cap has to leave room for its own base64 inside a frame, or
+/// the op would need chunking it deliberately does not have.
+#[test]
+fn the_put_file_cap_base64s_inside_one_frame() {
+    assert_eq!(MAX_PUT_FILE_BYTES, 10 * 1024 * 1024);
+    let encoded = MAX_PUT_FILE_BYTES.div_ceil(3) * 4;
+    assert!(
+        (encoded as usize) < roost_ipc::MAX_FRAME_BYTES,
+        "{encoded} encoded bytes must fit a {} byte frame with the envelope",
+        roost_ipc::MAX_FRAME_BYTES
+    );
+}
+
+#[test]
+fn session_put_file_shapes_match_their_golden_json() {
+    const PARAMS: &str = concat!(
+        r#"{"lease":"9f2c1d7a4b6e08315c0d9a72e4f16b83","#,
+        r#""name":"shot.png","data":"aGVsbG8="}"#,
+    );
+    let params = SessionPutFileParams {
+        lease: LEASE.into(),
+        name: "shot.png".into(),
+        data: b"hello".to_vec(),
+    };
+    round_trip(&params);
+    assert_eq!(serde_json::to_string(&params).unwrap(), PARAMS);
+    assert_eq!(
+        serde_json::from_str::<SessionPutFileParams>(PARAMS).unwrap(),
+        params
+    );
+
+    // Strict like every other request type: a caller that misspells a
+    // field is refused, not served with the field ignored.
+    assert!(serde_json::from_str::<SessionPutFileParams>(
+        r#"{"lease":"l","name":"a.png","data":"aGVsbG8=","mode":"0600"}"#
+    )
+    .is_err());
+    // Malformed base64 is a decode failure, so the engine never sees a
+    // half-decoded payload.
+    assert!(serde_json::from_str::<SessionPutFileParams>(
+        r#"{"lease":"l","name":"a","data":"!!"}"#
+    )
+    .is_err());
+
+    const RESULT: &str =
+        r#"{"path":"/home/c/.cache/roost-session/files/4b9d1e7f0a3c5e21/shot.png","bytes":482113}"#;
+    let result = SessionPutFileResult {
+        path: "/home/c/.cache/roost-session/files/4b9d1e7f0a3c5e21/shot.png".into(),
+        bytes: 482_113,
+    };
+    round_trip(&result);
+    assert_eq!(serde_json::to_string(&result).unwrap(), RESULT);
+    // `bytes` is a count, not an id: the string-int64 convention
+    // deliberately does not apply, so it must stay a JSON number.
+    assert!(serde_json::to_value(&result).unwrap()["bytes"].is_u64());
+}
+
+#[test]
+fn tab_send_file_shapes_match_their_golden_json() {
+    const PARAMS: &str = r#"{"tab":"h2.7","paths":["/Users/c/Desktop/shot.png"]}"#;
+    let params = TabSendFileParams {
+        tab: "h2.7".into(),
+        paths: vec!["/Users/c/Desktop/shot.png".into()],
+    };
+    round_trip(&params);
+    assert_eq!(serde_json::to_string(&params).unwrap(), PARAMS);
+    // The tab ref rides as the same string `tab.focus` takes, so both
+    // spellings have to survive the trip unchanged.
+    for raw in ["5", "h2.7"] {
+        let one: TabSendFileParams =
+            serde_json::from_value(serde_json::json!({"tab": raw, "paths": ["/a"]})).unwrap();
+        assert_eq!(one.tab, raw);
+        assert!(WireTabRef::parse(&one.tab).is_some(), "{raw} parses");
+    }
+    assert!(serde_json::from_str::<TabSendFileParams>(
+        r#"{"tab":"5","paths":["/a"],"host":"hs-2f1c"}"#
+    )
+    .is_err());
+
+    const RESULT: &str = concat!(
+        r#"{"pasted":"/home/c/files/shot.png","uploads":[{"source":"/Users/c/Desktop/shot.png","#,
+        r#""name":"shot.png","path":"/home/c/files/shot.png","bytes":482113}],"#,
+        r#""skipped":[{"path":"/Users/c/build","reason":"directory"}]}"#,
+    );
+    let result = TabSendFileResult {
+        pasted: "/home/c/files/shot.png".into(),
+        uploads: vec![SentFile {
+            source: "/Users/c/Desktop/shot.png".into(),
+            name: "shot.png".into(),
+            path: "/home/c/files/shot.png".into(),
+            bytes: 482_113,
+        }],
+        skipped: vec![SkippedFile {
+            path: "/Users/c/build".into(),
+            reason: "directory".into(),
+        }],
+    };
+    round_trip(&result);
+    assert_eq!(serde_json::to_string(&result).unwrap(), RESULT);
+
+    // A local tab crosses no boundary: the pasted text is the escaped
+    // local path and nothing was uploaded.
+    let local = TabSendFileResult {
+        pasted: "/Users/c/my\\ shot.png".into(),
+        ..TabSendFileResult::default()
+    };
+    round_trip(&local);
+    assert!(local.uploads.is_empty());
+}
+
+/// The five spellings the planner emits. A `String` on the wire, so a
+/// reason a client has no name for still decodes — but these five are
+/// the published set, and renaming one has to break here.
+#[test]
+fn every_published_skip_reason_round_trips() {
+    for reason in [
+        "directory",
+        "missing",
+        "unreadable",
+        "not-regular",
+        "over-cap",
+    ] {
+        let skipped = SkippedFile {
+            path: "/a".into(),
+            reason: reason.into(),
+        };
+        round_trip(&skipped);
+        assert_eq!(
+            serde_json::to_value(&skipped).unwrap()["reason"],
+            serde_json::Value::String(reason.into())
+        );
+    }
+    let future: SkippedFile =
+        serde_json::from_str(r#"{"path":"/a","reason":"encrypted-volume"}"#).unwrap();
+    assert_eq!(future.reason, "encrypted-volume");
+}
+
+/// `clipboard.write` takes exactly one of `text` / `image_png` (plan
+/// 047 §3.5). `text` went optional here, so the two things this pins
+/// are that a `text` request is byte-identical to what it always was,
+/// and that the image form neither invents a `text` key nor accepts
+/// both.
+#[test]
+fn clipboard_write_carries_text_or_a_png_and_never_invents_the_other() {
+    const TEXT: &str = r#"{"target":"system","text":"hello"}"#;
+    let text = ClipboardWriteParams {
+        target: "system".into(),
+        text: Some("hello".into()),
+        image_png: None,
+    };
+    round_trip(&text);
+    assert_eq!(serde_json::to_string(&text).unwrap(), TEXT);
+    assert_eq!(
+        serde_json::from_str::<ClipboardWriteParams>(TEXT).unwrap(),
+        text
+    );
+
+    const IMAGE: &str = r#"{"target":"system","image_png":"aGVsbG8="}"#;
+    let image = ClipboardWriteParams {
+        target: "system".into(),
+        text: None,
+        image_png: Some(b"hello".to_vec()),
+    };
+    round_trip(&image);
+    assert_eq!(serde_json::to_string(&image).unwrap(), IMAGE);
+    assert_eq!(
+        serde_json::from_str::<ClipboardWriteParams>(IMAGE).unwrap(),
+        image
+    );
+
+    // Both absent decodes — the handler answers `missing-param`, which
+    // is the layer that can say which op needed which field.
+    let neither: ClipboardWriteParams = serde_json::from_str(r#"{"target":"system"}"#).unwrap();
+    assert_eq!(neither.text, None);
+    assert_eq!(neither.image_png, None);
+
+    // An explicit null is absent, not empty bytes.
+    let nulled: ClipboardWriteParams =
+        serde_json::from_str(r#"{"target":"system","text":null,"image_png":null}"#).unwrap();
+    assert_eq!(nulled.image_png, None);
+
+    assert!(serde_json::from_str::<ClipboardWriteParams>(
+        r#"{"target":"system","image_png":"!!"}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<ClipboardWriteParams>(
+        r#"{"target":"system","text":"a","html":"<b>a</b>"}"#
+    )
+    .is_err());
 }

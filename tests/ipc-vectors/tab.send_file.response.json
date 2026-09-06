@@ -1,0 +1,16 @@
+{
+  "id": "13",
+  "ok": true,
+  "result": {
+    "pasted": "/home/charlie/.cache/roost-session/files/4b9d1e7f0a3c5e21/shot.png",
+    "uploads": [
+      {
+        "source": "/Users/charlie/Desktop/shot.png",
+        "name": "shot.png",
+        "path": "/home/charlie/.cache/roost-session/files/4b9d1e7f0a3c5e21/shot.png",
+        "bytes": 482113
+      }
+    ],
+    "skipped": [{ "path": "/Users/charlie/build", "reason": "directory" }]
+  }
+}

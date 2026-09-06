@@ -1,0 +1,9 @@
+{
+  "id": "12",
+  "op": "session.put_file",
+  "params": {
+    "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+    "name": "roost-image-1757083567-8f3a1d0e5b7c42c2.png",
+    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+  }
+}

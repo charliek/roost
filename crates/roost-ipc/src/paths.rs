@@ -205,6 +205,36 @@ impl BundleProfile {
         self.log_dir.join("roost.log")
     }
 
+    /// Where a host session stores files a client uploaded for one of
+    /// its tabs (plan 047 §3.1). **Cache semantics**, honestly: the
+    /// contents are reproducible from the client, disposable, and swept
+    /// at every start and at every clean stop.
+    ///
+    /// macOS `~/Library/Caches/<label>/files`; Linux
+    /// `$XDG_CACHE_HOME/<ns>/files`, default `~/.cache/<ns>/files`.
+    /// Deliberately **not** the Mac state dir, whose path contains a
+    /// space and so could never be pasted bare; and **not**
+    /// `$XDG_RUNTIME_DIR`, which is tmpfs.
+    ///
+    /// When `ROOST_STATE_DIR` is honoured it is `<state_dir>/files`
+    /// instead — the same condition [`apply_state_dir_override`]
+    /// applies, so a spawned dev session's sweep-on-start stays inside
+    /// the launcher's isolated tree rather than emptying the
+    /// developer's real cache.
+    pub fn files_dir(&self) -> anyhow::Result<PathBuf> {
+        self.files_dir_with(std::env::var_os(STATE_DIR_ENV).as_deref())
+    }
+
+    /// [`Self::files_dir`] with the seam's value passed in, so the
+    /// policy is testable without mutating process-global env — the
+    /// same split [`apply_state_dir_override`] uses.
+    fn files_dir_with(&self, state_dir_env: Option<&std::ffi::OsStr>) -> anyhow::Result<PathBuf> {
+        if honoured_state_dir(state_dir_env).is_some() {
+            return Ok(self.state_dir.join("files"));
+        }
+        Ok(resolve_cache_dir(self.kind, self.app_label)?.join("files"))
+    }
+
     /// flock guarding the IPC socket: the probe→unlink→bind sequence
     /// and the bound socket's lifetime. Lives next to the socket, so
     /// it follows `XDG_RUNTIME_DIR` and a `ROOST_STATE_DIR` override
@@ -388,6 +418,28 @@ fn resolve_paths(
     Ok((tmp.join("roost.sock"), tmp.clone(), tmp))
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_cache_dir(_kind: BundleProfileKind, app_label: &str) -> anyhow::Result<PathBuf> {
+    Ok(resolve_cache_dir_mac(
+        app_label,
+        std::env::var_os("HOME").as_deref(),
+    ))
+}
+
+/// The Mac cache root: the same directory the socket already lives in,
+/// with the same HOME-less `/tmp/<label>` fallback `resolve_paths`
+/// applies — a sandboxed launchd process can inherit `HOME=""`.
+#[cfg(target_os = "macos")]
+fn resolve_cache_dir_mac(app_label: &str, home: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(raw) = home {
+        let home = PathBuf::from(raw);
+        if !home.as_os_str().is_empty() && home.is_absolute() {
+            return home.join("Library/Caches").join(app_label);
+        }
+    }
+    PathBuf::from("/tmp").join(app_label)
+}
+
 /// The environment Linux path resolution reads, captured once so the
 /// resolver below can be pure. Same philosophy as
 /// [`apply_state_dir_override`]: the policy is unit-testable — and its
@@ -400,6 +452,7 @@ struct LinuxPathEnv {
     runtime_dir: Option<std::ffi::OsString>,
     data_home: Option<std::ffi::OsString>,
     state_home: Option<std::ffi::OsString>,
+    cache_home: Option<std::ffi::OsString>,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -410,6 +463,7 @@ impl LinuxPathEnv {
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
             data_home: std::env::var_os("XDG_DATA_HOME"),
             state_home: std::env::var_os("XDG_STATE_HOME"),
+            cache_home: std::env::var_os("XDG_CACHE_HOME"),
         }
     }
 }
@@ -431,11 +485,7 @@ fn resolve_paths_linux(
     env: &LinuxPathEnv,
     uid: u32,
 ) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
-    let namespace = match kind {
-        BundleProfileKind::Mac | BundleProfileKind::Linux => "roost",
-        BundleProfileKind::Iced => "roost-iced",
-        BundleProfileKind::Session => session_dir_names(cfg!(debug_assertions)).1,
-    };
+    let namespace = linux_namespace(kind);
     let socket = match valid_dir(env.runtime_dir.as_deref()) {
         Some(dir) => dir.join(namespace).join("roost.sock"),
         None => PathBuf::from(format!("/tmp/{namespace}-{uid}")).join("roost.sock"),
@@ -453,6 +503,35 @@ fn resolve_paths_linux(
             .join(namespace),
     };
     Ok((socket, state, log))
+}
+
+/// The XDG directory name every Linux path for a profile hangs off.
+#[cfg(not(target_os = "macos"))]
+fn linux_namespace(kind: BundleProfileKind) -> &'static str {
+    match kind {
+        BundleProfileKind::Mac | BundleProfileKind::Linux => "roost",
+        BundleProfileKind::Iced => "roost-iced",
+        BundleProfileKind::Session => session_dir_names(cfg!(debug_assertions)).1,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_cache_dir(kind: BundleProfileKind, _app_label: &str) -> anyhow::Result<PathBuf> {
+    resolve_cache_dir_linux(kind, &LinuxPathEnv::from_process())
+}
+
+/// The Linux cache root, the fourth XDG base dir this resolver reads.
+/// Same rule as the other three: a set-but-unusable `XDG_CACHE_HOME` is
+/// ignored, and `$HOME` is only required when it is what's left.
+#[cfg(not(target_os = "macos"))]
+fn resolve_cache_dir_linux(kind: BundleProfileKind, env: &LinuxPathEnv) -> anyhow::Result<PathBuf> {
+    let namespace = linux_namespace(kind);
+    Ok(match valid_dir(env.cache_home.as_deref()) {
+        Some(dir) => dir.join(namespace),
+        None => valid_home(env.home.as_deref())?
+            .join(".cache")
+            .join(namespace),
+    })
 }
 
 /// Validate `$HOME` as non-empty and absolute. The raw env value would
@@ -749,6 +828,7 @@ mod tests {
             runtime_dir: Some("/run/user/1000".into()),
             data_home: Some("/home/tester/.local/share".into()),
             state_home: Some("/home/tester/.local/state".into()),
+            cache_home: Some("/home/tester/.cache".into()),
         }
     }
 
@@ -819,12 +899,17 @@ mod tests {
             runtime_dir: Some("".into()),
             data_home: Some("relative/share".into()),
             state_home: Some("".into()),
+            cache_home: Some("relative/cache".into()),
         };
         let (socket, state, log) =
             resolve_paths_linux(BundleProfileKind::Linux, &env, 1000).expect("resolve");
         assert_eq!(socket, PathBuf::from("/tmp/roost-1000/roost.sock"));
         assert_eq!(state, PathBuf::from("/home/tester/.local/share/roost"));
         assert_eq!(log, PathBuf::from("/home/tester/.local/state/roost"));
+        assert_eq!(
+            resolve_cache_dir_linux(BundleProfileKind::Linux, &env).expect("resolve"),
+            PathBuf::from("/home/tester/.cache/roost")
+        );
     }
 
     /// `ROOST_STATE_DIR` moves `state.json` and its lock and nothing
@@ -930,6 +1015,111 @@ mod tests {
             log,
             PathBuf::from(format!("/home/tester/.local/state/{ns}"))
         );
+    }
+
+    /// The upload store's Linux path contract (plan 047 §3.1), pinned
+    /// literally like every other path above it.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn golden_linux_files_dirs_hang_off_the_cache_root() {
+        let ns = session_dir_names(cfg!(debug_assertions)).1;
+        let session_want = format!("/home/tester/.cache/{ns}/files");
+        for (kind, want) in [
+            (BundleProfileKind::Linux, "/home/tester/.cache/roost/files"),
+            (
+                BundleProfileKind::Iced,
+                "/home/tester/.cache/roost-iced/files",
+            ),
+            (BundleProfileKind::Session, session_want.as_str()),
+        ] {
+            let dir = resolve_cache_dir_linux(kind, &golden_env())
+                .expect("resolve")
+                .join("files");
+            assert_eq!(dir, PathBuf::from(want));
+            // Never the runtime dir: it is tmpfs, and an upload has to
+            // outlive the memory a session can spare for it.
+            assert!(!dir.starts_with("/run/user"));
+        }
+
+        // No `XDG_CACHE_HOME` → the spec's own default under `$HOME`.
+        let env = LinuxPathEnv {
+            home: Some("/home/tester".into()),
+            ..LinuxPathEnv::default()
+        };
+        assert_eq!(
+            resolve_cache_dir_linux(BundleProfileKind::Session, &env)
+                .expect("resolve")
+                .join("files"),
+            PathBuf::from(format!("/home/tester/.cache/{ns}/files"))
+        );
+
+        // And `$HOME` is required only when it is what's left.
+        let homeless = LinuxPathEnv::default();
+        assert!(resolve_cache_dir_linux(BundleProfileKind::Session, &homeless).is_err());
+    }
+
+    /// The macOS half. `~/Library/Caches` and not
+    /// `~/Library/Application Support`: the state dir has a space in
+    /// it, and every byte of this path has to survive being pasted
+    /// bare into an agent's composer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn golden_mac_files_dirs_hang_off_library_caches() {
+        let home = std::ffi::OsString::from("/Users/tester");
+        assert_eq!(
+            resolve_cache_dir_mac("Roost", Some(&home)).join("files"),
+            PathBuf::from("/Users/tester/Library/Caches/Roost/files")
+        );
+        let label = session_dir_names(cfg!(debug_assertions)).0;
+        let session = resolve_cache_dir_mac(label, Some(&home)).join("files");
+        assert_eq!(
+            session,
+            PathBuf::from(format!("/Users/tester/Library/Caches/{label}/files"))
+        );
+        assert!(!session.to_string_lossy().contains(' '));
+
+        // The same HOME-less fallback the socket takes.
+        for raw in [None, Some(std::ffi::OsStr::new(""))] {
+            assert_eq!(
+                resolve_cache_dir_mac("Roost", raw).join("files"),
+                PathBuf::from("/tmp/Roost/files")
+            );
+        }
+    }
+
+    /// The isolation rule: a honoured `ROOST_STATE_DIR` moves the
+    /// upload store inside it, so a spawned dev session's sweep-on-start
+    /// cannot empty the developer's real cache. A value the resolver
+    /// ignores leaves the store on the cache path, exactly as the state
+    /// dir stays put.
+    #[test]
+    fn files_dir_follows_a_honoured_state_dir_override() {
+        let base = BundleProfile::session().expect("session profile");
+        let isolated = BundleProfile {
+            state_dir: apply_state_dir_override(
+                base.state_dir.clone(),
+                Some("/tmp/roost-isolated-state".into()),
+            ),
+            ..base.clone()
+        };
+        assert_eq!(
+            isolated
+                .files_dir_with(Some(std::ffi::OsStr::new("/tmp/roost-isolated-state")))
+                .expect("files dir"),
+            PathBuf::from("/tmp/roost-isolated-state/files")
+        );
+
+        for raw in [None, Some(""), Some("relative/state")] {
+            let dir = base
+                .files_dir_with(raw.map(std::ffi::OsStr::new))
+                .expect("files dir");
+            assert!(
+                !dir.starts_with(&base.state_dir),
+                "{raw:?} must leave the store on the cache path, got {}",
+                dir.display()
+            );
+            assert!(dir.ends_with("files"));
+        }
     }
 
     /// A missing / unusable `$HOME` is only fatal when it is actually

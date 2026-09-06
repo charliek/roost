@@ -2980,13 +2980,25 @@ async fn dispatch(
         ops::CLIPBOARD_WRITE => {
             let p: ClipboardWriteParams = decode(params)?;
             let target = parse_clipboard_op(&p.target)?;
+            // The wire allows `text` OR `image_png` — exactly one. Both
+            // at once is ambiguous, and answering it by silently
+            // preferring `text` would drop an image the caller believed
+            // it had written.
+            if p.text.is_some() && p.image_png.is_some() {
+                return Err(HandlerError::new(
+                    "invalid-param",
+                    "clipboard.write takes `text` or `image_png`, not both",
+                ));
+            }
+            // This arm serves text; the image form lands with the
+            // clipboard test seam (plan 047 §3.5).
+            let text = p.text.ok_or_else(|| {
+                HandlerError::new("missing-param", "clipboard.write requires `text`")
+            })?;
             // Fire-and-forget — matches the `app.activate` pattern.
             // Headless handler / dropped receiver: no-op.
             if let Some(tx) = &h.ui_tx {
-                let _ = tx.send(UiRequest::ClipboardWrite {
-                    target,
-                    text: p.text,
-                });
+                let _ = tx.send(UiRequest::ClipboardWrite { target, text });
             }
             Ok(serde_json::json!({}))
         }

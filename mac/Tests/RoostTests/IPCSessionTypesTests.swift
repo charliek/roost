@@ -16,9 +16,9 @@ import XCTest
 
 final class IPCSessionTypesTests: XCTestCase {
     func testSessionProtocolVersionIsSeparateFromTheWireVersion() {
-        // HS-1b's lease gate bumped the session protocol to 2; the
-        // request/response wire version did not move with it.
-        XCTAssertEqual(ipcSessionProtocolVersion, 2)
+        // Plan 047's `session.put_file` bumped the session protocol to
+        // 3; the request/response wire version did not move with it.
+        XCTAssertEqual(ipcSessionProtocolVersion, 3)
         XCTAssertEqual(ipcProtocolVersion, 1)
     }
 

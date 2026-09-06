@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use roost_ipc::dataframe::{write_data_frame, DataFrameReader, FRAME_INPUT, FRAME_PTY, PREAMBLE};
 use roost_ipc::framing::{write_frame, FrameReader};
-use roost_ipc::messages::{AttachHandshake, SESSION_STOPPING_EVENT};
+use roost_ipc::messages::{AttachHandshake, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT};
 use roost_ipc::{
     CloseReason, ConnAction, ConnCloser, ConnCtx, DataConn, Handler, HandlerError, HandlerOutcome,
     IpcServer, PushSource,
@@ -27,6 +27,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+
+/// An attach handshake line at the protocol this build actually speaks.
+/// Spelling the number as a literal here let the fixtures drift a whole
+/// version behind the constant (plan 047 bumped it to 3); these tests
+/// serve a stub handler, so nothing would have failed.
+fn handshake_line(token: &str) -> String {
+    format!(r#"{{"attach":"{token}","protocol_version":{SESSION_PROTOCOL_VERSION}}}"#)
+}
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -266,7 +274,8 @@ async fn an_attach_first_line_reaches_handle_data_with_its_residue() {
     // residue is dropped on handover.
     let payload = b"echo me";
     let mut wire = serde_json::to_vec(&serde_json::json!({
-        "attach": "tok", "protocol_version": 2, "resume_from_seq": 12,
+        "attach": "tok", "protocol_version": SESSION_PROTOCOL_VERSION,
+        "resume_from_seq": 12,
     }))
     .unwrap();
     wire.push(b'\n');
@@ -297,7 +306,7 @@ async fn an_attach_first_line_reaches_handle_data_with_its_residue() {
     let handshakes = served.handler.handshakes.lock().unwrap();
     assert_eq!(handshakes.len(), 1);
     assert_eq!(handshakes[0].attach, "tok");
-    assert_eq!(handshakes[0].protocol_version, 2);
+    assert_eq!(handshakes[0].protocol_version, SESSION_PROTOCOL_VERSION);
     assert_eq!(handshakes[0].resume_from_seq, Some(12));
     assert!(
         served.handler.ops.lock().unwrap().is_empty(),
@@ -308,7 +317,7 @@ async fn an_attach_first_line_reaches_handle_data_with_its_residue() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_socket_without_a_data_plane_answers_not_supported() {
     let served = serve(Recorder::default()).await;
-    let reply = first_reply(&served.socket, br#"{"attach":"tok","protocol_version":2}"#)
+    let reply = first_reply(&served.socket, handshake_line("tok").as_bytes())
         .await
         .expect("a reply line");
     assert_eq!(reply["ok"], serde_json::json!(false));
@@ -324,9 +333,12 @@ async fn an_undecodable_handshake_gets_a_clean_error_line() {
         ..Recorder::default()
     })
     .await;
-    let reply = first_reply(&served.socket, br#"{"attach":5,"protocol_version":2}"#)
-        .await
-        .expect("a reply line");
+    let reply = first_reply(
+        &served.socket,
+        format!(r#"{{"attach":5,"protocol_version":{SESSION_PROTOCOL_VERSION}}}"#).as_bytes(),
+    )
+    .await
+    .expect("a reply line");
     assert_eq!(reply["ok"], serde_json::json!(false));
     assert_eq!(reply["error"]["code"], serde_json::json!("parse-error"));
     assert!(
@@ -406,7 +418,7 @@ async fn a_handshake_after_the_first_line_is_a_parse_error() {
         serde_json::json!(true)
     );
 
-    write_frame(&mut w, br#"{"attach":"tok","protocol_version":2}"#)
+    write_frame(&mut w, handshake_line("tok").as_bytes())
         .await
         .unwrap();
     assert_eq!(
@@ -537,7 +549,7 @@ async fn closing_a_data_connection_ends_it_even_when_the_handler_ignores_the_wat
     .await;
     let (r, mut w) = dial(&served.socket).await.into_split();
     let mut reader = FrameReader::new(r);
-    write_frame(&mut w, br#"{"attach":"tok","protocol_version":2}"#)
+    write_frame(&mut w, handshake_line("tok").as_bytes())
         .await
         .unwrap();
     assert_eq!(

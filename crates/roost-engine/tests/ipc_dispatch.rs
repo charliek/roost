@@ -210,6 +210,50 @@ async fn tab_feed_ime_rejects_inverted_cursor_range() {
     }
 }
 
+/// `clipboard.write` carries `text` **or** `image_png`, never both.
+/// Preferring one silently would drop the other, so the ambiguous
+/// request is refused outright; and a request carrying neither is a
+/// missing `text`, which is the field this arm serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clipboard_write_refuses_both_text_and_an_image_and_demands_one() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+
+    for (params, want) in [
+        (
+            serde_json::json!({"target": "system", "text": "hi", "image_png": "aGVsbG8="}),
+            "invalid-param",
+        ),
+        (serde_json::json!({"target": "system"}), "missing-param"),
+    ] {
+        let err = client
+            .call_raw(ops::CLIPBOARD_WRITE, params.clone())
+            .await
+            .expect_err("expected error");
+        match err {
+            roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, want, "{params}"),
+            other => panic!("expected Server error, got {other:?}"),
+        }
+    }
+}
+
 /// Same dispatcher-level guard for an unrecognized `action`: rejected
 /// before `ui_call`, so a typo doesn't reach the UI as an ambiguous
 /// no-op.

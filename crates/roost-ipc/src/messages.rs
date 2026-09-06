@@ -610,11 +610,31 @@ pub struct ClipboardDumpResult {
 /// `clipboard.dump` — lets a test set a known pasteboard value before
 /// asserting paste behavior. Not a security regression: any process on
 /// the host can already write the OS clipboard.
+///
+/// **Exactly one of `text` / `image_png`** (plan 047 §3.5). `text` was
+/// required until the image form existed; it is optional now so a
+/// caller can seed a PNG instead, and a request carrying neither is
+/// `missing-param`. `image_png` is the seam the host-paste e2e needs —
+/// there is no other way to put a real image on the clipboard from an
+/// IPC-only harness.
+///
+/// The Mac UI is **text only** (`ipc.md`): its handler has no name for
+/// `image_png` and refuses the key with `unknown-field`, and a request
+/// carrying neither field is `invalid-param` there.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClipboardWriteParams {
     pub target: String,
-    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// A PNG image, base64-encoded like every other bytes field. See
+    /// `bytes_base64_opt`.
+    #[serde(
+        default,
+        with = "bytes_base64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_png: Option<Vec<u8>>,
 }
 
 // ============================================================================
@@ -1653,14 +1673,34 @@ pub struct AgentReportChangedEvent {
 /// speaks. A host-session change must not force every `roostctl` build
 /// to be re-gated, and vice versa.
 ///
-/// `2` (plan 036, HS-1b) is a **breaking** bump from HS-1a's `1`:
-/// `events.subscribe` and `tab.attach` now require the lease minted by
+/// # The versioning rule
+///
+/// **An additive op bumps this when a pre-bump peer could not refuse it
+/// meaningfully.** Not every addition does: a new *event* name inside
+/// an existing batch is ignored by a client that has no name for it,
+/// and a new lease-gated op a client never sends costs an old session
+/// nothing — those stay at the current number.
+///
+/// `session.put_file` (plan 047) is the other kind. A pre-047 session
+/// answers `unknown-op` to a paste the user just performed, and the
+/// only honest client response is a per-paste special case ("this
+/// host's session is too old to receive files") carried forever.
+/// Charlie's call was the clean break instead: bump, and let the
+/// existing `NeedsRestart` dialog offer the update. The cost is stated
+/// plainly — the bump disables **every** host session against an
+/// un-updated far side, not just uploads, and a Unix-socket host gets
+/// no offer at all (its user updates the far side by hand).
+///
+/// `3` (plan 047) adds [`ops::SESSION_PUT_FILE`] under that rule.
+///
+/// `2` (plan 036, HS-1b) was a **breaking** bump from HS-1a's `1`:
+/// `events.subscribe` and `tab.attach` require the lease minted by
 /// [`ops::SESSION_CONNECT`], so a client written against `1` — which
 /// subscribed with no lease at all — is rejected with
 /// `connect-required`. The attach handshake carries this same number in
 /// its `protocol_version` field and a mismatch is refused before the
 /// token is even looked at.
-pub const SESSION_PROTOCOL_VERSION: u32 = 2;
+pub const SESSION_PROTOCOL_VERSION: u32 = 3;
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -2259,10 +2299,12 @@ pub mod host_state {
 // HS-2 server-side additions: effects envelopes + theme reseed
 // ============================================================================
 //
-// Both are additive (plan 037 §3.6): a new event name inside the
-// existing `EventBatch` and a new lease-gated session op. Old clients
-// ignore an event they have no name for, so `SESSION_PROTOCOL_VERSION`
-// stays 2.
+// Both are additive (plan 037 §3.6), and both are the kind of addition
+// that does NOT move `SESSION_PROTOCOL_VERSION` under the rule stated
+// on that constant: an old client ignores an event name it does not
+// know, and an old session never sees an op the client only sends to a
+// newer one. Neither leaves a peer unable to refuse meaningfully, so
+// the number stayed where it was.
 
 /// Which client-directed effect a [`TabEffectEvent`] carries.
 ///
@@ -2472,6 +2514,134 @@ pub struct SessionSetAgentHooksResult {
 }
 
 // ============================================================================
+// Files across a host boundary (plan 047)
+// ============================================================================
+//
+// Two ops, one gesture. [`ops::TAB_SEND_FILE`] is what every surface
+// drives — a drop, a clipboard image paste, `roostctl tab send-file` —
+// and it is served by the **UI** socket, which owns the files and the
+// tab. [`ops::SESSION_PUT_FILE`] is the leg underneath it: one file,
+// one frame, from that client to the **session** socket, answering with
+// the host path the client then pastes.
+
+/// Raw-byte cap on one [`ops::SESSION_PUT_FILE`] upload, shared by the
+/// client's preflight and the server's check so the two cannot
+/// disagree about which file is too big.
+///
+/// 10 MiB base64-encodes to ~13.4 MiB, which still fits a 16 MiB frame
+/// with the envelope around it — that headroom is why the op needs no
+/// chunking. The engine checks the *encoded* length before it decodes
+/// (the frame already exists by then; what the early check spares is
+/// the decoded `Vec<u8>`) and the decoded length again afterwards.
+pub const MAX_PUT_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// [`ops::SESSION_PUT_FILE`] params: one file's bytes, for the session
+/// to land somewhere its own shells can read.
+///
+/// `name` is the **client's** basename and is validated identically by
+/// both ends: 1–128 bytes of `[A-Za-z0-9._-]`, not `.` or `..`, not
+/// starting with `-`. Anything else is `invalid-param` — never repaired
+/// and never escaped, because the path this op returns has to be
+/// pasteable **bare**, which is the one spelling every agent unquotes
+/// the same way. `data` is over [`MAX_PUT_FILE_BYTES`] → `too-large`.
+///
+/// Lease-gated, and in the session's mutating set: a `session.stop`
+/// racing an upload waits for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPutFileParams {
+    pub lease: String,
+    pub name: String,
+    /// Raw bytes encoded as base64. See `bytes_base64`.
+    #[serde(with = "bytes_base64")]
+    pub data: Vec<u8>,
+}
+
+/// [`ops::SESSION_PUT_FILE`] result: where the file landed, and how
+/// much of it did.
+///
+/// `path` is absolute, matches `^/[A-Za-z0-9._/-]+$`, and its final
+/// component is exactly the `name` that was sent — the session
+/// guarantees all three (falling back to a `/tmp` root when the cache
+/// path it resolved is not in that grammar), and the client re-checks
+/// all three plus `bytes` before pasting. A malformed or hostile reply
+/// must never become typed input.
+///
+/// The path stays valid until the session stops cleanly or starts
+/// again: nothing evicts it, because it may sit unsubmitted in an
+/// agent's composer for an hour. A store with no room answers
+/// `store-full` and deletes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPutFileResult {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// [`ops::TAB_SEND_FILE`] params: send these files to this tab.
+///
+/// `tab` takes the same spelling [`TabFocusParams`] does — a bare
+/// engine id, or `h<host>.<id>` for a connected host's tab. It is a
+/// plain string here because an unresolvable ref is answered
+/// `not-found` by the handler that resolves it, not as a decode
+/// failure.
+///
+/// `paths` must be non-empty and every entry **absolute** (relative →
+/// `invalid-param`); duplicates are dropped first-seen. They are read
+/// in the **UI process's** filesystem namespace. That is not a new
+/// security boundary: the socket is same-uid 0700, and `tab.write` /
+/// `tab.open` already let the same caller type or run anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabSendFileParams {
+    pub tab: String,
+    pub paths: Vec<String>,
+}
+
+/// [`ops::TAB_SEND_FILE`] result: what was pasted, what crossed the
+/// boundary, and what did not.
+///
+/// The reply is sent when the paste has been **queued** client-side —
+/// what `tab.capture_pty_input` sees. Not host receipt, and not agent
+/// attachment: the data plane has no acknowledgement.
+///
+/// `uploads` is empty for a local tab, where `pasted` is the escaped
+/// local path and nothing crossed a boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabSendFileResult {
+    pub pasted: String,
+    pub uploads: Vec<SentFile>,
+    pub skipped: Vec<SkippedFile>,
+}
+
+/// One file that crossed to the host: where it came from, the basename
+/// it kept, where it landed, and its size.
+///
+/// `name` survives the crossing because the agents show it in their
+/// chips — `design.pdf` stays `design.pdf`, and the random directory
+/// above it is what keeps two drops of one name from colliding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentFile {
+    pub source: String,
+    pub name: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// One path [`ops::TAB_SEND_FILE`] did not send, and why.
+///
+/// `reason` is one of the stable strings `directory`, `missing`,
+/// `unreadable`, `not-regular`, `over-cap` — the planner's `SkipReason`
+/// serialized. A `String` rather than an enum for the same reason
+/// [`AgentHooksSkipped::reason`] is one: a result a client cannot
+/// decode at all is worse than one carrying a reason it has no name
+/// for, and the planner that mints these lives a crate away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: String,
+}
+
+// ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
 
@@ -2498,6 +2668,13 @@ pub mod ops {
     /// session scoping. Params + state machine live in
     /// [`crate::agent`].
     pub const TAB_AGENT_REPORT: &str = "tab.agent_report";
+    /// Send local files to a tab: upload them if the tab lives on a
+    /// host, then paste the resulting path(s). The one op every
+    /// surface routes a drop or an image paste through — the native
+    /// drop handler calls the same function this does, so a drop *is*
+    /// this op minus the window event. Served by the UI socket,
+    /// ungated; answers once the paste is queued.
+    pub const TAB_SEND_FILE: &str = "tab.send_file";
     pub const NOTIFICATION_CREATE: &str = "notification.create";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     /// Host-session handshake: version + identity + what the session can
@@ -2533,6 +2710,12 @@ pub mod ops {
     /// session that was built with an install callback: the engine
     /// decodes and gates it, `roost-session` does the work.
     pub const SESSION_SET_AGENT_HOOKS: &str = "session.set_agent_hooks";
+    /// Take one file's bytes and land them somewhere the session's own
+    /// shells can read, answering with a paste-safe absolute host path.
+    /// Lease-gated and mutating; a session built without a file store
+    /// answers `not-supported`, and a UI socket `unknown-op` like every
+    /// other session op. The leg underneath [`TAB_SEND_FILE`].
+    pub const SESSION_PUT_FILE: &str = "session.put_file";
     /// Ask for a ticket to open a data connection for one tab. The
     /// control-plane half of an attach: it negotiates payload kind,
     /// build identity, and geometry on stable JSON, and hands back a
@@ -3005,6 +3188,30 @@ pub mod bytes_base64 {
     /// [`encode`]'s inverse, for the client applying such a field.
     pub fn decode(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
         STANDARD.decode(text.as_bytes())
+    }
+}
+
+/// [`bytes_base64`] for an optional field — same alphabet, same
+/// errors, and an explicit `null` decodes as absent rather than as
+/// empty bytes.
+pub mod bytes_base64_opt {
+    use super::bytes_base64;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<Vec<u8>>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => ser.serialize_str(&bytes_base64::encode(bytes)),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let Some(raw) = Option::<String>::deserialize(de)? else {
+            return Ok(None);
+        };
+        bytes_base64::decode(&raw)
+            .map(Some)
+            .map_err(|e| serde::de::Error::custom(format!("invalid base64: {e}")))
     }
 }
 

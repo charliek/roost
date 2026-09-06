@@ -96,7 +96,7 @@ flowchart LR
 
 ## Server-side additions (HS-2, additive)
 
-Two small additions ride the existing events stream as new event types — additive, so `SESSION_PROTOCOL_VERSION` stays `2` and an older client simply ignores an event name it doesn't recognize:
+Two small additions ride the existing events stream as new event types — additive, and of the kind that does not move `SESSION_PROTOCOL_VERSION` (an older client simply ignores an event name it doesn't recognize), so it stayed at `2` for HS-2. Plan 047 later moved it to `3` for `session.put_file`, which a pre-047 session could only answer `unknown-op` — see the versioning rule in [`ipc.md`](../reference/ipc.md#session-sockets):
 
 - **`tab.effect` events** — a session's per-tab OSC scan now emits `bell` and OSC 52 `clipboard-write` as client-directed effects on the events stream (`crates/roost-engine/src/tab_task.rs`), for whichever client currently holds the tab's lease to apply. Everything else the scanner sees (pointer shape, today) stays dropped and debug-logged in the tab task, by design — the envelope is scoped to these two effects rather than left open to "just one more."
 - **`session.set_theme`** — closes the reseed gap the architecture doc left open: a connecting client seeds every tab's server `Terminal` with its own palette (sent right after `session.connect`, before the first `tab.attach`), so a program that queries a color from a session gets back what the attached client is actually rendering, not the server's factory default.

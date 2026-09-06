@@ -1603,7 +1603,7 @@ Params: `{}`. Response:
 ```json
 {
   "app_version": "0.0.18",
-  "session_protocol": 2,
+  "session_protocol": 3,
   "payload_kinds": ["ghostty-snapshot", "vt"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
@@ -1615,12 +1615,16 @@ The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
 `SESSION_PROTOCOL_VERSION` — deliberately separate from the
 request/response `protocol_version` in [`identify`](#identify), because
-the two version different things and move independently. It is **`2`**
-as of HS-1b: the bump is breaking because
-[`events.subscribe`](#eventssubscribe) and [`tab.attach`](#tabattach)
-now require a lease, and a client written against `1` subscribed with
-none. The [attach handshake](#data-plane) carries the same number and
-refuses a mismatch before it even looks at the token.
+the two version different things and move independently. It is **`3`**
+as of plan 047, which added `session.put_file`: a
+pre-047 session could only answer `unknown-op` to a file the user just
+pasted, which is not a refusal a client can act on, so the number moved
+rather than carrying a per-paste special case forever. `2` was HS-1b's
+breaking bump, because [`events.subscribe`](#eventssubscribe) and
+[`tab.attach`](#tabattach) began requiring a lease that a client written
+against `1` never presented. The [attach handshake](#data-plane) carries
+the same number and refuses a mismatch before it even looks at the
+token.
 
 `payload_kinds` names what this session can encode a tab's attach
 payload as, in no particular order; it is an **open list of strings**,
@@ -2002,7 +2006,7 @@ the first line only, so a request stream can never be diverted
 mid-flight by a payload that happens to look like a handshake.
 
 ```json
-{"attach": "1a0be5c37d924f68b1c05e3a7f2d8496", "protocol_version": 2,
+{"attach": "1a0be5c37d924f68b1c05e3a7f2d8496", "protocol_version": 3,
  "resume_from_seq": 8814, "server_epoch": 6032428321756423947,
  "tab_generation": 3}
 ```
