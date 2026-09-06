@@ -184,6 +184,32 @@ its timeouts (`ROOST_TEST_TIMEOUT_SCALE`) and clears any stale
 socket/lock before launching, since a crashed instance's held
 single-instance flock is the one cascade mode that wedges the next run.
 
+**Proving a flake fix.** A red run on a test the commit did not touch is
+a defect to remove, not a rerun button. A race is fixed in the test by
+removing the race, never by widening a budget — a budget moves only for
+a proven runner-load case, and only through `ROOST_TEST_TIMEOUT_SCALE`,
+never a bigger bare constant. One green run is not evidence about a
+race, so the proof is a loop over the *built* binary — before the fix,
+to show it reproduces; after, to show it does not — on the OS it was
+seen on:
+
+```sh
+BIN=$(cargo test -p roost-engine --features server-vt --test tab_task_test --no-run 2>&1 | sed -n 's/^ *Executable .* (\(.*\))$/\1/p')
+for i in $(seq 100); do perl -e 'alarm 120; exec @ARGV' "$BIN" >"/tmp/run-$i.log" 2>&1 || echo "FAIL $i exit=$?"; done
+```
+
+`alarm` is what makes a hang a counted failure — it reports as
+`exit=142` (macOS has no GNU `timeout`, and a pending alarm survives
+`exec`); any other non-zero exit is the test itself. Taking the path from
+cargo's own `Executable` line rather than `ls -t` matters: a stale hash
+from another feature set — `tab_task_test` built *without* `server-vt` is
+an empty binary — would run zero tests and pass. Check that
+`grep 'test result:' /tmp/run-1.log` shows a non-zero count, and put the
+before/after tallies in the PR.
+[#410](https://github.com/charliek/roost/pull/410) is the worked
+example: `a_query_flood…` went 8/100 → 0/100 on Linux, and the loop is
+also what surfaced [#409](https://github.com/charliek/roost/issues/409).
+
 ## Adding coverage
 
 - **Behavior or content** — a Layer 1 case in `tools/roosttest/`. Use
