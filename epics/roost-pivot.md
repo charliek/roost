@@ -6,6 +6,8 @@
 
 **Why this exists — read first:**
 https://claude.ai/code/artifact/add27f67-3d15-4541-bd3f-eda3f34fcc48
+(Private — opens with the owner's claude.ai login. A 404 from anywhere
+else is expected, not a broken link.)
 Sections that matter here: §03 (the layering rule), §04 Q7 (local-only,
 SSH is the transport) and Q12 (where a session lives; the three kinds of
 write), §06 Track R.
@@ -72,5 +74,8 @@ R9 is the one not to rush.
 - **R8 ↔ gx A3.** gx stamps the opt-in key once its remote lane exists;
   R8 documents the key and passes it through.
 - **R9 is roost's own HS-5**, parked in `discovery/host-sessions-roadmap.md`
-  as "a decision point, not scheduled." The decision is now made; the DL
-  entry lands with R9's PR.
+  as "a decision point, not scheduled." The decision is now made. Until R9
+  merges, that roadmap row still reads "not scheduled" — stale by
+  decision, not a contradiction: roost's rule is that DL entries land in
+  the PR that builds the thing, so the `vision.md` entry and the roadmap
+  status update ship with R9, not here.
