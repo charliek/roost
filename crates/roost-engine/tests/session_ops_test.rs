@@ -125,6 +125,7 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
         ops::SESSION_STOP,
         ops::SESSION_SET_FOCUS,
         ops::SESSION_SET_AGENT_HOOKS,
+        ops::SESSION_PUT_FILE,
     ] {
         let err = call(&f.handler, op, serde_json::json!({}))
             .await
@@ -291,6 +292,23 @@ async fn session_stop_reaps_latches_and_finalizes() {
     )
     .await
     .expect_err("session.set_agent_hooks after stop");
+    assert_eq!(err.code, "shutting-down");
+
+    // Same latch again, and the latch wins over every other answer this
+    // op has: the store this would write into is swept by the tail that
+    // is already running, so a path handed back now points at nothing.
+    // (`not-supported` — this fixture has no store — must not win.)
+    let err = call(
+        &f.handler,
+        ops::SESSION_PUT_FILE,
+        serde_json::json!({
+            "lease": "0".repeat(32),
+            "name": "shot.png",
+            "data": "aGVsbG8=",
+        }),
+    )
+    .await
+    .expect_err("session.put_file after stop");
     assert_eq!(err.code, "shutting-down");
 
     // Idempotent-reject: a second stop gets the same answer, and never

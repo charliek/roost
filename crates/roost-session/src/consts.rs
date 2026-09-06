@@ -34,7 +34,8 @@ pub const FAKE_BUILD_ENV: &str = "ROOST_SESSION_FAKE_BUILD";
 /// socket — inherits this posture rather than restating it.
 pub const PROCESS_UMASK: libc::mode_t = 0o077;
 
-/// Mode for the directories the daemon creates itself (state, log).
+/// Mode for the directories the daemon creates itself (state, log, the
+/// file store).
 /// The socket dir is `validate_runtime_dir`'s business and it enforces
 /// the same value.
 pub const OWNER_ONLY_DIR_MODE: u32 = 0o700;

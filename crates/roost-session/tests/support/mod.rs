@@ -101,6 +101,14 @@ impl Layout {
         self.dir.path().join("state.lock")
     }
 
+    /// Where uploads land for a session started over this layout.
+    /// Inside the layout on purpose: the real path is a cache directory
+    /// the session sweeps at every start, and a test must never point
+    /// one at the developer's own.
+    pub fn files_dir(&self) -> PathBuf {
+        self.dir.path().join("files")
+    }
+
     /// Create a sub-directory under the layout root and hand back its
     /// path — somewhere for a tab to live, or for a shell to write to.
     pub fn subdir(&self, name: &str) -> PathBuf {
@@ -116,6 +124,8 @@ impl Layout {
             app_label: APP_LABEL.into(),
             app_id: APP_ID.into(),
             launch_cwd: launch_cwd.to_path_buf(),
+            files_dir: Some(self.files_dir()),
+            files_fallback: self.dir.path().join("files-fallback"),
             // Always on here: `tab.feed_pty_bytes` and
             // `tab.capture_pty_input` are how a test puts known bytes
             // through a real tab without scripting a shell, and the
@@ -140,7 +150,15 @@ impl Layout {
     /// tail has run — socket unlinked, locks released — so a test can
     /// await it and then start another run over the same state.
     pub fn spawn(&self, launch_cwd: &Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        let config = self.config(launch_cwd);
+        self.spawn_config(self.config(launch_cwd))
+    }
+
+    /// [`Self::spawn`] with the config stated, for a test that needs one
+    /// field of it to be something the layout would never produce.
+    pub fn spawn_config(
+        &self,
+        config: SessionConfig,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
         let locks = self.locks();
         tokio::spawn(async move {
             // The verdict has no reader in-process; tests wait on the

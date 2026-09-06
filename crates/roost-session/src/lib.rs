@@ -46,6 +46,7 @@ pub mod agent_hooks;
 pub mod bridge;
 pub mod consts;
 pub mod daemonize;
+pub mod files;
 pub mod hydrate;
 pub mod identity;
 pub mod logging;

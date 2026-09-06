@@ -3,14 +3,16 @@
 //! `Workspace` + `PtySupervisor`), then dials it with the
 //! `IpcClient` and exercises a short scripted scenario.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use roost_engine::ipc::IpcHandler;
+use roost_engine::ipc::{FileStore, IpcHandler, SessionInfo, StopHandle};
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::messages::{
-    ops, IdentifyParams, IdentifyResult, ProjectCreateParams, ProjectCreateResult, TabListResult,
-    TabOpenParams, TabOpenResult,
+    ops, IdentifyParams, IdentifyResult, ProjectCreateParams, ProjectCreateResult,
+    SessionConnectParams, SessionConnectResult, SessionPutFileParams, SessionPutFileResult,
+    TabListResult, TabOpenParams, TabOpenResult, MAX_PUT_FILE_BYTES,
 };
 use roost_ipc::IpcClient;
 use roost_ipc::IpcServer;
@@ -665,6 +667,343 @@ async fn app_keybind_dispatch_rejects_non_paste_action() {
         roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "invalid-param"),
         other => panic!("expected Server error, got {other:?}"),
     }
+}
+
+// ============================================================================
+// `session.put_file` — plan 047 §3.1 / W1
+// ============================================================================
+
+/// A live session socket, with or without a file store behind it.
+///
+/// Dialed over a real socket rather than driven through the `Handler`
+/// trait, because half of what this op promises is about two
+/// *connections*: two uploads racing for the same room, and a second
+/// connection presenting a lease the first one minted.
+struct SessionFixture {
+    socket: PathBuf,
+    root: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl SessionFixture {
+    /// `cap` bounds the store; `None` builds the session without one at
+    /// all, which is every socket that is not a host session's.
+    async fn new(cap: Option<u64>) -> Self {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("roost.sock");
+        let root = dir.path().join("files");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut handler = IpcHandler::new(
+            Arc::new(Workspace::new()),
+            Arc::new(PtySupervisor::new()),
+            socket.clone(),
+            "Roost-test",
+            "ai.stridelabs.Roost.test",
+        )
+        .with_session(
+            SessionInfo {
+                session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
+                started_at: "2026-09-05T14:03:11Z".into(),
+                app_version: "9.9.9".into(),
+                payload_kinds: Vec::new(),
+                libghostty_build: String::new(),
+                default_tab_size: (80, 24),
+                test_mode: false,
+            },
+            StopHandle::new(|| async {}),
+        );
+        if let Some(cap) = cap {
+            handler = handler
+                .with_file_store(FileStore::with_cap(root.clone(), cap).expect("open the store"));
+        }
+
+        let server = IpcServer::bind(&socket, handler).await.expect("bind");
+        let bound = server.socket_path().to_path_buf();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        Self {
+            socket: bound,
+            root,
+            _dir: dir,
+        }
+    }
+
+    async fn client(&self) -> IpcClient {
+        connect_with_retry(&self.socket).await
+    }
+
+    /// A connection holding the session's interactive lease.
+    async fn leased(&self) -> (IpcClient, String) {
+        let mut client = self.client().await;
+        let lease: SessionConnectResult = client
+            .call(
+                ops::SESSION_CONNECT,
+                SessionConnectParams { takeover: true },
+            )
+            .await
+            .expect("session.connect");
+        (client, lease.lease)
+    }
+
+    /// Every upload directory the store currently holds.
+    fn uploads(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<_> = std::fs::read_dir(&self.root)
+            .expect("read the store root")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        dirs.sort();
+        dirs
+    }
+}
+
+async fn put_file(
+    client: &mut IpcClient,
+    lease: &str,
+    name: &str,
+    data: Vec<u8>,
+) -> Result<SessionPutFileResult, roost_ipc::ClientError> {
+    client
+        .call(
+            ops::SESSION_PUT_FILE,
+            SessionPutFileParams {
+                lease: lease.to_string(),
+                name: name.to_string(),
+                data,
+            },
+        )
+        .await
+}
+
+fn code(error: &roost_ipc::ClientError) -> &str {
+    match error {
+        roost_ipc::ClientError::Server { code, .. } => code,
+        other => panic!("expected a server error, got {other:?}"),
+    }
+}
+
+/// The name is the client's and is never repaired: the path this op
+/// returns has to be pasteable bare, so a name that would need quoting
+/// — or that could climb out of its upload directory — is refused
+/// rather than rewritten into something the client did not ask for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_file_refuses_every_name_it_cannot_paste_bare() {
+    let f = SessionFixture::new(Some(1 << 20)).await;
+    let (mut client, lease) = f.leased().await;
+
+    let long = "a".repeat(129);
+    for name in [
+        "",
+        long.as_str(),
+        ".",
+        "..",
+        "-rf.png",
+        "dir/shot.png",
+        "../escape.png",
+        "two words.png",
+        "caf\u{e9}.png",
+        "shot.png; rm -rf /",
+        "$HOME.png",
+        "shot\npng",
+    ] {
+        let error = put_file(&mut client, &lease, name, b"x".to_vec())
+            .await
+            .expect_err("a name outside the grammar must be refused");
+        assert_eq!(code(&error), "invalid-param", "{name:?}");
+    }
+    assert!(
+        f.uploads().is_empty(),
+        "a refused name must not have claimed a directory"
+    );
+
+    // The boundary on the good side: 128 bytes is a name.
+    let name = format!("{}.png", "b".repeat(124));
+    assert_eq!(name.len(), 128);
+    let landed = put_file(&mut client, &lease, &name, b"x".to_vec())
+        .await
+        .expect("a 128-byte name is inside the rule");
+    assert!(landed.path.ends_with(&name));
+}
+
+/// The cap is exact on both sides, and the *encoded* screen in front of
+/// the decode does not move it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exactly_the_cap_lands_and_one_more_byte_does_not() {
+    let f = SessionFixture::new(Some(64 * 1024 * 1024)).await;
+    let (mut client, lease) = f.leased().await;
+
+    let cap = usize::try_from(MAX_PUT_FILE_BYTES).unwrap();
+    let landed = put_file(&mut client, &lease, "exact.bin", vec![0xAB; cap])
+        .await
+        .expect("exactly the cap must land");
+    assert_eq!(landed.bytes, MAX_PUT_FILE_BYTES);
+    assert_eq!(
+        std::fs::metadata(&landed.path).expect("stat").len(),
+        MAX_PUT_FILE_BYTES
+    );
+
+    let error = put_file(&mut client, &lease, "over.bin", vec![0xAB; cap + 1])
+        .await
+        .expect_err("one byte over the cap must be refused");
+    assert_eq!(code(&error), "too-large");
+    assert_eq!(f.uploads().len(), 1, "the refusal claimed no directory");
+}
+
+/// The screen in front of the decode, proven by the one payload that
+/// can tell the two apart: base64 that is both over-long *and*
+/// malformed. Decoded first, it would be `invalid-param`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_payload_is_refused_before_it_is_decoded() {
+    let f = SessionFixture::new(Some(64 * 1024 * 1024)).await;
+    let (mut client, lease) = f.leased().await;
+
+    let encoded_cap = usize::try_from(MAX_PUT_FILE_BYTES).unwrap().div_ceil(3) * 4;
+    let error = client
+        .call_raw(
+            ops::SESSION_PUT_FILE,
+            serde_json::json!({
+                "lease": lease,
+                "name": "over.bin",
+                "data": "!".repeat(encoded_cap + 1),
+            }),
+        )
+        .await
+        .expect_err("an over-long payload must be refused");
+    assert_eq!(code(&error), "too-large");
+    assert!(f.uploads().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_base64_is_invalid_param() {
+    let f = SessionFixture::new(Some(1 << 20)).await;
+    let (mut client, lease) = f.leased().await;
+
+    let error = client
+        .call_raw(
+            ops::SESSION_PUT_FILE,
+            serde_json::json!({"lease": lease, "name": "shot.png", "data": "not base64!!"}),
+        )
+        .await
+        .expect_err("malformed base64 must be refused");
+    assert_eq!(code(&error), "invalid-param");
+    assert!(f.uploads().is_empty());
+}
+
+/// The op writes into the session user's home and its answer is about
+/// to be typed into one of the session's tabs, so it is lease-gated
+/// like every other op that carries authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_file_needs_a_lease_and_loses_it_to_a_takeover() {
+    let f = SessionFixture::new(Some(1 << 20)).await;
+
+    let mut stranger = f.client().await;
+    let error = put_file(
+        &mut stranger,
+        "0".repeat(32).as_str(),
+        "shot.png",
+        b"x".to_vec(),
+    )
+    .await
+    .expect_err("no lease, no upload");
+    assert_eq!(code(&error), "connect-required");
+
+    let (mut first, lease) = f.leased().await;
+    put_file(&mut first, &lease, "before.png", b"x".to_vec())
+        .await
+        .expect("the lease holder may upload");
+
+    // One client, several connections, is the shape a host client
+    // actually has — §3.3 gives uploads a connection of their own — so a
+    // second connection presenting the same lease is admitted under it.
+    let mut sibling = f.client().await;
+    put_file(&mut sibling, &lease, "sibling.png", b"x".to_vec())
+        .await
+        .expect("a second connection under one lease may upload too");
+
+    // A connection that holds the lease token but has not yet presented
+    // it: the takeover below closes the *registered* connections, so
+    // this is the one that lives to hear the refusal.
+    let mut displaced = f.client().await;
+
+    let (_second, new_lease) = f.leased().await;
+    assert_ne!(new_lease, lease);
+    let error = put_file(&mut displaced, &lease, "after.png", b"x".to_vec())
+        .await
+        .expect_err("a displaced lease cannot upload");
+    assert_eq!(code(&error), "taken-over");
+    assert_eq!(
+        f.uploads().len(),
+        2,
+        "and nothing landed after the takeover"
+    );
+}
+
+/// Two connections under one lease, racing for the last room in the
+/// store. Admission is one serialized decision, so exactly one of them
+/// can win — and the loser hearing `store-full` rather than a lease
+/// error is also what proves the second connection was admitted under
+/// the first one's lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_connections_racing_for_the_last_room_cannot_over_admit() {
+    const BYTES: usize = 4096;
+    let f = SessionFixture::new(Some(2 * BYTES as u64 - 1)).await;
+    let (mut first, lease) = f.leased().await;
+    let mut second = f.client().await;
+
+    let (a, b) = tokio::join!(
+        put_file(&mut first, &lease, "a.bin", vec![0xA; BYTES]),
+        put_file(&mut second, &lease, "b.bin", vec![0xB; BYTES]),
+    );
+
+    let winners = [&a, &b].into_iter().filter(|r| r.is_ok()).count();
+    assert_eq!(winners, 1, "exactly one upload fits: a={a:?} b={b:?}");
+    for outcome in [&a, &b] {
+        if let Err(error) = outcome {
+            assert_eq!(code(error), "store-full");
+        }
+    }
+    assert_eq!(f.uploads().len(), 1, "and only one directory was claimed");
+}
+
+/// A full store refuses and **deletes nothing**: a path this op has
+/// already handed back may sit unsubmitted in an agent's composer for
+/// an hour, so eviction would break the one promise the op makes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_store_refuses_and_deletes_nothing() {
+    const BYTES: usize = 4096;
+    let f = SessionFixture::new(Some(BYTES as u64)).await;
+    let (mut client, lease) = f.leased().await;
+
+    let landed = put_file(&mut client, &lease, "kept.bin", vec![0xA; BYTES])
+        .await
+        .expect("the first file fills the store exactly");
+
+    for (name, size) in [("second.bin", BYTES), ("tiny.bin", 1)] {
+        let error = put_file(&mut client, &lease, name, vec![0xB; size])
+            .await
+            .expect_err("nothing else fits");
+        assert_eq!(code(&error), "store-full", "{name}");
+    }
+
+    assert_eq!(
+        std::fs::read(&landed.path).expect("the kept file is still there"),
+        vec![0xA; BYTES]
+    );
+    assert_eq!(f.uploads().len(), 1);
+}
+
+/// Not every socket is a host session's, and a session built without a
+/// store says so rather than writing somewhere nothing will sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_without_a_store_answers_not_supported() {
+    let f = SessionFixture::new(None).await;
+    let (mut client, lease) = f.leased().await;
+
+    let error = put_file(&mut client, &lease, "shot.png", b"x".to_vec())
+        .await
+        .expect_err("no store, no upload");
+    assert_eq!(code(&error), "not-supported");
 }
 
 /// Connect to a freshly-bound server with bounded retries instead of
