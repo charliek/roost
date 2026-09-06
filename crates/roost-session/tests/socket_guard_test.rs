@@ -71,13 +71,29 @@ fn a_symlink_over_the_path_never_matches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("roost.sock");
     let target = dir.path().join("elsewhere");
-    std::fs::write(&path, b"ours").unwrap();
+    std::fs::write(&path, b"precious").unwrap();
     let recorded = SocketIdentity::of(&path).unwrap();
 
-    std::fs::remove_file(&path).unwrap();
-    std::fs::write(&target, b"precious").unwrap();
-    std::os::unix::fs::symlink(&target, &path).unwrap();
+    // Our own file moves aside and becomes the link's target, so the
+    // target carries exactly the recorded identity: following the link
+    // is the one mistake this test can catch. The link is staged beside
+    // the path and renamed over it for the reason the successor test
+    // gives — remove+create let ext4 hand the inode straight back.
+    std::fs::rename(&path, &target).unwrap();
+    assert_eq!(SocketIdentity::of(&target).unwrap(), recorded);
+    let staged = dir.path().join("roost.sock.next");
+    std::os::unix::fs::symlink(&target, &staged).unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+    assert_ne!(
+        SocketIdentity::of(&path).unwrap(),
+        recorded,
+        "the symlink must have a different inode for this test to mean anything"
+    );
 
     assert_eq!(unlink_if_ours(&path, recorded).unwrap(), Unlinked::Foreign);
-    assert!(target.exists(), "the symlink's target must be untouched");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"precious",
+        "the symlink's target must be untouched"
+    );
 }
