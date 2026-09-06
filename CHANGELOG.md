@@ -97,6 +97,14 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **A tab whose child stops reading can no longer park the engine's PTY
+  writer (#409)** — on Linux a master `write(2)` blocked on a full slave
+  input buffer was never released, not by the child dying nor by the tab
+  closing, and it held a runtime worker until the process exited; quitting
+  could hang on it. The master is non-blocking now and the writer waits on
+  the reactor, ending on the slave's hang-up; the reader waits in `poll(2)`
+  for the same reason. macOS was never bitten (that kernel releases the
+  write), but both UIs run the one path.
 - **A `localhost` host can now start its session with `ROOST_STATE_DIR`
   set (#397)** — a spawned daemon used to inherit the launcher's own state
   dir wholesale and refuse to start against the lock the UI already held.

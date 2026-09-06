@@ -17,13 +17,17 @@
 //!   path that M3+ doesn't need yet.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -577,17 +581,33 @@ impl PtySupervisor {
             })
             .context("openpty failed")?;
 
-        // Acquire the master reader + writer BEFORE spawning the
-        // child, so `spawn_command` becomes the last fallible step.
-        // If these fail, the PTY tears down with no child to orphan.
-        // Doing them *after* the spawn (as before) could return an
-        // error while a live shell had no wait task installed — that
+        // Acquire everything derived from the master BEFORE spawning
+        // the child, so `spawn_command` stays the last fallible step.
+        // If any of these fail, the PTY tears down with no child to
+        // orphan. Doing them *after* the spawn (as before) could return
+        // an error while a live shell had no wait task installed — that
         // PTY would escape supervisor control entirely (#80).
-        let reader_handle = pair
-            .master
-            .try_clone_reader()
-            .context("master.try_clone_reader")?;
-        let writer = pair.master.take_writer().context("master.take_writer")?;
+        //
+        // The master is O_NONBLOCK from here on. Every dup below shares
+        // that (one open file description); the slave is its own, so
+        // the child's stdio stays blocking. It is set first, before the
+        // dups, so nothing ever holds a blocking view of the master: on
+        // Linux a master `write(2)` parked on a full slave input buffer
+        // is never released — not by the child dying, not by the slave
+        // closing (#409) — so no write may ever block.
+        let master_fd = pair.master.as_raw_fd().context("master pty has no fd")?;
+        set_nonblocking(master_fd).context("master O_NONBLOCK")?;
+        let reader_handle = dup_master(master_fd).context("dup master for reader")?;
+        let writer = AsyncFd::with_interest(
+            dup_master(master_fd).context("dup master for writer")?,
+            Interest::WRITABLE,
+        )
+        .context("register master writer with the reactor")?;
+        // Kept for its drop, never written to: portable-pty sends `\n`
+        // + VEOF to the child when this handle drops, the only EOF a
+        // stdin-reading child gets if a supervisor is dropped without
+        // `close()`.
+        let eof_on_drop = pair.master.take_writer().context("master.take_writer")?;
 
         // The server Terminal is built HERE, before the child: it is
         // fallible, and `spawn_command` has to stay the last fallible
@@ -708,19 +728,22 @@ impl PtySupervisor {
         // Writer + resizer: a single ordered loop over the unified
         // command stream, so a resize never reorders relative to the
         // input bytes submitted around it (and keystrokes never
-        // reorder relative to each other).
+        // reorder relative to each other). A write that cannot make
+        // progress waits on the reactor, not in a syscall: a child that
+        // stops reading costs this task nothing, and the slave's
+        // hang-up ends the wait (#409).
         tokio::spawn(async move {
-            let mut writer = writer;
+            let _eof_on_drop = eof_on_drop;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     WriterCmd::Input(data) => {
-                        if let Err(err) = tokio::task::block_in_place(|| writer.write_all(&data)) {
+                        if let Err(err) = write_all_nonblocking(&writer, &data).await {
                             warn!(tab_id, ?err, "pty write failed");
                             break;
                         }
                     }
                     WriterCmd::Resize(size) => {
-                        if let Err(err) = tokio::task::block_in_place(|| master.resize(size)) {
+                        if let Err(err) = master.resize(size) {
                             warn!(tab_id, ?err, "pty resize failed");
                         }
                     }
@@ -1589,11 +1612,7 @@ fn publish_exit_once(output: &OutputPublisher, published: &AtomicBool, status: i
 /// The two consumers are the default publisher and — under server-VT —
 /// the tab task's bounded channel; sharing the loop keeps the read,
 /// EOF and `Interrupted` handling identical for both.
-fn pty_reader_loop(
-    mut reader: Box<dyn Read + Send>,
-    tab_id: i64,
-    mut sink: impl FnMut(Vec<u8>) -> bool,
-) {
+fn pty_reader_loop(mut reader: File, tab_id: i64, mut sink: impl FnMut(Vec<u8>) -> bool) {
     let mut buf = vec![0u8; PTY_OUTPUT_CHUNK_SIZE];
     loop {
         match reader.read(&mut buf) {
@@ -1602,19 +1621,161 @@ fn pty_reader_loop(
                 return;
             }
             Ok(n) => {
-                if !sink(buf[..n].to_vec()) {
+                // A partially filled chunk stays open for COALESCE_WINDOW
+                // from its first byte before it is published. A streaming
+                // child hands the line discipline one line at a time, and
+                // a reader woken per line published ~40-byte events —
+                // twice what the blocking reader did, measured — which is
+                // what fills the 256-slot broadcast on a slow consumer.
+                // The window is a deadline, not an idle gap: a trickle
+                // cannot hold its first byte past it, and an interactive
+                // echo pays it once.
+                let mut filled = n;
+                let deadline = Instant::now() + COALESCE_WINDOW;
+                while filled < buf.len() {
+                    match reader.read(&mut buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(m) => filled += m,
+                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            if left.is_zero() {
+                                break;
+                            }
+                            // `poll` counts whole milliseconds; a
+                            // sub-millisecond remainder still waits one.
+                            let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(1);
+                            if !matches!(wait_readable_for(reader.as_raw_fd(), ms), Ok(true)) {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !sink(buf[..filled].to_vec()) {
                     return;
                 }
             }
-            Err(err) => {
-                if matches!(err.kind(), std::io::ErrorKind::Interrupted) {
-                    continue;
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            // The master is O_NONBLOCK for the writer's sake (#409); the
+            // reader waits in `poll(2)` instead. Level-triggered, so
+            // input landing between the read and the poll is not missed.
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                match wait_readable(reader.as_raw_fd()) {
+                    Ok(true) => continue,
+                    // A hang-up with nothing left to read. Neither kernel
+                    // produces this today (Linux answers EIO, macOS 0),
+                    // but it is the one shape that would spin.
+                    Ok(false) => {
+                        debug!(tab_id, "pty hung up");
+                        return;
+                    }
+                    Err(err) => {
+                        debug!(tab_id, ?err, "pty poll error, stopping reader");
+                        return;
+                    }
                 }
+            }
+            // Linux's answer once the slave side is gone; portable-pty's
+            // reader used to fold it into the EOF case.
+            Err(err) if err.raw_os_error() == Some(libc::EIO) => {
+                debug!(tab_id, "pty reached EOF");
+                return;
+            }
+            Err(err) => {
                 debug!(tab_id, ?err, "pty read error, stopping reader");
                 return;
             }
         }
     }
+}
+
+/// How long a partially filled chunk stays open for more output, counted
+/// from its first byte. A streaming child fills the chunk well inside
+/// this; an interactive echo pays it once.
+const COALESCE_WINDOW: Duration = Duration::from_millis(1);
+
+/// `true` once there is input to read; `false` on a hang-up or error
+/// with no input pending.
+fn wait_readable(fd: RawFd) -> std::io::Result<bool> {
+    wait_readable_for(fd, -1)
+}
+
+/// `wait_readable` with a timeout in milliseconds (`-1` = none): `Ok(false)`
+/// also when the timeout expires with nothing to read. The loop exists
+/// only to retry `EINTR`.
+fn wait_readable_for(fd: RawFd, timeout_ms: i32) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one `pollfd`, passed with a count of one; the fd is
+        // owned by the caller's `File` for the duration of the call.
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(rc > 0 && pfd.revents & libc::POLLIN != 0);
+    }
+}
+
+/// Write all of `data` to the non-blocking master, waiting on the
+/// reactor between partial writes.
+///
+/// The hang-up check runs BEFORE the write on purpose: after the slave
+/// hangs up, Linux answers a write with EAGAIN rather than an error, and
+/// tokio keeps the closed readiness through `clear_ready`, so `writable`
+/// returns at once every time — a loop that checked afterwards would
+/// spin on EAGAIN for as long as the task lived (#409). macOS reaches
+/// the same exit through EIO.
+async fn write_all_nonblocking(fd: &AsyncFd<File>, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let mut guard = fd.writable().await?;
+        if guard.ready().is_write_closed() {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "pty slave hung up",
+            ));
+        }
+        match guard.try_io(|inner| {
+            let mut file: &File = inner.get_ref();
+            file.write(data)
+        }) {
+            Ok(Ok(0)) => return Err(ErrorKind::WriteZero.into()),
+            Ok(Ok(n)) => data = &data[n..],
+            Ok(Err(err)) if err.kind() == ErrorKind::Interrupted => continue,
+            Ok(Err(err)) => return Err(err),
+            Err(_would_block) => continue,
+        }
+    }
+    Ok(())
+}
+
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: plain `fcntl` calls on a valid fd the caller owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A CLOEXEC dup of the master as a `File`. Taken before the child
+/// exists, so no master fd ever reaches it.
+fn dup_master(fd: RawFd) -> std::io::Result<File> {
+    // SAFETY: `fd` is the master's, owned by `pair.master`, which
+    // outlives this call.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    Ok(File::from(borrowed.try_clone_to_owned()?))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1634,6 +1795,67 @@ pub enum PtyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hang-up branch of `write_all_nonblocking` (#409), fenced
+    /// without a child or a runtime shutdown to hide behind: a write
+    /// waiting on a full slave input buffer ends when the slave hangs
+    /// up. Remove the `is_write_closed()` check and this times out —
+    /// after the hang-up Linux answers EAGAIN, and `try_io` then clears
+    /// the readiness the one-time HUP edge came in on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_waiting_on_a_full_buffer_ends_when_the_slave_hangs_up() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let (mut master_fd, mut slave_fd) = (-1, -1);
+        // SAFETY: `openpty` fills the two fds; nothing else is passed.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: both fds are fresh and owned by nothing else.
+        let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+
+        set_nonblocking(master_fd).expect("O_NONBLOCK");
+        let writer =
+            AsyncFd::with_interest(dup_master(master_fd).expect("dup"), Interest::WRITABLE)
+                .expect("register");
+
+        // Non-canonical, so the input buffer fills instead of the line
+        // discipline discarding past one line.
+        // SAFETY: termios round-trip on an fd this test owns.
+        unsafe {
+            let mut term: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave_fd, &mut term), 0);
+            term.c_lflag &= !libc::ICANON;
+            assert_eq!(libc::tcsetattr(slave_fd, libc::TCSANOW, &term), 0);
+        }
+
+        let payload = vec![b'x'; 1 << 20];
+        let pending = tokio::spawn(async move { write_all_nonblocking(&writer, &payload).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "a mebibyte must not fit a slave input buffer nobody reads"
+        );
+
+        drop(slave);
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("the waiting write must end when the slave hangs up")
+            .expect("writer task");
+        assert!(
+            result.is_err(),
+            "a hung-up slave is an error, not a completed write: {result:?}"
+        );
+        drop(master);
+    }
 
     #[test]
     fn concurrent_publishers_deliver_seqs_in_send_order() {

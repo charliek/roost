@@ -11,7 +11,7 @@
 //!
 //! Children are `exec`'d so the PTY's direct child is the only process
 //! holding the slave fd. A surviving descendant would keep the reader
-//! task blocked on `read()`, and dropping the tokio runtime waits on
+//! task parked in `poll()`, and dropping the tokio runtime waits on
 //! in-flight blocking tasks — the test would hang instead of failing.
 
 use std::time::{Duration, Instant};
