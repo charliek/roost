@@ -35,6 +35,8 @@ const ORDERING_RUNS: i64 = 20;
 /// machine makes each read return far less than a full chunk — see the
 /// lag handling below.
 const FILLER_LINES: usize = 2000;
+/// SCRATCH MEASUREMENT (never merges): output events seen by the drain.
+static EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Drain a tab's output until it reports `Exit`, returning the bytes
 /// that arrived first, the exit status, and any drain-level error.
@@ -49,6 +51,7 @@ async fn drain_until_exit(
     while Instant::now() < deadline && status.is_none() {
         match rx.try_recv() {
             Ok(TabOutput::Bytes(b) | TabOutput::Scanned { data: b, .. }) => {
+                EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 bytes.extend_from_slice(&b)
             }
             Ok(TabOutput::Exit { status: s, .. }) => status = Some(s),
@@ -66,8 +69,10 @@ async fn trailing_output_arrives_before_exit() {
     let mut completed = 0;
     let mut lagged = 0;
     let mut tab_id = 600;
-    while completed < ORDERING_RUNS {
+    let mut stats: Vec<String> = Vec::new();
+    while (completed + lagged) < 2 * ORDERING_RUNS {
         let run = completed;
+        EVENTS.store(0, std::sync::atomic::Ordering::Relaxed);
         tab_id += 1;
         let sentinel = format!("ROOST_TAIL_SENTINEL_{tab_id}");
         // `exec` so the process that writes is the process that exits:
@@ -93,8 +98,17 @@ async fn trailing_output_arrives_before_exit() {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
         let _session = TabSession::attach_with_receiver(sup.clone(), tab_id, pty_rx, out_tx, None);
 
+        let started = Instant::now();
         let (bytes, status, error) = drain_until_exit(&mut out_rx, Duration::from_secs(20)).await;
         sup.close(tab_id);
+        stats.push(format!(
+            "attempt {}: events={} bytes={} ms={} lag={:?}",
+            completed + lagged,
+            EVENTS.load(std::sync::atomic::Ordering::Relaxed),
+            bytes.len(),
+            started.elapsed().as_millis(),
+            error.as_deref().map(|e| e.trim_start_matches("broadcast lagged: dropped ")),
+        ));
 
         // A lagging drain is the *other* truncation path — broadcast
         // capacity, not exit ordering — which this commit deliberately
@@ -102,12 +116,8 @@ async fn trailing_output_arrives_before_exit() {
         // when a loaded machine starves the drain task, and it would
         // fake a failure of the ordering assertion below, so retry the
         // run instead of reading anything into it.
-        if let Some(err) = error {
+        if let Some(_err) = error {
             lagged += 1;
-            assert!(
-                lagged <= ORDERING_RUNS,
-                "run {run}: every attempt lagged, ordering never got a clean run: {err}"
-            );
             continue;
         }
         assert_eq!(status, Some(0), "run {run}: no clean Exit event");
@@ -121,6 +131,10 @@ async fn trailing_output_arrives_before_exit() {
         );
         completed += 1;
     }
+    panic!(
+        "SCRATCH-MEASUREMENT clean={completed} lagged={lagged} of {}\n{}", 2 * ORDERING_RUNS,
+        stats.join("\n")
+    );
 }
 
 /// A background descendant keeps the slave fd open, so the reader task
