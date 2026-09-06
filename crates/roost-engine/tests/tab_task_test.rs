@@ -648,6 +648,21 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
             &socket("flood"),
         )
         .expect("spawn");
+    // Close on every exit path, not just the happy one. The writer task
+    // ends this test parked in a real blocking `write(2)` on the full
+    // PTY input buffer, and close is what frees it: SIGHUP takes the
+    // child, the slave closes, the write answers EIO. A failed assertion
+    // would otherwise unwind past the close and leave the runtime waiting
+    // on that blocking task — bounded only by `sleep 30` today, and not
+    // at all under #409's condition. Declared before `commands` so it
+    // drops after it: sender gone first, then close, as before.
+    struct CloseOnDrop<'a>(&'a PtySupervisor, i64);
+    impl Drop for CloseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.close(self.1);
+        }
+    }
+    let _close = CloseOnDrop(&sup, 918);
     let commands = sup.tab_commands(918).expect("server-vt tab task");
 
     // Nothing may be written before `stty` has run, or the replies to it
@@ -708,23 +723,18 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
             "gap at teed event {index}"
         );
     }
-    assert_eq!(
-        bytes_of(&seen[..1]),
-        queries,
-        "the first teed event is the first flood chunk"
-    );
+    for (index, event) in seen[..CHUNKS].iter().enumerate() {
+        assert_eq!(
+            bytes_of(std::slice::from_ref(event)),
+            queries,
+            "teed event {index} is not the flood chunk verbatim"
+        );
+    }
     assert_eq!(
         bytes_of(&seen[seen.len() - 1..]),
         MARKER,
         "the last teed event is the marker"
     );
-
-    drop(commands);
-    // The writer task is parked in a real blocking `write(2)` on the
-    // full PTY input buffer, and close is what frees it: SIGHUP takes
-    // the child, the slave closes, the write answers EIO. Without that
-    // the runtime's blocking pool never drains and this test hangs.
-    sup.close(918);
 }
 
 /// D1's inertness guarantee: with the runtime flag off — which is every
