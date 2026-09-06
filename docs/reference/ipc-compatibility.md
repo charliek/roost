@@ -50,6 +50,16 @@ Two triggers revisit that decision:
 Tags cost only tag ceremony during rapid change, which is why they are
 deferred rather than rejected.
 
+[`examples/ipc-consumer`](https://github.com/charliek/roost/tree/main/examples/ipc-consumer)
+is this section's compilable companion: a standalone crate, outside the
+root workspace, that depends on `roost-ipc` the way an external project
+would (its own `Cargo.toml`/`Cargo.lock` show the path-vs-git-dependency
+split above in context). It dials a UI socket, calls `identify`, and
+polls `tab.list` — leaseless ops only, so it stays correct across R1's
+lease work — and CI both builds it and asserts, via `cargo metadata` on
+its resolved graph, that `roost-ipc` is the only workspace crate it
+pulls in.
+
 ### Module tour
 
 | Module | What it holds |

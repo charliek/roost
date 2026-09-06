@@ -40,6 +40,11 @@ members = [
     "crates/roost-iced",
     "crates/roost-session",
 ]
+# Belt-and-braces: members is already explicit above, but exclude spells
+# out that examples/ipc-consumer is a deliberately separate crate (own
+# workspace, own lockfile) proving roost-ipc is consumable standalone —
+# see docs/reference/ipc-compatibility.md.
+exclude = ["examples/ipc-consumer"]
 
 [workspace.package]
 # Single source of truth for the release version. Tag pushes (`v0.0.2`)
