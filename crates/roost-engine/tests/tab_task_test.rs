@@ -506,17 +506,24 @@ async fn the_replay_ring_evicts_oldest_first() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_after_the_exit_replays_the_stored_exit() {
     let (sup, _workspace) = enabled_supervisor(false);
+    // The child parks at `read` until this test holds the command
+    // handle: the reaper drops the session on exit, so a child that ran
+    // to completion first would leave `tab_commands` nothing to return.
     let mut output = sup
         .spawn(
             916,
             "/tmp",
-            &sh("printf 'bye\\n'; exit 7"),
+            &sh("read _; printf 'bye\\n'; exit 7"),
             20,
             6,
             &socket("postexit"),
         )
         .expect("spawn");
     let commands = sup.tab_commands(916).expect("server-vt tab task");
+    commands
+        .send(TabCmd::Input(b"\n".to_vec()))
+        .await
+        .expect("tab task is alive");
 
     let exit = loop {
         match timeout(BUDGET, output.recv()).await {
@@ -596,18 +603,69 @@ async fn a_stalled_task_backs_the_child_up_without_losing_bytes() {
 /// on a full writer channel — so output processing keeps up regardless.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
+    const CHUNKS: usize = 200;
+    const MARKER: &[u8] = b"\x1b[2J\x1b[Hstill-here";
+
     let (sup, _workspace) = enabled_supervisor(false);
+    // `-echo` stops the line discipline bouncing every CPR reply back at
+    // the reader. That echo is the whole flake this fence removes: the
+    // replies land after the marker and overwrite row 0, and thousands of
+    // them lap the 256-slot broadcast. Unfixed, this test failed 8/100 on
+    // Linux in exactly those two shapes; with echo off it is 100/100.
+    //
+    // The line-mode flag differs per platform because the two kernels
+    // fail this test in opposite directions, and each setting is the one
+    // that makes the exact event count below true there:
+    //
+    //   macOS needs `-icanon`. It rings the BEL on a full *canonical*
+    //   input buffer no matter what `-echo` says, and each bell is one
+    //   more event on the tee — 222 instead of 201, measured.
+    //
+    //   Linux must NOT have `-icanon`. Non-canonical mode is what makes
+    //   "the writer blocks on a full PTY input buffer" literally true
+    //   there (canonical n_tty admits one byte past full and discards
+    //   it), and a writer that genuinely blocks never comes back: it
+    //   parks in `write(2)` inside `block_in_place` (`pty.rs:717`) and
+    //   is released neither by the child dying nor by `close()`
+    //   returning, so the runtime cannot shut down. 100/100 hangs,
+    //   measured. That is a product bug, filed as #409, and a test may
+    //   not carry a 100% hang to prove a point.
+    //
+    // So the blocking-writer half of this test's premise is exercised on
+    // macOS only until #409 is fixed.
+    let line_mode = if cfg!(target_os = "macos") {
+        "stty -echo -icanon"
+    } else {
+        "stty -echo"
+    };
     let mut output = sup
-        .spawn(918, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("flood"))
+        .spawn(
+            918,
+            "/tmp",
+            &sh(&format!("{line_mode}; printf READY; exec sleep 30")),
+            80,
+            24,
+            &socket("flood"),
+        )
         .expect("spawn");
     let commands = sup.tab_commands(918).expect("server-vt tab task");
+
+    // Nothing may be written before `stty` has run, or the replies to it
+    // come back echoed.
+    let mut greeting = Vec::new();
+    while !greeting.windows(5).any(|window| window == b"READY") {
+        match timeout(BUDGET, output.recv()).await {
+            Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => greeting.extend_from_slice(&data),
+            other => panic!("expected the child's READY, got {other:?}"),
+        }
+    }
 
     // `sleep` never reads its stdin, so the PTY's input buffer fills,
     // the writer task blocks mid-write, and the writer channel backs up.
     // Each of these chunks answers with well over a kilobyte, so the
     // 64 KiB pending cap is crossed many times over.
     let queries = b"\x1b[6n".repeat(256);
-    for _ in 0..200 {
+    for _ in 0..CHUNKS {
         timeout(BUDGET, async { feed(&commands, &queries).await })
             .await
             .expect("queuing a chunk must never block on the writer");
@@ -615,39 +673,33 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
 
     // The load-bearing assertion: the task is still servicing its
     // pipeline after the flood.
-    feed(&commands, b"\x1b[2J\x1b[Hstill-here").await;
+    timeout(BUDGET, feed(&commands, MARKER))
+        .await
+        .expect("queuing the marker must never block on the writer");
     let dump = quiesce(&commands).await;
     let row = dump.rows_text.first().map(String::as_str).unwrap_or("");
-    // Starts-with, not equals: the flood's own replies are ECHOED back
-    // by the line discipline (see the tee comment below), and an echo
-    // that lands after the clear-and-write leaves its tail on this row —
-    // `\x1b[24;1R` arriving late shows up as a stray `;`. How much echo
-    // laps back is platform- and load-dependent, which is why an exact
-    // match failed on CI while passing on a fast local box. What this
-    // test is about is that the marker was processed AT ALL after the
-    // flood; the debris after it is the flood, not a regression.
-    assert!(
-        row.starts_with("still-here"),
-        "the tab task must keep processing output through a reply flood; row was {row:?}"
+    assert_eq!(
+        row, "still-here",
+        "the tab task must keep processing output through a reply flood"
     );
 
-    // …and the tee kept flowing through it, contiguously. The replies
-    // this test floods out get ECHOED by the PTY line discipline
-    // (`sleep` never reads, echo is on), and how much of that echo makes
-    // it back through the reader depends on the platform's PTY buffer —
-    // on a roomy kernel it is enough to lap this plain subscriber. Lag
-    // is legal for a subscriber by contract (the authoritative terminal
-    // is fed synchronously, not via this broadcast), so the drain
-    // tolerates it and pins contiguity from the first event it kept.
+    // …and the tee carried exactly the flood, contiguously: one event
+    // per `FeedBytes` chunk plus the marker, which fits the 256-slot
+    // broadcast. With echo off nothing else can reach the reader, so a
+    // lag here is a defect rather than a lossy-consumer fact.
     let mut seen = Vec::new();
     loop {
         match timeout(Duration::from_millis(50), output.recv()).await {
             Ok(Ok(event)) => seen.push(event),
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            _ => break,
+            Ok(Err(err)) => panic!("the flood must fit the broadcast; got {err}"),
+            Err(_) => break,
         }
     }
-    assert!(!seen.is_empty(), "the flood's chunks were teed");
+    assert_eq!(
+        seen.len(),
+        CHUNKS + 1,
+        "every flood chunk and the marker was teed, exactly once each"
+    );
     let first = seen[0].seq();
     for (index, event) in seen.iter().enumerate() {
         assert_eq!(
@@ -656,8 +708,22 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
             "gap at teed event {index}"
         );
     }
+    assert_eq!(
+        bytes_of(&seen[..1]),
+        queries,
+        "the first teed event is the first flood chunk"
+    );
+    assert_eq!(
+        bytes_of(&seen[seen.len() - 1..]),
+        MARKER,
+        "the last teed event is the marker"
+    );
 
     drop(commands);
+    // The writer task is parked in a real blocking `write(2)` on the
+    // full PTY input buffer, and close is what frees it: SIGHUP takes
+    // the child, the slave closes, the write answers EIO. Without that
+    // the runtime's blocking pool never drains and this test hangs.
     sup.close(918);
 }
 

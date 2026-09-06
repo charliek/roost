@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
 use roost_engine::{PtyOutputEvent, PtySupervisor, Workspace};
-use roost_ipc::messages::{ops, SessionIdentify, SessionStopResult, TabOpenResult};
+use roost_ipc::messages::{bytes_base64, ops, SessionIdentify, SessionStopResult, TabOpenResult};
 use roost_ipc::{ConnAction, ConnCtx, Handler, HandlerError, HandlerOutcome};
 use tempfile::TempDir;
 
@@ -370,17 +370,32 @@ async fn open_tab_reporting_size(f: &Fixture, size: Option<(u32, u32)>) -> (u16,
         call(
             &f.handler,
             ops::TAB_OPEN,
-            tab_open_params(project, &["/bin/sh", "-c", "stty size"], size),
+            tab_open_params(project, &["/bin/sh", "-c", "read _; stty size"], size),
         )
         .await
         .expect("tab.open"),
     );
     let opened: TabOpenResult = serde_json::from_value(value).unwrap();
 
+    // The tab parks at `read` until the receiver is taken: the
+    // supervisor drops a session as soon as it is reaped, so a tab that
+    // ran to completion first would leave nothing to subscribe to. The
+    // release below needs no readiness wait — PTY input queues in the
+    // tty buffer whether or not the shell has reached `read` yet.
     let mut output = f
         .supervisor
         .take_initial_receiver(opened.tab.id)
         .expect("initial receiver");
+    call(
+        &f.handler,
+        ops::TAB_WRITE,
+        serde_json::json!({
+            "tab_id": opened.tab.id.to_string(),
+            "data": bytes_base64::encode(b"\n"),
+        }),
+    )
+    .await
+    .expect("tab.write");
     let mut collected = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
