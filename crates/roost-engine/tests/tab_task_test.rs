@@ -613,31 +613,15 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
     // them lap the 256-slot broadcast. Unfixed, this test failed 8/100 on
     // Linux in exactly those two shapes; with echo off it is 100/100.
     //
-    // The line-mode flag differs per platform because the two kernels
-    // fail this test in opposite directions, and each setting is the one
-    // that makes the exact event count below true there:
-    //
-    //   macOS needs `-icanon`. It rings the BEL on a full *canonical*
-    //   input buffer no matter what `-echo` says, and each bell is one
-    //   more event on the tee — 222 instead of 201, measured.
-    //
-    //   Linux must NOT have `-icanon`. Non-canonical mode is what makes
-    //   "the writer blocks on a full PTY input buffer" literally true
-    //   there (canonical n_tty admits one byte past full and discards
-    //   it), and a writer that genuinely blocks never comes back: it
-    //   parks in `write(2)` inside `block_in_place` (`pty.rs:717`) and
-    //   is released neither by the child dying nor by `close()`
-    //   returning, so the runtime cannot shut down. 100/100 hangs,
-    //   measured. That is a product bug, filed as #409, and a test may
-    //   not carry a 100% hang to prove a point.
-    //
-    // So the blocking-writer half of this test's premise is exercised on
-    // macOS only until #409 is fixed.
-    let line_mode = if cfg!(target_os = "macos") {
-        "stty -echo -icanon"
-    } else {
-        "stty -echo"
-    };
+    // `-icanon` is what makes "the writer is stuck on a full input
+    // buffer" true on both kernels: macOS rings the BEL on a full
+    // *canonical* buffer no matter what `-echo` says (each bell one more
+    // tee event), and Linux only ever stalls the master in non-canonical
+    // mode. On Linux that stall used to be a `write(2)` nothing could
+    // release — 100/100 hangs, #409 — so this test ran it on macOS only;
+    // the writer now waits on the reactor and the slave's hang-up ends
+    // the wait, on both.
+    let line_mode = "stty -echo -icanon";
     let mut output = sup
         .spawn(
             918,
@@ -649,13 +633,12 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
         )
         .expect("spawn");
     // Close on every exit path, not just the happy one. The writer task
-    // ends this test parked in a real blocking `write(2)` on the full
-    // PTY input buffer, and close is what frees it: SIGHUP takes the
-    // child, the slave closes, the write answers EIO. A failed assertion
-    // would otherwise unwind past the close and leave the runtime waiting
-    // on that blocking task — bounded only by `sleep 30` today, and not
-    // at all under #409's condition. Declared before `commands` so it
-    // drops after it: sender gone first, then close, as before.
+    // ends this test waiting on a full PTY input buffer, and close is
+    // what ends that wait: SIGHUP takes the child, the slave closes, the
+    // master reports the hang-up. A failed assertion would otherwise
+    // unwind past the close and leave the child alive until `sleep 30`
+    // expires. Declared before `commands` so it drops after it: sender
+    // gone first, then close, as before.
     struct CloseOnDrop<'a>(&'a PtySupervisor, i64);
     impl Drop for CloseOnDrop<'_> {
         fn drop(&mut self) {
@@ -676,7 +659,7 @@ async fn a_query_flood_against_a_full_writer_never_blocks_the_task() {
     }
 
     // `sleep` never reads its stdin, so the PTY's input buffer fills,
-    // the writer task blocks mid-write, and the writer channel backs up.
+    // the writer task stalls mid-chunk, and the writer channel backs up.
     // Each of these chunks answers with well over a kilobyte, so the
     // 64 KiB pending cap is crossed many times over.
     let queries = b"\x1b[6n".repeat(256);
