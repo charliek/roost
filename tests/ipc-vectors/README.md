@@ -3,6 +3,12 @@
 Canonical wire-format exemplars for the JSON IPC protocol defined in
 [`docs/reference/ipc.md`](../../docs/reference/ipc.md).
 
+This corpus is the compatibility contract: an existing vector is never
+semantically edited to bless a wire change, and additive changes add new
+vectors instead. The policy — what "additive" means, the four-direction
+compatibility matrix, and what enforces this — lives in
+[`docs/reference/ipc-compatibility.md`](../../docs/reference/ipc-compatibility.md).
+
 Each file is one JSON object — either a request envelope, a response
 envelope, or an event envelope. The naming convention is:
 
@@ -12,9 +18,13 @@ envelope, or an event envelope. The naming convention is:
 - `<event-name>.event.json` — server-push event envelope.
 
 Both the Rust side (`cargo test -p roost-ipc`) and the Swift side
-(`swift test --package-path mac`, post-M4) load these files and assert
-that decode → re-encode produces a byte-equal result. This guards
-against schema drift between the two languages.
+(`swift test --package-path mac`, post-M4) load these files: every
+vector is round-tripped schema-agnostically, and selected vectors are
+decoded into the typed structs on each side, which pins field names and
+shapes and guards against schema drift between the two languages. (The
+byte-exact assertions live in `wire_types_test.rs` against in-file
+literal exemplars; the on-disk files are compared semantically, not
+byte-for-byte.)
 
 When you add a new op or event, drop a new vector file here. The
 loader is intentionally schema-agnostic — it round-trips raw

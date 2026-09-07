@@ -1,0 +1,22 @@
+# Standalone crate, deliberately outside the root workspace (see the
+# empty [workspace] table below) — it exists to prove roost-ipc is
+# consumable on its own, by an external project pinning a git rev
+# rather than a path. Docs: docs/reference/ipc-compatibility.md.
+
+[package]
+name = "ipc-consumer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# In this repo, a path dependency so the example always builds against
+# the checked-out crate. An external consumer spells this instead:
+#   roost-ipc = { git = "https://github.com/charliek/roost", branch = "main" }
+roost-ipc = { path = "../../crates/roost-ipc" }
+
+# current_thread: this program has one connection and one timer, no
+# need for the multi-thread scheduler.
+tokio = { version = "1.40", features = ["rt", "macros", "signal", "time"] }

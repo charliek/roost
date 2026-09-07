@@ -48,6 +48,7 @@ nav = [
     { "Configuration" = "reference/config.md" },
     { "CLI" = "reference/cli.md" },
     { "IPC" = "reference/ipc.md" },
+    { "IPC Compatibility" = "reference/ipc-compatibility.md" },
     { "Paths & Environment" = "reference/paths.md" },
     { "Themes" = "reference/themes.md" },
     { "Fonts" = "reference/fonts.md" },

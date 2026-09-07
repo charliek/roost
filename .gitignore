@@ -13,6 +13,10 @@
 /target/
 **/*.rs.bk
 
+# examples/ipc-consumer is its own workspace (outside the root one), so
+# /target/ above doesn't reach its build output.
+/examples/ipc-consumer/target/
+
 # Vendored Ghostty (new architecture; same source-of-truth model as build/)
 /third_party/ghostty/out/
 /third_party/ghostty/src/

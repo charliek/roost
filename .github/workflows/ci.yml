@@ -28,6 +28,7 @@ jobs:
       deb: ${{ steps.filter.outputs.deb }}
       macbundle: ${{ steps.filter.outputs.macbundle }}
       docnav: ${{ steps.filter.outputs.docnav }}
+      examples: ${{ steps.filter.outputs.examples }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -94,6 +95,14 @@ jobs:
             docnav:
               - 'zensical.toml'
               - 'docs/**'
+            # examples/ipc-consumer is its own workspace, outside
+            # `rustcore`'s `crates/**` anchor on purpose (it proves
+            # roost-ipc buildable with no other workspace crate) — a
+            # dedicated output keeps it out of the heavy rust/mac/linux
+            # jobs while still gating `rust-build`, the job that builds
+            # and metadata-checks it (see `docnav`'s precedent above).
+            examples:
+              - 'examples/ipc-consumer/**'
             ci:
               - '.github/workflows/ci.yml'
             # Deliberately NOT `linux`: that filter folds in the *rustcore
@@ -241,10 +250,10 @@ jobs:
 
   rust-build:
     needs: changes
-    # `docnav` rides along here only — this is the job that runs `cargo
-    # test`, and widening `rust` itself would drag four other heavy jobs
-    # onto every docs typo.
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.docnav == 'true'
+    # `docnav` and `examples` ride along here only — this is the job that
+    # runs `cargo test`, and widening `rust` itself would drag four other
+    # heavy jobs onto every docs typo or example-crate edit.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.docnav == 'true' || needs.changes.outputs.examples == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -337,6 +346,71 @@ jobs:
       # production consumer; test it explicitly so the gated code stays green.
       - name: cargo test (roost-engine with facade)
         run: cargo test -p roost-engine --features facade
+
+      # examples/ipc-consumer is its own workspace (own Cargo.lock, path
+      # dep on roost-ipc in-tree; a real consumer pins a git rev — see
+      # docs/reference/ipc-compatibility.md). It needs no libghostty-vt:
+      # roost-ipc has no roost-vt dependency.
+      - name: Build example external consumer
+        run: cargo build --manifest-path examples/ipc-consumer/Cargo.toml --locked
+
+      # A grep for `path =` would miss a git/package-renamed alias, so
+      # this asserts on the resolved dependency graph instead: the only
+      # package cargo actually pulled in from this repo's crates/ is
+      # roost-ipc itself. That is the policy in
+      # docs/reference/ipc-compatibility.md ("Consuming the crate") —
+      # fail loudly and name it if a future edit adds a second in-repo
+      # dependency to the example.
+      - name: Example consumer depends on no other workspace crate
+        run: |
+          cargo metadata \
+            --manifest-path examples/ipc-consumer/Cargo.toml \
+            --format-version 1 \
+            --locked \
+            > /tmp/ipc-consumer-metadata.json
+          cargo metadata \
+            --no-deps \
+            --format-version 1 \
+            > /tmp/root-workspace-metadata.json
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          with open("/tmp/ipc-consumer-metadata.json") as f:
+              metadata = json.load(f)
+          with open("/tmp/root-workspace-metadata.json") as f:
+              root = json.load(f)
+
+          # Two legs: a path leg (anything resolved from this checkout's
+          # crates/) and a name leg (any package sharing a root workspace
+          # member's name, wherever it was fetched from — catches a git
+          # or vendored copy of a workspace crate that the path leg
+          # cannot see).
+          member_names = {pkg["name"] for pkg in root["packages"]}
+          crates_dir = os.path.realpath("crates") + os.sep
+          offenders = sorted(
+              {
+                  pkg["name"]
+                  for pkg in metadata["packages"]
+                  if pkg["name"] != "roost-ipc"
+                  and (
+                      os.path.realpath(pkg["manifest_path"]).startswith(crates_dir)
+                      or pkg["name"] in member_names
+                  )
+              }
+          )
+          if offenders:
+              print(
+                  "policy violation (docs/reference/ipc-compatibility.md, "
+                  "'Consuming the crate'): examples/ipc-consumer must depend "
+                  "on no roost workspace crate other than roost-ipc; found: "
+                  + ", ".join(offenders),
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print("examples/ipc-consumer dependency isolation OK")
+          PYEOF
 
   swift-mac:
     needs: changes
