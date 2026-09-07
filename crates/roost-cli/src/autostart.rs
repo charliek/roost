@@ -816,12 +816,19 @@ pub enum InstallOutcome {
 
 /// The two cases that settle before the supervisor is asked anything.
 /// `None` means "write, then run the load commands".
+///
+/// Identical bytes settle only while the supervisor already holds the
+/// definition. Otherwise the file is right and nothing is running it —
+/// which is precisely the state [`InstallOutcome::ActivationUnconfirmed`]
+/// leaves behind, since it keeps the file and asks for a retry. Settling
+/// there would make that retry a no-op reporting success.
 pub fn settled_without_supervisor(
     existing: Existing,
     loaded_before: bool,
 ) -> Option<InstallOutcome> {
     match existing {
-        Existing::Identical => Some(InstallOutcome::Unchanged),
+        Existing::Identical if loaded_before => Some(InstallOutcome::Unchanged),
+        Existing::Identical => None,
         _ if loaded_before => Some(InstallOutcome::ReinstalledLoaded),
         _ => None,
     }
@@ -1664,10 +1671,27 @@ mod tests {
     #[test]
     fn classify_install_covers_every_outcome() {
         let untouched = supervision(false, false);
-        // Identical bytes settle before anything is asked.
+        // Identical bytes settle before anything is asked — but only
+        // while the supervisor holds the definition.
+        assert_eq!(
+            classify_install(Existing::Identical, supervision(true, true), None, None),
+            InstallOutcome::Unchanged
+        );
+        // Identical bytes the supervisor does NOT hold are the state an
+        // earlier failed activation leaves behind: activate, do not
+        // report success having done nothing.
+        assert_eq!(
+            classify_install(
+                Existing::Identical,
+                supervision(false, true),
+                None,
+                Some("s1")
+            ),
+            InstallOutcome::SupervisedFresh
+        );
         assert_eq!(
             classify_install(Existing::Identical, untouched, None, None),
-            InstallOutcome::Unchanged
+            InstallOutcome::ActivationUnconfirmed
         );
         // A loaded supervisor is left alone, whatever was on disk.
         for existing in [Existing::Absent, Existing::Changed, Existing::Foreign] {
@@ -1722,9 +1746,10 @@ mod tests {
         // The two "supervisor untouched" cases agree with the predicate
         // the installer branches on.
         assert_eq!(
-            settled_without_supervisor(Existing::Identical, false),
+            settled_without_supervisor(Existing::Identical, true),
             Some(InstallOutcome::Unchanged)
         );
+        assert_eq!(settled_without_supervisor(Existing::Identical, false), None);
         assert_eq!(
             settled_without_supervisor(Existing::Changed, true),
             Some(InstallOutcome::ReinstalledLoaded)

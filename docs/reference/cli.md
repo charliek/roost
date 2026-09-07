@@ -433,8 +433,9 @@ is a real fault and exits 1, not 3.
 Write, or remove, the one supervisor artifact that brings `roost-session`
 back after a login or a reboot — a `systemd --user` unit on Linux, a
 launchd LaunchAgent on macOS. **Opt-in**: nothing calls this on your
-behalf, and neither verb ever interrupts a session that's already
-running.
+behalf. `install` never interrupts a session that's already running;
+`uninstall` stops the one the supervisor is running, and only that one
+(see below).
 
 ```bash
 roostctl session autostart install

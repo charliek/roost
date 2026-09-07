@@ -343,7 +343,11 @@ just as happily race the upgrade flow's own stop-then-restart.
 `SuccessfulExit: false` reads that same exit `0` as "stopped on
 purpose" and only respawns on a nonzero exit — an actual crash — which
 auto-reconnect's connect-if-present then absorbs on its own.
-`Restart=on-failure` is systemd's spelling of the identical rule. Two
+`Restart=on-failure` is systemd's counterpart. The half that matters is
+the same — a deliberate stop exits `0`, and neither supervisor undoes it
+— but it is not literally the same rule: systemd also restarts on an
+uncaught signal, a start/stop timeout, or a watchdog timeout, none of
+which a clean **Stop Session** produces. Two
 more lines worth reading literally: `KillMode=mixed` sends the stop's
 `SIGTERM` to the daemon process alone, so its own orderly shutdown
 (SIGHUP the shells, reap, SIGKILL fallback) runs the way `session stop`
