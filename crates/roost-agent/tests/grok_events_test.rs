@@ -1,13 +1,17 @@
-//! One case per row of plan 046 §3.1's grok/gx table, plus the
-//! malformed-input edges every adapter is required to survive.
+//! One case per row of plan 046 §3.1's grok/gx table and plan 051's
+//! `Stop`-gate / `StopFailure` rules, plus the malformed-input edges
+//! every adapter is required to survive.
 //!
-//! `PermissionDenied`, `PostToolUseFailure` and `StopFailure` were not
-//! observed in the probe (nothing failed during the run); those three
-//! are pinned here by synthetic payloads, not fixture evidence.
+//! `PermissionDenied` and `PostToolUseFailure` have not been observed in
+//! either probe (auto-approve was on, no tool failed); those two are
+//! pinned here by synthetic payloads alone. `StopFailure` now has a
+//! fixture (`gx-failure.jsonl`) — the payload shapes it does not carry
+//! are still synthetic.
 
 use roost_agent::grok::{grok_event_to_reports, GROK_HOOK_EVENTS, SOURCE};
 use roost_ipc::agent::{
-    validate_report, AgentLifecycle, AttentionOp, OwnershipAction, Severity, TabAgentReportParams,
+    apply_report, validate_report, AgentLifecycle, AgentTabState, AttentionOp, OwnershipAction,
+    Severity, TabAgentReportParams,
 };
 use serde_json::{json, Value};
 
@@ -165,19 +169,113 @@ fn other_notification_types_leave_lifecycle_unchanged() {
     assert_eq!(report.detail, "something_else");
 }
 
+/// The first fire, spelled the way a real gx payload spells it.
 #[test]
 fn stop_without_background_tasks_finishes() {
-    for payload in [
-        grok(json!({ "session_id": "s-1" })),
-        grok(json!({ "session_id": "s-1", "backgroundTasks": [] })),
-    ] {
-        let report = only("Stop", &payload);
-        assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished));
-        assert_eq!(report.attention, AttentionOp::Set);
-        assert_eq!(report.body, "Turn complete");
-        assert_eq!(report.detail, "stop");
-        assert_eq!(report.metadata["background_tasks"], "0");
-        assert_eq!(report.metadata["session_crons"], "0");
+    let report = only(
+        "Stop",
+        &grok(json!({
+            "session_id": "s-1",
+            "reason": "end_turn",
+            "stopHookActive": false,
+            "backgroundTasks": [],
+            "sessionCrons": [],
+        })),
+    );
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished));
+    assert_eq!(report.attention, AttentionOp::Set);
+    assert_eq!(report.body, "Turn complete");
+    assert_eq!(report.detail, "stop");
+    assert_eq!(report.metadata["background_tasks"], "0");
+    assert_eq!(report.metadata["session_crons"], "0");
+}
+
+/// An absent array is "this fire says nothing", not zero — metadata has
+/// no delete channel, so a stamped `0` would be permanent.
+#[test]
+fn a_stop_that_omits_the_arrays_finishes_without_stamping_counts() {
+    let report = only("Stop", &grok(json!({ "session_id": "s-1" })));
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished));
+    assert_eq!(report.body, "Turn complete");
+    assert_eq!(report.detail, "stop");
+    assert!(report.metadata.is_empty());
+}
+
+#[test]
+fn a_continued_stop_fire_stays_working_without_a_banner() {
+    let report = only(
+        "Stop",
+        &grok(json!({
+            "session_id": "s-1",
+            "reason": "end_turn",
+            "stopHookActive": true,
+            "backgroundTasks": [{ "id": "b1" }],
+            "sessionCrons": [],
+        })),
+    );
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Working));
+    assert_eq!(report.lifecycle_if, None);
+    assert_eq!(report.attention, AttentionOp::Clear);
+    assert_eq!(report.detail, "stop:continued");
+    assert!(report.title.is_empty());
+    assert!(report.body.is_empty());
+    assert_eq!(report.metadata["background_tasks"], "1");
+    assert_eq!(report.metadata["session_crons"], "0");
+}
+
+#[test]
+fn a_session_end_stop_fire_changes_nothing() {
+    for reason in ["shutdown", "channel_closed"] {
+        let report = only(
+            "Stop",
+            &grok(json!({ "session_id": "s-1", "reason": reason, "stopHookActive": false })),
+        );
+        assert_eq!(report.lifecycle, None, "{reason}");
+        assert_eq!(report.lifecycle_if, None, "{reason}");
+        assert_eq!(report.attention, AttentionOp::Preserve, "{reason}");
+        assert_eq!(report.detail, format!("stop:{reason}"));
+        // gx omits both arrays on this fire; nothing may be stamped.
+        assert!(report.metadata.is_empty(), "{reason}");
+    }
+}
+
+#[test]
+fn an_unknown_stop_reason_is_the_same_no_op() {
+    let report = only(
+        "Stop",
+        &grok(json!({ "session_id": "s-1", "reason": "something_new" })),
+    );
+    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.attention, AttentionOp::Preserve);
+    assert_eq!(report.detail, "stop:something_new");
+}
+
+#[test]
+fn a_session_end_reason_wins_over_stop_hook_active() {
+    let report = only(
+        "Stop",
+        &grok(json!({ "session_id": "s-1", "reason": "shutdown", "stopHookActive": true })),
+    );
+    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.attention, AttentionOp::Preserve);
+    assert_eq!(report.detail, "stop:shutdown");
+}
+
+#[test]
+fn stop_hook_active_is_read_as_a_json_bool_only() {
+    for value in [json!("true"), json!(1), json!(null)] {
+        let report = only(
+            "Stop",
+            &grok(json!({
+                "session_id": "s-1",
+                "reason": "end_turn",
+                "stopHookActive": value.clone(),
+                "backgroundTasks": [],
+            })),
+        );
+        assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished), "{value}");
+        assert_eq!(report.attention, AttentionOp::Set, "{value}");
+        assert_eq!(report.detail, "stop", "{value}");
     }
 }
 
@@ -198,7 +296,6 @@ fn stop_with_background_tasks_stays_working() {
     assert_eq!(report.metadata["session_crons"], "1");
 }
 
-/// Not observed in the probe — pinned by the plan's table alone.
 #[test]
 fn stop_failure_maps_to_failed() {
     let report = only(
@@ -210,6 +307,77 @@ fn stop_failure_maps_to_failed() {
     assert_eq!(report.attention, AttentionOp::Set);
     assert_eq!(report.body, "Stopped: rate_limit");
     assert_eq!(report.detail, "rate_limit");
+}
+
+/// gx emits only the camelCase spelling; the snake key never exists in
+/// a real payload, which is why the body used to be the bare fallback.
+#[test]
+fn stop_failure_carries_gxs_camelcase_error_details() {
+    let report = only(
+        "StopFailure",
+        &grok(json!({
+            "session_id": "s-1",
+            "error": "server_error",
+            "errorDetails": "Unauthorized (401) from https://example.invalid",
+        })),
+    );
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Failed));
+    assert_eq!(report.severity, Severity::Error);
+    assert_eq!(
+        report.body,
+        "Unauthorized (401) from https://example.invalid"
+    );
+    assert_eq!(report.detail, "server_error");
+}
+
+#[test]
+fn stop_failure_falls_back_when_the_details_are_empty_or_not_a_string() {
+    for details in [json!(""), json!(42), json!(null), json!({ "a": 1 })] {
+        let report = only(
+            "StopFailure",
+            &grok(json!({
+                "session_id": "s-1",
+                "error": "rate_limit",
+                "errorDetails": details.clone(),
+            })),
+        );
+        assert_eq!(report.body, "Stopped: rate_limit", "{details}");
+        assert_eq!(report.detail, "rate_limit", "{details}");
+    }
+}
+
+#[test]
+fn stop_failure_prefers_the_snake_spelling_when_both_are_present() {
+    let report = only(
+        "StopFailure",
+        &grok(json!({
+            "session_id": "s-1",
+            "error": "server_error",
+            "error_details": "snake",
+            "errorDetails": "camel",
+        })),
+    );
+    assert_eq!(report.body, "snake");
+}
+
+/// gx fires this immediately before the `StopFailure` for the same turn,
+/// which carries the same text with the right severity.
+#[test]
+fn an_agent_error_notification_is_silent() {
+    let report = only(
+        "Notification",
+        &grok(json!({
+            "session_id": "s-1",
+            "message": "Unauthorized (401) from https://example.invalid",
+            "notificationType": "agent_error",
+            "level": "error",
+        })),
+    );
+    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.lifecycle_if, None);
+    assert_eq!(report.attention, AttentionOp::Preserve);
+    assert_eq!(report.severity, Severity::Info);
+    assert_eq!(report.detail, "agent_error");
 }
 
 /// The Esc-interrupt signal — grok has no dedicated interrupt hook, this
@@ -285,6 +453,11 @@ fn malformed_payloads_do_not_panic() {
         json!({}),
         grok(json!({ "session_id": 7, "backgroundTasks": "not-array" })),
         grok(json!({ "backgroundTasks": {}, "sessionCrons": 3, "error": false })),
+        grok(json!({ "session_id": "s-1", "reason": 7, "stopHookActive": "true" })),
+        grok(json!({ "session_id": "s-1", "reason": [], "stopHookActive": 1 })),
+        grok(json!({ "session_id": "s-1", "reason": "", "errorDetails": 42 })),
+        grok(json!({ "session_id": "s-1", "gxRemote": {} })),
+        grok(json!({ "session_id": "s-1", "gxRemote": ["x"] })),
     ];
     for event in GROK_HOOK_EVENTS {
         for payload in &payloads {
@@ -303,10 +476,135 @@ fn every_report_carries_source_grok_and_the_payload_session_id() {
         "message": "m",
         "notificationType": "idle_prompt",
         "error": "overloaded",
+        "gxRemote": "http://127.0.0.1:2421",
     }));
     for event in GROK_HOOK_EVENTS {
         let report = only(event, &payload);
         assert_eq!(report.source, "grok", "{event}");
         assert_eq!(report.session_id, "s-42", "{event}");
+        assert_eq!(
+            report.metadata["gx.remote"], "http://127.0.0.1:2421",
+            "{event}"
+        );
     }
+}
+
+// ---------------------------------------------------------------------
+// §3.3 (plan 051) — the `gx.remote` metadata key
+// ---------------------------------------------------------------------
+
+/// A token-free loopback base URL is stamped unchanged; anything else —
+/// absent, empty, non-string, `https`, a non-loopback host, a userinfo,
+/// a missing/zero/out-of-range port, or trailing path/query/fragment —
+/// leaves the key absent, with no other effect on the report.
+#[test]
+fn gx_remote_is_stamped_only_for_a_token_free_loopback_base_url() {
+    let rejected = [
+        json!(null),
+        json!(""),
+        json!(42),
+        json!(true),
+        json!("https://127.0.0.1:2421"),
+        json!("http://10.0.0.5:2421"),
+        json!("http://127.0.0.1:2421/"),
+        json!("http://127.0.0.1:2421?token=x"),
+        json!("http://127.0.0.1:2421#f"),
+        json!("http://user@127.0.0.1:2421"),
+        json!("http://127.0.0.1"),
+        json!("http://127.0.0.1:0"),
+        json!("http://127.0.0.1:70000"),
+        json!("http://localhost:2421/x"),
+    ];
+    for value in rejected {
+        let report = only(
+            "PreToolUse",
+            &grok(json!({ "session_id": "s-1", "gxRemote": value.clone() })),
+        );
+        assert!(
+            !report.metadata.contains_key("gx.remote"),
+            "{value} must not be stamped"
+        );
+    }
+    // Missing entirely, as opposed to present-but-null/empty above.
+    let report = only("PreToolUse", &grok(json!({ "session_id": "s-1" })));
+    assert!(!report.metadata.contains_key("gx.remote"));
+
+    let accepted = [
+        "http://127.0.0.1:2421",
+        "http://localhost:2421",
+        "http://[::1]:2421",
+        "http://127.0.0.1:65535",
+    ];
+    for value in accepted {
+        let report = only(
+            "PreToolUse",
+            &grok(json!({ "session_id": "s-1", "gxRemote": value })),
+        );
+        assert_eq!(report.metadata["gx.remote"], value, "{value}");
+    }
+}
+
+/// The lane binds asynchronously, so `gxRemote` can appear partway
+/// through a session. Driven through [`apply_report`] rather than just
+/// inspecting each report's own metadata, because "still present" after
+/// a report that carries no `gxRemote` is a claim about the *merged
+/// server state*, not about the adapter: a `Preserve` report's empty
+/// metadata means "says nothing about it", so the key survives; only a
+/// fresh `Claim` (a new `SessionStart`) replaces the whole map and
+/// resets it — the only "delete" that exists for this key.
+#[test]
+fn gx_remote_appears_mid_session_and_resets_only_on_a_new_claim() {
+    let mut state = AgentTabState::default();
+    const NOW: i64 = 1_757_000_000;
+
+    let apply = |state: &AgentTabState, event: &str, payload: &Value| {
+        let reports = grok_event_to_reports(event, payload, TAB);
+        assert_eq!(reports.len(), 1, "{event}");
+        let report = &reports[0];
+        validate_report(report).expect("every emitted report must be valid");
+        apply_report(state, report, NOW).state
+    };
+
+    // SessionStart without gxRemote: key absent.
+    state = apply(
+        &state,
+        "SessionStart",
+        &grok(json!({ "session_id": "s-1", "source": "new" })),
+    );
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata.get("gx.remote"),
+        None
+    );
+
+    // PreToolUse with it: present.
+    state = apply(
+        &state,
+        "PreToolUse",
+        &grok(json!({
+            "session_id": "s-1",
+            "gxRemote": "http://127.0.0.1:2421",
+        })),
+    );
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata["gx.remote"],
+        "http://127.0.0.1:2421"
+    );
+
+    // PostToolUse without it: still present (merge-only).
+    state = apply(&state, "PostToolUse", &grok(json!({ "session_id": "s-1" })));
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata["gx.remote"],
+        "http://127.0.0.1:2421"
+    );
+
+    // A new SessionStart (a Claim) without it: absent again.
+    state = apply(
+        &state,
+        "SessionStart",
+        &grok(json!({ "session_id": "s-2", "source": "new" })),
+    );
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata.get("gx.remote"),
+        None
+    );
 }

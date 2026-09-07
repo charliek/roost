@@ -13,6 +13,15 @@ release workflow asserts they agree).
 
 ### Added
 
+- **`gx.remote` metadata key surfaces a gx session's remote lane (#425)** —
+  when gx's remote lane is up it stamps its loopback base URL (`gxRemote`,
+  e.g. `http://127.0.0.1:2421`) onto every hook payload; roost now forwards
+  a validated token-free loopback URL as `metadata["gx.remote"]` on the
+  owning tab, and `roostctl doctor` prints it. It's a discovery hint, not
+  liveness — gx never clears its own announcement and roost's metadata has
+  no delete channel, so the key can outlive the lane; see the [Agent
+  Hooks](docs/guides/agents.md#gx) guide for the naming convention and the
+  consumer contract a client still has to follow before using it.
 - **Remote host sections drag-reorder too (#398)** — dragging a project row
   or a tab pill inside a connected host's section now reorders it exactly
   like the LOCAL section always could; the drop routes over that host's own
@@ -97,6 +106,18 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **grok/gx: a continued turn's `stopHookActive: true` Stop fires keep the
+  tab `working`, and a failed turn's banner carries the reason (#423)** —
+  gx's `Stop` hook is a gate: when a blocking Stop hook continues the
+  turn, `Stop` fires again with `stopHookActive: true`. Each such fire now
+  keeps the tab `working` (instead of re-reporting `finished` with another
+  "Turn complete" banner) until gx's own `idle_prompt` Notification
+  settles it. The very first fire of a turn still reports `finished`
+  until the next tool event or gated fire — a passive observer cannot
+  tell whether a gate will block it (see the agents guide). Separately,
+  `StopFailure` banners now read gx's `errorDetails` (the adapter was
+  reading `error_details`, a key gx never emits) instead of always
+  falling back to the bare classified error name.
 - **`tab.close` no longer answers `not-found` for a tab it just closed
   (#416)** — the op sent the child its hang-up first and removed the
   workspace row second, and the exit path that hang-up starts also
