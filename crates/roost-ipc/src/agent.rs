@@ -253,8 +253,8 @@ pub const SOURCE_LEGACY: &str = "legacy";
 /// There is deliberately **no timestamp or TTL heuristic** (AD-3):
 /// Claude fires no periodic hook, so a long tool call would look stale
 /// and get released mid-turn. Ownership is cleared only by the explicit
-/// rules in [`apply_report`], by [`apply_shell_mark`] dropping the
-/// lifecycle at a prompt, or by PTY replacement.
+/// rules in [`apply_report`]; [`apply_shell_mark`] at a prompt drops the
+/// lifecycle but keeps the owner.
 pub fn is_live(state: &AgentTabState) -> bool {
     matches!(&state.ownership, Some(o) if !o.source.is_empty())
 }

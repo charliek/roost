@@ -650,19 +650,6 @@ final class Workspace {
         commit(events, persist: false)
     }
 
-    /// The tab's PTY was replaced: the shell that hosted any agent is
-    /// gone, so both axes and ownership reset.
-    ///
-    /// Stated as a rule about the PTY rather than about closing —
-    /// closing drops the whole row, so it needs no help. #170's
-    /// hard-restart keeps the row and is this call.
-    func ptyReplaced(_ tabID: Int64) throws {
-        guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
-        let events = replaceAgent(&t, with: AgentTabState())
-        tabs[tabID] = t
-        commit(events, persist: false)
-    }
-
     /// Raise a tab's attention — pending badge, inbox row, and desktop
     /// banner. Returns whether it was delivered.
     ///

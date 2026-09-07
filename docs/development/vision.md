@@ -408,7 +408,10 @@ an explicit rule: a matching release, an unconditional `claim`
 (supersede — the only path that can take a tab from a live owner), or
 PTY replacement (tab close today; #170's hard-restart lands the same
 rule without a hardcoded path, since it's stated as "the PTY was
-replaced," not "the tab was closed").
+replaced," not "the tab was closed"). (Amended by plan 052: the
+`pty_replaced` primitive was removed with no caller; a close drops
+the row, and #170's hard-restart rebuilds the reset with its
+respawn.)
 
 Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
 tab) is the **one exception that gets a real failsafe**, because it's

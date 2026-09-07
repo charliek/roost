@@ -678,18 +678,6 @@ struct WorkspaceAgentStateTests {
         #expect(ws.tab(tid)?.hookActive == false)
     }
 
-    @Test func ptyReplacementClearsOwnership() throws {
-        let (ws, tid) = try ownedWorkspace(.working)
-        try ws.applyShellMark(tid, body: "C")
-
-        try ws.ptyReplaced(tid)
-        let tab = try #require(ws.tab(tid))
-        #expect(tab.agent.ownership == nil)
-        #expect(tab.agent.lifecycle == .inactive)
-        #expect(tab.agent.shell == .unknown)
-        #expect(tab.state == Workspace.TabState.none)
-    }
-
     /// The derived slices ride along with the full record, so the UI and
     /// any external subscriber see one consistent story.
     @Test func acceptedReportEmitsStateHookAndAgentEvents() throws {
