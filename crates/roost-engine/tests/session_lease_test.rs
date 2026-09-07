@@ -544,7 +544,15 @@ async fn a_momentarily_full_stream_is_told_by_its_own_relay_and_not_cut() {
     // full queue — and a healthy stream.
     f.workspace.create_project("a", "/tmp").unwrap();
     f.workspace.create_project("b", "/tmp").unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Nothing observable says "the relay is parked on its reservation",
+    // so this is wall-clock synchronisation: generous, and scaled the
+    // way every other budget in the suite is, because a loaded CI
+    // runner that has not drained `a` yet would send the envelope first
+    // and fail the ordering assertion below for the wrong reason.
+    tokio::time::sleep(
+        std::time::Duration::from_millis(500).mul_f64(roost_ipc::session_launch::timeout_scale()),
+    )
+    .await;
 
     connect_as(&f, &conn(3), true, Some("a phone"))
         .await
