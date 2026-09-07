@@ -948,7 +948,18 @@ the same rule one level out from connection state.
   guaranteed a turn after 256 KiB of PTY payload or 50 ms). Budgets:
   2 MiB replay ring, 8 MiB forwarder queue, 512 MiB / 60 s per attach.
   See [ipc.md's Data plane](../docs/reference/ipc.md#data-plane).
-- Remote image paste policy over SSH (HS-3 plan; OSC 52 read is
-  already pinned default-deny).
+- ~~Remote image paste policy over SSH (HS-3 plan; OSC 52 read is
+  already pinned default-deny)~~ **Resolved, shipped in plan 047
+  (#406)**: bytes cross as an op, not as a clipboard. `session.put_file`
+  (lease-gated, one frame, 10 MiB, a 512 MiB no-evict admission cap on
+  the host) lands the file and answers with a host path; the client
+  re-validates that path and pastes it **bare**, which is the one
+  spelling every agent unquotes identically. `tab.send_file` is the one
+  entry point a drop, a clipboard-image paste and `roostctl tab
+  send-file` all drive. Any regular file uploads, not only images. OSC
+  52 *read* is unchanged — still parser-level default-deny everywhere.
+  Cost: `SESSION_PROTOCOL_VERSION` 2 → 3. See
+  [ipc.md's `session.put_file`](../docs/reference/ipc.md#sessionput_file)
+  and [DL-22](../docs/development/vision.md).
 - Mac `roost-session` packaging (post-HS-3; code is portable
   already).

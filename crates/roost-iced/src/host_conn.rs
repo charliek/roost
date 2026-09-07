@@ -83,12 +83,14 @@ pub(crate) mod reconnect;
 pub(crate) mod restart;
 pub(crate) mod state;
 pub(crate) mod task;
+pub(crate) mod upload;
 
 pub(crate) use mirror::SharedMirror;
 pub(crate) use queue::{HostIntent, HostOpError, HostOps};
 pub(crate) use reconnect::{Decision, DropInput};
 pub(crate) use state::{HostConnState, HostTransport};
 pub(crate) use task::{ConnectMode, Shutdown};
+pub(crate) use upload::{UploadResult, UploadSource};
 
 /// How far wall-clock time may run past an armed delay before the
 /// handler reads it as a suspend rather than a busy event loop.
@@ -933,6 +935,7 @@ impl HostConnSet {
             held_lease,
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
+            uploads: ops.uploads(),
         };
         // Detached on purpose: the task owns its own shutdown, bounds it
         // (`task::SHUTDOWN_GRACE`), and answers its queue on the way

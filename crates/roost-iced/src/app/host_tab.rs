@@ -803,7 +803,11 @@ fn classify_op_failure(error: &crate::host_conn::queue::HostOpError) -> FailReas
     use crate::host_conn::queue::HostOpError;
     match error {
         HostOpError::Rejected { code, .. } => reason_for(Some(code), error.to_string()),
-        HostOpError::Disconnected | HostOpError::Unavailable => {
+        // `Local` is the upload lane's own refusal and cannot reach a
+        // token mint at all; grouped with the two that do not retry
+        // because an unexplained client-side refusal is not something a
+        // second attach attempt would fix either.
+        HostOpError::Disconnected | HostOpError::Unavailable | HostOpError::Local(_) => {
             FailReason::HostGone(error.to_string())
         }
         HostOpError::Transport(_) => FailReason::Retryable(error.to_string()),
@@ -984,11 +988,9 @@ fn lift_frame(attempt: u64, frame: ServerFrame) -> HostTabFrame {
 
 #[cfg(test)]
 mod tests {
-    use roost_ui_model::theme::Theme;
     use roost_vt::{Terminal, TerminalOptions};
 
     use super::*;
-    use crate::app::tab_backend::TabHandle;
     use crate::app::terminal_tab::TerminalTab;
     use crate::engine_feed::{self, EngineFeedReceiver};
 
@@ -1015,15 +1017,11 @@ mod tests {
         // The frames below are hand-fed, so the machine must be on the
         // attempt they carry.
         attach.attempt = 1;
-        let handle = TabHandle::host(attach.input_tx(), true);
-        let tab = TerminalTab::attach_host(
+        let (tab, _capture) = crate::app::terminal_tab::attach_test_host_terminal(
             GEOMETRY.cols,
             GEOMETRY.rows,
-            Theme::roost_dark_fallback(),
-            String::new(),
-            handle,
-        )
-        .expect("host tab terminal");
+            attach.input_tx(),
+        );
         (attach, tab, feed_tx, feed_rx)
     }
 

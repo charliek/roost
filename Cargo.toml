@@ -108,6 +108,13 @@ debug = "limited"
 [profile.dev.package."*"]
 opt-level = 2
 
+# Test binaries keep file:line for panic backtraces and drop the rest:
+# `dev` is already "limited", and what remains is mostly what makes the
+# 46 test binaries slow to link. Costs variable inspection under lldb
+# for tests only.
+[profile.test]
+debug = "line-tables-only"
+
 [patch.crates-io]
 # Vendored swash 0.2.10 carrying the #292 zero-long-metrics guard.
 # See third_party/swash/README.roost.md and CLAUDE.md § Library preferences.

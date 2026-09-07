@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 
+use roost_engine::ipc::{HostOpFailure, HostOpReply};
+use roost_ipc::messages::{SentFile, SkippedFile, TabSendFileResult};
+use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
 use roost_ui_model::keys::HostId;
 
+use super::file_transfer::{GestureOutcome, SentSource};
 use super::interactions::{host_reorder_call, ReorderTarget};
 use super::*;
 
@@ -15,7 +19,14 @@ use super::*;
 /// stop latch, which a UI socket has no notion of, and both reorder ops
 /// are in the session's mutating set — so a latched session answers it
 /// for exactly the ops this maps.
-const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 10] = [
+///
+/// `too-large` and `store-full` join the list for plan 047 §3.1: they
+/// are a session's answers to *one file*, and `tab.send_file` names
+/// them in its own error precedence (§3.4). Folding them onto
+/// `host-unavailable` would tell a caller the host is gone when what
+/// happened is that one file was too big for a host that is right
+/// there.
+const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 12] = [
     "unknown-op",
     "unknown-field",
     "missing-param",
@@ -26,6 +37,8 @@ const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 10] = [
     "not-found",
     "not-implemented",
     "internal",
+    "too-large",
+    "store-full",
 ];
 
 /// What a host-routed op's failure says on the wire (plan 044 §3.1 d6).
@@ -45,13 +58,13 @@ const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 10] = [
 /// [`crate::host_conn::HostOpError`]'s `Display`, which for a refusal
 /// is the session's code *and* its sentence, and for a dead connection
 /// is the same sentence the drag gesture's status banner shows.
-fn host_op_failure(error: &crate::host_conn::HostOpError) -> roost_engine::ipc::HostOpFailure {
+fn host_op_failure(error: &crate::host_conn::HostOpError) -> HostOpFailure {
     if let crate::host_conn::HostOpError::Rejected { code, message } = error {
         if CODES_A_UI_SOCKET_ALSO_SPEAKS.contains(&code.as_str()) {
-            return roost_engine::ipc::HostOpFailure::new(code.as_str(), message.clone());
+            return HostOpFailure::new(code.as_str(), message.clone());
         }
     }
-    roost_engine::ipc::HostOpFailure::new(HOST_UNAVAILABLE, error.to_string())
+    host_unavailable(error.to_string())
 }
 
 /// This client could not reach the host session an op named.
@@ -63,8 +76,171 @@ const HOST_UNAVAILABLE: &str = "host-unavailable";
 
 /// The answer for an incarnation this client is not connected to — the
 /// same `not-found` `tab.focus` gives for the same reason.
-fn no_connected_host() -> roost_engine::ipc::HostOpFailure {
-    roost_engine::ipc::HostOpFailure::new("not-found", "no connected host with that incarnation")
+fn no_connected_host() -> HostOpFailure {
+    HostOpFailure::new("not-found", "no connected host with that incarnation")
+}
+
+fn host_unavailable(message: impl Into<String>) -> HostOpFailure {
+    HostOpFailure::new(HOST_UNAVAILABLE, message)
+}
+
+/// What a finished gesture says on the `tab.send_file` wire — plan 047
+/// §3.4's error precedence, minus what [`send_file_refusal`] and the
+/// servicing arm answer before a gesture exists at all.
+///
+/// Pure, and the only place an outcome becomes wire words. The
+/// sentences are the gesture's own wherever it has one
+/// (`LostReason::sentence` writes them, `status::over_budget` the
+/// budget refusal), so the status line a gesture painted and the
+/// message its caller reads cannot disagree about what happened.
+///
+/// The one outcome with no sentence of its own is
+/// `Refusal::Frozen` — a frozen frame's copy is the `App`'s to name
+/// and never enters the outcome — so it answers with the sentence the
+/// rest of the app gives any host that cannot take work, the same one
+/// `Refusal::Unavailable` gets. `Lost { Frozen, .. }`, which *does*
+/// carry the frame's own sentence, keeps it.
+fn send_file_outcome(outcome: GestureOutcome) -> Result<TabSendFileResult, HostOpFailure> {
+    match outcome {
+        GestureOutcome::Pasted {
+            text,
+            uploads,
+            skipped,
+        } => Ok(TabSendFileResult {
+            pasted: text,
+            uploads: uploads.into_iter().map(sent_file).collect(),
+            skipped: skipped.iter().map(skipped_file).collect(),
+        }),
+        GestureOutcome::Refused(Refusal::Frozen | Refusal::Unavailable) => {
+            Err(host_unavailable(super::file_transfer::HOST_UNAVAILABLE))
+        }
+        // Nothing crossed and nothing could have: the request named
+        // only paths this host would refuse. `invalid-param` with the
+        // skips spelled out is the only answer that tells the caller
+        // which path to fix.
+        GestureOutcome::Refused(Refusal::NothingUploadable(skipped)) => Err(HostOpFailure::new(
+            "invalid-param",
+            nothing_to_send(&skipped),
+        )),
+        GestureOutcome::Refused(Refusal::Empty) => {
+            Err(HostOpFailure::new("invalid-param", nothing_to_send(&[])))
+        }
+        // The client's own per-gesture cap, refused before a byte
+        // moved. `too-large` because it is the same judgement the host
+        // makes per file, and the message is the toast's own wording.
+        GestureOutcome::Refused(Refusal::GestureOverBudget { total }) => {
+            Err(HostOpFailure::new("too-large", status::over_budget(total)))
+        }
+        // One upload failed, so nothing pasted (§3.3's all-or-nothing).
+        GestureOutcome::Failed { name, error } => {
+            let failure = host_op_failure(&error);
+            Err(HostOpFailure::new(
+                failure.code,
+                named(Some(name), failure.message),
+            ))
+        }
+        GestureOutcome::Lost { reason, name } => {
+            Err(host_unavailable(named(name, reason.sentence())))
+        }
+    }
+}
+
+/// §3.4's "message naming the file where there is one".
+fn named(name: Option<String>, sentence: impl Into<String>) -> String {
+    match name {
+        Some(name) => format!("{name}: {}", sentence.into()),
+        None => sentence.into(),
+    }
+}
+
+/// §3.4's precedence over what the servicing arm can decide before a
+/// gesture exists: a host that cannot take work outranks a path this op
+/// will not resolve, and the arm's own `not-found` outranks both.
+///
+/// The paths are refused rather than resolved because the only cwd this
+/// process could resolve a relative one against is the *app's*, which is
+/// not the one the caller typed it in.
+fn send_file_refusal(target: Target, paths: &[String]) -> Option<HostOpFailure> {
+    if matches!(target, Target::Frozen | Target::Unavailable) {
+        return Some(host_unavailable(super::file_transfer::HOST_UNAVAILABLE));
+    }
+    if paths.is_empty() {
+        return Some(HostOpFailure::new(
+            "invalid-param",
+            "paths must not be empty",
+        ));
+    }
+    let relative = paths
+        .iter()
+        .find(|path| !std::path::Path::new(path).is_absolute())?;
+    Some(HostOpFailure::new(
+        "invalid-param",
+        format!("paths must be absolute: {relative}"),
+    ))
+}
+
+/// `nothing to send: /tmp/build (directory), /tmp/gone (missing)`.
+///
+/// The full paths and the wire `reason` strings rather than
+/// `status::nothing_uploadable`'s basenames and prose: this is what a
+/// caller greps, and it is the same vocabulary `skipped` uses when the
+/// gesture succeeds.
+fn nothing_to_send(skipped: &[Skipped]) -> String {
+    if skipped.is_empty() {
+        return "nothing to send".to_string();
+    }
+    let listed: Vec<String> = skipped
+        .iter()
+        .map(skipped_file)
+        .map(|item| format!("{} ({})", item.path, item.reason))
+        .collect();
+    format!("nothing to send: {}", listed.join(", "))
+}
+
+/// Answer a `tab.send_file` caller when its gesture ends, off the winit
+/// thread.
+///
+/// The reply is never awaited inside `service_engine`: that is the
+/// winit thread, and a gesture outlives many frames — §3.4's "the UI
+/// socket keeps serving other frames during a long upload". The
+/// gesture answers on every terminal path, `Drop for Gestures`
+/// included, so the dropped-sender arm is a leak that cannot happen;
+/// it is written down rather than unwrapped because a caller blocked
+/// forever is the one outcome §3.4 rules out.
+fn defer_send_file_reply(
+    runtime: &tokio::runtime::Handle,
+    outcome: tokio::sync::oneshot::Receiver<GestureOutcome>,
+    reply: HostOpReply<TabSendFileResult>,
+) {
+    runtime.spawn(async move {
+        let answer = match outcome.await {
+            Ok(outcome) => send_file_outcome(outcome),
+            Err(_) => Err(host_unavailable("the gesture ended without an answer")),
+        };
+        let _ = reply.send(answer);
+    });
+}
+
+fn sent_file(sent: super::file_transfer::Sent) -> SentFile {
+    SentFile {
+        // A `tab.send_file` upload is always a path the caller named;
+        // the clipboard image is the other entry point's, and it has no
+        // reply to fill in.
+        source: match &sent.source {
+            SentSource::Path(path) => path.display().to_string(),
+            SentSource::ClipboardPng => String::new(),
+        },
+        name: sent.name,
+        path: sent.path,
+        bytes: sent.bytes,
+    }
+}
+
+fn skipped_file(skipped: &Skipped) -> SkippedFile {
+    SkippedFile {
+        path: skipped.path.display().to_string(),
+        reason: skipped.reason.as_wire_str().to_string(),
+    }
 }
 
 /// One host section as `app.sidebar_dump` reports it (plan 044 §3.1 d7).
@@ -581,6 +757,23 @@ fn macos_test_gated<T>(
     } else {
         read()
     }
+}
+
+/// Why `clipboard.write { image_png }` will not run here, or `None`
+/// when it will (plan 047 §3.5).
+///
+/// `not-supported` rather than `not-enabled`: the image form is a seam
+/// a lane either has or does not, and a lane's answer is the same skip
+/// either way. What the *display server* will not do is not predicted
+/// here — that answer comes from attempting the write
+/// ([`paste_image::write_png`]).
+fn image_write_refusal(test_mode: bool) -> Option<HostOpFailure> {
+    (!test_mode).then(|| {
+        HostOpFailure::new(
+            "not-supported",
+            "clipboard.write `image_png` requires ROOST_TEST_MODE=1 at UI launch",
+        )
+    })
 }
 
 /// `app.keybind_dispatch`'s namespace restriction. The op exists solely
@@ -2513,6 +2706,14 @@ impl App {
                 self.clipboard.enqueue_write(target, text);
                 task = task.then(self.clipboard.start_next());
             }
+            UiRequest::ClipboardWriteImage { png, reply } => {
+                if let Some(failure) = image_write_refusal(self.test_mode) {
+                    let _ = reply.send(Err(failure));
+                } else {
+                    self.clipboard.enqueue_write_image(png, reply);
+                    task = task.then(self.clipboard.start_next());
+                }
+            }
             UiRequest::TabExpandSelectionAt {
                 tab_id,
                 col,
@@ -2636,6 +2837,27 @@ impl App {
                     .focus_host_tab_and_clear(key, false)
                     .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
                 let _ = reply.send(result);
+            }
+            // Plan 047 §3.4: the op *is* the drop, minus the window
+            // event — same `send_files`, same gesture queue, same
+            // paste. What comes first is the precedence a gesture
+            // cannot express, in §3.4's order: the tab, then the host,
+            // then the paths.
+            UiRequest::TabSendFile { tab, paths, reply } => {
+                let key = self.wire_tab_key(tab);
+                if !self.tab_live(key) {
+                    let _ = reply.send(Err(HostOpFailure::new(
+                        "not-found",
+                        format!("tab {tab} has no live terminal"),
+                    )));
+                } else if let Some(failure) = send_file_refusal(self.transfer_target(key), &paths) {
+                    let _ = reply.send(Err(failure));
+                } else {
+                    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+                    let paths = paths.into_iter().map(PathBuf::from).collect();
+                    task = task.then(self.send_files(key, paths, Some(outcome_tx)));
+                    defer_send_file_reply(&self.runtime_handle, outcome_rx, reply);
+                }
             }
             UiRequest::HostTabReorder {
                 host,
@@ -2917,7 +3139,19 @@ impl App {
 mod tests {
     use roost_ui_model::keys::HostId;
 
+    use super::file_transfer::LostReason;
     use super::*;
+
+    /// The image seam's one gate: the env it was launched with, and
+    /// nothing about the box it is running on — see
+    /// [`image_write_refusal`] for why that is the whole policy.
+    #[test]
+    fn an_image_clipboard_write_outside_test_mode_is_not_supported() {
+        let refusal = image_write_refusal(false).expect("no test mode, no seam");
+        assert_eq!(refusal.code, "not-supported");
+        assert!(refusal.message.contains("ROOST_TEST_MODE"), "{refusal:?}");
+        assert_eq!(image_write_refusal(true), None);
+    }
 
     /// Every `HostOpError` a host-routed op can fail with, and the code
     /// plus message it puts on the UI socket (plan 044 §3.1 d6).
@@ -2995,6 +3229,300 @@ mod tests {
             "an unrecognised code would decode as `Other` and defeat the \
              point of declaring it"
         );
+    }
+
+    /// §3.4's error precedence, over every terminal outcome a gesture
+    /// has. `not-found` is absent on purpose: the arm answers that one
+    /// before a gesture exists, so it never reaches this mapping.
+    ///
+    /// Every sentence below is a literal, deliberately: this table is
+    /// where the copy is pinned, and spelling it with the constant it is
+    /// read from would pin nothing.
+    #[test]
+    fn every_gesture_outcome_maps_onto_the_send_file_error_precedence() {
+        use crate::host_conn::HostOpError;
+        use roost_ipc::client::ServerCode;
+        use roost_ui_model::file_transfer::SkipReason;
+
+        let skipped = |path: &str, reason: SkipReason| Skipped {
+            path: std::path::PathBuf::from(path),
+            reason,
+        };
+
+        let sent = send_file_outcome(GestureOutcome::Pasted {
+            text: "/files/ab/shot.png".into(),
+            uploads: vec![super::file_transfer::Sent {
+                source: SentSource::Path(std::path::PathBuf::from("/home/me/shot.png")),
+                name: "shot.png".into(),
+                path: "/files/ab/shot.png".into(),
+                bytes: 482_113,
+            }],
+            skipped: vec![skipped("/home/me/build", SkipReason::Directory)],
+        })
+        .expect("a pasted gesture is the op's success");
+        assert_eq!(sent.pasted, "/files/ab/shot.png");
+        assert_eq!(
+            sent.uploads,
+            vec![SentFile {
+                source: "/home/me/shot.png".into(),
+                name: "shot.png".into(),
+                path: "/files/ab/shot.png".into(),
+                bytes: 482_113,
+            }],
+            "`source` is the local path the caller named, `path` the host's"
+        );
+        assert_eq!(
+            sent.skipped,
+            vec![SkippedFile {
+                path: "/home/me/build".into(),
+                reason: "directory".into(),
+            }]
+        );
+
+        let lost = |reason, name: Option<&str>| GestureOutcome::Lost {
+            reason,
+            name: name.map(str::to_string),
+        };
+        for (outcome, code, message) in [
+            (
+                GestureOutcome::Refused(Refusal::Frozen),
+                "host-unavailable",
+                "that host is not accepting operations".to_string(),
+            ),
+            (
+                GestureOutcome::Refused(Refusal::Unavailable),
+                "host-unavailable",
+                "that host is not accepting operations".to_string(),
+            ),
+            // A gesture that got as far as uploading names the file it
+            // lost, exactly as its status line does.
+            (
+                lost(LostReason::Reconnected, Some("a.txt")),
+                "host-unavailable",
+                "a.txt: the host reconnected".to_string(),
+            ),
+            (
+                lost(LostReason::Disconnected, Some("a.txt")),
+                "host-unavailable",
+                "a.txt: the host disconnected".to_string(),
+            ),
+            (
+                lost(LostReason::Frozen("this session ended"), Some("a.txt")),
+                "host-unavailable",
+                "a.txt: this session ended".to_string(),
+            ),
+            (
+                lost(LostReason::TabClosed, Some("a.txt")),
+                "host-unavailable",
+                "a.txt: the tab closed before the files could be pasted".to_string(),
+            ),
+            // And one that lost before any file was its own to name
+            // says the sentence bare.
+            (
+                lost(LostReason::TabClosed, None),
+                "host-unavailable",
+                "the tab closed before the files could be pasted".to_string(),
+            ),
+            (
+                lost(LostReason::QueueFull, None),
+                "host-unavailable",
+                "too many files are waiting for this host".to_string(),
+            ),
+            (
+                lost(LostReason::Inspection, None),
+                "host-unavailable",
+                "reading the files did not finish".to_string(),
+            ),
+            (
+                lost(LostReason::Shutdown, None),
+                "host-unavailable",
+                "the app is shutting down".to_string(),
+            ),
+            // A dead link is the connection failing, not the session
+            // refusing, so it folds — and still names the file.
+            (
+                GestureOutcome::Failed {
+                    name: "a.txt".into(),
+                    error: HostOpError::Disconnected,
+                },
+                "host-unavailable",
+                "a.txt: the host disconnected before this ran".to_string(),
+            ),
+            // A session's per-file size and quota refusals are this
+            // op's own answers (§3.1), so they cross the fold as
+            // themselves rather than as `host-unavailable`.
+            (
+                GestureOutcome::Failed {
+                    name: "big.bin".into(),
+                    error: HostOpError::Rejected {
+                        code: ServerCode::TooLarge,
+                        message: "over the 10 MiB limit".into(),
+                    },
+                },
+                "too-large",
+                "big.bin: over the 10 MiB limit".to_string(),
+            ),
+            (
+                GestureOutcome::Failed {
+                    name: "big.bin".into(),
+                    error: HostOpError::Rejected {
+                        code: ServerCode::StoreFull,
+                        message: "the file store is full".into(),
+                    },
+                },
+                "store-full",
+                "big.bin: the file store is full".to_string(),
+            ),
+            // Every item skipped: nothing crossed and nothing could
+            // have, so the caller is told which path to fix.
+            (
+                GestureOutcome::Refused(Refusal::NothingUploadable(vec![
+                    skipped("/home/me/build", SkipReason::Directory),
+                    skipped("/home/me/gone.txt", SkipReason::Missing),
+                ])),
+                "invalid-param",
+                "nothing to send: /home/me/build (directory), /home/me/gone.txt (missing)"
+                    .to_string(),
+            ),
+            (
+                GestureOutcome::Refused(Refusal::Empty),
+                "invalid-param",
+                "nothing to send".to_string(),
+            ),
+            (
+                GestureOutcome::Refused(Refusal::GestureOverBudget {
+                    total: 540 * 1024 * 1024,
+                }),
+                "too-large",
+                "That drop is 540 MiB, over the 256 MiB per-drop limit".to_string(),
+            ),
+        ] {
+            let failure =
+                send_file_outcome(outcome).expect_err("every outcome but `Pasted` is a refusal");
+            assert_eq!(failure.code, code, "{}", failure.message);
+            assert_eq!(failure.message, message);
+        }
+    }
+
+    /// §3.4's precedence *before* a gesture: a host that cannot take
+    /// work outranks a path this op will not resolve, so an unknown tab
+    /// and a frozen host are not reported as bad parameters. (The
+    /// `not-found` ahead of both is the arm's own `tab_live` step.)
+    #[test]
+    fn a_refused_host_outranks_a_path_send_file_will_not_resolve() {
+        let relative = ["./shot.png".to_string()];
+        for target in [Target::Frozen, Target::Unavailable] {
+            let failure = send_file_refusal(target, &relative)
+                .expect("a host that cannot take work refuses first");
+            assert_eq!(failure.code, "host-unavailable", "{target:?}");
+            assert_eq!(
+                failure.message, "that host is not accepting operations",
+                "{target:?}"
+            );
+            assert!(
+                send_file_refusal(target, &[])
+                    .is_some_and(|failure| failure.code == "host-unavailable"),
+                "{target:?}: and outranks an empty batch too"
+            );
+        }
+
+        for target in [Target::Host, Target::Local] {
+            assert_eq!(
+                send_file_refusal(target, &[])
+                    .expect("a batch with nothing in it is a bad parameter")
+                    .message,
+                "paths must not be empty",
+                "{target:?}"
+            );
+            let failure = send_file_refusal(
+                target,
+                &[
+                    "/tmp/a.png".to_string(),
+                    "tmp/relative.png".to_string(),
+                    "./b.png".to_string(),
+                ],
+            )
+            .expect("a relative path is refused, never resolved");
+            assert_eq!(failure.code, "invalid-param", "{target:?}");
+            assert_eq!(
+                failure.message, "paths must be absolute: tmp/relative.png",
+                "{target:?}: naming the first one"
+            );
+            assert!(
+                send_file_refusal(target, &["/tmp/a.png".to_string()]).is_none(),
+                "{target:?}: an absolute batch reaches the gesture"
+            );
+        }
+    }
+
+    /// §3.4: the reply is deferred, never awaited on the winit thread —
+    /// so a request behind a running gesture is answered while that
+    /// gesture is still uploading, and out of order with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_file_reply_is_deferred_so_the_next_request_is_not_behind_it() {
+        use roost_ui_model::file_transfer::Refusal;
+
+        let runtime = tokio::runtime::Handle::current();
+
+        let (running, running_outcome) = tokio::sync::oneshot::channel();
+        let (running_reply, mut running_result) = tokio::sync::oneshot::channel();
+        defer_send_file_reply(&runtime, running_outcome, running_reply);
+        assert!(
+            matches!(
+                running_result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "a gesture that has not ended answers nothing"
+        );
+
+        // The next request, answered while the first is still running.
+        let (next, next_outcome) = tokio::sync::oneshot::channel();
+        let (next_reply, next_result) = tokio::sync::oneshot::channel();
+        defer_send_file_reply(&runtime, next_outcome, next_reply);
+        next.send(GestureOutcome::Refused(Refusal::Unavailable))
+            .expect("the deferred task holds the receiver");
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(5), next_result)
+            .await
+            .expect("the second reply must not wait for the first")
+            .expect("the deferred task answers");
+        assert_eq!(
+            answered.expect_err("an unavailable host refuses").code,
+            HOST_UNAVAILABLE
+        );
+        assert!(
+            matches!(
+                running_result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "and the first is still in flight"
+        );
+
+        running
+            .send(GestureOutcome::Pasted {
+                text: "/files/ab/a.txt".into(),
+                uploads: Vec::new(),
+                skipped: Vec::new(),
+            })
+            .expect("the deferred task holds the receiver");
+        let landed = tokio::time::timeout(std::time::Duration::from_secs(5), running_result)
+            .await
+            .expect("the gesture answers when it ends")
+            .expect("the deferred task answers")
+            .expect("a pasted gesture succeeds");
+        assert_eq!(landed.pasted, "/files/ab/a.txt");
+
+        // The arm §3.4 rules out: a gesture dropped without answering
+        // still unblocks its caller rather than hanging it forever.
+        let (dropped, dropped_outcome) = tokio::sync::oneshot::channel::<GestureOutcome>();
+        let (dropped_reply, dropped_result) = tokio::sync::oneshot::channel();
+        defer_send_file_reply(&runtime, dropped_outcome, dropped_reply);
+        drop(dropped);
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(5), dropped_result)
+            .await
+            .expect("a dropped gesture answers too")
+            .expect("the deferred task answers")
+            .expect_err("there is nothing to paste");
+        assert_eq!(failure.code, HOST_UNAVAILABLE);
     }
 
     /// The other arm of `host_reorder_op`: an incarnation this client

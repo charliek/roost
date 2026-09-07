@@ -1,0 +1,8 @@
+{
+  "id": "13",
+  "op": "tab.send_file",
+  "params": {
+    "tab": "h2.7",
+    "paths": ["/Users/charlie/Desktop/shot.png", "/Users/charlie/build"]
+  }
+}

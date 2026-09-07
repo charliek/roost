@@ -94,17 +94,27 @@ terminal from. It shares the socket path but not the framing; see
 * **Errors:** stable kebab-case codes. Current set:
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
-  `not-implemented`, `internal`, `shutting-down`, `host-unavailable`.
+  `not-implemented`, `internal`, `too-large`, `store-full`,
+  `shutting-down`, `host-unavailable`.
   Clients should treat unknown codes as fatal for the request and
-  surface `message` to the user. `host-unavailable` is
+  surface `message` to the user. `too-large` and `store-full` arrived
+  with [`session.put_file`](#sessionput_file) and are both about **one
+  file**: it is over the per-upload cap, or the host's file store has
+  no room left for it. Two codes rather than one because the remedy
+  differs — send something smaller, or restart the session to clear the
+  store — and a status line has to say which. `host-unavailable` is
   `shutting-down`'s mirror image — **UI-socket only** — and says a
   host-routed op could not reach the session it named: the connection
   is gone, died mid-op, or its queue is full. A session's own refusal
   crossing to a UI socket keeps its code when that code is one of the
-  ten above that both sockets share; a session-scoped code (including
+  twelve above that both sockets share; a session-scoped code (including
   `shutting-down`) or one a newer session invents folds onto
   `host-unavailable`, its own code and sentence kept in `message`, so a
-  UI socket never answers a code this list does not name.
+  UI socket never answers a code this list does not name. `too-large`
+  and `store-full` are deliberately on the shared side of that line
+  (`CODES_A_UI_SOCKET_ALSO_SPEAKS`, `app/servicing.rs`): folding them
+  would tell a caller the host is gone when the host is right there and
+  one file did not fit.
   `shutting-down` is **session-socket only**: once
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
@@ -308,6 +318,119 @@ test suite round-trips `0x00..0xff`). Errors `not-found` if the tab
 has no live PTY.
 
 Response: `{}`.
+
+### `tab.send_file`
+
+Send local files to a tab. On a **host** tab each one is uploaded to
+that host with [`session.put_file`](#sessionput_file) and the host paths
+are pasted; on a local tab nothing crosses a boundary and the escaped
+local paths are pasted, which is what a file drop has always done. UI
+socket only, ungated. The same function the native drop handler calls —
+the op *is* the drop, minus the window event.
+
+**Served by the iced UI only.** The Swift `Roost.app` answers
+`unknown-op`: it has no host sessions, so there is nothing to upload to,
+and this op's whole point is the crossing. (The protocol integer that
+moved for this work is `session_protocol`, which governs *session*
+sockets; the UI socket's own `protocol_version` is unchanged, so a Mac
+UI is not claiming to serve this.) The Mac fold-in is described in the
+plan's §3.7 and waits on Mac host sessions.
+
+Request:
+```json
+{"id": "13", "op": "tab.send_file", "params": {
+  "tab": "h2.7",
+  "paths": ["/Users/charlie/Desktop/shot.png", "/Users/charlie/build"]
+}}
+```
+
+Response:
+```json
+{"pasted": "/home/charlie/.cache/roost-session/files/4b9d1e7f0a3c5e21/shot.png",
+ "uploads": [{"source": "/Users/charlie/Desktop/shot.png",
+              "name": "shot.png",
+              "path": "/home/charlie/.cache/roost-session/files/4b9d1e7f0a3c5e21/shot.png",
+              "bytes": 482113}],
+ "skipped": [{"path": "/Users/charlie/build", "reason": "directory"}]}
+```
+
+`tab` takes the same spelling [`tab.focus`](#tabfocus) does — a bare
+engine id, or `h<host>.<id>` for a connected host's tab (DL-20 routing).
+`paths` must be non-empty and every entry **absolute**: a relative path
+is `invalid-param`, because the only working directory this process
+could resolve one against is the *app's*, which is not the one the
+caller typed it in. Duplicates are dropped first-seen. The paths are
+read in the **UI process's** filesystem namespace.
+
+**`skipped` is not a failure.** Each entry carries the path and one of
+five stable `reason` strings — `directory`, `missing`, `unreadable`,
+`not-regular`, `over-cap` — and the rest of the batch still goes. The
+reasons are the client planner's `SkipReason` serialized
+(`roost_ui_model::file_transfer`); they are a `String` on the wire so a
+result a client cannot decode at all is never the price of a reason it
+has no name for. `not-regular` is what a FIFO, a device node or a
+procfs entry gets: `is_file()` is the only kind that uploads, because
+everything else has a `len()` that lies.
+
+**The reply lands when the paste has been *queued* client-side** — what
+[`tab.capture_pty_input`](#tabcapture_pty_input-test-only-gated) sees.
+Not host receipt, and not agent attachment: the data plane has no
+acknowledgement and none was added for this. `uploads` is empty for a
+local tab. A gesture is **all-or-nothing for the paste**: if one upload
+fails nothing is pasted, and the files that already crossed stay on the
+host until it is swept.
+
+**Error precedence**, in order:
+
+1. `not-found` — the `tab` ref resolves to no live terminal.
+2. `host-unavailable` — the host is frozen (taken over, stopped), not
+   connected, or it disconnected, reconnected or was taken over
+   mid-gesture; also a tab closed under the gesture and an app
+   shutting down. The message names the file where there is one.
+3. `invalid-param` — an empty or relative `paths`, or a request where
+   **every** path was skipped, in which case the message lists each
+   path with its reason (`nothing to send: /tmp/build (directory)`).
+4. `too-large` / `store-full` — one file the host would not take.
+
+Be precise about `too-large`: the client preflights against the same
+`MAX_PUT_FILE_BYTES` the session enforces, so an ordinary over-cap file
+never reaches the wire — it is skipped as `over-cap`, and a request of
+nothing but such files answers **`invalid-param`**, not `too-large`.
+The host's own `too-large` is reachable only if a file *grows* between
+inspection and upload, which the upload lane catches by reading through
+`take(cap + 1)`. `too-large` is also the client's own answer to a batch
+whose regular files sum past the 256 MiB per-drop limit (`That drop is
+540 MiB, over the 256 MiB per-drop limit`) — the same judgement the host
+makes per file, made once for the gesture. `store-full` is reachable
+normally, and means what it says on
+[`session.put_file`](#sessionput_file).
+
+**Every terminal path answers.** The handler replies through a oneshot
+the gesture queue owns rather than blocking the winit thread, so the UI
+socket keeps serving other frames while a long upload runs, and a
+`roostctl` caller can never hang: a refusal, an upload timeout, a
+disconnect, a takeover, a frozen frame, a closed tab and app shutdown
+all answer. A caller that disconnects first drops its receiver and the
+gesture completes anyway.
+
+Note the shape of that concurrency. Frames on **one** connection are
+served serially — `roost-ipc`'s server awaits each handler inline per
+connection — so a caller that wants to do something else while a
+send-file is in flight opens a **second** connection. What the deferred
+reply buys is that the UI itself never stalls and other connections stay
+served.
+
+**No new security boundary**, stated the way
+[`clipboard.write`](#selection-clipboard-test-ops-selection-clipboard)
+states its own: the UI now *reads* a local file on behalf of a socket
+caller, which is new — but the socket is `0600` inside a `0700`
+directory and reachable only by the same user, and `tab.write` /
+[`tab.open`](#tabopen) already let that same caller type or run
+anything.
+
+See [`cli.md`](cli.md#tab-send-file) for `roostctl tab send-file`, and
+the [host-sessions guide](../guides/host-sessions.md#pasting-images-and-files-into-a-host-tab)
+for what the user sees.
 
 ### `tab.resize`
 
@@ -1356,7 +1479,38 @@ collapsed); the empty-state row (`"agents:empty"`) is not actionable.
 | `selection.clear` | `{"tab_id": "1"}` | Drop the active selection (no-op if none). |
 | `selection.dump` | `{"tab_id": "1"}` | Read back the selection. Response: `{"text"?: "...", "anchor_visible": bool, "cursor_visible": bool}`. `text` carries the **whole** selection, including rows scrolled out of the viewport (#249). It is omitted when no selection is active, and also when an active selection currently resolves to nothing — its rows were evicted from scrollback, or it belongs to the screen (primary/alternate) that is not on display. Those cases are reported as an *absent* `text`, never as another row's text (#334); an alt-screen one starts reporting text again once its screen is active. `anchor_visible` / `cursor_visible` stay viewport-truthful on purpose — they answer "is this endpoint on screen right now", which is a different question from what `text` contains, and the pixel-level tests rely on it; a discarded or inactive-screen endpoint reads `false`. |
 | `clipboard.dump` | `{"target": "system" \| "selection"}` | Read the host pasteboard. Response: `{"text"?: "..."}`. `system` is the ⌘V / Ctrl+V target; `selection` is the named per-app pasteboard on Mac / X11 PRIMARY on Linux. Unknown targets → `invalid-param`. |
-| `clipboard.write` | `{"target": "...", "text": "..."}` | Test-only pasteboard seeding (lets a roosttest case set a known value before asserting paste behavior). Not gated: any process on the host can already write the OS clipboard. |
+| `clipboard.write` | `{"target": "...", "text": "..."}` or `{"target": "system", "image_png": "<base64>"}` | Test-only pasteboard seeding (lets a roosttest case set a known value before asserting paste behavior). The text form is not gated: any process on the host can already write the OS clipboard. The image form is — see below. |
+
+**`clipboard.write` takes exactly one of `text` / `image_png`.** `text`
+was required until the image form existed and is optional now; both at
+once is `invalid-param` (silently preferring `text` would drop an image
+the caller believed it had written) and neither is `missing-param`.
+`image_png` exists for one reason: the host-file-paste end-to-end lanes
+need a *real* image on the clipboard, and an IPC-only harness has no
+other way to put one there. It is therefore **gated on
+`ROOST_TEST_MODE=1`** at UI launch — outside test mode it answers
+`not-supported`, the same "this seam is not here" answer a lane skips
+on. `target` must be `"system"`: PRIMARY carries text by convention and
+the paste path never probes it for an image, so a `selection` image
+write would seed a clipboard nothing reads (`invalid-param`). The PNG is
+decoded before it is written, so bytes that are not a PNG, that do not
+reduce to 8-bit RGBA, or that exceed the paste path's own 40 MP pixel
+cap are `invalid-param` too.
+
+The iced UI writes the image through `arboard`, holding one clipboard
+handle for the life of the process — X11 has no clipboard *content*,
+only an owning window, and a handle dropped at the end of the call takes
+the image with it. Under **Wayland** the write is attempted and only its
+*failure* is classified: a compositor that implements
+`wlr-data-control` (COSMIC does) works, and one that does not — the
+headless compositors the lanes run under — fails with `not-supported`
+naming [#302](https://github.com/charliek/roost/issues/302), which is a
+lane's cue to skip rather than to report a paste bug.
+
+**Mac is text only.** `Roost.app`'s handler names `target` and `text`
+and nothing else, so an `image_png` key is `unknown-field` there, and a
+request carrying neither field is `invalid-param` (a decode failure, not
+`missing-param`).
 
 `roostctl` does not surface these yet — they exist for end-to-end test
 coverage (`tools/roosttest/`) and as a stable surface a future scriptable
@@ -1603,7 +1757,7 @@ Params: `{}`. Response:
 ```json
 {
   "app_version": "0.0.18",
-  "session_protocol": 2,
+  "session_protocol": 3,
   "payload_kinds": ["ghostty-snapshot", "vt"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
@@ -1615,12 +1769,16 @@ The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
 `SESSION_PROTOCOL_VERSION` — deliberately separate from the
 request/response `protocol_version` in [`identify`](#identify), because
-the two version different things and move independently. It is **`2`**
-as of HS-1b: the bump is breaking because
-[`events.subscribe`](#eventssubscribe) and [`tab.attach`](#tabattach)
-now require a lease, and a client written against `1` subscribed with
-none. The [attach handshake](#data-plane) carries the same number and
-refuses a mismatch before it even looks at the token.
+the two version different things and move independently. It is **`3`**
+as of plan 047, which added `session.put_file`: a
+pre-047 session could only answer `unknown-op` to a file the user just
+pasted, which is not a refusal a client can act on, so the number moved
+rather than carrying a per-paste special case forever. `2` was HS-1b's
+breaking bump, because [`events.subscribe`](#eventssubscribe) and
+[`tab.attach`](#tabattach) began requiring a lease that a client written
+against `1` never presented. The [attach handshake](#data-plane) carries
+the same number and refuses a mismatch before it even looks at the
+token.
 
 `payload_kinds` names what this session can encode a tab's attach
 payload as, in no particular order; it is an **open list of strings**,
@@ -1842,6 +2000,103 @@ Served only by a session built with an install backend. A session without one an
 
 Like `session.connect`, this answers `shutting-down` once `session.stop` has latched — and it is in the latched set deliberately, because entries wired after a stop would point at a `roostctl` reporting to a socket the session is about to unlink.
 
+### `session.put_file`
+
+Land one client-supplied file on the host and answer with a path a
+shell on that host can be told to read. This is the leg underneath
+[`tab.send_file`](#tabsend_file): the client uploads each file over a
+connection of its own, then pastes the returned paths into the tab.
+Lease-gated, like every op that writes under the session user's `$HOME`.
+
+Request:
+```json
+{"id": "12", "op": "session.put_file", "params": {
+  "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+  "name": "roost-image-1757083567-8f3a1d0e5b7c42c2.png",
+  "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB…"
+}}
+```
+
+Response:
+```json
+{"path": "/home/charlie/.cache/roost-session/files/4b9d1e7f0a3c5e21/roost-image-1757083567-8f3a1d0e5b7c42c2.png",
+ "bytes": 69}
+```
+
+`data` is base64 like every other bytes field. **One frame per file, no
+chunking**: the raw cap is 10 MiB (`roost_ipc::MAX_PUT_FILE_BYTES`),
+which base64-encodes to ~13.4 MiB and still fits the 16 MiB frame with
+the envelope around it — that headroom is the whole reason the op needs
+no chunked form. Over the cap is `too-large`, checked twice: the encoded
+string's length before the typed decode (the frame and its
+`serde_json::Value` already exist by then, so what the early check
+spares is the decoded `Vec<u8>`), and the decoded length again after.
+The early check is deliberately coarse — base64 carries three bytes per
+four characters, so a file one or two bytes over encodes to exactly the
+cap's own length and is caught by the exact check instead. Both answer
+the same code.
+
+**`name` is the client's, and is never repaired.** It must be a bare
+basename: 1–128 bytes of `[A-Za-z0-9._-]`, not `.` or `..`, not starting
+with `-`. Anything else is `invalid-param` — not sanitized, not escaped,
+not quoted. The reason is the whole point of the op: the path this
+answers with is about to be **pasted bare** into an agent's composer,
+and bare is the one spelling every agent unquotes identically. A name
+that would need quoting is not a name this store can land, so the client
+sanitizes a dropped file's basename to that charset before it asks
+(`roost_ui_model::file_transfer::sanitize_name`), and a clipboard image
+keeps the `roost-image-<nanos>-<16hex>.png` shape the local paste
+already uses.
+
+**The whole returned path is paste-safe, and the client re-checks it.**
+The file lands at `<files_dir>/<16 hex chars>/<name>` (eight bytes of OS
+entropy, one directory per file); the random
+directory is what keeps two drops of one name from colliding while the
+basename survives, because the agents show that basename in their chips.
+At start the session checks its **entire** resolved `files_dir` path
+against `^/[A-Za-z0-9._/-]+$` and falls back to a `/tmp` root of its own
+if a `$HOME` or `$XDG_CACHE_HOME` put a space, a unicode character or a
+non-UTF-8 byte anywhere in it — see [`paths.md`](paths.md#session-profile).
+So the op never returns a path an agent cannot parse. The client still
+refuses to paste a reply that is not absolute, not in that grammar,
+whose final component is not exactly the `name` it sent, or whose
+`bytes` is not what it sent: a malformed or hostile reply must never
+become typed input.
+
+**The store admits, and never evicts.** One serialized `FileStore` per
+session holds a **512 MiB** admission cap
+(`roost_engine::ipc::FILE_STORE_CAP_BYTES`); accounting and directory
+allocation both happen under one lock, so two connections can never each
+be told their file fits the same remaining room. When the next file does
+not fit, the op answers `store-full` and **deletes nothing** — a path
+this op has handed back may sit unsubmitted in an agent's composer for
+an hour, and Roost removing it under the agent is exactly the bug
+eviction would have introduced. Clearing a full store means stopping or
+restarting the session. The write itself (private temp file, rename,
+`0600` under `0700` directories) runs on the blocking pool, because a
+session's cache can sit on a network mount and a stalled write must not
+take the tokio worker serving other connections with it; a write that
+fails removes the whole upload directory, so no partial file is ever
+visible under a path this op never returned.
+
+**Lifetime.** A returned path stays valid until the session stops
+cleanly or starts again. `roost-session` sweeps `files_dir` **entirely
+at start** — a crash or a `SIGKILL` leaves it behind, and the next start
+is where that gets cleaned up — and again on the clean wire-stop path,
+after the reap. The SIGTERM direct-finalize fallback does not sweep:
+its children may still be alive, and the next start sweeps anyway.
+
+`session.put_file` is in the session's **mutating** set, so a slow write
+holds the mutation barrier and a racing [`session.stop`](#sessionstop)
+waits for it. That is the accepted price of never handing back a path
+the sweep has already removed. Once a stop has latched, the op answers
+`shutting-down` like every other mutating op.
+
+Served only by a session built with a file store. One that could not
+open its root answers `not-supported` rather than refusing to start —
+the session still serves everything else. A **UI socket answers
+`unknown-op`**, like every other `session.*` op.
+
 ### `tab.attach`
 
 Negotiate a payload kind for one tab and get a single-use ticket for
@@ -2002,7 +2257,7 @@ the first line only, so a request stream can never be diverted
 mid-flight by a payload that happens to look like a handshake.
 
 ```json
-{"attach": "1a0be5c37d924f68b1c05e3a7f2d8496", "protocol_version": 2,
+{"attach": "1a0be5c37d924f68b1c05e3a7f2d8496", "protocol_version": 3,
  "resume_from_seq": 8814, "server_epoch": 6032428321756423947,
  "tab_generation": 3}
 ```
@@ -2292,10 +2547,16 @@ is the UI socket's schema version — currently **`1`**
 (`roost_ipc::PROTOCOL_VERSION`); it is reported by
 [`identify`](#identify) but nothing compares it, so the UI socket has no
 handshake gate. `session.identify.session_protocol` is the session
-sockets' — currently **`2`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
+sockets' — currently **`3`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
 covering both the session JSON ops and the binary [data
 plane](#data-plane); conforming clients check it for equality before
 anything else and the [attach handshake](#tabattach) refuses a mismatch.
+`3` is plan 047's bump for `session.put_file` — an
+additive op that moved the number anyway, under the rule stated on the
+constant: an addition bumps when a pre-bump peer could not refuse it
+meaningfully (a pre-047 session can only answer `unknown-op` to a file
+the user just pasted). The history of the integer is in
+[`session.identify`](#sessionidentify).
 
 **The consumption and compatibility policy lives in
 [`ipc-compatibility.md`](ipc-compatibility.md)** — what is additive in

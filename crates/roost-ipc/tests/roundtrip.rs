@@ -324,3 +324,61 @@ fn reorder_tab_ids_serialize_as_string_array() {
         ])
     );
 }
+
+/// The plan-047 file-transfer ops. Both vectors are decoded into the
+/// typed shapes *and* re-encoded against the fixture, so a field the
+/// struct spells differently — or a `bytes` written as a string —
+/// fails here rather than at a session's socket.
+#[test]
+fn file_transfer_vectors_decode_as_typed_params_and_results() {
+    fn vector(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/../../tests/ipc-vectors/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    }
+
+    let request = vector("session.put_file.request.json");
+    assert_eq!(request["op"], ops::SESSION_PUT_FILE);
+    let params: SessionPutFileParams =
+        serde_json::from_value(request["params"].clone()).expect("session.put_file params decode");
+    assert_eq!(params.name, "roost-image-1757083567-8f3a1d0e5b7c42c2.png");
+    assert!(params.data.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(serde_json::to_value(&params).unwrap(), request["params"]);
+
+    let response = vector("session.put_file.response.json");
+    let result: SessionPutFileResult =
+        serde_json::from_value(response["result"].clone()).expect("session.put_file result decode");
+    // The three properties the client re-checks before it pastes:
+    // absolute, in the paste-safe grammar, and named what was sent.
+    assert!(result.path.starts_with('/'));
+    assert!(result
+        .path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c)));
+    assert!(result.path.ends_with(&format!("/{}", params.name)));
+    assert_eq!(result.bytes as usize, params.data.len());
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+
+    let request = vector("tab.send_file.request.json");
+    assert_eq!(request["op"], ops::TAB_SEND_FILE);
+    let params: TabSendFileParams =
+        serde_json::from_value(request["params"].clone()).expect("tab.send_file params decode");
+    assert_eq!(params.tab, "h2.7");
+    assert!(params.paths.iter().all(|p| p.starts_with('/')));
+    assert_eq!(serde_json::to_value(&params).unwrap(), request["params"]);
+
+    let response = vector("tab.send_file.response.json");
+    let result: TabSendFileResult =
+        serde_json::from_value(response["result"].clone()).expect("tab.send_file result decode");
+    assert_eq!(result.uploads.len(), 1);
+    assert_eq!(result.uploads[0].source, params.paths[0]);
+    assert_eq!(result.uploads[0].name, "shot.png");
+    assert_eq!(result.pasted, result.uploads[0].path);
+    assert_eq!(result.skipped.len(), 1);
+    assert_eq!(result.skipped[0].path, params.paths[1]);
+    assert_eq!(result.skipped[0].reason, "directory");
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+}

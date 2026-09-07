@@ -3774,7 +3774,11 @@ mod tests {
     fn identity(app_version: &str, build: &str) -> SessionBinaryIdentity {
         SessionBinaryIdentity {
             app_version: app_version.to_string(),
-            session_protocol: 2,
+            // From the constant, not a literal: a hard-coded number
+            // silently inverts every fixture below the moment the
+            // protocol moves — after plan 047's bump to 3 the old `2`
+            // described the *stale* peer as the expected one.
+            session_protocol: crate::messages::SESSION_PROTOCOL_VERSION,
             libghostty_build: build.to_string(),
         }
     }
@@ -4775,8 +4779,11 @@ mod tests {
 
     #[test]
     fn an_identity_line_parses_and_anything_else_degrades_to_none() {
-        let line = r#"{"app_version":"0.0.19","session_protocol":2,"libghostty_build":"g+s"}"#;
-        assert_eq!(parse_identity_line(line), Some(identity("0.0.19", "g+s")));
+        let version = crate::messages::SESSION_PROTOCOL_VERSION;
+        let line = format!(
+            r#"{{"app_version":"0.0.19","session_protocol":{version},"libghostty_build":"g+s"}}"#
+        );
+        assert_eq!(parse_identity_line(&line), Some(identity("0.0.19", "g+s")));
         assert_eq!(
             parse_identity_line(&format!("{line}\n")),
             Some(identity("0.0.19", "g+s"))
@@ -4870,7 +4877,10 @@ mod tests {
         ));
 
         let mut protocol = expected.clone();
-        protocol.session_protocol = 3;
+        // Relative to the constant, so this can never quietly become
+        // "the current version is a mismatch" — which is what a literal
+        // did here when the protocol moved to 3.
+        protocol.session_protocol = crate::messages::SESSION_PROTOCOL_VERSION + 1;
         assert!(!identity_matches(&expected, &protocol));
 
         // No ordering: a newer build is not a match either.

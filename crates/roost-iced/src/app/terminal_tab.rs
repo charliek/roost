@@ -184,6 +184,29 @@ pub(super) fn attach_test_terminal(
     (tab, supervisor)
 }
 
+/// A host tab's terminal plus the test-mode tap on what it queues toward
+/// the host — [`attach_test_terminal`]'s remote twin. There is no PTY and
+/// no supervisor: a host tab's bytes leave on `input`, and the capture is
+/// what a test reads them back from.
+#[cfg(test)]
+pub(super) fn attach_test_host_terminal(
+    cols: u16,
+    rows: u16,
+    input: tokio::sync::mpsc::UnboundedSender<super::tab_backend::HostDataMsg>,
+) -> (TerminalTab, InputCapture) {
+    let handle = TabHandle::host(input, true);
+    let capture = handle.capture().cloned().expect("test-mode input capture");
+    let tab = TerminalTab::attach_host(
+        cols,
+        rows,
+        Theme::roost_dark_fallback(),
+        String::new(),
+        handle,
+    )
+    .expect("host tab terminal");
+    (tab, capture)
+}
+
 /// Accumulate one tab's PTY bytes off `rx` until `needle` shows up or
 /// the window elapses. Returns what was seen either way, so the same
 /// helper serves the positive and the negative assertion.

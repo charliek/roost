@@ -42,6 +42,7 @@ use tokio::sync::{mpsc, Notify};
 use super::mirror::{HostMirror, SharedMirror};
 use super::queue::{self, HostIntent, HostOpError, OpFault};
 use super::state::{check_compatibility, HostConnState, HostStateMachine, HostTransport};
+use super::upload::Uploads;
 use super::{HostIdMinter, HostWorkspaceEvent};
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 
@@ -80,7 +81,7 @@ impl Shutdown {
     ///
     /// The flag is read *before* parking, so a signal raised in the
     /// window between the two is seen rather than slept through.
-    async fn requested(&self) {
+    pub(super) async fn requested(&self) {
         while !self.requested.load(Ordering::Acquire) {
             self.wake.notified().await;
         }
@@ -134,6 +135,10 @@ pub(crate) struct ConnectionConfig {
     /// The client's terminal palette, re-read on every (re)connect so a
     /// theme changed while disconnected is the one the session gets.
     pub(crate) theme: Arc<Mutex<OscColorsParams>>,
+    /// The UI's handle on this host's upload lane. Filled at every
+    /// `Connected` edge and emptied on every way out of one — see
+    /// [`Uploads::open`] and [`serve`].
+    pub(crate) uploads: Uploads,
 }
 
 /// The scale every budget in this module is stretched by, read once.
@@ -527,6 +532,18 @@ async fn connect_loop(
                 {
                     ConnEnd::FeedClosed
                 } else {
+                    // The upload lane opens with the incarnation and
+                    // closes with it. The guard is what carries "every
+                    // exit from `Connected`" (plan 047 §3.3): every
+                    // `ConnEnd` arm below, an explicit reconnect and a
+                    // `HostConn::drop` (both of which signal `shutdown`,
+                    // which `serve` returns on), and the whole loop's
+                    // future being dropped by [`run`]'s grace timer —
+                    // that last one runs no code, which is why this is a
+                    // `Drop` and not a line after the `await`.
+                    let _lane = config
+                        .uploads
+                        .open(config.socket.clone(), live.lease.clone());
                     serve(
                         config,
                         incarnation,
@@ -1227,6 +1244,20 @@ mod tests {
         SharedMirror::new(HostMirror::from_list(seeded_list(Some(revision)), revision))
     }
 
+    /// The `session.identify` result every fake session in this module
+    /// answers with — the one shape that clears the compatibility gate
+    /// against the build [`config`] claims.
+    fn identify_result() -> serde_json::Value {
+        serde_json::json!({
+            "app_version": "test",
+            "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+            "payload_kinds": [super::super::state::REQUIRED_PAYLOAD_KIND],
+            "libghostty_build": "gb",
+            "session_id": "s1",
+            "started_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
     fn settled(error: &AttemptError) -> (&str, &str) {
         match error {
             AttemptError::Unrecoverable { reason, detail } => (reason.as_str(), detail.as_str()),
@@ -1483,6 +1514,7 @@ mod tests {
             held_lease: None,
             client_build: "gb".into(),
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
+            uploads: Uploads::default(),
         }
     }
 
@@ -1676,19 +1708,9 @@ mod tests {
                         serde_json::from_str(&line).expect("a request");
                     let id = request["id"].clone();
                     let response = match request["op"].as_str().unwrap_or_default() {
-                        ops::SESSION_IDENTIFY => serde_json::json!({
-                            "id": id,
-                            "ok": true,
-                            "result": {
-                                "app_version": "test",
-                                "session_protocol":
-                                    roost_ipc::messages::SESSION_PROTOCOL_VERSION,
-                                "payload_kinds": [super::super::state::REQUIRED_PAYLOAD_KIND],
-                                "libghostty_build": "gb",
-                                "session_id": "s1",
-                                "started_at": "2026-01-01T00:00:00Z",
-                            },
-                        }),
+                        ops::SESSION_IDENTIFY => {
+                            serde_json::json!({"id": id, "ok": true, "result": identify_result()})
+                        }
                         ops::SESSION_CONNECT => serde_json::json!({
                             "id": id,
                             "ok": true,
@@ -2101,15 +2123,7 @@ mod tests {
                             ops::SESSION_IDENTIFY => serde_json::json!({
                                 "id": id,
                                 "ok": true,
-                                "result": {
-                                    "app_version": "test",
-                                    "session_protocol":
-                                        roost_ipc::messages::SESSION_PROTOCOL_VERSION,
-                                    "payload_kinds": [super::super::state::REQUIRED_PAYLOAD_KIND],
-                                    "libghostty_build": "gb",
-                                    "session_id": "s1",
-                                    "started_at": "2026-01-01T00:00:00Z",
-                                },
+                                "result": identify_result(),
                             }),
                             ops::SESSION_CONNECT => serde_json::json!({
                                 "id": id,
@@ -2299,5 +2313,637 @@ mod tests {
     fn the_agent_hooks_op_gets_its_own_budget() {
         assert!(op_budget(ops::SESSION_SET_AGENT_HOOKS) > op_budget(ops::TAB_LIST));
         assert_eq!(op_budget(ops::TAB_LIST), leg());
+    }
+
+    // ---- the upload lane (plan 047 §3.3) -------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    use roost_ipc::messages::{SessionPutFileParams, SessionPutFileResult};
+    use tokio::sync::oneshot;
+
+    use super::super::upload::{UploadSource, Uploads};
+
+    /// Where [`Fake`] claims to have landed a file — the shape §3.1
+    /// pins, all of it inside the paste-safe grammar.
+    const FILES_ROOT: &str = "/home/c/.cache/roost-session/files/4b9d1e7f0a3c5e21";
+
+    /// How [`Fake`] answers `session.put_file`.
+    #[derive(Clone)]
+    enum PutFile {
+        /// Land it under [`FILES_ROOT`] and answer honestly.
+        Land,
+        /// Read the first `n` frames and never answer them; land the
+        /// rest. `usize::MAX` is "never answer anything".
+        HoldFirst(usize),
+        /// Answer with this, whatever was sent.
+        Reply(SessionPutFileResult),
+        /// Refuse with this code.
+        Refuse(&'static str),
+    }
+
+    /// A session that serves the whole prologue, scripts
+    /// `session.put_file`, and can hold one control op unanswered or cut
+    /// its event stream on cue.
+    ///
+    /// Every connection is served by its own task, which is the point:
+    /// an upload dials the socket afresh, so the stall below holds the
+    /// *control* connection and nothing else.
+    #[derive(Clone)]
+    struct Fake {
+        put_file: PutFile,
+        /// A control op this session reads and does not answer until
+        /// [`Self::release`] is signalled.
+        stall: Option<&'static str>,
+        release: Arc<Shutdown>,
+        /// Raised once the stalled op has been read.
+        stalled: Arc<Shutdown>,
+        /// Raised once a `session.put_file` frame has been read.
+        uploading: Arc<Shutdown>,
+        /// Close a subscribed connection when this is signalled, at most
+        /// `cuts` times — the signal is level-triggered, so a reconnect
+        /// must not be cut by the same one.
+        cut: Arc<Shutdown>,
+        cuts: Arc<AtomicUsize>,
+        puts: Arc<AtomicUsize>,
+        dials: Arc<AtomicUsize>,
+    }
+
+    impl Fake {
+        fn new(put_file: PutFile) -> Fake {
+            Fake {
+                put_file,
+                stall: None,
+                release: Arc::new(Shutdown::default()),
+                stalled: Arc::new(Shutdown::default()),
+                uploading: Arc::new(Shutdown::default()),
+                cut: Arc::new(Shutdown::default()),
+                cuts: Arc::new(AtomicUsize::new(0)),
+                puts: Arc::new(AtomicUsize::new(0)),
+                dials: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn stalling(mut self, op: &'static str) -> Fake {
+            self.stall = Some(op);
+            self
+        }
+
+        fn cutting(self, times: usize) -> Fake {
+            self.cuts.store(times, Ordering::Release);
+            self
+        }
+
+        fn serve(&self, socket: &Path) {
+            let listener = tokio::net::UnixListener::bind(socket).expect("bind a fake session");
+            let fake = self.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    fake.dials.fetch_add(1, Ordering::AcqRel);
+                    tokio::spawn(fake.clone().connection(stream));
+                }
+            });
+        }
+
+        async fn connection(self, stream: tokio::net::UnixStream) {
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reader));
+            let mut subscribed = false;
+            loop {
+                let line = tokio::select! {
+                    () = self.cut.requested(),
+                        if subscribed && self.cuts.load(Ordering::Acquire) > 0 =>
+                    {
+                        self.cuts.fetch_sub(1, Ordering::AcqRel);
+                        return;
+                    }
+                    line = lines.next_line() => match line {
+                        Ok(Some(line)) => line,
+                        _ => return,
+                    },
+                };
+                let request: serde_json::Value = serde_json::from_str(&line).expect("a request");
+                let id = request["id"].clone();
+                let op = request["op"].as_str().unwrap_or_default().to_string();
+                if self.stall == Some(op.as_str()) {
+                    self.stalled.request();
+                    self.release.requested().await;
+                }
+                let response = match op.as_str() {
+                    ops::SESSION_IDENTIFY => {
+                        serde_json::json!({"id": id, "ok": true, "result": identify_result()})
+                    }
+                    ops::SESSION_CONNECT => serde_json::json!({
+                        "id": id,
+                        "ok": true,
+                        "result": { "lease": "the-lease", "revision": 1 },
+                    }),
+                    ops::TAB_LIST => serde_json::json!({
+                        "id": id,
+                        "ok": true,
+                        "result": seeded_list(Some(1)),
+                    }),
+                    ops::EVENTS_SUBSCRIBE => {
+                        subscribed = true;
+                        serde_json::json!({"id": id, "ok": true, "result": {"revision": 1}})
+                    }
+                    ops::SESSION_PUT_FILE => match self.put_file(&request, &id).await {
+                        Some(response) => response,
+                        None => return,
+                    },
+                    _ => serde_json::json!({"id": id, "ok": true, "result": {}}),
+                };
+                let mut body = serde_json::to_vec(&response).expect("encode a response");
+                body.push(b'\n');
+                if tokio::io::AsyncWriteExt::write_all(&mut writer, &body)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        /// The scripted answer, or `None` for one this session keeps.
+        async fn put_file(
+            &self,
+            request: &serde_json::Value,
+            id: &serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            let params: SessionPutFileParams =
+                serde_json::from_value(request["params"].clone()).expect("put_file params");
+            assert_eq!(params.lease, "the-lease", "an upload presents the lease");
+            let nth = self.puts.fetch_add(1, Ordering::AcqRel);
+            self.uploading.request();
+            let result = match &self.put_file {
+                PutFile::Land => SessionPutFileResult {
+                    path: format!("{FILES_ROOT}/{}", params.name),
+                    bytes: params.data.len() as u64,
+                },
+                PutFile::HoldFirst(held) if nth < *held => {
+                    // Read and never answer. The client's own budget is
+                    // the only thing that ends this.
+                    std::future::pending::<()>().await;
+                    unreachable!("pending never resolves")
+                }
+                PutFile::HoldFirst(_) => SessionPutFileResult {
+                    path: format!("{FILES_ROOT}/{}", params.name),
+                    bytes: params.data.len() as u64,
+                },
+                PutFile::Reply(reply) => reply.clone(),
+                PutFile::Refuse(code) => {
+                    return Some(serde_json::json!({
+                        "id": id,
+                        "ok": false,
+                        "error": { "code": code, "message": "refused" },
+                    }))
+                }
+            };
+            Some(serde_json::json!({"id": id, "ok": true, "result": result}))
+        }
+    }
+
+    /// Wait for a fake session's cue, or fail the test rather than hang.
+    async fn cued(signal: &Shutdown, what: &str) {
+        tokio::time::timeout(Duration::from_secs(10), signal.requested())
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    /// Every host state the task has published, drained as it goes.
+    #[derive(Default)]
+    struct States(Vec<HostConnState>);
+
+    impl States {
+        fn drain(&mut self, rx: &mut crate::engine_feed::EngineFeedReceiver) {
+            for item in feed_items(rx) {
+                if let EngineFeed::HostState(_, state) = item {
+                    self.0.push(state);
+                }
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.0.iter().filter(|state| state.is_connected()).count()
+        }
+
+        fn last(&self) -> &HostConnState {
+            self.0.last().expect("a task publishes at least one state")
+        }
+
+        /// Poll the feed until the task has connected `nth` times.
+        async fn until_connected(
+            &mut self,
+            rx: &mut crate::engine_feed::EngineFeedReceiver,
+            nth: usize,
+        ) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    self.drain(rx);
+                    if self.connections() >= nth {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the fake session connects");
+        }
+    }
+
+    /// One connected task against `fake`, and the handles a test drives
+    /// it with.
+    struct Connected {
+        ops: super::super::HostOps,
+        shutdown: Arc<Shutdown>,
+        task: tokio::task::JoinHandle<()>,
+        feed: crate::engine_feed::EngineFeedReceiver,
+        states: States,
+    }
+
+    impl Connected {
+        async fn start(socket: PathBuf, transport: HostTransport) -> Connected {
+            let (ops, ops_rx) = super::super::HostOps::channel();
+            let mut config = config(socket, transport, ConnectMode::Dial);
+            config.uploads = ops.uploads();
+            let (feed, mut rx) = crate::engine_feed::channel();
+            let shutdown = Arc::new(Shutdown::default());
+            let task = tokio::spawn(run(
+                config,
+                HostIdMinter::new(),
+                ops_rx,
+                feed,
+                Arc::clone(&shutdown),
+            ));
+            let mut states = States::default();
+            states.until_connected(&mut rx, 1).await;
+            Connected {
+                ops,
+                shutdown,
+                task,
+                feed: rx,
+                states,
+            }
+        }
+
+        fn upload(
+            &self,
+            name: &str,
+        ) -> oneshot::Receiver<Result<SessionPutFileResult, HostOpError>> {
+            self.ops
+                .uploads()
+                .enqueue(name.into(), UploadSource::Bytes(b"png".to_vec()))
+                .expect("a connected host admits an upload")
+        }
+
+        async fn stop(mut self) -> States {
+            self.shutdown.request();
+            tokio::time::timeout(Duration::from_secs(10), self.task)
+                .await
+                .expect("the task ends")
+                .expect("and does not panic");
+            self.states.drain(&mut self.feed);
+            self.states
+        }
+    }
+
+    /// **The W3 criterion.** An upload is admitted and completes while
+    /// the control leg is stalled on an op the session never answers —
+    /// and the control leg is exactly where it was, so releasing it
+    /// answers, and the next op round-trips.
+    ///
+    /// This is the whole reason uploads are not intents: the connection
+    /// loop awaits each control call inline, so an upload queued behind
+    /// one could not even be *received*, let alone run.
+    #[tokio::test]
+    async fn an_upload_runs_while_the_control_leg_is_stalled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("stalled.sock");
+        let fake = Fake::new(PutFile::Land).stalling(ops::TAB_OPEN);
+        fake.serve(&socket);
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        // Wedge the control leg first, so the upload has to be admitted
+        // and run past a loop that is mid-`await`.
+        let stalled = tokio::spawn(host.ops.call(ops::TAB_OPEN, serde_json::json!({}), false));
+        cued(&fake.stalled, "the session read the control op").await;
+
+        let landed = tokio::time::timeout(
+            Duration::from_secs(10),
+            host.ops
+                .put_file("shot.png".into(), UploadSource::Bytes(b"png".to_vec())),
+        )
+        .await
+        .expect("an upload must not wait on the control leg")
+        .expect("and the fake session lands it");
+        assert_eq!(landed.path, format!("{FILES_ROOT}/shot.png"));
+        assert_eq!(landed.bytes, 3);
+
+        // Nothing about the control leg moved: it is still waiting for
+        // its answer, and it takes one.
+        fake.release.request();
+        assert!(tokio::time::timeout(Duration::from_secs(10), stalled)
+            .await
+            .expect("the released op answers")
+            .expect("and its task does not panic")
+            .is_ok());
+        assert!(tokio::time::timeout(
+            Duration::from_secs(10),
+            host.ops
+                .call(ops::SESSION_SET_FOCUS, serde_json::json!({}), true)
+        )
+        .await
+        .expect("and the queue keeps draining afterwards")
+        .is_ok());
+
+        let states = host.stop().await;
+        assert_eq!(states.connections(), 1, "one incarnation throughout");
+    }
+
+    /// An upload the session never answers spends its own budget and
+    /// nothing else's: the host is still `Connected` afterwards.
+    ///
+    /// The clock is paused once the frame has reached the session, so
+    /// the ~30 s budget is spent in virtual time — and the elapsed
+    /// virtual time is asserted, which is what tells this budget from
+    /// the 10 s control leg's.
+    #[tokio::test]
+    async fn a_never_answered_upload_times_out_without_touching_the_host() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("held.sock");
+        let fake = Fake::new(PutFile::HoldFirst(usize::MAX));
+        fake.serve(&socket);
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        let waiting = host.upload("shot.png");
+        cued(&fake.uploading, "the session read the upload").await;
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let answered = waiting.await.expect("answered, not dropped");
+        let spent = started.elapsed();
+
+        let budget = super::super::upload::budget(3);
+        assert!(
+            matches!(&answered, Err(HostOpError::Transport(reason))
+                if reason.contains(ops::SESSION_PUT_FILE) && reason.contains("timed out")),
+            "{answered:?}"
+        );
+        // The window absorbs the timer's millisecond granularity and the
+        // real time between arming the budget and pausing the clock; it
+        // is nowhere near wide enough to admit the 10 s control leg.
+        assert!(
+            spent + Duration::from_secs(5) >= budget && spent <= budget + Duration::from_secs(1),
+            "the upload's own budget, not the control leg's: {spent:?} of {budget:?}"
+        );
+
+        host.states.drain(&mut host.feed);
+        assert!(
+            host.states.last().is_connected(),
+            "a timed-out upload is not a dropped host: {:?}",
+            host.states.last()
+        );
+    }
+
+    /// An upload in flight when the connection drops is **answered** —
+    /// `Ok(Err(Disconnected))` on the raw receiver, not a sender dropped
+    /// with the subtask — and the lane is closed behind it.
+    #[tokio::test]
+    async fn an_upload_in_flight_when_the_connection_drops_is_answered() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("cut.sock");
+        // Unix-socket + dial: a dropped connection ends the task instead
+        // of retrying, so the lane's own cancellation is the only thing
+        // that can answer this upload.
+        let fake = Fake::new(PutFile::HoldFirst(usize::MAX)).cutting(1);
+        fake.serve(&socket);
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        let waiting = host.upload("shot.png");
+        cued(&fake.uploading, "the session read the upload").await;
+        fake.cut.request();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waiting)
+                .await
+                .expect("an upload must not outlive its incarnation unanswered"),
+            Ok(Err(HostOpError::Disconnected)),
+            "answered, rather than dropped with its reply channel"
+        );
+        assert_eq!(
+            host.ops
+                .uploads()
+                .enqueue("late.png".into(), UploadSource::Bytes(vec![1]))
+                .err(),
+            Some(HostOpError::Disconnected),
+            "and the lane closed with the incarnation"
+        );
+        host.stop().await;
+    }
+
+    /// The same, through a **reconnect**: the old incarnation's upload is
+    /// answered as its lane closes, and the new incarnation opens one of
+    /// its own that works.
+    ///
+    /// An explicit reconnect is the same shape one rung up — the app
+    /// drops the `HostConn`, which signals the task below.
+    #[tokio::test]
+    async fn a_reconnect_answers_the_old_upload_and_opens_a_new_lane() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("reconnect.sock");
+        // Localhost, so the drop is retried by this same task and the
+        // second incarnation is what serves the upload below.
+        let fake = Fake::new(PutFile::HoldFirst(1)).cutting(1);
+        fake.serve(&socket);
+        let mut host = Connected::start(socket, HostTransport::LocalSession).await;
+
+        let waiting = host.upload("first.png");
+        cued(&fake.uploading, "the session read the upload").await;
+        fake.cut.request();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waiting)
+                .await
+                .expect("the old incarnation answers before it goes"),
+            Ok(Err(HostOpError::Disconnected))
+        );
+
+        host.states.until_connected(&mut host.feed, 2).await;
+        let landed = tokio::time::timeout(
+            Duration::from_secs(10),
+            host.ops
+                .put_file("second.png".into(), UploadSource::Bytes(b"png".to_vec())),
+        )
+        .await
+        .expect("the new incarnation has a lane of its own")
+        .expect("and it works");
+        assert_eq!(landed.path, format!("{FILES_ROOT}/second.png"));
+
+        let states = host.stop().await;
+        assert_eq!(states.connections(), 2, "two incarnations, two lanes");
+    }
+
+    /// `HostConn::drop` signals the task's shutdown — quitting, removing
+    /// the host, or an explicit reconnect replacing the connection. An
+    /// upload in flight when that happens is answered too.
+    #[tokio::test]
+    async fn an_upload_in_flight_when_the_host_is_dropped_is_answered() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("dropped.sock");
+        let fake = Fake::new(PutFile::HoldFirst(usize::MAX));
+        fake.serve(&socket);
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        let waiting = host.upload("shot.png");
+        cued(&fake.uploading, "the session read the upload").await;
+        // Exactly what `HostConn::drop` does.
+        host.shutdown.request();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waiting)
+                .await
+                .expect("a detached upload must not outlive the app"),
+            Ok(Err(HostOpError::Disconnected))
+        );
+        host.stop().await;
+    }
+
+    /// The lane's guard is what carries the one exit that runs no code
+    /// in the connection task — [`run`]'s grace timer dropping the whole
+    /// loop's future. Both halves are answered: the uploads in flight
+    /// and the ones still queued behind them.
+    #[tokio::test]
+    async fn dropping_the_lane_answers_what_is_running_and_what_is_queued() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("lane.sock");
+        let fake = Fake::new(PutFile::HoldFirst(usize::MAX));
+        fake.serve(&socket);
+
+        let uploads = Uploads::default();
+        let lane = uploads.open(socket, "the-lease".into());
+        // Two more than run at once, so half of these are still on the
+        // channel when the lane closes.
+        let waiting: Vec<_> = (0..4)
+            .map(|nth| {
+                uploads
+                    .enqueue(format!("{nth}.png"), UploadSource::Bytes(b"png".to_vec()))
+                    .expect("the lane is open")
+            })
+            .collect();
+        cued(&fake.uploading, "the session read an upload").await;
+
+        drop(lane);
+
+        for reply in waiting {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), reply)
+                    .await
+                    .expect("every upload is answered, running or queued"),
+                Ok(Err(HostOpError::Disconnected))
+            );
+        }
+    }
+
+    /// A takeover reaches the upload as that upload's refusal, with the
+    /// code intact. What it means for the *host* is not this lane's
+    /// call — the control connection decides that, and here it was never
+    /// told anything.
+    #[tokio::test]
+    async fn a_takeover_mid_upload_refuses_the_upload_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("taken.sock");
+        let fake = Fake::new(PutFile::Refuse("taken-over"));
+        fake.serve(&socket);
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        let refused = tokio::time::timeout(Duration::from_secs(10), host.upload("shot.png"))
+            .await
+            .expect("the refusal comes back")
+            .expect("answered");
+        assert_eq!(
+            refused,
+            Err(HostOpError::Rejected {
+                code: ServerCode::TakenOver,
+                message: "refused".into()
+            })
+        );
+
+        host.states.drain(&mut host.feed);
+        assert!(
+            host.states.last().is_connected(),
+            "the upload lane never moves the host's state: {:?}",
+            host.states.last()
+        );
+        host.stop().await;
+    }
+
+    /// The reply re-check is really on the path, not just unit-tested:
+    /// a session that answers with somebody else's file name is refused
+    /// rather than pasted.
+    #[tokio::test]
+    async fn a_hostile_reply_is_refused_on_the_wire() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("hostile.sock");
+        let fake = Fake::new(PutFile::Reply(SessionPutFileResult {
+            path: format!("{FILES_ROOT}/other.png"),
+            bytes: 3,
+        }));
+        fake.serve(&socket);
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        let refused = tokio::time::timeout(Duration::from_secs(10), host.upload("shot.png"))
+            .await
+            .expect("the reply comes back")
+            .expect("answered");
+        let Err(HostOpError::Local(message)) = refused else {
+            panic!("a reply the client cannot use is its own refusal, got {refused:?}");
+        };
+        assert!(message.contains("a different file name"), "{message}");
+
+        host.states.drain(&mut host.feed);
+        assert!(host.states.last().is_connected());
+        host.stop().await;
+    }
+
+    /// A file that grew past the cap since it was inspected is refused
+    /// **before anything is dialed** — the read is capped at one byte
+    /// past the limit, and the session never hears about it.
+    #[tokio::test]
+    async fn a_file_over_the_cap_is_refused_before_any_dial() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("never-dialed.sock");
+        let fake = Fake::new(PutFile::Land);
+        fake.serve(&socket);
+
+        let grown = dir.path().join("grown.png");
+        std::fs::write(
+            &grown,
+            vec![0u8; roost_ipc::messages::MAX_PUT_FILE_BYTES as usize + 1],
+        )
+        .expect("write an over-cap file");
+
+        let uploads = Uploads::default();
+        let _lane = uploads.open(socket, "the-lease".into());
+        let refused = uploads
+            .enqueue("grown.png".into(), UploadSource::Path(grown))
+            .expect("the lane admits it; the read is what refuses");
+        let refused = tokio::time::timeout(Duration::from_secs(10), refused)
+            .await
+            .expect("the refusal comes back")
+            .expect("answered");
+        assert!(
+            matches!(
+                &refused,
+                Err(HostOpError::Rejected {
+                    code: ServerCode::TooLarge,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            fake.dials.load(Ordering::Acquire),
+            0,
+            "an over-cap file never reaches the wire"
+        );
     }
 }

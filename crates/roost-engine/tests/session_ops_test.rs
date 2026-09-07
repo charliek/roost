@@ -125,6 +125,7 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
         ops::SESSION_STOP,
         ops::SESSION_SET_FOCUS,
         ops::SESSION_SET_AGENT_HOOKS,
+        ops::SESSION_PUT_FILE,
     ] {
         let err = call(&f.handler, op, serde_json::json!({}))
             .await
@@ -165,6 +166,38 @@ async fn a_session_socket_does_not_know_the_host_ops() {
         f.workspace.hosts().is_empty(),
         "no shadow registry entry may have been created"
     );
+}
+
+/// `tab.send_file` is a UI-socket op (plan 047 §3.4): the files are the
+/// UI process's to read and the paste is its tab to type. A session
+/// daemon has no UI, so it refuses — but as `invalid-param`, the same
+/// answer a host-qualified `tab.focus` gives a UI-less handler, not
+/// `unknown-op`.
+///
+/// The `unknown-op` list above it is deliberately not extended: that
+/// list exists for the *host registry*, which a daemon must not grow a
+/// shadow copy of. `tab.send_file` writes nothing anywhere without a
+/// UI, so the honest refusal is the one that names what is missing —
+/// and it is the same refusal every other UI-only op gives on this
+/// socket, rather than a second convention for one op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_socket_cannot_send_files_into_a_tab() {
+    for with_session in [true, false] {
+        let f = fixture(with_session);
+        let err = call(
+            &f.handler,
+            ops::TAB_SEND_FILE,
+            serde_json::json!({"tab": "7", "paths": ["/tmp/a.txt"]}),
+        )
+        .await
+        .expect_err("no UI, no send");
+        assert_eq!(err.code, "invalid-param", "with_session={with_session}");
+        assert!(
+            err.message.contains("needs a UI"),
+            "with_session={with_session}: {}",
+            err.message
+        );
+    }
 }
 
 /// A session's tab ids are one bare id-space; the `h<host>.<id>` wire
@@ -291,6 +324,23 @@ async fn session_stop_reaps_latches_and_finalizes() {
     )
     .await
     .expect_err("session.set_agent_hooks after stop");
+    assert_eq!(err.code, "shutting-down");
+
+    // Same latch again, and the latch wins over every other answer this
+    // op has: the store this would write into is swept by the tail that
+    // is already running, so a path handed back now points at nothing.
+    // (`not-supported` — this fixture has no store — must not win.)
+    let err = call(
+        &f.handler,
+        ops::SESSION_PUT_FILE,
+        serde_json::json!({
+            "lease": "0".repeat(32),
+            "name": "shot.png",
+            "data": "aGVsbG8=",
+        }),
+    )
+    .await
+    .expect_err("session.put_file after stop");
     assert_eq!(err.code, "shutting-down");
 
     // Idempotent-reject: a second stop gets the same answer, and never

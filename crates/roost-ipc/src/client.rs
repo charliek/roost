@@ -609,8 +609,18 @@ pub enum ServerCode {
     InvalidToken,
     /// The terminal could not be encoded right now. Re-attach.
     SnapshotFailed,
-    /// This socket serves no data connections (a UI socket).
+    /// This socket serves no data connections (a UI socket), or the
+    /// session was built without the store `session.put_file` needs.
     NotSupported,
+    // -- file transfer -----------------------------------------------------
+    /// One file is over `MAX_PUT_FILE_BYTES`. Distinct from
+    /// [`StoreFull`](Self::StoreFull) because the two say different
+    /// things to a user: this one is "over 10 MiB".
+    TooLarge,
+    /// The host's file store has no room for the next file. Nothing was
+    /// deleted to make room — a path already handed out stays valid —
+    /// so the way out is restarting the session.
+    StoreFull,
     // -- data-plane stream faults ----------------------------------------
     /// A gap or duplicate `seq`, a lagged tee, a blown attach budget.
     /// Re-attach.
@@ -656,6 +666,8 @@ impl ServerCode {
             "invalid-token" => ServerCode::InvalidToken,
             "snapshot-failed" => ServerCode::SnapshotFailed,
             "not-supported" => ServerCode::NotSupported,
+            "too-large" => ServerCode::TooLarge,
+            "store-full" => ServerCode::StoreFull,
             "desync" => ServerCode::Desync,
             "overflow" => ServerCode::Overflow,
             "superseded" => ServerCode::Superseded,
@@ -686,6 +698,8 @@ impl ServerCode {
             ServerCode::InvalidToken => "invalid-token",
             ServerCode::SnapshotFailed => "snapshot-failed",
             ServerCode::NotSupported => "not-supported",
+            ServerCode::TooLarge => "too-large",
+            ServerCode::StoreFull => "store-full",
             ServerCode::Desync => "desync",
             ServerCode::Overflow => "overflow",
             ServerCode::Superseded => "superseded",
@@ -781,6 +795,8 @@ mod tests {
             "invalid-token",
             "snapshot-failed",
             "not-supported",
+            "too-large",
+            "store-full",
             "desync",
             "overflow",
             "superseded",

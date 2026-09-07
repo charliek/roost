@@ -60,6 +60,18 @@ pub struct SessionConfig {
     /// Directory the user launched from, captured before the daemon
     /// `chdir`'d to `/`. Seeds the first project on an empty state file.
     pub launch_cwd: PathBuf,
+    /// Where `session.put_file` lands what a client uploads, swept at
+    /// every start and every clean stop.
+    ///
+    /// `None` when no cache path could be resolved at all — the session
+    /// still serves, and the op answers `not-supported`. A field rather
+    /// than a profile lookup inside `serve` so the integration tests can
+    /// point a session at a tempdir instead of the developer's cache.
+    pub files_dir: Option<PathBuf>,
+    /// Where the store goes instead when `files_dir` cannot be pasted
+    /// bare — [`BundleProfile::files_dir_fallback`] in production, a
+    /// tempdir in tests.
+    pub files_fallback: PathBuf,
     /// Whether this session serves the test-mode op set
     /// (`tab.feed_pty_bytes`, `tab.capture_pty_input`) and keeps the
     /// input-capture buffer.
@@ -95,12 +107,25 @@ impl SessionConfig {
     /// The shipped configuration for a profile.
     pub fn from_profile(profile: &BundleProfile, launch_cwd: PathBuf) -> Self {
         let (test_mode, fake_libghostty_build) = identity::test_mode_env();
+        let files_dir = match profile.files_dir() {
+            Ok(dir) => Some(dir),
+            // Handled, not propagated: the only way this fails is a
+            // process with no home to hang a cache off, and that is a
+            // session without `session.put_file`, not a session that
+            // refuses to start.
+            Err(error) => {
+                warn!(%error, "no file-store path resolved; session.put_file will answer not-supported");
+                None
+            }
+        };
         Self {
             socket_path: profile.socket_path.clone(),
             state_path: profile.state_json_path(),
             app_label: profile.app_label.to_string(),
             app_id: profile.app_id.to_string(),
             launch_cwd,
+            files_dir,
+            files_fallback: profile.files_dir_fallback(),
             test_mode,
             fake_libghostty_build,
         }
@@ -197,21 +222,55 @@ pub async fn serve(
         "host session starting"
     );
 
+    // Opened before the handler is built, because the root it settled
+    // on — which is not always the one that was configured — is also
+    // what the clean stop sweeps.
+    //
+    // On the blocking pool like the writes and the stop sweep: the start
+    // sweep walks and removes whatever a crash left, and `$HOME` can be
+    // a network mount.
+    let file_store = match config.files_dir.clone() {
+        Some(dir) => {
+            let fallback = config.files_fallback.clone();
+            let opened =
+                tokio::task::spawn_blocking(move || crate::files::open_store(&dir, &fallback))
+                    .await
+                    .unwrap_or_else(|join| {
+                        Err(anyhow::anyhow!("the file-store open task failed: {join}"))
+                    });
+            match opened {
+                Ok(store) => Some(store),
+                // A session that cannot land files still serves
+                // everything else; the op answers `not-supported`
+                // (plan 047 §3.1).
+                Err(error) => {
+                    error!(%error, "no file store; session.put_file will answer not-supported");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let files_root = file_store.as_ref().map(|store| store.root().to_path_buf());
+
     // Never `.with_ui`: there is no main thread to hop to, and the
     // UI-only ops answer `internal: no UI attached` for exactly that
     // reason.
-    let handler = IpcHandler::new(
+    let mut handler = IpcHandler::new(
         Arc::clone(&workspace),
         supervisor,
         config.socket_path.clone(),
         config.app_label.clone(),
         config.app_id.clone(),
     )
-    .with_session(session, stop_handle(&stop))
+    .with_session(session, stop_handle(&stop, files_root))
     // The install engine lives on this side of the seam and only this
     // side: `roost-engine` decodes and lease-gates the op, the daemon
     // owns the `$HOME` it writes (plan 046 §3.4).
     .with_agent_hooks(crate::agent_hooks::handle());
+    if let Some(store) = file_store {
+        handler = handler.with_file_store(store);
+    }
 
     let server = IpcServer::bind(&config.socket_path, handler)
         .await
@@ -348,12 +407,38 @@ fn take<T>(slot: &Mutex<Option<T>>) -> Option<T> {
         .take()
 }
 
-fn stop_handle(stop: &Arc<StopState>) -> StopHandle {
+fn stop_handle(stop: &Arc<StopState>, files_root: Option<PathBuf>) -> StopHandle {
     let stop = Arc::clone(stop);
     StopHandle::new(move || {
         let stop = Arc::clone(&stop);
-        async move { stop.finalize() }
+        let files_root = files_root.clone();
+        async move { run_stop(&stop, files_root).await }
     })
+}
+
+/// The clean stop, in order: sweep the file store, then run the process
+/// tail.
+///
+/// The sweep is here and **not** in [`StopState::finalize`] on purpose.
+/// This runs only on the wire path, after the engine has drained the
+/// mutation barrier and reaped every child, so nothing can be mid-upload
+/// and no shell is left holding a path that is about to vanish. The
+/// SIGTERM direct-finalize fallback reaches `finalize` without coming
+/// through here, and must not sweep: its children may still be alive,
+/// and the next start sweeps anyway.
+///
+/// On the blocking pool and awaited, for the reason the writes are:
+/// `$HOME` can be a network mount.
+async fn run_stop(stop: &StopState, files_root: Option<PathBuf>) {
+    if let Some(root) = files_root {
+        let files = root.display().to_string();
+        match tokio::task::spawn_blocking(move || crate::files::sweep(&root)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!(%files, %error, "could not sweep the file store"),
+            Err(error) => error!(%files, %error, "the file-store sweep task failed"),
+        }
+    }
+    stop.finalize();
 }
 
 /// Route SIGTERM and SIGINT into the wire's own stop.
@@ -419,5 +504,75 @@ async fn request_stop_over_the_wire(stop: &StopState, signal_name: &str) {
             );
             stop.finalize();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `StopState` with no locks, no socket and no completion signal —
+    /// everything the tail touches is optional, which is what lets the
+    /// two stop entrances be compared without standing a session up.
+    fn stop_state(root: &std::path::Path) -> Arc<StopState> {
+        let (cancel, _rx) = watch::channel(false);
+        Arc::new(StopState {
+            finalized: AtomicBool::new(false),
+            cancel,
+            workspace: Arc::new(Workspace::open(root.join("state.json"))),
+            socket_path: root.join("roost.sock"),
+            socket_identity: OnceLock::new(),
+            locks: Mutex::new(None),
+            done: Mutex::new(None),
+        })
+    }
+
+    fn seeded_store(root: &std::path::Path) -> PathBuf {
+        let files = root.join("files");
+        std::fs::create_dir_all(files.join("4b9d1e7f0a3c5e21")).expect("seed the store");
+        std::fs::write(files.join("4b9d1e7f0a3c5e21/shot.png"), b"png").expect("seed a file");
+        files
+    }
+
+    #[tokio::test]
+    async fn the_clean_stop_sweeps_the_file_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = seeded_store(dir.path());
+        let stop = stop_state(dir.path());
+
+        run_stop(&stop, Some(files.clone())).await;
+
+        assert!(!files.exists(), "a clean stop must leave no store behind");
+        assert!(stop.finalized.load(Ordering::Acquire), "and still finalize");
+    }
+
+    /// The other entrance, and the reason the sweep does not live in
+    /// `finalize`: a SIGTERM whose self-dial could not reach the socket
+    /// has run none of the engine's stop, so its children may still be
+    /// alive and holding paths in the store. The next start sweeps.
+    #[test]
+    fn a_direct_finalize_leaves_the_file_store_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = seeded_store(dir.path());
+        let stop = stop_state(dir.path());
+
+        stop.finalize();
+
+        assert!(
+            files.join("4b9d1e7f0a3c5e21/shot.png").exists(),
+            "the direct finalize must not sweep"
+        );
+        assert!(stop.finalized.load(Ordering::Acquire));
+    }
+
+    /// A session with no store still stops.
+    #[tokio::test]
+    async fn a_stop_without_a_store_still_finalizes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stop = stop_state(dir.path());
+
+        run_stop(&stop, None).await;
+
+        assert!(stop.finalized.load(Ordering::Acquire));
     }
 }

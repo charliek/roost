@@ -36,7 +36,8 @@ use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcClient;
-use roost_ui_model::keys::{ProjectKey, TabKey};
+use roost_ui_model::file_transfer::Candidate;
+use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -82,8 +83,8 @@ enum Message {
         value: Option<String>,
     },
     ClipboardWriteCompleted(u64),
-    /// A clipboard image probe finished. `path` is the temp PNG to paste,
-    /// or `None` when the clipboard held no usable image.
+    /// A clipboard image probe finished — a temp PNG's path for a local
+    /// tab, the encoded bytes for a host one, or why neither happened.
     ///
     /// `tab` is the tab whose paste asked for it, host-qualified: the
     /// probe blocks, so this is a delayed callback and its target must
@@ -91,7 +92,21 @@ enum Message {
     /// lands.
     PasteImageMaterialized {
         tab: TabKey,
-        path: Option<String>,
+        result: Result<paste_image::Materialized, paste_image::ProbeError>,
+    },
+    /// A dropped batch has been `metadata`'d off the UI thread — or the
+    /// inspection ran past [`INSPECT_BUDGET`] (or did not join), which is
+    /// the `Err`: nothing waiting on a gesture may wait forever.
+    FilesInspected {
+        id: u64,
+        result: Result<Vec<Candidate>, String>,
+    },
+    /// One `session.put_file` answered.
+    UploadSettled {
+        host: HostId,
+        gesture: u64,
+        index: usize,
+        result: host_conn::UploadResult,
     },
     UrlOpenCompleted(Result<(), String>),
     Keyboard(keyboard::Event),
@@ -471,10 +486,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.reorder_hold_tick();
             Task::none()
         }
-        Message::FileDropDeadline => {
-            app.file_drop_deadline();
-            Task::none()
-        }
+        Message::FileDropDeadline => app.file_drop_deadline().map_task(),
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
         Message::WindowFocus(id, focused) => {
@@ -489,10 +501,16 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::ClipboardWriteCompleted(request_id) => {
             app.clipboard_write_completed(request_id).map_task()
         }
-        Message::PasteImageMaterialized { tab, path } => {
-            app.paste_image_materialized(tab, path.as_deref());
-            Task::none()
+        Message::PasteImageMaterialized { tab, result } => {
+            app.paste_image_materialized(tab, result).map_task()
         }
+        Message::FilesInspected { id, result } => app.files_inspected(id, result).map_task(),
+        Message::UploadSettled {
+            host,
+            gesture,
+            index,
+            result,
+        } => app.upload_settled(host, gesture, index, result).map_task(),
         Message::Keyboard(event) => app.keyboard(event).map_task(),
         Message::Ime(event) => {
             match event {
@@ -812,6 +830,16 @@ fn activate_existing(profile: &BundleProfile, pid: i32) {
     }
 }
 
+/// How long a dropped batch's `metadata` walk may take before the
+/// gesture gives up on it. Generous — it is a stall guard, not a
+/// deadline: a hung network mount is the case it exists for, and nothing
+/// waiting on a gesture may wait forever (plan 047 §3.4).
+const INSPECT_BUDGET: Duration = Duration::from_secs(30);
+
+fn inspect_budget() -> Duration {
+    INSPECT_BUDGET.mul_f64(crate::host_conn::task::scale())
+}
+
 trait UiTask {
     fn map_task(self) -> Task<Message>;
 }
@@ -863,6 +891,23 @@ impl UiTask for app::UiTask {
                 };
                 write.chain(Task::done(Message::ClipboardWriteCompleted(request_id)))
             }
+            // The reply is answered from inside the blocking closure
+            // rather than from the completion arm: `Task::perform`'s
+            // mapper is an `Fn`, so it cannot consume a oneshot sender,
+            // and this is the only place the platform's own verdict is
+            // in hand. A panic there drops the sender, which the
+            // dispatcher reports as `internal` — the queue still
+            // resumes below.
+            app::UiTask::ClipboardWriteImage {
+                request_id,
+                png,
+                reply,
+            } => Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    let _ = reply.send(paste_image::write_png(&png));
+                }),
+                move |_joined| Message::ClipboardWriteCompleted(request_id),
+            ),
             app::UiTask::OpenUrl { url } => {
                 Task::perform(url_launcher::open(url), Message::UrlOpenCompleted)
             }
@@ -870,24 +915,51 @@ impl UiTask for app::UiTask {
             // `update` in `Executor::enter`, i.e. this runs inside the
             // application's tokio runtime. The blocking pool is what keeps
             // the clipboard round-trip and the PNG encode off the UI thread.
-            app::UiTask::PasteImageProbe { tab } => Task::perform(
-                tokio::task::spawn_blocking(paste_image::materialize),
+            app::UiTask::PasteImageProbe { tab, sink } => Task::perform(
+                tokio::task::spawn_blocking(move || paste_image::probe(sink)),
                 move |joined| {
-                    let tab_id = tab.tab;
-                    let path = match joined {
-                        Ok(Ok(path)) => Some(path.to_string_lossy().into_owned()),
-                        Ok(Err(error)) => {
-                            tracing::debug!(tab_id, %error, "clipboard image paste found nothing");
-                            None
-                        }
-                        Err(error) => {
-                            tracing::debug!(tab_id, %error, "clipboard image probe did not join");
-                            None
-                        }
-                    };
-                    Message::PasteImageMaterialized { tab, path }
+                    let result = joined.unwrap_or_else(|error| {
+                        Err(paste_image::ProbeError::Failed(format!(
+                            "clipboard image: probe did not join: {error}"
+                        )))
+                    });
+                    Message::PasteImageMaterialized { tab, result }
                 },
             ),
+            // Bounded: a `metadata` on a hung mount would otherwise hold
+            // the gesture's slot — and its reply — for the life of the
+            // process.
+            app::UiTask::InspectFiles { id, paths } => Task::perform(
+                tokio::time::timeout(
+                    inspect_budget(),
+                    tokio::task::spawn_blocking(move || app::file_transfer::inspect(paths)),
+                ),
+                move |settled| {
+                    let result = match settled {
+                        Ok(Ok(candidates)) => Ok(candidates),
+                        Ok(Err(error)) => {
+                            tracing::warn!(id, %error, "file inspection did not join");
+                            Err("inspecting the dropped files did not finish".to_string())
+                        }
+                        Err(_) => {
+                            tracing::warn!(id, "file inspection ran past its budget");
+                            Err("inspecting the dropped files took too long".to_string())
+                        }
+                    };
+                    Message::FilesInspected { id, result }
+                },
+            ),
+            app::UiTask::Upload {
+                host,
+                gesture,
+                index,
+                future,
+            } => Task::future(future).map(move |result| Message::UploadSettled {
+                host,
+                gesture,
+                index,
+                result,
+            }),
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
             }

@@ -98,7 +98,7 @@ FRAME_NAMES = {
     FRAME_RESIZE: "RESIZE",
 }
 
-SESSION_PROTOCOL_VERSION = 2
+SESSION_PROTOCOL_VERSION = 3
 GHOSTTY_SNAPSHOT = "ghostty-snapshot"
 
 # ---------------------------------------------------------------------------

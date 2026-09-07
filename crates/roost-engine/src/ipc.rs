@@ -17,7 +17,7 @@
 
 use std::future::Future;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -41,17 +41,18 @@ use roost_ipc::messages::{
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
     SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionSetAgentHooksParams, SessionSetAgentHooksResult,
-    SessionSetFocusParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, WireProjectRef, WireTabRef, SESSION_PROTOCOL_VERSION,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetAgentHooksResult, SessionSetFocusParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
+    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
+    WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -306,6 +307,20 @@ pub enum UiRequest {
     },
     /// `clipboard.write` — test-only pasteboard seeding.
     ClipboardWrite { target: ClipboardOp, text: String },
+    /// `clipboard.write { image_png }` — the same seeding, with a real
+    /// image (plan 047 §3.5). Unlike its text sibling this one is
+    /// answered: the write can fail (no test mode, Wayland, a PNG that
+    /// will not decode, a display server that refuses the selection)
+    /// and a harness that pressed paste against a clipboard it only
+    /// believed it had seeded would blame the paste path instead.
+    ///
+    /// The reply lands when the platform clipboard can be read back,
+    /// not when the request was queued — the whole point of the seam is
+    /// that a paste issued right afterwards reads what this put there.
+    ClipboardWriteImage {
+        png: Vec<u8>,
+        reply: HostOpReply<()>,
+    },
     /// `tab.feed_pty_bytes` — inject bytes into a tab's PTY-output
     /// drain as if the supervisor had emitted them. The UI side
     /// rejects (`Err`) when `ROOST_TEST_MODE=1` was not set at
@@ -514,6 +529,24 @@ pub enum UiRequest {
         host: u32,
         tab_id: i64,
         reply: HostReply<()>,
+    },
+    /// `tab.send_file` — put these local files into that tab, the same
+    /// route a native drop takes (plan 047 §3.4).
+    ///
+    /// `paths` arrives exactly as the caller sent it, and unread: the
+    /// app validates it non-empty and absolute — §3.4 ranks the tab and
+    /// the host ahead of the paths, and only the app can answer those —
+    /// and the app is the process that opens them, so the handler never
+    /// touches a filesystem it might not share.
+    ///
+    /// Like [`UiRequest::HostTabReorder`] this cannot be answered
+    /// inside `update` — the uploads and the paste are a gesture the
+    /// app runs over many frames — so the reply travels with the
+    /// gesture and is answered from wherever it ends.
+    TabSendFile {
+        tab: WireTabRef,
+        paths: Vec<String>,
+        reply: HostOpReply<TabSendFileResult>,
     },
     /// `tab.reorder` for a host-qualified project: send that host's
     /// session the whole new tab order over its op queue (plan 044
@@ -767,6 +800,197 @@ impl std::fmt::Debug for AgentHooksHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AgentHooksHandle")
     }
+}
+
+/// Admission cap a [`FileStore`] gets when the caller states none.
+pub const FILE_STORE_CAP_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Longest `name` `session.put_file` will land.
+const MAX_PUT_FILE_NAME_BYTES: usize = 128;
+
+/// Where a session lands the files a client uploads for its tabs, and
+/// the accounting that decides whether the next one fits.
+///
+/// The dependency direction mirrors [`AgentHooksHandle`]: this crate
+/// decodes `session.put_file` and gates it on the lease, and the
+/// *daemon* — the process that owns the host's cache directory and
+/// sweeps it — supplies the root. A handler built without one answers
+/// `not-supported`, the honest answer for any socket that is not a host
+/// session's.
+///
+/// **Nothing here ever evicts** (plan 047 §3.1). A path this store has
+/// handed out stays valid until the session stops cleanly or starts
+/// again, because it may sit unsubmitted in an agent's composer for an
+/// hour; a store with no room answers `store-full` and deletes nothing.
+#[derive(Clone)]
+pub struct FileStore(Arc<FileStoreState>);
+
+struct FileStoreState {
+    root: PathBuf,
+    cap: u64,
+    /// Logical bytes landed: summed once by walking `root`, maintained
+    /// per write afterwards. Admission and directory allocation both
+    /// happen under this lock, so two connections cannot each be told
+    /// their file fits the same remaining room.
+    used: std::sync::Mutex<u64>,
+}
+
+impl FileStore {
+    /// A store over `root` with the default cap.
+    ///
+    /// `root` must already exist and be private to this user — the
+    /// session creates it, because the session is also what sweeps it.
+    pub fn new(root: PathBuf) -> std::io::Result<Self> {
+        Self::with_cap(root, FILE_STORE_CAP_BYTES)
+    }
+
+    /// [`Self::new`] with the cap stated, so a test can fill a store
+    /// without writing half a gigabyte.
+    pub fn with_cap(root: PathBuf, cap: u64) -> std::io::Result<Self> {
+        let used = logical_bytes(&root)?;
+        Ok(Self(Arc::new(FileStoreState {
+            root,
+            cap,
+            used: std::sync::Mutex::new(used),
+        })))
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.0.root
+    }
+
+    /// Land `data` at `<root>/<16 hex>/<name>`, or leave nothing behind.
+    ///
+    /// Called from the blocking pool: a session's cache can sit on a
+    /// network mount, and a stalled write must not take the tokio worker
+    /// serving other connections down with it.
+    fn put(&self, name: &str, data: &[u8]) -> Result<PathBuf, HandlerError> {
+        let bytes = data.len() as u64;
+        let dir = self.admit(bytes)?;
+        let path = dir.join(name);
+        if let Err(error) = write_upload(&dir, &path, data) {
+            // Nothing partial may survive under a path this op never
+            // returned, and bytes that never landed are not the next
+            // upload's problem — but only once they are actually gone.
+            // A cleanup that fails leaves the bytes on disk, and
+            // refunding them anyway is the one way this counter can
+            // undercount, which is the one way the store can over-admit.
+            let message = match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    let mut used = lock(&self.0.used);
+                    *used = used.saturating_sub(bytes);
+                    format!("could not land {}: {error}", path.display())
+                }
+                Err(cleanup) => format!(
+                    "could not land {}: {error}; and could not remove it: {cleanup} \
+                     (its bytes stay charged against the store)",
+                    path.display()
+                ),
+            };
+            return Err(HandlerError::new("internal", message));
+        }
+        Ok(path)
+    }
+
+    /// Charge `bytes` against the cap and claim a private directory for
+    /// them, both under the one lock that makes over-admission
+    /// impossible.
+    fn admit(&self, bytes: u64) -> Result<PathBuf, HandlerError> {
+        let mut used = lock(&self.0.used);
+        let after = used
+            .checked_add(bytes)
+            .filter(|after| *after <= self.0.cap)
+            .ok_or_else(|| {
+                HandlerError::new(
+                    "store-full",
+                    format!(
+                        "the host's file store holds {} of its {} byte cap and cannot take \
+                         {bytes} more; restart the session to clear it",
+                        *used, self.0.cap
+                    ),
+                )
+            })?;
+        // One attempt: the name is 64 bits of OS entropy, so a collision
+        // is a real error rather than something to retry around.
+        let dir = self.0.root.join(crate::workspace::random_hex(8));
+        create_private_dir(&dir).map_err(|error| {
+            HandlerError::new(
+                "internal",
+                format!(
+                    "could not create the upload directory {}: {error}",
+                    dir.display()
+                ),
+            )
+        })?;
+        *used = after;
+        Ok(dir)
+    }
+}
+
+impl std::fmt::Debug for FileStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileStore")
+            .field("root", &self.0.root)
+            .field("cap", &self.0.cap)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Sum the regular files under `root`. A root that does not exist holds
+/// nothing; anything else that cannot be read is an error, because a
+/// store that undercounts what it already holds is a store that
+/// over-admits.
+fn logical_bytes(root: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            // `DirEntry::metadata` does not follow symlinks, so a link
+            // planted in the store counts as the link it is.
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Write, then rename: a reader must never find a half-written file
+/// under the name this op is about to return.
+///
+/// The temp name carries a `~`, which the op's own name grammar forbids,
+/// so it can never be the name being landed. No fsync — the store is
+/// cache, swept at every start and every clean stop, and the client can
+/// always upload again.
+fn write_upload(dir: &Path, path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let temp = dir.join(".part~");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(data)?;
+    drop(file);
+    std::fs::rename(&temp, path)
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
 }
 
 /// Session-socket state: the identity, the stop tail, and the two
@@ -1357,6 +1581,11 @@ fn is_mutating_op(op: &str) -> bool {
             // this session is about to unlink. Listed so a stop latches
             // it out along with everything else that changes the world.
             | ops::SESSION_SET_AGENT_HOOKS
+            // Also not workspace state, and listed for the same reason:
+            // it writes a file into the host's store and hands the path
+            // back to be pasted. A stop that has already swept that
+            // store would leave the client holding a path to nothing.
+            | ops::SESSION_PUT_FILE
             | ops::TAB_ATTACH
             | ops::TAB_FEED_PTY_BYTES
             | ops::HOST_ADD
@@ -1396,6 +1625,11 @@ pub struct IpcHandler {
     /// `not-supported` — see [`AgentHooksHandle`] for why this crate
     /// holds a callback rather than the install engine itself.
     agent_hooks: Option<AgentHooksHandle>,
+    /// Set by the host-session daemon: where `session.put_file` lands
+    /// what a client uploads. `None` everywhere else, and the op answers
+    /// `not-supported` — the daemon owns the directory because the
+    /// daemon is what sweeps it.
+    files: Option<FileStore>,
 }
 
 impl IpcHandler {
@@ -1416,6 +1650,7 @@ impl IpcHandler {
             session: None,
             push_limits: PushLimits::default(),
             agent_hooks: None,
+            files: None,
         }
     }
 
@@ -1429,6 +1664,19 @@ impl IpcHandler {
     #[must_use]
     pub fn with_agent_hooks(mut self, handle: AgentHooksHandle) -> Self {
         self.agent_hooks = Some(handle);
+        self
+    }
+
+    /// Give a session socket somewhere to land uploaded files.
+    ///
+    /// Separate from [`Self::with_session`] for the reason
+    /// [`Self::with_agent_hooks`] is: only the daemon knows a directory
+    /// it also sweeps, and a session built without one serves
+    /// `session.put_file` as `not-supported` rather than writing
+    /// somewhere nothing will ever clean up.
+    #[must_use]
+    pub fn with_file_store(mut self, store: FileStore) -> Self {
+        self.files = Some(store);
         self
     }
 
@@ -1715,13 +1963,11 @@ fn mixed_refs(op: &str) -> HandlerError {
     ))
 }
 
-/// The host form is client state: the connection whose session would
-/// serve it lives in the app, so a socket with no UI has nothing to
-/// route to. The `tab.focus` guard, one op over.
-fn needs_a_ui(op: &str) -> HandlerError {
-    HandlerError::invalid_param(format!(
-        "a host-qualified {op} needs a UI: host connections are client state"
-    ))
+/// A request only an app can serve. `what` is the request as the
+/// refusal names it (a whole op, or just its host-qualified form) and
+/// `because` is what the app has that this socket does not.
+fn needs_a_ui(what: &str, because: &str) -> HandlerError {
+    HandlerError::invalid_param(format!("{what} needs a UI: {because}"))
 }
 
 /// A session socket has one bare id-space and no host connections, so a
@@ -1764,7 +2010,10 @@ fn tab_reorder_route(
                 })
                 .collect::<Result<_, _>>()?;
             if !h.has_ui() {
-                return Err(needs_a_ui(op));
+                return Err(needs_a_ui(
+                    &format!("a host-qualified {op}"),
+                    "host connections are client state",
+                ));
             }
             Ok((ReorderInstance::Host(host), project, tab_ids))
         }
@@ -1810,7 +2059,10 @@ fn project_reorder_route(
         })
         .collect::<Result<_, _>>()?;
     if !h.has_ui() {
-        return Err(needs_a_ui(op));
+        return Err(needs_a_ui(
+            &format!("a host-qualified {op}"),
+            "host connections are client state",
+        ));
     }
     Ok((ReorderInstance::Host(host), project_ids))
 }
@@ -2064,6 +2316,16 @@ async fn dispatch_outcome(
     if op == ops::SESSION_SET_AGENT_HOOKS {
         let p: SessionSetAgentHooksParams = decode(params)?;
         return session_set_agent_hooks(h, session, ctx, p)
+            .await
+            .map(HandlerOutcome::Reply);
+    }
+
+    // Connection-scoped like its neighbours, and guarded before the
+    // decode: see [`put_file_size_guard`].
+    if op == ops::SESSION_PUT_FILE {
+        put_file_size_guard(&params)?;
+        let p: SessionPutFileParams = decode(params)?;
+        return session_put_file(h, session, ctx, p)
             .await
             .map(HandlerOutcome::Reply);
     }
@@ -2354,6 +2616,110 @@ async fn session_set_agent_hooks(
             AgentHooksError::Failed(_) => HandlerError::new("internal", error.to_string()),
         })?;
     encode(&result)
+}
+
+/// `session.put_file`: land one client-supplied file on the host and
+/// answer with the path a shell can be told to read (plan 047 §3.1).
+///
+/// Lease-gated because the file is written under the session user's
+/// `$HOME` and its path is about to be typed into one of this session's
+/// tabs, and in [`is_mutating_op`] because a session that has latched
+/// `session.stop` is about to sweep the very directory this writes into.
+/// A slow write therefore holds the mutation barrier and a racing stop
+/// waits for it — the price of never handing back a path that is already
+/// gone.
+async fn session_put_file(
+    h: &IpcHandler,
+    session: &Arc<SessionState>,
+    ctx: &ConnCtx,
+    p: SessionPutFileParams,
+) -> Result<serde_json::Value, HandlerError> {
+    session.require_lease(&p.lease, ctx)?;
+    let store = h.files.clone().ok_or_else(|| {
+        HandlerError::new(
+            "not-supported",
+            "this session cannot receive files: it was built without a file store",
+        )
+    })?;
+    validate_put_file_name(&p.name)?;
+    let bytes = p.data.len() as u64;
+    // The exact check the pre-decode guard cannot make.
+    if bytes > MAX_PUT_FILE_BYTES {
+        return Err(too_large());
+    }
+
+    let SessionPutFileParams { name, data, .. } = p;
+    let path = tokio::task::spawn_blocking(move || store.put(&name, &data))
+        .await
+        .map_err(|error| HandlerError::new("internal", format!("the upload failed: {error}")))??;
+
+    encode(&SessionPutFileResult {
+        // Lossy is not a repair here: the root came from a session that
+        // checked it against the paste grammar, and `name` just passed
+        // `validate_put_file_name`.
+        path: path.to_string_lossy().into_owned(),
+        bytes,
+    })
+}
+
+/// Refuse an oversized upload before the typed decode allocates it.
+///
+/// The frame and its `serde_json::Value` already exist by the time this
+/// runs; what the early check spares is the decoded `Vec<u8>`. It is
+/// deliberately coarse: base64 carries three bytes per four characters,
+/// so a file one or two bytes over the cap encodes to exactly the same
+/// length as the cap itself and is caught by the exact check after the
+/// decode instead. Both answer `too-large`.
+fn put_file_size_guard(params: &serde_json::Value) -> Result<(), HandlerError> {
+    // A `data` that is absent or not a string is a shape error, and
+    // `decode` names it far better than this can.
+    let Some(encoded) = params.get("data").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    if encoded.len() as u64 > MAX_PUT_FILE_BYTES.div_ceil(3) * 4 {
+        return Err(too_large());
+    }
+    Ok(())
+}
+
+fn too_large() -> HandlerError {
+    HandlerError::new(
+        "too-large",
+        format!(
+            "this file is over the {} byte cap on one upload",
+            MAX_PUT_FILE_BYTES
+        ),
+    )
+}
+
+/// The client's basename, taken or refused — never repaired.
+///
+/// The path this op returns has to be pasteable **bare**, which is the
+/// one spelling every agent unquotes identically (plan 047 §3.1), so a
+/// name that would need quoting, or that could climb out of the upload
+/// directory, is not a name this store can land. `-` leading is out
+/// because a bare path is also an argv word.
+fn validate_put_file_name(name: &str) -> Result<(), HandlerError> {
+    let refuse = |why: &str| Err(HandlerError::invalid_param(format!("name {name:?} {why}")));
+    if name.is_empty() {
+        return refuse("must not be empty");
+    }
+    if name.len() > MAX_PUT_FILE_NAME_BYTES {
+        return refuse(&format!("is longer than {MAX_PUT_FILE_NAME_BYTES} bytes"));
+    }
+    if name == "." || name == ".." {
+        return refuse("is a directory reference, not a file name");
+    }
+    if name.starts_with('-') {
+        return refuse("must not start with '-'");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return refuse("must be a bare basename of [A-Za-z0-9._-]");
+    }
+    Ok(())
 }
 
 /// Wire colors → the engine's theme seed.
@@ -2701,8 +3067,9 @@ async fn dispatch(
                 WireTabRef::Local(tab_id) => tab_id,
                 WireTabRef::Host { host, tab } => {
                     if !h.has_ui() {
-                        return Err(HandlerError::invalid_param(
-                            "a host-qualified tab.focus needs a UI: host selection is client state",
+                        return Err(needs_a_ui(
+                            "a host-qualified tab.focus",
+                            "host selection is client state",
                         ));
                     }
                     h.ui_call(|reply| UiRequest::HostTabFocus {
@@ -2727,6 +3094,31 @@ async fn dispatch(
                 previous_project_id,
                 previous_tab_id,
             })
+        }
+        ops::TAB_SEND_FILE => {
+            let p: TabSendFileParams = decode(params)?;
+            // Only what is decidable with no client state at all: the
+            // ref spelling and the fact that there is an app. The paths
+            // are the app's to judge, because §3.4's precedence puts
+            // `not-found` and `host-unavailable` ahead of a relative
+            // path and only the app knows those two.
+            let tab = WireTabRef::parse(&p.tab).ok_or_else(|| {
+                HandlerError::invalid_param(format!("invalid tab reference: {}", p.tab))
+            })?;
+            if !h.has_ui() {
+                return Err(needs_a_ui(
+                    ops::TAB_SEND_FILE,
+                    "reading the files and typing the paste are the app's",
+                ));
+            }
+            let result = h
+                .ui_call(|reply| UiRequest::TabSendFile {
+                    tab,
+                    paths: p.paths,
+                    reply,
+                })
+                .await??;
+            encode(&result)
         }
         ops::TAB_SET_TITLE => {
             let p: TabSetTitleParams = decode(params)?;
@@ -2980,13 +3372,39 @@ async fn dispatch(
         ops::CLIPBOARD_WRITE => {
             let p: ClipboardWriteParams = decode(params)?;
             let target = parse_clipboard_op(&p.target)?;
+            // The wire allows `text` OR `image_png` — exactly one. Both
+            // at once is ambiguous, and answering it by silently
+            // preferring `text` would drop an image the caller believed
+            // it had written.
+            if p.text.is_some() && p.image_png.is_some() {
+                return Err(HandlerError::new(
+                    "invalid-param",
+                    "clipboard.write takes `text` or `image_png`, not both",
+                ));
+            }
+            if let Some(png) = p.image_png {
+                // PRIMARY carries text by convention and the paste path
+                // never probes it for an image (`probe_wanted`), so a
+                // selection image write would seed a clipboard nothing
+                // reads. Refused here rather than in the UI so the
+                // headless dispatcher answers it too.
+                if target != ClipboardOp::System {
+                    return Err(HandlerError::new(
+                        "invalid-param",
+                        "clipboard.write `image_png` requires target \"system\"",
+                    ));
+                }
+                h.ui_call(|reply| UiRequest::ClipboardWriteImage { png, reply })
+                    .await??;
+                return Ok(serde_json::json!({}));
+            }
+            let text = p.text.ok_or_else(|| {
+                HandlerError::new("missing-param", "clipboard.write requires `text`")
+            })?;
             // Fire-and-forget — matches the `app.activate` pattern.
             // Headless handler / dropped receiver: no-op.
             if let Some(tx) = &h.ui_tx {
-                let _ = tx.send(UiRequest::ClipboardWrite {
-                    target,
-                    text: p.text,
-                });
+                let _ = tx.send(UiRequest::ClipboardWrite { target, text });
             }
             Ok(serde_json::json!({}))
         }
@@ -3632,5 +4050,137 @@ mod tests {
             "a subscribe after the sweep must be refused"
         );
         late.abort();
+    }
+
+    /// Admission is atomic, not merely capped: the check and the charge
+    /// happen under one lock. A split (read the counter, then lock and
+    /// write) passes the two-connection wire test whenever tokio happens
+    /// to serialise it; this drives real contention through a barrier
+    /// and demands *exactly* `cap` winners, every time.
+    #[test]
+    fn admission_never_over_admits_under_contention() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        const CAP: u64 = 64;
+        const THREADS: u64 = 4 * CAP;
+        let store = FileStore::with_cap(dir.path().to_path_buf(), CAP).expect("store");
+        let barrier = Arc::new(Barrier::new(THREADS as usize));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.admit(1).is_ok()
+                })
+            })
+            .collect();
+        // Every thread is spawned before any is joined, or the barrier
+        // never releases.
+        let mut admitted = 0u64;
+        for handle in handles {
+            if handle.join().expect("thread") {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(admitted, CAP, "exactly the cap may be admitted");
+        assert_eq!(*lock(&store.0.used), CAP);
+        let dirs = std::fs::read_dir(dir.path()).expect("read").count() as u64;
+        assert_eq!(
+            dirs, CAP,
+            "one directory per admitted upload, none for a refusal"
+        );
+    }
+
+    /// The store admits against what its root **already** holds, not
+    /// against zero: a session restarted over a root it did not sweep
+    /// would otherwise hand out room twice.
+    #[test]
+    fn a_store_counts_what_its_root_already_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("files");
+        std::fs::create_dir_all(root.join("aa")).expect("seed a directory");
+        std::fs::write(root.join("aa/one.bin"), [0u8; 10]).expect("seed a file");
+        std::fs::write(root.join("aa/two.bin"), [0u8; 6]).expect("seed a file");
+
+        let store = FileStore::with_cap(root, 20).expect("open the store");
+        assert_eq!(*lock(&store.0.used), 16);
+        store
+            .put("three.bin", &[0u8; 4])
+            .expect("4 more fits exactly");
+        let error = store
+            .put("four.bin", &[0u8; 1])
+            .expect_err("and nothing after that");
+        assert_eq!(error.code, "store-full");
+    }
+
+    /// A write that cannot land leaves nothing behind — no directory,
+    /// and no charge against the room the next upload has to fit in.
+    ///
+    /// Forced with the one failure a test can arrange *after* the upload
+    /// directory already exists: a final path over the OS's `PATH_MAX`,
+    /// with the directory and its temp file comfortably inside it. The
+    /// shorter name landing afterwards is what proves the refund.
+    #[test]
+    fn a_write_that_fails_leaves_no_directory_and_no_charge() {
+        #[cfg(target_os = "macos")]
+        const PATH_MAX: usize = 1024;
+        #[cfg(not(target_os = "macos"))]
+        const PATH_MAX: usize = 4096;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut root = dir.path().to_path_buf();
+        let target = PATH_MAX - 60;
+        while root.as_os_str().len() + 101 <= target {
+            root.push("d".repeat(100));
+        }
+        let pad = target.saturating_sub(root.as_os_str().len() + 1);
+        if pad > 0 {
+            root.push("d".repeat(pad));
+        }
+        std::fs::create_dir_all(&root).expect("create the deep root");
+
+        let store = FileStore::with_cap(root.clone(), 1024).expect("open the store");
+        let error = store
+            .put(&"n".repeat(MAX_PUT_FILE_NAME_BYTES), b"payload")
+            .expect_err("the final path is over PATH_MAX");
+        assert_eq!(error.code, "internal");
+        assert!(
+            std::fs::read_dir(&root)
+                .expect("read the root")
+                .next()
+                .is_none(),
+            "a failed write must leave no directory"
+        );
+        assert_eq!(*lock(&store.0.used), 0, "and no charge");
+
+        let landed = store.put("ok.bin", b"payload").expect("a short name lands");
+        assert_eq!(std::fs::read(&landed).expect("read it back"), b"payload");
+        assert_eq!(*lock(&store.0.used), 7);
+    }
+
+    /// The screen in front of the typed decode: coarse by construction
+    /// (base64 carries three bytes per four characters), and silent
+    /// about anything that is not an over-long string, because `decode`
+    /// names those failures far better.
+    #[test]
+    fn the_size_guard_screens_the_encoded_length_and_defers_the_rest() {
+        let data = |len: usize| serde_json::json!({ "data": "A".repeat(len) });
+        let cap = usize::try_from(MAX_PUT_FILE_BYTES).unwrap();
+        let encoded_cap = cap.div_ceil(3) * 4;
+
+        put_file_size_guard(&data(encoded_cap)).expect("the cap's own encoding fits");
+        assert_eq!(
+            put_file_size_guard(&data(encoded_cap + 1))
+                .expect_err("one character more does not")
+                .code,
+            "too-large"
+        );
+        put_file_size_guard(&serde_json::json!({})).expect("a missing `data` is decode's to name");
+        put_file_size_guard(&serde_json::json!({"data": 7}))
+            .expect("and so is one of the wrong type");
     }
 }

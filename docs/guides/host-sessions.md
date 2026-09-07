@@ -160,6 +160,76 @@ The difference is where the new order lives. It is saved **on the session**, not
 
 A **disconnected** section's rows stay listed and dimmed, and they can't be dragged — there is nothing to route the change to. Reconnect first (the section's inline **↻ Reconnect**, or the palette's Connect), then drag.
 
+## Pasting images and files into a host tab
+
+Copy a screenshot and press Ctrl+V in a host tab, or drag a file onto one, and the agent running on the far machine attaches it — the same gesture that has always worked in a local tab.
+
+It has to work differently underneath, and knowing how explains everything else on this page. Every agent reads the clipboard *itself* when you press Ctrl+V, which cannot reach across an SSH connection. What Roost does instead is send the **bytes** to the host and paste the **host path** the session answers with. So a clipboard image is written on `workbox`, never on your laptop, and what appears in the composer is a `workbox` path the agent can open. A dropped file works the same way; the basename is preserved (`design.pdf` stays `design.pdf`, which is what the agent shows you in its chip) under a random directory, so two drops of the same name never collide.
+
+Local tabs are unchanged — nothing crosses a boundary and the local path is pasted, exactly as before.
+
+The same thing is a command, for scripts and for when a drop is awkward:
+
+```bash
+roostctl tab send-file --tab h2.7 ~/Desktop/shot.png
+```
+
+See [`cli.md`](../reference/cli.md#tab-send-file) — note `--tab` is required there, and that it blocks until the paste lands.
+
+### The three limits
+
+| Limit | What it is | What you see |
+|---|---|---|
+| **10 MiB** | per file | The file is skipped and named, and the rest of the drop still goes. |
+| **256 MiB** | per drop | The whole drop is refused before a byte moves: *That drop is 540 MiB, over the 256 MiB per-drop limit*. |
+| **512 MiB** | per host, total | Uploads start failing, and the reason names the store: *the host's file store … cannot take … more; restart the session to clear it*. |
+
+The last one is the one worth understanding. The host's store **never evicts**: a path Roost handed back may sit in an agent's composer unsubmitted for an hour, and deleting the file out from under it would be worse than refusing the next upload. So a full store stays full until the session goes away — Stop Session and connect again, or `roostctl session stop` and `start` on the host. Everything already uploaded keeps working meanwhile.
+
+### What is skipped, and what it says
+
+A drop can hold anything. Directories, files that are missing or unreadable, things that are not regular files (a FIFO, a device node), and files over the 10 MiB cap are all **skipped and named** — the rest of the drop still goes. The status line reports both halves in one sentence:
+
+```text
+Sending shot.png (4.2 MiB) to workbox…
+Sent 3 files to workbox (skipped: build/ is a directory, core.dump is over 10 MiB)
+Could not send shot.png to workbox: the host disconnected
+```
+
+A drop where *nothing* was sendable says so (`Nothing to send to workbox (skipped: …)`) and pastes nothing. And a drop is **all-or-nothing for the paste**: if one upload of several fails, nothing is pasted at all, rather than silently leaving out a file you dropped.
+
+Uploads ride their own connection, so a large one never stalls typing in another tab on the same host, and the host stays connected while it runs. If the host disconnects, reconnects, or is taken over mid-upload, the gesture is failed and named — a reconnect refuses even when the session survived it, because from this side a link blip and a restarted session look identical.
+
+### What is cleaned up, and when
+
+The host's file store is swept **entirely at start** and again on a clean stop. That is the whole rule, and its consequences are worth stating:
+
+- **Stop Session** (or `roostctl session stop`) removes every uploaded file on that host as part of stopping.
+- A **disconnect** removes nothing. The shells keep running and so do the files — reconnect and the paths in your agents' composers still work.
+- A session that was **killed rather than stopped** — `kill -9`, a crash, a machine that lost power — leaves its files behind. They are removed by that session's **next start**, not by anything in between. (A plain `SIGTERM` — `systemctl --user stop`, a logout — is routed into the same clean stop and *does* sweep; only if that self-stop can't complete does it fall through to the next start.)
+
+### Which agents attach what
+
+Most of these attach a single, unquoted, absolute path with the extension intact — which is exactly what Roost pastes, and why it pastes it bare rather than quoted or escaped. All five were driven live against a real session over SSH for this release:
+
+| Agent | A pasted host path |
+|---|---|
+| **Claude Code** | Attaches images and PDFs. |
+| **Codex** | Attaches images — **if** `image_paste_enabled` is on in that user's Codex config. Off, Codex leaves the path as plain text (locally too; this is not a host-tab thing). One path per paste. |
+| **OpenCode** | Attaches images and PDFs. One path per paste. |
+| **grok / gx** | Attaches images, and deliberately **rejects tiny ones** — a 1×1 test PNG stays text. |
+| **cursor-agent** | **Does not attach.** The path stays plain text in its composer, and cursor-agent reads it as part of your prompt — it will often try to `ls` or `cat` the file rather than look at it. Verified live, and it behaves the same way for an ordinary *local* paste, so this is cursor-agent's own composer rather than anything about host paths. |
+
+cursor-agent aside, three things follow. **A multi-file drop attaches in none of them** — several paths on one line is not a shape any of these parse — but the paths are still real paths on the host, so an agent can be asked to read them. And **any regular file uploads**, not just images: what you always get is a working host path, and whether the agent turns it into an attachment chip depends on that agent's own supported types.
+
+### One-time cost: every host needs its session updated
+
+This feature moved the session protocol version, which means a Roost with it **cannot talk to a `roost-session` that predates it at all** — not just for file paste. Every saved host needs its session updated once. Roost catches this at Connect and shows the [upgrade / restart flow](#the-upgrade-restart-flow) rather than a broken screen:
+
+- **A `localhost` host** offers to restart the session for you.
+- **A host reached over SSH** offers to install the matching `roost-session` and restart it, with the usual consent card first.
+- **A host reached over a plain [`ssh -L` forward](#scripted-fallback-forwarding-with-ssh-n-l) (a Unix-socket target)** gets no in-app offer — Roost cannot reach in over a bare forwarded socket. SSH into that machine yourself, update `roost-session`, then `roostctl session stop` and `roostctl session start` there, and Connect again from here.
+
 ## Takeover
 
 A session holds one interactive lease at a time. If you connect to the same host from a second window (a second machine, or the same machine after a crash left the first window's connection stale), the new connection **takes over**: it gets the lease, and the *displaced* window is told.

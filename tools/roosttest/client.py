@@ -465,6 +465,61 @@ class Roost:
     def clipboard_write(self, target: str, text: str) -> None:
         self.call("clipboard.write", {"target": target, "text": text})
 
+    def clipboard_write_image(self, png: bytes) -> None:
+        """Put a real PNG on the SYSTEM clipboard (plan 047 §3.5).
+
+        The seam the host image-paste lane needs: an IPC-only harness
+        has no other way to put an image where a paste will find it.
+        `text` and `image_png` are exclusive, and only `system` makes
+        sense for an image — PRIMARY carries text and the paste path
+        never probes it, so `selection` is `invalid-param`.
+
+        Returns once the image can be read back off the platform
+        clipboard, so a paste issued straight afterwards reads what this
+        put there.
+
+        Refusals, all `RoostError`: `not-supported` when the UI was
+        launched without ROOST_TEST_MODE=1, or when the display server
+        refused the write and it is a Wayland session (a compositor with
+        no data-control clipboard to offer, issue #302) — a lane's cue
+        to skip; `invalid-param` for bytes that do not decode as an
+        8-bit RGBA-reducible PNG or that exceed the 40 MP pixel cap.
+        iced only — the Mac handler has no name for the field and
+        answers `unknown-field`."""
+        self.call("clipboard.write", {
+            "target": "system",
+            "image_png": base64.b64encode(png).decode("ascii"),
+        })
+
+    # -- files into a tab (plan 047 §3.4) ---------------------------------
+    def tab_send_file(self, tab: str | int, paths) -> dict:
+        """Send local files to a tab — the drop route, as an op.
+
+        `tab` takes `tab.focus`'s spelling: a bare id (or an int) for a
+        local tab, `h<host>.<id>` for a connected host's. Every path
+        must be **absolute**; duplicates are dropped first-seen.
+
+        Returns the result verbatim: ``{"pasted": str, "uploads":
+        [{source, name, path, bytes}, ...], "skipped": [{path,
+        reason}, ...]}`` — `uploads` empty and `pasted` the escaped
+        local paths for a local tab.
+
+        **Blocks** until the paste has been queued in the tab (what
+        `tab_capture_pty_input` sees), not until the host acknowledges
+        anything — the data plane has no acknowledgement. A large
+        upload can therefore take a while; the client's own socket
+        timeout, if one was set, is what bounds the wait.
+
+        Every refusal raises `RoostError` with the op's code:
+        `not-found` for a tab this UI does not have, `host-unavailable`
+        for a host that is frozen, gone or reconnected mid-gesture,
+        `invalid-param` for a relative path or a batch where every item
+        was skipped, `too-large` / `store-full` from the host."""
+        return self.call(
+            "tab.send_file",
+            {"tab": str(tab), "paths": [str(path) for path in paths]},
+        )
+
     # -- test-only PTY drain ops (ROOST_TEST_MODE=1) ---------------------
     # `tab.feed_pty_bytes` injects bytes into a tab's PTY-output drain;
     # `tab.capture_pty_input` reads the bytes the UI has queued back

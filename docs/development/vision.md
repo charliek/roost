@@ -662,8 +662,11 @@ rule because the second one will not get the same review the first did:
   ride separate connections with no ordering between them. The held drag
   preview is the corollary, not a special case.
 - **Which codes may cross.** A session's own refusal keeps its code when
-  that code is one of the ten both sockets share, so a caller matching
-  `invalid-param` sees the same thing whichever end refused. A
+  that code is one both sockets share, so a caller matching
+  `invalid-param` sees the same thing whichever end refused. (Ten when
+  this was written; DL-22's `too-large` and `store-full` joined the list
+  later — [`ipc.md`](../reference/ipc.md#wire-format) is the current
+  one.) A
   session-scoped code must **fold**: `shutting-down` is session-socket
   only, and so is anything a newer session invents — both become
   `host-unavailable` with the original code and sentence kept in
@@ -730,6 +733,87 @@ in a production enum (`DeadTunnel::Recorded`) is a last resort,
 acceptable only when the value's *source* is another crate's private
 state that no constructible cluster can reach. That is why it stays
 until #385's seam is cheap (costed in plan 045 §3.4).
+
+### DL-22: files cross a host boundary as bytes through the op set, pasted as bare host paths the client has validated (2026-09-06)
+
+Plan 047 (#406) made a pasted image and a dropped file work in a host
+tab. The mechanism is worth writing down because the obvious one is
+wrong. Pasting an image into an agent looks like a clipboard feature,
+and it is not: **every** agent Roost supports reads the clipboard
+*itself* on Ctrl+V, on the machine it is running on. Over SSH that
+machine is not the one holding the clipboard, so no amount of clipboard
+plumbing composes. What every agent *also* accepts is a filesystem path
+it can open. That is the only contract that survives the boundary, so
+that is the one Roost targets: the bytes travel as an **op**
+(`session.put_file` — lease-gated, one frame, 10 MiB, answering with the
+host path), and the client pastes the path that comes back.
+
+**Bare, not quoted or escaped.** The single spelling every agent
+unquotes identically is no quoting at all. The five parsers each strip
+*something* — one shlex-tokenizes, one un-backslashes, they disagree on
+`file://` — and there is no guarantee of parity across them for any
+escaped form, so escaping the returned path (which is what the local
+drop route does to a local one) would be betting the feature on five
+independent implementations agreeing. Instead, "paste-safe" becomes a
+property of the whole path rather than a transformation applied at the
+end: `name` is validated, never repaired
+(`[A-Za-z0-9._-]`, refused otherwise), and the session checks its
+*entire* resolved store path against `[A-Za-z0-9._/-]` at start, moving
+to a `/tmp` root if a `$HOME` with a space in it would have made every
+upload unpasteable.
+
+**And the client re-checks the reply before it types it.** The returned
+path must be absolute, in that grammar, end in exactly the `name` that
+was sent, and report the byte count that was sent. This is not
+belt-and-braces about our own session: a path from a socket becomes
+*typed input into a live shell*, which is the one place a malformed or
+hostile answer would be executed rather than displayed. Validating at
+the point of use is what makes the guarantee independent of who answered.
+
+**The op set is the whole surface, as usual.** One entry point,
+`tab.send_file`, is what a native drop, a clipboard-image paste and
+`roostctl tab send-file` all drive — the drop *is* the op minus the
+window event, which is also why the e2e can exercise drops without
+XDND. Policy (what uploads, what is skipped, what a batch costs) is a
+pure planner in `roost-ui-model` so the Swift fold-in mirrors it rather
+than re-deriving it; inspection and upload are the impure layers around
+it. Uploads ride a **dedicated per-incarnation dispatcher** on their own
+connection, never the control leg, because that loop awaits each call
+inline and could not admit an upload while one was in flight.
+
+**The contract this is written against**, from the agents' own sources
+(2026-09):
+
+| Agent | A pasted absolute path |
+|---|---|
+| Claude Code | Attaches images and PDFs. |
+| Codex | Attaches images, gated on the user's `image_paste_enabled`; a single path per paste. |
+| OpenCode | Attaches images and PDFs; a single path per paste. |
+| grok / gx | Attaches images; rejects tiny ones, so fixtures must be real-sized. |
+| cursor-agent | **Does not attach** a pasted path — verified live, and identically for a local paste, so the gap is its composer, not the host path. |
+
+Two consequences are load-bearing, not incidental. **A multi-path paste
+attaches in none of them**, so a multi-file drop is a paste of real host
+paths and nothing more — which is honest, and is why the guide says so.
+And **any regular file uploads**, not only images: the deliverable is a
+working host path, and whether it becomes an attachment chip is the
+agent's decision, not Roost's.
+
+**What this cost, stated plainly:** `SESSION_PROTOCOL_VERSION` moved
+2 → 3, which disables *every* host session until its far side is
+updated, not just file paste. The rule that made it move is now written
+on the constant — an additive op bumps when a pre-bump peer could not
+refuse it meaningfully — and a pre-047 session could only answer
+`unknown-op` to a file the user had just pasted. The alternative (keep
+`2`, degrade per paste) was narrower and equally honest; it was declined
+rather than overlooked, because carrying that fallback forever is a debt
+and this is a young protocol.
+
+See [`reference/ipc.md`](../reference/ipc.md#tabsend_file) for both ops'
+wire shapes, [`reference/paths.md`](../reference/paths.md#session-profile)
+for where the files land, and the [host-sessions
+guide](../guides/host-sessions.md#pasting-images-and-files-into-a-host-tab)
+for the user-facing shape.
 
 ## Direction (under evaluation)
 

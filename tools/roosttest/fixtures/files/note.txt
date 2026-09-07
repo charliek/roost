@@ -1,0 +1,2 @@
+roost plan 047 fixture
+A plain text file a host tab's agent can attach by path.

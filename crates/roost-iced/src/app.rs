@@ -63,6 +63,7 @@ use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, Engi
 use crate::font_registry::{system_font_registry, FontRegistry};
 use crate::notifications::DesktopNotifications;
 use crate::palette_scroll::Visibility;
+use crate::paste_image::{Materialized, ProbeError};
 use crate::sidebar_resize::SidebarResizeGrip;
 use crate::strip_reorder::{ReorderStrip, StripEvent};
 use crate::terminal_widget::{
@@ -77,6 +78,7 @@ use crate::{chrome, input};
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 pub(crate) mod agent_hooks;
 pub(crate) mod bootstrap;
+pub(crate) mod file_transfer;
 mod host_dialog;
 pub(crate) mod host_lifecycle;
 pub(crate) mod host_notice;
@@ -1450,6 +1452,19 @@ fn resolve_keyboard_route(
 /// Iced-side mapping is `Task::future(_).map(Message::EngineOp)`.
 pub type EngineOpFuture = Pin<Box<dyn Future<Output = EngineOpResult> + Send>>;
 
+/// One `session.put_file` in flight, boxed for the same reason
+/// [`EngineOpFuture`] is.
+pub type UploadFuture = Pin<Box<dyn Future<Output = crate::host_conn::UploadResult> + Send>>;
+
+/// Which half of the clipboard-image probe a target wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeSink {
+    /// A local tab: write the temp PNG and paste its path.
+    TempFile,
+    /// A host tab: the encoded bytes, which go over the wire instead.
+    Bytes,
+}
+
 #[derive(Default)]
 pub enum UiTask {
     #[default]
@@ -1486,14 +1501,44 @@ pub enum UiTask {
         target: ClipboardOp,
         text: String,
     },
+    /// `clipboard.write { image_png }`'s half of the queue (plan 047
+    /// §3.5). The decode and the platform write both block, so this
+    /// runs on the blocking pool — which is also where `reply` is
+    /// answered, since only there is it known whether the clipboard
+    /// really took the image.
+    ClipboardWriteImage {
+        request_id: u64,
+        png: Vec<u8>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    },
     OpenUrl {
         url: String,
     },
     /// A paste found no text on the system clipboard — go look for an
     /// image. The read + PNG encode block, so this runs off the UI
     /// thread and reports back as `Message::PasteImageMaterialized`.
+    ///
+    /// `sink` is chosen from the target tab when the probe is spawned: a
+    /// host tab's image must never touch this machine's disk (plan 047
+    /// §3.2), so it stops at the bytes.
     PasteImageProbe {
         tab: TabKey,
+        sink: ProbeSink,
+    },
+    /// `metadata` a dropped batch off the UI thread — the only
+    /// filesystem access a gesture makes on this side. Answers as
+    /// `Message::FilesInspected`.
+    InspectFiles {
+        id: u64,
+        paths: Vec<PathBuf>,
+    },
+    /// One file on its way to a host, on the upload lane's own
+    /// connection. Answers as `Message::UploadSettled`.
+    Upload {
+        host: HostId,
+        gesture: u64,
+        index: usize,
+        future: UploadFuture,
     },
     /// One-shot: wake once the file-drop gesture's debounce window has
     /// elapsed. Scheduled where the deadline is set, never polled.
@@ -1970,6 +2015,11 @@ pub struct App {
     confirm_delete: Option<ConfirmDeleteProject>,
     pending_attachments: servicing::PendingAttachments,
     file_drops: FileDropQueue,
+    /// Per-host upload gestures (plan 047 §3.3). Holds the reply
+    /// oneshots C6's `tab.send_file` waits on, so it must be dropped
+    /// while those callers can still hear the answer — its `Drop`
+    /// answers everything it still holds.
+    gestures: file_transfer::Gestures,
     config: RoostConfig,
     typography: TerminalTypography,
     font_registry: &'static FontRegistry,
@@ -2309,6 +2359,7 @@ impl App {
             confirm_delete: None,
             pending_attachments: servicing::PendingAttachments::default(),
             file_drops: FileDropQueue::default(),
+            gestures: file_transfer::Gestures::default(),
             config,
             typography,
             font_registry,
@@ -2800,9 +2851,10 @@ impl App {
         let now = Instant::now();
         let new_origin = native_file_drop_origin(self.window_id, window_id, self.keyboard_route());
         let (ready, accepted) = self.file_drops.push_at(new_origin, path, now);
-        if let Some(batch) = ready {
-            self.deliver_file_drop(batch);
-        }
+        let delivered = match ready {
+            Some(batch) => self.send_files(batch.tab, batch.paths, None),
+            None => UiTask::None,
+        };
         if !accepted {
             tracing::debug!("ignored native file drop without an active terminal input route");
         }
@@ -2810,17 +2862,18 @@ impl App {
         // ones that only extended the window. The earlier shots then fire
         // against a deadline that has moved and find nothing ready, which
         // is why they need no cancellation.
-        match self.file_drops.pending_deadline() {
+        delivered.then(match self.file_drops.pending_deadline() {
             Some(deadline) => UiTask::FileDropDeadline(deadline.saturating_duration_since(now)),
             None => UiTask::None,
-        }
+        })
     }
 
     /// A file-drop debounce window elapsed. Stale shots — one whose
     /// deadline a later path extended — find nothing ready and do nothing.
-    pub fn file_drop_deadline(&mut self) {
-        if let Some(batch) = self.file_drops.take_ready_at(Instant::now()) {
-            self.deliver_file_drop(batch);
+    pub fn file_drop_deadline(&mut self) -> UiTask {
+        match self.file_drops.take_ready_at(Instant::now()) {
+            Some(batch) => self.send_files(batch.tab, batch.paths, None),
+            None => UiTask::None,
         }
     }
 

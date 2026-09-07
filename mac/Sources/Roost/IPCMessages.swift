@@ -651,10 +651,19 @@ let ipcProtocolVersion: UInt32 = 1
 /// the two move independently. Mirrors Rust's
 /// `messages::SESSION_PROTOCOL_VERSION`.
 ///
-/// `2` is HS-1b's breaking bump: `events.subscribe` and `tab.attach`
+/// The rule: an **additive op bumps this when a pre-bump peer could
+/// not refuse it meaningfully**. A new event name inside an existing
+/// batch does not — an old client ignores it — and neither does an op
+/// an old session never receives.
+///
+/// `3` is plan 047's bump for `session.put_file`: a pre-047 session
+/// answers `unknown-op` to a paste the user just performed, and no
+/// per-paste special case was worth carrying forever.
+///
+/// `2` was HS-1b's breaking bump: `events.subscribe` and `tab.attach`
 /// require the lease `session.connect` mints, so a client written
 /// against `1` is rejected rather than served.
-let ipcSessionProtocolVersion: UInt32 = 2
+let ipcSessionProtocolVersion: UInt32 = 3
 
 /// Maximum length of a single framed line. Matches roost-ipc's
 /// `MAX_FRAME_BYTES`.

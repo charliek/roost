@@ -56,9 +56,13 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import os
+import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import session as sessionlib
@@ -67,6 +71,10 @@ from agent_jail import INSTALLABLE_AGENTS
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
+from util import drain, drain_until_match
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
+import pngtool  # noqa: E402  — pure stdlib PNG decoder, imported not shelled out
 
 pytestmark = pytest.mark.host_client
 
@@ -1742,3 +1750,357 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
     assert not claude_settings.exists() or (
         "ROOST_AGENT_HOOK" not in claude_settings.read_text()
     ), "off removed the record but left the entry in the file"
+
+
+# ---------------------------------------------------------------------------
+# 14. Plan 047 — bytes across the host boundary
+#
+# A host tab looks like a local tab, so a paste or a drop into one has to
+# behave like a local one: the image attaches, the file attaches. It
+# cannot work the local way — the agent runs on the far machine and the
+# path this client would paste names nothing there — so the bytes cross
+# as `session.put_file` and what gets pasted is a **host** path.
+#
+# That is what these cases read: not "the op returned ok" but "there is a
+# file on the far side, inside this fixture's jail, whose content is the
+# one this test put on the clipboard or named on the command line". The
+# jail read is a plain `pathlib` open — there is no IPC op for a session's
+# file store, deliberately (§3.1), so the harness reaches for the bytes
+# the way the agent will.
+#
+# The image half needs a real clipboard, which is what
+# `clipboard.write { image_png }` is for (§3.5): a test-mode seam that
+# hands arboard a PNG and returns once a reader can see it. Whether this
+# box's display server will take one is the display server's answer
+# rather than something the UI predicts, so the case attempts it and
+# skips on the `not-supported` a compositor with no clipboard to write
+# earns (#302) — the same shape as the rest of the clipboard tier.
+# ---------------------------------------------------------------------------
+
+
+FIXTURE_FILES = Path(__file__).resolve().parent / "fixtures" / "files"
+
+# What `paste_image::temp_png_name` mints (which `session.put_file` keeps
+# as the far-side basename), and the per-file ceiling both ends read.
+# Restated rather than imported for the reason every copied constant here
+# is: the first is the #282 charset pin, the second is the number an
+# off-by-one would move, and a change to either should have to be made
+# twice, on purpose.
+HOST_IMAGE_PATH = re.compile(rb"/[A-Za-z0-9._/-]*roost-image-\d+-[0-9a-f]{16}\.png")
+PUT_FILE_CAP = 10 * 1024 * 1024
+
+
+def in_the_jail(host, path: str) -> Path:
+    """A host path the client pasted, checked to be inside this session's
+    own root before anything opens it.
+
+    The check is the point, not the ceremony: `pasted` is a string a
+    *session* chose, and a lane that opened whatever it was handed would
+    keep passing if a host started answering with `/etc/passwd` — or with
+    the client's own source path, which would satisfy a byte comparison
+    while proving nothing crossed. Both sides are resolved and the answer
+    is containment, not a prefix, so `<jail>/../outside` and a symlink out
+    of the store fail here rather than read fine.
+
+    The session's root is the fixture's temp dir (`SessionEnv.root`), so
+    on Linux the store lands at
+    `<root>/cache/<namespace>/files/<16 hex>/<name>`.
+    """
+    landed = Path(path).resolve()
+    assert landed.is_relative_to(host.env.root.resolve()), (
+        f"a host path outside this session's jail: {path!r} (jail {host.env.root})"
+    )
+    return landed
+
+
+@pytest.fixture
+def connected_host_tab(host, roost):
+    """A connected host with one quiet tab, focused, its attach traffic
+    already drained — the starting point every case in this section
+    shares."""
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+    key = host_key(roost, tab)
+    focus(roost, key)
+    drain(roost, key)  # what the attach itself sent
+    yield host, key
+
+
+@pytest.fixture
+def clipboard_left_empty(roost):
+    """Take the system clipboard back at the end of a case that seeded an
+    image on it.
+
+    The write leaves a process-lifetime arboard handle owning the
+    selection (`paste_image::IMAGE_CLIPBOARD`), so an image this case put
+    there outlives it — and a *later* case's paste would find it and
+    upload it. A text write is what takes ownership back, and running it
+    from a finalizer is what makes it happen on the failing runs too,
+    which are exactly the ones that leave an image behind.
+    """
+    yield
+    with contextlib.suppress(RoostError):
+        roost.clipboard_write("system", "")
+
+
+def test_a_clipboard_image_pasted_into_a_host_tab_becomes_a_host_file(
+    connected_host_tab, roost, clipboard_left_empty
+):
+    """§3.5's end-to-end claim, and the reason the seam exists.
+
+    Every agent reads the clipboard itself on Ctrl+V, which cannot work
+    over SSH — so pasting a *host* path is the only route that composes
+    with a remote host, and this is the case that proves the whole chain:
+    a real PNG on this machine's clipboard, the paste accelerator, an
+    empty text read (which is what makes the probe fire at all), an
+    upload, and a path in the tab's input queue naming a file that exists
+    on the far side with the pixels we copied.
+
+    Pixels, not bytes: arboard re-encodes with its own PNG writer on the
+    way onto the clipboard and again on the way off, so byte equality
+    would be asserting something the design never promised. The image is
+    what survives the crossing.
+
+    The tail is §3.5's other half — a later *text* write clears the
+    image. Two clipboard owners live in this process (iced's for text,
+    arboard's for the image), and "the image is still there under the
+    text" would be a seam that lies to every case after this one. It
+    cannot be read off `clipboard.dump`, which sees text only, so the
+    proof is a second paste: with the text emptied the probe runs again,
+    and a surviving image would upload and paste a path.
+    """
+    host, key = connected_host_tab
+    source = FIXTURE_FILES / "shot.png"
+
+    try:
+        roost.clipboard_write_image(source.read_bytes())
+    except RoostError as error:
+        if error.code == "not-supported":
+            pytest.skip(f"this UI cannot seed a clipboard image: {error.message}")
+        raise
+    # The probe only runs when the text read came back empty, so an image
+    # write that left text behind would make the rest of this vacuous.
+    assert not roost.clipboard_dump("system"), "the image write left text on the clipboard"
+
+    roost.call("app.keybind_dispatch", {"action": "paste"})
+    queued = drain_until_match(roost, key, HOST_IMAGE_PATH, timeout=60.0)
+    landed = in_the_jail(host, HOST_IMAGE_PATH.search(queued).group(0).decode())
+    assert landed.is_file(), f"the pasted path names nothing on the host: {landed}"
+    assert pngtool.load(str(landed)) == pngtool.load(str(source)), (
+        "the image on the host is not the image that was copied"
+    )
+
+    # And now the text write, which must take the selection back.
+    text = marker("AFTER-IMAGE")
+    roost.clipboard_write("system", text)
+    wait_until(
+        lambda: roost.clipboard_dump("system") == text,
+        30.0,
+        "a text clipboard write to replace the image",
+    )
+
+    roost.clipboard_write("system", "")
+    wait_until(
+        lambda: roost.clipboard_dump("system") == "",
+        30.0,
+        "an empty text clipboard, which is what makes the probe run",
+    )
+    drain(roost, key)
+    roost.call("app.keybind_dispatch", {"action": "paste"})
+    quiet = b""
+    deadline = time.monotonic() + scaled_timeout(5.0)
+    while time.monotonic() < deadline:
+        quiet += drain(roost, key)
+        assert not HOST_IMAGE_PATH.search(quiet), f"the image outlived the text: {quiet!r}"
+        time.sleep(0.05)
+    quiet += drain(roost, key)
+    assert not HOST_IMAGE_PATH.search(quiet), f"the image outlived the text: {quiet!r}"
+
+
+def test_send_file_uploads_a_batch_and_pastes_every_host_path(connected_host_tab, roost):
+    """The drop route as an op (§3.4), over the three shapes an agent is
+    actually handed at once: an image, a document, a text file.
+
+    `tab.send_file` is what a drop, a `roostctl tab send-file` and a
+    future Swift drop all funnel through, so asserting on it here covers
+    the surfaces that have no test seam of their own. One gesture rather
+    than three: `session.put_file` treats the three identically, and the
+    batch additionally pins what a single-file case cannot — that a drop
+    of several files uploads all of them and pastes all of their paths,
+    in the order they were given. Every field of every row is checked
+    against the file it names, `bytes` in particular, since a truncated
+    upload would still produce a path and still paste.
+    """
+    host, key = connected_host_tab
+    sources = [FIXTURE_FILES / name for name in ("shot.png", "note.pdf", "note.txt")]
+
+    result = roost.tab_send_file(key, sources)
+
+    assert result["skipped"] == [], result
+    sent = {row["name"]: row for row in result["uploads"]}
+    assert sorted(sent) == sorted(source.name for source in sources), result
+    for source in sources:
+        row = sent[source.name]
+        assert row["source"] == str(source), row
+        assert row["bytes"] == source.stat().st_size, row
+        landed = in_the_jail(host, row["path"])
+        assert landed.name == source.name, f"the basename must survive the crossing: {landed}"
+        assert landed.read_bytes() == source.read_bytes(), f"{source.name} did not cross intact"
+
+    assert result["pasted"] == "\n".join(row["path"] for row in result["uploads"]), result
+    drain_until_match(roost, key, re.escape(result["pasted"].encode()), timeout=60.0)
+
+
+def test_a_file_at_the_cap_crosses_and_one_byte_over_never_leaves(
+    connected_host_tab, roost, tmp_path
+):
+    """The per-file ceiling, from both sides of the boundary.
+
+    Exactly `MAX_PUT_FILE_BYTES` is the *passing* half and matters more
+    than the refusal: an off-by-one in either the client's planner or the
+    session's pre-decode screen would show up here as a 10 MiB file that
+    cannot be sent at all. So the bytes are read back off the far side
+    and the path is watched into the tab, exactly as the smaller batch
+    does — a reply reporting 10 MiB over a file that arrived truncated,
+    or never arrived, is the failure this size is most likely to have.
+
+    The refusal is `invalid-param`, not `too-large`. Both ends read the
+    same constant, so the client's planner skips an over-cap file
+    (`over-cap`) before a byte is read and the batch has nothing left to
+    send — a `too-large` from the host is unreachable through this route
+    by construction, and is pinned where it can happen, in the session's
+    own dispatch tests. What this asserts is that the refusal *names the
+    file and the reason*, which is what a caller can act on. The
+    over-cap file is sparse: the planner refuses it on `st_size`, so
+    10 MiB of real bytes would only slow the case down.
+    """
+    host, key = connected_host_tab
+
+    exact = tmp_path / "exact.bin"
+    exact.write_bytes(b"\xa5" * PUT_FILE_CAP)
+    at_cap = roost.tab_send_file(key, [exact])
+    assert at_cap["skipped"] == [], at_cap
+    assert at_cap["uploads"][0]["bytes"] == PUT_FILE_CAP, at_cap
+    landed = in_the_jail(host, at_cap["pasted"])
+    assert landed.read_bytes() == exact.read_bytes(), "the file at the cap did not cross intact"
+    drain_until_match(roost, key, re.escape(at_cap["pasted"].encode()), timeout=60.0)
+
+    over = tmp_path / "over.bin"
+    over.touch()
+    os.truncate(over, PUT_FILE_CAP + 1)
+    refusal = refused(roost.tab_send_file, key, [over])
+    assert refusal.code == "invalid-param", refusal
+    assert str(over) in refusal.message, refusal
+    assert "over-cap" in refusal.message, refusal
+
+
+def test_a_directory_in_a_batch_is_skipped_and_a_batch_of_only_one_is_refused(
+    connected_host_tab, roost, tmp_path
+):
+    """A drop is whatever the file manager handed over, so "some of this
+    cannot be sent" is the ordinary case, not the error case.
+
+    The two halves are deliberately different answers: a batch with
+    something left to send succeeds and *reports* what it dropped, and a
+    batch with nothing left is refused by name rather than succeeding
+    with an empty paste. An all-skipped gesture that answered ok would
+    look, from the tab, exactly like a paste that silently vanished —
+    which is the complaint this whole plan is about.
+    """
+    _host, key = connected_host_tab
+    folder = tmp_path / "a folder"
+    folder.mkdir()
+    source = FIXTURE_FILES / "note.txt"
+
+    mixed = roost.tab_send_file(key, [source, folder])
+    assert [row["path"] for row in mixed["uploads"]] == [mixed["pasted"]], mixed
+    assert mixed["skipped"] == [{"path": str(folder), "reason": "directory"}], mixed
+
+    only_a_directory = refused(roost.tab_send_file, key, [folder])
+    assert only_a_directory.code == "invalid-param", only_a_directory
+    assert str(folder) in only_a_directory.message, only_a_directory
+    assert "directory" in only_a_directory.message, only_a_directory
+
+
+def test_send_file_on_a_local_tab_pastes_the_escaped_local_path(roost, project, tmp_path):
+    """The same op, the other target: nothing crosses a boundary and the
+    text is the one a drop has always produced.
+
+    The space in the name is the assertion — a local paste is shell
+    input, so it is escaped, while a host path is bare by construction
+    (the session guarantees the whole path is paste-safe, §3.1). One op,
+    two spellings, decided by the target and not by the caller.
+    """
+    source = tmp_path / "a note.txt"
+    source.write_text("local\n")
+    tab = quiet_tab(roost, project, tmp_path)
+    drain(roost, tab)
+
+    result = roost.tab_send_file(tab, [source])
+
+    assert result["uploads"] == [], result
+    assert result["skipped"] == [], result
+    assert result["pasted"] == str(source).replace(" ", r"\ "), result
+    drain_until_match(roost, tab, re.escape(result["pasted"].encode()))
+
+
+def test_send_file_into_a_frozen_host_frame_is_refused(host, roost):
+    """The #376 rule, applied to the newest way of putting bytes in a tab.
+
+    A taken-over host keeps its last frame — that is what makes the
+    freeze recoverable — so the tab is still there, still addressable,
+    and still looks like somewhere a file could go. Nothing on the other
+    end will ever read it. The refusal has to come *before* anything is
+    uploaded, which is what `host-unavailable` (rather than a timeout, or
+    a successful-looking empty result) says.
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+    key = host_key(roost, tab)
+
+    with host.client() as interloper:
+        lease = HostUnderTest.lease(interloper, takeover=True)
+        with EventStream(host.env.socket, lease=lease) as stream:
+            # Subscribing is what makes the takeover *land*: the lease
+            # alone does not displace the connected client until the
+            # interloper is actually listening, so without this the wait
+            # below races and times out on a loaded runner.
+            stream.subscribe()
+            host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
+            refusal = refused(roost.tab_send_file, key, [FIXTURE_FILES / "note.txt"])
+            assert refusal.code == "host-unavailable", refusal
+
+
+def test_roostctl_tab_send_file_prints_the_host_path_it_pasted(
+    connected_host_tab, roost, target
+):
+    """The CLI verb, run the way a user runs it.
+
+    `roostctl tab send-file` is the surface a script reaches for, and its
+    contract is narrow enough to be worth a subprocess: it blocks until
+    the paste is queued and prints **the host path**, so `$(roostctl tab
+    send-file …)` is a usable expression. The client class cannot assert
+    that — it never spawns the binary — and the argument parsing that
+    gets there is unit-tested but the plumbing between them is not.
+    """
+    host, key = connected_host_tab
+    source = FIXTURE_FILES / "shot.png"
+
+    ran = host.env.roostctl(
+        "--socket",
+        str(ui.socket_path(target)),
+        "tab",
+        "send-file",
+        "--tab",
+        key,
+        str(source),
+        timeout=180.0,
+    )
+
+    assert ran.returncode == 0, ran
+    pasted = ran.stdout.strip()
+    landed = in_the_jail(host, pasted)
+    assert landed.read_bytes() == source.read_bytes(), f"roostctl printed {pasted}"
+    drain_until_match(roost, key, re.escape(pasted.encode()), timeout=60.0)
