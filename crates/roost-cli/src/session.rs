@@ -40,6 +40,8 @@ use roost_ipc::session_launch::{
 };
 use roost_ipc::IpcClient;
 
+use crate::autostart::{self, AutostartCmd};
+
 /// How long to wait for the spawned `roost-session start` to print its
 /// verdict line, and how long to poll before declaring the verdict a
 /// lie. Both are read off the daemon's own waits rather than chosen
@@ -61,7 +63,7 @@ const STATUS_NOT_RUNNING_EXIT: i32 = 3;
 /// Scale every budget above by [`timeout_scale`] — the same reader
 /// `roost-session` uses, so a loaded CI runner widens the driver's
 /// waits alongside the daemon's.
-fn scaled(budget: Duration) -> Duration {
+pub(crate) fn scaled(budget: Duration) -> Duration {
     budget.mul_f64(timeout_scale())
 }
 
@@ -79,8 +81,14 @@ pub enum SessionCmd {
     /// Stopping something that is not running succeeds.
     Stop,
     /// Print the running session's identity and workspace size, or
-    /// report that none is running (exit 3).
+    /// report that none is running (exit 3). Either way the
+    /// `autostart=` line prints too — the two are independent.
     Status,
+    /// Install or remove the supervisor artifact that brings a session
+    /// back after a login or a reboot (`systemd --user` on Linux,
+    /// launchd on macOS).
+    #[command(subcommand)]
+    Autostart(AutostartCmd),
 }
 
 /// Run a `session` verb. Returns the process exit code rather than
@@ -90,6 +98,7 @@ pub async fn run(cmd: &SessionCmd) -> i32 {
         SessionCmd::Start => start().await,
         SessionCmd::Stop => stop().await,
         SessionCmd::Status => status().await,
+        SessionCmd::Autostart(cmd) => autostart::run(cmd).await,
     };
     match result {
         Ok(code) => code,
@@ -260,6 +269,9 @@ async fn status() -> Result<i32> {
 
     if probe_gone(&socket).await {
         println!("not running (no session at {})", socket.display());
+        // Printed in this branch too: whether the next login brings a
+        // session back is exactly what a stopped one raises.
+        println!("{}", autostart::status_line());
         return Ok(STATUS_NOT_RUNNING_EXIT);
     }
 
@@ -283,6 +295,7 @@ async fn status() -> Result<i32> {
 
     print_identity(&identity, &socket);
     println!("projects={}\ntabs={tabs}", list.projects.len());
+    println!("{}", autostart::status_line());
     Ok(0)
 }
 
