@@ -342,25 +342,28 @@ mod tests {
         path
     }
 
-    /// An executable shell script that behaves like a `roost-session`
-    /// launcher — well or badly, per `body`.
+    /// A `roost-session` launcher that behaves well or badly, per `body`.
     ///
-    /// The script states its own `PATH` because a spawned launcher
-    /// inherits this process's environment, and `doctor`'s tests point
-    /// the process-global `PATH` at an empty directory while they run.
-    /// Without this, a body using `sleep` or `head` silently becomes a
-    /// body that exits instantly, and these tests pass or fail on which
-    /// suite they were run with.
+    /// A symlink to the committed fixture plus `body` in a plain
+    /// `.conf` file beside it, never a script of our own: these cases
+    /// run in parallel threads, and an executable written while a
+    /// sibling is forking races `execve` — the fork inherits our
+    /// still-open write descriptor, and the exec answers ETXTBSY on
+    /// Linux (#431). The fixture sources the conf, which has no such
+    /// window, and pins the `PATH` the body runs under — see its header.
     fn fake_launcher(dir: &Path, body: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(BIN_NAME);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\n{body}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(path.with_extension("conf"), format!("{body}\n")).unwrap();
+        std::os::unix::fs::symlink(launcher_fixture(), &path).unwrap();
         path
+    }
+
+    fn launcher_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
+            .canonicalize()
+            .expect("the fake-roost-session fixture must exist")
     }
 
     /// A unique scratch directory. `std::env::temp_dir()` plus the test
@@ -762,6 +765,17 @@ mod tests {
         let bin = fake_launcher(&dir, body);
         let started = std::time::Instant::now();
         let verdict = spawn_and_read_verdict(&bin, &dir, None, TEST_BUDGET).await;
+        // Every case is about what the launcher did once it ran. A spawn
+        // that never happened must not read as a launcher verdict: five
+        // of these cases expect an `Err`, and without this four of them
+        // fail on the text with no mention of the spawn while the fifth
+        // passes outright.
+        if let Err(error) = &verdict {
+            assert!(
+                !error.to_string().starts_with("spawn "),
+                "the launcher was never run: {error:#}"
+            );
+        }
         (verdict, started.elapsed())
     }
 

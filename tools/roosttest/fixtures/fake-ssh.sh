@@ -28,6 +28,14 @@
 #                         `run-remote` it is how the far side gets its
 #                         `HOME`, its `PATH` and its filesystem jail
 #                         (see below).
+#   FAKE_SSH_EXIT_HOLD    optional directory that parks a `-O exit`: the
+#                         exit path creates `<dir>/started`, then waits
+#                         (10 ms polls; after 6000 of them — a minute or
+#                         so — exit 70, so a forgotten release is loud) for `<dir>/release` to exist
+#                         before it logs or removes anything. A test that
+#                         cancels a teardown mid-flight drives the
+#                         cancellation point with this instead of racing
+#                         the scheduler for it.
 #
 # Modes:
 #
@@ -182,13 +190,29 @@ for arg in "$@"; do
 done
 
 if [ "$is_exit" -eq 1 ]; then
+    if [ -n "${FAKE_SSH_EXIT_HOLD:-}" ]; then
+        : >"$FAKE_SSH_EXIT_HOLD/started"
+        waited=0
+        while [ ! -e "$FAKE_SSH_EXIT_HOLD/release" ]; do
+            if [ "$waited" -ge 6000 ]; then
+                printf '%s\n' "fake-ssh: -O exit held through 6000 polls and never released" >&2
+                exit 70
+            fi
+            sleep 0.01
+            waited=$((waited + 1))
+        done
+    fi
+    # The record goes down before the socket does: a kill that lands
+    # between the two can then never read as "ctl gone, nothing logged",
+    # which is the one shape a teardown test cannot tell from a bug.
     if [ -n "$ctl" ] && [ -e "$ctl" ]; then
         line="$line${TAB}ctl-exists=1"
+        printf '%s\n' "$line" >>"$FAKE_SSH_LOG"
         rm -f "$ctl"
     else
         line="$line${TAB}ctl-exists=0"
+        printf '%s\n' "$line" >>"$FAKE_SSH_LOG"
     fi
-    printf '%s\n' "$line" >>"$FAKE_SSH_LOG"
     exit 0
 fi
 
