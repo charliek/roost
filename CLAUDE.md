@@ -152,6 +152,9 @@ wrapper small.
 - Default to no comments. Add a comment only when the WHY is
   non-obvious — a hidden constraint, a workaround, a tricky
   invariant. Don't comment what well-named code already says.
+  State that WHY **once**, where the thing is defined — not again at
+  every call site, and not restated in the doc of the test that pins
+  it.
 - No `// TODO: ...` left in committed code. Either do it, file an
   issue, or leave a `// XXX:` for known dead-ends.
 

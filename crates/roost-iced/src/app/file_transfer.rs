@@ -50,9 +50,6 @@ const MAX_QUEUED_GESTURES: usize = 8;
 /// How a gesture ended. Exactly one of these reaches a [`GestureReply`],
 /// on every path out — including the queue being dropped with gestures
 /// still in it.
-// C6's `tab.send_file` is the caller that reads these; until then the
-// queue's own tests are what pin them.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(super) enum GestureOutcome {
     Pasted {
@@ -66,8 +63,14 @@ pub(super) enum GestureOutcome {
     Failed { name: String, error: HostOpError },
     /// The uploads landed but the paste could not: the world moved under
     /// the gesture. Typed rather than stringified so C6 can map it onto
-    /// the error precedence in §3.4.
-    Lost(LostReason),
+    /// the error precedence in §3.4, and carrying the file the status
+    /// line named so §3.4's "message naming the file where there is one"
+    /// holds on the wire too. `None` is a gesture that lost before any
+    /// file was its own to name.
+    Lost {
+        reason: LostReason,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,23 @@ pub(super) enum LostReason {
     Inspection,
     /// The queue was dropped with this gesture still in it.
     Shutdown,
+}
+
+impl LostReason {
+    /// What this reason says, once. The status line the `App` paints and
+    /// the `tab.send_file` message its caller reads both come from here,
+    /// so a toast and a wire answer cannot disagree about what happened.
+    pub(super) fn sentence(&self) -> &'static str {
+        match self {
+            LostReason::Reconnected => "the host reconnected",
+            LostReason::Disconnected => "the host disconnected",
+            LostReason::Frozen(refusal) => refusal,
+            LostReason::TabClosed => "the tab closed before the files could be pasted",
+            LostReason::QueueFull => "too many files are waiting for this host",
+            LostReason::Inspection => "reading the files did not finish",
+            LostReason::Shutdown => "the app is shutting down",
+        }
+    }
 }
 
 /// One file that reached the host.
@@ -126,6 +146,15 @@ pub(super) enum Effect {
     Paste {
         tab: TabKey,
         text: String,
+    },
+    /// Answer the waiting caller — an effect rather than a call, so that
+    /// it lands *after* the [`Effect::Paste`] before it. §3.4's reply
+    /// means "the paste has been queued", and the reply crosses a tokio
+    /// task: answered first, a `tab.send_file` caller could see success
+    /// before a byte reached the tab's input side.
+    Answer {
+        reply: GestureReply,
+        outcome: GestureOutcome,
     },
 }
 
@@ -339,8 +368,14 @@ pub(super) const HOST_UNAVAILABLE: &str = "that host is not accepting operations
 /// rather than growing without bound. Answers the reply and returns the
 /// line the `App` should show.
 fn queue_full(name: &str, label: &str, reply: Option<GestureReply>) -> String {
-    answer(reply, GestureOutcome::Lost(LostReason::QueueFull));
-    status::failed(name, label, "too many files are waiting for this host")
+    answer(reply, lost_outcome(LostReason::QueueFull, None));
+    status::failed(name, label, LostReason::QueueFull.sentence())
+}
+
+/// A lost gesture, and the file it lost — `None` where the gesture never
+/// had one of its own to name.
+fn lost_outcome(reason: LostReason, name: Option<String>) -> GestureOutcome {
+    GestureOutcome::Lost { reason, name }
 }
 
 fn answer(reply: Option<GestureReply>, outcome: GestureOutcome) {
@@ -610,7 +645,7 @@ impl Gestures {
         };
         tracing::info!(tab = ?pending.tab, message, "a file inspection did not finish");
         let line = status::failed("files", &pending.label, message);
-        answer(pending.reply, GestureOutcome::Lost(LostReason::Inspection));
+        answer(pending.reply, lost_outcome(LostReason::Inspection, None));
         let mut effects = vec![Effect::Status(line)];
         effects.extend(self.start_head(pending.tab.host));
         effects
@@ -730,11 +765,11 @@ impl Drop for Gestures {
             if let Some(active) = lane.active.take() {
                 answer(
                     active.gesture.reply,
-                    GestureOutcome::Lost(LostReason::Shutdown),
+                    lost_outcome(LostReason::Shutdown, None),
                 );
             }
             for slot in lane.queued.drain(..) {
-                answer(slot.reply(), GestureOutcome::Lost(LostReason::Shutdown));
+                answer(slot.reply(), lost_outcome(LostReason::Shutdown, None));
             }
         }
     }
@@ -787,37 +822,38 @@ fn finish_pasted(active: Active, gate: PasteGate) -> Vec<Effect> {
                 .join("\n");
             let names: Vec<String> = sent.iter().map(|file| file.name.clone()).collect();
             let line = status::sent(&names, &label, &skipped);
+            let mut effects = vec![Effect::Paste {
+                tab,
+                text: text.clone(),
+            }];
+            if let Some(reply) = reply {
+                effects.push(Effect::Answer {
+                    reply,
+                    outcome: GestureOutcome::Pasted {
+                        text,
+                        uploads: sent,
+                        skipped,
+                    },
+                });
+            }
+            effects.push(Effect::Status(line));
+            effects
+        }
+        PasteGate::Reconnected => lost(&sent, &label, LostReason::Reconnected, reply),
+        PasteGate::Disconnected => lost(&sent, &label, LostReason::Disconnected, reply),
+        PasteGate::Frozen(refusal) => {
             answer(
                 reply,
-                GestureOutcome::Pasted {
-                    text: text.clone(),
-                    uploads: sent,
-                    skipped,
-                },
+                lost_outcome(LostReason::Frozen(refusal), first_name(&sent)),
             );
-            vec![Effect::Paste { tab, text }, Effect::Status(line)]
-        }
-        PasteGate::Reconnected => lost(
-            &sent,
-            &label,
-            "the host reconnected",
-            LostReason::Reconnected,
-            reply,
-        ),
-        PasteGate::Disconnected => lost(
-            &sent,
-            &label,
-            "the host disconnected",
-            LostReason::Disconnected,
-            reply,
-        ),
-        PasteGate::Frozen(refusal) => {
-            answer(reply, GestureOutcome::Lost(LostReason::Frozen(refusal)));
             vec![Effect::Status(refusal.to_string())]
         }
         PasteGate::TabClosed => {
             tracing::debug!(?tab, "discarded a finished upload gesture for a closed tab");
-            answer(reply, GestureOutcome::Lost(LostReason::TabClosed));
+            answer(
+                reply,
+                lost_outcome(LostReason::TabClosed, first_name(&sent)),
+            );
             Vec::new()
         }
     }
@@ -826,17 +862,18 @@ fn finish_pasted(active: Active, gate: PasteGate) -> Vec<Effect> {
 /// The uploads landed but the paste cannot: one sentence, naming one
 /// file. One name for a batch, deliberately — the status table names a
 /// file, and the first is the one the user pointed at.
-fn lost(
-    sent: &[Sent],
-    label: &str,
-    reason: &str,
-    lost: LostReason,
-    reply: Option<GestureReply>,
-) -> Vec<Effect> {
-    let name = sent.first().map(|file| file.name.as_str()).unwrap_or("");
-    let line = status::failed(name, label, reason);
-    answer(reply, GestureOutcome::Lost(lost));
+fn lost(sent: &[Sent], label: &str, lost: LostReason, reply: Option<GestureReply>) -> Vec<Effect> {
+    let line = status::failed(
+        first_name(sent).as_deref().unwrap_or(""),
+        label,
+        lost.sentence(),
+    );
+    answer(reply, lost_outcome(lost, first_name(sent)));
     vec![Effect::Status(line)]
+}
+
+fn first_name(sent: &[Sent]) -> Option<String> {
+    sent.first().map(|file| file.name.clone())
 }
 
 /// Upload `name` failed: nothing is pasted, the files already up there
@@ -927,7 +964,7 @@ impl super::App {
         }
         if !facts.tab_live {
             tracing::debug!(?tab, "discarded a file gesture for a closed tab");
-            answer(reply, GestureOutcome::Lost(LostReason::TabClosed));
+            answer(reply, lost_outcome(LostReason::TabClosed, None));
             return UiTask::None;
         }
         match route(target, paths) {
@@ -962,7 +999,7 @@ impl super::App {
     ) -> UiTask {
         if !live {
             tracing::debug!(?tab, "discarded a file gesture for a closed tab");
-            answer(reply, GestureOutcome::Lost(LostReason::TabClosed));
+            answer(reply, lost_outcome(LostReason::TabClosed, None));
             return UiTask::None;
         }
         let outcome = match route(Target::Local, paths) {
@@ -1089,6 +1126,7 @@ impl super::App {
             match effect {
                 Effect::Status(line) => self.set_status(line),
                 Effect::Paste { tab, text } => deliver_paste_image(&self.tabs, tab, Some(&text)),
+                Effect::Answer { reply, outcome } => answer(Some(reply), outcome),
                 Effect::StartUpload {
                     host,
                     gesture,
@@ -1133,10 +1171,7 @@ impl super::App {
         let saved = self.host_view(tab.host).map(|view| view.saved_id.as_str());
         TransferFacts {
             is_local: tab.is_local(),
-            tab_live: self.tabs.contains_key(&tab)
-                && tab
-                    .local_tab()
-                    .is_none_or(|tab_id| self.workspace.tab(tab_id).is_ok()),
+            tab_live: self.tab_live(tab),
             frozen: self
                 .frozen_host_frame_for(tab)
                 .map(|frame| frame.paste_refusal()),
@@ -1152,6 +1187,17 @@ impl super::App {
 
     pub(super) fn transfer_target(&self, tab: TabKey) -> Target {
         target_of(&self.transfer_facts(tab))
+    }
+
+    /// A tab worth pasting into: it has a terminal, and — if it is local
+    /// — the workspace still has the row behind it. One decider, so
+    /// `tab.send_file`'s `not-found` and the gate's
+    /// [`LostReason::TabClosed`] mean the same thing.
+    pub(super) fn tab_live(&self, tab: TabKey) -> bool {
+        self.tabs.contains_key(&tab)
+            && tab
+                .local_tab()
+                .is_none_or(|tab_id| self.workspace.tab(tab_id).is_ok())
     }
 
     /// The label a status line names this host by. (`host_label` on
@@ -1469,7 +1515,8 @@ mod tests {
         );
         assert!(matches!(
             outcome(&mut rx),
-            GestureOutcome::Lost(LostReason::Disconnected)
+            GestureOutcome::Lost { reason: LostReason::Disconnected, name }
+                if name.as_deref() == Some("a.txt")
         ));
     }
 
@@ -1665,7 +1712,10 @@ mod tests {
         );
         assert!(matches!(
             outcome(&mut rx),
-            GestureOutcome::Lost(LostReason::QueueFull)
+            GestureOutcome::Lost {
+                reason: LostReason::QueueFull,
+                name: None
+            }
         ));
         assert!(rx.try_recv().is_err(), "and only once");
 
@@ -1679,7 +1729,10 @@ mod tests {
         );
         assert!(matches!(
             outcome(&mut rx),
-            GestureOutcome::Lost(LostReason::QueueFull)
+            GestureOutcome::Lost {
+                reason: LostReason::QueueFull,
+                name: None
+            }
         ));
     }
 
@@ -1718,7 +1771,10 @@ mod tests {
         assert_eq!(name, "b.txt");
         assert!(matches!(
             outcome(&mut rx),
-            GestureOutcome::Lost(LostReason::Inspection)
+            GestureOutcome::Lost {
+                reason: LostReason::Inspection,
+                name: None
+            }
         ));
         assert!(rx.try_recv().is_err(), "and only once");
 
@@ -1860,6 +1916,21 @@ mod tests {
         rx.try_recv().expect("the gesture answered exactly once")
     }
 
+    /// Run the [`Effect::Answer`]s in order and hand back the rest — the
+    /// test-side half of `App::run_transfer_effects`.
+    fn run_answers(effects: Vec<Effect>) -> Vec<Effect> {
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Answer { reply, outcome } => {
+                    let _ = reply.send(outcome);
+                    None
+                }
+                other => Some(other),
+            })
+            .collect()
+    }
+
     #[test]
     fn every_terminal_path_answers_the_reply_exactly_once() {
         // Refusal.
@@ -1915,7 +1986,7 @@ mod tests {
             );
             gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), gate);
             assert!(
-                matches!(outcome(&mut rx), GestureOutcome::Lost(reason) if reason == expected),
+                matches!(outcome(&mut rx), GestureOutcome::Lost { reason, .. } if reason == expected),
                 "{gate:?} must answer {expected:?}"
             );
         }
@@ -1930,7 +2001,7 @@ mod tests {
             &[("a.txt", "/tmp/a.txt", 1)],
             Some(tx),
         );
-        gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), PasteGate::Ready);
+        run_answers(gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), PasteGate::Ready));
         let GestureOutcome::Pasted {
             text,
             uploads,
@@ -1950,6 +2021,57 @@ mod tests {
             }]
         );
         assert!(skipped.is_empty());
+    }
+
+    /// A1 / §3.4: the reply *means* "the paste has been queued", so it
+    /// rides the effect list behind the paste instead of being sent
+    /// while the paste is still an intention. It crosses a tokio task,
+    /// so answering first would let a `tab.send_file` caller see success
+    /// and then `tab.capture_pty_input` an empty tab.
+    #[test]
+    fn a_pasted_gestures_answer_follows_its_paste_through_the_effects() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut gestures = Gestures::default();
+        let (id, _) = begun(
+            &mut gestures,
+            tab(3, 7),
+            "workbox",
+            &[("a.txt", "/tmp/a.txt", 1)],
+            Some(tx),
+        );
+        let effects = gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), PasteGate::Ready);
+
+        let order: Vec<&str> = effects
+            .iter()
+            .map(|effect| match effect {
+                Effect::Paste { .. } => "paste",
+                Effect::Answer { .. } => "answer",
+                Effect::Status(_) => "status",
+                Effect::StartUpload { .. } => "upload",
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["paste", "answer", "status"],
+            "the answer is strictly behind the paste it reports"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "and nothing is answered while the paste is still only an effect"
+        );
+
+        assert_eq!(
+            pastes(&effects),
+            vec![(tab(3, 7), "/files/a.txt".to_string())]
+        );
+        run_answers(effects);
+        let GestureOutcome::Pasted { text, .. } = outcome(&mut rx) else {
+            panic!("a landed gesture pastes")
+        };
+        assert_eq!(text, "/files/a.txt");
     }
 
     /// Dropping the queue — app shutdown — answers everything still in
@@ -1982,7 +2104,10 @@ mod tests {
         for rx in [&mut running, &mut queued, &mut inspecting] {
             assert!(matches!(
                 outcome(rx),
-                GestureOutcome::Lost(LostReason::Shutdown)
+                GestureOutcome::Lost {
+                    reason: LostReason::Shutdown,
+                    name: None
+                }
             ));
         }
     }

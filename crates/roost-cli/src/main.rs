@@ -15,6 +15,7 @@
 //!   roostctl tab close [--tab ID]
 //!   roostctl tab send [--tab ID] --bytes 'echo hi\n' [--raw]
 //!   roostctl tab send [--tab ID] --bytes-base64 BASE64
+//!   roostctl tab send-file --tab ID PATH… [--json]
 //!   roostctl tab resize [--tab ID] --cols N --rows N
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
@@ -49,6 +50,7 @@ mod session;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::prelude::*;
@@ -67,8 +69,8 @@ use roost_ipc::messages::{
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
     ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
     TabCloseParams, TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetStateParams, TabSetTitleParams,
-    TabState, TabWriteParams, WireProjectRef, WireTabRef,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
+    TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
@@ -336,6 +338,26 @@ enum TabCmd {
     Focus {
         #[arg(long, env = "ROOST_TAB_ID")]
         tab: Option<String>,
+    },
+    /// Send local files to a tab: upload them to the tab's host and
+    /// paste the host paths, or — for a local tab — paste the escaped
+    /// local paths. The same route a file drop onto the tab takes.
+    ///
+    /// `--tab` is **required**: the no-flag fallback resolves the UI's
+    /// local active tab, which is never the host tab a caller means.
+    ///
+    /// **Blocks** until the paste has been queued in the tab — up to
+    /// the upload budget for large files — and prints nothing until
+    /// then. Deliberate: there is no progress channel, and the pasted
+    /// text is the only thing worth printing. Prints the pasted text;
+    /// `--json` prints the whole result (uploads + skips).
+    SendFile {
+        #[arg(long)]
+        tab: String,
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// List projects + their tabs. `--json` emits the machine-readable
     /// workspace snapshot (the `tab.list` result) instead of plain text.
@@ -935,6 +957,30 @@ async fn main() -> Result<()> {
             client
                 .call::<_, serde_json::Value>(ops::TAB_WRITE, TabWriteParams { tab_id, data })
                 .await?;
+        }
+        Cmd::Tab(TabCmd::SendFile { tab, paths, json }) => {
+            let tab_id = wire_tab_ref(&mut client, Some(tab.as_str())).await?;
+            let paths = canonicalize_for_send_file(&paths)?;
+            let budget = send_file_budget(paths.len(), timeout_scale());
+            let call = client.call(
+                ops::TAB_SEND_FILE,
+                TabSendFileParams {
+                    tab: tab_id.to_string(),
+                    paths,
+                },
+            );
+            let result: TabSendFileResult =
+                tokio::time::timeout(budget, call).await.map_err(|_| {
+                    anyhow!(
+                        "tab send-file gave up after {}s; the paste may still land in the tab",
+                        budget.as_secs()
+                    )
+                })??;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", result.pasted);
+            }
         }
         Cmd::Tab(TabCmd::Resize { tab, cols, rows }) => {
             let tab_id = resolve_tab(&mut client, tab).await?;
@@ -1759,6 +1805,41 @@ async fn wire_tab_ref(client: &mut IpcClient, explicit: Option<&str>) -> Result<
     }
 }
 
+/// `tab.send_file`'s paths as the op wants them: absolute and existing.
+///
+/// Canonicalized in **roostctl's** cwd, because that is where the
+/// caller typed them and the UI's cwd is not it — the op refuses a
+/// relative path for exactly that reason. A path that is not there is
+/// this side's error, naming the path, rather than a wire round-trip
+/// that comes back saying the same thing later.
+fn canonicalize_for_send_file(paths: &[PathBuf]) -> Result<Vec<String>> {
+    paths
+        .iter()
+        .map(|path| {
+            let resolved = std::fs::canonicalize(path)
+                .map_err(|e| anyhow!("cannot send {}: {e}", path.display()))?;
+            resolved.into_os_string().into_string().map_err(|bad| {
+                anyhow!(
+                    "cannot send {}: the resolved path is not valid UTF-8",
+                    Path::new(&bad).display()
+                )
+            })
+        })
+        .collect()
+}
+
+/// How long `tab send-file` waits for its paste to be queued.
+///
+/// §3.4 blocks until then "up to the upload budget", and `IpcClient`
+/// has no request timeout of its own — so a wedged UI would hang
+/// `roostctl` forever. One dial's worth of slack plus §3.3's per-file
+/// budget (~298 s for a 10 MiB file at the modelled rate, rounded), and
+/// the harness's `ROOST_TEST_TIMEOUT_SCALE` stretches it as it does
+/// every other budget.
+fn send_file_budget(paths: usize, scale: f64) -> Duration {
+    Duration::from_secs(60 + 300 * paths as u64).mul_f64(scale)
+}
+
 /// Resolve the tab id for a per-tab command. Falls back to the
 /// running UI's active tab via `identify` when neither `--tab` nor
 /// `ROOST_TAB_ID` is set. Errors with a clear message when the UI
@@ -1858,6 +1939,79 @@ mod tests {
         for refused in ["h0.7", "007", "+7", "h2.", "", "h.7"] {
             assert!(WireTabRef::parse(refused).is_none(), "{refused:?}");
         }
+    }
+
+    /// `tab send-file` requires `--tab` — unlike every other per-tab
+    /// verb — and at least one path.
+    #[test]
+    fn send_file_requires_a_tab_and_at_least_one_path() {
+        let args = Args::try_parse_from(["roostctl", "tab", "send-file", "--tab", "h2.7", "a.png"])
+            .expect("a tab and a path parse");
+        let Cmd::Tab(TabCmd::SendFile { tab, paths, json }) = args.command else {
+            panic!("expected tab send-file")
+        };
+        assert_eq!(tab, "h2.7");
+        assert_eq!(paths, vec![PathBuf::from("a.png")]);
+        assert!(!json);
+
+        assert!(
+            Args::try_parse_from(["roostctl", "tab", "send-file", "a.png"]).is_err(),
+            "--tab must not fall back to the active tab"
+        );
+        assert!(
+            Args::try_parse_from(["roostctl", "tab", "send-file", "--tab", "h2.7"]).is_err(),
+            "a send with no files is a typo, not an empty batch"
+        );
+    }
+
+    /// Paths are resolved in **roostctl's** cwd before they go on the
+    /// wire, and a path that is not there is this side's error, naming
+    /// the path.
+    #[test]
+    fn send_file_canonicalizes_in_its_own_cwd_and_names_a_missing_path() {
+        let exe = std::env::current_exe().expect("the test binary is a real file");
+        let canonical = std::fs::canonicalize(&exe).expect("canonicalize");
+        let dir = canonical.parent().expect("the binary has a directory");
+
+        // A detour through `..` is the same file once resolved: what
+        // goes on the wire is absolute, `..`-free and symlink-free.
+        let indirect = dir
+            .join("..")
+            .join(dir.file_name().expect("a named directory"))
+            .join(canonical.file_name().expect("a named file"));
+        assert_eq!(
+            canonicalize_for_send_file(&[indirect]).expect("an existing path resolves"),
+            vec![canonical.to_string_lossy().to_string()]
+        );
+
+        for missing in [
+            PathBuf::from("roost-047-no-such-file"),
+            std::env::temp_dir().join("roost-047-no-such-file"),
+        ] {
+            let error = canonicalize_for_send_file(std::slice::from_ref(&missing))
+                .expect_err("a path that is not there is our error, not the wire's");
+            assert!(
+                error.to_string().contains(&missing.display().to_string()),
+                "{error}"
+            );
+        }
+    }
+
+    /// A5 / §3.4: the block is bounded, and the bound grows with the
+    /// batch rather than being one flat number a big drop outruns.
+    #[test]
+    fn the_send_file_wait_is_one_dial_plus_a_per_file_upload_budget() {
+        assert_eq!(send_file_budget(1, 1.0), Duration::from_secs(360));
+        assert_eq!(send_file_budget(4, 1.0), Duration::from_secs(1260));
+        assert_eq!(
+            send_file_budget(4, 2.5),
+            Duration::from_secs(3150),
+            "a scaled harness stretches it like every other budget"
+        );
+        assert!(
+            send_file_budget(1, 1.0) > roost_ipc::session_launch::IPC_TIMEOUT,
+            "and it is never the ordinary request timeout"
+        );
     }
 
     #[test]

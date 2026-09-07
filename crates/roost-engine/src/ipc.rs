@@ -49,9 +49,10 @@ use roost_ipc::messages::{
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
-    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
+    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
+    WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -514,6 +515,24 @@ pub enum UiRequest {
         host: u32,
         tab_id: i64,
         reply: HostReply<()>,
+    },
+    /// `tab.send_file` — put these local files into that tab, the same
+    /// route a native drop takes (plan 047 §3.4).
+    ///
+    /// `paths` arrives exactly as the caller sent it, and unread: the
+    /// app validates it non-empty and absolute — §3.4 ranks the tab and
+    /// the host ahead of the paths, and only the app can answer those —
+    /// and the app is the process that opens them, so the handler never
+    /// touches a filesystem it might not share.
+    ///
+    /// Like [`UiRequest::HostTabReorder`] this cannot be answered
+    /// inside `update` — the uploads and the paste are a gesture the
+    /// app runs over many frames — so the reply travels with the
+    /// gesture and is answered from wherever it ends.
+    TabSendFile {
+        tab: WireTabRef,
+        paths: Vec<String>,
+        reply: HostOpReply<TabSendFileResult>,
     },
     /// `tab.reorder` for a host-qualified project: send that host's
     /// session the whole new tab order over its op queue (plan 044
@@ -1930,13 +1949,11 @@ fn mixed_refs(op: &str) -> HandlerError {
     ))
 }
 
-/// The host form is client state: the connection whose session would
-/// serve it lives in the app, so a socket with no UI has nothing to
-/// route to. The `tab.focus` guard, one op over.
-fn needs_a_ui(op: &str) -> HandlerError {
-    HandlerError::invalid_param(format!(
-        "a host-qualified {op} needs a UI: host connections are client state"
-    ))
+/// A request only an app can serve. `what` is the request as the
+/// refusal names it (a whole op, or just its host-qualified form) and
+/// `because` is what the app has that this socket does not.
+fn needs_a_ui(what: &str, because: &str) -> HandlerError {
+    HandlerError::invalid_param(format!("{what} needs a UI: {because}"))
 }
 
 /// A session socket has one bare id-space and no host connections, so a
@@ -1979,7 +1996,10 @@ fn tab_reorder_route(
                 })
                 .collect::<Result<_, _>>()?;
             if !h.has_ui() {
-                return Err(needs_a_ui(op));
+                return Err(needs_a_ui(
+                    &format!("a host-qualified {op}"),
+                    "host connections are client state",
+                ));
             }
             Ok((ReorderInstance::Host(host), project, tab_ids))
         }
@@ -2025,7 +2045,10 @@ fn project_reorder_route(
         })
         .collect::<Result<_, _>>()?;
     if !h.has_ui() {
-        return Err(needs_a_ui(op));
+        return Err(needs_a_ui(
+            &format!("a host-qualified {op}"),
+            "host connections are client state",
+        ));
     }
     Ok((ReorderInstance::Host(host), project_ids))
 }
@@ -3030,8 +3053,9 @@ async fn dispatch(
                 WireTabRef::Local(tab_id) => tab_id,
                 WireTabRef::Host { host, tab } => {
                     if !h.has_ui() {
-                        return Err(HandlerError::invalid_param(
-                            "a host-qualified tab.focus needs a UI: host selection is client state",
+                        return Err(needs_a_ui(
+                            "a host-qualified tab.focus",
+                            "host selection is client state",
                         ));
                     }
                     h.ui_call(|reply| UiRequest::HostTabFocus {
@@ -3056,6 +3080,31 @@ async fn dispatch(
                 previous_project_id,
                 previous_tab_id,
             })
+        }
+        ops::TAB_SEND_FILE => {
+            let p: TabSendFileParams = decode(params)?;
+            // Only what is decidable with no client state at all: the
+            // ref spelling and the fact that there is an app. The paths
+            // are the app's to judge, because §3.4's precedence puts
+            // `not-found` and `host-unavailable` ahead of a relative
+            // path and only the app knows those two.
+            let tab = WireTabRef::parse(&p.tab).ok_or_else(|| {
+                HandlerError::invalid_param(format!("invalid tab reference: {}", p.tab))
+            })?;
+            if !h.has_ui() {
+                return Err(needs_a_ui(
+                    ops::TAB_SEND_FILE,
+                    "reading the files and typing the paste are the app's",
+                ));
+            }
+            let result = h
+                .ui_call(|reply| UiRequest::TabSendFile {
+                    tab,
+                    paths: p.paths,
+                    reply,
+                })
+                .await??;
+            encode(&result)
         }
         ops::TAB_SET_TITLE => {
             let p: TabSetTitleParams = decode(params)?;

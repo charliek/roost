@@ -465,6 +465,35 @@ class Roost:
     def clipboard_write(self, target: str, text: str) -> None:
         self.call("clipboard.write", {"target": target, "text": text})
 
+    # -- files into a tab (plan 047 §3.4) ---------------------------------
+    def tab_send_file(self, tab: str | int, paths) -> dict:
+        """Send local files to a tab — the drop route, as an op.
+
+        `tab` takes `tab.focus`'s spelling: a bare id (or an int) for a
+        local tab, `h<host>.<id>` for a connected host's. Every path
+        must be **absolute**; duplicates are dropped first-seen.
+
+        Returns the result verbatim: ``{"pasted": str, "uploads":
+        [{source, name, path, bytes}, ...], "skipped": [{path,
+        reason}, ...]}`` — `uploads` empty and `pasted` the escaped
+        local paths for a local tab.
+
+        **Blocks** until the paste has been queued in the tab (what
+        `tab_capture_pty_input` sees), not until the host acknowledges
+        anything — the data plane has no acknowledgement. A large
+        upload can therefore take a while; the client's own socket
+        timeout, if one was set, is what bounds the wait.
+
+        Every refusal raises `RoostError` with the op's code:
+        `not-found` for a tab this UI does not have, `host-unavailable`
+        for a host that is frozen, gone or reconnected mid-gesture,
+        `invalid-param` for a relative path or a batch where every item
+        was skipped, `too-large` / `store-full` from the host."""
+        return self.call(
+            "tab.send_file",
+            {"tab": str(tab), "paths": [str(path) for path in paths]},
+        )
+
     # -- test-only PTY drain ops (ROOST_TEST_MODE=1) ---------------------
     # `tab.feed_pty_bytes` injects bytes into a tab's PTY-output drain;
     # `tab.capture_pty_input` reads the bytes the UI has queued back

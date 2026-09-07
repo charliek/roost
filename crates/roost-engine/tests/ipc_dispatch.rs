@@ -1006,6 +1006,105 @@ async fn a_session_without_a_store_answers_not_supported() {
     assert_eq!(code(&error), "not-supported");
 }
 
+/// Plan 047 §3.4: the dispatcher decides the ref spelling and nothing
+/// else — the paths reach the app untouched, because §3.4 ranks the tab
+/// and the host ahead of them and only the app can answer those. The
+/// recorder proves both halves: a misspelt ref never becomes a gesture,
+/// and the paths the app hears are the ones the caller sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tab_send_file_refuses_a_misspelt_ref_before_the_ui_hears_it() {
+    use roost_engine::ipc::UiRequest;
+    use roost_ipc::messages::{TabSendFileParams, TabSendFileResult};
+
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = IpcHandler::new(
+        Arc::new(Workspace::new()),
+        Arc::new(PtySupervisor::new()),
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    )
+    .with_ui(ui_tx);
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Stand in for the app: record the request and answer with the
+    // paths it was handed, so the reply carries what crossed the seam.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<String>)>::new()));
+    let recorder = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Some(request) = ui_rx.recv().await {
+            if let UiRequest::TabSendFile { tab, paths, reply } = request {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push((tab.to_string(), paths.clone()));
+                let _ = reply.send(Ok(TabSendFileResult {
+                    pasted: paths.join("\n"),
+                    ..TabSendFileResult::default()
+                }));
+            }
+        }
+    });
+
+    let mut client = connect_with_retry(&server_socket).await;
+
+    // A relative path rides along untouched: the app is the one that
+    // judges it, after the tab and the host.
+    let sent: TabSendFileResult = client
+        .call(
+            ops::TAB_SEND_FILE,
+            TabSendFileParams {
+                tab: "h2.7".into(),
+                paths: vec!["/tmp/b.txt".into(), "tmp/relative.txt".into()],
+            },
+        )
+        .await
+        .expect("tab.send_file");
+    assert_eq!(
+        sent.pasted, "/tmp/b.txt\ntmp/relative.txt",
+        "the paths cross the seam as the caller spelled them"
+    );
+
+    for (tab, paths, needle) in [
+        // Non-canonical spellings are refused rather than normalized,
+        // the same rule `tab.focus`'s ref parser states.
+        ("h0.7", vec!["/tmp/a.txt"], "h0.7"),
+        ("007", vec!["/tmp/a.txt"], "007"),
+        ("", vec!["/tmp/a.txt"], "invalid tab reference"),
+    ] {
+        let error = client
+            .call_raw(
+                ops::TAB_SEND_FILE,
+                TabSendFileParams {
+                    tab: tab.into(),
+                    paths: paths.iter().map(|p| p.to_string()).collect(),
+                },
+            )
+            .await
+            .expect_err("a malformed tab.send_file must be refused");
+        assert_eq!(code(&error), "invalid-param", "{tab} {paths:?}");
+        let roost_ipc::ClientError::Server { message, .. } = &error else {
+            unreachable!()
+        };
+        assert!(message.contains(needle), "{tab} {paths:?}: {message}");
+    }
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(
+            "h2.7".to_string(),
+            vec!["/tmp/b.txt".to_string(), "tmp/relative.txt".to_string()]
+        )],
+        "only the well-spelled ref may reach the app"
+    );
+}
+
 /// Connect to a freshly-bound server with bounded retries instead of
 /// a flat sleep. CI runners under load can take more than 50ms to
 /// schedule the accept loop; a bounded retry is robust without

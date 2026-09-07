@@ -168,6 +168,38 @@ async fn a_session_socket_does_not_know_the_host_ops() {
     );
 }
 
+/// `tab.send_file` is a UI-socket op (plan 047 §3.4): the files are the
+/// UI process's to read and the paste is its tab to type. A session
+/// daemon has no UI, so it refuses — but as `invalid-param`, the same
+/// answer a host-qualified `tab.focus` gives a UI-less handler, not
+/// `unknown-op`.
+///
+/// The `unknown-op` list above it is deliberately not extended: that
+/// list exists for the *host registry*, which a daemon must not grow a
+/// shadow copy of. `tab.send_file` writes nothing anywhere without a
+/// UI, so the honest refusal is the one that names what is missing —
+/// and it is the same refusal every other UI-only op gives on this
+/// socket, rather than a second convention for one op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_socket_cannot_send_files_into_a_tab() {
+    for with_session in [true, false] {
+        let f = fixture(with_session);
+        let err = call(
+            &f.handler,
+            ops::TAB_SEND_FILE,
+            serde_json::json!({"tab": "7", "paths": ["/tmp/a.txt"]}),
+        )
+        .await
+        .expect_err("no UI, no send");
+        assert_eq!(err.code, "invalid-param", "with_session={with_session}");
+        assert!(
+            err.message.contains("needs a UI"),
+            "with_session={with_session}: {}",
+            err.message
+        );
+    }
+}
+
 /// A session's tab ids are one bare id-space; the `h<host>.<id>` wire
 /// spelling names a UI's client-side tab and is refused by name rather
 /// than silently narrowed to a number (plan 037 §3.4). The refusal
