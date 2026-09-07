@@ -26,7 +26,9 @@ synchronization.
 
 from __future__ import annotations
 
+import base64
 import os
+import re
 import signal
 import stat
 import threading
@@ -35,6 +37,18 @@ import pytest
 import session as sessionlib
 from client import RoostError
 from eventstream import EventStream
+
+# The resume cases below are effect cases too — a resumed stream must
+# never carry an effect out of its gap — so they borrow the helpers that
+# already drive one over a real daemon rather than growing a second copy
+# of `osc52` here.
+from test_session_effects import (
+    batches_through,
+    connect_lease,
+    next_effect,
+    osc52,
+    quiet_tab,
+)
 
 pytestmark = pytest.mark.session_daemon
 
@@ -695,7 +709,414 @@ def test_events_push_reaches_a_python_subscriber(env):
 
 
 # ---------------------------------------------------------------------------
-# 15. The CLI's own verbs, end to end
+# 15. Resuming a stream from a revision (plan 052 §3.4-§3.6)
+# ---------------------------------------------------------------------------
+#
+# A subscriber that drops off does not have to re-snapshot: it presents
+# the fence it had and the session replays the gap out of a bounded ring.
+# The client half is unchanged — `expect_contiguous` from the ack is
+# still the whole loss check, across the replay/live boundary as much as
+# within it.
+#
+# Never a literal revision anywhere below: hydration and a tab's own PTY
+# activity move a fresh session's revision before any of this runs, so
+# every fence is one a stream watched arrive.
+
+# What the outside-the-window case shrinks the ring to, through the
+# daemon's test-mode `ROOST_SESSION_REPLAY_WINDOW`: small enough that a
+# handful of commits rolls a fence off the back of it. The shipped
+# default is 1024 batches, which no end-to-end test can outrun cheaply.
+REPLAY_WINDOW = 4
+
+
+def current_revision(client) -> int:
+    """The revision a `tab.list` snapshot carries — the same number an
+    `events.subscribe` ack means, which is what makes the two
+    interchangeable as a fence."""
+    return int(client.call("tab.list")["revision"])
+
+
+def revision_beyond(client, fence: int, what: str) -> int:
+    """Wait until the workspace has committed past `fence`; return where
+    it got to.
+
+    A condition wait rather than one read, because not every commit these
+    cases drive is synchronous with the op that caused it: bytes fed into
+    a tab's drain reach `commit` on the session's own tasks, well after
+    `tab.feed_pty_bytes` has replied.
+    """
+
+    def moved():
+        revision = current_revision(client)
+        return revision if revision > fence else None
+
+    return sessionlib.wait_until(moved, 20.0, what)
+
+
+def watched_fence(env, client, tab: int, title: str) -> int:
+    """Open a stream, drive one commit, watch it land, and return the
+    revision the client now holds — the fence a resume presents."""
+    with EventStream(env.socket) as live:
+        fence = live.subscribe()
+        client.set_title(tab, title)
+        batches, envelope = live.recv_until("tab.title_changed", timeout=20.0)
+        live.expect_contiguous(batches, fence)
+        assert envelope["data"]["title"] == title, envelope
+        return int(batches[-1]["revision"])
+
+
+def titles_in(batches: list[dict]) -> list[str]:
+    return [
+        envelope["data"]["title"]
+        for batch in batches
+        for envelope in batch["events"]
+        if envelope["event"] == "tab.title_changed"
+    ]
+
+
+def event_names(batches: list[dict]) -> list[str]:
+    return [envelope["event"] for batch in batches for envelope in batch["events"]]
+
+
+def test_a_resume_replays_the_gap_and_then_runs_live(env):
+    """The whole point of the ring, end to end.
+
+    The fence is the client's promise ("I have everything up to here"),
+    so the ack echoes it and the batches that follow start at fence+1 —
+    the replayed ones and the live ones alike, in one unbroken sequence.
+    A client that could not tell where the replay ended would be right:
+    there is no seam to find.
+    """
+    started(env)
+
+    with env.client() as client:
+        session_id = client.call("session.identify")["session_id"]
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        fence = watched_fence(env, client, tab, "before-the-gap")
+
+        # The gap: commits made while nobody was subscribed.
+        gap_tab = quiet_tab(client, project, env.launch_cwd)
+        client.set_title(tab, "renamed-in-the-gap")
+        client.close_tab(gap_tab)
+        gap_end = revision_beyond(client, fence, "the gap's commits to land")
+
+        with EventStream(env.socket) as resumed:
+            assert resumed.subscribe(from_revision=fence, session_id=session_id) == fence
+
+            replayed = batches_through(resumed, gap_end)
+            resumed.expect_contiguous(replayed, fence)
+            names = event_names(replayed)
+            assert "tab.opened" in names and "tab.closed" in names, names
+            assert "renamed-in-the-gap" in titles_in(replayed), replayed
+
+            # And it is a stream, not a recording: the next commit
+            # arrives on it, in sequence with the replay it followed.
+            client.set_title(tab, "after-the-resume")
+            batches, envelope = resumed.recv_until("tab.title_changed", timeout=20.0)
+            resumed.expect_contiguous(batches, gap_end)
+            assert envelope["data"]["title"] == "after-the-resume", envelope
+
+    env.stop_over_the_wire()
+
+
+def test_a_resume_at_the_current_revision_replays_nothing(env):
+    """`from_revision == current` is a valid resume, not an edge case.
+
+    The client is already caught up, so the ring has nothing to hand it
+    and the first batch on the wire is the *next* commit. That is the
+    assertion below — the first frame after the ack is fence+1 AND
+    carries the title this test set after subscribing — because on this
+    wire "the replay was empty" has no other observable form.
+    """
+    started(env)
+
+    with env.client() as client:
+        session_id = client.call("session.identify")["session_id"]
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        fence = watched_fence(env, client, tab, "caught-up")
+
+        with EventStream(env.socket) as resumed:
+            assert resumed.subscribe(from_revision=fence, session_id=session_id) == fence
+
+            client.set_title(tab, "after-the-empty-replay")
+            frame = resumed.recv_frame(timeout=20.0)
+            assert int(frame["revision"]) == fence + 1, frame
+            assert titles_in([frame]) == ["after-the-empty-replay"], frame
+
+    env.stop_over_the_wire()
+
+
+def test_a_fence_outside_the_replay_window_is_refused_by_name(env):
+    """Past the ring's back edge the answer is a refusal, not a lie.
+
+    The window is a count of commits, so the test drives more of them
+    than the (test-mode) window holds and never names a revision: the
+    refusal has to name `oldest resumable` and `current` itself, which is
+    what tells the client its fence is unreachable rather than its
+    session wrong.
+
+    The second half is the shape of the refusal, not its text: it lands
+    on the **ack**, before the connection flips to a push stream, so the
+    same connection can just subscribe again — which is exactly what a
+    client does after snapshotting.
+    """
+    started(env, ROOST_TEST_MODE="1", ROOST_SESSION_REPLAY_WINDOW=str(REPLAY_WINDOW))
+
+    with env.client() as client:
+        session_id = client.call("session.identify")["session_id"]
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        fence = watched_fence(env, client, tab, "about-to-fall-off-the-ring")
+
+        for n in range(REPLAY_WINDOW * 2):
+            client.set_title(tab, f"past-the-window-{n}")
+        current = revision_beyond(client, fence, "the gap's commits to land")
+        # The premise, in the test's own arithmetic rather than in a
+        # literal: the fence is now further back than the ring reaches.
+        assert current - fence > REPLAY_WINDOW, (current, fence)
+
+        with EventStream(env.socket) as expired:
+            with pytest.raises(RoostError) as refused:
+                expired.subscribe(from_revision=fence, session_id=session_id)
+            assert refused.value.code == "replay-expired", refused.value
+
+            named = re.search(
+                r"revision (\d+) is outside the replay window "
+                r"\(oldest resumable: (\d+), current: (\d+)\)",
+                refused.value.message,
+            )
+            assert named, refused.value.message
+            asked, oldest, now = (int(group) for group in named.groups())
+            assert asked == fence, refused.value.message
+            # The two numbers are the useful half: `oldest` is past the
+            # fence (that is *why* it expired) and `now` is where a
+            # snapshot would land.
+            assert oldest > fence, refused.value.message
+            assert now >= oldest, refused.value.message
+
+            plain = expired.subscribe()
+            assert plain >= now, (plain, now)
+            client.set_title(tab, "after-the-recovery")
+            batches, envelope = expired.recv_until("tab.title_changed", timeout=20.0)
+            expired.expect_contiguous(batches, plain)
+            assert envelope["data"]["title"] == "after-the-recovery", envelope
+
+    env.stop_over_the_wire()
+
+
+def test_a_fence_ahead_of_the_session_is_refused_by_name(env):
+    """A revision this session never produced is its own diagnosis.
+
+    Not `replay-expired` (which says "snapshot and carry on") and not
+    `invalid-param`: a fence from the future means the client is talking
+    to a session it did not fence against, or has a bug, and the message
+    says which two numbers to compare.
+    """
+    started(env)
+
+    with env.client() as client:
+        session_id = client.call("session.identify")["session_id"]
+        ahead = current_revision(client) + 1000
+
+        with EventStream(env.socket) as stream:
+            with pytest.raises(RoostError) as refused:
+                stream.subscribe(from_revision=ahead, session_id=session_id)
+            assert refused.value.code == "revision-ahead", refused.value
+
+            named = re.search(
+                r"never produced revision (\d+) \(current: (\d+)\)", refused.value.message
+            )
+            assert named, refused.value.message
+            asked, now = (int(group) for group in named.groups())
+            assert asked == ahead and now < ahead, refused.value.message
+
+    env.stop_over_the_wire()
+
+
+def test_a_resume_without_a_session_id_is_refused(env):
+    """A resume names the incarnation it fenced against.
+
+    Unnamed, the server cannot tell a stale fence from a valid one — the
+    counter restarts with the process — so the request is refused for
+    what it is missing rather than served against the wrong history.
+    """
+    started(env)
+
+    with env.client() as client:
+        fence = current_revision(client)
+
+        with EventStream(env.socket) as stream:
+            with pytest.raises(RoostError) as refused:
+                stream.subscribe(from_revision=fence)
+            assert refused.value.code == "invalid-param", refused.value
+            assert "session_id" in refused.value.message, refused.value.message
+
+    env.stop_over_the_wire()
+
+
+def test_a_fence_from_a_previous_incarnation_is_refused(env):
+    """The hazard the `session_id` key exists to close.
+
+    Revisions restart at 0 with the process, so a fence carried across a
+    restart names a revision the *new* session may well be able to serve
+    — a different history that would pass the client's gap check
+    perfectly. The incarnation, not the number, is what makes a resume
+    safe, and the refusal names both sessions so a client can see which
+    one it is holding.
+    """
+    started(env)
+
+    with env.client() as client:
+        old_session = client.call("session.identify")["session_id"]
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        fence = watched_fence(env, client, tab, "before-the-restart")
+
+    env.stop_over_the_wire()
+    env.wait_socket_gone()
+
+    started(env)
+    new_session = env.identify()["session_id"]
+    assert new_session != old_session
+
+    with EventStream(env.socket) as resumed:
+        with pytest.raises(RoostError) as refused:
+            resumed.subscribe(from_revision=fence, session_id=old_session)
+        assert refused.value.code == "session-mismatch", refused.value
+        assert old_session in refused.value.message, refused.value.message
+        assert new_session in refused.value.message, refused.value.message
+
+        # Refused on the ack, so the connection never flipped: the
+        # client re-fences against the session it is actually talking to
+        # and carries on, on the same connection.
+        refenced = resumed.subscribe(session_id=new_session)
+        with env.client() as client:
+            restored = int(client.tabs()[0]["id"])
+            client.set_title(restored, "after-the-refence")
+            batches, envelope = resumed.recv_until("tab.title_changed", timeout=20.0)
+            resumed.expect_contiguous(batches, refenced)
+            assert envelope["data"]["title"] == "after-the-refence", envelope
+
+    env.stop_over_the_wire()
+
+
+def test_a_resume_across_a_takeover_replays_the_facts_and_none_of_the_effects(env):
+    """A deposed driver catches up as an observer, and learns it late.
+
+    Three things at once. The workspace facts from the takeover era are
+    replayed — a demoted client is still watching the session, which is
+    the whole of plan 049 §3.8. The effects are not: they are the *live*
+    driver's side-channel (DL-18), and this stream's lease is dead twice
+    over. And `session.driver_changed` is not replayable either — it is
+    per-stream state, not a commit — so the resumed stream never sees
+    one and finds out the way any client that missed the envelope does:
+    from its next lease-bearing op, which answers `taken-over`.
+    """
+    started(env, ROOST_TEST_MODE="1")
+
+    with env.client() as deposed:
+        session_id = deposed.call("session.identify")["session_id"]
+        lease = connect_lease(deposed)
+        project = first_project(deposed)
+        tab = quiet_tab(deposed, project, env.launch_cwd)
+
+        with EventStream(env.socket, lease=lease) as stream:
+            fence = stream.subscribe()
+            # It really was a driver stream before the gap: an effect
+            # arrived on it.
+            deposed.tab_feed_pty_bytes(tab, osc52(b"the driver's clipboard"))
+            data, fence = next_effect(stream, fence)
+            assert data["effect"] == "clipboard-write", data
+
+    # The gap: somebody else takes the lease and drives.
+    with env.client() as phone:
+        connect_lease(phone, takeover=True, label="a phone")
+        phone.tab_feed_pty_bytes(tab, osc52(b"the phone's clipboard"))
+        gap_tab = quiet_tab(phone, project, env.launch_cwd)
+        gap_end = revision_beyond(phone, fence, "the takeover-era commits")
+
+        with EventStream(env.socket, lease=lease) as resumed:
+            assert resumed.subscribe(from_revision=fence, session_id=session_id) == fence
+
+            replayed = batches_through(resumed, gap_end)
+            resumed.expect_contiguous(replayed, fence)
+            opened = [
+                int(envelope["data"]["tab"]["id"])
+                for batch in replayed
+                for envelope in batch["events"]
+                if envelope["event"] == "tab.opened"
+            ]
+            assert gap_tab in opened, replayed
+            assert "tab.effect" not in event_names(replayed), replayed
+            assert resumed.driver_changes == [], resumed.driver_changes
+
+        with env.client() as stale:
+            with pytest.raises(RoostError) as refused:
+                stale.send(tab, "x", lease=lease)
+            assert refused.value.code == "taken-over", refused.value
+
+        phone.call("session.stop")
+
+
+def test_a_driver_that_resumes_is_still_the_driver_but_never_re_lives_its_gap(env):
+    """The case that proves the *ring* strips effects, not the lease.
+
+    This stream's lease is current the whole way through, so nothing
+    downstream would filter anything: if the effect committed during the
+    gap comes back, it came back out of the ring. It does not — the
+    revision arrives as an empty batch, which is how a commit whose only
+    event was an effect is kept visible without being re-enacted — while
+    the ordinary workspace fact beside it replays in full. And the
+    driver is still the driver: the effect fired *after* the resume
+    lands.
+    """
+    started(env, ROOST_TEST_MODE="1")
+
+    with env.client() as client:
+        session_id = client.call("session.identify")["session_id"]
+        lease = connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
+        with EventStream(env.socket, lease=lease) as stream:
+            fence = stream.subscribe()
+            client.tab_feed_pty_bytes(tab, osc52(b"live, before the gap"))
+            data, fence = next_effect(stream, fence)
+            assert data["effect"] == "clipboard-write", data
+
+        # The gap: an effect first, alone, so its revision is known and
+        # can be asserted on by number; then an ordinary fact.
+        client.tab_feed_pty_bytes(tab, osc52(b"stripped by the ring"))
+        effect_revision = revision_beyond(
+            client, fence, "the gap's clipboard effect to commit"
+        )
+        client.set_title(tab, "renamed-in-the-gap")
+        gap_end = revision_beyond(client, effect_revision, "the gap's title change to commit")
+
+        with EventStream(env.socket, lease=lease) as resumed:
+            assert resumed.subscribe(from_revision=fence, session_id=session_id) == fence
+
+            replayed = batches_through(resumed, gap_end)
+            resumed.expect_contiguous(replayed, fence)
+            assert "tab.effect" not in event_names(replayed), replayed
+            stripped = [b for b in replayed if int(b["revision"]) == effect_revision]
+            assert stripped and stripped[0]["events"] == [], (
+                f"the effect's revision must replay as an empty batch: {stripped}"
+            )
+            assert "renamed-in-the-gap" in titles_in(replayed), replayed
+
+            # Still the driver, so a live effect is delivered.
+            client.tab_feed_pty_bytes(tab, osc52(b"live, after the resume"))
+            data, _ = next_effect(resumed, gap_end)
+            assert base64.b64decode(data["data"]) == b"live, after the resume", data
+
+        client.call("session.stop")
+
+
+# ---------------------------------------------------------------------------
+# 16. The CLI's own verbs, end to end
 # ---------------------------------------------------------------------------
 
 

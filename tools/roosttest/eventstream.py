@@ -80,26 +80,55 @@ class EventStream:
         self.close()
 
     # -- protocol ---------------------------------------------------------
-    def subscribe(self, tab_id_filter: int = 0, lease: str | None = None) -> int:
+    def subscribe(
+        self,
+        tab_id_filter: int = 0,
+        lease: str | None = None,
+        from_revision: int | None = None,
+        session_id: str | None = None,
+    ) -> int:
         """Send `events.subscribe` and return the ack's fence revision.
 
         The client already has everything at or below this revision (that
         is what a `tab.list` taken at the same moment means), so the first
         batch it should see is `revision + 1`.
 
+        `from_revision` **resumes** rather than starting fresh (plan 052
+        §3.5): the ack echoes the value back, the gap comes out of the
+        session's bounded replay ring, and live batches follow it with no
+        seam — so `revision + 1` still names the first batch and
+        [`expect_contiguous`] is still the whole gap check. Two things a
+        resuming caller has to know: a resume must name the incarnation
+        it fenced against (`session_id` alone is fine, `from_revision`
+        alone is `invalid-param`, since revisions restart with the
+        process), and every refusal — `session-mismatch`,
+        `replay-expired`, `revision-ahead` — is answered on the *ack*,
+        before the connection flips to a push stream, so a refused caller
+        may simply subscribe again on the same connection.
+
+        Both keys are omitted when None rather than sent as `null`: an
+        optional request field is omit-when-unset on this wire
+        (`docs/reference/ipc-compatibility.md`), which is what lets a
+        pre-052 session answer a plain subscribe instead of
+        `unknown-field`.
+
         Never refused for want of a lease: an absent or stale one opens
         an observer stream instead (plan 049 §3.7). What still refuses is
         `tab_id_filter` (unimplemented) and a session that has already
         latched its stop (`shutting-down`).
         """
-        request = {
-            "id": "1",
-            "op": "events.subscribe",
-            "params": {
-                "lease": self.lease if lease is None else lease,
-                "tab_id_filter": str(tab_id_filter),
-            },
+        params: dict = {
+            "lease": self.lease if lease is None else lease,
+            "tab_id_filter": str(tab_id_filter),
         }
+        if from_revision is not None:
+            # A plain JSON number: a revision is an in-process counter,
+            # not an id, so the string-int convention above does not
+            # apply to it.
+            params["from_revision"] = int(from_revision)
+        if session_id is not None:
+            params["session_id"] = session_id
+        request = {"id": "1", "op": "events.subscribe", "params": params}
         self._sock.sendall((json.dumps(request) + "\n").encode())
         ack = json.loads(self._readline())
         if not ack.get("ok"):

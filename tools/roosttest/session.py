@@ -111,6 +111,11 @@ _SANITIZE = (
     # libghostty build no client can match, so the cases that want it
     # pass it per launch and nothing else inherits one.
     "ROOST_SESSION_FAKE_BUILD",
+    # The replay ring's test-mode window override (plan 052 §3.6), for
+    # the same reason: a stray value in a developer's shell would shrink
+    # (or widen) the ring under every resume case here, including the
+    # ones that assert on a *default*-sized window.
+    "ROOST_SESSION_REPLAY_WINDOW",
     # The install engine's test-mode override. A developer who exported
     # it in their own shell would otherwise hand every session in this
     # module a licence to write real dotfiles; the one case that wants it
