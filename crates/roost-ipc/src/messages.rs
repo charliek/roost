@@ -1295,15 +1295,29 @@ pub struct NotificationCreateParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsSubscribeParams {
-    /// The lease [`ops::SESSION_CONNECT`] handed out. Required on a
-    /// session socket: the event stream is interactive authority, and a
-    /// client that never connected has none.
+    /// The lease [`ops::SESSION_CONNECT`] handed out — a **classifier,
+    /// not a gate** (plan 049 §3.7).
     ///
-    /// Defaulted rather than required by serde so the *decode* still
-    /// succeeds for a client written against the leaseless HS-1a form —
-    /// which then gets `connect-required` naming the step it skipped,
-    /// instead of an envelope-shaped `invalid-param` that names nothing.
-    /// A credential: never logged, never echoed in an error.
+    /// Reading a session is not interactive authority, so a subscribe is
+    /// never refused for want of one. What the lease decides is *what
+    /// arrives*:
+    ///
+    /// * present and current → the **driver** stream: every workspace
+    ///   batch plus [`ops::EVENT_TAB_EFFECT`], which is the driving
+    ///   client's side-channel (bells, OSC 52 clipboard writes) and
+    ///   nobody else's;
+    /// * absent, stale, or unknown → an **observer** stream: every
+    ///   workspace batch plus [`ops::EVENT_NOTIFICATION_FIRED`], with
+    ///   `tab.effect` filtered out. A revision whose every event was
+    ///   filtered still arrives, as an empty [`EventBatch`], because the
+    ///   client's whole loss check is the revision sequence.
+    ///
+    /// A driver stream whose lease is taken over is reclassified in
+    /// place and told once, with [`SESSION_DRIVER_CHANGED_EVENT`].
+    ///
+    /// Defaulted rather than required by serde so a client that holds no
+    /// lease may omit the key entirely. A credential: never logged,
+    /// never echoed in an error.
     #[serde(default)]
     pub lease: String,
     /// Restrict to a single tab. `"0"` (or absent) means all events.

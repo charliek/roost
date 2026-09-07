@@ -2363,8 +2363,11 @@ impl HostConnSet {
         // Stamped once and never cleared until the next `open_ssh`: from
         // here on, every drop for this attempt is a *session going away*
         // rather than a connect that never worked, and the bootstrap
-        // offer turns on exactly that difference.
-        if next.is_connected() {
+        // offer turns on exactly that difference. An observer settlement
+        // reached the session just as surely — it answered the probe —
+        // even though `TakenOver` projects as not-connected everywhere
+        // else (plan 049 §3.11), so it counts here too.
+        if next.is_connected() || matches!(next, HostConnState::TakenOver { .. }) {
             if let Some(ssh) = self
                 .entries
                 .get_mut(&host)
@@ -2381,7 +2384,7 @@ impl HostConnSet {
             // Terminal in the machine, and nothing is armed in any of
             // them: if the entry did not go here, nothing would ever
             // clean it up (§3.4).
-            | HostConnState::TakenOver
+            | HostConnState::TakenOver { .. }
             | HostConnState::Stopped
             | HostConnState::NeedsRestart(_) => self.clear_outage(&host),
             HostConnState::Connecting { .. } | HostConnState::Disconnected(_) => {}
@@ -2854,10 +2857,14 @@ mod tests {
             Some("h2")
         );
         assert_eq!(
-            set.apply_state(first, HostConnState::TakenOver).as_deref(),
+            set.apply_state(first, HostConnState::TakenOver { taken_by: None })
+                .as_deref(),
             Some("h1")
         );
-        assert_eq!(set.state("h1"), Some(&HostConnState::TakenOver));
+        assert_eq!(
+            set.state("h1"),
+            Some(&HostConnState::TakenOver { taken_by: None })
+        );
         assert_eq!(set.state("h2"), Some(&HostConnState::Connected));
         assert_eq!(set.incarnation("h2"), Some(second));
     }
@@ -3377,15 +3384,45 @@ mod tests {
         assert!(!set.ssh_reached_connected("h1"));
     }
 
-    /// The lease's whole life, walked rather than seeded.
-    ///
-    /// Every step of it is somewhere the previous store would have been
-    /// wiped, which is why none of them may be short-circuited: it is
-    /// published at `Connected`, when **no outage exists yet**; the
-    /// outage that copies it out is not created until the drop; and the
-    /// entry it was stamped on is replaced wholesale by the very
-    /// `open_ssh` the ladder re-enters through. A test that seeded any
-    /// one of those by hand would stay green while the guard was dead.
+
+    /// An observer settlement answers the same question: the session
+    /// was reached and refused the lease, which is not "never worked".
+    /// Without this, a client deposed on a fresh tunnel whose observer
+    /// stream later drops would be treated as a connect that never
+    /// happened, and the ladder would give up on it.
+    #[tokio::test]
+    async fn an_observer_settlement_counts_as_having_reached_the_session() {
+        let (mut set, _feed) = a_set();
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-observer.sock"),
+            HostTransport::Ssh,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        assert!(!set.ssh_reached_connected("h1"));
+
+        set.apply_state(
+            incarnation,
+            HostConnState::TakenOver {
+                taken_by: Some("kestrel.local".into()),
+            },
+        );
+        assert!(
+            set.ssh_reached_connected("h1"),
+            "settling as an observer reached the session"
+        );
+    }
     #[tokio::test]
     async fn a_lease_published_at_connected_reaches_the_attempt_after_the_drop() {
         let (mut set, _feed) = a_set();
@@ -3447,6 +3484,15 @@ mod tests {
     /// for that drop, and the ladder goes on presenting a lease the far
     /// side has already tombstoned: `taken-over`, terminal, with no other
     /// client involved (plan 040 §3.7).
+    /// The lease's whole life, walked rather than seeded.
+    ///
+    /// Every step of it is somewhere the previous store would have been
+    /// wiped, which is why none of them may be short-circuited: it is
+    /// published at `Connected`, when **no outage exists yet**; the
+    /// outage that copies it out is not created until the drop; and the
+    /// entry it was stamped on is replaced wholesale by the very
+    /// `open_ssh` the ladder re-enters through. A test that seeded any
+    /// one of those by hand would stay green while the guard was dead.
     #[tokio::test]
     async fn a_second_drop_refreshes_the_lease_the_outage_carries() {
         let (mut set, _feed) = a_set();
@@ -4481,7 +4527,7 @@ mod tests {
         set.apply_state(incarnation, dropped("the connection closed"));
         assert!(set.has_outage("h1"));
 
-        set.apply_state(incarnation, HostConnState::TakenOver);
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
         assert!(!set.has_outage("h1"));
         assert!(set
             .carried_lease("h1", AttemptCause::AutoReconnect)

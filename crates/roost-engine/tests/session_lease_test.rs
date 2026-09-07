@@ -17,7 +17,9 @@ use roost_engine::{AttentionSource, PtySupervisor, Workspace};
 use roost_ipc::messages::{
     ops, AgentHooksMode, AgentHooksSkipped, SessionConnectResult, SessionSetAgentHooksResult,
 };
-use roost_ipc::{CloseReason, ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome};
+use roost_ipc::{
+    CloseReason, ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome, PushSource,
+};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -28,6 +30,21 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     fixture_with(None)
+}
+
+/// A fixture whose push bounds are narrow enough that a test can fill a
+/// subscriber's queue deterministically.
+fn fixture_with_limits(limits: roost_engine::event_push::PushLimits) -> Fixture {
+    let Fixture {
+        handler,
+        workspace,
+        _dir,
+    } = fixture_with(None);
+    Fixture {
+        handler: handler.with_push_limits(limits),
+        workspace,
+        _dir,
+    }
 }
 
 fn fixture_with(agent_hooks: Option<AgentHooksHandle>) -> Fixture {
@@ -82,15 +99,22 @@ fn reply(outcome: HandlerOutcome) -> serde_json::Value {
 }
 
 async fn connect(f: &Fixture, c: &Conn, takeover: bool) -> Result<SessionConnectResult, String> {
-    match f
-        .handler
-        .handle(
-            &c.ctx,
-            ops::SESSION_CONNECT,
-            serde_json::json!({"takeover": takeover}),
-        )
-        .await
-    {
+    connect_as(f, c, takeover, None).await
+}
+
+/// `session.connect` with a self-reported label — the claimant naming
+/// itself, which is the only thing a deposed stream is told about it.
+async fn connect_as(
+    f: &Fixture,
+    c: &Conn,
+    takeover: bool,
+    label: Option<&str>,
+) -> Result<SessionConnectResult, String> {
+    let mut params = serde_json::json!({"takeover": takeover});
+    if let Some(label) = label {
+        params["client_label"] = serde_json::json!(label);
+    }
+    match f.handler.handle(&c.ctx, ops::SESSION_CONNECT, params).await {
         Ok(outcome) => Ok(serde_json::from_value(reply(outcome)).expect("typed connect result")),
         Err(e) => Err(e.code),
     }
@@ -99,7 +123,7 @@ async fn connect(f: &Fixture, c: &Conn, takeover: bool) -> Result<SessionConnect
 /// Subscribe and keep the push source alive: dropping it would end the
 /// relay, and a dead connection is pruned out of the registry — which is
 /// the opposite of what most of these cases are checking.
-async fn subscribe(f: &Fixture, c: &Conn, lease: &str) -> Result<ConnAction, String> {
+async fn subscribe(f: &Fixture, c: &Conn, lease: &str) -> Result<PushSource, String> {
     match f
         .handler
         .handle(
@@ -109,7 +133,13 @@ async fn subscribe(f: &Fixture, c: &Conn, lease: &str) -> Result<ConnAction, Str
         )
         .await
     {
-        Ok(HandlerOutcome::ReplyThen { then, .. }) => Ok(then),
+        Ok(HandlerOutcome::ReplyThen {
+            then: ConnAction::StartPush(source),
+            ..
+        }) => Ok(source),
+        Ok(HandlerOutcome::ReplyThen { then, .. }) => {
+            panic!("subscribe must start a push, not {then:?}")
+        }
         Ok(HandlerOutcome::Reply(value)) => panic!("subscribe must flip to push mode: {value}"),
         Err(e) => {
             assert!(
@@ -120,6 +150,31 @@ async fn subscribe(f: &Fixture, c: &Conn, lease: &str) -> Result<ConnAction, Str
             Err(e.code)
         }
     }
+}
+
+/// The next frame a stream would write, or `None` once its relay is
+/// gone (which is the bare EOF a peer sees).
+async fn next_frame(source: &mut PushSource) -> Option<serde_json::Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), source.next())
+        .await
+        .expect("a stream must answer within its budget")
+}
+
+/// The `taken_by` of the next `session.driver_changed` on this stream,
+/// failing if anything else arrives first.
+async fn next_driver_changed(source: &mut PushSource) -> String {
+    let frame = next_frame(source)
+        .await
+        .expect("a healthy stream is told about the takeover, not cut");
+    assert_eq!(
+        frame["event"],
+        serde_json::json!(roost_ipc::messages::SESSION_DRIVER_CHANGED_EVENT),
+        "unexpected frame: {frame}"
+    );
+    frame["data"]["taken_by"]
+        .as_str()
+        .expect("taken_by is always a string")
+        .to_string()
 }
 
 fn is_hex_32(s: &str) -> bool {
@@ -200,43 +255,147 @@ async fn takeover_replaces_the_lease_and_tombstones_the_old_one() {
     assert!(old != new, "takeover re-issued the displaced lease");
 
     // The tombstone is what turns a stale lease into an instruction:
-    // "you lost it", not "you never had one".
+    // "you lost it", not "you never had one". Read through a lease-gated
+    // op rather than a subscribe, which is free now.
     assert_eq!(
-        subscribe(&f, &conn(3), &old).await.unwrap_err(),
+        set_focus(&f, &conn(3), &old, None).await.unwrap_err(),
         "taken-over"
     );
-    subscribe(&f, &second, &new)
+    set_focus(&f, &second, &new, None)
         .await
         .expect("the new lease works");
 }
 
-/// The takeover's whole job: every connection the previous holder had —
-/// its control connection and any stream it opened — is closed with the
-/// reason that says why, and the requester's own connection is not.
+/// The takeover's whole job, and the one thing it deliberately does not
+/// do: every *writing* connection the previous holder had is closed with
+/// the reason that says why, its **stream survives** and is told instead,
+/// and the requester's own connection is untouched.
+///
+/// The survival is structural, not a skipped branch: streams live in the
+/// observer registry and never under the lease's connection list, so the
+/// closer loop cannot reach one (plan 049 §3.7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn takeover_closes_the_previous_holders_connections_but_never_the_requesters() {
+async fn takeover_closes_the_previous_holders_connections_but_demotes_its_stream() {
     let f = fixture();
     let control = conn(1);
     let lease = connect(&f, &control, false).await.expect("connect").lease;
     let stream = conn(2);
-    let _push = subscribe(&f, &stream, &lease)
+    let mut push = subscribe(&f, &stream, &lease)
         .await
         .expect("subscribe under the live lease");
 
     let taker = conn(3);
-    connect(&f, &taker, true).await.expect("takeover");
+    connect_as(&f, &taker, true, Some("a phone"))
+        .await
+        .expect("takeover");
 
     assert_eq!(control.watch.reason(), Some(CloseReason::TakenOver));
     assert_eq!(
         stream.watch.reason(),
-        Some(CloseReason::TakenOver),
-        "a subscribe registers the connection, which is what makes it reachable by a takeover"
+        None,
+        "a stream is demoted by a takeover, never closed by one"
     );
+    assert_eq!(next_driver_changed(&mut push).await, "a phone");
     assert_eq!(
         taker.watch.reason(),
         None,
         "the requesting connection is the one being answered on"
     );
+
+    // Demoted, not dead: the next commit still reaches it.
+    f.workspace.create_project("after", "/tmp").unwrap();
+    let batch = next_frame(&mut push).await.expect("the stream keeps going");
+    assert!(batch.get("revision").is_some(), "expected a batch: {batch}");
+}
+
+/// Every registered stream learns who took over — not only the deposed
+/// driver's. An observer already watching has the same question, and a
+/// client that never hears the answer has to rediscover it through a
+/// reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_registered_stream_is_told_who_took_over() {
+    let f = fixture();
+    let holder = conn(1);
+    let lease = connect(&f, &holder, false).await.expect("connect").lease;
+
+    // The connections are bound, not passed as temporaries: a dropped
+    // `Conn` drops its close watch, and the registry prunes a stream
+    // whose connection is gone on the next registration.
+    let (a, b, c) = (conn(2), conn(3), conn(4));
+    let mut driver = subscribe(&f, &a, &lease).await.expect("driver stream");
+    let mut observer = subscribe(&f, &b, "").await.expect("observer stream");
+    let mut stale = subscribe(&f, &c, "00000000000000000000000000000000")
+        .await
+        .expect("an unknown lease is an observer, not a refusal");
+
+    connect_as(&f, &conn(5), true, Some("a phone"))
+        .await
+        .expect("takeover");
+
+    for source in [&mut driver, &mut observer, &mut stale] {
+        assert_eq!(next_driver_changed(source).await, "a phone");
+    }
+
+    // All three keep delivering, and each gets the same commit.
+    f.workspace.create_project("after", "/tmp").unwrap();
+    for source in [&mut driver, &mut observer, &mut stale] {
+        let batch = next_frame(source).await.expect("a live stream");
+        assert!(batch.get("revision").is_some(), "expected a batch: {batch}");
+    }
+}
+
+/// Consecutive takeovers arrive in the order they happened — the
+/// injections are serialized by the same registry lock the takeovers
+/// are, so there is no window for two to swap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consecutive_takeovers_arrive_in_order() {
+    let f = fixture();
+    connect(&f, &conn(1), false).await.expect("connect");
+    let watcher = conn(2);
+    let mut watching = subscribe(&f, &watcher, "").await.expect("observer stream");
+
+    connect_as(&f, &conn(3), true, Some("first")).await.unwrap();
+    connect_as(&f, &conn(4), true, Some("second"))
+        .await
+        .unwrap();
+    connect_as(&f, &conn(5), true, None).await.unwrap();
+
+    assert_eq!(next_driver_changed(&mut watching).await, "first");
+    assert_eq!(next_driver_changed(&mut watching).await, "second");
+    assert_eq!(
+        next_driver_changed(&mut watching).await,
+        "unknown client",
+        "taken_by is always a non-empty string; a banner never renders a blank name"
+    );
+}
+
+/// The label is display metadata a client hands over, so it is
+/// normalized before anybody renders it: trimmed, control characters
+/// dropped, capped, and an empty one is no label at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_label_is_normalized_before_it_is_announced() {
+    let f = fixture();
+    connect(&f, &conn(1), false).await.expect("connect");
+    let watcher = conn(2);
+    let mut watching = subscribe(&f, &watcher, "").await.expect("observer stream");
+
+    connect_as(&f, &conn(3), true, Some("  pop\u{7}-os \n"))
+        .await
+        .unwrap();
+    assert_eq!(next_driver_changed(&mut watching).await, "pop-os");
+
+    connect_as(&f, &conn(4), true, Some("   ")).await.unwrap();
+    assert_eq!(
+        next_driver_changed(&mut watching).await,
+        "unknown client",
+        "whitespace is not a name"
+    );
+
+    connect_as(&f, &conn(5), true, Some(&"x".repeat(500)))
+        .await
+        .unwrap();
+    let capped = next_driver_changed(&mut watching).await;
+    assert_eq!(capped.len(), 128, "a label is capped at 128 bytes");
 }
 
 /// A client that already holds a connection under the lease and takes it
@@ -255,36 +414,105 @@ async fn a_registered_connection_taking_over_does_not_close_itself() {
     assert_eq!(first.watch.reason(), Some(CloseReason::TakenOver));
 }
 
+/// Reading a session is not authority (plan 049 §3.7). Absent, empty,
+/// and simply unknown all open a stream — an *observer* one — rather
+/// than being refused; the lease decides what arrives, not whether
+/// anything does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_without_a_usable_lease_names_the_missing_step() {
+async fn a_subscribe_without_a_usable_lease_opens_an_observer_stream() {
     let f = fixture();
 
-    // Absent, empty, and simply wrong all land on the same instruction:
-    // there is no lease here, go get one.
     let missing = f
         .handler
         .handle(&conn(1).ctx, ops::EVENTS_SUBSCRIBE, serde_json::json!({}))
         .await
-        .expect_err("a leaseless subscribe must be refused");
-    assert_eq!(missing.code, "connect-required");
+        .expect("a leaseless subscribe is an observer, not a refusal");
     assert!(
-        missing.message.contains("session.connect"),
-        "the error must name the step that was skipped: {}",
-        missing.message
+        matches!(
+            missing,
+            HandlerOutcome::ReplyThen {
+                then: ConnAction::StartPush(_),
+                ..
+            }
+        ),
+        "an omitted lease must still flip the connection to push mode"
     );
 
-    assert_eq!(
-        subscribe(&f, &conn(2), "").await.unwrap_err(),
-        "connect-required"
-    );
+    let (b, d, e) = (conn(2), conn(4), conn(6));
+    let _empty = subscribe(&f, &b, "").await.expect("an empty lease");
     connect(&f, &conn(3), false).await.expect("connect");
+    let _unknown = subscribe(&f, &d, "00000000000000000000000000000000")
+        .await
+        .expect("a lease this session never issued");
+
+    // And a live lease still buys the driver stream, which is the whole
+    // point of keeping the parameter.
+    let holder = conn(5);
+    let lease = connect(&f, &holder, true).await.expect("takeover").lease;
+    let _driver = subscribe(&f, &e, &lease).await.expect("driver stream");
+}
+
+/// A stop closes every stream — including on a session where no lease
+/// was ever minted. Observers do not live under the lease, so nothing
+/// about the sweep may be conditional on there being one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_closes_every_stream_with_no_lease_ever_minted() {
+    let f = fixture();
+    let first = conn(1);
+    let second = conn(2);
+    let _a = subscribe(&f, &first, "").await.expect("an observer");
+    let _b = subscribe(&f, &second, "").await.expect("another observer");
+
+    f.handler
+        .handle(&conn(3).ctx, ops::SESSION_STOP, serde_json::json!({}))
+        .await
+        .expect("session.stop");
+
+    assert_eq!(first.watch.reason(), Some(CloseReason::ShuttingDown));
+    assert_eq!(second.watch.reason(), Some(CloseReason::ShuttingDown));
     assert_eq!(
-        subscribe(&f, &conn(4), "00000000000000000000000000000000")
-            .await
-            .unwrap_err(),
-        "connect-required",
-        "a lease this session never issued is not a tombstone"
+        subscribe(&f, &conn(4), "").await.err(),
+        Some("shutting-down".to_string()),
+        "a subscribe that raced the sweep is refused rather than orphaned"
     );
+}
+
+/// A stream that cannot be told is cut rather than waited on: the
+/// takeover must never block on a peer that stopped reading. What that
+/// peer gets is a bare EOF — exactly the resync signal event
+/// backpressure already produces — and it re-learns the driver state
+/// through its reconnect prologue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_whose_queue_is_full_is_cut_and_the_takeover_still_lands() {
+    let f = fixture_with_limits(roost_engine::event_push::PushLimits {
+        capacity: 1,
+        stall: std::time::Duration::from_secs(30),
+    });
+    connect(&f, &conn(1), false).await.expect("connect");
+    let watcher = conn(2);
+    let mut stuffed = subscribe(&f, &watcher, "").await.expect("an observer");
+
+    // Fill the one queue slot and leave it there. Nothing is drained,
+    // so the injection has nowhere to go.
+    f.workspace.create_project("a", "/tmp").unwrap();
+    f.workspace.create_project("b", "/tmp").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    connect_as(&f, &conn(3), true, Some("a phone"))
+        .await
+        .expect("a full observer must never block a takeover");
+
+    // What the peer sees: whatever was queued, then EOF — no envelope.
+    let mut frames = 0;
+    while let Some(frame) = next_frame(&mut stuffed).await {
+        assert!(
+            frame.get("revision").is_some(),
+            "the cut stream must not have been told: {frame}"
+        );
+        frames += 1;
+        assert!(frames <= 4, "the queue is bounded");
+    }
+    assert!(frames >= 1, "the queue delivers what it accepted");
 }
 
 /// `tab_id_filter` is refused before the lease is even looked at: an

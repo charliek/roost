@@ -90,11 +90,15 @@ def first_project(client: Roost) -> int:
     return int(client.list()[0]["id"])
 
 
-def connect_lease(client: Roost, takeover: bool = False) -> str:
+def connect_lease(client: Roost, takeover: bool = False, label: str | None = None) -> str:
     """`session.connect` — the lease every lease-gated op presents. A
     bearer credential: returned, never logged, never interpolated into an
-    assertion message."""
-    return client.call("session.connect", {"takeover": takeover})["lease"]
+    assertion message. `label` is what the claimant reports itself as,
+    which is the only thing a deposed stream is told about it."""
+    params: dict = {"takeover": takeover}
+    if label is not None:
+        params["client_label"] = label
+    return client.call("session.connect", params)["lease"]
 
 
 def quiet_tab(client: Roost, project: int, cwd) -> int:
@@ -177,6 +181,128 @@ def test_a_bell_and_a_clipboard_write_arrive_as_tab_effect_events(env):
             data, fence = next_effect(stream, fence)
             assert data["effect"] == "clipboard-write", data
             assert data["target"] == "selection", data
+
+        client.call("session.stop")
+
+
+def batches_through(stream: EventStream, revision: int, timeout: float = 30.0) -> list[dict]:
+    """Every batch up to and including `revision`, contiguity checked.
+
+    A `session.driver_changed` on the way is read and skipped — it is
+    not a batch and carries no revision — so this doubles as "the stream
+    survived the takeover".
+    """
+    seen: list[dict] = []
+    while True:
+        frame = stream.recv_frame(timeout=timeout)
+        if "revision" not in frame:
+            assert frame.get("event") != "session.stopping", (
+                f"the stream ended ({stream.stopping_reason}) before revision {revision}"
+            )
+            continue
+        seen.append(frame)
+        if int(frame["revision"]) >= revision:
+            return seen
+
+
+def test_an_observer_stream_never_sees_an_effect_and_the_privilege_moves(env):
+    """Plan 049 §3.7 + §3.8, over a real daemon and a real PTY drain.
+
+    Effects are the *driving* client's side-channel (DL-18): a bell is a
+    notification only the attached window can ring, and an OSC 52 write
+    is somebody's clipboard. Reading a session is free now, so what used
+    to be enforced by refusing the subscribe is enforced by the
+    projection instead — and the revision still ships, as an **empty
+    batch**, because a commit silently dropped is indistinguishable from
+    loss to a client whose whole gap check is the revision sequence.
+
+    Then the privilege moves. A takeover demotes the old driver's
+    stream in place, and nothing that follows the
+    `session.driver_changed` envelope on that stream carries an effect.
+    """
+    started(env)
+
+    with env.client() as client:
+        lease = connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
+        with EventStream(env.socket, lease=lease) as driver:
+            with EventStream(env.socket) as watcher:
+                fence = driver.subscribe()
+                watch_fence = watcher.subscribe()
+                assert watch_fence >= fence
+
+                client.tab_feed_pty_bytes(tab, osc52(b"a secret"))
+                data, effect_revision = next_effect(driver, fence)
+                assert data["effect"] == "clipboard-write", data
+
+                # The same revision, on the leaseless stream: present,
+                # in sequence, and carrying nothing.
+                seen = batches_through(watcher, effect_revision)
+                watcher.expect_contiguous(seen, watch_fence)
+                filtered = [b for b in seen if int(b["revision"]) == effect_revision]
+                assert filtered and not filtered[0]["events"], (
+                    f"an observer must never see a tab.effect: {filtered}"
+                )
+
+                # The takeover. Both streams are told, neither is cut.
+                with env.client() as interloper:
+                    taker = connect_lease(interloper, takeover=True, label="a phone")
+                    assert driver.recv_driver_changed() == "a phone"
+                    assert watcher.recv_driver_changed() == "a phone"
+
+                    with EventStream(env.socket, lease=taker) as promoted:
+                        promoted_fence = promoted.subscribe()
+
+                        interloper.tab_feed_pty_bytes(tab, b"\x07")
+                        data, moved = next_effect(promoted, promoted_fence)
+                        assert data["effect"] == "bell", data
+
+                        # And the deposed stream, read to that same
+                        # revision, carries no effect after the envelope.
+                        after = batches_through(driver, moved)
+                        assert all(
+                            envelope["event"] != "tab.effect"
+                            for batch in after
+                            for envelope in batch["events"]
+                        ), f"an effect arrived after session.driver_changed: {after}"
+
+                    interloper.call("session.stop")
+
+
+def test_a_notification_reaches_an_observer(env):
+    """`notification.fired` is transient like an effect and crosses
+    anyway (plan 049 §3.7).
+
+    Routing notifications for AI coding agents is the point of watching
+    a session at all — a phone that could see every title change but no
+    notification would be watching the wrong half. Only `tab.effect`,
+    which carries clipboard payloads and rings somebody else's bell,
+    stays the driver's alone.
+    """
+    started(env)
+
+    with env.client() as client:
+        connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        # A second tab takes the selection: a focused, *active* tab
+        # suppresses its own notification, so leaving `tab` selected
+        # would make this pass or fail on the selection rather than on
+        # routing.
+        quiet_tab(client, project, env.launch_cwd)
+
+        with EventStream(env.socket) as watcher:
+            fence = watcher.subscribe()
+            client.call(
+                "notification.create",
+                {"tab_id": str(tab), "title": "agent", "body": "needs you"},
+            )
+            batches, envelope = watcher.recv_until("notification.fired", timeout=30.0)
+            watcher.expect_contiguous(batches, fence)
+            assert envelope["data"]["tab_id"] == str(tab), envelope
+            assert envelope["data"]["title"] == "agent", envelope
 
         client.call("session.stop")
 
