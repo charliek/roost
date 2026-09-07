@@ -2062,7 +2062,12 @@ def test_send_file_into_a_frozen_host_frame_is_refused(host, roost):
 
     with host.client() as interloper:
         lease = HostUnderTest.lease(interloper, takeover=True)
-        with EventStream(host.env.socket, lease=lease):
+        with EventStream(host.env.socket, lease=lease) as stream:
+            # Subscribing is what makes the takeover *land*: the lease
+            # alone does not displace the connected client until the
+            # interloper is actually listening, so without this the wait
+            # below races and times out on a loaded runner.
+            stream.subscribe()
             host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
             refusal = refused(roost.tab_send_file, key, [FIXTURE_FILES / "note.txt"])
             assert refusal.code == "host-unavailable", refusal
