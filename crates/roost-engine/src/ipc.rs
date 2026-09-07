@@ -1060,7 +1060,7 @@ const MAX_CLIENT_LABEL: usize = 128;
 fn normalize_client_label(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     let mut label = String::new();
-    for c in raw.trim().chars().filter(|c| !c.is_control()) {
+    for c in raw.trim().chars().filter(|c| !is_layout_hostile(*c)) {
         if label.len() + c.len_utf8() > MAX_CLIENT_LABEL {
             break;
         }
@@ -1068,6 +1068,17 @@ fn normalize_client_label(raw: Option<String>) -> Option<String> {
     }
     let label = label.trim().to_string();
     (!label.is_empty()).then_some(label)
+}
+
+/// Characters a banner must never receive, beyond `char::is_control`.
+///
+/// The line/paragraph separators break the banner onto a second line and
+/// the bidi overrides reorder everything after them — neither is a
+/// control character by Unicode's definition, so `is_control` alone
+/// lets both straight through into a string this session renders.
+fn is_layout_hostile(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// One live `events.subscribe` stream.
@@ -1093,6 +1104,24 @@ struct Observer {
     /// classifies off the same `current` under this same lock, so this
     /// view and that one cannot disagree.
     presented: Option<String>,
+    /// A `session.driver_changed` the queue would not take, waiting for
+    /// this stream's own relay to send it (plan 049 §3.8).
+    ///
+    /// The slot exists because a full queue does not mean a stalled
+    /// peer. The relay reserves capacity *before* it takes the registry
+    /// lock, so a stream that is draining perfectly reports `Full` to
+    /// the injector for exactly as long as its relay is parked on that
+    /// lock — and cutting it there would turn a healthy reader into a
+    /// bare EOF. Left here instead, [`LeaseGate`] finds it under the
+    /// same lock and spends its reserved permit on the notice first.
+    /// A peer that genuinely stopped reading still dies, on the relay's
+    /// own stall budget.
+    ///
+    /// One slot, not a queue: a second takeover's envelope names the
+    /// current holder, which is the more useful answer than the one it
+    /// replaces, and a stream that has not been told once has no order
+    /// to preserve.
+    notice: Option<serde_json::Value>,
 }
 
 impl Observer {
@@ -1286,11 +1315,13 @@ impl ClientRegistry {
     /// registration order, and consecutive takeovers are serialized by
     /// this lock, so a stream reads them in the order they happened.
     ///
-    /// A stream whose queue is full cannot be told. It is cut instead —
-    /// relay aborted, record dropped, peer gets a bare EOF — which is
-    /// exactly the resync semantics event backpressure already has, and
-    /// is the only answer that keeps a takeover from blocking on a peer
-    /// that stopped reading.
+    /// A stream whose queue is full at this instant is **not** cut: the
+    /// envelope is parked on its [`Observer::notice`] slot and its own
+    /// relay sends it, ahead of whatever batch that relay was holding a
+    /// permit for. Reserved capacity is not backpressure, and a takeover
+    /// still never waits on anybody — a peer that has really stopped
+    /// reading dies on the relay's stall budget instead, with the bare
+    /// EOF that has always been event backpressure's resync signal.
     fn announce_takeover(&mut self, displaced: &str, taken_by: &str) {
         let envelope = match serde_json::to_value(SessionDriverChangedEvent {
             taken_by: taken_by.to_string(),
@@ -1314,24 +1345,40 @@ impl ClientRegistry {
         let Some(observers) = self.observers.as_mut() else {
             return;
         };
-        observers.retain_mut(|observer| {
+        for observer in observers.iter_mut() {
             if observer.presented.as_deref() == Some(displaced) {
                 observer.presented = None;
             }
             let Some(queue) = observer.inject.upgrade() else {
                 // The relay is already gone; its EOF is the signal.
-                return true;
+                continue;
             };
-            if queue.try_send(envelope.clone()).is_ok() {
-                return true;
+            match queue.try_send(envelope.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(envelope)) => {
+                    tracing::debug!(
+                        conn_id = observer.conn_id,
+                        "an events subscriber's queue was full; its relay delivers the takeover"
+                    );
+                    observer.notice = Some(envelope);
+                }
+                // The receiver is gone: this connection is already on
+                // its way down and the relay's own `tx.closed()` arm
+                // ends it.
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
-            tracing::debug!(
-                conn_id = observer.conn_id,
-                "an events subscriber could not be told about the takeover; closing its stream"
-            );
-            observer.relay.abort();
-            false
-        });
+        }
+    }
+
+    /// The takeover envelope this stream's relay owes its peer, if one
+    /// was parked on it. See [`Observer::notice`].
+    fn take_notice(&mut self, conn_id: u64) -> Option<serde_json::Value> {
+        self.observers
+            .as_mut()?
+            .iter_mut()
+            .find(|observer| observer.conn_id == conn_id)?
+            .notice
+            .take()
     }
 
     /// Register one event stream. `false` once a stop has swept.
@@ -1356,6 +1403,7 @@ impl ClientRegistry {
             inject,
             relay,
             presented: (!lease.is_empty()).then(|| lease.to_string()),
+            notice: None,
         });
         true
     }
@@ -3045,6 +3093,9 @@ fn parse_rgb_hex(raw: &str) -> Option<(u8, u8, u8)> {
 struct LeaseGate {
     session: Arc<SessionState>,
     presented: String,
+    /// Which stream this is, so the gate can pick up a takeover notice
+    /// the injector had to park — see [`Observer::notice`].
+    conn_id: u64,
 }
 
 impl event_push::StreamGate for LeaseGate {
@@ -3052,7 +3103,7 @@ impl event_push::StreamGate for LeaseGate {
         &self,
         permit: tokio::sync::mpsc::Permit<'_, serde_json::Value>,
         batch: &crate::VersionedWorkspaceEvent,
-    ) -> bool {
+    ) -> event_push::Delivery {
         // The lock is the whole point. A takeover demotes this stream
         // and injects `session.driver_changed` in this same critical
         // section, so an effect batch is either enqueued *before* the
@@ -3063,13 +3114,21 @@ impl event_push::StreamGate for LeaseGate {
         //
         // Nothing is awaited here: the queue slot was reserved before
         // this call, so the send cannot block.
-        let guard = lock(&self.session.clients);
+        let mut guard = lock(&self.session.clients);
+        // Ahead of the batch, always: the reservation this permit came
+        // from is what made the queue look full to the injector, and
+        // sending the batch first would put a driver-classified
+        // `tab.effect` after the announcement on the same stream.
+        if let Some(notice) = guard.take_notice(self.conn_id) {
+            permit.send(notice);
+            return event_push::Delivery::NoticeSentRetryBatch;
+        }
         let driver = guard.is_driver(&self.presented);
         let Some(value) = event_push::batch_value(batch, driver) else {
-            return false;
+            return event_push::Delivery::End;
         };
         permit.send(value);
-        true
+        event_push::Delivery::Delivered
     }
 }
 
@@ -3106,6 +3165,7 @@ fn events_subscribe(
     let gate = Arc::new(LeaseGate {
         session: Arc::clone(session),
         presented: params.lease.clone(),
+        conn_id: ctx.conn_id,
     });
     let subscription = event_push::spawn(&h.workspace, h.push_limits, gate);
     if !session.register_stream(
@@ -4434,6 +4494,12 @@ mod tests {
             normalize_client_label(Some("\u{7}  pop-os".into())).as_deref(),
             Some("pop-os"),
             "whitespace uncovered by a dropped control character is trimmed too"
+        );
+        assert_eq!(
+            normalize_client_label(Some("pop\u{202e}o\u{2028}s".into())).as_deref(),
+            Some("popos"),
+            "a bidi override reorders the banner and a line separator splits it; \
+             neither is `is_control`, so both are dropped by name"
         );
         // A label that is nothing but control characters is no label.
         assert_eq!(normalize_client_label(Some("\u{0}\u{1}".into())), None);

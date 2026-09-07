@@ -477,32 +477,38 @@ async fn a_stop_closes_every_stream_with_no_lease_ever_minted() {
     );
 }
 
-/// A stream that cannot be told is cut rather than waited on: the
-/// takeover must never block on a peer that stopped reading. What that
-/// peer gets is a bare EOF — exactly the resync signal event
-/// backpressure already produces — and it re-learns the driver state
-/// through its reconnect prologue.
+/// A peer that has really stopped reading is cut rather than waited on:
+/// the takeover must never block on it. Its relay spends the stall
+/// budget on a reservation that never comes and ends, so what the peer
+/// gets is a bare EOF — exactly the resync signal event backpressure
+/// already produces — and it re-learns the driver state through its
+/// reconnect prologue.
+///
+/// The budget is what makes this case what it is. A queue that is
+/// *momentarily* full is the case below, and it must not be cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stream_whose_queue_is_full_is_cut_and_the_takeover_still_lands() {
+async fn a_stream_past_its_stall_budget_is_cut_and_the_takeover_still_lands() {
     let f = fixture_with_limits(roost_engine::event_push::PushLimits {
         capacity: 1,
-        stall: std::time::Duration::from_secs(30),
+        stall: std::time::Duration::from_millis(150),
     });
     connect(&f, &conn(1), false).await.expect("connect");
     let watcher = conn(2);
     let mut stuffed = subscribe(&f, &watcher, "").await.expect("an observer");
 
     // Fill the one queue slot and leave it there. Nothing is drained,
-    // so the injection has nowhere to go.
+    // so the second commit's reservation never resolves and the relay
+    // gives up on it.
     f.workspace.create_project("a", "/tmp").unwrap();
     f.workspace.create_project("b", "/tmp").unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     connect_as(&f, &conn(3), true, Some("a phone"))
         .await
-        .expect("a full observer must never block a takeover");
+        .expect("a stalled observer must never block a takeover");
 
-    // What the peer sees: whatever was queued, then EOF — no envelope.
+    // What the peer sees: whatever was queued, then EOF — no envelope,
+    // because there is no relay left to carry one.
     let mut frames = 0;
     while let Some(frame) = next_frame(&mut stuffed).await {
         assert!(
@@ -513,6 +519,51 @@ async fn a_stream_whose_queue_is_full_is_cut_and_the_takeover_still_lands() {
         assert!(frames <= 4, "the queue is bounded");
     }
     assert!(frames >= 1, "the queue delivers what it accepted");
+}
+
+/// Reserved capacity is not backpressure (plan 049 §3.8, Greptile P2).
+///
+/// A relay reserves its next slot *before* it takes the registry lock,
+/// so a stream that is draining perfectly reports `Full` to the injector
+/// for as long as its relay is parked there. Cutting on that would kill
+/// healthy readers on a busy session. The envelope is parked on the
+/// stream instead and its own relay sends it — ahead of the batch it was
+/// holding the permit for, which is what keeps the ordering invariant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_momentarily_full_stream_is_told_by_its_own_relay_and_not_cut() {
+    let f = fixture_with_limits(roost_engine::event_push::PushLimits {
+        capacity: 1,
+        stall: std::time::Duration::from_secs(30),
+    });
+    connect(&f, &conn(1), false).await.expect("connect");
+    let watcher = conn(2);
+    let mut stream = subscribe(&f, &watcher, "").await.expect("an observer");
+
+    // One batch in the only slot, a second one waiting on a reservation
+    // that will not resolve until the peer reads. The injector sees a
+    // full queue — and a healthy stream.
+    f.workspace.create_project("a", "/tmp").unwrap();
+    f.workspace.create_project("b", "/tmp").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    connect_as(&f, &conn(3), true, Some("a phone"))
+        .await
+        .expect("a full queue must never block a takeover");
+
+    let first = next_frame(&mut stream).await.expect("the queued batch");
+    assert!(first.get("revision").is_some(), "expected a batch: {first}");
+    assert_eq!(
+        next_driver_changed(&mut stream).await,
+        "a phone",
+        "the notice precedes the batch its permit was reserved for"
+    );
+    let after = next_frame(&mut stream).await.expect("the stream lives on");
+    assert!(after.get("revision").is_some(), "expected a batch: {after}");
+
+    // And it is still a stream: a later commit arrives like any other.
+    f.workspace.create_project("c", "/tmp").unwrap();
+    let later = next_frame(&mut stream).await.expect("not cut");
+    assert!(later.get("revision").is_some(), "expected a batch: {later}");
 }
 
 /// `tab_id_filter` is refused before the lease is even looked at: an

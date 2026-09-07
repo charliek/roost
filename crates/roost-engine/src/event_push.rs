@@ -47,15 +47,29 @@ use crate::{VersionedWorkspaceEvent, Workspace, WorkspaceEvent};
 /// is no longer entitled to effects.
 pub trait StreamGate: Send + Sync + 'static {
     /// Project `batch` for this stream and hand it to `permit`.
-    ///
-    /// `false` means the batch has no wire form and the stream must end
-    /// — the same "close rather than lie" answer the relay gives a
-    /// [`WorkspaceEvent::Resync`].
     fn deliver(
         &self,
         permit: mpsc::Permit<'_, serde_json::Value>,
         batch: &VersionedWorkspaceEvent,
-    ) -> bool;
+    ) -> Delivery;
+}
+
+/// What a gate did with the permit it was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The batch is on the queue.
+    Delivered,
+    /// The permit carried something else — a notice the embedder could
+    /// not enqueue itself because the queue was full at the time (plan
+    /// 049 §3.8's `session.driver_changed`). The batch was **not**
+    /// sent: the relay must reserve again and re-offer it, so the notice
+    /// always precedes it and the batch is classified after whatever the
+    /// notice announced.
+    NoticeSentRetryBatch,
+    /// The batch has no wire form and the stream must end — the same
+    /// "close rather than lie" answer the relay gives a
+    /// [`WorkspaceEvent::Resync`].
+    End,
 }
 
 /// The gate for a stream with no classification to make: everything the
@@ -71,13 +85,13 @@ impl StreamGate for FullFeed {
         &self,
         permit: mpsc::Permit<'_, serde_json::Value>,
         batch: &VersionedWorkspaceEvent,
-    ) -> bool {
+    ) -> Delivery {
         match batch_value(batch, true) {
             Some(value) => {
                 permit.send(value);
-                true
+                Delivery::Delivered
             }
-            None => false,
+            None => Delivery::End,
         }
     }
 }
@@ -412,24 +426,37 @@ async fn relay(
             // with: it committed between the subscribe and the read.
             Ok(batch) if batch.revision <= fence => continue,
             Ok(batch) => {
-                let permit = match tokio::time::timeout(limits.stall, tx.reserve()).await {
-                    Ok(Ok(permit)) => permit,
-                    // Receiver gone: the connection is already down.
-                    Ok(Err(_)) => return,
-                    Err(_) => {
-                        warn!(
-                            revision = batch.revision,
-                            "events subscriber is not draining; closing the connection"
-                        );
-                        return;
+                // One batch can cost two permits. A takeover that found
+                // this queue full left its `session.driver_changed`
+                // with the gate; the gate spends the first permit on
+                // that notice and the batch is re-offered, which is
+                // what keeps the notice ahead of it. Each attempt gets
+                // the full stall budget, and a peer that never drains
+                // still dies on the first one.
+                loop {
+                    let permit = match tokio::time::timeout(limits.stall, tx.reserve()).await {
+                        Ok(Ok(permit)) => permit,
+                        // Receiver gone: the connection is already down.
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            warn!(
+                                revision = batch.revision,
+                                "events subscriber is not draining; closing the connection"
+                            );
+                            return;
+                        }
+                    };
+                    match gate.deliver(permit, &batch) {
+                        Delivery::Delivered => break,
+                        Delivery::NoticeSentRetryBatch => continue,
+                        Delivery::End => {
+                            debug!(
+                                revision = batch.revision,
+                                "unpushable workspace event; closing the events connection"
+                            );
+                            return;
+                        }
                     }
-                };
-                if !gate.deliver(permit, &batch) {
-                    debug!(
-                        revision = batch.revision,
-                        "unpushable workspace event; closing the events connection"
-                    );
-                    return;
                 }
             }
             Err(RecvError::Lagged(missed)) => {

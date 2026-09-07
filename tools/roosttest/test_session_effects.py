@@ -186,11 +186,16 @@ def test_a_bell_and_a_clipboard_write_arrive_as_tab_effect_events(env):
 
 
 def batches_through(stream: EventStream, revision: int, timeout: float = 30.0) -> list[dict]:
-    """Every batch up to and including `revision`, contiguity checked.
+    """Every batch up to and including `revision`.
 
     A `session.driver_changed` on the way is read and skipped — it is
     not a batch and carries no revision — so this doubles as "the stream
     survived the takeover".
+
+    Contiguity is the **caller's** check: this returns what it read, and
+    a caller hands that to `EventStream.expect_contiguous` with the
+    revision it was last fenced at. Doing it here would need that fence,
+    which only the caller has.
     """
     seen: list[dict] = []
     while True:
@@ -260,8 +265,11 @@ def test_an_observer_stream_never_sees_an_effect_and_the_privilege_moves(env):
                         assert data["effect"] == "bell", data
 
                         # And the deposed stream, read to that same
-                        # revision, carries no effect after the envelope.
+                        # revision, is still whole — no hole where the
+                        # takeover was — and carries no effect after the
+                        # envelope.
                         after = batches_through(driver, moved)
+                        driver.expect_contiguous(after, effect_revision)
                         assert all(
                             envelope["event"] != "tab.effect"
                             for batch in after

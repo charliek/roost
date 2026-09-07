@@ -1646,9 +1646,11 @@ stream:
 ```
 
 `reason` is `"stop"` (the session is shutting down) or `"taken-over"`
-(this stream's own control/data connections were taken over —
-[`session.stop`](#sessionstop) only; a takeover no longer sends this to
-a *surviving* event stream, see below). It carries **no `revision`** and
+(a takeover closed this connection). On an **event stream** only
+`"stop"` is reachable: a takeover no longer ends a surviving stream, it
+demotes it and says so with the non-terminal envelope below.
+`"taken-over"` remains the terminal reason on the **control and data**
+connections a takeover does close. It carries **no `revision`** and
 is exempt from the gap check below: it is not a commit, it is the
 stream saying why it is over, and it is always the last frame before
 the close.
@@ -1673,15 +1675,24 @@ must not latch on it the way it latches on the stopping envelope.
 
 The catalog of batch envelopes is [Events](#events) below.
 
-Both non-batch envelopes are **best-effort**. A peer that stopped
-reading has already made the write impossible once its socket buffer
-filled — for `session.driver_changed` that ends the stream outright
-(relay aborted, bare EOF, exactly today's backpressure-resync
-semantics; no such thing as a labeled backpressure close exists on this
-wire) rather than blocking the takeover on a slow observer. A plain EOF
-remains the fallback signal for both envelopes, and a client must treat
-an unlabeled close the way it always has: reconnect and resync — which
-is also how a client that missed `driver_changed` learns the truth,
+Both non-batch envelopes are **best-effort**, and neither ever blocks
+the takeover on a slow reader. `session.driver_changed` is queued
+directly where there is room; where the queue is momentarily full it is
+handed to that stream's own writer, which sends it ahead of the next
+batch — a full queue usually means the writer has already reserved its
+next slot, not that the peer stopped reading, and cutting a healthy
+stream there would be a worse answer than a one-batch delay. (The
+parked envelope rides ahead of that stream's *next* batch, so a queue
+that was full at the takeover and then goes quiet learns of it at the
+next commit — or sooner, when its next lease-bearing op answers
+`taken-over` and the client waits for the stream to say the rest.) A
+temporarily full queue therefore never ends a relay; only a peer that
+really has stopped reading dies on its stall budget with a bare
+EOF, exactly today's backpressure-resync semantics (no such thing as a
+labeled backpressure close exists on this wire). A plain EOF remains
+the fallback signal for both envelopes, and a client must treat an
+unlabeled close the way it always has: reconnect and resync — which is
+also how a client that missed `driver_changed` learns the truth,
 through the reconnect prologue's own probe.
 
 Three properties make this lossless without a replay buffer:
@@ -1699,9 +1710,13 @@ Three properties make this lossless without a replay buffer:
   reading, falls behind the workspace broadcast, or the connection
   stalls, the server closes the connection instead of dropping events
   out of the stream. A close is the resync signal: reconnect,
-  re-subscribe, re-pull `tab.list`, and fence again — `session.stopping`
-  or `session.driver_changed`, where either arrives, only tell the
-  client *why* it is resyncing.
+  re-subscribe, re-pull `tab.list`, and fence again. Exactly two things
+  ask for that — `session.stopping`, and an EOF; `session.stopping`
+  only says *why* the stream that is already ending ended.
+  `session.driver_changed` asks for neither: the stream keeps
+  delivering, and a client that reconnected on it would be throwing
+  away a live subscription to re-take a session somebody else now
+  drives.
 
 After the flip the connection answers nothing. Frames a client writes
 on it are read and discarded (so the server still notices a peer that
@@ -1969,7 +1984,8 @@ on [`session.identify`](#sessionidentify): that op runs on a socket with
 no handshake gate, so an unconditionally-sent new field would be
 `deny_unknown_fields`-rejected by every session that predates it — the
 label rides `session.connect` instead, where mixed generations already
-fail closed. It is echoed to every deposed stream as
+fail closed. It is echoed to every registered stream — the deposed
+driver's and every observer's alike — as
 [`session.driver_changed`](#events)'s `taken_by`, falling back to
 `"unknown client"` when the claimant sent none.
 

@@ -593,6 +593,23 @@ struct HostEntry {
     /// What an ssh host's retry ladder must carry across its own
     /// attempts. See [`Outage`].
     outage: Option<Outage>,
+    /// Whether somebody else drives this session (plan 049 §3.11).
+    ///
+    /// The connection task latches the same fact for its *own* retries,
+    /// but that latch dies with the task — and an ssh host's ladder
+    /// re-enters at [`HostConnSet::open_ssh`] with a fresh one every
+    /// time. Without a copy here, an observer whose stream drops would
+    /// come back as a driver: no held lease, no latch, so
+    /// `attempt` skips the probe and dials
+    /// `session.connect{takeover:true}` — the silent retake the whole
+    /// probe policy exists to prevent.
+    ///
+    /// Set when a `TakenOver` settlement is applied, and cleared by
+    /// exactly one thing: an explicit attempt
+    /// ([`AttemptCause::Explicit`], which is the palette's "take the
+    /// session back" and nothing else). An auto-reconnect never clears
+    /// it, which is the point.
+    observer_only: bool,
     /// What a bootstrap is doing to this host right now, or how it
     /// ended.
     ///
@@ -905,6 +922,7 @@ impl HostConnSet {
             .get(host)
             .and_then(|entry| entry.conn.as_ref()?.incarnation);
         let held_lease = self.carried_lease(host, cause);
+        let observer_only = self.observer_mode(host, cause);
         self.forget(host);
         // An ssh attempt started at [`Self::open_ssh`] and was numbered
         // there, so the connect a working tunnel reaches carries that
@@ -933,6 +951,7 @@ impl HostConnSet {
             supersedes,
             mode,
             held_lease,
+            observer_only,
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
@@ -1021,6 +1040,12 @@ impl HostConnSet {
         if cause == AttemptCause::Explicit {
             self.clear_outage(host);
         }
+        // For the clear an explicit cause performs, and for it to
+        // happen before the tunnel rather than at the connect a working
+        // tunnel reaches: a takeback whose establish fails and lands on
+        // the ladder must still be a takeback when a socket finally
+        // exists. The verdict itself is read again there.
+        self.observer_mode(host, cause);
         let previous = self.take_tunnel(host);
         self.next_ssh_request += 1;
         let request = self.next_ssh_request;
@@ -1337,6 +1362,34 @@ impl HostConnSet {
             AttemptCause::Explicit => None,
             AttemptCause::AutoReconnect => self.entries.get(host)?.outage.as_ref()?.lease.clone(),
         }
+    }
+
+    /// Whether the attempt starting now may claim the lease, and the
+    /// only place [`HostEntry::observer_only`] is cleared.
+    ///
+    /// The takeback is a *user* act by construction — the palette's
+    /// `host:connect:<id>` row is the one door that reaches here with
+    /// [`AttemptCause::Explicit`] — so clearing it on that cause and
+    /// nothing else is the whole rule. Called from [`Self::connect`] and
+    /// [`Self::open_ssh`], because an ssh attempt starts at the tunnel
+    /// and only reaches the connect if one comes up.
+    fn observer_mode(&mut self, host: &str, cause: AttemptCause) -> bool {
+        match cause {
+            AttemptCause::Explicit => {
+                if let Some(entry) = self.entries.get_mut(host) {
+                    entry.observer_only = false;
+                }
+                false
+            }
+            AttemptCause::AutoReconnect => self.observes_only(host),
+        }
+    }
+
+    /// Whether this host has learned it is not the driver.
+    fn observes_only(&self, host: &str) -> bool {
+        self.entries
+            .get(host)
+            .is_some_and(|entry| entry.observer_only)
     }
 
     /// Drain one `EngineFeed::HostLease`: the lease a connection was
@@ -2375,6 +2428,13 @@ impl HostConnSet {
             {
                 ssh.reached_connected = true;
             }
+        }
+        // Task-independent by design: the arm below ends this host's
+        // outage, so every later auto-reconnect starts from a clean
+        // ladder with no lease to probe. This is what stops one of them
+        // dialing as a driver — see [`HostEntry::observer_only`].
+        if matches!(next, HostConnState::TakenOver { .. }) {
+            self.entry_mut(&host).observer_only = true;
         }
         match &next {
             // The outage is over, so the next one starts at the base
@@ -3420,6 +3480,71 @@ mod tests {
         assert!(
             set.ssh_reached_connected("h1"),
             "settling as an observer reached the session"
+        );
+    }
+
+    /// The other half of "only the explicit takeback promotes an
+    /// observer" (plan 049 §3.11), and the hole it closes.
+    ///
+    /// A `TakenOver` settlement ends the outage, so the auto-reconnect
+    /// that follows an observer's dropped stream carries no lease to
+    /// probe. Without a fact on the *set*, that attempt would spawn a
+    /// task with nothing to stop it dialing
+    /// `session.connect{takeover: true}` — the ladder taking the session
+    /// back on nobody's behalf.
+    #[tokio::test]
+    async fn an_auto_reconnect_after_a_takeover_dials_as_an_observer() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-deposed.sock");
+        assert!(!set.observes_only("h1"), "a driver claims its lease");
+
+        set.apply_state(
+            incarnation,
+            HostConnState::TakenOver {
+                taken_by: Some("a phone".into()),
+            },
+        );
+        assert!(set.observes_only("h1"), "the set carries the deposed fact");
+
+        // The observer's own stream drops and the ladder re-enters.
+        set.apply_state(incarnation, dropped("the event stream closed"));
+        assert!(
+            set.observes_only("h1"),
+            "an auto-reconnect must not clear it"
+        );
+        assert!(
+            set.observer_mode("h1", AttemptCause::AutoReconnect),
+            "so the task it spawns runs the observer prologue"
+        );
+
+        // Only the palette's "take the session back" clears it, and
+        // clearing it is what makes the next attempt a driver.
+        assert!(!set.observer_mode("h1", AttemptCause::Explicit));
+        assert!(!set.observes_only("h1"), "an explicit connect is a claim");
+    }
+
+    /// The clear happens at [`HostConnSet::open_ssh`] too, because an
+    /// ssh takeback starts at the tunnel: a handshake that fails and
+    /// lands on the ladder must not turn the user's claim back into a
+    /// watch by the time a socket finally exists.
+    #[tokio::test]
+    async fn an_explicit_ssh_attempt_clears_the_deposed_fact_at_the_tunnel() {
+        let (mut set, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-takeback.sock");
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        assert!(set.observes_only("h1"));
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        assert!(
+            !set.observes_only("h1"),
+            "the takeback is stated at the tunnel, not at the socket"
         );
     }
     #[tokio::test]
