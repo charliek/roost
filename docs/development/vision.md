@@ -815,6 +815,60 @@ for where the files land, and the [host-sessions
 guide](../guides/host-sessions.md#pasting-images-and-files-into-a-host-tab)
 for the user-facing shape.
 
+### DL-23: the interactive lease is re-cut — reads free, attach input + `tab.write` owned (2026-09-07)
+
+Plan 049 (R1, [#418](https://github.com/charliek/roost/issues/418))
+found the lease gating the wrong axis. HS-1b put `events.subscribe` and
+`tab.attach` behind it and left `tab.write` open to anything that could
+reach the socket — a phone watching a session the desktop drives is
+exactly backwards from that: the read was locked and the write was
+wide open. Every multi-client story past this point needs
+reads-free/writes-owned, so R1 flips both halves at once.
+
+**The lease is interactive-ownership coordination, not a security
+boundary** — restated, not new: any same-UID client could already
+`session.connect{takeover: true}` on purpose, and still can. What
+changed is what the lease *gates*. `events.subscribe` no longer
+requires one at all; presenting one now only **classifies** the
+resulting stream — a current lease gets the driver's full feed
+including `tab.effect` (bells, OSC 52 clipboard writes, still scoped to
+the driver alone per [DL-18](#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)),
+anything else gets an observer feed of workspace state plus
+`notification.fired`. What becomes **owned** is precisely attach input
+(unchanged from HS-1b) and, newly, `tab.write` on a session socket —
+not "writes" as a category: `tab.resize` and the administrative
+mutations (`tab.open`, `project.*`, `tab.agent_report`) stay lease-free,
+same-UID control-plane use exactly as before.
+
+**Takeover stopped being terminal for event streams.** A driver's
+control and data connections still close on takeover, same as always,
+but its event stream now survives, reclassified to observer in place
+and told once via the new non-terminal `session.driver_changed{taken_by}`
+envelope — the sibling of the terminal `session.stopping`, not a
+replacement for it. This is what lets the displaced iced window keep
+its tab list, titles, agent status, and notifications live while only
+the terminal grid freezes, and what lets a second client watch a
+session without ever claiming the lease at all.
+
+**The label is display metadata, never identity.** `taken_by` carries
+whatever the connecting client's `session.connect{client_label}` stated
+about itself — a hostname, an app name — normalized (trimmed,
+control-stripped, capped) but never authenticated; the UI renders it as
+what the client "reports itself as." A phone can call itself anything.
+
+`SESSION_PROTOCOL_VERSION` moved `3` → `4` for the breaking half of
+this (a `3` client's leaseless write is refused by a `4` session, and a
+`4` client's leaseless subscribe is refused by a `3` one); the new
+`session.identify.features` open list exists precisely so the *next*
+additive session op doesn't need a fifth generation the way
+`session.put_file` needed a fourth.
+
+See [`reference/ipc.md`](../reference/ipc.md#eventssubscribe) and
+[`reference/ipc-compatibility.md`](../reference/ipc-compatibility.md#version-bumps)
+for the wire contract, and
+[`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
+for the shipped mechanics.
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

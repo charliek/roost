@@ -232,13 +232,19 @@ This feature moved the session protocol version, which means a Roost with it **c
 
 ## Takeover
 
-A session holds one interactive lease at a time. If you connect to the same host from a second window (a second machine, or the same machine after a crash left the first window's connection stale), the new connection **takes over**: it gets the lease, and the *displaced* window is told.
+A session holds one interactive lease at a time — the authority to type into a tab. If you connect to the same host from a second window (a second machine, or the same machine after a crash left the first window's connection stale), the new connection **takes over**: it gets the lease, and the *displaced* window is told who took it.
 
-The displaced window keeps its last frame on screen — frozen, dimmed — under a banner:
+The displaced window's banner now names the taker, whenever the connecting client stated one:
 
-> **‹label› was taken over by another Roost window.** [Reconnect here]
+> **‹label› was taken over by a client reporting itself as ‹taken_by›.** [Reconnect here]
 
-"Reconnect here" is an ordinary Connect: it takes the lease back. There's no data loss either way — the shells themselves don't care who's watching; only the interactive connection moves.
+(or, when the new connection gave no name: "‹label› was taken over by another client.") "Reporting itself as" is deliberate wording, not a hedge you can ignore: the name is whatever the connecting client typed for itself — a hostname, an app name — and nothing here verifies it. Treat it as a hint, not an identity.
+
+Only the **terminal frame** freezes. The tab list, titles, agent status, and notifications for that host keep updating live underneath the banner — you can still see what's running and get notified about it, you just can't type into it or watch the screen redraw until you take it back. That's a deliberate split: watching a session is not the same act as driving it, so losing the lease doesn't mean losing the picture.
+
+"Reconnect here" is an ordinary Connect: it takes the lease back, and the terminal frame comes back live with it. There's no data loss either way — the shells themselves don't care who's driving; only the interactive connection moves.
+
+**Reading a session never needs the lease at all**, which is the same mechanism that keeps the displaced window's tab list and notifications live above. A second client that dials a host and asks only to watch — a script, a monitoring tool, a future phone client — sees the same live tab list, titles, and notifications, with no terminal frame and no risk of displacing whoever is actually driving, because it never asks for the lease in the first place. Watching is not degraded driving; it is the normal way to look at a session you don't hold.
 
 ## The upgrade / restart flow
 

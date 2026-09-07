@@ -123,6 +123,11 @@ terminal from. It shares the socket path but not the framing; see
   handshake: `connect-required`, `already-connected`, `taken-over`,
   `too-many-tokens`, `unsupported-kind`, `build-mismatch` — see
   [`session.connect`](#sessionconnect) and [`tab.attach`](#tabattach).
+  `connect-required` and `taken-over` are no longer `tab.attach`'s and
+  `events.subscribe`'s alone: [`tab.write`](#tabwrite) on a **session**
+  socket answers the same two codes now that the write itself is
+  lease-gated (plan 049, R1) — `events.subscribe` dropped the gate
+  instead (below).
 
 ## Shared types
 
@@ -309,13 +314,39 @@ Request:
 ```json
 {"id": "4", "op": "tab.write", "params": {
   "tab_id": "3",
-  "data": "bHMK"
+  "data": "bHMK",
+  "lease": "9f2c…6b83"
 }}
 ```
 
 `data` decodes verbatim into the PTY master fd. Binary-clean (the
 test suite round-trips `0x00..0xff`). Errors `not-found` if the tab
 has no live PTY.
+
+**On a UI socket, `lease` is accepted and ignored** — behavior here is
+byte-identical to before plan 049: that socket mints no leases, and
+rejecting the key would make one `roostctl` build unable to talk to
+both kinds of socket.
+
+**On a session socket, a write is an interactive act and belongs to
+whoever holds the driver lease** (plan 049, R1 — reads stay free, but
+writing is owned exactly like attach input). `lease` is then
+**required**: an absent or unrecognized one answers `connect-required`
+(go get a lease — `session.connect`, an attached client, or the agent
+API name the three lanes), and a lease that has since been displaced
+by a takeover answers `taken-over`. A client that holds no lease sends
+no `lease` key at all rather than an empty string, so an old
+`roostctl` talking to a new session degrades to the same
+`connect-required` a client that never connected gets.
+
+**The gate is an admission boundary, not a write fence.** `require_lease`
+runs and releases the registry lock *before* the bytes are handed to the
+supervisor to enqueue — so a write whose lease check linearizes just
+before a takeover wins admission, and its bytes may still land on the
+PTY after the takeover completes; one that linearizes after the takeover
+gets `taken-over`. A hard fence (holding a lock across the gate *and*
+the enqueue) was rejected: it would serialize every write against every
+lease op for a race the agent-API write path already makes irrelevant.
 
 Response: `{}`.
 
@@ -1564,8 +1595,12 @@ Every optional field is omitted rather than `null`, so a host that has never con
 ### `events.subscribe`
 
 Turn this connection into a one-way event stream. **Served by a
-host-session socket only**, and **lease-gated**: the caller presents
-the `lease` [`session.connect`](#sessionconnect) handed it.
+host-session socket only.**
+
+**Reading a session is not interactive authority, so this op is never
+refused for want of a lease** (plan 049, R1 — reversing HS-1b's gate).
+`lease` stays on the wire, but it now **classifies the stream** instead
+of gating it:
 
 Request: `{"params": {"lease": "9f2c…6b83", "tab_id_filter": "0"}}`.
 Response (the last request/response frame on the connection):
@@ -1574,34 +1609,80 @@ Response (the last request/response frame on the connection):
 {"id": "7", "ok": true, "result": {"revision": 42}}
 ```
 
-A missing or unknown lease is `{"code": "connect-required"}`; the lease
-of a client that was taken over is `{"code": "taken-over"}`. The two
-instruct differently on purpose — go get a lease, versus stop, somebody
-else drives this session now. Subscribing registers the connection
-under the lease, which is what lets a later takeover close *this*
-stream rather than leaving two clients both believing they drive the
-session.
+* **`lease` present and current** → a **driver** stream: every
+  workspace batch, plus [`tab.effect`](#events) (bells, OSC 52
+  clipboard writes) — the driving client's own side-channel, and
+  nobody else's ([DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)
+  stands unchanged).
+* **`lease` absent, stale, or unknown** → an **observer** stream: every
+  workspace batch, plus [`notification.fired`](#events) — notification
+  routing is roost's whole point, and a client watching without driving
+  is exactly who wants to still hear about it — but **never
+  `tab.effect`**: a clipboard write or a bell belongs to whoever is
+  driving, not to every watcher. A commit whose only events were
+  filtered still arrives as an **empty** `{"revision": N, "events": []}`
+  batch, so the strictly-consecutive revision fence below never sees a
+  gap that isn't real loss.
+* **A driver stream whose lease is taken over is reclassified to
+  observer in place**, mid-stream, with no reconnect: it keeps state
+  batches and `notification.fired`, stops receiving `tab.effect`, and is
+  told once via [`session.driver_changed`](#events) (below) — not a
+  fresh subscribe.
+
+Subscribing still registers the stream (in a registry separate from the
+lease's own connection list — see [`session.connect`](#sessionconnect)'s
+takeover table), which is what lets a takeover find and reclassify or
+notify it; a stream is never closed just because the lease it presented
+stopped being current.
 
 After the ack every frame is an `EventBatch` — one per workspace
 commit, `{"revision": <u64>, "events": [<EventEnvelope>, ...]}`, one
-per newline-delimited frame — **except** the single terminal control
-envelope that ends the stream:
+per newline-delimited frame — **except** two envelopes that ride
+outside the batch discipline entirely. The terminal one ends the
+stream:
 
 ```json
 {"event": "session.stopping", "data": {"reason": "stop"}}
 ```
 
 `reason` is `"stop"` (the session is shutting down) or `"taken-over"`
-(another client took the lease). It carries **no `revision`** and is
-exempt from the gap check below: it is not a commit, it is the stream
-saying why it is over, and it is always the last frame before the
-close. The catalog of batch envelopes is [Events](#events) below.
+(this stream's own control/data connections were taken over —
+[`session.stop`](#sessionstop) only; a takeover no longer sends this to
+a *surviving* event stream, see below). It carries **no `revision`** and
+is exempt from the gap check below: it is not a commit, it is the
+stream saying why it is over, and it is always the last frame before
+the close.
 
-The envelope is **best-effort**. A peer that stopped reading has
-already made the write impossible once its socket buffer filled, so a
-plain EOF remains the fallback signal and a client must treat an
-unlabeled close exactly as it treated one before: reconnect and
-resync.
+The other rides the same way but is **not terminal**:
+
+```json
+{"event": "session.driver_changed", "data": {"taken_by": "workbox"}}
+```
+
+Sent to **every** registered stream on a takeover — driver and observer
+alike, since an observer has the same "who drives this now?" question —
+in registration order for a run of consecutive takeovers, injected into
+the same serialized push queue a batch would use. **No `tab.effect` is
+ever delivered on the same stream after its `driver_changed`**: the
+classification a batch is built against and the takeover that emits the
+envelope are read and written under the same lock, so an effect batch
+racing the takeover is filtered as an observer's, and one that beat the
+takeover already drained. A stream keeps delivering after it — it is
+the sibling of `session.stopping`, not a relabeling of it, and a client
+must not latch on it the way it latches on the stopping envelope.
+
+The catalog of batch envelopes is [Events](#events) below.
+
+Both non-batch envelopes are **best-effort**. A peer that stopped
+reading has already made the write impossible once its socket buffer
+filled — for `session.driver_changed` that ends the stream outright
+(relay aborted, bare EOF, exactly today's backpressure-resync
+semantics; no such thing as a labeled backpressure close exists on this
+wire) rather than blocking the takeover on a slow observer. A plain EOF
+remains the fallback signal for both envelopes, and a client must treat
+an unlabeled close the way it always has: reconnect and resync — which
+is also how a client that missed `driver_changed` learns the truth,
+through the reconnect prologue's own probe.
 
 Three properties make this lossless without a replay buffer:
 
@@ -1610,15 +1691,17 @@ Three properties make this lossless without a replay buffer:
   with [`tab.list`](#tablist)'s own `revision`: snapshot, discard every
   batch `<=` it, apply the rest.
 * **No gaps.** Every commit is a batch, including a commit that
-  produced no events — that arrives as `{"revision": N, "events": []}`.
-  A skipped number therefore always means loss, never a quiet commit.
+  produced no events, or every one of whose events an observer stream
+  filtered — both arrive as `{"revision": N, "events": []}`. A skipped
+  number therefore always means loss, never a quiet commit and never a
+  filtered one.
 * **The server closes rather than thins.** If a subscriber stops
   reading, falls behind the workspace broadcast, or the connection
   stalls, the server closes the connection instead of dropping events
   out of the stream. A close is the resync signal: reconnect,
-  re-subscribe, re-pull `tab.list`, and fence again — the
-  `session.stopping` envelope, where it arrives, only tells the client
-  *why* it is resyncing.
+  re-subscribe, re-pull `tab.list`, and fence again — `session.stopping`
+  or `session.driver_changed`, where either arrives, only tell the
+  client *why* it is resyncing.
 
 After the flip the connection answers nothing. Frames a client writes
 on it are read and discarded (so the server still notices a peer that
@@ -1634,12 +1717,15 @@ ignored — HS-2 scope. Silently serving an unfiltered stream to a client
 that asked for one tab would make it mis-attribute every other tab's
 events.
 
-**Breaking change, HS-1b (plan 036).** HS-1a served this op with no
-lease at all. A client written against that form still *decodes* — the
-`lease` field defaults rather than being required — and gets
-`connect-required`, which names the step it skipped instead of an
-envelope-shaped `invalid-param` that names nothing.
-`SESSION_PROTOCOL_VERSION` bumped `1` → `2` for exactly this.
+**Breaking change, HS-1b (plan 036), then re-cut by plan 049 (R1).**
+HS-1a served this op with no lease at all; HS-1b required one
+(`SESSION_PROTOCOL_VERSION` `1` → `2`). R1 dropped the requirement again
+— `events.subscribe` is leaseless once more, but not the same as HS-1a's
+leaseless subscribe: it now classifies (driver vs. observer) rather than
+serving one undifferentiated feed, and a driver stream demoted by
+takeover survives instead of ending. `SESSION_PROTOCOL_VERSION` moved
+`3` → `4` for this and for [`tab.write`](#tabwrite)'s new gate together
+— see [Versioning](#versioning).
 
 On a **UI socket** the op is still unimplemented: it answers
 `{"ok": false, "error": {"code": "not-implemented", "message":
@@ -1655,19 +1741,27 @@ including [`tab.attach`](#tabattach), which is a `tab.*` name but a
 session-only op — which is how a client tells the two kinds of socket
 apart.
 
-The order a client runs them in is `session.identify` →
+The order a *driver* runs them in is `session.identify` →
 `session.connect` → `session.set_theme` / `session.set_focus` →
 `events.subscribe` / `tab.attach`, with `session.set_agent_hooks`
-queued behind them. Only the lease part of that is
-enforced: `identify` is a stateless read and nothing requires it first,
-but the lease *is* required, and the ops that need it say so by name.
-The three `set_*` ops are placed where they are because each states
-something the session would otherwise guess wrong — its palette, whose
-window is looking at it, and whether the user wants agent hooks on this
-machine — and each is re-stated whenever the client's own answer
-changes. `set_agent_hooks` is last and off the critical path on purpose:
-it is the only one that touches the filesystem, so a client queues it
-rather than waiting on it.
+queued behind them. Only the lease part of that is enforced, and only
+for the ops that still gate on one: `identify` is a stateless read and
+nothing requires it first, `events.subscribe` never required a lease to
+begin with and is leaseless again as of plan 049 R1 — the lease
+*classifies* that stream rather than gating it (see
+[`events.subscribe`](#eventssubscribe)) — but `tab.attach` and
+[`tab.write`](#tabwrite) on a session socket do require one, and say so
+by name. An **observer** — a client that never intends to drive — runs
+a shorter sequence: `session.identify` → `events.subscribe` with no
+`lease` → `tab.list`, and never calls `session.connect`,
+`session.set_theme`, or `tab.attach` at all. The three `set_*` ops are
+placed where they are for a driver because each states something the
+session would otherwise guess wrong — its palette, whose window is
+looking at it, and whether the user wants agent hooks on this machine —
+and each is re-stated whenever the client's own answer changes.
+`set_agent_hooks` is last and off the critical path on purpose: it is
+the only one that touches the filesystem, so a client queues it rather
+than waiting on it.
 
 ### Session sockets
 
@@ -1722,8 +1816,10 @@ report; the children then die with the process.
 HS-1a shipped with three documented deviations from
 [`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md);
 **HS-1b (plan 036) resolved all three**, and each is now described where
-it belongs: `events.subscribe` is
-[lease-gated](#eventssubscribe), `session.stop` and takeover
+it belongs: `events.subscribe` was made
+[lease-gated](#eventssubscribe) (plan 049, R1 later re-cut this —
+subscribing is leaseless again, and the lease classifies the stream
+instead), `session.stop` and takeover
 [label what they close](#sessionstop), and terminal-generated queries
 are answered by the tab's own server Terminal (below).
 
@@ -1757,8 +1853,9 @@ Params: `{}`. Response:
 ```json
 {
   "app_version": "0.0.18",
-  "session_protocol": 3,
+  "session_protocol": 4,
   "payload_kinds": ["ghostty-snapshot", "vt"],
+  "features": ["put_file"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
   "started_at": "2026-08-27T14:03:11Z"
@@ -1769,16 +1866,39 @@ The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
 `SESSION_PROTOCOL_VERSION` — deliberately separate from the
 request/response `protocol_version` in [`identify`](#identify), because
-the two version different things and move independently. It is **`3`**
-as of plan 047, which added `session.put_file`: a
-pre-047 session could only answer `unknown-op` to a file the user just
-pasted, which is not a refusal a client can act on, so the number moved
-rather than carrying a per-paste special case forever. `2` was HS-1b's
-breaking bump, because [`events.subscribe`](#eventssubscribe) and
-[`tab.attach`](#tabattach) began requiring a lease that a client written
-against `1` never presented. The [attach handshake](#data-plane) carries
-the same number and refuses a mismatch before it even looks at the
-token.
+the two version different things and move independently. It is **`4`**
+as of plan 049 (R1), which re-cut what the interactive lease owns —
+breaking in both directions:
+[`events.subscribe`](#eventssubscribe) no longer requires a lease (a
+`3` session refuses the leaseless subscribe a `4` client sends), and
+[`tab.write`](#tabwrite) on a session socket now does (a `3` client's
+leaseless write is refused by a `4` session). Takeover also stopped
+being terminal for event streams — they survive it and receive
+[`session.driver_changed`](#events) instead of `session.stopping`,
+which a `3` client skips as an unknown envelope and then waits forever
+for a goodbye that never comes. `3` was plan 047's bump, for
+`session.put_file`: a pre-047 session could only answer `unknown-op` to
+a file the user just pasted, which is not a refusal a client can act
+on, so the number moved rather than carrying a per-paste special case
+forever. `2` was HS-1b's breaking bump, because `events.subscribe` and
+[`tab.attach`](#tabattach) began requiring a lease that a client
+written against `1` never presented. The [attach handshake](#data-plane)
+carries the same number and refuses a mismatch before it even looks at
+the token.
+
+`features` is a newer, narrower channel than a whole protocol
+generation: an **open list of strings**, decode-when-absent (a `3`
+session sends no such key and a `4` client must still decode it as
+empty) like `payload_kinds`, naming the *additive* session ops this
+build serves so a client feature-detects them instead of a single new
+op spending a whole `SESSION_PROTOCOL_VERSION` generation. It is seeded
+with `"put_file"` — plan 047's op is the case that prompted this: had
+`features` existed then, `session.put_file` would not have needed the
+`2` → `3` bump at all. **What a generation bump itself covers is never
+listed here** — R1's own leaseless-subscribe / gated-write /
+`driver_changed` behaviors are what `4` covers, not `features` entries,
+because a client already knows its own generation. See
+[Versioning](#versioning) for how this relates to the bump rule.
 
 `payload_kinds` names what this session can encode a tab's attach
 payload as, in no particular order; it is an **open list of strings**,
@@ -1814,7 +1934,10 @@ tabs, not merely to read them.
 
 Request:
 ```json
-{"id": "3", "op": "session.connect", "params": {"takeover": true}}
+{"id": "3", "op": "session.connect", "params": {
+  "takeover": true,
+  "client_label": "workbox"
+}}
 ```
 
 Response:
@@ -1833,13 +1956,38 @@ the snapshot, so a client can fence its first
 [`tab.list`](#tablist) against the event stream without a second round
 trip.
 
+`client_label` is optional (omit-when-unset, so an unlabeled connect
+from before this field existed stays byte-identical): who the claimant
+says it is at the moment it claims authority — a hostname for a
+desktop, an app name for a phone. **Display metadata, never identity**
+— nothing here is authenticated, so a UI renders it as what the client
+*reports itself as*, never as a verified name. The server normalizes it
+(trim, strip control characters, cap at 128 UTF-8-safe bytes, empty
+after normalization → absent) rather than trusting the client to, so a
+hand-written request gets the same treatment as a typed one. It is not
+on [`session.identify`](#sessionidentify): that op runs on a socket with
+no handshake gate, so an unconditionally-sent new field would be
+`deny_unknown_fields`-rejected by every session that predates it — the
+label rides `session.connect` instead, where mixed generations already
+fail closed. It is echoed to every deposed stream as
+[`session.driver_changed`](#events)'s `taken_by`, falling back to
+`"unknown client"` when the claimant sent none.
+
 The lease is the interactive-authority boundary, and a self-declared
-client id would not be one: possession of the token is what proves a
-client is *the* driver. It gates [`events.subscribe`](#eventssubscribe)
-and [`tab.attach`](#tabattach). Administrative ops — `tab.open`,
-`tab.list`, `tab.write`, `project.*`, `tab.agent_report`, the dumps —
-stay lease-free: they are same-UID control-plane use (`roostctl`, a
-Claude hook), not interactive ownership.
+client id (like the label above) would not be one: possession of the
+token is what proves a client is *the* driver. **Framing, restated for
+plan 049 (R1):** the lease is interactive-ownership *coordination*, not
+a security boundary — any same-UID client can
+`session.connect{takeover: true}` on purpose, same as always. What the
+lease gates changed, though: **reading is free**
+([`events.subscribe`](#eventssubscribe) takes no lease at all — it
+classifies its stream on one, it does not require one), and **writing
+is owned** — [`tab.attach`](#tabattach)'s attach input, and now
+[`tab.write`](#tabwrite) on a session socket too. Administrative
+mutations — `tab.open`, `tab.list`, `project.*`, `tab.agent_report`,
+`tab.resize`, the dumps — stay lease-free: they are same-UID
+control-plane use (`roostctl`, a Claude hook), not interactive
+ownership.
 
 **The lease outlives the connection it was minted on.** Dropping every
 socket releases nothing; a client that reconnects is a *new* client as
@@ -1860,21 +2008,34 @@ The third row is not an oversight. A client that lost track of its own
 lease is exactly the one that has to re-establish it deliberately.
 
 A takeover, under one lock, atomically: invalidates the old lease,
-closes **every connection registered under it** except the requesting
-one, purges its outstanding attach tokens, and mints the new lease.
-What "closes" means depends on what the connection was doing:
+closes **every control/data connection registered under it** except
+the requesting one, notifies every registered event stream, purges the
+old lease's outstanding attach tokens, and mints the new lease. What
+"closes" means depends on what the connection was doing — and, as of
+plan 049 (R1), an event stream is no longer in that "closes" set at
+all:
 
 * a plain control connection just closes — there is no stream its peer
   is waiting on, only a reply it never asked for;
-* an events connection gets the terminal
-  `{"event": "session.stopping", "data": {"reason": "taken-over"}}`
-  envelope, then closes;
 * a data connection gets an `ERROR` frame with code `taken-over`, then
-  closes.
+  closes;
+* **an event stream survives.** It is registered separately from the
+  lease's own connection list precisely so a takeover cannot close the
+  stream it needs to reclassify. It gets one
+  `{"event": "session.driver_changed", "data": {"taken_by": "workbox"}}`
+  envelope — non-terminal, injected into its existing push queue — and
+  keeps delivering afterward, reclassified from driver to observer if
+  it was the deposed lease's own stream (see
+  [`events.subscribe`](#eventssubscribe) for what an observer stream
+  still gets). The tombstone rule below is unchanged by any of this.
 
-Both labels are best-effort under a 2 s deadline: a peer that stopped
-reading made the write impossible when its socket buffer filled, and
-EOF is then the only signal it gets.
+Both the control/data close and the `driver_changed` injection are
+best-effort under a short deadline: a peer that stopped reading made
+the write impossible when its socket buffer filled, and for a control
+or data connection EOF is then the only signal it gets; for an event
+stream, a full queue ends the relay outright (bare EOF, the same
+resync semantics event backpressure has always had) rather than
+blocking the takeover on a slow reader.
 
 Purging the displaced lease's attach tokens matters for a reason that
 is easy to miss: they would be refused at the handshake's lease
@@ -2469,10 +2630,25 @@ atomic on the wire. The set below is exhaustive — the serializer
 workspace's event enum, so a new event cannot ship without a name
 here.
 
-`session.stopping` is deliberately **not** in this set: it is not a
-workspace event, it carries no `revision`, and it never rides inside a
-batch. It is the connection's own terminal control envelope — see
-[`events.subscribe`](#eventssubscribe).
+`session.stopping` and `session.driver_changed` are deliberately **not**
+in this set: neither is a workspace event, neither carries a
+`revision`, and neither ever rides inside a batch — both are the
+connection's own control envelopes, delivered outside the batch
+discipline. `session.stopping` is **terminal** — the last frame before
+the stream closes. `session.driver_changed` is its **non-terminal**
+sibling: `{"event": "session.driver_changed", "data": {"taken_by":
+"<string>"}}`, sent to every registered stream on a takeover, and the
+stream keeps delivering batches after it. **Ordering is pinned:** a
+stream never delivers a `tab.effect` after its own
+`session.driver_changed` — the classification a batch is built against
+and the takeover that emits the envelope share one lock, so an effect
+racing the takeover is filtered as an observer's and one that beat it
+already drained. A stream whose push queue is full when the envelope
+would be injected never sees it at all — its relay ends and the peer
+gets a bare EOF instead, exactly today's backpressure-resync semantics;
+see [`events.subscribe`](#eventssubscribe) and
+[`session.connect`](#sessionconnect) for the full classification and
+takeover mechanics.
 
 * `tab.opened` — `{"tab": <Tab>}`.
 * `tab.closed` — `{"tab_id": "<id>"}`.
@@ -2547,16 +2723,20 @@ is the UI socket's schema version — currently **`1`**
 (`roost_ipc::PROTOCOL_VERSION`); it is reported by
 [`identify`](#identify) but nothing compares it, so the UI socket has no
 handshake gate. `session.identify.session_protocol` is the session
-sockets' — currently **`3`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
+sockets' — currently **`4`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
 covering both the session JSON ops and the binary [data
 plane](#data-plane); conforming clients check it for equality before
 anything else and the [attach handshake](#tabattach) refuses a mismatch.
-`3` is plan 047's bump for `session.put_file` — an
-additive op that moved the number anyway, under the rule stated on the
-constant: an addition bumps when a pre-bump peer could not refuse it
-meaningfully (a pre-047 session can only answer `unknown-op` to a file
-the user just pasted). The history of the integer is in
+The history of the integer, generation by generation, is in
 [`session.identify`](#sessionidentify).
+
+An addition bumps this integer when a pre-bump peer could not refuse it
+meaningfully — **session-socket only** (a UI-socket op like
+`tab.send_file` moves nothing here, because that wire has no handshake
+gate to move), and now the **fallback**: [`features`](#sessionidentify)
+is the preferred channel for an additive session op, so a generation
+is spent only when there is no lighter way to say "this build can do
+one more thing."
 
 **The consumption and compatibility policy lives in
 [`ipc-compatibility.md`](ipc-compatibility.md)** — what is additive in
