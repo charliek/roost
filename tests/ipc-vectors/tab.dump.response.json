@@ -1,0 +1,16 @@
+{
+  "id": "13",
+  "ok": true,
+  "result": {
+    "cols": 80,
+    "rows": 24,
+    "cursor": {
+      "row": 2,
+      "col": 0,
+      "visible": true
+    },
+    "rows_text": ["/tmp $ echo hi", "hi"],
+    "scrollback_rows": 3,
+    "scrollback_text": ["/tmp $ ls", "README.md", "/tmp $ clear"]
+  }
+}

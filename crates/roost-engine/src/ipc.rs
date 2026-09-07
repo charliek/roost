@@ -3438,6 +3438,10 @@ async fn dispatch(
                     .cursor
                     .map(|(row, col, visible)| TabDumpCursor { row, col, visible }),
                 rows_text: data.rows_text,
+                // No scrollback is read yet; the next commit gives
+                // `DumpData` these two and wires them through.
+                scrollback_rows: 0,
+                scrollback_text: Vec::new(),
             })
         }
         ops::PROJECT_CREATE => {

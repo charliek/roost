@@ -425,6 +425,7 @@ async fn dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
             ops::TAB_DUMP,
             TabDumpParams {
                 tab_id: WireTabRef::Local(tab_id),
+                ..Default::default()
             },
         )
         .await

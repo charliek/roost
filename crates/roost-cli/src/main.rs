@@ -736,6 +736,7 @@ async fn main() -> Result<()> {
                                     ops::TAB_DUMP,
                                     TabDumpParams {
                                         tab_id: WireTabRef::Local(tab_id),
+                                        ..Default::default()
                                     },
                                 )
                                 .await
@@ -1003,8 +1004,15 @@ async fn main() -> Result<()> {
         }
         Cmd::Tab(TabCmd::Dump { tab, json }) => {
             let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
-            let result: TabDumpResult =
-                client.call(ops::TAB_DUMP, TabDumpParams { tab_id }).await?;
+            let result: TabDumpResult = client
+                .call(
+                    ops::TAB_DUMP,
+                    TabDumpParams {
+                        tab_id,
+                        ..Default::default()
+                    },
+                )
+                .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {

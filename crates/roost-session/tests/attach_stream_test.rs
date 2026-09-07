@@ -603,6 +603,10 @@ impl DecodedGrid {
                     visible: true,
                 }),
             rows_text: self.rows.iter().map(|row| row.text.clone()).collect(),
+            // This fixture mirrors a decoded viewport, which carries no
+            // history; the scrollback halves are compared separately.
+            scrollback_rows: 0,
+            scrollback_text: Vec::new(),
         }
     }
 
