@@ -797,10 +797,8 @@ fn code(error: &roost_ipc::ClientError) -> &str {
     }
 }
 
-/// The name is the client's and is never repaired: the path this op
-/// returns has to be pasteable bare, so a name that would need quoting
-/// — or that could climb out of its upload directory — is refused
-/// rather than rewritten into something the client did not ask for.
+/// Every name shape `validate_put_file_name` rules out, refused on the
+/// wire. Its own doc says why they are refused rather than repaired.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_file_refuses_every_name_it_cannot_paste_bare() {
     let f = SessionFixture::new(Some(1 << 20)).await;

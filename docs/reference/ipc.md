@@ -328,6 +328,14 @@ local paths are pasted, which is what a file drop has always done. UI
 socket only, ungated. The same function the native drop handler calls —
 the op *is* the drop, minus the window event.
 
+**Served by the iced UI only.** The Swift `Roost.app` answers
+`unknown-op`: it has no host sessions, so there is nothing to upload to,
+and this op's whole point is the crossing. (The protocol integer that
+moved for this work is `session_protocol`, which governs *session*
+sockets; the UI socket's own `protocol_version` is unchanged, so a Mac
+UI is not claiming to serve this.) The Mac fold-in is described in the
+plan's §3.7 and waits on Mac host sessions.
+
 Request:
 ```json
 {"id": "13", "op": "tab.send_file", "params": {

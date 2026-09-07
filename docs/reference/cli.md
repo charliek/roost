@@ -183,6 +183,11 @@ actually read them; on a local tab it pastes the escaped local paths.
 Exactly what dropping the files onto the tab does — same route, same
 gesture queue — backed by the [`tab.send_file`](ipc.md#tabsend_file) op.
 
+**Linux/iced only.** The Swift `Roost.app` does not serve this op and
+answers `unknown-op`; it has no host sessions to upload to, and its
+local drop route is unchanged. See [the Swift fold-in
+note](ipc.md#tabsend_file).
+
 | Flag | Effect |
 |---|---|
 | `--tab <id>` | **Required.** Bare engine id, or `h<host>.<id>` for a connected host's tab. |
