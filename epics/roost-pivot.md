@@ -36,10 +36,14 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R8 | [#425](https://github.com/charliek/roost/issues/425) | RP/M2 | gx opt-in indicator via the `metadata` map — no new agent variant |
 | R9 | [#426](https://github.com/charliek/roost/issues/426) | RP/M5 | local default flip (HS-5): the UI connects to a local `roost-session` |
 
-**Start with R6.** It is XS, fixes a live false-idle, and shakes down the
-issue → PR → `Closes` → board chain before anything larger depends on it.
-R6, R2 and R1 are small enough to ride the release currently in flight;
-R9 is the one not to rush.
+**Sequencing.** R6 went first, as the XS item that shook down the
+issue → PR → `Closes` → board chain; R2 and R1 followed, then R8, then
+R7 and R5. What is left is R3 and R4, which are independent of each
+other and of everything above, and **R9, the one not to rush** — it
+depends on R1 (landed) and changes the default every session runs under,
+so it wants living with the pieces before it, not speed. The board
+carries the current state; this paragraph is only the order and the
+reasoning behind it.
 
 ## Rules that apply in this repo
 
