@@ -13,7 +13,10 @@
 use std::borrow::Cow;
 
 use roost_ipc::client::{ClientError, ServerCode};
+use roost_ipc::messages::SessionPutFileResult;
 use tokio::sync::{mpsc, oneshot};
+
+use super::upload::{UploadSource, Uploads};
 
 /// How many intents may be waiting on a host before enqueuing fails.
 ///
@@ -37,6 +40,12 @@ pub(crate) enum HostOpError {
     Transport(String),
     /// The queue was full, or the connection task is already gone.
     Unavailable,
+    /// **This client** refused it: an upload's file could not be read,
+    /// or the session's answer was not one the client can use (plan 047
+    /// §3.1's reply re-check). Nothing is wrong with the connection, and
+    /// nothing was wrong with the request — the message is the whole
+    /// story.
+    Local(String),
 }
 
 impl std::fmt::Display for HostOpError {
@@ -48,6 +57,7 @@ impl std::fmt::Display for HostOpError {
             }
             HostOpError::Transport(error) => write!(f, "connection lost: {error}"),
             HostOpError::Unavailable => f.write_str("the host is not accepting operations"),
+            HostOpError::Local(message) => f.write_str(message),
         }
     }
 }
@@ -133,12 +143,50 @@ impl HostIntent {
 #[derive(Debug, Clone)]
 pub(crate) struct HostOps {
     tx: mpsc::Sender<HostIntent>,
+    /// The upload lane, which shares nothing with the queue above but
+    /// the handle that reaches it. See [`upload`].
+    uploads: Uploads,
 }
 
 impl HostOps {
     pub(crate) fn channel() -> (HostOps, mpsc::Receiver<HostIntent>) {
         let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
-        (HostOps { tx }, rx)
+        (
+            HostOps {
+                tx,
+                uploads: Uploads::default(),
+            },
+            rx,
+        )
+    }
+
+    /// The slot the connection task fills at its `Connected` edge.
+    pub(crate) fn uploads(&self) -> Uploads {
+        self.uploads.clone()
+    }
+
+    /// Send one file to the host, and wait for the path it landed at.
+    ///
+    /// Deliberately **not** an intent: the queue above is drained by a
+    /// loop that awaits each op inline, so an upload on it could not
+    /// even be admitted while a control op was in flight, and its
+    /// timeout would drop the host. It goes to the per-incarnation
+    /// dispatcher instead, on a connection of its own.
+    ///
+    /// Like [`Self::call`], the future always resolves: a dispatcher
+    /// that went away mid-upload reads as [`HostOpError::Disconnected`],
+    /// which is what happened.
+    // The App calls it in C5; the lane's own tests are what drive it
+    // until then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn put_file(
+        &self,
+        name: String,
+        source: UploadSource,
+    ) -> impl std::future::Future<Output = Result<SessionPutFileResult, HostOpError>> + Send + 'static
+    {
+        let queued = self.uploads.enqueue(name, source);
+        async move { queued?.await.unwrap_or(Err(HostOpError::Disconnected)) }
     }
 
     /// Enqueue. The intent's own reply channel carries the outcome; the

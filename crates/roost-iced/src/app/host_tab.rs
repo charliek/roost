@@ -803,7 +803,11 @@ fn classify_op_failure(error: &crate::host_conn::queue::HostOpError) -> FailReas
     use crate::host_conn::queue::HostOpError;
     match error {
         HostOpError::Rejected { code, .. } => reason_for(Some(code), error.to_string()),
-        HostOpError::Disconnected | HostOpError::Unavailable => {
+        // `Local` is the upload lane's own refusal and cannot reach a
+        // token mint at all; grouped with the two that do not retry
+        // because an unexplained client-side refusal is not something a
+        // second attach attempt would fix either.
+        HostOpError::Disconnected | HostOpError::Unavailable | HostOpError::Local(_) => {
             FailReason::HostGone(error.to_string())
         }
         HostOpError::Transport(_) => FailReason::Retryable(error.to_string()),
