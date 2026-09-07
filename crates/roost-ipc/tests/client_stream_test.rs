@@ -138,6 +138,64 @@ async fn the_ack_fences_the_stream_and_every_commit_arrives() {
         requests[0].params["tab_id_filter"], "0",
         "HS-2 subscribes unfiltered and filters client-side"
     );
+    assert!(
+        requests[0].params.get("from_revision").is_none(),
+        "a plain subscribe puts no resume key on the wire: {}",
+        requests[0].params
+    );
+}
+
+/// The resume vector's params — what a session's own corpus says this
+/// request looks like, rather than a second spelling of it here.
+fn resume_vector_params() -> serde_json::Value {
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(path.pop(), "pop roost-ipc");
+    assert!(path.pop(), "pop crates");
+    path.push("tests");
+    path.push("ipc-vectors");
+    path.push("events.subscribe.resume.request.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let vector: serde_json::Value = serde_json::from_str(&raw).expect("vector JSON");
+    vector["params"].clone()
+}
+
+/// A resume names both the fence and the incarnation it fenced against,
+/// and the ack echoes the fence back — so "the first batch is
+/// `revision + 1`" reads the same as it does for a fresh subscribe, and
+/// the replayed batches are what fills the gap.
+#[tokio::test]
+async fn a_resume_sends_its_fence_and_its_session_and_is_acked_with_the_fence() {
+    let stub = Stub::start(
+        Plan::new()
+            .subscribe(Subscribe::Ack(1180))
+            .push(Push::batch(1181, vec![event(ops::EVENT_TAB_CLOSED)])),
+    )
+    .await;
+
+    let client = within("the dial", IpcClient::connect(stub.path()))
+        .await
+        .expect("connect");
+    let mut stream = within(
+        "the resume",
+        client.resume_events(
+            "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+            1180,
+            "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+        ),
+    )
+    .await
+    .expect("the stub acks the resume");
+    assert_eq!(stream.revision(), 1180);
+    match within("a batch", stream.next()).await.expect("a frame") {
+        Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, 1181),
+        other => panic!("expected the batch after the fence, got {other:?}"),
+    }
+
+    let requests = stub.recorded().requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].op, ops::EVENTS_SUBSCRIBE);
+    assert_eq!(requests[0].params, resume_vector_params());
 }
 
 /// The only loss signal the protocol offers. A client that missed it

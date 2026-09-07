@@ -13,6 +13,24 @@ release workflow asserts they agree).
 
 ### Added
 
+- **`events.subscribe` can resume instead of re-snapshotting (#422)** — a
+  phone dropping in and out of a flaky link used to pay a `tab.list`
+  snapshot and a re-fence on every stall; a host session now keeps a
+  bounded ring of committed batches behind its revision fence, and
+  `events.subscribe` takes two new optional request fields,
+  `from_revision` (what the client already has) and `session_id` (the
+  incarnation it fenced against — required alongside `from_revision`,
+  since revisions restart per process and an unnamed fence could
+  otherwise be served a different session's history that still passes
+  the client's own gap check). A resume outside the retained window
+  answers `replay-expired` naming how far back it can still go; ahead of
+  the session, `revision-ahead`; against a restarted session,
+  `session-mismatch` — all three, plus `invalid-param` for a bare
+  `from_revision`, land on the ack before the stream ever spawns, so the
+  connection stays usable for a plain re-subscribe. `tab.effect` (bells,
+  clipboard writes) is never replayed, driver included — only live
+  clients see it — while `notification.fired` is. No protocol bump: the
+  capability rides `session.identify.features` as `events_resume`.
 - **`gx.remote` metadata key surfaces a gx session's remote lane (#425)** —
   when gx's remote lane is up it stamps its loopback base URL (`gxRemote`,
   e.g. `http://127.0.0.1:2421`) onto every hook payload; roost now forwards

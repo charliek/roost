@@ -22,7 +22,7 @@
 //!   bootstrap drains via `take_restore_layout`; it is kept out of the
 //!   live `tabs` map (those are the re-opened fresh shells).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -42,6 +42,26 @@ use crate::persistence::{persist_state, read_state, HostSnapshot, ProjectSnapsho
 /// Subscribers that fall behind get a `Lagged` and resync via
 /// `tab.list`.
 pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// How many committed batches the replay ring retains, at most.
+///
+/// A count of commits, not a duration, and deliberately larger than the
+/// per-subscriber lag bound above so a subscriber the server closed for
+/// lagging has **headroom** to resume rather than snapshot. Headroom,
+/// not a guarantee: commits keep landing through the stall budget, the
+/// disconnect and the reconnect, and if more than a window's worth
+/// arrive before the fence is presented the answer is `replay-expired`,
+/// which is the designed fallback and not a failure.
+pub const REPLAY_WINDOW: usize = 4 * EVENT_CHANNEL_CAPACITY;
+
+/// How many bytes of retained batches the replay ring may hold, at most,
+/// measured as the serialized JSON length of each stored batch.
+///
+/// The count bound alone bounds nothing useful: a `notification.fired`
+/// body comes through `roost-osc`, whose own cap is 1 MiB, and titles,
+/// cwds and agent metadata are unrestricted strings out of frames up to
+/// 16 MiB. Whichever bound binds first evicts.
+pub const REPLAY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Narrowest the sidebar may be dragged, in logical points.
 pub const SIDEBAR_MIN_WIDTH: f64 = 160.0;
@@ -130,6 +150,15 @@ struct Inner {
     persist_seq: u64,
     /// Monotonic in-process revision for every committed transition.
     revision: u64,
+    /// Committed batches retained for a resume, oldest first, effects
+    /// stripped. Lives here rather than beside the broadcast sender
+    /// because `commit` must push it in the *same* critical section as
+    /// the revision bump and the send: anywhere else and a resume could
+    /// copy a ring that disagrees with the revision it was cut at.
+    /// Empty for every workspace built without [`ReplayBounds`].
+    replay: VecDeque<ReplayEntry>,
+    /// Running total of `replay`'s [`ReplayEntry::bytes`].
+    replay_bytes: usize,
 }
 
 impl Default for Inner {
@@ -152,8 +181,54 @@ impl Default for Inner {
             window_focused: true,
             persist_seq: 0,
             revision: 0,
+            replay: VecDeque::new(),
+            replay_bytes: 0,
         }
     }
+}
+
+impl Inner {
+    /// Retain `batch` under `bounds`, evicting oldest-first.
+    fn push_replay(&mut self, batch: VersionedWorkspaceEvent, bounds: ReplayBounds) {
+        let bytes = replay_cost(&batch);
+        if bytes > bounds.budget_bytes {
+            // A hole is never allowed. One legal batch can exceed the
+            // whole budget (a 1 MiB notification body), and storing it
+            // alone or skipping it inside the ring would both leave a
+            // resume reading a history it never committed — so the ring
+            // is cleared and a resume from before it expires.
+            self.replay.clear();
+            self.replay_bytes = 0;
+            return;
+        }
+        self.replay_bytes += bytes;
+        self.replay.push_back(ReplayEntry { batch, bytes });
+        while self.replay.len() > bounds.window || self.replay_bytes > bounds.budget_bytes {
+            match self.replay.pop_front() {
+                Some(evicted) => self.replay_bytes -= evicted.bytes,
+                None => break,
+            }
+        }
+    }
+
+    /// The smallest `from_revision` the ring can serve — see
+    /// [`ResumeError`] for the two names.
+    fn oldest_resumable_from(&self, current: u64) -> u64 {
+        match self.replay.front() {
+            Some(entry) => entry.batch.revision.saturating_sub(1),
+            None => current,
+        }
+    }
+}
+
+/// What one retained batch costs against [`ReplayBounds::budget_bytes`].
+///
+/// Infallible for these types (no floats, no non-string map keys); a
+/// batch that somehow could not be measured is still bounded by the
+/// window count, so a zero is safe rather than a second failure mode
+/// under the commit lock.
+fn replay_cost(batch: &VersionedWorkspaceEvent) -> usize {
+    serde_json::to_vec(batch).map_or(0, |bytes| bytes.len())
 }
 
 /// A persisted project's tab layout, surfaced to the UI bootstrap.
@@ -323,6 +398,82 @@ pub struct VersionedWorkspaceEvent {
     pub events: Vec<WorkspaceEvent>,
 }
 
+/// What a workspace retains for `events.subscribe {from_revision}`.
+///
+/// Opted into with [`Workspace::with_replay`] and **off by default**:
+/// the UI, the facade tests and every local path build workspaces that
+/// never serve a subscription, and they pay neither the clone nor the
+/// memory. Only the host session turns it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayBounds {
+    /// Batch count. Clamped to at least 1 by [`Workspace::with_replay`]
+    /// — a zero window is "no ring", which is what *not* calling it
+    /// already means.
+    pub window: usize,
+    /// Serialized JSON bytes of the retained batches.
+    pub budget_bytes: usize,
+}
+
+impl Default for ReplayBounds {
+    fn default() -> Self {
+        Self {
+            window: REPLAY_WINDOW,
+            budget_bytes: REPLAY_BUDGET_BYTES,
+        }
+    }
+}
+
+/// One batch in the ring, with what it cost to keep.
+///
+/// The cost is computed once, where the batch is pushed, rather than
+/// re-serialized on every eviction check.
+struct ReplayEntry {
+    batch: VersionedWorkspaceEvent,
+    bytes: usize,
+}
+
+/// Everything one subscription needs, captured in **one** critical
+/// section by [`Workspace::subscribe_from`] / [`Workspace::subscribe_live`].
+///
+/// The atomicity is the whole design. The receiver is subscribed, the
+/// current revision is read and the ring is copied under the same lock a
+/// commit bumps and broadcasts under, so there is no instant at which a
+/// commit can land between "the ring was copied" and "the receiver
+/// exists": the replay covers `from_revision + 1 ..= fence` and the
+/// receiver's first batch is exactly `fence + 1`, with no gap and no
+/// overlap. A relay that opened its own receiver instead would reopen
+/// that hole, which is why [`crate::event_push::spawn`] consumes this
+/// and never subscribes.
+pub struct ResumeCut {
+    /// The live half. Batches at or below `fence` are the replay's.
+    pub rx: broadcast::Receiver<VersionedWorkspaceEvent>,
+    /// The gap, oldest first, effects already stripped.
+    pub replay: Vec<VersionedWorkspaceEvent>,
+    /// The revision the cut was taken at.
+    pub fence: u64,
+}
+
+/// Why a resume could not be served.
+///
+/// Two named numbers, used in both variants and in the refusals built
+/// from them: `oldest_batch_revision` is the revision of the oldest
+/// retained batch, and `oldest_resumable_from` is
+/// `oldest_batch_revision - 1` — the smallest `from_revision` the ring
+/// can serve, since a client that has everything up to it needs the
+/// oldest batch and nothing older. With an empty or absent ring both
+/// collapse to the current revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeError {
+    /// `from_revision` is past the current revision: a fence from
+    /// another incarnation, or a client bug.
+    Ahead { current: u64 },
+    /// `from_revision` is older than the ring reaches.
+    Expired {
+        oldest_resumable_from: u64,
+        current: u64,
+    },
+}
+
 pub struct Workspace {
     inner: Mutex<Inner>,
     /// Workspace event channel. Mutators publish on this **while
@@ -358,6 +509,10 @@ pub struct Workspace {
     /// Lock-free because `persist()` runs after the `inner` lock drops
     /// — it can't read a field guarded by that lock.
     shutting_down: AtomicBool,
+    /// What the replay ring retains, or `None` for no ring at all.
+    /// Fixed at construction (`with_replay`), so it is read without the
+    /// lock even though the ring it bounds lives under it.
+    replay_bounds: Option<ReplayBounds>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -499,7 +654,18 @@ impl Workspace {
             persist_guard: Mutex::new(0),
             restore_layout: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
+            replay_bounds: None,
         }
+    }
+
+    /// Retain committed batches so `events.subscribe {from_revision}`
+    /// can be served — see [`ReplayBounds`] for why it is opt-in.
+    pub fn with_replay(mut self, bounds: ReplayBounds) -> Self {
+        self.replay_bounds = Some(ReplayBounds {
+            window: bounds.window.max(1),
+            budget_bytes: bounds.budget_bytes,
+        });
+        self
     }
 
     /// Construct a workspace backed by `state_path`. Loads the file
@@ -585,6 +751,7 @@ impl Workspace {
             persist_guard: Mutex::new(0),
             restore_layout: Mutex::new(Some(restore)),
             shutting_down: AtomicBool::new(false),
+            replay_bounds: None,
         }
     }
 
@@ -736,6 +903,51 @@ impl Workspace {
     /// Subscribe to events carrying their authoritative commit revision.
     pub fn subscribe_versioned(&self) -> broadcast::Receiver<VersionedWorkspaceEvent> {
         self.versioned_events.subscribe()
+    }
+
+    /// Start a subscription at the current revision — see [`ResumeCut`].
+    pub fn subscribe_live(&self) -> ResumeCut {
+        let inner = self.inner.lock().unwrap();
+        ResumeCut {
+            rx: self.versioned_events.subscribe(),
+            replay: Vec::new(),
+            fence: inner.revision,
+        }
+    }
+
+    /// Start a subscription from `from_revision`, replaying what the
+    /// ring still holds above it — see [`ResumeCut`] and [`ResumeError`].
+    ///
+    /// `from_revision == current` is a valid resume with an empty
+    /// replay, and on a workspace with no ring that is the *only*
+    /// resume that succeeds.
+    pub fn subscribe_from(&self, from_revision: u64) -> Result<ResumeCut, ResumeError> {
+        let inner = self.inner.lock().unwrap();
+        // Under the lock with the ring copy below, so the receiver and
+        // the replay meet exactly at `fence` (see `ResumeCut`).
+        let rx = self.versioned_events.subscribe();
+        let current = inner.revision;
+        if from_revision > current {
+            return Err(ResumeError::Ahead { current });
+        }
+        let oldest_resumable_from = inner.oldest_resumable_from(current);
+        if from_revision < oldest_resumable_from {
+            return Err(ResumeError::Expired {
+                oldest_resumable_from,
+                current,
+            });
+        }
+        let replay = inner
+            .replay
+            .iter()
+            .filter(|entry| entry.batch.revision > from_revision)
+            .map(|entry| entry.batch.clone())
+            .collect();
+        Ok(ResumeCut {
+            rx,
+            replay,
+            fence: current,
+        })
     }
 
     /// Snapshot of the workspace as it appears on the wire.
@@ -1779,6 +1991,25 @@ impl Workspace {
             Persist::Skip => None,
             Persist::Write => Some(inner.snapshot_for_persist()),
         };
+        if let Some(bounds) = self.replay_bounds {
+            // Effects are the driving client's live side-channel
+            // (DL-18): replaying a clipboard write from thirty seconds
+            // ago is wrong in itself, and a 256 KiB one would burn the
+            // byte budget for nothing. A batch whose events were all
+            // effects is still retained — empty — because the revision
+            // is what the client's gap check reads. A clone and a
+            // `VecDeque` push are non-blocking, which is what this lock
+            // permits.
+            let stripped = VersionedWorkspaceEvent {
+                revision,
+                events: events
+                    .iter()
+                    .filter(|ev| !matches!(ev, WorkspaceEvent::TabEffect { .. }))
+                    .cloned()
+                    .collect(),
+            };
+            inner.push_replay(stripped, bounds);
+        }
         for ev in &events {
             let _ = self.events.send(ev.clone());
         }
@@ -3802,6 +4033,250 @@ mod tests {
             restored,
             vec![("low".to_string(), 0)],
             "the last row in the file wins, not the last in display order"
+        );
+    }
+
+    // ================================================================
+    // The replay ring (plan 052 §3.4)
+    // ================================================================
+
+    /// A workspace that retains its commits, with bounds a test can
+    /// exhaust in a handful of them.
+    fn replaying(window: usize, budget_bytes: usize) -> Workspace {
+        Workspace::new().with_replay(ReplayBounds {
+            window,
+            budget_bytes,
+        })
+    }
+
+    fn replayed(cut: &ResumeCut) -> Vec<u64> {
+        cut.replay.iter().map(|batch| batch.revision).collect()
+    }
+
+    /// The default: the UI, the facade tests and every local path pay
+    /// nothing, and the one resume that still works is the degenerate
+    /// "I am already at the fence".
+    #[test]
+    fn a_workspace_without_a_ring_resumes_only_at_its_current_revision() {
+        let ws = Workspace::new();
+        ws.create_project("p", "/").unwrap();
+        let current = ws.revision();
+        assert!(current > 0, "the setup must have committed something");
+
+        let cut = ws.subscribe_from(current).expect("the fence itself");
+        assert!(cut.replay.is_empty());
+        assert_eq!(cut.fence, current);
+        assert_eq!(
+            ws.subscribe_from(current - 1).err(),
+            Some(ResumeError::Expired {
+                oldest_resumable_from: current,
+                current
+            })
+        );
+        assert_eq!(
+            ws.subscribe_from(current + 1).err(),
+            Some(ResumeError::Ahead { current })
+        );
+    }
+
+    /// The pinned example from the plan: current 10, window 4, retained
+    /// 7–10, so `oldest_batch_revision` is 7 and the smallest fence the
+    /// ring can serve is 6 — one below it, because a client that has
+    /// everything through 6 needs 7 and nothing older.
+    #[test]
+    fn the_window_evicts_oldest_first_and_names_the_fence_it_can_still_serve() {
+        let ws = replaying(4, REPLAY_BUDGET_BYTES);
+        for i in 0..10 {
+            ws.create_project(&format!("p{i}"), "/").unwrap();
+        }
+        assert_eq!(ws.revision(), 10, "one commit per project");
+
+        let cut = ws
+            .subscribe_from(6)
+            .expect("6 is the oldest resumable from");
+        assert_eq!(replayed(&cut), vec![7, 8, 9, 10]);
+        assert_eq!(cut.fence, 10);
+
+        assert_eq!(
+            ws.subscribe_from(5).err(),
+            Some(ResumeError::Expired {
+                oldest_resumable_from: 6,
+                current: 10
+            })
+        );
+        assert!(
+            ws.subscribe_from(10)
+                .expect("the fence itself")
+                .replay
+                .is_empty(),
+            "from_revision == current is a valid resume with nothing to replay"
+        );
+        assert_eq!(
+            ws.subscribe_from(11).err(),
+            Some(ResumeError::Ahead { current: 10 })
+        );
+    }
+
+    /// `from_revision: 0` — "I have nothing" — is valid exactly while
+    /// the whole history is still retained.
+    #[test]
+    fn a_zero_fence_replays_the_whole_retained_history() {
+        let ws = replaying(REPLAY_WINDOW, REPLAY_BUDGET_BYTES);
+        for i in 0..3 {
+            ws.create_project(&format!("p{i}"), "/").unwrap();
+        }
+        assert_eq!(
+            replayed(&ws.subscribe_from(0).expect("young enough")),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// A commit that published no events is still a batch in the ring:
+    /// `from_revision + 1` has to be resumable whatever it carried, and
+    /// the client's whole loss check is the revision sequence.
+    #[test]
+    fn an_empty_commit_enters_the_ring() {
+        let ws = replaying(REPLAY_WINDOW, REPLAY_BUDGET_BYTES);
+        ws.add_host("box", "user@box").unwrap();
+
+        let cut = ws.subscribe_from(0).expect("young enough");
+        assert_eq!(replayed(&cut), vec![1]);
+        assert!(cut.replay[0].events.is_empty());
+    }
+
+    /// Effects are the driving client's live side-channel and are never
+    /// replayed — not even to the driver. `notification.fired` is a
+    /// workspace fact and is.
+    #[test]
+    fn the_ring_strips_effects_and_keeps_a_fired_notification() {
+        let ws = replaying(REPLAY_WINDOW, REPLAY_BUDGET_BYTES);
+        let project = ws.create_project("p", "/").unwrap().id;
+        let tab = ws.open_tab(project, "/", "watched").unwrap().id;
+        // A second tab takes the focus, so the raise on the first is not
+        // suppressed as "the user is looking at it".
+        ws.open_tab(project, "/", "active").unwrap();
+
+        ws.publish_tab_effect(tab, TabEffectKind::Bell);
+        let effects_only = ws.revision();
+        assert!(ws
+            .raise_attention(tab, "title", "body", AttentionSource::RawOsc)
+            .unwrap());
+        let fired = ws.revision();
+
+        let cut = ws.subscribe_from(0).expect("young enough");
+        let batch = |revision| {
+            cut.replay
+                .iter()
+                .find(|batch| batch.revision == revision)
+                .unwrap_or_else(|| panic!("revision {revision} is not in the ring"))
+        };
+        assert!(
+            batch(effects_only).events.is_empty(),
+            "an effects-only commit replays as an empty batch, revision and all"
+        );
+        assert!(
+            batch(fired)
+                .events
+                .iter()
+                .any(|event| matches!(event, WorkspaceEvent::NotificationFired { .. })),
+            "a watcher resumes to catch exactly the notification it missed"
+        );
+    }
+
+    /// The count bound alone bounds nothing useful — one legal
+    /// notification body is 1 MiB — so the byte budget evicts too, and
+    /// long before a 1024-commit window would.
+    #[test]
+    fn the_byte_budget_evicts_before_the_window_does() {
+        let ws = replaying(REPLAY_WINDOW, 4096);
+        for i in 0..5 {
+            ws.create_project(&format!("{i}{}", "n".repeat(1500)), "/")
+                .unwrap();
+        }
+
+        let Some(ResumeError::Expired {
+            oldest_resumable_from,
+            current,
+        }) = ws.subscribe_from(0).err()
+        else {
+            panic!("five 1.5 KiB commits must not fit a 4 KiB budget");
+        };
+        assert_eq!(current, 5);
+        assert!(
+            (1..5).contains(&oldest_resumable_from),
+            "some but not all of the history survived: {oldest_resumable_from}"
+        );
+
+        // What survived is a contiguous tail ending at the fence.
+        let cut = ws.subscribe_from(oldest_resumable_from).expect("the tail");
+        assert_eq!(
+            replayed(&cut),
+            (oldest_resumable_from + 1..=current).collect::<Vec<_>>()
+        );
+    }
+
+    /// A single batch bigger than the whole budget cannot be kept, and
+    /// keeping the ones around it would put a hole in the middle of the
+    /// history — so the ring is emptied and every fence below it expires.
+    #[test]
+    fn a_batch_over_the_whole_budget_clears_the_ring() {
+        let ws = replaying(REPLAY_WINDOW, 4096);
+        ws.create_project("small", "/").unwrap();
+        assert_eq!(replayed(&ws.subscribe_from(0).expect("retained")), vec![1]);
+
+        ws.create_project(&"x".repeat(8192), "/").unwrap();
+        assert_eq!(
+            ws.subscribe_from(1).err(),
+            Some(ResumeError::Expired {
+                oldest_resumable_from: 2,
+                current: 2
+            }),
+            "the batch that cleared the ring is itself unreplayable"
+        );
+        assert!(ws
+            .subscribe_from(2)
+            .expect("the fence itself")
+            .replay
+            .is_empty());
+
+        // And the ring refills from the next commit rather than staying
+        // poisoned.
+        ws.create_project("after", "/").unwrap();
+        assert_eq!(replayed(&ws.subscribe_from(2).expect("retained")), vec![3]);
+    }
+
+    /// The seam the whole design is about: the ring copy and the
+    /// receiver are taken in one critical section, so a commit either
+    /// makes the replay or arrives live — never both, and never neither.
+    #[test]
+    fn a_resume_racing_a_commit_meets_it_exactly_once() {
+        let ws = replaying(REPLAY_WINDOW, REPLAY_BUDGET_BYTES);
+        for i in 0..3 {
+            ws.create_project(&format!("p{i}"), "/").unwrap();
+        }
+        let fence = 1;
+
+        let ResumeCut {
+            mut rx,
+            replay,
+            fence: cut_fence,
+        } = ws.subscribe_from(fence).expect("young enough");
+        // Committed after the cut was taken: it belongs to the live half.
+        ws.create_project("raced", "/").unwrap();
+
+        let tail: Vec<u64> = replay.iter().map(|batch| batch.revision).collect();
+        assert_eq!(tail, vec![2, 3]);
+        assert_eq!(*tail.last().expect("a tail"), cut_fence);
+
+        let head = rx.try_recv().expect("the commit after the cut");
+        assert_eq!(
+            head.revision,
+            cut_fence + 1,
+            "the live head is the replay tail's successor: no gap, no overlap"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing the replay already carried is repeated on the receiver"
         );
     }
 }

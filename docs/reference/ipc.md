@@ -1602,12 +1602,60 @@ refused for want of a lease** (plan 049, R1 — reversing HS-1b's gate).
 `lease` stays on the wire, but it now **classifies the stream** instead
 of gating it:
 
-Request: `{"params": {"lease": "9f2c…6b83", "tab_id_filter": "0"}}`.
+Request: `{"params": {"lease": "9f2c…6b83", "tab_id_filter": "0"}}`. Two
+more fields, both optional and, per the wire's usual rule, omitted
+rather than sent as `null` when unset:
+
+* **`from_revision`** — resume instead of starting fresh: *the client
+  already has everything at or below this revision*, the same sentence
+  the response's own `revision` already means. Served out of a bounded
+  replay ring behind the fence (bounds below); absent means a fresh
+  subscribe at the current revision. `0` means "I have nothing, replay
+  from 1", valid exactly while the whole history is still retained; a
+  value equal to the current revision is a valid resume with an empty
+  replay.
+* **`session_id`** — the incarnation the client fenced against
+  ([`session.identify.session_id`](#sessionidentify)). **A resume must
+  name it**: revisions restart at `0` in every process, so a fence
+  carried across a session restart would otherwise be served a
+  *different* history that still passes the client's own gap check.
+  Accepted without `from_revision` too — a client may always state who
+  it thinks it is talking to.
+
 Response (the last request/response frame on the connection):
 
 ```json
 {"id": "7", "ok": true, "result": {"revision": 42}}
 ```
+
+On a resume the ack echoes `from_revision` back as `revision`, so **"the
+first batch is `revision + 1`" holds unchanged**: the replayed batches
+run consecutively into the live ones, with a fresh subscribe's
+`revision` (the current one) as the case with nothing to replay.
+
+Four refusals answer on the ack, before anything is spawned or
+registered — validation runs ahead of the replay cut, the relay task and
+the stream registration, so a refusal leaves the connection exactly the
+request/response connection it was, and a client may simply subscribe
+again on it:
+
+* **`invalid-param`** — `from_revision` without `session_id`: "a resume
+  names the session it fenced against: from_revision requires
+  session_id, which session.identify reports".
+* **`session-mismatch`** — `session_id` names an incarnation that is not
+  this one's: "this is session `<id>`, not `<named>`: revisions restart
+  with the process, so a fence from another incarnation cannot be
+  resumed; snapshot with tab.list and subscribe afresh".
+* **`replay-expired`** — `from_revision` is older than the ring still
+  holds: "revision `N` is outside the replay window (oldest resumable:
+  `M`, current: `C`); snapshot with tab.list and subscribe afresh".
+* **`revision-ahead`** — `from_revision` is past the current revision, a
+  fence from another incarnation or a client bug: "this session never
+  produced revision `N` (current: `C`): a different incarnation, or a
+  client bug; compare session.identify.session_id, then snapshot".
+
+Past validation, `lease` decides what rides the stream, resumed or
+fresh alike:
 
 * **`lease` present and current** → a **driver** stream: every
   workspace batch, plus [`tab.effect`](#events) (bells, OSC 52
@@ -1628,6 +1676,22 @@ Response (the last request/response frame on the connection):
   batches and `notification.fired`, stops receiving `tab.effect`, and is
   told once via [`session.driver_changed`](#events) (below) — not a
   fresh subscribe.
+
+Classification on a **resumed** stream is the same rule, applied to
+replayed and live batches alike: `lease` present and current → driver,
+else observer. A driver whose stream ended (a lag, a stall) and who
+resumes with a lease that is still current comes back the driver; one
+who was taken over during the gap comes back an observer, and gets **no
+synthetic `session.driver_changed`** for it — the envelope is per-stream
+state parked per connection, not a commit, so it never entered the ring
+to replay. It learns of the takeover the way any client that missed the
+envelope always has: through the reconnect prologue's own probe, or its
+next lease-bearing op, which answers `taken-over` **only while it is the
+most recent loser** — the registry keeps exactly one tombstone — and
+`connect-required` for an older one. Since effects are never replayed
+(below), the "no `tab.effect` after `driver_changed`" invariant holds
+across a resume exactly as it holds live: a replay can never put one
+after the notice the stream missed.
 
 Subscribing still registers the stream (in a registry separate from the
 lease's own connection list — see [`session.connect`](#sessionconnect)'s
@@ -1695,7 +1759,32 @@ unlabeled close the way it always has: reconnect and resync — which is
 also how a client that missed `driver_changed` learns the truth,
 through the reconnect prologue's own probe.
 
-Three properties make this lossless without a replay buffer:
+**Replay window.** A subscribe that supplies `from_revision` is served
+out of a bounded ring of committed batches the session keeps behind the
+fence: **at most** `REPLAY_WINDOW` commits (1024) **and**
+`REPLAY_BUDGET_BYTES` bytes (4 MiB) of their serialized JSON, whichever
+binds first — stated as a maximum, never as a guaranteed window. A busy
+session can exhaust either one (an agent's tab churn burning the count,
+or a single 1 MiB `notification.fired` body eating the whole budget at
+once — which **clears the ring** rather than leave a hole in the middle
+of it, so every fence below it also expires); the answer either way is
+`replay-expired`, which is the designed fallback, not a failure — the
+client snapshots with `tab.list` and subscribes afresh.
+
+**Effects are live-only.** [`tab.effect`](#events) is the driving
+client's own side-channel (bells, OSC 52 clipboard writes —
+[DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29))
+and is stripped before a batch ever enters the ring, so **a resumed
+stream never receives one from its gap — the driver included, not only
+observers**: replaying a clipboard write from thirty seconds ago is
+wrong regardless of who resumes into it. A commit whose only events were
+effects still occupies a revision and replays as the same empty
+`{"revision": N, "events": []}` batch the gap rule already requires.
+`notification.fired` is not an effect and **is replayed** — it is a
+workspace fact, and a watcher that blinked wants the one it missed.
+
+Three properties made this lossless before the replay ring existed, and
+still do — the ring just means fewer clients ever need the third one:
 
 * **The ack is a fence.** `revision` is the commit the subscription
   starts from, and the first batch is exactly `revision + 1`. Pair it
@@ -1703,15 +1792,17 @@ Three properties make this lossless without a replay buffer:
   batch `<=` it, apply the rest.
 * **No gaps.** Every commit is a batch, including a commit that
   produced no events, or every one of whose events an observer stream
-  filtered — both arrive as `{"revision": N, "events": []}`. A skipped
-  number therefore always means loss, never a quiet commit and never a
-  filtered one.
+  (or a replay) filtered — all arrive as `{"revision": N, "events": []}`.
+  A skipped number therefore always means loss, never a quiet commit and
+  never a filtered one.
 * **The server closes rather than thins.** If a subscriber stops
   reading, falls behind the workspace broadcast, or the connection
   stalls, the server closes the connection instead of dropping events
-  out of the stream. A close is the resync signal: reconnect,
-  re-subscribe, re-pull `tab.list`, and fence again. Exactly two things
-  ask for that — `session.stopping`, and an EOF; `session.stopping`
+  out of the stream. A close is still the resync signal: reconnect, and
+  either re-subscribe fresh and re-pull `tab.list`, or — with a fence and
+  a `session_id` in hand — resume, and let the replay window catch up
+  what the gap cost instead of re-snapshotting. Exactly two things ask
+  for the close — `session.stopping`, and an EOF; `session.stopping`
   only says *why* the stream that is already ending ended.
   `session.driver_changed` asks for neither: the stream keeps
   delivering, and a client that reconnected on it would be throwing
@@ -1897,7 +1988,7 @@ Params: `{}`. Response:
   "app_version": "0.0.18",
   "session_protocol": 4,
   "payload_kinds": ["ghostty-snapshot", "vt"],
-  "features": ["put_file"],
+  "features": ["put_file", "events_resume"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
   "started_at": "2026-08-27T14:03:11Z"
@@ -1931,16 +2022,23 @@ the token.
 `features` is a newer, narrower channel than a whole protocol
 generation: an **open list of strings**, decode-when-absent (a `3`
 session sends no such key and a `4` client must still decode it as
-empty) like `payload_kinds`, naming the *additive* session ops this
-build serves so a client feature-detects them instead of a single new
-op spending a whole `SESSION_PROTOCOL_VERSION` generation. It is seeded
+empty) like `payload_kinds`, naming the *additive* session capabilities
+this build serves — an op, such as `put_file`, or an op *parameter*,
+such as `events.subscribe`'s `from_revision`/`session_id` resume pair —
+so a client feature-detects them instead of a single new capability
+spending a whole `SESSION_PROTOCOL_VERSION` generation. It was seeded
 with `"put_file"` — plan 047's op is the case that prompted this: had
 `features` existed then, `session.put_file` would not have needed the
-`2` → `3` bump at all. **What a generation bump itself covers is never
-listed here** — R1's own leaseless-subscribe / gated-write /
-`driver_changed` behaviors are what `4` covers, not `features` entries,
-because a client already knows its own generation. See
-[Versioning](#versioning) for how this relates to the bump rule.
+`2` → `3` bump at all — and plan 052 added `"events_resume"` the same
+way, for the resume params documented under
+[`events.subscribe`](#eventssubscribe) above. **What a generation bump
+itself covers is never listed here** — R1's own leaseless-subscribe /
+gated-write / `driver_changed` behaviors are what `4` covers, not
+`features` entries, because a client already knows its own generation.
+See [Versioning](#versioning) and
+[ipc-compatibility.md](ipc-compatibility.md#capability-negotiation-over-version-sniffing)
+for how this relates to the bump rule and to the monotonicity/subset
+policy that governs the list across generations.
 
 `payload_kinds` names what this session can encode a tab's attach
 payload as, in no particular order; it is an **open list of strings**,

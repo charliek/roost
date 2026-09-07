@@ -136,6 +136,9 @@ impl Layout {
             // mismatch fixture is driven out of process by the session
             // e2e lane, which spawns a daemon with the env var set.
             fake_libghostty_build: None,
+            // Likewise: the shipped window, which no in-process test
+            // drives past.
+            replay_window: None,
         }
     }
 

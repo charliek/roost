@@ -35,7 +35,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
 use roost_engine::single_instance::InstanceLocks;
-use roost_engine::{LocalClient, PtySupervisor, ServerVtConfig, ServerVtWorkspace, Workspace};
+use roost_engine::workspace::{REPLAY_BUDGET_BYTES, REPLAY_WINDOW};
+use roost_engine::{
+    LocalClient, PtySupervisor, ReplayBounds, ServerVtConfig, ServerVtWorkspace, Workspace,
+};
 use roost_ipc::messages::{ops, AttachPayloadKind, SessionStopParams};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::{IpcClient, IpcServer};
@@ -101,12 +104,28 @@ pub struct SessionConfig {
     /// config — the session e2e lane drives it by spawning a daemon
     /// with the env var set.
     pub fake_libghostty_build: Option<String>,
+    /// How many committed batches this session retains for
+    /// `events.subscribe {from_revision}`, when a test wants a window it
+    /// can drive past.
+    ///
+    /// `None` in every shipped run — [`SessionConfig::from_profile`]
+    /// fills it from [`crate::consts::REPLAY_WINDOW_ENV`] only while
+    /// `test_mode` is on, the same way `fake_libghostty_build` works, so
+    /// the environment is read once at the edge and a production daemon
+    /// keeps `REPLAY_WINDOW`.
+    pub replay_window: Option<usize>,
 }
 
 impl SessionConfig {
     /// The shipped configuration for a profile.
     pub fn from_profile(profile: &BundleProfile, launch_cwd: PathBuf) -> Self {
         let (test_mode, fake_libghostty_build) = identity::test_mode_env();
+        let replay_window = parse_replay_window(
+            test_mode,
+            std::env::var(crate::consts::REPLAY_WINDOW_ENV)
+                .ok()
+                .as_deref(),
+        );
         let files_dir = match profile.files_dir() {
             Ok(dir) => Some(dir),
             // Handled, not propagated: the only way this fails is a
@@ -128,6 +147,28 @@ impl SessionConfig {
             files_fallback: profile.files_dir_fallback(),
             test_mode,
             fake_libghostty_build,
+            replay_window,
+        }
+    }
+}
+
+/// The replay-window override, or `None` for the shipped default.
+///
+/// Pure so the gate and the fallbacks are testable without a
+/// process-global environment: production ignores the variable outright,
+/// and in test mode a value that is not a positive count is a mistake
+/// worth naming rather than a reason to serve a zero-length ring.
+fn parse_replay_window(test_mode: bool, raw: Option<&str>) -> Option<usize> {
+    let raw = raw.filter(|_| test_mode)?;
+    match raw.parse::<usize>() {
+        Ok(window) if window > 0 => Some(window),
+        _ => {
+            warn!(
+                value = %raw,
+                "ignoring an unusable {}; the default replay window applies",
+                crate::consts::REPLAY_WINDOW_ENV
+            );
+            None
         }
     }
 }
@@ -143,7 +184,14 @@ pub async fn serve(
     locks: InstanceLocks,
     readiness: &mut Readiness,
 ) -> Result<()> {
-    let workspace = Arc::new(Workspace::open(config.state_path.clone()));
+    // The one workspace that serves `events.subscribe`, so the one that
+    // pays for a replay ring.
+    let workspace = Arc::new(Workspace::open(config.state_path.clone()).with_replay(
+        ReplayBounds {
+            window: config.replay_window.unwrap_or(REPLAY_WINDOW),
+            budget_bytes: REPLAY_BUDGET_BYTES,
+        },
+    ));
     let supervisor = Arc::new(PtySupervisor::new());
 
     // Before the first spawn, which is what makes it total: every tab
@@ -574,5 +622,28 @@ mod tests {
         run_stop(&stop, None).await;
 
         assert!(stop.finalized.load(Ordering::Acquire));
+    }
+
+    /// The knob is a test-harness knob and nothing else: a production
+    /// daemon keeps the shipped window whatever the environment says,
+    /// and a value that is not a positive count falls back to it rather
+    /// than serving a ring nothing can resume from.
+    #[test]
+    fn the_replay_window_override_is_test_mode_only_and_falls_back() {
+        assert_eq!(parse_replay_window(true, Some("4")), Some(4));
+
+        assert_eq!(
+            parse_replay_window(false, Some("4")),
+            None,
+            "a production daemon never reads it"
+        );
+        for unusable in ["0", "-1", "many", "4.5", ""] {
+            assert_eq!(
+                parse_replay_window(true, Some(unusable)),
+                None,
+                "{unusable:?} must fall back to the default window"
+            );
+        }
+        assert_eq!(parse_replay_window(true, None), None);
     }
 }

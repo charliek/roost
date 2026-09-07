@@ -193,21 +193,40 @@ recognize, and picks from the intersection with its own. Nothing about
 that logic mentions a version number, which is why adding a payload kind
 costs nothing.
 
-**`session.identify.features` is the same pattern applied to *ops*.**
-An open string list, decode-when-absent like `payload_kinds`, naming the
-additive session ops this build serves — seeded with `"put_file"` (plan
-049, R1). It exists because the alternative, bumping
-`SESSION_PROTOCOL_VERSION` for every additive op, conflates two
-different questions: "can this peer speak my generation of the wire at
-all" (the exact gate above) and "does this peer happen to also support
-one more optional op" (a capability). Before `features`,
-`session.put_file` had only the generation gate to answer the second
-question with, which is what set the now-superseded exception described
-under [Version bumps](#version-bumps) below. A client checks
-`features` the same way it checks `payload_kinds`: read the list, look
-for the name it cares about, degrade gracefully if it's missing. What a
-whole generation bump covers is never listed in `features` — a client
-already knows its own `session_protocol`.
+**`session.identify.features` is the same pattern applied to *ops and
+op parameters alike*.** An open string list, decode-when-absent like
+`payload_kinds`, naming the additive session capabilities this build
+serves — seeded with `"put_file"` (plan 049, R1) and joined by
+`"events_resume"` (plan 052) for `events.subscribe`'s
+`from_revision`/`session_id` pair, a capability that is a parameter on
+an existing op rather than a new one. It exists because the
+alternative, bumping `SESSION_PROTOCOL_VERSION` for every additive
+capability, conflates two different questions: "can this peer speak my
+generation of the wire at all" (the exact gate above) and "does this
+peer happen to also support one more optional thing" (a capability).
+Before `features`, `session.put_file` had only the generation gate to
+answer the second question with, which is what set the now-superseded
+exception described under [Version bumps](#version-bumps) below. A
+client checks `features` the same way it checks `payload_kinds`: read
+the list, look for the name it cares about, degrade gracefully if it's
+missing. What a whole generation bump covers is never listed in
+`features` — a client already knows its own `session_protocol`.
+
+**`features` is monotonic within a generation.** A capability already
+listed is never removed without a `SESSION_PROTOCOL_VERSION` bump —
+that bump is *when* the next generation's vector is cut, so a capability
+can only disappear at exactly the moment a client is already forced to
+renegotiate everything else. That is what lets a frozen generation's
+identify vector stay meaningful after the build that serves it grows
+new features: the vector pins the **floor** — the capabilities that
+generation is guaranteed to have — and the current build's `features`
+is checked against it as a **superset**, never an equality. The
+`session.identify.response.v<N>.json` vector for the running generation
+is compared field-by-field except `features`, which is asserted
+duplicate-free and a **subset** of what the current build advertises;
+older generations' vectors are unaffected, since they are exercised only
+by decode-only tests that never compare against the live `features`
+list.
 
 **Absence of a mandatory capability is a legitimate refusal.** Capability
 detection governs optional features; it does not mean every negotiation

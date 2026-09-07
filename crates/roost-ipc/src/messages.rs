@@ -1328,6 +1328,38 @@ pub struct EventsSubscribeParams {
     /// mis-attribute every other tab's events. HS-2 scope.
     #[serde(with = "string_int64", default)]
     pub tab_id_filter: i64,
+    /// Resume instead of starting fresh: *the client already has
+    /// everything at or below this revision* — the same sentence
+    /// [`EventsSubscribeResult::revision`] already means, which is why
+    /// the ack echoes this value back and the first batch is still
+    /// `revision + 1`.
+    ///
+    /// Served out of a bounded replay ring behind the fence, so the
+    /// answer depends on what the session still retains: `0` means "I
+    /// have nothing, replay from 1" and is valid exactly while the whole
+    /// history is retained; a value equal to the current revision is a
+    /// valid resume with an empty replay; anything older than the ring
+    /// is refused `replay-expired`, and anything this session never
+    /// produced `revision-ahead`. Absent → a fresh subscribe at the
+    /// current revision.
+    ///
+    /// Plain `u64` like [`EventBatch::revision`] — revisions are
+    /// in-process counters, not ids, so the string-int64 convention does
+    /// not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_revision: Option<u64>,
+    /// The incarnation the client fenced against —
+    /// [`SessionIdentify::session_id`].
+    ///
+    /// A resume must name it (`from_revision` without it is
+    /// `invalid-param`) and a value that is not this session's is
+    /// refused `session-mismatch`: revisions restart at 0 in every
+    /// process, so a fence carried across a session restart would
+    /// otherwise replay a *different* history that still passes the
+    /// client's gap check. Accepted without `from_revision` too — a
+    /// client may always state who it thinks it is talking to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// `events.subscribe` ack — the last request/response frame on the
@@ -1770,7 +1802,16 @@ pub const SESSION_PROTOCOL_VERSION: u32 = 4;
 
 /// What this build advertises in [`SessionIdentify::features`] — the
 /// one source both the docs and the tests read.
-pub const SESSION_FEATURES: &[&str] = &["put_file"];
+///
+/// Additive within a generation and **monotonic**: a capability is never
+/// removed without a [`SESSION_PROTOCOL_VERSION`] bump, which is when
+/// the next generation of vectors is cut. That is what lets an older
+/// generation's frozen vector stay valid — its list is a subset of this
+/// one, never an equal.
+///
+/// `events_resume` is [`EventsSubscribeParams::from_revision`]: a
+/// capability that is an op *parameter*, not a new op.
+pub const SESSION_FEATURES: &[&str] = &["put_file", "events_resume"];
 
 /// What a host session can encode a tab's attach payload as.
 ///

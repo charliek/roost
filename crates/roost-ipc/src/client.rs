@@ -176,7 +176,37 @@ impl IpcClient {
     /// a live one the server answers `connect-required`, and with one
     /// another client has since taken, `taken-over` — see
     /// [`ServerCode`].
-    pub async fn subscribe_events(mut self, lease: &str) -> Result<EventStream, ClientError> {
+    pub async fn subscribe_events(self, lease: &str) -> Result<EventStream, ClientError> {
+        self.subscribe(lease, None, None).await
+    }
+
+    /// Resume a stream instead of starting one: `from_revision` is what
+    /// the client already has, `session_id` the incarnation it fenced
+    /// against ([`crate::messages::SessionIdentify::session_id`]).
+    ///
+    /// The batches from the gap are replayed ahead of the live ones and
+    /// the whole sequence stays consecutive, so a caller's gap check
+    /// does not change. A session that cannot reach that far back
+    /// refuses by name — [`ServerCode::ReplayExpired`],
+    /// [`ServerCode::RevisionAhead`], [`ServerCode::SessionMismatch`] —
+    /// and the recovery is a plain [`Self::subscribe_events`] plus a
+    /// `tab.list` snapshot.
+    pub async fn resume_events(
+        self,
+        lease: &str,
+        from_revision: u64,
+        session_id: &str,
+    ) -> Result<EventStream, ClientError> {
+        self.subscribe(lease, Some(from_revision), Some(session_id.to_string()))
+            .await
+    }
+
+    async fn subscribe(
+        mut self,
+        lease: &str,
+        from_revision: Option<u64>,
+        session_id: Option<String>,
+    ) -> Result<EventStream, ClientError> {
         let ack: EventsSubscribeResult = self
             .call(
                 ops::EVENTS_SUBSCRIBE,
@@ -185,6 +215,8 @@ impl IpcClient {
                     // HS-2 scope: subscribe unfiltered and filter
                     // client-side. A non-zero value is refused.
                     tab_id_filter: 0,
+                    from_revision,
+                    session_id,
                 },
             )
             .await?;
@@ -608,6 +640,16 @@ pub enum ServerCode {
     AlreadyConnected,
     /// `session.stop` has latched.
     ShuttingDown,
+    // -- events resume ---------------------------------------------------
+    /// The `from_revision` a resume presented is older than the replay
+    /// ring still holds. Snapshot with `tab.list` and subscribe afresh.
+    ReplayExpired,
+    /// This session never produced that revision — a fence from another
+    /// incarnation, or a client bug.
+    RevisionAhead,
+    /// The `session_id` a resume named is not this session's: the
+    /// session restarted, and its revisions restarted with it.
+    SessionMismatch,
     // -- attach negotiation ----------------------------------------------
     /// The two ends' libghostty builds disagree — the upgrade flow.
     BuildMismatch,
@@ -673,6 +715,9 @@ impl ServerCode {
             "taken-over" => ServerCode::TakenOver,
             "already-connected" => ServerCode::AlreadyConnected,
             "shutting-down" => ServerCode::ShuttingDown,
+            "replay-expired" => ServerCode::ReplayExpired,
+            "revision-ahead" => ServerCode::RevisionAhead,
+            "session-mismatch" => ServerCode::SessionMismatch,
             "build-mismatch" => ServerCode::BuildMismatch,
             "unsupported-kind" => ServerCode::UnsupportedKind,
             "too-many-tokens" => ServerCode::TooManyTokens,
@@ -705,6 +750,9 @@ impl ServerCode {
             ServerCode::TakenOver => "taken-over",
             ServerCode::AlreadyConnected => "already-connected",
             ServerCode::ShuttingDown => "shutting-down",
+            ServerCode::ReplayExpired => "replay-expired",
+            ServerCode::RevisionAhead => "revision-ahead",
+            ServerCode::SessionMismatch => "session-mismatch",
             ServerCode::BuildMismatch => "build-mismatch",
             ServerCode::UnsupportedKind => "unsupported-kind",
             ServerCode::TooManyTokens => "too-many-tokens",
@@ -822,6 +870,9 @@ mod tests {
             "parse-error",
             "frame-too-large",
             "internal",
+            "replay-expired",
+            "revision-ahead",
+            "session-mismatch",
         ] {
             let mapped = ServerCode::from_wire(code);
             assert!(
