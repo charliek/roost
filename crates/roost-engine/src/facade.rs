@@ -259,8 +259,7 @@ impl Engine {
             }
             EngineCommand::TabOpen(p) => self.open_tab(p).await.map(CommandResult::Tab),
             EngineCommand::TabClose(p) => {
-                self.supervisor.close(p.tab_id);
-                self.workspace.close_tab(p.tab_id)?;
+                crate::application::close_tab(&self.workspace, &self.supervisor, p.tab_id)?;
                 Ok(CommandResult::Ack)
             }
             EngineCommand::TabFocus(p) => {

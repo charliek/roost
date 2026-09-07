@@ -3,9 +3,11 @@
 //! Everything here drives the real `serve` path in-process: real
 //! `Workspace`, real `PtySupervisor`, real shells, real socket, real
 //! instance locks. What it skips is the process shell around it — the
-//! fork, the stdio redirect, the process-global subscriber — because
+//! fork, the stdio redirect, the daemon's own log file — because
 //! those are process-level facts a `#[tokio::test]` cannot own, and C6's
-//! pytest lane covers them against the actual binary.
+//! pytest lane covers them against the actual binary. The daemon's log
+//! is still reachable: [`Layout::new`] installs a stderr subscriber when
+//! `RUST_LOG` is set, and nothing otherwise.
 //!
 //! No sleeps as synchronization: every wait is a poll against a
 //! deadline, and every deadline scales with `ROOST_TEST_TIMEOUT_SCALE`
@@ -63,6 +65,16 @@ pub struct Layout {
 
 impl Layout {
     pub fn new() -> Self {
+        // The daemon runs in this process, so its log is only visible
+        // if the test binary installs a subscriber. Opt-in through
+        // `RUST_LOG` (e.g. `roost_engine=debug,roost_session=debug`);
+        // silent otherwise. Idempotent: later layouts find one installed.
+        if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let launch_cwd = dir.path().join("launch");
         std::fs::create_dir_all(&launch_cwd).expect("create the launch dir");

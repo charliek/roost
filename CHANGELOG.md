@@ -97,6 +97,15 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **`tab.close` no longer answers `not-found` for a tab it just closed
+  (#416)** — the op sent the child its hang-up first and removed the
+  workspace row second, and the exit path that hang-up starts also
+  removes the row; when it got there first the op failed with `tab N not
+  found`. The row now leaves the workspace before the PTY is torn down,
+  the order `project.delete` always used. `roostctl tab close` was the
+  only surface that showed it — both UIs already treated the race as a
+  closed tab — and `attach_stream_test::exit_during_attach` was the flake
+  it produced on CI.
 - **A tab whose child stops reading can no longer park the engine's PTY
   writer (#409)** — on Linux a master `write(2)` blocked on a full slave
   input buffer was never released, not by the child dying nor by the tab

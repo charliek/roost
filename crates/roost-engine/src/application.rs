@@ -16,7 +16,27 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use roost_ipc::messages::{Project, Tab};
 
-use crate::{AttentionSource, PtySupervisor, Workspace};
+use crate::{AttentionSource, PtySupervisor, Workspace, WorkspaceError};
+
+/// The one `tab.close` sequence, shared by the served handler, the
+/// in-process client and the facade.
+///
+/// The row leaves the workspace BEFORE the PTY is torn down. The
+/// teardown's SIGHUP starts the exit path, whose `close_row` also
+/// removes the row; with the PTY first, that removal can land between
+/// the two statements and the op reports `not-found` for a tab it just
+/// closed (#416). The supervisor is closed on both arms, as before: a
+/// stale id still answers `not-found`, and a session with no row still
+/// gets its hang-up.
+pub fn close_tab(
+    workspace: &Workspace,
+    supervisor: &PtySupervisor,
+    tab_id: i64,
+) -> Result<(), WorkspaceError> {
+    let removed = workspace.close_tab(tab_id);
+    supervisor.close(tab_id);
+    removed
+}
 
 /// In-process workspace + PTY supervisor handle.
 #[derive(Clone)]
@@ -123,8 +143,7 @@ impl LocalClient {
     }
 
     pub async fn close_tab(&self, tab_id: i64) -> Result<()> {
-        self.supervisor.close(tab_id);
-        Ok(self.workspace.close_tab(tab_id)?)
+        Ok(close_tab(&self.workspace, &self.supervisor, tab_id)?)
     }
 
     pub async fn set_tab_title(&self, tab_id: i64, title: &str) -> Result<()> {
