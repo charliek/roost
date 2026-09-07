@@ -10,7 +10,8 @@
 
 use roost_agent::grok::{grok_event_to_reports, GROK_HOOK_EVENTS, SOURCE};
 use roost_ipc::agent::{
-    validate_report, AgentLifecycle, AttentionOp, OwnershipAction, Severity, TabAgentReportParams,
+    apply_report, validate_report, AgentLifecycle, AgentTabState, AttentionOp, OwnershipAction,
+    Severity, TabAgentReportParams,
 };
 use serde_json::{json, Value};
 
@@ -455,6 +456,8 @@ fn malformed_payloads_do_not_panic() {
         grok(json!({ "session_id": "s-1", "reason": 7, "stopHookActive": "true" })),
         grok(json!({ "session_id": "s-1", "reason": [], "stopHookActive": 1 })),
         grok(json!({ "session_id": "s-1", "reason": "", "errorDetails": 42 })),
+        grok(json!({ "session_id": "s-1", "gxRemote": {} })),
+        grok(json!({ "session_id": "s-1", "gxRemote": ["x"] })),
     ];
     for event in GROK_HOOK_EVENTS {
         for payload in &payloads {
@@ -473,10 +476,135 @@ fn every_report_carries_source_grok_and_the_payload_session_id() {
         "message": "m",
         "notificationType": "idle_prompt",
         "error": "overloaded",
+        "gxRemote": "http://127.0.0.1:2421",
     }));
     for event in GROK_HOOK_EVENTS {
         let report = only(event, &payload);
         assert_eq!(report.source, "grok", "{event}");
         assert_eq!(report.session_id, "s-42", "{event}");
+        assert_eq!(
+            report.metadata["gx.remote"], "http://127.0.0.1:2421",
+            "{event}"
+        );
     }
+}
+
+// ---------------------------------------------------------------------
+// §3.3 (plan 051) — the `gx.remote` metadata key
+// ---------------------------------------------------------------------
+
+/// A token-free loopback base URL is stamped unchanged; anything else —
+/// absent, empty, non-string, `https`, a non-loopback host, a userinfo,
+/// a missing/zero/out-of-range port, or trailing path/query/fragment —
+/// leaves the key absent, with no other effect on the report.
+#[test]
+fn gx_remote_is_stamped_only_for_a_token_free_loopback_base_url() {
+    let rejected = [
+        json!(null),
+        json!(""),
+        json!(42),
+        json!(true),
+        json!("https://127.0.0.1:2421"),
+        json!("http://10.0.0.5:2421"),
+        json!("http://127.0.0.1:2421/"),
+        json!("http://127.0.0.1:2421?token=x"),
+        json!("http://127.0.0.1:2421#f"),
+        json!("http://user@127.0.0.1:2421"),
+        json!("http://127.0.0.1"),
+        json!("http://127.0.0.1:0"),
+        json!("http://127.0.0.1:70000"),
+        json!("http://localhost:2421/x"),
+    ];
+    for value in rejected {
+        let report = only(
+            "PreToolUse",
+            &grok(json!({ "session_id": "s-1", "gxRemote": value.clone() })),
+        );
+        assert!(
+            !report.metadata.contains_key("gx.remote"),
+            "{value} must not be stamped"
+        );
+    }
+    // Missing entirely, as opposed to present-but-null/empty above.
+    let report = only("PreToolUse", &grok(json!({ "session_id": "s-1" })));
+    assert!(!report.metadata.contains_key("gx.remote"));
+
+    let accepted = [
+        "http://127.0.0.1:2421",
+        "http://localhost:2421",
+        "http://[::1]:2421",
+        "http://127.0.0.1:65535",
+    ];
+    for value in accepted {
+        let report = only(
+            "PreToolUse",
+            &grok(json!({ "session_id": "s-1", "gxRemote": value })),
+        );
+        assert_eq!(report.metadata["gx.remote"], value, "{value}");
+    }
+}
+
+/// The lane binds asynchronously, so `gxRemote` can appear partway
+/// through a session. Driven through [`apply_report`] rather than just
+/// inspecting each report's own metadata, because "still present" after
+/// a report that carries no `gxRemote` is a claim about the *merged
+/// server state*, not about the adapter: a `Preserve` report's empty
+/// metadata means "says nothing about it", so the key survives; only a
+/// fresh `Claim` (a new `SessionStart`) replaces the whole map and
+/// resets it — the only "delete" that exists for this key.
+#[test]
+fn gx_remote_appears_mid_session_and_resets_only_on_a_new_claim() {
+    let mut state = AgentTabState::default();
+    const NOW: i64 = 1_757_000_000;
+
+    let apply = |state: &AgentTabState, event: &str, payload: &Value| {
+        let reports = grok_event_to_reports(event, payload, TAB);
+        assert_eq!(reports.len(), 1, "{event}");
+        let report = &reports[0];
+        validate_report(report).expect("every emitted report must be valid");
+        apply_report(state, report, NOW).state
+    };
+
+    // SessionStart without gxRemote: key absent.
+    state = apply(
+        &state,
+        "SessionStart",
+        &grok(json!({ "session_id": "s-1", "source": "new" })),
+    );
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata.get("gx.remote"),
+        None
+    );
+
+    // PreToolUse with it: present.
+    state = apply(
+        &state,
+        "PreToolUse",
+        &grok(json!({
+            "session_id": "s-1",
+            "gxRemote": "http://127.0.0.1:2421",
+        })),
+    );
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata["gx.remote"],
+        "http://127.0.0.1:2421"
+    );
+
+    // PostToolUse without it: still present (merge-only).
+    state = apply(&state, "PostToolUse", &grok(json!({ "session_id": "s-1" })));
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata["gx.remote"],
+        "http://127.0.0.1:2421"
+    );
+
+    // A new SessionStart (a Claim) without it: absent again.
+    state = apply(
+        &state,
+        "SessionStart",
+        &grok(json!({ "session_id": "s-2", "source": "new" })),
+    );
+    assert_eq!(
+        state.ownership.as_ref().unwrap().metadata.get("gx.remote"),
+        None
+    );
 }

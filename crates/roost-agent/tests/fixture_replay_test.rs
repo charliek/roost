@@ -471,6 +471,10 @@ fn the_gx_gate_probe_holds_working_across_every_continued_stop_fire() {
             (Severity::Info, IDLE_PROMPT.to_string()),
         ],
     );
+
+    // Every line of this fixture carries `gxRemote`, so the metadata key
+    // it maps to is present by the end of the replay too.
+    assert_eq!(tab.metadata("gx.remote"), Some("http://127.0.0.1:2431"));
 }
 
 /// The two mid-run facts the row table has no column for.
@@ -542,6 +546,9 @@ fn the_gx_failure_probe_banners_the_401_exactly_once() {
         mid.feed_via(grok_event_to_reports, event, payload);
     }
     assert_eq!(mid.detail(), Some("server_error"));
+
+    // Every line of this fixture carries `gxRemote` too.
+    assert_eq!(tab.metadata("gx.remote"), Some("http://127.0.0.1:2431"));
 }
 
 // ---------------------------------------------------------------------

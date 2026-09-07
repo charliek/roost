@@ -41,6 +41,10 @@
 //!                     observed types: permission_prompt, idle_prompt,
 //!                     agent_error
 //! SessionEnd         reason: "shutdown"
+//! (any event)        gxRemote (camelCase only — gx stamps this once its
+//!                     lane binds, so it can appear mid-session; a
+//!                     token-free loopback base URL, e.g.
+//!                     "http://127.0.0.1:2421")
 //! ```
 //!
 //! grok has no `PermissionRequest` hook. Its only blocked signal is
@@ -136,7 +140,7 @@ pub fn grok_event_to_reports(
         ..TabAgentReportParams::sessionless(tab_id, SOURCE, OwnershipAction::Preserve, None)
     };
 
-    let report = match kind {
+    let mut report = match kind {
         EventKind::SessionStart => session_start(base, payload),
         EventKind::UserPromptSubmit => user_prompt_submit(base),
         EventKind::PreToolUse => tool_progress(base, "pre_tool_use"),
@@ -150,7 +154,47 @@ pub fn grok_event_to_reports(
         EventKind::SessionEnd => session_end(base),
     };
 
+    // gx's lane binds asynchronously after the leader is up, so
+    // `gxRemote` can appear mid-session on any event kind rather than
+    // only on `SessionStart` — checked here, after the match, rather
+    // than per-kind. The value is a discovery hint, never liveness (see
+    // the module doc and plan 051 §3.3), which is exactly why the shape
+    // check below is load-bearing: it is what lets `doctor.rs` allowlist
+    // `gx.remote` for verbatim display without re-validating it there.
+    // Checking on `SessionEnd` too is harmless — `Release` drops the
+    // record regardless of what got stamped into it.
+    if let Some(url) = non_empty(field(payload, "gxRemote")).filter(|url| loopback_base_url(url)) {
+        report
+            .metadata
+            .insert("gx.remote".to_string(), url.to_string());
+    }
+
     vec![report]
+}
+
+/// `true` for a `http://` URL whose host is `127.0.0.1`, `localhost` or
+/// `[::1]`, followed by `:` and a decimal port in `1..=65535` and
+/// nothing else — no userinfo, path, query, or fragment. Anything else,
+/// including an absent/empty/non-string `gxRemote`, is handled by the
+/// caller via [`non_empty`]; this only judges the shape once a
+/// non-empty string is in hand.
+fn loopback_base_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return false;
+    };
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        let Some(after_host) = rest.strip_prefix(host) else {
+            continue;
+        };
+        let Some(port) = after_host.strip_prefix(':') else {
+            continue;
+        };
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        return matches!(port.parse::<u32>(), Ok(p) if (1..=65535).contains(&p));
+    }
+    false
 }
 
 fn session_start(mut report: TabAgentReportParams, payload: &Value) -> TabAgentReportParams {
