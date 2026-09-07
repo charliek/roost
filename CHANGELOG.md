@@ -75,6 +75,42 @@ release workflow asserts they agree).
   the retired `~/.config/roost/claude-settings.json` is still around); and
   the agents palette (`Cmd-Shift-O` / `Alt-Shift-O`) now names which agent
   owns each row instead of just `project · tab`.
+- **`roostctl session autostart install|uninstall` brings `roost-session`
+  back after a login or reboot (#424)** — a generated `systemd --user`
+  unit (`~/.config/systemd/user/roost-session.service`, `Type=simple`,
+  `Restart=on-failure`, `KillMode=mixed`) or launchd LaunchAgent
+  (`~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`,
+  `KeepAlive: {SuccessfulExit: false}`) replaces the doc's old
+  copy-this-plist-by-hand recipe. It's opt-in and never interrupts a
+  session that's already running: installing over one already up prints
+  `installed; a session was already running and was not interrupted` and
+  leaves the unit stopped-on-purpose, while `uninstall` says `stopping
+  the supervised session` before it does exactly that. Every artifact
+  roost writes carries an ownership marker, so a foreign file — including
+  one hand-copied from the old doc recipe — reads as foreign and needs
+  `--force` once before roost will replace it. `roostctl session status`
+  now prints an `autostart=` line in both its running and not-running
+  branches (`installed (… → <binary>)`, `not installed`, `unavailable`,
+  with `foreign file` / `binary missing` qualifiers), read straight off
+  the artifact on disk; it deliberately never asks `systemctl` or
+  `launchctl` anything, which stay the authority on enabled/active state.
+  See the [Host Sessions
+  guide](docs/guides/host-sessions.md#surviving-reboots-launchd) and
+  [`cli.md`](docs/reference/cli.md#session-autostart-install-uninstall).
+
+### Removed
+
+- **The dead `Workspace::pty_replaced` / `Workspace.ptyReplaced`
+  primitive is gone on both platforms (#424)** — a no-op for users. It
+  existed to reset agent ownership when a PTY was replaced in place, for
+  a hard-restart-keeping-the-tab-id respawn ([#170](https://github.com/charliek/roost/issues/170))
+  that was never built; on both platforms today a PTY exit closes the
+  tab outright, and the primitive's only caller left was its own unit
+  test. The Mac's call site ran immediately before `tab.closed` and
+  emitted one now-removed `agent_report.changed` commit that nothing
+  observed, since the row is dropped a commit later regardless. #170's
+  hard-restart, if it ever ships, rebuilds the same reset inside its own
+  respawn commit.
 
 ### Changed
 

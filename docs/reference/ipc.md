@@ -1802,6 +1802,33 @@ its socket only if the path still resolves to the `(dev, ino)` it bound
 — a guard against removing a different, later session's live socket at
 the same path.
 
+**One session per bundle profile per machine.** Precisely: one per
+resolved socket namespace (`XDG_RUNTIME_DIR`, or its fallback) and state
+namespace (`ROOST_STATE_DIR`) — the two are pointed elsewhere on purpose
+whenever a test, or a second profile, needs an isolated session of its
+own. Uniqueness is enforced by two flocks, taken in a load-bearing
+order: the socket lock beside the socket first, then the state lock
+beside `state.json` (`crates/roost-engine/src/single_instance.rs`). A
+second `roost-session start` against the same two namespaces finds the
+socket lock already held, reports `already-running`, and exits 0
+without touching the state a live session owns; `roostctl session
+start` does not take that verdict on faith — it polls `session.identify`
+on the socket afterward and only reports success once a session
+actually answers.
+
+There is deliberately no `session.list` / `session.create` /
+`session.kill`: one profile is one session, so there is nothing to
+enumerate or select among. The seam for more than one session on a
+single host — a **named** session such as `workbox:agents` (HS-4e) — is
+one more path component in the profile resolver (`BundleProfile` →
+socket dir + state dir) plus a `--name` flag on `session start` / `stop`
+/ `status`, and on the autostart artifact's own name (see
+[`cli.md`](cli.md#session-autostart-install-uninstall)); it is not a
+registry op, and nothing on this wire needs to change to support it.
+`session.identify.session_id` distinguishes **process incarnations** of
+one session (it changes across a restart) — it names a run, not a
+session.
+
 **The wire is byte-identical over SSH.** A host session reached over an SSH target (host-sessions HS-3) is not a distinct protocol — the client's local bridge socket and the far side's `roost-session client-bridge` are a pure byte pump between this socket and the client's control/events/data connections, so every op and frame on this page crosses SSH exactly as written here. See [Host sessions (development) → Transport: SSH hosts](../development/host-sessions.md#transport-ssh-hosts) for the transport itself (per-connection `ssh` exec over a shared `ControlMaster`, the classified-failure surface); the classifier deciding whether a saved host's `target` is an SSH destination, a socket path, or `localhost` is [`host.add`'s](#host-registry-host) concern, not this socket's.
 
 `roostctl session start|stop|status` address this socket directly; they
