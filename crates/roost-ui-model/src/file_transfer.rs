@@ -385,6 +385,23 @@ pub mod status {
         format!("Could not send {} to {host}: {reason}", display(name))
     }
 
+    /// `Nothing to send to workbox (skipped: build/ is a directory)` —
+    /// [`super::Refusal::NothingUploadable`], which has no uploaded count
+    /// to report and so cannot borrow [`sent`]'s wording.
+    pub fn nothing_uploadable(host: &str, skipped: &[Skipped]) -> String {
+        format!("Nothing to send to {host}{}", skipped_suffix(skipped))
+    }
+
+    /// `That drop is 540 MiB, over the 256 MiB per-drop limit` —
+    /// [`super::Refusal::GestureOverBudget`].
+    pub fn over_budget(total: u64) -> String {
+        format!(
+            "That drop is {}, over the {} per-drop limit",
+            format_mib(total),
+            format_mib(super::MAX_GESTURE_BYTES)
+        )
+    }
+
     fn skipped_suffix(skipped: &[Skipped]) -> String {
         if skipped.is_empty() {
             return String::new();
@@ -931,6 +948,38 @@ mod tests {
         assert_eq!(
             status::sent(&names, "workbox", &skipped),
             "Sent 2 files to workbox (skipped: build/ is a directory, core.dump is over 10 MiB)"
+        );
+    }
+
+    #[test]
+    fn status_nothing_uploadable_names_every_skip() {
+        let skipped = vec![
+            Skipped {
+                path: PathBuf::from("/tmp/build"),
+                reason: SkipReason::Directory,
+            },
+            Skipped {
+                path: PathBuf::from("/tmp/core.dump"),
+                reason: SkipReason::OverCap {
+                    len: 11 * 1024 * 1024,
+                },
+            },
+        ];
+        assert_eq!(
+            status::nothing_uploadable("workbox", &skipped),
+            "Nothing to send to workbox (skipped: build/ is a directory, core.dump is over 10 MiB)"
+        );
+        assert_eq!(
+            status::nothing_uploadable("workbox", &[]),
+            "Nothing to send to workbox"
+        );
+    }
+
+    #[test]
+    fn status_over_budget_names_both_sides_of_the_limit() {
+        assert_eq!(
+            status::over_budget(540 * 1024 * 1024),
+            "That drop is 540 MiB, over the 256 MiB per-drop limit"
         );
     }
 

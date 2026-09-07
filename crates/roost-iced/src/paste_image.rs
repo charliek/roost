@@ -7,19 +7,28 @@
 //! recognise the image and offer to attach it. Mirrors
 //! the Mac UI's `PasteImage.swift`.
 //!
-//! [`materialize`] BLOCKS: `arboard` talks to the display server (or
-//! NSPasteboard) synchronously, and a large paste also spends real time
-//! in the PNG encoder. Callers run it on the blocking pool — see
+//! A host tab takes the other half of this: [`read_clipboard_png`] stops
+//! at the bytes, which go over the wire as `session.put_file` and never
+//! touch this machine's disk (plan 047 §3.2). [`probe`] picks the half
+//! its caller's sink asked for.
+//!
+//! [`read_clipboard_png`] BLOCKS: `arboard` talks to the display server
+//! (or NSPasteboard) synchronously, and a large paste also spends real
+//! time in the PNG encoder. Callers run it on the blocking pool — see
 //! `UiTask::PasteImageProbe` — never on the UI thread.
 //!
-//! Errors are `String`, like `screenshot.rs`: every failure mode here is
-//! logged and dropped at one call site, so a typed enum would buy the
-//! crate nothing (and roost-iced carries no `thiserror`).
+//! Failures are strings, like `screenshot.rs` — roost-iced carries no
+//! `thiserror` — wrapped in [`ProbeError`] only far enough to separate
+//! "there was no image" from "there was one and it did not work": the
+//! first is the ordinary end of a text paste that found nothing and says
+//! nothing, the second is worth a toast.
 
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+
+use roost_ipc::messages::MAX_PUT_FILE_BYTES;
 
 /// Decoded-pixel cap. Unlike the now-removed GTK UI — which streamed a
 /// compressed payload into gdk-pixbuf and could bail from `size-prepared`
@@ -28,27 +37,79 @@ use std::path::PathBuf;
 /// 40 MP comfortably covers 5K and 8K screenshots.
 pub(crate) const MAX_PIXELS: u64 = 40 * 1024 * 1024;
 
-/// Maximum PNG we'll write. Matches the Mac ceiling (and the removed GTK
-/// UI's, which applied it to the re-encoded output too, the check we
-/// mirror here since our input is never compressed).
-pub(crate) const MAX_BYTES: usize = 10 * 1024 * 1024;
-
-/// Read the system clipboard's image and write it to a temp PNG.
-///
-/// Blocking — see the module docs.
-pub(crate) fn materialize() -> Result<PathBuf, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("clipboard image: open: {error}"))?;
-    let image = clipboard
-        .get_image()
-        .map_err(|error| format!("clipboard image: read: {error}"))?;
-    materialize_rgba(image.width, image.height, &image.bytes)
+/// Why a probe produced no image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeError {
+    /// The clipboard holds no image — an empty clipboard, or one
+    /// carrying only text. Not a failure: a paste that found neither
+    /// text nor an image is over, quietly.
+    Empty,
+    /// There was an image and it did not become a PNG: over the caps,
+    /// a clipboard held by someone else, an encode that failed.
+    Failed(String),
 }
 
-/// Encode RGBA8 pixels to a temp PNG and return its path. Split from the
-/// clipboard read so the caps and the naming are testable without a
-/// display server.
-fn materialize_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PathBuf, String> {
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeError::Empty => f.write_str("the clipboard holds no image"),
+            ProbeError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// What a probe produced, by the sink its target asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Materialized {
+    /// A local tab's temp PNG, to be pasted as a bare path.
+    Path(String),
+    /// A host tab's bytes, to be uploaded under `name`. They never reach
+    /// this machine's disk.
+    Png { name: String, png: Vec<u8> },
+}
+
+/// The whole blocking half of a clipboard-image paste, by the sink its
+/// target asked for.
+///
+/// The host name is minted here rather than on the UI thread:
+/// [`temp_png_name`] reads `/dev/urandom`, which has no business
+/// blocking a frame.
+pub(crate) fn probe(sink: crate::app::ProbeSink) -> Result<Materialized, ProbeError> {
+    let png = read_clipboard_png()?;
+    match sink {
+        crate::app::ProbeSink::TempFile => write_temp_png(&png)
+            .map(|path| Materialized::Path(path.to_string_lossy().into_owned()))
+            .map_err(ProbeError::Failed),
+        crate::app::ProbeSink::Bytes => {
+            let name = temp_png_name().map_err(ProbeError::Failed)?;
+            Ok(Materialized::Png { name, png })
+        }
+    }
+}
+
+/// Read the system clipboard's image and encode it, stopping at the
+/// bytes.
+///
+/// Blocking — see the module docs.
+pub(crate) fn read_clipboard_png() -> Result<Vec<u8>, ProbeError> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| ProbeError::Failed(format!("clipboard image: open: {error}")))?;
+    let image = clipboard.get_image().map_err(read_failure)?;
+    encode_rgba(image.width, image.height, &image.bytes).map_err(ProbeError::Failed)
+}
+
+/// arboard reports an empty clipboard and one carrying only text with
+/// the same variant, which is exactly the distinction we want: neither
+/// is an image, and neither is worth telling the user about.
+fn read_failure(error: arboard::Error) -> ProbeError {
+    match error {
+        arboard::Error::ContentNotAvailable => ProbeError::Empty,
+        other => ProbeError::Failed(format!("clipboard image: read: {other}")),
+    }
+}
+
+/// The caps and the encoder, with nothing written anywhere.
+fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
     if width == 0 || height == 0 {
         return Err(format!("clipboard image: empty payload ({width}x{height})"));
     }
@@ -80,13 +141,16 @@ fn materialize_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PathBuf,
     )
     .map_err(|error| format!("clipboard image: {error}"))?;
     ensure_encoded_size(png.len())?;
-    write_temp_png(&png)
+    Ok(png)
 }
 
+/// The per-file ceiling `session.put_file` enforces is the same one a
+/// local temp PNG has always had (the Mac's, and the removed GTK UI's),
+/// so both routes read it from the one place that owns it now.
 fn ensure_encoded_size(len: usize) -> Result<(), String> {
-    if len > MAX_BYTES {
+    if len as u64 > MAX_PUT_FILE_BYTES {
         return Err(format!(
-            "clipboard image: encoded PNG exceeds {MAX_BYTES} bytes ({len})"
+            "clipboard image: encoded PNG exceeds {MAX_PUT_FILE_BYTES} bytes ({len})"
         ));
     }
     Ok(())
@@ -96,7 +160,7 @@ fn ensure_encoded_size(len: usize) -> Result<(), String> {
 /// dir. Byte-for-byte the now-removed GTK UI's scheme: `create_new` so
 /// a collision fails rather than clobbering, and mode `0o600` so the
 /// file is unreadable by other users on a shared box.
-fn write_temp_png(data: &[u8]) -> Result<PathBuf, String> {
+pub(crate) fn write_temp_png(data: &[u8]) -> Result<PathBuf, String> {
     let path = std::env::temp_dir().join(temp_png_name()?);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -110,7 +174,10 @@ fn write_temp_png(data: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn temp_png_name() -> Result<String, String> {
+/// The minted name, which a host upload needs on its own: the bytes go
+/// over the wire under it, so `session.put_file` lands
+/// `roost-image-<nanos>-<16hex>.png` on the far side too.
+pub(crate) fn temp_png_name() -> Result<String, String> {
     let mut rnd = [0u8; 8];
     {
         // /dev/urandom is POSIX-portable and avoids pulling in
@@ -145,6 +212,15 @@ mod tests {
 
     fn cleanup(path: &PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Encode RGBA8 pixels to a temp PNG and return its path — the two
+    /// halves of [`probe`]'s `TempFile` sink with the clipboard read
+    /// taken out, so the caps and the naming are testable without a
+    /// display server.
+    fn materialize_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PathBuf, String> {
+        let png = encode_rgba(width, height, rgba)?;
+        write_temp_png(&png)
     }
 
     /// The generated name is also the defense-in-depth pin for #282: the
@@ -226,10 +302,39 @@ mod tests {
     /// ceiling to its re-encoded bytes.
     #[test]
     fn encoded_size_cap_matches_the_removed_gtk_uis_ceiling() {
-        assert_eq!(MAX_BYTES, 10 * 1024 * 1024);
-        assert!(ensure_encoded_size(MAX_BYTES).is_ok());
-        assert!(ensure_encoded_size(MAX_BYTES + 1)
+        let cap = MAX_PUT_FILE_BYTES as usize;
+        assert_eq!(cap, 10 * 1024 * 1024);
+        assert!(ensure_encoded_size(cap).is_ok());
+        assert!(ensure_encoded_size(cap + 1)
             .expect_err("over the byte cap")
             .contains("exceeds"));
+    }
+
+    /// The split the host route needs: the bytes on their own, and the
+    /// file written from exactly those bytes.
+    #[test]
+    fn the_encoded_bytes_and_the_written_file_are_the_same_png() {
+        let pixels = rgba(4, 3);
+        let png = encode_rgba(4, 3, &pixels).expect("encode");
+        let path = write_temp_png(&png).expect("write");
+        assert_eq!(std::fs::read(&path).expect("read back"), png);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name_is_safe(&name), "unexpected temp name {name}");
+        cleanup(&path);
+    }
+
+    /// An empty clipboard is not a failure and must not become one: the
+    /// probe's `Err` arm toasts, and "you pasted with nothing on the
+    /// clipboard" is not news.
+    #[test]
+    fn only_a_missing_image_is_silent() {
+        assert_eq!(
+            read_failure(arboard::Error::ContentNotAvailable),
+            ProbeError::Empty
+        );
+        assert!(matches!(
+            read_failure(arboard::Error::ClipboardOccupied),
+            ProbeError::Failed(_)
+        ));
     }
 }

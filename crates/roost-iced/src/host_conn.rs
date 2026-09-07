@@ -90,6 +90,7 @@ pub(crate) use queue::{HostIntent, HostOpError, HostOps};
 pub(crate) use reconnect::{Decision, DropInput};
 pub(crate) use state::{HostConnState, HostTransport};
 pub(crate) use task::{ConnectMode, Shutdown};
+pub(crate) use upload::{UploadResult, UploadSource};
 
 /// How far wall-clock time may run past an armed delay before the
 /// handler reads it as a suspend rather than a busy event loop.

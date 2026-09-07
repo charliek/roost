@@ -176,9 +176,6 @@ impl HostOps {
     /// Like [`Self::call`], the future always resolves: a dispatcher
     /// that went away mid-upload reads as [`HostOpError::Disconnected`],
     /// which is what happened.
-    // The App calls it in C5; the lane's own tests are what drive it
-    // until then.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn put_file(
         &self,
         name: String,
