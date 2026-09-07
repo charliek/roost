@@ -1094,7 +1094,11 @@ mod tests {
         );
         tab.refresh_snapshot().expect("refresh");
         assert!(
-            tab.dump().rows_text.join("\n").contains("after-resume"),
+            tab.dump(0)
+                .expect("dump")
+                .rows_text
+                .join("\n")
+                .contains("after-resume"),
             "resumed PTY applies to the surviving terminal"
         );
     }
@@ -1110,7 +1114,11 @@ mod tests {
         attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
         assert!(matches!(attach.phase, Phase::Hydrating(_)));
         assert!(
-            tab.dump().rows_text.join("\n").contains("old-screen"),
+            tab.dump(0)
+                .expect("dump")
+                .rows_text
+                .join("\n")
+                .contains("old-screen"),
             "the old terminal renders through hydration — never blank"
         );
         let step = hydrate_fully(
@@ -1123,7 +1131,7 @@ mod tests {
         assert_eq!(step, AttachStep::Refresh);
         assert!(matches!(attach.phase, Phase::Live));
         tab.refresh_snapshot().expect("refresh");
-        let text = tab.dump().rows_text.join("\n");
+        let text = tab.dump(0).expect("dump").rows_text.join("\n");
         assert!(
             text.contains("fresh-host-screen"),
             "FINISH swaps the hydrated terminal in: {text:?}"
@@ -1150,7 +1158,7 @@ mod tests {
             snapshot_with("base"),
         );
         tab.refresh_snapshot().expect("refresh");
-        let text = tab.dump().rows_text.join("\n");
+        let text = tab.dump(0).expect("dump").rows_text.join("\n");
         assert!(
             text.contains("early-bytes"),
             "the deferral replays into the hydrated terminal: {text:?}"
@@ -1489,7 +1497,11 @@ mod tests {
         );
         tab.refresh_snapshot().expect("refresh");
         assert!(
-            !tab.dump().rows_text.join("\n").contains("from the dead"),
+            !tab.dump(0)
+                .expect("dump")
+                .rows_text
+                .join("\n")
+                .contains("from the dead"),
             "a dead attempt's bytes never touch the terminal"
         );
     }

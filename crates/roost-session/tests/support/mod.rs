@@ -22,8 +22,9 @@ use roost_engine::single_instance::{self, InstanceLocks};
 use roost_ipc::messages::{
     ops, IdentifyParams, IdentifyResult, SessionConnectParams, SessionConnectResult,
     SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult, Tab,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabResizeParams, TabSetTitleParams, WireTabRef,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabFeedPtyBytesParams, TabListResult, TabOpenParams, TabOpenResult, TabResizeParams,
+    TabSetTitleParams, WireTabRef,
 };
 use roost_ipc::IpcClient;
 use roost_session::{Readiness, SessionConfig};
@@ -296,16 +297,52 @@ pub async fn resize_tab(
 /// anywhere in the process. On a UI socket this same op hops to the main
 /// thread; here it is a round trip through the tab task.
 pub async fn tab_dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
+    tab_dump_scrollback(client, tab_id, 0).await
+}
+
+/// [`tab_dump`] asking for `scrollback` rows of history above the
+/// viewport. The error arm is surfaced because callers assert that an
+/// oversized ask is clamped rather than refused.
+pub async fn tab_dump_scrollback(
+    client: &mut IpcClient,
+    tab_id: i64,
+    scrollback: u32,
+) -> TabDumpResult {
+    try_tab_dump(client, tab_id, scrollback)
+        .await
+        .expect("tab.dump")
+}
+
+pub async fn try_tab_dump(
+    client: &mut IpcClient,
+    tab_id: i64,
+    scrollback: u32,
+) -> Result<TabDumpResult, roost_ipc::ClientError> {
     client
         .call(
             ops::TAB_DUMP,
             TabDumpParams {
                 tab_id: WireTabRef::Local(tab_id),
-                ..Default::default()
+                scrollback,
             },
         )
         .await
-        .expect("tab.dump")
+}
+
+/// Inject bytes into a tab's PTY-output drain — the way every test here
+/// puts known content on a screen without scripting a shell. Served
+/// because [`Layout::config`] always runs these sessions in test mode.
+pub async fn feed_pty_bytes(client: &mut IpcClient, tab_id: i64, data: &[u8]) {
+    let _: serde_json::Value = client
+        .call(
+            ops::TAB_FEED_PTY_BYTES,
+            TabFeedPtyBytesParams {
+                tab_id,
+                data: data.to_vec(),
+            },
+        )
+        .await
+        .expect("tab.feed_pty_bytes");
 }
 
 /// `tab.dump_resolved` — the same walk, through the production color

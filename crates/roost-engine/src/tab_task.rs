@@ -297,7 +297,12 @@ pub enum TabCmd {
         from_seq: u64,
         reply: oneshot::Sender<Result<ResumeAt, TabError>>,
     },
-    Dump(oneshot::Sender<Result<DumpData, TabError>>),
+    Dump {
+        /// History rows to return above the viewport, already clamped
+        /// by the handler.
+        scrollback: u32,
+        reply: oneshot::Sender<Result<DumpData, TabError>>,
+    },
     DumpResolved(oneshot::Sender<Result<ResolvedCellsData, TabError>>),
     /// Test-mode byte injection — the same pipeline a real chunk takes.
     FeedBytes(Vec<u8>),
@@ -881,8 +886,8 @@ impl TabTask {
             TabCmd::Resume { from_seq, reply } => {
                 let _ = reply.send(self.resume(from_seq));
             }
-            TabCmd::Dump(reply) => {
-                let _ = reply.send(self.dump());
+            TabCmd::Dump { scrollback, reply } => {
+                let _ = reply.send(self.dump(scrollback));
             }
             TabCmd::DumpResolved(reply) => {
                 let _ = reply.send(self.dump_resolved());
@@ -954,8 +959,10 @@ impl TabTask {
         Ok((grid, colors, cursor))
     }
 
-    fn dump(&mut self) -> Result<DumpData, TabError> {
+    fn dump(&mut self, scrollback: u32) -> Result<DumpData, TabError> {
         let (grid, _, cursor) = self.render_grid()?;
+        let scrollback_rows = roost_vt::scrollback_rows(&self.vt.terminal)?;
+        let scrollback_text = roost_vt::scrollback_text(&self.vt.terminal, scrollback)?;
         Ok(DumpData {
             cols: u32::from(self.vt.cols),
             rows: u32::from(self.vt.rows),
@@ -963,6 +970,8 @@ impl TabTask {
                 .filter(|cursor| cursor.visible)
                 .map(|cursor| (cursor.row, cursor.col, cursor.visible)),
             rows_text: grid.into_iter().map(|row| row.text).collect(),
+            scrollback_rows,
+            scrollback_text,
         })
     }
 

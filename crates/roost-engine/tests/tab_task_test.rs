@@ -130,7 +130,12 @@ async fn feed(commands: &mpsc::Sender<TabCmd>, bytes: &[u8]) {
 /// command channel is FIFO and the task is single-threaded, so any
 /// round-tripped command is a fence.
 async fn quiesce(commands: &mpsc::Sender<TabCmd>) -> DumpData {
-    ask(commands, TabCmd::Dump).await.expect("dump")
+    ask(commands, |reply| TabCmd::Dump {
+        scrollback: 0,
+        reply,
+    })
+    .await
+    .expect("dump")
 }
 
 /// D3, the fence twin: the same invariants `pty_seq_test.rs` pins on the

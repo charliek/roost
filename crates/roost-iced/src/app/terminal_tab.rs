@@ -1207,8 +1207,13 @@ impl TerminalTab {
         Ok(())
     }
 
-    pub(super) fn dump(&self) -> DumpData {
-        DumpData {
+    /// The viewport comes from the render snapshot and the history from
+    /// the live terminal, so the snapshot is republished first: a stale
+    /// one would put the two halves a PTY chunk apart and break the
+    /// adjacency `scrollback_text` promises.
+    pub(super) fn dump(&mut self, scrollback: u32) -> Result<DumpData> {
+        self.refresh_snapshot()?;
+        Ok(DumpData {
             cols: u32::from(self.snapshot.cols),
             rows: u32::from(self.snapshot.rows),
             cursor: self
@@ -1222,7 +1227,9 @@ impl TerminalTab {
                 .iter()
                 .map(|row| row.text.clone())
                 .collect(),
-        }
+            scrollback_rows: roost_vt::scrollback_rows(&self.terminal)?,
+            scrollback_text: roost_vt::scrollback_text(&self.terminal, scrollback)?,
+        })
     }
 
     pub(super) fn resolved_cells(&self) -> ResolvedCellsData {

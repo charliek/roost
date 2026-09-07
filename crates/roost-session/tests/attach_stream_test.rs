@@ -603,8 +603,9 @@ impl DecodedGrid {
                     visible: true,
                 }),
             rows_text: self.rows.iter().map(|row| row.text.clone()).collect(),
-            // This fixture mirrors a decoded viewport, which carries no
-            // history; the scrollback halves are compared separately.
+            // A render walk sees a viewport and nothing else, so this
+            // fixture has no history to state — hence [`viewport_only`]
+            // on the server dump it is compared against.
             scrollback_rows: 0,
             scrollback_text: Vec::new(),
         }
@@ -619,6 +620,18 @@ impl DecodedGrid {
 
 fn dump_decoded(terminal: &Terminal, cols: u16) -> TabDumpResult {
     walk_decoded(terminal, cols).dump(cols)
+}
+
+/// A server dump with its history halves dropped, so it can be compared
+/// whole against a decoded fixture. What this lane pins is that the two
+/// terminals show the same screen; `tab.dump`'s history contract is
+/// pinned by `tab_dump_scrollback_test.rs`.
+fn viewport_only(dump: &TabDumpResult) -> TabDumpResult {
+    TabDumpResult {
+        scrollback_rows: 0,
+        scrollback_text: Vec::new(),
+        ..dump.clone()
+    }
 }
 
 /// The rows at the very top of a terminal's scrollback, read the only
@@ -792,7 +805,7 @@ async fn fidelity_at_the_fence() {
     let grid = walk_decoded(&decoded.terminal, COLS);
     assert_eq!(
         grid.dump(COLS),
-        server,
+        viewport_only(&server),
         "the decoded viewport must equal the server's dump at the fence"
     );
     assert_row_colors_match(&grid, &server_resolved, row_showing(&server, "SGR_FENCE"));
@@ -916,7 +929,7 @@ async fn one_byte_at_a_time() {
     );
 
     let grid = walk_decoded(&decoded.terminal, COLS);
-    assert_eq!(grid.dump(COLS), server);
+    assert_eq!(grid.dump(COLS), viewport_only(&server));
     assert_row_colors_match(&grid, &server_resolved, row_showing(&server, "SGR_FENCE"));
 
     session.stop().await;
@@ -1036,7 +1049,7 @@ async fn input_echo_and_replies() {
     let server = session.dump_showing(tab_id, "HELLO_TYPED").await;
     assert_eq!(
         dump_decoded(&decoded.terminal, COLS),
-        server,
+        viewport_only(&server),
         "the echo landed identically on both terminals"
     );
 
@@ -1091,7 +1104,7 @@ async fn resume_ring_hit_and_miss() {
     let server = session.dump_showing(tab_id, "RESUME_MISSED").await;
     assert_eq!(
         dump_decoded(&decoded.terminal, COLS),
-        server,
+        viewport_only(&server),
         "the ring slice carried the terminal forward with no seam"
     );
     drop(data);
@@ -1121,7 +1134,7 @@ async fn resume_ring_hit_and_miss() {
     let server = session.dump_showing(tab_id, "RING_TAIL").await;
     assert_eq!(
         dump_decoded(&fresh.terminal, COLS),
-        server,
+        viewport_only(&server),
         "the fallback snapshot converges on the same screen"
     );
 
@@ -1200,7 +1213,7 @@ async fn exit_during_attach() {
     );
     assert_eq!(
         dump_decoded(&decoded.terminal, COLS),
-        server,
+        viewport_only(&server),
         "the terminal the client is left holding is the one the tab died with"
     );
 
@@ -1279,7 +1292,7 @@ async fn resize_mid_history() {
     );
     assert_eq!(
         dump_decoded(&decoded.terminal, 60),
-        server,
+        viewport_only(&server),
         "the viewport still matches; only the scrollback behind it was forfeit"
     );
 
