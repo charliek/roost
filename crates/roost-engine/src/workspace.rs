@@ -1385,23 +1385,6 @@ impl Workspace {
         Ok(())
     }
 
-    /// The tab's PTY was replaced: the shell that hosted any agent is
-    /// gone, so both axes and ownership reset.
-    ///
-    /// Stated as a rule about the PTY rather than about closing —
-    /// closing drops the whole row, so it needs no help. #170's
-    /// hard-restart keeps the row and is this call.
-    pub fn pty_replaced(&self, tab_id: i64) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let row = inner
-            .tabs
-            .get_mut(&tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        let events = replace_agent(row, AgentTabState::default());
-        self.commit(inner, events, Persist::Skip);
-        Ok(())
-    }
-
     /// Apply `first` and then `then` under one lock, emitting the
     /// derived-state deltas once for the net result.
     ///
@@ -2999,19 +2982,6 @@ mod tests {
 
         ws.set_tab_hook_active(tid, false).unwrap();
         assert!(!ws.tab(tid).unwrap().hook_active);
-    }
-
-    #[test]
-    fn pty_replacement_clears_ownership() {
-        let (ws, tid) = owned_ws(AgentLifecycle::Working);
-        ws.apply_shell_mark(tid, "C").unwrap();
-
-        ws.pty_replaced(tid).unwrap();
-        let tab = ws.tab(tid).unwrap();
-        assert_eq!(tab.ownership, None);
-        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
-        assert_eq!(tab.shell_state, ShellState::Unknown);
-        assert_eq!(tab.state, TabState::None);
     }
 
     /// The derived slices ride along with the full record, so the two

@@ -341,8 +341,8 @@ enum Agent {
     /// There is deliberately **no timestamp or TTL heuristic** (AD-3):
     /// Claude fires no periodic hook, so a long tool call would look
     /// stale and get released mid-turn. Ownership is cleared only by
-    /// the explicit rules in `applyReport`, by `applyShellMark`
-    /// dropping the lifecycle at a prompt, or by PTY replacement.
+    /// the explicit rules in `applyReport`; `applyShellMark` at a prompt
+    /// drops the lifecycle but keeps the owner.
     static func isLive(_ state: AgentTabState) -> Bool {
         guard let owner = state.ownership else { return false }
         return !owner.source.isEmpty

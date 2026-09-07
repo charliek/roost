@@ -28,6 +28,7 @@
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install        (alias of `agent install claude`)
 //!   roostctl session {start,stop,status}
+//!   roostctl session autostart {install [--force],uninstall}
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
 //!
@@ -44,6 +45,7 @@
 //! reaches a session only through an explicit `--socket`.
 
 mod agent_install;
+mod autostart;
 mod doctor;
 mod host;
 mod session;
