@@ -22,6 +22,15 @@ pub(crate) fn has_field(payload: &Value, key: &str) -> bool {
     payload.get(key).is_some_and(|v| !v.is_null())
 }
 
+/// A boolean field, true **only** for a JSON `true`. The string
+/// `"true"`, a `1`, `null` and an absent key all read as `false`:
+/// a producer that means "yes" in a payload roost reads as a signal has
+/// to say so in the type, or a stringly-typed near-miss would silently
+/// flip a lifecycle.
+pub(crate) fn bool_field(payload: &Value, key: &str) -> bool {
+    payload.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
 pub(crate) fn non_empty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
@@ -80,7 +89,10 @@ mod tests {
 
     #[test]
     fn accessors_degrade_on_anything_that_is_not_the_expected_shape() {
-        let payload = json!({ "s": "v", "empty": "", "n": 7, "null": null, "arr": [1, 2] });
+        let payload = json!({
+            "s": "v", "empty": "", "n": 7, "null": null, "arr": [1, 2],
+            "yes": true, "no": false, "yes_str": "true", "one": 1,
+        });
         assert_eq!(field(&payload, "s"), "v");
         assert_eq!(field(&payload, "n"), "");
         assert_eq!(field(&payload, "missing"), "");
@@ -93,6 +105,13 @@ mod tests {
         assert_eq!(array_len(&payload, "arr"), 2);
         assert_eq!(array_len(&payload, "n"), 0);
         assert_eq!(array_len(&payload, "missing"), 0);
+        assert!(bool_field(&payload, "yes"));
+        assert!(!bool_field(&payload, "no"));
+        assert!(!bool_field(&payload, "yes_str"));
+        assert!(!bool_field(&payload, "one"));
+        assert!(!bool_field(&payload, "null"));
+        assert!(!bool_field(&payload, "missing"));
+        assert!(!bool_field(&json!([]), "yes"));
     }
 
     #[test]

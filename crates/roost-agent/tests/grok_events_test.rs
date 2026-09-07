@@ -1,9 +1,12 @@
-//! One case per row of plan 046 §3.1's grok/gx table, plus the
-//! malformed-input edges every adapter is required to survive.
+//! One case per row of plan 046 §3.1's grok/gx table and plan 051's
+//! `Stop`-gate / `StopFailure` rules, plus the malformed-input edges
+//! every adapter is required to survive.
 //!
-//! `PermissionDenied`, `PostToolUseFailure` and `StopFailure` were not
-//! observed in the probe (nothing failed during the run); those three
-//! are pinned here by synthetic payloads, not fixture evidence.
+//! `PermissionDenied` and `PostToolUseFailure` have not been observed in
+//! either probe (auto-approve was on, no tool failed); those two are
+//! pinned here by synthetic payloads alone. `StopFailure` now has a
+//! fixture (`gx-failure.jsonl`) — the payload shapes it does not carry
+//! are still synthetic.
 
 use roost_agent::grok::{grok_event_to_reports, GROK_HOOK_EVENTS, SOURCE};
 use roost_ipc::agent::{
@@ -165,19 +168,113 @@ fn other_notification_types_leave_lifecycle_unchanged() {
     assert_eq!(report.detail, "something_else");
 }
 
+/// The first fire, spelled the way a real gx payload spells it.
 #[test]
 fn stop_without_background_tasks_finishes() {
-    for payload in [
-        grok(json!({ "session_id": "s-1" })),
-        grok(json!({ "session_id": "s-1", "backgroundTasks": [] })),
-    ] {
-        let report = only("Stop", &payload);
-        assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished));
-        assert_eq!(report.attention, AttentionOp::Set);
-        assert_eq!(report.body, "Turn complete");
-        assert_eq!(report.detail, "stop");
-        assert_eq!(report.metadata["background_tasks"], "0");
-        assert_eq!(report.metadata["session_crons"], "0");
+    let report = only(
+        "Stop",
+        &grok(json!({
+            "session_id": "s-1",
+            "reason": "end_turn",
+            "stopHookActive": false,
+            "backgroundTasks": [],
+            "sessionCrons": [],
+        })),
+    );
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished));
+    assert_eq!(report.attention, AttentionOp::Set);
+    assert_eq!(report.body, "Turn complete");
+    assert_eq!(report.detail, "stop");
+    assert_eq!(report.metadata["background_tasks"], "0");
+    assert_eq!(report.metadata["session_crons"], "0");
+}
+
+/// An absent array is "this fire says nothing", not zero — metadata has
+/// no delete channel, so a stamped `0` would be permanent.
+#[test]
+fn a_stop_that_omits_the_arrays_finishes_without_stamping_counts() {
+    let report = only("Stop", &grok(json!({ "session_id": "s-1" })));
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished));
+    assert_eq!(report.body, "Turn complete");
+    assert_eq!(report.detail, "stop");
+    assert!(report.metadata.is_empty());
+}
+
+#[test]
+fn a_continued_stop_fire_stays_working_without_a_banner() {
+    let report = only(
+        "Stop",
+        &grok(json!({
+            "session_id": "s-1",
+            "reason": "end_turn",
+            "stopHookActive": true,
+            "backgroundTasks": [{ "id": "b1" }],
+            "sessionCrons": [],
+        })),
+    );
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Working));
+    assert_eq!(report.lifecycle_if, None);
+    assert_eq!(report.attention, AttentionOp::Clear);
+    assert_eq!(report.detail, "stop:continued");
+    assert!(report.title.is_empty());
+    assert!(report.body.is_empty());
+    assert_eq!(report.metadata["background_tasks"], "1");
+    assert_eq!(report.metadata["session_crons"], "0");
+}
+
+#[test]
+fn a_session_end_stop_fire_changes_nothing() {
+    for reason in ["shutdown", "channel_closed"] {
+        let report = only(
+            "Stop",
+            &grok(json!({ "session_id": "s-1", "reason": reason, "stopHookActive": false })),
+        );
+        assert_eq!(report.lifecycle, None, "{reason}");
+        assert_eq!(report.lifecycle_if, None, "{reason}");
+        assert_eq!(report.attention, AttentionOp::Preserve, "{reason}");
+        assert_eq!(report.detail, format!("stop:{reason}"));
+        // gx omits both arrays on this fire; nothing may be stamped.
+        assert!(report.metadata.is_empty(), "{reason}");
+    }
+}
+
+#[test]
+fn an_unknown_stop_reason_is_the_same_no_op() {
+    let report = only(
+        "Stop",
+        &grok(json!({ "session_id": "s-1", "reason": "something_new" })),
+    );
+    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.attention, AttentionOp::Preserve);
+    assert_eq!(report.detail, "stop:something_new");
+}
+
+#[test]
+fn a_session_end_reason_wins_over_stop_hook_active() {
+    let report = only(
+        "Stop",
+        &grok(json!({ "session_id": "s-1", "reason": "shutdown", "stopHookActive": true })),
+    );
+    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.attention, AttentionOp::Preserve);
+    assert_eq!(report.detail, "stop:shutdown");
+}
+
+#[test]
+fn stop_hook_active_is_read_as_a_json_bool_only() {
+    for value in [json!("true"), json!(1), json!(null)] {
+        let report = only(
+            "Stop",
+            &grok(json!({
+                "session_id": "s-1",
+                "reason": "end_turn",
+                "stopHookActive": value.clone(),
+                "backgroundTasks": [],
+            })),
+        );
+        assert_eq!(report.lifecycle, Some(AgentLifecycle::Finished), "{value}");
+        assert_eq!(report.attention, AttentionOp::Set, "{value}");
+        assert_eq!(report.detail, "stop", "{value}");
     }
 }
 
@@ -198,7 +295,6 @@ fn stop_with_background_tasks_stays_working() {
     assert_eq!(report.metadata["session_crons"], "1");
 }
 
-/// Not observed in the probe — pinned by the plan's table alone.
 #[test]
 fn stop_failure_maps_to_failed() {
     let report = only(
@@ -210,6 +306,77 @@ fn stop_failure_maps_to_failed() {
     assert_eq!(report.attention, AttentionOp::Set);
     assert_eq!(report.body, "Stopped: rate_limit");
     assert_eq!(report.detail, "rate_limit");
+}
+
+/// gx emits only the camelCase spelling; the snake key never exists in
+/// a real payload, which is why the body used to be the bare fallback.
+#[test]
+fn stop_failure_carries_gxs_camelcase_error_details() {
+    let report = only(
+        "StopFailure",
+        &grok(json!({
+            "session_id": "s-1",
+            "error": "server_error",
+            "errorDetails": "Unauthorized (401) from https://example.invalid",
+        })),
+    );
+    assert_eq!(report.lifecycle, Some(AgentLifecycle::Failed));
+    assert_eq!(report.severity, Severity::Error);
+    assert_eq!(
+        report.body,
+        "Unauthorized (401) from https://example.invalid"
+    );
+    assert_eq!(report.detail, "server_error");
+}
+
+#[test]
+fn stop_failure_falls_back_when_the_details_are_empty_or_not_a_string() {
+    for details in [json!(""), json!(42), json!(null), json!({ "a": 1 })] {
+        let report = only(
+            "StopFailure",
+            &grok(json!({
+                "session_id": "s-1",
+                "error": "rate_limit",
+                "errorDetails": details.clone(),
+            })),
+        );
+        assert_eq!(report.body, "Stopped: rate_limit", "{details}");
+        assert_eq!(report.detail, "rate_limit", "{details}");
+    }
+}
+
+#[test]
+fn stop_failure_prefers_the_snake_spelling_when_both_are_present() {
+    let report = only(
+        "StopFailure",
+        &grok(json!({
+            "session_id": "s-1",
+            "error": "server_error",
+            "error_details": "snake",
+            "errorDetails": "camel",
+        })),
+    );
+    assert_eq!(report.body, "snake");
+}
+
+/// gx fires this immediately before the `StopFailure` for the same turn,
+/// which carries the same text with the right severity.
+#[test]
+fn an_agent_error_notification_is_silent() {
+    let report = only(
+        "Notification",
+        &grok(json!({
+            "session_id": "s-1",
+            "message": "Unauthorized (401) from https://example.invalid",
+            "notificationType": "agent_error",
+            "level": "error",
+        })),
+    );
+    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.lifecycle_if, None);
+    assert_eq!(report.attention, AttentionOp::Preserve);
+    assert_eq!(report.severity, Severity::Info);
+    assert_eq!(report.detail, "agent_error");
 }
 
 /// The Esc-interrupt signal — grok has no dedicated interrupt hook, this
@@ -285,6 +452,9 @@ fn malformed_payloads_do_not_panic() {
         json!({}),
         grok(json!({ "session_id": 7, "backgroundTasks": "not-array" })),
         grok(json!({ "backgroundTasks": {}, "sessionCrons": 3, "error": false })),
+        grok(json!({ "session_id": "s-1", "reason": 7, "stopHookActive": "true" })),
+        grok(json!({ "session_id": "s-1", "reason": [], "stopHookActive": 1 })),
+        grok(json!({ "session_id": "s-1", "reason": "", "errorDetails": 42 })),
     ];
     for event in GROK_HOOK_EVENTS {
         for payload in &payloads {
