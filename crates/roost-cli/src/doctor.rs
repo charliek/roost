@@ -1481,12 +1481,13 @@ const MAX_KEY_CHARS: usize = 40;
 /// Metadata keys whose values are safe to print. Everything else prints
 /// its length only — `session_title` is derived from the user's own
 /// prompt, and any adapter can invent new keys.
-const METADATA_VALUE_ALLOWLIST: [&str; 5] = [
+const METADATA_VALUE_ALLOWLIST: [&str; 6] = [
     "model",
     "source",
     "background_tasks",
     "session_crons",
     "gx.remote",
+    "server_url",
 ];
 
 /// Escape control characters so an agent-supplied string cannot inject
@@ -5084,11 +5085,20 @@ mod tests {
         metadata.insert("session_title".to_string(), "fix the \x07 bug".to_string());
         metadata.insert("x".repeat(200), "whatever".to_string());
         metadata.insert("gx.remote".to_string(), "http://127.0.0.1:2421".to_string());
+        metadata.insert(
+            "server_url".to_string(),
+            "http://127.0.0.1:41234".to_string(),
+        );
         let out = redact_metadata(&metadata);
         assert!(out.contains("model=claude-opus-5"), "{out}");
         assert!(
             out.contains("gx.remote=http://127.0.0.1:2421"),
             "an allowlisted key must print verbatim: {out}"
+        );
+        assert!(
+            out.contains("server_url=http://127.0.0.1:41234"),
+            "a loopback URL is not a secret and is what makes the \
+             handshake debuggable: {out}"
         );
         assert!(
             out.contains("session_title=<13 chars>"),
