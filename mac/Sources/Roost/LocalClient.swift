@@ -112,8 +112,13 @@ final class LocalClient {
     }
 
     func closeTab(_ tabID: Int64) throws {
+        // Row first, then the PTY, on both arms — the order
+        // `roost_engine::application::close_tab` pins (#416). The main
+        // actor already serializes this against the exit auto-close, so
+        // on this side it is parity, not a fix.
+        let removed = Result { try workspace.closeTab(tabID) }
         supervisor.close(tabID: tabID)
-        try workspace.closeTab(tabID)
+        try removed.get()
     }
 
     func setTabTitle(_ tabID: Int64, title: String) throws {
