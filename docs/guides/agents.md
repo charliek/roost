@@ -19,9 +19,13 @@ What differs is where each signal comes from:
 |---|---|---|---|---|---|
 | Claude Code | `claude` | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`) — merged in beside your own hooks | `PermissionRequest` (immediate) | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
 | Codex | `codex` | `~/.codex/hooks.json` + `[hooks.state]` in `config.toml` (or `$CODEX_HOME`) | `PermissionRequest` | `Stop` | `Interrupt` |
-| grok / gx | `grok` | `$GROK_HOME/hooks/roost.json` (default `~/.grok`) — a file Roost owns outright | `Notification` `notificationType: permission_prompt` | `Stop` | `StopCancelled` |
+| grok / gx | `grok` | `$GROK_HOME/hooks/roost.json` (default `~/.grok`) — a file Roost owns outright | `Notification` `notificationType: permission_prompt` | `Stop` on its first fire; a fire with `stopHookActive: true` (a blocking Stop gate already continued the turn) keeps `working` instead, and the `idle_prompt` Notification settles it | `StopCancelled` |
 | cursor-agent | `cursor` | `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR`) — merged in beside your own hooks | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
 | OpenCode | `opencode` | `~/.config/opencode/plugins/roost-agent-state.js` (or `$OPENCODE_CONFIG_DIR`) — a plugin Roost owns outright, not a command hook | `permission.asked` / `question.asked` | `session.idle` | `session.error` |
+
+grok/gx's `StopFailure` maps to `failed`, its banner body carrying gx's
+`errorDetails` (or `error_details`) verbatim rather than just the
+classified error name.
 
 Claude and cursor also load hooks from `~/.claude/settings.json`
 themselves (grok can be configured to, and cursor always does via its
@@ -348,6 +352,54 @@ Neither point introduces a new capability a lease holder didn't already
 have: on a host, whoever holds the session's lease can already run
 arbitrary commands there via `tab.open`.
 
+## gx
+
+gx is a fork of grok that shares grok's config file and reports through
+the same adapter — it shows up as `source: "grok"`, same as stock grok;
+[Per-agent caveats](#per-agent-caveats) below covers where gx's behavior
+diverges from grok's.
+
+gx additionally announces a **remote lane** — an HTTP control surface
+for the running session — by stamping `gxRemote` (its own loopback base
+URL, e.g. `http://127.0.0.1:2421`) onto every hook payload once that
+lane comes up. Roost forwards it, when it parses as a **token-free
+loopback base URL** — `http://127.0.0.1:<port>`, `localhost`, or
+`[::1]`, and nothing after the port (no path, query, or fragment) —
+as the `gx.remote` key in the tab's `metadata`; anything else (a query
+string, a non-loopback host, `https`) is dropped rather than stamped.
+`roostctl doctor` prints the value when present.
+
+`gx.remote` is a **naming convention, not a new mechanism**: `metadata`
+is already the open extension channel every adapter writes into
+([`ipc.md`](../reference/ipc.md#tabagent_report)), and this is the rule
+for using it without collisions — a key owned by one product is
+prefixed `<product>.` (`gx.remote`), while a key roost itself defines
+stays bare snake_case (`model`, `session_title`).
+
+Treat the key as a **discovery hint, not liveness**. gx's remote-lane
+address is a process-global set once and never cleared, so it never
+tells you the lane died; and `metadata` itself is merge-only with no
+delete channel, so `gx.remote` can outlive the lane that announced it,
+and a same-process restart on another port is never reflected. The
+only thing that removes it is the reset path: a new `SessionStart`
+replaces `metadata` wholesale, so a stock-grok session started on the
+same tab afterward drops the key. It is absent to begin with on stock
+grok and on a gx run with `--no-leader` or `GX_REMOTE_DISABLE=1`.
+
+A consumer must still follow gx's own client contract before treating
+the lane as usable — the key alone is never enough to act on: call the
+lane's token-free `GET /v1/healthz`, compare its `instanceId` against
+`$GROK_HOME/gx-remote.json`, and only then use the bearer token from
+`$GROK_HOME/gx-remote.token`. Roost carries neither the instance id nor
+the token; `gx.remote` is just the URL.
+
+The agents palette does not render `gx.remote` — a bare loopback URL has
+no in-terminal action to attach it to; revisit if a roost client action
+ever uses the lane. gx does not get its own `source`/`Agent` variant
+today; that's warranted only if its hook vocabulary diverges from
+grok's in a way the shared adapter can't map correctly, or it stops
+sharing `$GROK_HOME` with grok.
+
 ## Per-agent caveats
 
 - **cursor has no blocked state.** `beforeShellExecution` fires roughly
@@ -364,6 +416,41 @@ arbitrary commands there via `tab.open`.
   the tab you attached from. There's no reliable fix from the plugin
   side (a session's `directory` matching your tab's cwd isn't a safe
   enough signal), so this is documented rather than papered over.
+- **gx leader mode misattributes hooks to the first tab, and a quit gx
+  keeps its tab owned** ([grok-build#14](https://github.com/charliek/grok-build/issues/14)).
+  gx's hooks run inside the `gx agent leader` process, not the TUI
+  itself, and that process inherits `ROOST_TAB_ID` from whichever TUI
+  spawned it — so every further gx TUI that attaches to the same leader
+  reports its events against the *first* tab (its `SessionStart` claims
+  that tab), and the second TUI's own tab stays `inactive`, the same
+  shape as the `opencode attach` caveat above. Separately, `SessionEnd`
+  never fires for a leader-resident session, so quitting a leader-backed
+  gx leaves its tab owned at whatever lifecycle it last reported,
+  instead of releasing to `inactive`. Stock grok (leader mode off) is
+  unaffected by either.
+- **grok's Stop gate leaves a residual "finished" window on the *first*
+  blocked fire.** A blocking Stop hook that blocks the very first `Stop`
+  of a turn shows the tab as `finished` (with a "Turn complete" banner)
+  from that fire until the next tool event or the next `Stop` — which,
+  once the gate has fired at least once, carries `stopHookActive: true`
+  and correctly reads as `working` again. In that gate case the user
+  never sees a second "Turn complete"; instead they see gx's own
+  `idle_prompt` banner roughly a minute after the turn actually ended.
+  If the 8-continuation cap is hit, gx forces a stop with no hook fired
+  at all, so the tab stays `working` until `idle_prompt` settles it. A
+  passive observer — which is all roost's adapter is — cannot close this
+  gap without delaying every turn's "Turn complete" by that same minute,
+  gated or not; that trade was rejected.
+- **grok's `agent_error` Notification is deliberately silent.** It fires
+  immediately before the `StopFailure` that reports the same failure,
+  so banner-ing both would show the same error twice; only the
+  `StopFailure` banner (with gx's `errorDetails` text) reaches the tab.
+- **grok subagents never claim the tab.** A subagent (from
+  `spawn_subagent`) runs as its own session id, stamps `subagentType` on
+  every event, and never fires its own `SessionStart` — so its reports
+  never match the tab's owning `(source, session_id)` pair and the
+  server drops them on the ordinary `preserve` mismatch path. No adapter
+  filter is needed.
 - **codex re-trusts on reordering or a moved path.** See [Codex
   trust](#codex-trust) above — either one costs a single review dialog,
   cleared by the next `ensure`.
@@ -380,8 +467,8 @@ arbitrary commands there via `tab.open`.
   the title.
 - **gx shares grok's file.** grok and its fork gx read the same
   `$GROK_HOME`, so one install (`roostctl agent install grok`) wires
-  both binaries at once; there is no separate `gx` source or adapter,
-  and uninstalling `grok` removes the file both share.
+  both binaries at once, and uninstalling `grok` removes the file both
+  share. See [gx](#gx) above for gx-specific behavior.
 - **cursor (and optionally grok) also execute Claude's hook format.** cursor always
   loads `~/.claude/settings.json` (`claudeUserHooks`), and grok can be
   configured to; with Roost's Claude entries installed, both would
