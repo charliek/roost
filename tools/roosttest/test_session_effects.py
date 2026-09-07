@@ -445,6 +445,67 @@ def test_set_theme_is_lease_gated_and_validates_its_palette(env):
 
 
 # ---------------------------------------------------------------------------
+# 2b. tab.write is the driver's
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_write_needs_the_driver_lease(env):
+    """Writing into a tab is an interactive act, so on a session socket
+    it belongs to whoever holds the lease.
+
+    The child copies its first bytes to a file: that file is the only
+    honest proof the leased write reached the terminal rather than
+    merely being admitted. `stty raw -echo` so the six bytes arrive
+    unlineated and nothing is echoed back.
+    """
+    started(env)
+    sink = env.launch_cwd / "written"
+
+    with env.client() as client:
+        project = first_project(client)
+        tab = client.open_tab(
+            project,
+            cwd=str(env.launch_cwd),
+            cols=COLS,
+            rows=ROWS,
+            argv=[
+                "/bin/sh",
+                "-c",
+                f"stty raw -echo; dd bs=1 count=6 of='{sink}' 2>/dev/null; exec sleep 300",
+            ],
+        )
+
+        # No lease at all, and an empty one: both are "this client never
+        # connected", and neither may move a byte.
+        for presented in (None, ""):
+            with pytest.raises(RoostError) as refused:
+                client.send(tab, b"NOPE!!", lease=presented)
+            assert refused.value.code == "connect-required", refused.value
+
+        lease = connect_lease(client)
+        client.send(tab, b"LEASED", lease=lease)
+        sessionlib.wait_until(
+            lambda: sink.is_file() and sink.stat().st_size == 6,
+            30.0,
+            "the child to receive the leased write",
+        )
+        assert sink.read_bytes() == b"LEASED"
+
+    # And the displaced lease buys nothing once someone else drives. The
+    # check runs on a fresh connection because the takeover closes every
+    # connection registered under the lease it displaces — including the
+    # one that just wrote.
+    with env.client() as taker:
+        connect_lease(taker, takeover=True, label="taker")
+        with env.client() as stranger:
+            with pytest.raises(RoostError) as stale:
+                stranger.send(tab, b"STALE!", lease=lease)
+            assert stale.value.code == "taken-over", stale.value
+
+    env.stop_over_the_wire()
+
+
+# ---------------------------------------------------------------------------
 # 3. The build-mismatch seam
 # ---------------------------------------------------------------------------
 

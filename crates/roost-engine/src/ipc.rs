@@ -2580,6 +2580,25 @@ async fn dispatch_outcome(
             .map(HandlerOutcome::Reply);
     }
 
+    // A write is an interactive act, so on a session socket it belongs
+    // to whoever holds the lease — served here, and not in `dispatch`,
+    // because that is where the presenting connection is visible. UI
+    // sockets never reach this arm (they return at the head of this
+    // function), so there the key stays accepted-and-ignored.
+    //
+    // The gate is an admission boundary, not a write fence: a write that
+    // linearizes just before a takeover may still land after it. See
+    // `TabWriteParams::lease`.
+    if op == ops::TAB_WRITE {
+        let p: TabWriteParams = decode(params)?;
+        session.require_lease(p.lease.as_deref().unwrap_or(""), ctx)?;
+        h.supervisor
+            .write(p.tab_id, p.data)
+            .await
+            .map_err(pty_err)?;
+        return Ok(HandlerOutcome::Reply(serde_json::json!({})));
+    }
+
     dispatch(h, op, params).await.map(HandlerOutcome::Reply)
 }
 

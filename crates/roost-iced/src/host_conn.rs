@@ -3384,7 +3384,6 @@ mod tests {
         assert!(!set.ssh_reached_connected("h1"));
     }
 
-
     /// An observer settlement answers the same question: the session
     /// was reached and refused the lease, which is not "never worked".
     /// Without this, a client deposed on a fresh tunnel whose observer

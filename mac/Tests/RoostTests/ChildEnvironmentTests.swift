@@ -29,6 +29,11 @@ import Testing
         #expect(out["TERMINFO"] == nil)
     }
 
+    @Test func stripsAnInheritedDriverLease() {
+        let out = env(base: ["ROOST_LEASE": "9f2c1d7a4b6e08315c0d9a72e4f16b83", "HOME": "/Users/u"])
+        #expect(out["ROOST_LEASE"] == nil)
+    }
+
     @Test func forcesTerminalIdentityAndRoostContract() {
         let out = env(base: ["TERM": "xterm-kitty", "HOME": "/Users/u"])
         #expect(out["TERM"] == "xterm-256color")
