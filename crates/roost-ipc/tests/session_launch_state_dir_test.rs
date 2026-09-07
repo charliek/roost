@@ -32,6 +32,19 @@
 //! env — and it was replaced by the sharper one above. It also happens
 //! to be what CLAUDE.md asks for (`tests/*_test.rs`).
 //!
+//! **They exec what they write — so they must not write it.** The same
+//! fork-inherits-everything fact bites inside this binary too: a stand-in
+//! script written by one of these tests while a sibling is mid-`spawn`
+//! is held open for writing by that sibling's forked child until its
+//! exec, and an `execve` of the script in that window answers ETXTBSY
+//! ("Text file busy") on Linux — seen on CI as
+//! `spawn /tmp/.tmpXXXXXX/roost-session: Text file busy` (#408). So the
+//! executable is a symlink to the committed
+//! `tools/roosttest/fixtures/fake-roost-session.sh`, and what the test
+//! writes is a plain `.conf` beside it that the fixture *sources*;
+//! nothing exec'd is ever written here. `bootstrap_test.rs` and
+//! `ssh_transport_test.rs` do the same with `fake-ssh.sh`.
+//!
 //! # What is proved here
 //!
 //! Only what reaches the child's environment; `paths.rs` table-tests the
@@ -63,25 +76,24 @@ fn ambient_state_dir() -> OsString {
 /// Spawn a stand-in `roost-session` through the real launcher with
 /// `seam` in hand, and hand back the `ROOST_STATE_DIR` it saw.
 ///
-/// The script takes its record path out of `LAUNCH_CWD_ENV` rather than
+/// The body takes its record path out of `LAUNCH_CWD_ENV` rather than
 /// an interpolated literal, so no tempdir path has to survive shell
 /// quoting, and the answer is read as bytes, so no path has to be UTF-8.
 /// `${VAR-UNSET}` (not `${VAR:-UNSET}`) tells an unset variable from an
-/// empty one.
+/// empty one. It is sourced by the fixture, never exec'd from here —
+/// see the header.
 async fn state_dir_handed_to(seam: Option<&OsStr>) -> (tempfile::TempDir, OsString) {
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().expect("temp dir");
     let bin = dir.path().join(BIN_NAME);
     std::fs::write(
-        &bin,
-        "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\n\
-         printf '%s' \"${ROOST_STATE_DIR-UNSET}\" > \"$ROOST_SESSION_LAUNCH_CWD/seen\"\n\
+        bin.with_extension("conf"),
+        "printf '%s' \"${ROOST_STATE_DIR-UNSET}\" > \"$ROOST_SESSION_LAUNCH_CWD/seen\"\n\
          echo 'ready pid=4321'\n",
     )
-    .expect("write the stand-in session");
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    .expect("write the stand-in's body");
+    std::os::unix::fs::symlink(fixture_path(), &bin).expect("link the stand-in session");
 
     let verdict = spawn_and_read_verdict(&bin, dir.path(), seam, SEAM_BUDGET)
         .await
@@ -91,6 +103,13 @@ async fn state_dir_handed_to(seam: Option<&OsStr>) -> (tempfile::TempDir, OsStri
     let seen =
         std::fs::read(dir.path().join("seen")).expect("the stand-in records what it was handed");
     (dir, OsString::from_vec(seen))
+}
+
+fn fixture_path() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
+        .canonicalize()
+        .expect("the fake-roost-session fixture must exist")
 }
 
 #[tokio::test]

@@ -493,6 +493,35 @@ impl Harness {
         std::fs::write(self.state.join("chmod.release"), b"").expect("release chmod");
     }
 
+    /// Park the fixture's `-O exit` until [`Harness::release_master_exit`]:
+    /// the exit path creates `<hold>/started`, then waits for
+    /// `<hold>/release` before it logs or removes anything. A test that
+    /// cancels a teardown through it knows exactly where the killed
+    /// child was. Appended to the conf the fixture sources, so it is
+    /// set before any invocation reads it and no executable is written.
+    fn hold_master_exit(&self) -> PathBuf {
+        use std::io::Write as _;
+
+        let hold = self.state.join("exit-hold");
+        std::fs::create_dir_all(&hold).expect("create the exit hold");
+        let mut conf = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self._root.path().join("ssh.conf"))
+            .expect("open the fake ssh config");
+        writeln!(
+            conf,
+            "FAKE_SSH_EXIT_HOLD={}\nexport FAKE_SSH_EXIT_HOLD",
+            shell_quote(&hold.display().to_string())
+        )
+        .expect("extend the fake ssh config");
+        hold
+    }
+
+    /// Let every held (and future) `-O exit` through.
+    fn release_master_exit(&self) {
+        std::fs::write(self.state.join("exit-hold/release"), b"").expect("release the exit hold");
+    }
+
     /// Make the far side's `uname` hang, so a probe exec runs out its
     /// budget. Bounded rather than infinite: the process this leaves
     /// behind is orphaned by the kill, and an orphan that never exits is
@@ -2352,36 +2381,74 @@ async fn a_cancelled_install_leaves_a_temporary_that_the_next_one_sweeps() {
 /// until `ControlPersist` and the scratch directory leaked forever,
 /// because `parse_scratch_dir_name` refuses these names and no sweep
 /// ever reclaims them. `Drop` finishes what the cancelled close started.
+///
+/// The cancellation point is driven, not raced. A zero-budget `timeout`
+/// used to stand in for it, and where its kill landed was scheduler
+/// timing: a child that had already removed the control socket but not
+/// yet logged left `Drop` with no master to address and this test with
+/// nothing recorded (#408). The fixture now holds its `-O exit` until
+/// released, so the close is dropped while its child is provably
+/// mid-teardown — logged nothing, removed nothing — and the one exit on
+/// record can only be `Drop`'s.
 #[tokio::test]
 async fn a_cancelled_close_leaves_drop_still_owing_the_teardown() {
     let harness = Harness::new();
     harness.plant("$HOME/.local/bin/roost-session", &Stub::matching("cut"));
-    let dir = {
+    let hold = harness.hold_master_exit();
+    let (dir, ctl) = {
         let job = harness.job(harness.options()).await;
         // Opens the master, so the control socket exists and `close()`
         // has real work to do.
         job.probe().await.expect("probe");
         assert_eq!(harness.job_dirs().len(), 1);
+        let dir = harness.job_dirs()[0].clone();
+        let ctl = dir.join("ctl");
+        assert!(ctl.exists(), "the probe left a master to exit");
 
-        // Zero budget: `timeout` polls the inner future once — long
-        // enough to enter the teardown — and then drops it.
-        let cancelled = tokio::time::timeout(Duration::ZERO, job.close()).await;
-        assert!(cancelled.is_err(), "the close must not have finished");
+        // `close()` spawns its `-O exit` on the first poll and then
+        // awaits the reap; the fixture parks that child at the hold.
+        // Dropping the future there kills the child mid-teardown.
+        tokio::select! {
+            _ = job.close() => panic!("the close must not have finished"),
+            _ = wait_for("the held `-O exit` to start", || hold.join("started").exists()) => {}
+        }
+        assert!(
+            ctl.exists(),
+            "the cancelled close got nowhere near removing the control socket"
+        );
+        assert!(
+            !harness
+                .invocations()
+                .iter()
+                .any(|argv| is_master_exit(argv)),
+            "the cancelled close must not have recorded an exit it never completed"
+        );
         assert_eq!(
             harness.job_dirs().len(),
             1,
             "the cancelled close got nowhere near removing the directory"
         );
-        harness.job_dirs()[0].clone()
+        harness.release_master_exit();
+        (dir, ctl)
     };
 
     assert!(!dir.exists(), "{} outlived its job", dir.display());
+    let exits: Vec<Vec<String>> = harness
+        .invocations()
+        .into_iter()
+        .filter(|argv| {
+            is_master_exit(argv) && ctl_of(argv).as_deref() == Some(&*ctl.to_string_lossy())
+        })
+        .collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "Drop owes exactly the one `-O exit` a cancelled close never sent: {exits:?}"
+    );
     assert!(
-        harness
-            .invocations()
-            .iter()
-            .any(|argv| is_master_exit(argv)),
-        "Drop still owes the `-O exit` a cancelled close never sent"
+        exits[0].contains(&"ctl-exists=1".to_string()),
+        "Drop must address a master that was still there: {:?}",
+        exits[0]
     );
 }
 
