@@ -4,7 +4,8 @@
 //! its reply, and `SESSION_PROTOCOL_VERSION`.
 //!
 //! What pins their shape is this file plus the golden vectors under
-//! `tests/ipc-vectors/`, which the Swift mirror in
+//! `tests/ipc-vectors/` (the identify vector per generation, see
+//! `identify_vector_name`), which the Swift mirror in
 //! `mac/Sources/Roost/IPCMessages.swift` consumes too. The
 //! assertions are deliberately byte-exact against literal JSON:
 //! a field rename or a reordering that a `round_trip` would happily
@@ -268,16 +269,45 @@ fn unknown_fields_are_tolerated_on_decode() {
     assert!(fence.events.is_empty());
 }
 
-#[test]
-fn session_identify_vector_decodes_into_its_typed_result() {
-    let raw = read_vector("session.identify.response.json");
+/// `session.identify`'s response embeds the protocol integer, so its
+/// vector is versioned per generation (`docs/reference/ipc-compatibility.md`,
+/// "Generation-bearing vectors are versioned"). The filename is built from
+/// the constant, never spelled out: a bump that forgets to add the new
+/// generation's vector fails here instead of silently testing the old one.
+fn identify_vector_name(generation: u32) -> String {
+    format!("session.identify.response.v{generation}.json")
+}
+
+fn decode_identify_vector(name: &str) -> SessionIdentify {
+    let raw = read_vector(name);
     let resp: roost_ipc::messages::Response =
         serde_json::from_str(&raw).expect("decode response envelope");
-    assert!(resp.ok);
-    let result: SessionIdentify =
-        serde_json::from_value(resp.result.expect("result body")).expect("decode session identify");
+    assert!(resp.ok, "{name}: not an ok response");
+    serde_json::from_value(resp.result.expect("result body"))
+        .unwrap_or_else(|e| panic!("{name}: decode session identify: {e}"))
+}
+
+#[test]
+fn session_identify_vector_decodes_into_its_typed_result() {
+    let result = decode_identify_vector(&identify_vector_name(SESSION_PROTOCOL_VERSION));
     assert_eq!(result, sample_identify());
     assert_eq!(result.session_protocol, SESSION_PROTOCOL_VERSION);
+}
+
+/// Every prior generation's vector stays on disk and keeps decoding —
+/// the compatibility policy's "an old client's view still parses",
+/// as a test rather than a claim. `2` is the first versioned
+/// generation (the corpus was backfilled at the `2` → `3` bump).
+#[test]
+fn every_prior_session_identify_generation_still_decodes() {
+    const FIRST_VERSIONED: u32 = 2;
+    // Compile-time: the loop below must have something to walk.
+    const { assert!(SESSION_PROTOCOL_VERSION > FIRST_VERSIONED) };
+    for generation in FIRST_VERSIONED..SESSION_PROTOCOL_VERSION {
+        let result = decode_identify_vector(&identify_vector_name(generation));
+        assert_eq!(result.session_protocol, generation);
+        assert_ne!(result.session_protocol, SESSION_PROTOCOL_VERSION);
+    }
 }
 
 fn sample_stop_report() -> SessionStopResult {

@@ -2296,10 +2296,16 @@ is the UI socket's schema version — currently **`1`**
 (`roost_ipc::PROTOCOL_VERSION`); it is reported by
 [`identify`](#identify) but nothing compares it, so the UI socket has no
 handshake gate. `session.identify.session_protocol` is the session
-sockets' — currently **`2`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
+sockets' — currently **`3`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
 covering both the session JSON ops and the binary [data
 plane](#data-plane); conforming clients check it for equality before
 anything else and the [attach handshake](#tabattach) refuses a mismatch.
+`3` is plan 047's bump for `session.put_file` — an
+additive op that moved the number anyway, under the rule stated on the
+constant: an addition bumps when a pre-bump peer could not refuse it
+meaningfully (a pre-047 session can only answer `unknown-op` to a file
+the user just pasted). The history of the integer is in
+[`session.identify`](#sessionidentify).
 
 **The consumption and compatibility policy lives in
 [`ipc-compatibility.md`](ipc-compatibility.md)** — what is additive in

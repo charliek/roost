@@ -237,7 +237,15 @@ quoted in `ipc.md`, and the versioned fixtures below.
 
 Additive changes — new optional fields that satisfy all four directions
 of the matrix, new ops, new events, new values in an open list — do not
-bump anything.
+bump anything, with one deliberate exception: **an additive op bumps the
+session integer when a pre-bump peer could not refuse it meaningfully.**
+Plan 047's `session.put_file` is the case that set the rule (documented
+on `SESSION_PROTOCOL_VERSION` and in [ipc.md's
+`session.identify`](ipc.md#sessionidentify)): a pre-047 session can only
+answer `unknown-op` to a file the user just pasted, which is not a
+refusal a client can act on per paste, so `2` → `3` moved rather than
+carrying a per-paste special case forever. A new *event* a client can
+ignore, or a lease-gated op a client never sends, stays additive.
 
 ## Fixtures are the contract
 
@@ -289,10 +297,15 @@ loudly instead of silently testing the old shape. That is the
 are and keep being exercised by decode-only tests, which is how "an old
 client's view still parses" stops being a claim and becomes a test.
 
-Today's `session.identify.response.json` still carries the unversioned
-name; the versioned set is backfilled by the next session-protocol bump,
-which retains every prior generation, adds the new current one, and
-repoints both test suites at the lookup rule.
+The set was backfilled at the `2` → `3` bump (plan 047):
+`session.identify.response.v2.json` is the unversioned file that existed
+before, renamed and carrying its original content, `v3.json` is the
+current generation, and both suites build the name from their constant
+(`wire_types_test.rs`'s `identify_vector_name`,
+`IPCSessionTypesTests.swift`'s `testSessionIdentifyVectorDecodes`). The
+Rust suite additionally decodes every prior generation, from `2` up to
+the current one, so a retired generation's vector cannot quietly stop
+parsing.
 
 ### What enforces this
 

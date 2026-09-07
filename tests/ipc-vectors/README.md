@@ -16,6 +16,9 @@ envelope, or an event envelope. The naming convention is:
 - `<op>.response.json` — success response envelope for the op.
 - `<op>.error.json` — error response envelope variant.
 - `<event-name>.event.json` — server-push event envelope.
+- `<op>.response.v<N>.json` — a response that embeds a protocol
+  integer, one file per generation it has carried (`session.identify`
+  today). Tests build `<N>` from the constant; older generations stay.
 
 Both the Rust side (`cargo test -p roost-ipc`) and the Swift side
 (`swift test --package-path mac`, post-M4) load these files: every

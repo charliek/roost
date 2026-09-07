@@ -1,6 +1,8 @@
 // IPCSessionTypesTests — the Swift half of the host-session wire
 // types (plan 033 §D4). Loads the same
-// `tests/ipc-vectors/session.identify.response.json` and
+// `tests/ipc-vectors/session.identify.response.v<N>.json` (N built from
+// `ipcSessionProtocolVersion` — the current-generation lookup rule in
+// docs/reference/ipc-compatibility.md) and
 // `events.batch.json` the Rust `wire_types_test.rs` decodes, so a
 // field rename on either side surfaces here rather than in HS-1's
 // first attach.
@@ -41,7 +43,8 @@ final class IPCSessionTypesTests: XCTestCase {
     }
 
     func testSessionIdentifyVectorDecodes() throws {
-        let raw = try Data(contentsOf: vectorURL("session.identify.response.json"))
+        let raw = try Data(
+            contentsOf: vectorURL("session.identify.response.v\(ipcSessionProtocolVersion).json"))
         let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
         XCTAssertTrue(response.ok)
         let result = try XCTUnwrap(response.result)
