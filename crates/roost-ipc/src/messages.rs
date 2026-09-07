@@ -227,6 +227,25 @@ pub struct SessionStoppingEvent {
     pub reason: String,
 }
 
+/// The other envelope that rides outside an [`EventBatch`]: another
+/// client took the driver lease.
+///
+/// Unlike [`SESSION_STOPPING_EVENT`] this one is **not terminal** — the
+/// stream keeps delivering after it; what changed is that this
+/// subscriber is no longer the driver. Like the stopping envelope it
+/// carries no revision and is exempt from the client's gap check.
+pub const SESSION_DRIVER_CHANGED_EVENT: &str = "session.driver_changed";
+
+/// `data` of the [`SESSION_DRIVER_CHANGED_EVENT`] envelope.
+///
+/// `taken_by` is the new holder's label as *it reported itself* on
+/// [`ops::SESSION_CONNECT`] — display metadata, never identity — and
+/// falls back to `"unknown client"` when the claimant sent none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDriverChangedEvent {
+    pub taken_by: String,
+}
+
 // ============================================================================
 // Identify
 // ============================================================================
@@ -310,6 +329,19 @@ pub struct TabWriteParams {
     /// Raw bytes encoded as base64. See `bytes_base64`.
     #[serde(with = "bytes_base64")]
     pub data: Vec<u8>,
+    /// The driver lease minted by [`ops::SESSION_CONNECT`].
+    ///
+    /// **Required on a session socket** — a write is an interactive
+    /// act and belongs to whoever holds the lease. On a UI socket the
+    /// key is accepted and ignored: that socket mints no leases, and
+    /// rejecting it would make one `roostctl` build unable to talk to
+    /// both.
+    ///
+    /// Omitted when unset so a lease-less client's request is
+    /// byte-identical to what it has always sent — an older server
+    /// `deny_unknown_fields`-rejects a key it has never heard of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1263,15 +1295,29 @@ pub struct NotificationCreateParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsSubscribeParams {
-    /// The lease [`ops::SESSION_CONNECT`] handed out. Required on a
-    /// session socket: the event stream is interactive authority, and a
-    /// client that never connected has none.
+    /// The lease [`ops::SESSION_CONNECT`] handed out — a **classifier,
+    /// not a gate** (plan 049 §3.7).
     ///
-    /// Defaulted rather than required by serde so the *decode* still
-    /// succeeds for a client written against the leaseless HS-1a form —
-    /// which then gets `connect-required` naming the step it skipped,
-    /// instead of an envelope-shaped `invalid-param` that names nothing.
-    /// A credential: never logged, never echoed in an error.
+    /// Reading a session is not interactive authority, so a subscribe is
+    /// never refused for want of one. What the lease decides is *what
+    /// arrives*:
+    ///
+    /// * present and current → the **driver** stream: every workspace
+    ///   batch plus [`ops::EVENT_TAB_EFFECT`], which is the driving
+    ///   client's side-channel (bells, OSC 52 clipboard writes) and
+    ///   nobody else's;
+    /// * absent, stale, or unknown → an **observer** stream: every
+    ///   workspace batch plus [`ops::EVENT_NOTIFICATION_FIRED`], with
+    ///   `tab.effect` filtered out. A revision whose every event was
+    ///   filtered still arrives, as an empty [`EventBatch`], because the
+    ///   client's whole loss check is the revision sequence.
+    ///
+    /// A driver stream whose lease is taken over is reclassified in
+    /// place and told once, with [`SESSION_DRIVER_CHANGED_EVENT`].
+    ///
+    /// Defaulted rather than required by serde so a client that holds no
+    /// lease may omit the key entirely. A credential: never logged,
+    /// never echoed in an error.
     #[serde(default)]
     pub lease: String,
     /// Restrict to a single tab. `"0"` (or absent) means all events.
@@ -1675,11 +1721,18 @@ pub struct AgentReportChangedEvent {
 ///
 /// # The versioning rule
 ///
-/// **An additive op bumps this when a pre-bump peer could not refuse it
-/// meaningfully.** Not every addition does: a new *event* name inside
-/// an existing batch is ignored by a client that has no name for it,
-/// and a new lease-gated op a client never sends costs an old session
-/// nothing — those stay at the current number.
+/// **An additive *session-socket* op bumps this when a pre-bump peer
+/// could not refuse it meaningfully.** Two qualifiers, both learned
+/// after the fact: the rule is scoped to this protocol's own sockets
+/// (a UI-socket op like [`ops::TAB_SEND_FILE`] moves
+/// [`crate::PROTOCOL_VERSION`]'s story, not this one, and that wire has
+/// no handshake gate to move), and it is now the **fallback** —
+/// [`SessionIdentify::features`] advertises additive session ops so a
+/// client feature-detects them instead of a whole generation being
+/// spent on one op. Not every addition bumped even before that: a new
+/// *event* name inside an existing batch is ignored by a client that
+/// has no name for it, and a new lease-gated op a client never sends
+/// costs an old session nothing.
 ///
 /// `session.put_file` (plan 047) is the other kind. A pre-047 session
 /// answers `unknown-op` to a paste the user just performed, and the
@@ -1691,6 +1744,19 @@ pub struct AgentReportChangedEvent {
 /// un-updated far side, not just uploads, and a Unix-socket host gets
 /// no offer at all (its user updates the far side by hand).
 ///
+/// `4` (plan 049, R1) re-cuts what the lease owns, which is
+/// **breaking in both directions**. [`ops::EVENTS_SUBSCRIBE`] no longer
+/// requires a lease — it *classifies* on one (driver stream vs.
+/// observer stream), so a `3` session refuses the leaseless subscribe a
+/// `4` client makes; [`ops::TAB_WRITE`] on a session socket now
+/// requires one, so a `3` client's leaseless write is refused by a `4`
+/// session. Takeover stopped being terminal for event streams: they
+/// survive it and receive [`SESSION_DRIVER_CHANGED_EVENT`] instead of
+/// [`SESSION_STOPPING_EVENT`], which a `3` client skips as an unknown
+/// envelope and then waits forever for a goodbye that never comes.
+/// [`SessionConnectParams::client_label`] and
+/// [`SessionIdentify::features`] ride along additively.
+///
 /// `3` (plan 047) adds [`ops::SESSION_PUT_FILE`] under that rule.
 ///
 /// `2` (plan 036, HS-1b) was a **breaking** bump from HS-1a's `1`:
@@ -1700,7 +1766,11 @@ pub struct AgentReportChangedEvent {
 /// `connect-required`. The attach handshake carries this same number in
 /// its `protocol_version` field and a mismatch is refused before the
 /// token is even looked at.
-pub const SESSION_PROTOCOL_VERSION: u32 = 3;
+pub const SESSION_PROTOCOL_VERSION: u32 = 4;
+
+/// What this build advertises in [`SessionIdentify::features`] — the
+/// one source both the docs and the tests read.
+pub const SESSION_FEATURES: &[&str] = &["put_file"];
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -1782,6 +1852,16 @@ pub struct SessionIdentify {
     pub app_version: String,
     pub session_protocol: u32,
     pub payload_kinds: Vec<AttachPayloadKind>,
+    /// Optional additive session ops this build serves, as an open
+    /// string list — same preserve-unknown contract as
+    /// `payload_kinds`, and the channel that keeps a single new op from
+    /// spending a whole [`SESSION_PROTOCOL_VERSION`] generation. Never
+    /// generations: what a bump covers is not listed here.
+    ///
+    /// `#[serde(default)]` because a `3` session sends no such key and
+    /// must still decode — the values are [`SESSION_FEATURES`].
+    #[serde(default)]
+    pub features: Vec<String>,
     pub libghostty_build: String,
     pub session_id: String,
     pub started_at: String,
@@ -1849,6 +1929,22 @@ pub struct EventBatch {
 pub struct SessionConnectParams {
     #[serde(default)]
     pub takeover: bool,
+    /// Who the claimant says it is — a hostname for a desktop, an app
+    /// name for a phone — stated at the moment it claims authority, and
+    /// echoed to the deposed streams as
+    /// [`SessionDriverChangedEvent::taken_by`].
+    ///
+    /// **Display metadata, never identity**: nothing is authenticated,
+    /// so a UI renders it as what the client *reports itself as*.
+    /// Normalized server-side (trim, strip control characters, cap at
+    /// 128 bytes, empty → absent) rather than here, so a hand-written
+    /// request gets the same treatment as a typed one.
+    ///
+    /// Omitted when unset: an older session `deny_unknown_fields`-
+    /// rejects the key, so an unlabeled connect must stay byte-
+    /// identical to what it has always sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_label: Option<String>,
 }
 
 /// [`ops::SESSION_CONNECT`] result: the bearer lease every lease-gated
@@ -3495,6 +3591,7 @@ mod tests {
         let p = TabWriteParams {
             tab_id: 5,
             data: b"hello\n".to_vec(),
+            lease: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"data\":\"aGVsbG8K\""), "got: {json}");

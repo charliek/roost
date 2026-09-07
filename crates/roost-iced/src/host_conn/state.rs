@@ -191,9 +191,20 @@ pub(crate) enum HostConnState {
         previous: Option<HostId>,
     },
     Connected,
-    /// Another client took the lease. Terminal: nothing auto-retries,
-    /// because retrying is taking it back and that is a decision.
-    TakenOver,
+    /// Another client holds the lease. This client keeps *watching* —
+    /// the stream survives a takeover now (plan 049 §3.8) and observer
+    /// batches still land — but it drives nothing: the frame is frozen,
+    /// no lease-bearing intent is sent, and no auto-retry ever takes the
+    /// session back, because retrying is taking it back and that is a
+    /// decision only the user makes.
+    ///
+    /// `taken_by` is the claimant's self-reported label from the
+    /// `session.driver_changed` envelope — display metadata, never
+    /// identity, and `None` when this client inferred the takeover from
+    /// a probe rather than being told.
+    TakenOver {
+        taken_by: Option<String>,
+    },
     /// The session said it is shutting down. Terminal for the same
     /// reason — an explicit Connect starts a fresh one.
     Stopped,
@@ -217,7 +228,7 @@ impl HostConnState {
             Self::Disconnected(_) => SectionState::Disconnected,
             Self::Connecting { .. } => SectionState::Connecting,
             Self::Connected => SectionState::Connected,
-            Self::TakenOver => SectionState::TakenOver,
+            Self::TakenOver { .. } => SectionState::TakenOver,
             Self::Stopped => SectionState::Stopped,
             Self::NeedsRestart(_) => SectionState::NeedsRestart,
         }
@@ -227,6 +238,17 @@ impl HostConnState {
     pub(crate) fn retry_in(&self) -> Option<Duration> {
         match self {
             HostConnState::Disconnected(d) => d.retry_in,
+            _ => None,
+        }
+    }
+
+    /// Who the session says is driving it now, when this client has
+    /// been told. `None` everywhere else — including a takeover this
+    /// client only *inferred*, from a probe that came back
+    /// non-current.
+    pub(crate) fn taken_by(&self) -> Option<&str> {
+        match self {
+            HostConnState::TakenOver { taken_by } => taken_by.as_deref(),
             _ => None,
         }
     }
@@ -365,11 +387,24 @@ impl HostStateMachine {
     /// that told us it was going away.
     pub(crate) fn stopping(&mut self, reason: &str) -> HostConnState {
         let next = if reason == "taken-over" {
-            HostConnState::TakenOver
+            HostConnState::TakenOver { taken_by: None }
         } else {
             HostConnState::Stopped
         };
         self.transition(next)
+    }
+
+    /// This client is no longer the driver: the stream said so
+    /// (`session.driver_changed`, `taken_by` named) or a reconnect
+    /// probe came back non-current (`taken_by` unknown).
+    ///
+    /// Not terminal any more. The connection task stays up as an
+    /// observer — tab list, titles, agent status and notifications keep
+    /// arriving — and the backoff is reset because watching is a
+    /// working connection, not a failed one.
+    pub(crate) fn taken_over(&mut self, taken_by: Option<String>) -> HostConnState {
+        self.backoff.reset();
+        self.transition(HostConnState::TakenOver { taken_by })
     }
 
     /// The connection dropped for a transport reason (EOF, refused, an
@@ -433,6 +468,7 @@ mod tests {
                 .iter()
                 .map(|k| AttachPayloadKind((*k).to_string()))
                 .collect(),
+            features: vec![],
             libghostty_build: build.into(),
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),
@@ -470,7 +506,10 @@ mod tests {
                 SectionState::Connecting,
             ),
             (dropped, SectionState::Disconnected),
-            (HostConnState::TakenOver, SectionState::TakenOver),
+            (
+                HostConnState::TakenOver { taken_by: None },
+                SectionState::TakenOver,
+            ),
             (HostConnState::Stopped, SectionState::Stopped),
             (mismatch, SectionState::NeedsRestart),
         ];
@@ -493,7 +532,9 @@ mod tests {
             HostDot::Pending
         );
         assert_eq!(
-            HostConnState::TakenOver.section_state().dot(),
+            HostConnState::TakenOver { taken_by: None }
+                .section_state()
+                .dot(),
             HostDot::Offline
         );
     }
@@ -615,7 +656,10 @@ mod tests {
         let mut machine = HostStateMachine::new(true);
         machine.begin_attempt(None);
         machine.connected();
-        assert_eq!(machine.stopping("taken-over"), HostConnState::TakenOver);
+        assert_eq!(
+            machine.stopping("taken-over"),
+            HostConnState::TakenOver { taken_by: None }
+        );
 
         let mut machine = HostStateMachine::new(true);
         machine.begin_attempt(None);

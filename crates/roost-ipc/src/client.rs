@@ -44,7 +44,8 @@ use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
     ops, AttachAccepted, AttachHandshake, AttachHandshakeReply, EventBatch, EventsSubscribeParams,
     EventsSubscribeResult, IdentifyParams, IdentifyResult, RawRequest, Response, ResponseError,
-    SessionStoppingEvent, SESSION_STOPPING_EVENT,
+    SessionDriverChangedEvent, SessionStoppingEvent, SESSION_DRIVER_CHANGED_EVENT,
+    SESSION_STOPPING_EVENT,
 };
 use crate::Error;
 
@@ -203,11 +204,10 @@ impl IpcClient {
 
 /// One frame off a subscribed connection.
 ///
-/// Every frame is a batch except the single terminal control envelope
-/// that ends the stream. Envelopes that carry neither a `revision` nor
-/// the [`SESSION_STOPPING_EVENT`] name are skipped rather than
-/// surfaced — additive server-side control frames must not break a
-/// client that predates them (`ipc.md` #versioning).
+/// Every frame is a batch except the two control envelopes. Envelopes
+/// that carry neither a `revision` nor one of those names are skipped
+/// rather than surfaced — additive server-side control frames must not
+/// break a client that predates them (`ipc.md` #versioning).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventFrame {
     /// One workspace commit. Empty commits are pushed too, which is
@@ -216,6 +216,9 @@ pub enum EventFrame {
     /// The stream is over and says why. Always the last frame before
     /// the close.
     Stopping(SessionStoppingEvent),
+    /// Another client took the driver lease. **Not terminal**: the
+    /// stream keeps delivering after it, as an observer.
+    DriverChanged(SessionDriverChangedEvent),
 }
 
 /// A subscribed connection, reading the server's push stream.
@@ -308,6 +311,19 @@ impl EventStream {
                     }
                     self.stopping = Some(stopping.clone());
                     return Ok(Some(EventFrame::Stopping(stopping)));
+                }
+                if name == SESSION_DRIVER_CHANGED_EVENT {
+                    // Deliberately not latched: the stopping latch
+                    // exists because that envelope is defined as the
+                    // last frame, and this one is defined as not.
+                    let changed: SessionDriverChangedEvent = value
+                        .get("data")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(Error::from)?
+                        .unwrap_or_default();
+                    return Ok(Some(EventFrame::DriverChanged(changed)));
                 }
                 tracing::debug!(event = %name, "ignoring an unrecognized push envelope");
                 continue;

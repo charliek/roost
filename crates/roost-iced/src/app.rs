@@ -5232,7 +5232,15 @@ impl App {
         &self,
     ) -> Option<(&str, host_notice::FrozenFrame, host_notice::HostBanner)> {
         let (view, frozen) = self.frozen_host_frame()?;
-        Some((view.saved_id.as_str(), frozen, frozen.banner(&view.label)))
+        let taken_by = self
+            .hosts
+            .section(&view.saved_id)
+            .and_then(|section| section.state.taken_by());
+        Some((
+            view.saved_id.as_str(),
+            frozen,
+            frozen.banner(&view.label, taken_by),
+        ))
     }
 
     /// The frozen-frame banner's button (plan 037 §3.1).

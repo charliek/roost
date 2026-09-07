@@ -93,13 +93,18 @@ def first_project(client: Roost) -> int:
 # ---------------------------------------------------------------------------
 
 
-def connect_lease(client: Roost, takeover: bool = False) -> str:
+def connect_lease(client: Roost, takeover: bool = False, label: str | None = None) -> str:
     """`session.connect` — the lease every lease-gated op presents.
 
     The lease is a bearer credential: it is returned, never logged, and
-    never interpolated into an assertion message.
+    never interpolated into an assertion message. `label` is what the
+    claimant reports itself as, which is the only thing a deposed stream
+    is told about it.
     """
-    return client.call("session.connect", {"takeover": takeover})["lease"]
+    params: dict = {"takeover": takeover}
+    if label is not None:
+        params["client_label"] = label
+    return client.call("session.connect", params)["lease"]
 
 
 def attach_ticket(
@@ -226,15 +231,20 @@ def pty_payload(frames) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def test_a_takeover_closes_every_connection_the_old_lease_held(env):
-    """One takeover, four consequences.
+def test_a_takeover_closes_the_old_lease_but_demotes_its_stream(env):
+    """One takeover, four consequences — and one deliberate survivor.
 
     The lease is what makes a host session single-driver, so the
-    interesting assertion is not that a new client gets a lease — it is
-    that the old one loses *all three* of its footholds at once: its
-    control connection, its event stream, and its live data connection.
-    A client left holding any of them would still believe it drives the
+    interesting assertion is that the old client loses every foothold
+    that *writes*: its control connection and its live data connection.
+    A client left holding either would still believe it drives the
     session.
+
+    Its **event stream is the exception** (plan 049 §3.8). Reading is
+    not authority, so the stream is demoted rather than cut: it gets one
+    non-terminal `session.driver_changed` naming whoever claimed the
+    lease, and it keeps delivering after it. A deposed window that lost
+    its stream would go blind about the session it is still showing.
 
     The tombstone is the fourth: an op presenting the dead lease is told
     `taken-over` (someone else has it) rather than `connect-required`
@@ -254,7 +264,7 @@ def test_a_takeover_closes_every_connection_the_old_lease_held(env):
     conn.read_until_ready()
 
     new = env.client()
-    new_lease = connect_lease(new, takeover=True)
+    new_lease = connect_lease(new, takeover=True, label="  a phone\n  ")
     assert len(new_lease) == 32
 
     # The data connection is told why it ended. EOF is the contract's
@@ -265,8 +275,16 @@ def test_a_takeover_closes_every_connection_the_old_lease_held(env):
     assert ending.code == "taken-over", ending
     conn.close()
 
-    # The event stream gets the terminal control envelope, same reason.
-    assert stream.recv_stopping(timeout=30.0) == "taken-over"
+    # The event stream is told, not cut — and the label the claimant
+    # reported arrives normalized (trimmed, control characters gone).
+    assert stream.recv_driver_changed(timeout=30.0) == "a phone"
+    assert stream.stopping_reason is None, "a driver_changed must not end the stream"
+
+    # And it keeps delivering: a commit after the takeover still lands,
+    # with no hole in the revision sequence.
+    watched = quiet_tab(new, project, env.launch_cwd)
+    _batches, opened = stream.recv_until("tab.opened", timeout=30.0)
+    assert int(opened["data"]["tab"]["id"]) == watched
     stream.close()
 
     # And the connection that ran the original `session.connect` is gone.

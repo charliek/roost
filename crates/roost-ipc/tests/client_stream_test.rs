@@ -206,6 +206,56 @@ async fn the_stopping_envelope_names_why_the_stream_ended() {
     }
 }
 
+/// The driver-changed envelope is the deliberate counterexample to the
+/// stopping latch: same non-commit shape, but the stream keeps going —
+/// the subscriber is now an observer, not gone.
+#[tokio::test]
+async fn the_driver_changed_envelope_does_not_end_the_stream() {
+    let stub = Stub::start(
+        Plan::new()
+            .subscribe(Subscribe::Ack(4))
+            .push(Push::empty(5))
+            .push(Push::Raw(serde_json::json!({
+                "event": "session.driver_changed",
+                "data": {"taken_by": "kestrel.local"},
+            })))
+            .push(Push::empty(6)),
+    )
+    .await;
+
+    let mut stream = EventStream::connect(stub.path(), "lease")
+        .await
+        .expect("subscribed");
+    match within("the first batch", stream.next())
+        .await
+        .expect("a frame")
+    {
+        Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, 5),
+        other => panic!("expected batch 5, got {other:?}"),
+    }
+    match within("the envelope", stream.next())
+        .await
+        .expect("a frame")
+    {
+        Some(EventFrame::DriverChanged(changed)) => {
+            assert_eq!(changed.taken_by, "kestrel.local");
+        }
+        other => panic!("expected the driver-changed envelope, got {other:?}"),
+    }
+    assert_eq!(
+        stream.stopping_reason(),
+        None,
+        "a non-terminal envelope must not latch the stream"
+    );
+    match within("the batch after it", stream.next())
+        .await
+        .expect("a frame")
+    {
+        Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, 6),
+        other => panic!("expected batch 6, got {other:?}"),
+    }
+}
+
 /// Additive control frames from a newer session must not break a client
 /// that predates them — the versioning policy's whole point. The gap
 /// check must not see them either: they are not commits.

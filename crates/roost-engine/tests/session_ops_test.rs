@@ -104,6 +104,45 @@ fn tab_open_params(project_id: i64, argv: &[&str], size: Option<(u32, u32)>) -> 
     })
 }
 
+/// A `tab.write` request. `lease` is omitted rather than empty when
+/// absent — that is exactly the shape a client holding no lease sends.
+fn tab_write_params(tab_id: i64, data: &[u8], lease: Option<&str>) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "tab_id": tab_id.to_string(),
+        "data": bytes_base64::encode(data),
+    });
+    if let Some(lease) = lease {
+        params["lease"] = serde_json::json!(lease);
+    }
+    params
+}
+
+/// One client's connection. The lease gate registers the presenting
+/// connection, so a takeover test needs two distinct identities — which
+/// [`call`]'s per-call context cannot express.
+fn conn(id: u64) -> ConnCtx {
+    ConnCtx::new(id).0
+}
+
+/// Mint the interactive lease on a fresh connection.
+async fn connect(f: &Fixture, ctx: &ConnCtx) -> String {
+    connect_with(f, ctx, false).await
+}
+
+async fn connect_with(f: &Fixture, ctx: &ConnCtx, takeover: bool) -> String {
+    let value = reply(
+        f.handler
+            .handle(
+                ctx,
+                ops::SESSION_CONNECT,
+                serde_json::json!({"takeover": takeover}),
+            )
+            .await
+            .expect("session.connect"),
+    );
+    value["lease"].as_str().expect("lease token").to_string()
+}
+
 /// Every tab the report accounts for, in bucket order. The three lists
 /// partition the live set, so a tab appearing twice here is a bug.
 fn accounted(report: &SessionStopResult) -> Vec<i64> {
@@ -135,8 +174,9 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
     }
 
     // And nothing about the UI socket's other answers moved: the size
-    // fallback is still 80x24.
-    assert_eq!(open_tab_reporting_size(&f, None).await, (80, 24));
+    // fallback is still 80x24 — reached through a leaseless `tab.write`,
+    // which this socket must keep serving (it mints no leases).
+    assert_eq!(open_tab_reporting_size(&f, None, None).await, (80, 24));
 }
 
 /// The mirror of the UI-socket rule: the host registry is client-side
@@ -243,9 +283,16 @@ async fn session_identify_reports_the_installed_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tab_open_without_a_size_uses_the_session_default() {
     let f = fixture(true);
-    assert_eq!(open_tab_reporting_size(&f, None).await, (120, 40));
+    let lease = connect(&f, &conn(1)).await;
+    assert_eq!(
+        open_tab_reporting_size(&f, None, Some(&lease)).await,
+        (120, 40)
+    );
     // An explicit size still wins.
-    assert_eq!(open_tab_reporting_size(&f, Some((72, 19))).await, (72, 19));
+    assert_eq!(
+        open_tab_reporting_size(&f, Some((72, 19)), Some(&lease)).await,
+        (72, 19)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -414,7 +461,16 @@ async fn a_mutation_racing_stop_is_refused_or_reaped() {
 /// Open a tab whose shell prints its winsize, and read it back off the
 /// PTY. This is the only honest check that the default reached the
 /// terminal rather than just the workspace record.
-async fn open_tab_reporting_size(f: &Fixture, size: Option<(u32, u32)>) -> (u16, u16) {
+///
+/// `lease` rides the `tab.write` that releases the shell: a session
+/// socket refuses an unleased write, and the size the shell reports is
+/// what proves a leased one reached the terminal rather than just being
+/// admitted.
+async fn open_tab_reporting_size(
+    f: &Fixture,
+    size: Option<(u32, u32)>,
+    lease: Option<&str>,
+) -> (u16, u16) {
     let project = f.workspace.ensure_default_project("/tmp");
     let value = reply(
         call(
@@ -439,10 +495,7 @@ async fn open_tab_reporting_size(f: &Fixture, size: Option<(u32, u32)>) -> (u16,
     call(
         &f.handler,
         ops::TAB_WRITE,
-        serde_json::json!({
-            "tab_id": opened.tab.id.to_string(),
-            "data": bytes_base64::encode(b"\n"),
-        }),
+        tab_write_params(opened.tab.id, b"\n", lease),
     )
     .await
     .expect("tab.write");
@@ -471,6 +524,81 @@ async fn open_tab_reporting_size(f: &Fixture, size: Option<(u32, u32)>) -> (u16,
     let rows: u16 = parts.next().unwrap().parse().unwrap();
     let cols: u16 = parts.next().unwrap().parse().unwrap();
     (cols, rows)
+}
+
+/// A write is an interactive act, so on a session socket it is the
+/// lease holder's. The UI-socket half of this rule — a leaseless write
+/// still lands — is pinned in
+/// `a_ui_socket_does_not_know_the_session_ops`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_socket_refuses_an_unleased_tab_write() {
+    let f = fixture(true);
+    let project = f.workspace.ensure_default_project("/tmp");
+    let opened: TabOpenResult = serde_json::from_value(reply(
+        call(
+            &f.handler,
+            ops::TAB_OPEN,
+            tab_open_params(project, &["/bin/sh", "-c", "sleep 30"], None),
+        )
+        .await
+        .expect("tab.open"),
+    ))
+    .unwrap();
+
+    for lease in [None, Some("")] {
+        let err = call(
+            &f.handler,
+            ops::TAB_WRITE,
+            tab_write_params(opened.tab.id, b"x", lease),
+        )
+        .await
+        .expect_err("an unleased session write must be refused");
+        assert_eq!(err.code, "connect-required", "lease={lease:?}");
+    }
+}
+
+/// Takeover is an **admission boundary**, not a write fence: the lease
+/// check linearizes before or after it, and a write admitted just
+/// before one may still enqueue afterwards. What is pinned is the gate
+/// — after the takeover the old lease buys nothing and the new one is
+/// the whole authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_taken_over_lease_cannot_write_and_the_new_one_can() {
+    let f = fixture(true);
+    let first = conn(1);
+    let second = conn(2);
+    let old = connect(&f, &first).await;
+    let project = f.workspace.ensure_default_project("/tmp");
+    let opened: TabOpenResult = serde_json::from_value(reply(
+        call(
+            &f.handler,
+            ops::TAB_OPEN,
+            tab_open_params(project, &["/bin/sh", "-c", "sleep 30"], None),
+        )
+        .await
+        .expect("tab.open"),
+    ))
+    .unwrap();
+
+    let new = connect_with(&f, &second, true).await;
+    assert_ne!(old, new);
+
+    let err = call(
+        &f.handler,
+        ops::TAB_WRITE,
+        tab_write_params(opened.tab.id, b"x", Some(&old)),
+    )
+    .await
+    .expect_err("the displaced lease must not write");
+    assert_eq!(err.code, "taken-over");
+
+    call(
+        &f.handler,
+        ops::TAB_WRITE,
+        tab_write_params(opened.tab.id, b"x", Some(&new)),
+    )
+    .await
+    .expect("the live lease writes");
 }
 
 /// The latch is what gates; nothing else about the handler is stateful,

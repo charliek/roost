@@ -63,7 +63,7 @@ pub(crate) enum FrozenFrame {
 /// not the other.
 pub(super) fn frozen_frame(state: &HostConnState) -> Option<FrozenFrame> {
     match state {
-        HostConnState::TakenOver => Some(FrozenFrame::TakenOver),
+        HostConnState::TakenOver { .. } => Some(FrozenFrame::TakenOver),
         HostConnState::Stopped => Some(FrozenFrame::Stopped),
         HostConnState::Disconnected(_)
         | HostConnState::Connecting { .. }
@@ -92,10 +92,21 @@ pub(super) fn click_still_lands(rendered: FrozenFrame, current: Option<FrozenFra
 
 impl FrozenFrame {
     /// What this frame says to the user, over the pixels it froze.
-    pub(super) fn banner(self, label: &str) -> HostBanner {
+    ///
+    /// `taken_by` is the claimant's *self-reported* label (plan 049
+    /// §3.9) and the copy says so: nothing authenticates it, so the
+    /// sentence attributes the name to the client rather than asserting
+    /// it. `None` — a takeover this client inferred from a probe rather
+    /// than being told about — says only that somebody did.
+    pub(super) fn banner(self, label: &str, taken_by: Option<&str>) -> HostBanner {
         match self {
             Self::TakenOver => HostBanner {
-                message: format!("{label} was taken over by another Roost window."),
+                message: match taken_by {
+                    Some(taker) => {
+                        format!("{label} was taken over by a client reporting itself as {taker}.")
+                    }
+                    None => format!("{label} was taken over by another client."),
+                },
                 action: "Reconnect here",
             },
             Self::Stopped => HostBanner {
@@ -311,7 +322,7 @@ mod tests {
     /// The two production halves composed exactly as the terminal area
     /// composes them.
     fn banner(label: &str, state: &HostConnState) -> Option<HostBanner> {
-        Some(frozen_frame(state)?.banner(label))
+        Some(frozen_frame(state)?.banner(label, state.taken_by()))
     }
 
     fn every_state() -> Vec<HostConnState> {
@@ -323,7 +334,7 @@ mod tests {
             }),
             HostConnState::Connecting { previous: None },
             HostConnState::Connected,
-            HostConnState::TakenOver,
+            HostConnState::TakenOver { taken_by: None },
             HostConnState::Stopped,
             HostConnState::NeedsRestart(mismatch(MismatchKind::Build, RestartAction::RestartLocal)),
         ]
@@ -344,7 +355,21 @@ mod tests {
         assert_eq!(
             banners[3],
             Some(HostBanner {
-                message: "pop-os was taken over by another Roost window.".into(),
+                message: "pop-os was taken over by another client.".into(),
+                action: "Reconnect here",
+            })
+        );
+        // …and when the session told this client *who*, the banner says
+        // so — attributed, because nothing authenticates the label.
+        assert_eq!(
+            banner(
+                "pop-os",
+                &HostConnState::TakenOver {
+                    taken_by: Some("a phone".into())
+                }
+            ),
+            Some(HostBanner {
+                message: "pop-os was taken over by a client reporting itself as a phone.".into(),
                 action: "Reconnect here",
             })
         );
@@ -365,7 +390,8 @@ mod tests {
     /// shells are gone, so its button may not promise a reconnect.
     #[test]
     fn the_two_banners_promise_different_things() {
-        let taken = banner("pop-os", &HostConnState::TakenOver).expect("takeover banner");
+        let taken = banner("pop-os", &HostConnState::TakenOver { taken_by: None })
+            .expect("takeover banner");
         let stopped = banner("pop-os", &HostConnState::Stopped).expect("stopped banner");
         assert_ne!(taken.action, stopped.action);
         assert!(taken.message.contains("taken over"));

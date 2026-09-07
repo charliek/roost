@@ -216,6 +216,26 @@ existing `roost-ipc` framing and op set. New/changed ops:
   older ones fall back to `connect-required`) and purges the displaced
   lease's outstanding attach tokens. See
   [ipc.md's `session.connect`](../docs/reference/ipc.md#sessionconnect).
+  **Plan 049 (R1) re-cut this boundary — not a correction of what is
+  written above, but a deliberate widening of it.** The lease was
+  required on `events.subscribe` as well as on interactive input; R1
+  drops that requirement — reading a session is not interactive
+  authority, so a subscribe is never refused for want of a lease, and
+  the lease presented on one now *classifies* the resulting stream
+  (full feed incl. `tab.effect` vs. a filtered one) rather than gating
+  it. Takeover also stopped closing event streams: they survive it and
+  are reclassified in place via a new non-terminal
+  `session.driver_changed{taken_by}` envelope, so a deposed client
+  keeps watching instead of losing its connection. What this section
+  got right and R1 left standing: exactly one tombstone, the purge of
+  outstanding attach tokens, and the requirement itself on `tab.attach`
+  — R1 additionally puts `tab.write` on a session socket behind the
+  same gate, so "authority to drive tabs" now names attach input and
+  `tab.write` together, not attach input alone. See
+  [ipc.md's `events.subscribe`](../docs/reference/ipc.md#eventssubscribe)
+  and
+  [`docs/development/host-sessions.md`'s lease/takeover lifecycle](../docs/development/host-sessions.md#the-leasetakeover-lifecycle)
+  for the shipped shape.
 - `session.stop` → graceful shutdown (§8). Distinct from disconnect,
   which is just closing connections. **Shipped in HS-1a**, reap
   report included.

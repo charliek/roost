@@ -21,13 +21,14 @@ use roost_ipc::messages::{
     AgentHooksMode, AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode,
     AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope,
     ProjectReorderParams, ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity,
-    SessionConnectParams, SessionConnectResult, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
+    SessionConnectParams, SessionConnectResult, SessionDriverChangedEvent, SessionIdentify,
+    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
     SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams,
     SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
     TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, TabReorderParams,
-    TabSendFileParams, TabSendFileResult, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef,
+    MAX_PUT_FILE_BYTES, SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES, SESSION_PROTOCOL_VERSION,
+    SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -53,6 +54,7 @@ fn sample_identify() -> SessionIdentify {
             AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
             AttachPayloadKind::VT.into(),
         ],
+        features: SESSION_FEATURES.iter().map(|f| (*f).to_string()).collect(),
         libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
         session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
         started_at: "2026-08-27T14:03:11Z".into(),
@@ -89,14 +91,14 @@ where
     );
 }
 
-/// Plan 047's bump, under the rule stated on the constant: a pre-047
-/// session answers `session.put_file` with `unknown-op`, which is not a
-/// refusal a client can act on per paste, so the number moves. The
-/// request/response wire version did not move with it — the two version
-/// different things.
+/// Plan 049 R1's bump: the lease changed axis (leaseless classified
+/// `events.subscribe`, lease-gated session-socket `tab.write`,
+/// non-terminal `session.driver_changed`), which no `3` peer can be
+/// served. The request/response wire version did not move with it — the
+/// two version different things.
 #[test]
-fn session_protocol_version_is_three() {
-    assert_eq!(SESSION_PROTOCOL_VERSION, 3);
+fn session_protocol_version_is_four() {
+    assert_eq!(SESSION_PROTOCOL_VERSION, 4);
     assert_eq!(roost_ipc::PROTOCOL_VERSION, 1);
 }
 
@@ -149,8 +151,9 @@ fn unknown_attach_payload_kind_survives_a_round_trip() {
 #[test]
 fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.18","session_protocol":3,"#,
+        r#"{"app_version":"0.0.18","session_protocol":4,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
+        r#""features":["put_file"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
         r#""started_at":"2026-08-27T14:03:11Z"}"#,
@@ -170,7 +173,7 @@ fn session_identify_matches_its_golden_json() {
 #[test]
 fn session_binary_identity_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.19","session_protocol":3,"#,
+        r#"{"app_version":"0.0.19","session_protocol":4,"#,
         r#""libghostty_build":"ghostty-abcdef0123456789+snapshot.v1"}"#,
     );
 
@@ -406,6 +409,65 @@ fn session_connect_params_default_to_no_takeover() {
     assert!(serde_json::from_str::<SessionConnectParams>(r#"{"force":true}"#).is_err());
 }
 
+/// The label rides `session.connect`, not `identify`, and is omitted
+/// unless the client actually states one — an older session
+/// `deny_unknown_fields`-rejects a key it has never heard of, so an
+/// unlabeled connect must stay byte-identical to what it always sent.
+#[test]
+fn session_connect_params_omit_an_unset_client_label() {
+    let bare = SessionConnectParams {
+        takeover: true,
+        client_label: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&bare).unwrap(),
+        r#"{"takeover":true}"#
+    );
+
+    let labeled = SessionConnectParams {
+        takeover: true,
+        client_label: Some("kestrel.local".into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&labeled).unwrap(),
+        r#"{"takeover":true,"client_label":"kestrel.local"}"#
+    );
+    round_trip(&labeled);
+
+    let decoded: SessionConnectParams = serde_json::from_str(r#"{"takeover":false}"#).unwrap();
+    assert_eq!(decoded.client_label, None);
+}
+
+/// Same omit-when-unset contract on the write path, and the reason is
+/// the sharper one: a lease-less `roostctl` must keep talking to a UI
+/// socket that predates the key entirely.
+#[test]
+fn tab_write_params_omit_an_unset_lease() {
+    let bare = TabWriteParams {
+        tab_id: 5,
+        data: b"ls\n".to_vec(),
+        lease: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&bare).unwrap(),
+        r#"{"tab_id":"5","data":"bHMK"}"#
+    );
+
+    let leased = TabWriteParams {
+        tab_id: 5,
+        data: b"ls\n".to_vec(),
+        lease: Some(LEASE.into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&leased).unwrap(),
+        format!(r#"{{"tab_id":"5","data":"bHMK","lease":"{LEASE}"}}"#)
+    );
+    round_trip(&leased);
+
+    let decoded: TabWriteParams = serde_json::from_str(r#"{"tab_id":"5","data":"bHMK"}"#).unwrap();
+    assert_eq!(decoded.lease, None);
+}
+
 #[test]
 fn session_connect_result_matches_its_golden_json() {
     const GOLDEN: &str = r#"{"lease":"9f2c1d7a4b6e08315c0d9a72e4f16b83","revision":42}"#;
@@ -476,9 +538,9 @@ fn tab_attach_result_matches_its_golden_json() {
 
 #[test]
 fn attach_handshake_matches_its_golden_json() {
-    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":3}"#;
+    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":4}"#;
     const RESUME: &str = concat!(
-        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":3,"#,
+        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":4,"#,
         r#""resume_from_seq":901,"server_epoch":6032428321756423947,"#,
         r#""tab_generation":3}"#,
     );
@@ -640,6 +702,67 @@ fn session_stopping_vector_decodes_into_its_typed_shape() {
         serde_json::from_str(r#"{"reason":"taken-over"}"#).unwrap();
     assert_eq!(taken_over.reason, "taken-over");
     round_trip(&taken_over);
+}
+
+/// Non-terminal by construction: it carries no revision (so the gap
+/// check skips it) and the stream is defined to continue after it —
+/// the whole point of the R1 re-cut.
+#[test]
+fn session_driver_changed_vector_decodes_into_its_typed_shape() {
+    let raw = read_vector("session.driver_changed.event.json");
+    let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
+    assert_eq!(envelope.event, SESSION_DRIVER_CHANGED_EVENT);
+    let data: SessionDriverChangedEvent =
+        serde_json::from_value(envelope.data).expect("decode driver-changed data");
+    assert_eq!(data.taken_by, "kestrel.local");
+    round_trip(&data);
+    assert_eq!(
+        serde_json::to_string(&data).unwrap(),
+        r#"{"taken_by":"kestrel.local"}"#
+    );
+
+    // A claimant that stated no label still produces an envelope; the
+    // server substitutes the fallback rather than omitting the key.
+    let unlabeled: SessionDriverChangedEvent =
+        serde_json::from_str(r#"{"taken_by":"unknown client"}"#).unwrap();
+    assert_eq!(unlabeled.taken_by, "unknown client");
+}
+
+/// The labeled variant of the connect request — an additive vector
+/// beside the unlabeled one rather than an edit of it, which is what
+/// "never edit an existing vector" means in practice.
+#[test]
+fn labeled_session_connect_vector_decodes_into_its_typed_shape() {
+    let raw = read_vector("session.connect.labeled.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_CONNECT);
+    let params: SessionConnectParams =
+        serde_json::from_value(request.params).expect("decode connect params");
+    assert!(params.takeover);
+    assert_eq!(params.client_label.as_deref(), Some("kestrel.local"));
+}
+
+/// `features` is an open list with a client-side default: a `3`
+/// session sends no such key and must still decode, and a newer
+/// session's unrecognized entries survive rather than becoming a
+/// decode error (the `payload_kinds` contract, applied to ops).
+#[test]
+fn session_identify_features_default_when_absent_and_preserve_unknowns() {
+    let v3 = decode_identify_vector(&identify_vector_name(SESSION_PROTOCOL_VERSION - 1));
+    assert!(
+        v3.features.is_empty(),
+        "a pre-features generation must decode, not fail"
+    );
+
+    let newer: SessionIdentify = serde_json::from_str(
+        r#"{"app_version":"0.0.99","session_protocol":9,"payload_kinds":["vt"],
+            "features":["put_file","teleport"],"libghostty_build":"b",
+            "session_id":"s","started_at":"t"}"#,
+    )
+    .unwrap();
+    assert_eq!(newer.features, vec!["put_file", "teleport"]);
+    round_trip(&newer);
 }
 
 #[test]

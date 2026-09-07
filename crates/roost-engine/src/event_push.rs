@@ -36,6 +36,66 @@ use tracing::{debug, warn};
 use crate::workspace::TabEffectKind;
 use crate::{VersionedWorkspaceEvent, Workspace, WorkspaceEvent};
 
+/// What one subscription is allowed to see, asked at the instant a batch
+/// is enqueued.
+///
+/// The seam exists so the *decision* can be made under whatever lock the
+/// embedder reclassifies streams with. A takeover flips a driver stream
+/// to an observer and injects `session.driver_changed` into the same
+/// queue; unless the classification and the enqueue are one step, an
+/// effect batch could be written after the envelope that says the reader
+/// is no longer entitled to effects.
+pub trait StreamGate: Send + Sync + 'static {
+    /// Project `batch` for this stream and hand it to `permit`.
+    fn deliver(
+        &self,
+        permit: mpsc::Permit<'_, serde_json::Value>,
+        batch: &VersionedWorkspaceEvent,
+    ) -> Delivery;
+}
+
+/// What a gate did with the permit it was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The batch is on the queue.
+    Delivered,
+    /// The permit carried something else — a notice the embedder could
+    /// not enqueue itself because the queue was full at the time (plan
+    /// 049 §3.8's `session.driver_changed`). The batch was **not**
+    /// sent: the relay must reserve again and re-offer it, so the notice
+    /// always precedes it and the batch is classified after whatever the
+    /// notice announced.
+    NoticeSentRetryBatch,
+    /// The batch has no wire form and the stream must end — the same
+    /// "close rather than lie" answer the relay gives a
+    /// [`WorkspaceEvent::Resync`].
+    End,
+}
+
+/// The gate for a stream with no classification to make: everything the
+/// workspace publishes goes out.
+///
+/// The relay's own cases drive it, here and across the crate boundary in
+/// `tests/`, which is why it is public: a fence or a teardown is easier
+/// to read against a gate that decides nothing.
+pub struct FullFeed;
+
+impl StreamGate for FullFeed {
+    fn deliver(
+        &self,
+        permit: mpsc::Permit<'_, serde_json::Value>,
+        batch: &VersionedWorkspaceEvent,
+    ) -> Delivery {
+        match batch_value(batch, true) {
+            Some(value) => {
+                permit.send(value);
+                Delivery::Delivered
+            }
+            None => Delivery::End,
+        }
+    }
+}
+
 /// How many batches may be queued for one subscriber before it is
 /// treated as not keeping up.
 ///
@@ -251,9 +311,24 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
 }
 
 /// One batch's wire form, or `None` if the connection must close.
-fn batch_value(batch: &VersionedWorkspaceEvent) -> Option<serde_json::Value> {
+///
+/// `driver` is the stream's classification (plan 049 §3.7). An observer
+/// sees every workspace fact — `notification.fired` included, because
+/// routing notifications is what a watcher subscribes for — but never a
+/// [`WorkspaceEvent::TabEffect`]: bells and OSC 52 clipboard writes are
+/// the *driving* client's side-channel (DL-18), and fanning a clipboard
+/// payload out to every watcher is not a filter anyone can add later.
+///
+/// A revision whose every event was filtered still ships, as an empty
+/// batch. The client's loss check is "did I skip a revision", so a
+/// silently-dropped commit would read as loss; an empty batch advances
+/// the fence exactly as a real one does.
+pub fn batch_value(batch: &VersionedWorkspaceEvent, driver: bool) -> Option<serde_json::Value> {
     let mut events = Vec::with_capacity(batch.events.len());
     for event in &batch.events {
+        if !driver && matches!(event, WorkspaceEvent::TabEffect { .. }) {
+            continue;
+        }
         events.push(envelope(event)?);
     }
     // Infallible in practice: the envelopes are already `Value`s.
@@ -264,11 +339,28 @@ fn batch_value(batch: &VersionedWorkspaceEvent) -> Option<serde_json::Value> {
     .ok()
 }
 
-/// Subscribe `workspace` and start relaying its commits.
-///
-/// Returns the revision the subscription starts from — the ack the
-/// client is owed — plus the [`PushSource`] the server writes from and
-/// an [`AbortHandle`] for the relay task.
+/// Everything one [`spawn`]ed subscription hands back to its caller.
+pub struct Subscription {
+    /// The revision the subscription starts from — the ack the client
+    /// is owed.
+    pub revision: u64,
+    /// What the server writes frames from.
+    pub source: PushSource,
+    /// Ends the relay. Dropping its sender is what closes the
+    /// connection, so this doubles as "cut this stream".
+    pub abort: AbortHandle,
+    /// Writes a non-batch envelope into this stream's queue, ahead of
+    /// nothing and behind everything already queued — the serialization
+    /// a takeover's `session.driver_changed` rides.
+    ///
+    /// **Weak on purpose.** A strong clone parked in a registry would
+    /// keep the channel open after the relay ended, turning what should
+    /// be an EOF into a connection that hangs with no producer. Upgrade
+    /// failing *is* "this stream is already going away".
+    pub inject: mpsc::WeakSender<serde_json::Value>,
+}
+
+/// Subscribe `workspace` and start relaying its commits through `gate`.
 ///
 /// The ordering is the contract: the broadcast is subscribed **before**
 /// the revision is read, so no commit can slip through the gap. Commits
@@ -280,18 +372,24 @@ fn batch_value(batch: &VersionedWorkspaceEvent) -> Option<serde_json::Value> {
 /// any condition that would otherwise hide a loss: a lagged broadcast, a
 /// queue that stays full past [`PushLimits::stall`], a `Resync`, or a
 /// dropped receiver.
-pub fn spawn(workspace: &Arc<Workspace>, limits: PushLimits) -> (u64, PushSource, AbortHandle) {
+pub fn spawn(
+    workspace: &Arc<Workspace>,
+    limits: PushLimits,
+    gate: Arc<dyn StreamGate>,
+) -> Subscription {
     let rx = workspace.subscribe_versioned();
     let revision = workspace.revision();
     let (tx, source_rx) = mpsc::channel(limits.capacity.max(1));
-    let task = tokio::spawn(relay(rx, tx, revision, limits));
-    (
+    let inject = tx.downgrade();
+    let task = tokio::spawn(relay(rx, tx, revision, limits, gate));
+    Subscription {
         revision,
         // The queue bound and the socket-write bound are the same
         // policy seen from two sides, so they share one budget.
-        PushSource::new(source_rx).with_write_deadline(limits.stall),
-        task.abort_handle(),
-    )
+        source: PushSource::new(source_rx).with_write_deadline(limits.stall),
+        abort: task.abort_handle(),
+        inject,
+    }
 }
 
 /// Relay `rx`'s batches into `tx`, dropping everything at or below
@@ -300,11 +398,17 @@ pub fn spawn(workspace: &Arc<Workspace>, limits: PushLimits) -> (u64, PushSource
 /// Split out from [`spawn`] so the fence boundary and the teardown
 /// conditions can be driven with a hand-fed channel, without a
 /// workspace, a socket, or a race to set up.
+///
+/// Capacity is reserved *before* `gate` is consulted, and the gate then
+/// classifies and enqueues in one step: waiting for room is the only
+/// part that can block, and it must not happen under the embedder's
+/// registry lock.
 async fn relay(
     mut rx: tokio::sync::broadcast::Receiver<VersionedWorkspaceEvent>,
     tx: mpsc::Sender<serde_json::Value>,
     fence: u64,
     limits: PushLimits,
+    gate: Arc<dyn StreamGate>,
 ) {
     loop {
         let received = tokio::select! {
@@ -322,23 +426,36 @@ async fn relay(
             // with: it committed between the subscribe and the read.
             Ok(batch) if batch.revision <= fence => continue,
             Ok(batch) => {
-                let Some(value) = batch_value(&batch) else {
-                    debug!(
-                        revision = batch.revision,
-                        "unpushable workspace event; closing the events connection"
-                    );
-                    return;
-                };
-                match tokio::time::timeout(limits.stall, tx.send(value)).await {
-                    Ok(Ok(())) => {}
-                    // Receiver gone: the connection is already down.
-                    Ok(Err(_)) => return,
-                    Err(_) => {
-                        warn!(
-                            revision = batch.revision,
-                            "events subscriber is not draining; closing the connection"
-                        );
-                        return;
+                // One batch can cost two permits. A takeover that found
+                // this queue full left its `session.driver_changed`
+                // with the gate; the gate spends the first permit on
+                // that notice and the batch is re-offered, which is
+                // what keeps the notice ahead of it. Each attempt gets
+                // the full stall budget, and a peer that never drains
+                // still dies on the first one.
+                loop {
+                    let permit = match tokio::time::timeout(limits.stall, tx.reserve()).await {
+                        Ok(Ok(permit)) => permit,
+                        // Receiver gone: the connection is already down.
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            warn!(
+                                revision = batch.revision,
+                                "events subscriber is not draining; closing the connection"
+                            );
+                            return;
+                        }
+                    };
+                    match gate.deliver(permit, &batch) {
+                        Delivery::Delivered => break,
+                        Delivery::NoticeSentRetryBatch => continue,
+                        Delivery::End => {
+                            debug!(
+                                revision = batch.revision,
+                                "unpushable workspace event; closing the events connection"
+                            );
+                            return;
+                        }
                     }
                 }
             }
@@ -386,7 +503,7 @@ mod tests {
     async fn the_fence_drops_its_own_revision_and_keeps_the_next() {
         let (events, rx) = tokio::sync::broadcast::channel(16);
         let (tx, mut source) = mpsc::channel(8);
-        let task = tokio::spawn(relay(rx, tx, 7, TEST_LIMITS));
+        let task = tokio::spawn(relay(rx, tx, 7, TEST_LIMITS, Arc::new(FullFeed)));
 
         // Below, at, and above the fence, in one go: only the last two
         // may be delivered, and they must arrive in order.
@@ -410,7 +527,7 @@ mod tests {
     async fn a_dropped_receiver_ends_the_relay_without_a_commit() {
         let (events, rx) = tokio::sync::broadcast::channel(16);
         let (tx, source) = mpsc::channel(8);
-        let task = tokio::spawn(relay(rx, tx, 0, TEST_LIMITS));
+        let task = tokio::spawn(relay(rx, tx, 0, TEST_LIMITS, Arc::new(FullFeed)));
 
         drop(source);
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -421,5 +538,72 @@ mod tests {
         // Nothing was ever committed, and the broadcast is still open —
         // the wake came from the disconnect alone.
         assert_eq!(events.receiver_count(), 0);
+    }
+
+    /// The observer projection: every workspace fact survives and the
+    /// effect does not.
+    #[test]
+    fn an_observer_loses_the_effect_and_keeps_the_revision() {
+        let commit = VersionedWorkspaceEvent {
+            revision: 12,
+            events: vec![
+                WorkspaceEvent::TabEffect {
+                    tab_id: 5,
+                    effect: TabEffectKind::Bell,
+                },
+                WorkspaceEvent::NotificationFired {
+                    tab_id: 5,
+                    title: "t".into(),
+                    body: "b".into(),
+                },
+            ],
+        };
+
+        let driver: EventBatch =
+            serde_json::from_value(batch_value(&commit, true).expect("a wire form")).unwrap();
+        assert_eq!(
+            driver
+                .events
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                roost_ipc::messages::ops::EVENT_TAB_EFFECT,
+                roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED,
+            ]
+        );
+
+        let observer: EventBatch =
+            serde_json::from_value(batch_value(&commit, false).expect("a wire form")).unwrap();
+        assert_eq!(observer.revision, 12);
+        assert_eq!(
+            observer
+                .events
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            vec![roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED],
+            "notification.fired crosses to observers; only tab.effect is driver-only"
+        );
+    }
+
+    /// A commit whose only event was filtered is still a batch — see
+    /// [`batch_value`] for why the alternative reads as loss.
+    #[test]
+    fn a_wholly_filtered_commit_ships_as_an_empty_batch() {
+        let commit = VersionedWorkspaceEvent {
+            revision: 3,
+            events: vec![WorkspaceEvent::TabEffect {
+                tab_id: 1,
+                effect: TabEffectKind::ClipboardWrite {
+                    text: "secret".into(),
+                    target: roost_ipc::messages::ClipboardEffectTarget::System,
+                },
+            }],
+        };
+        let observer: EventBatch =
+            serde_json::from_value(batch_value(&commit, false).expect("a wire form")).unwrap();
+        assert_eq!(observer.revision, 3);
+        assert!(observer.events.is_empty());
     }
 }

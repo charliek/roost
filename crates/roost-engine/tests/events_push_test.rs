@@ -22,7 +22,8 @@ use roost_ipc::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use roost_ipc::framing::{write_frame, FrameReader};
 use roost_ipc::messages::{
     ops, EventBatch, EventsSubscribeResult, Project, Response, SessionConnectResult,
-    SessionStopResult, Tab, TabListResult, TabState, SESSION_STOPPING_EVENT,
+    SessionStopResult, Tab, TabListResult, TabState, SESSION_DRIVER_CHANGED_EVENT,
+    SESSION_STOPPING_EVENT,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -99,12 +100,27 @@ impl Harness {
     /// survives the connection that took it, so the second caller in a
     /// test would otherwise get `already-connected`.
     async fn lease(&self) -> String {
+        self.lease_as(None).await
+    }
+
+    /// The same, with the claimant naming itself — what a deposed
+    /// stream is told in `session.driver_changed`.
+    async fn lease_as(&self, label: Option<&str>) -> String {
         let mut client = IpcClient::connect(&self.socket).await.expect("connect");
+        let mut params = serde_json::json!({"takeover": true});
+        if let Some(label) = label {
+            params["client_label"] = serde_json::json!(label);
+        }
         let result: SessionConnectResult = client
-            .call(ops::SESSION_CONNECT, serde_json::json!({"takeover": true}))
+            .call(ops::SESSION_CONNECT, params)
             .await
             .expect("session.connect");
         result.lease
+    }
+
+    /// Subscribe with no lease at all: an observer stream.
+    async fn watch(&self) -> (Reader, Writer, u64) {
+        self.subscribe_with("").await
     }
 
     /// Dial, subscribe, and return the connection plus the acked fence.
@@ -342,13 +358,15 @@ async fn a_subscriber_that_stops_draining_is_closed_and_can_heal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_relay_gives_up_on_a_source_nobody_polls() {
     let workspace = Arc::new(Workspace::new());
-    let (_revision, mut source, _abort) = event_push::spawn(
+    let mut subscription = event_push::spawn(
         &workspace,
         PushLimits {
             capacity: 1,
             stall: Duration::from_millis(100),
         },
+        Arc::new(event_push::FullFeed),
     );
+    let source = &mut subscription.source;
     for i in 0..8 {
         workspace.create_project(&format!("p{i}"), "/tmp").unwrap();
     }
@@ -483,23 +501,98 @@ async fn session_stop_labels_and_closes_a_live_push_connection() {
     );
 }
 
-/// A takeover closes the previous holder's stream, labeled with the
-/// reason that distinguishes it from a shutdown: a taken-over client must
-/// not reconnect the way a client whose session stopped would.
+/// A takeover **demotes** the previous holder's stream rather than
+/// closing it (plan 049 §3.8): one non-terminal `session.driver_changed`
+/// naming the claimant, and the stream keeps delivering after it.
+///
+/// This is the wire-visible half of the inversion. A client that lost
+/// its stream here would go blind about a session it is still showing —
+/// which is exactly what the frozen-frame banner exists to avoid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_labels_and_closes_the_previous_holders_stream() {
+async fn a_takeover_tells_the_previous_holders_stream_and_keeps_it_open() {
     let h = harness(true, None).await;
-    let (mut reader, _w, _fence) = h.subscribe().await;
+    let (mut reader, _w, fence) = h.subscribe().await;
 
     // A second client takes the lease. Its own connection is untouched;
-    // the first holder's is cut.
-    let _second = h.lease().await;
+    // the first holder's control connection is cut, its stream is not.
+    let _second = h.lease_as(Some("a phone")).await;
 
-    let (last, tail) = read_to_close(&mut reader).await;
-    let last = last.expect("a taken-over stream must be labeled");
-    assert_eq!(last["event"], SESSION_STOPPING_EVENT, "last frame: {last}");
-    assert_eq!(last["data"]["reason"], "taken-over");
-    assert!(tail, "the envelope must be the last frame before the close");
+    let envelope = read_frame(&mut reader).await;
+    assert_eq!(
+        envelope["event"], SESSION_DRIVER_CHANGED_EVENT,
+        "frame: {envelope}"
+    );
+    assert_eq!(envelope["data"]["taken_by"], "a phone");
+    assert!(
+        envelope.get("revision").is_none(),
+        "the control envelope is not a batch and carries no revision: {envelope}"
+    );
+
+    // Still delivering, and still contiguous: the demotion is not a gap.
+    h.workspace.create_project("after", "/tmp").unwrap();
+    let batch = read_batch(&mut reader).await;
+    assert_eq!(batch.revision, fence + 1);
+    assert_eq!(names(&batch), vec![ops::EVENT_PROJECT_CREATED]);
+}
+
+/// Three concurrent streams, one commit, three deliveries. The registry
+/// keeps one record per stream and the relay is per-subscription, so
+/// "the second subscriber gets a partial feed" has to be a test rather
+/// than an assumption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_concurrent_streams_are_each_delivered_in_full() {
+    let h = harness(true, None).await;
+    let lease = h.lease().await;
+    let (mut driver, _dw, driver_fence) = h.subscribe_with(&lease).await;
+    let (mut first, _fw, first_fence) = h.watch().await;
+    let (mut second, _sw, second_fence) = h.watch().await;
+
+    for name in ["one", "two", "three"] {
+        h.workspace.create_project(name, "/tmp").unwrap();
+    }
+
+    for (reader, fence) in [
+        (&mut driver, driver_fence),
+        (&mut first, first_fence),
+        (&mut second, second_fence),
+    ] {
+        for step in 1..=3 {
+            let batch = read_batch(reader).await;
+            assert_eq!(batch.revision, fence + step, "a stream skipped a revision");
+            assert_eq!(names(&batch), vec![ops::EVENT_PROJECT_CREATED]);
+        }
+    }
+}
+
+/// `notification.fired` is not an effect. It is transient like one, but
+/// routing notifications is the point of watching a session at all, so
+/// it crosses to observers (plan 049 §3.7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_reaches_an_observer() {
+    let h = harness(true, None).await;
+    let project = h.workspace.create_project("p", "/tmp").unwrap();
+    let tab = h.workspace.open_tab(project.id, "/tmp", "t").unwrap();
+    // A second tab takes the selection: a focused, *active* tab
+    // suppresses its own notification, which would make this pass or
+    // fail on which tab happened to be selected rather than on routing.
+    h.workspace.open_tab(project.id, "/tmp", "other").unwrap();
+    let (mut watcher, _ww, _fence) = h.watch().await;
+
+    assert!(h
+        .workspace
+        .raise_attention(
+            tab.id,
+            "title",
+            "body",
+            roost_engine::AttentionSource::Structured,
+        )
+        .expect("the tab exists"));
+    let batch = read_batch(&mut watcher).await;
+    assert!(
+        names(&batch).contains(&ops::EVENT_NOTIFICATION_FIRED),
+        "an observer must be told: {:?}",
+        names(&batch)
+    );
 }
 
 /// Read to EOF and report the last frame seen plus whether the close

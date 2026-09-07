@@ -651,15 +651,22 @@ def test_events_push_reaches_a_python_subscriber(env):
     started(env)
 
     with env.client() as client:
-        # The stream is lease-gated: a client that never connected is
-        # told which step it skipped rather than handed a stream.
+        # Reading a session is not authority (plan 049 §3.7): a client
+        # that never connected gets an *observer* stream rather than a
+        # refusal, and it is a real stream — acked with a fence, and
+        # delivering the session's commits.
         with EventStream(env.socket) as leaseless:
-            with pytest.raises(RoostError) as refused:
-                leaseless.subscribe()
-            assert refused.value.code == "connect-required"
-            assert "session.connect" in refused.value.message
+            observer_fence = leaseless.subscribe()
+            assert observer_fence > 0
 
-        lease = client.call("session.connect", {"takeover": False})["lease"]
+            lease = client.call("session.connect", {"takeover": False})["lease"]
+            snapshot = client.call("tab.list")
+            project = int(snapshot["projects"][0]["id"])
+            watched = client.open_tab(project, cwd=str(env.launch_cwd), title="watched")
+            batches, envelope = leaseless.recv_until("tab.opened", timeout=20.0)
+            leaseless.expect_contiguous(batches, observer_fence)
+            assert int(envelope["data"]["tab"]["id"]) == watched
+
         # Bind the length before asserting so a failure dump prints the
         # number, never the bearer token itself.
         lease_len = len(lease)

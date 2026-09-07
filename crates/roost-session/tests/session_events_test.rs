@@ -53,32 +53,6 @@ async fn subscribe(socket_path: &Path, lease: &str) -> (Reader, Writer, u64) {
     (reader, w, ack.revision)
 }
 
-/// The refusal a subscribe gets, on a connection that is then dropped.
-/// Separate from [`subscribe`] because a refused subscribe never flips
-/// the connection — there is no stream to hand back.
-async fn subscribe_error(socket_path: &Path, lease: &str) -> roost_ipc::messages::ResponseError {
-    let stream = UnixStream::connect(socket_path)
-        .await
-        .expect("dial the session socket");
-    let (r, mut w) = stream.into_split();
-    let mut reader = FrameReader::new(r);
-    let body = serde_json::to_vec(&serde_json::json!({
-        "id": "1",
-        "op": ops::EVENTS_SUBSCRIBE,
-        "params": {"lease": lease},
-    }))
-    .unwrap();
-    write_frame(&mut w, &body).await.expect("write subscribe");
-    let line = tokio::time::timeout(support::scaled(Duration::from_secs(10)), reader.read_line())
-        .await
-        .expect("the reply must arrive")
-        .expect("read")
-        .expect("expected a reply frame");
-    let response: Response = serde_json::from_slice(&line).expect("response envelope");
-    assert!(!response.ok, "subscribe must not succeed: {response:?}");
-    response.error.expect("an error body")
-}
-
 async fn next_batch(reader: &mut Reader) -> EventBatch {
     let line = tokio::time::timeout(support::scaled(Duration::from_secs(10)), reader.read_line())
         .await
@@ -99,10 +73,10 @@ async fn a_session_pushes_its_commits_and_cuts_the_stream_on_stop() {
     let seeded = support::tabs(&mut client).await;
     let project_id = seeded[0].project_id;
 
-    // Lease first: the stream is interactive authority, and the daemon
-    // refuses to hand it out to a client that never connected.
-    let leaseless = subscribe_error(&socket_path, "").await;
-    assert_eq!(leaseless.code, "connect-required", "{leaseless:?}");
+    // No lease needed: reading a session is not authority (plan 049
+    // §3.7), so a client that never connected still gets a stream — an
+    // observer one, which for a workspace commit is the same feed.
+    let (mut watching, _watch_w, watch_fence) = subscribe(&socket_path, "").await;
     let lease = support::session_connect(&mut client).await.lease;
 
     let (mut reader, _w, fence) = subscribe(&socket_path, &lease).await;
@@ -136,6 +110,26 @@ async fn a_session_pushes_its_commits_and_cuts_the_stream_on_stop() {
     };
     assert_eq!(opened.data["tab"]["id"], tab.id.to_string());
     assert_eq!(opened.data["tab"]["title"], "watched");
+
+    // The leaseless stream saw the same open, on the same contiguous
+    // sequence — the daemon serves an observer, it does not merely
+    // tolerate one.
+    let mut expected_watch = watch_fence + 1;
+    loop {
+        let batch = next_batch(&mut watching).await;
+        assert_eq!(
+            batch.revision, expected_watch,
+            "the observer's revision stream has a gap"
+        );
+        expected_watch += 1;
+        if batch
+            .events
+            .iter()
+            .any(|e| e.event == ops::EVENT_TAB_OPENED)
+        {
+            break;
+        }
+    }
 
     // The fence a client would snapshot at is the same counter.
     let list = support::tab_list(&mut client).await;

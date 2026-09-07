@@ -193,6 +193,22 @@ recognize, and picks from the intersection with its own. Nothing about
 that logic mentions a version number, which is why adding a payload kind
 costs nothing.
 
+**`session.identify.features` is the same pattern applied to *ops*.**
+An open string list, decode-when-absent like `payload_kinds`, naming the
+additive session ops this build serves — seeded with `"put_file"` (plan
+049, R1). It exists because the alternative, bumping
+`SESSION_PROTOCOL_VERSION` for every additive op, conflates two
+different questions: "can this peer speak my generation of the wire at
+all" (the exact gate above) and "does this peer happen to also support
+one more optional op" (a capability). Before `features`,
+`session.put_file` had only the generation gate to answer the second
+question with, which is what set the now-superseded exception described
+under [Version bumps](#version-bumps) below. A client checks
+`features` the same way it checks `payload_kinds`: read the list, look
+for the name it cares about, degrade gracefully if it's missing. What a
+whole generation bump covers is never listed in `features` — a client
+already knows its own `session_protocol`.
+
 **Absence of a mandatory capability is a legitimate refusal.** Capability
 detection governs optional features; it does not mean every negotiation
 is soft. A client that can only render `ghostty-snapshot` and finds no
@@ -237,15 +253,37 @@ quoted in `ipc.md`, and the versioned fixtures below.
 
 Additive changes — new optional fields that satisfy all four directions
 of the matrix, new ops, new events, new values in an open list — do not
-bump anything, with one deliberate exception: **an additive op bumps the
-session integer when a pre-bump peer could not refuse it meaningfully.**
-Plan 047's `session.put_file` is the case that set the rule (documented
-on `SESSION_PROTOCOL_VERSION` and in [ipc.md's
+bump anything, with one deliberate exception, now **re-qualified twice**
+since it was first written:
+
+**An additive *session-socket* op bumps the session integer when a
+pre-bump peer could not refuse it meaningfully — and only as a
+fallback, now that `features` exists.** Two qualifiers, both learned
+after the fact. First, *session-socket only*: a UI-socket op like
+`tab.send_file` correctly does not move `PROTOCOL_VERSION` — that wire
+has no handshake gate for a bump to protect, so the exception never
+applied there in the first place; `tab.send_file` shipped as a pure
+addition, no bump, exactly as the matrix predicts. Second, *fallback,
+not first resort*: [`session.identify.features`](#capability-negotiation-over-version-sniffing)
+(plan 049, R1) is now the preferred channel for "this build also does
+one more optional thing" — a client feature-detects an entry instead of
+a whole generation being spent on one op.
+
+Plan 047's `session.put_file` is the case that set the rule in the
+first place (documented on `SESSION_PROTOCOL_VERSION` and in [ipc.md's
 `session.identify`](ipc.md#sessionidentify)): a pre-047 session can only
 answer `unknown-op` to a file the user just pasted, which is not a
 refusal a client can act on per paste, so `2` → `3` moved rather than
-carrying a per-paste special case forever. A new *event* a client can
-ignore, or a lease-gated op a client never sends, stays additive.
+carrying a per-paste special case forever. **That bump stands as
+history** — `features` did not exist yet, so it was the only channel
+available at the time, and nothing about the re-qualification unwinds
+it. Plan 049 (R1) itself bumped `3` → `4`, but not under this exception:
+R1's leaseless-classified `events.subscribe` and lease-gated
+`tab.write` are genuinely breaking in both directions (an old peer's
+request is refused or misunderstood, not merely a feature it lacks),
+which is the ordinary rule above, not the additive-op fallback. A new
+*event* a client can ignore, or a lease-gated op a client never sends,
+stays additive.
 
 ## Fixtures are the contract
 

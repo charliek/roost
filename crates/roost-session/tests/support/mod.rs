@@ -217,7 +217,10 @@ pub async fn session_connect(client: &mut IpcClient) -> SessionConnectResult {
     client
         .call(
             ops::SESSION_CONNECT,
-            SessionConnectParams { takeover: true },
+            SessionConnectParams {
+                takeover: true,
+                client_label: None,
+            },
         )
         .await
         .expect("session.connect")

@@ -238,7 +238,7 @@ actor IPCHandlerImpl: IPCHandler {
     @MainActor
     private func tabWrite(params: AnyCodable?) async throws {
         let p = try decodeParams(
-            params, as: IPCTabWriteParams.self, expected: ["tab_id", "data"]
+            params, as: IPCTabWriteParams.self, expected: ["tab_id", "data", "lease"]
         )
         do {
             _ = try client.writeTab(p.tabID, data: p.data)
@@ -1299,12 +1299,19 @@ private struct IPCTabListResult: Codable {
 private struct IPCTabWriteParams: Codable {
     let tabID: Int64
     let data: Data
+    /// The driver lease, on a session socket. Accepted and ignored
+    /// here: this socket mints no leases and gates nothing on one, and
+    /// refusing the key would leave a single `roostctl` build unable to
+    /// talk to both socket families.
+    let lease: String?
     enum CodingKeys: String, CodingKey {
         case tabID = "tab_id"
         case data
+        case lease
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.lease = try c.decodeIfPresent(String.self, forKey: .lease)
         let raw = try c.decode(String.self, forKey: .tabID)
         guard let v = Int64(raw) else {
             throw DecodingError.dataCorruptedError(
@@ -1324,6 +1331,7 @@ private struct IPCTabWriteParams: Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(String(tabID), forKey: .tabID)
         try c.encode(data.base64EncodedString(), forKey: .data)
+        try c.encodeIfPresent(lease, forKey: .lease)
     }
 }
 
