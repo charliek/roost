@@ -97,6 +97,7 @@ from test_host_client import (
     HostUnderTest,
     first_project,
     host_row_ids,
+    in_the_jail,
     marker,
     quiet_tab,
     start_session,
@@ -576,6 +577,27 @@ def connect_and_wait(host: HostUnderTest, timeout: float = 60.0) -> None:
     host.wait_connected(timeout)
 
 
+def attached_tab(host: HostUnderTest, roost: Roost, label: str) -> str:
+    """Connect, open a quiet tab on the far side, and hand back its
+    client-side key once the client's own terminal has rendered a marker
+    written into it.
+
+    The marker round-trip is what makes the key usable, not decoration:
+    `tab.focus` answers as soon as the attach is *asked for*, and the
+    tab's own data connection — its own `ssh` exec — is dialed after
+    that. A case that samples the invocation log before those bytes have
+    crossed counts the attach's connection as its own.
+    """
+    connect_and_wait(host)
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        key = host_key(roost, tab)
+        line = marker(label)
+        session.tab_feed_pty_bytes(tab, f"{line}\r\n".encode())
+        wait_dump_contains(roost, key, line)
+    return key
+
+
 def wait_for_a_settled_reason(
     host: HostUnderTest, after: int, timeout: float = 90.0
 ) -> dict:
@@ -723,16 +745,64 @@ def test_an_ssh_host_connects_and_renders_its_session(ssh_host, roost):
     one exec per connection — rather than reaching the session some other
     way.
     """
-    connect_and_wait(ssh_host)
+    attached_tab(ssh_host, roost, "OVER-SSH")
     assert count(is_establish) >= 1, invocations()
     assert count(is_exec) >= 1, invocations()
 
-    with ssh_host.client() as session:
-        tab = quiet_tab(session, first_project(session), ssh_host.env.launch_cwd)
-        key = host_key(roost, tab)
-        line = marker("OVER-SSH")
-        session.tab_feed_pty_bytes(tab, f"{line}\r\n".encode())
-        wait_dump_contains(roost, key, line)
+
+# ---------------------------------------------------------------------------
+# Plan 047 §3.3: an upload rides its own connection, not the control leg
+# ---------------------------------------------------------------------------
+
+
+def test_a_send_file_opens_one_extra_bridge_connection_and_moves_no_generation(
+    ssh_host, roost, tmp_path
+):
+    """W3's e2e half, read off the transport instead of the clock.
+
+    An upload takes a connection of its own — that is the whole design:
+    the control loop awaits each call inline, so a `session.put_file` on
+    it would block every other op for the length of the transfer (§3.3).
+    Over ssh each connection is a separate `ssh` exec, which makes the
+    invocation log the one place that claim is directly observable: one
+    more exec, exactly, for one upload. Two would mean a retry nobody
+    asked for; zero would mean the bytes went down the control leg after
+    all.
+
+    `generation` is the other half. It counts *connection attempts*
+    (`host.status`), so an unchanged one says the upload neither dropped
+    the host nor reconnected it — the failure plan 046 was about, reached
+    here by a new door.
+
+    The marker round-trip [`attached_tab`] does before the count is not
+    decoration — see its own note; sampling the log before the tab's data
+    connection has been dialed counts the attach's connection as the
+    upload's, which is how this case first read `2`.
+
+    Placed second, beside the happy path, and not with the later
+    failure-mode cases: this module shares one session across its cases
+    and saves a fresh host per case, so by the end of it a connect is
+    landing against an accumulated registry and a session several tabs
+    deep, and this case's preamble — a tab opened *after* the connect,
+    waited for through the client's mirror — times out there. Nothing
+    about the upload needs that depth; the ladder cases below own it.
+    """
+    key = attached_tab(ssh_host, roost, "SSH-SEND-FILE")
+
+    source = tmp_path / "over-ssh.txt"
+    source.write_text("plan 047 over a real SshTunnel\n")
+
+    execs_before = count(is_exec)
+    generation_before = status(ssh_host)["generation"]
+
+    result = roost.tab_send_file(key, [source])
+    assert result["skipped"] == [], result
+    assert result["uploads"][0]["path"] == result["pasted"], result
+    landed = in_the_jail(ssh_host, result["pasted"])
+    assert landed.read_bytes() == source.read_bytes(), result
+
+    assert count(is_exec) - execs_before == 1, invocations()
+    assert status(ssh_host)["generation"] == generation_before, status(ssh_host)
 
 
 # ---------------------------------------------------------------------------

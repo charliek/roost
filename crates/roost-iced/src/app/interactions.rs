@@ -2306,7 +2306,6 @@ enum ClipboardReadCompletion {
     },
 }
 
-#[derive(Debug)]
 enum ClipboardEffect {
     Read {
         request_id: u64,
@@ -2317,12 +2316,20 @@ enum ClipboardEffect {
         target: ClipboardOp,
         text: String,
     },
+    /// The test seam's image write (plan 047 §3.5).
+    WriteImage {
+        request_id: u64,
+        png: Vec<u8>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    },
 }
 
 impl ClipboardEffect {
     fn request_id(&self) -> u64 {
         match self {
-            Self::Read { request_id, .. } | Self::Write { request_id, .. } => *request_id,
+            Self::Read { request_id, .. }
+            | Self::Write { request_id, .. }
+            | Self::WriteImage { request_id, .. } => *request_id,
         }
     }
 
@@ -2337,6 +2344,15 @@ impl ClipboardEffect {
                 request_id,
                 target,
                 text,
+            },
+            Self::WriteImage {
+                request_id,
+                png,
+                reply,
+            } => UiTask::ClipboardWriteImage {
+                request_id,
+                png,
+                reply,
             },
         }
     }
@@ -2396,6 +2412,20 @@ impl ClipboardQueue {
             request_id,
             target,
             text,
+        });
+        request_id
+    }
+
+    pub(super) fn enqueue_write_image(
+        &mut self,
+        png: Vec<u8>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    ) -> u64 {
+        let request_id = self.allocate_request_id();
+        self.queued.push_back(ClipboardEffect::WriteImage {
+            request_id,
+            png,
+            reply,
         });
         request_id
     }
@@ -4917,6 +4947,42 @@ mod tests {
                 .expect("active read completion"),
         );
         assert_eq!(result.try_recv().unwrap().unwrap().as_deref(), Some("B"));
+    }
+
+    /// Plan 047 §3.5's ordering rule, which is the whole reason the
+    /// image write joins this queue instead of being spawned beside it.
+    #[test]
+    fn a_paste_read_behind_an_image_write_waits_for_the_clipboard() {
+        let mut queue = ClipboardQueue::default();
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        let write_id = queue.enqueue_write_image(vec![0x89, b'P', b'N', b'G'], reply);
+        // Held for the rest of the case rather than matched on a
+        // temporary: the task owns the reply sender, and dropping it is
+        // what closes the caller's channel.
+        let started = queue.start_next();
+        let UiTask::ClipboardWriteImage {
+            request_id, png, ..
+        } = &started
+        else {
+            panic!("the image write must be the first effect started");
+        };
+        assert_eq!(*request_id, write_id);
+        assert_eq!(png.as_slice(), b"\x89PNG");
+
+        let read_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(7));
+        assert!(matches!(queue.start_next(), UiTask::None));
+        // The reply is the blocking pool's to send, so nothing has
+        // answered it while the write is still the active item.
+        assert!(matches!(
+            answered.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        assert!(queue.complete_write(write_id));
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead { request_id, .. } if request_id == read_id
+        ));
     }
 
     #[test]

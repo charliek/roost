@@ -891,6 +891,23 @@ impl UiTask for app::UiTask {
                 };
                 write.chain(Task::done(Message::ClipboardWriteCompleted(request_id)))
             }
+            // The reply is answered from inside the blocking closure
+            // rather than from the completion arm: `Task::perform`'s
+            // mapper is an `Fn`, so it cannot consume a oneshot sender,
+            // and this is the only place the platform's own verdict is
+            // in hand. A panic there drops the sender, which the
+            // dispatcher reports as `internal` — the queue still
+            // resumes below.
+            app::UiTask::ClipboardWriteImage {
+                request_id,
+                png,
+                reply,
+            } => Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    let _ = reply.send(paste_image::write_png(&png));
+                }),
+                move |_joined| Message::ClipboardWriteCompleted(request_id),
+            ),
             app::UiTask::OpenUrl { url } => {
                 Task::perform(url_launcher::open(url), Message::UrlOpenCompleted)
             }

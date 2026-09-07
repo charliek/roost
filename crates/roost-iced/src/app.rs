@@ -1501,6 +1501,16 @@ pub enum UiTask {
         target: ClipboardOp,
         text: String,
     },
+    /// `clipboard.write { image_png }`'s half of the queue (plan 047
+    /// §3.5). The decode and the platform write both block, so this
+    /// runs on the blocking pool — which is also where `reply` is
+    /// answered, since only there is it known whether the clipboard
+    /// really took the image.
+    ClipboardWriteImage {
+        request_id: u64,
+        png: Vec<u8>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    },
     OpenUrl {
         url: String,
     },

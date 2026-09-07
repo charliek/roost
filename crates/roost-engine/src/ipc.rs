@@ -307,6 +307,20 @@ pub enum UiRequest {
     },
     /// `clipboard.write` — test-only pasteboard seeding.
     ClipboardWrite { target: ClipboardOp, text: String },
+    /// `clipboard.write { image_png }` — the same seeding, with a real
+    /// image (plan 047 §3.5). Unlike its text sibling this one is
+    /// answered: the write can fail (no test mode, Wayland, a PNG that
+    /// will not decode, a display server that refuses the selection)
+    /// and a harness that pressed paste against a clipboard it only
+    /// believed it had seeded would blame the paste path instead.
+    ///
+    /// The reply lands when the platform clipboard can be read back,
+    /// not when the request was queued — the whole point of the seam is
+    /// that a paste issued right afterwards reads what this put there.
+    ClipboardWriteImage {
+        png: Vec<u8>,
+        reply: HostOpReply<()>,
+    },
     /// `tab.feed_pty_bytes` — inject bytes into a tab's PTY-output
     /// drain as if the supervisor had emitted them. The UI side
     /// rejects (`Err`) when `ROOST_TEST_MODE=1` was not set at
@@ -3368,8 +3382,22 @@ async fn dispatch(
                     "clipboard.write takes `text` or `image_png`, not both",
                 ));
             }
-            // This arm serves text; the image form lands with the
-            // clipboard test seam (plan 047 §3.5).
+            if let Some(png) = p.image_png {
+                // PRIMARY carries text by convention and the paste path
+                // never probes it for an image (`probe_wanted`), so a
+                // selection image write would seed a clipboard nothing
+                // reads. Refused here rather than in the UI so the
+                // headless dispatcher answers it too.
+                if target != ClipboardOp::System {
+                    return Err(HandlerError::new(
+                        "invalid-param",
+                        "clipboard.write `image_png` requires target \"system\"",
+                    ));
+                }
+                h.ui_call(|reply| UiRequest::ClipboardWriteImage { png, reply })
+                    .await??;
+                return Ok(serde_json::json!({}));
+            }
             let text = p.text.ok_or_else(|| {
                 HandlerError::new("missing-param", "clipboard.write requires `text`")
             })?;

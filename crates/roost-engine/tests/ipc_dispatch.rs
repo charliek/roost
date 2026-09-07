@@ -216,6 +216,12 @@ async fn tab_feed_ime_rejects_inverted_cursor_range() {
 /// Preferring one silently would drop the other, so the ambiguous
 /// request is refused outright; and a request carrying neither is a
 /// missing `text`, which is the field this arm serves.
+///
+/// The image form's two dispatcher-level judgements ride along: PRIMARY
+/// is refused before any UI sees it (the paste path never probes it for
+/// an image), and a well-formed system request takes the `ui_call`
+/// route rather than falling through to the text arm's `missing-param`
+/// — which headless, with no UI attached, is exactly `internal`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clipboard_write_refuses_both_text_and_an_image_and_demands_one() {
     let dir = tempdir().unwrap();
@@ -244,6 +250,14 @@ async fn clipboard_write_refuses_both_text_and_an_image_and_demands_one() {
             "invalid-param",
         ),
         (serde_json::json!({"target": "system"}), "missing-param"),
+        (
+            serde_json::json!({"target": "selection", "image_png": "aGVsbG8="}),
+            "invalid-param",
+        ),
+        (
+            serde_json::json!({"target": "system", "image_png": "aGVsbG8="}),
+            "internal",
+        ),
     ] {
         let err = client
             .call_raw(ops::CLIPBOARD_WRITE, params.clone())

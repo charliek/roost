@@ -465,6 +465,32 @@ class Roost:
     def clipboard_write(self, target: str, text: str) -> None:
         self.call("clipboard.write", {"target": target, "text": text})
 
+    def clipboard_write_image(self, png: bytes) -> None:
+        """Put a real PNG on the SYSTEM clipboard (plan 047 §3.5).
+
+        The seam the host image-paste lane needs: an IPC-only harness
+        has no other way to put an image where a paste will find it.
+        `text` and `image_png` are exclusive, and only `system` makes
+        sense for an image — PRIMARY carries text and the paste path
+        never probes it, so `selection` is `invalid-param`.
+
+        Returns once the image can be read back off the platform
+        clipboard, so a paste issued straight afterwards reads what this
+        put there.
+
+        Refusals, all `RoostError`: `not-supported` when the UI was
+        launched without ROOST_TEST_MODE=1, or when the display server
+        refused the write and it is a Wayland session (a compositor with
+        no data-control clipboard to offer, issue #302) — a lane's cue
+        to skip; `invalid-param` for bytes that do not decode as an
+        8-bit RGBA-reducible PNG or that exceed the 40 MP pixel cap.
+        iced only — the Mac handler has no name for the field and
+        answers `unknown-field`."""
+        self.call("clipboard.write", {
+            "target": "system",
+            "image_png": base64.b64encode(png).decode("ascii"),
+        })
+
     # -- files into a tab (plan 047 §3.4) ---------------------------------
     def tab_send_file(self, tab: str | int, paths) -> dict:
         """Send local files to a tab — the drop route, as an op.

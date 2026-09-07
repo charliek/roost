@@ -759,6 +759,23 @@ fn macos_test_gated<T>(
     }
 }
 
+/// Why `clipboard.write { image_png }` will not run here, or `None`
+/// when it will (plan 047 §3.5).
+///
+/// `not-supported` rather than `not-enabled`: the image form is a seam
+/// a lane either has or does not, and a lane's answer is the same skip
+/// either way. What the *display server* will not do is not predicted
+/// here — that answer comes from attempting the write
+/// ([`paste_image::write_png`]).
+fn image_write_refusal(test_mode: bool) -> Option<HostOpFailure> {
+    (!test_mode).then(|| {
+        HostOpFailure::new(
+            "not-supported",
+            "clipboard.write `image_png` requires ROOST_TEST_MODE=1 at UI launch",
+        )
+    })
+}
+
 /// `app.keybind_dispatch`'s namespace restriction. The op exists solely
 /// so `ROOST_TEST_MODE=1` can drive the paste accelerator — nothing else
 /// in that table has another IPC seam — so `"paste"` is the only name it
@@ -2689,6 +2706,14 @@ impl App {
                 self.clipboard.enqueue_write(target, text);
                 task = task.then(self.clipboard.start_next());
             }
+            UiRequest::ClipboardWriteImage { png, reply } => {
+                if let Some(failure) = image_write_refusal(self.test_mode) {
+                    let _ = reply.send(Err(failure));
+                } else {
+                    self.clipboard.enqueue_write_image(png, reply);
+                    task = task.then(self.clipboard.start_next());
+                }
+            }
             UiRequest::TabExpandSelectionAt {
                 tab_id,
                 col,
@@ -3116,6 +3141,17 @@ mod tests {
 
     use super::file_transfer::LostReason;
     use super::*;
+
+    /// The image seam's one gate: the env it was launched with, and
+    /// nothing about the box it is running on — see
+    /// [`image_write_refusal`] for why that is the whole policy.
+    #[test]
+    fn an_image_clipboard_write_outside_test_mode_is_not_supported() {
+        let refusal = image_write_refusal(false).expect("no test mode, no seam");
+        assert_eq!(refusal.code, "not-supported");
+        assert!(refusal.message.contains("ROOST_TEST_MODE"), "{refusal:?}");
+        assert_eq!(image_write_refusal(true), None);
+    }
 
     /// Every `HostOpError` a host-routed op can fail with, and the code
     /// plus message it puts on the UI socket (plan 044 §3.1 d6).
