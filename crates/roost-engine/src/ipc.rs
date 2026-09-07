@@ -605,7 +605,9 @@ pub enum ClipboardOp {
 
 use crate::event_push::{self, PushLimits};
 use crate::persistence::HostSnapshot;
-use crate::{AttentionSource, PtyError, PtySupervisor, Workspace, WorkspaceError};
+use crate::{
+    AttentionSource, PtyError, PtySupervisor, ResumeCut, ResumeError, Workspace, WorkspaceError,
+};
 
 /// How long `session.stop` lets a hung-up child live before it escalates
 /// to SIGKILL. Long enough for a shell to run its exit traps and for an
@@ -3132,6 +3134,65 @@ impl event_push::StreamGate for LeaseGate {
     }
 }
 
+/// Where this subscription starts: the current revision, or the replay
+/// a `from_revision` asked for.
+///
+/// Every refusal is named rather than folded onto `invalid-param`,
+/// because each one asks the client for something different: re-fence
+/// (`session-mismatch`), snapshot (`replay-expired`), or fix a bug
+/// (`revision-ahead`).
+fn resume_cut(
+    h: &IpcHandler,
+    session: &Arc<SessionState>,
+    params: &EventsSubscribeParams,
+) -> Result<ResumeCut, HandlerError> {
+    if let Some(named) = &params.session_id {
+        if *named != session.info.session_id {
+            return Err(HandlerError::new(
+                "session-mismatch",
+                format!(
+                    "this is session {}, not {named}: revisions restart with the process, so a \
+                     fence from another incarnation cannot be resumed; snapshot with tab.list and \
+                     subscribe afresh",
+                    session.info.session_id
+                ),
+            ));
+        }
+    }
+    let Some(from_revision) = params.from_revision else {
+        return Ok(h.workspace.subscribe_live());
+    };
+    if params.session_id.is_none() {
+        return Err(HandlerError::invalid_param(
+            "a resume names the session it fenced against: from_revision requires session_id, \
+             which session.identify reports",
+        ));
+    }
+    h.workspace
+        .subscribe_from(from_revision)
+        .map_err(|err| match err {
+            ResumeError::Ahead { current } => HandlerError::new(
+                "revision-ahead",
+                format!(
+                    "this session never produced revision {from_revision} (current: {current}): a \
+                 different incarnation, or a client bug; compare session.identify.session_id, \
+                 then snapshot"
+                ),
+            ),
+            ResumeError::Expired {
+                oldest_resumable_from,
+                current,
+            } => HandlerError::new(
+                "replay-expired",
+                format!(
+                    "revision {from_revision} is outside the replay window (oldest resumable: \
+                 {oldest_resumable_from}, current: {current}); snapshot with tab.list and \
+                 subscribe afresh"
+                ),
+            ),
+        })
+}
+
 /// `events.subscribe` on a session socket: ack with the fence, then push.
 ///
 /// **Leaseless, and lease-classified** (plan 049 §3.7). Reading a session
@@ -3143,6 +3204,11 @@ impl event_push::StreamGate for LeaseGate {
 /// * absent, stale, or unknown → an observer stream: every workspace
 ///   batch plus `notification.fired`, with `tab.effect` filtered and its
 ///   revision still delivered as an empty batch.
+///
+/// Classification is the ordinary one on a resume too, for replayed and
+/// live batches alike: a driver taken over during its gap comes back an
+/// observer, and since effects are never replayed, a replay cannot put a
+/// `tab.effect` after the `session.driver_changed` it missed.
 ///
 /// Not a mutating op — it changes no workspace state — but it does
 /// establish a resource, so it is refused once the session has latched:
@@ -3162,12 +3228,17 @@ fn events_subscribe(
             params.tab_id_filter
         )));
     }
+    // Everything a resume can be refused for is settled before anything
+    // is spawned or registered, so a refusal leaves the connection the
+    // request/response connection it was and the client can simply
+    // subscribe again on it.
+    let cut = resume_cut(h, session, params)?;
     let gate = Arc::new(LeaseGate {
         session: Arc::clone(session),
         presented: params.lease.clone(),
         conn_id: ctx.conn_id,
     });
-    let subscription = event_push::spawn(&h.workspace, h.push_limits, gate);
+    let subscription = event_push::spawn(cut, h.push_limits, gate);
     if !session.register_stream(
         &params.lease,
         ctx,

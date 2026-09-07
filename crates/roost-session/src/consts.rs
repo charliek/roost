@@ -29,6 +29,15 @@ pub use roost_ipc::session_launch::{timeout_scale, LAUNCH_CWD_ENV, MAX_VERDICT_B
 /// one-line fixture instead.
 pub const FAKE_BUILD_ENV: &str = "ROOST_SESSION_FAKE_BUILD";
 
+/// Batch count for the workspace replay ring, overriding
+/// `roost_engine::workspace::REPLAY_WINDOW`.
+///
+/// Read **only** when `ROOST_TEST_MODE=1`. The production window is 1024
+/// commits, and driving a stream past it from a test would mean a
+/// thousand round trips just to see `replay-expired`; a window of 4
+/// makes the outside-the-window case a handful of commits.
+pub const REPLAY_WINDOW_ENV: &str = "ROOST_SESSION_REPLAY_WINDOW";
+
 /// `umask` the daemon installs before it creates anything. Everything
 /// downstream — state dir, log dir, `state.json`, crash reports, the
 /// socket — inherits this posture rather than restating it.

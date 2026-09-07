@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use roost_engine::event_push::{self, PushLimits};
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
-use roost_engine::{PtySupervisor, Workspace, WorkspaceEvent};
+use roost_engine::{PtySupervisor, ReplayBounds, Workspace, WorkspaceEvent};
 use roost_ipc::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use roost_ipc::framing::{write_frame, FrameReader};
 use roost_ipc::messages::{
@@ -31,6 +31,13 @@ use tokio::net::UnixStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What the harness's session answers `session.identify` with, and what
+/// a resume therefore has to name.
+const SESSION_ID: &str = "01K3S8TQ4F0Q9YB2K6WZ5D7XN";
+
+/// Small enough that a test can commit past it — see [`harness`].
+const TEST_REPLAY_WINDOW: usize = 4;
+
 type Reader = FrameReader<tokio::net::unix::OwnedReadHalf>;
 type Writer = tokio::net::unix::OwnedWriteHalf;
 
@@ -42,10 +49,19 @@ struct Harness {
 
 /// Bind a server. `session` picks which socket kind this is; `limits`
 /// narrows the push bounds so the overflow branch is reachable.
+///
+/// The workspace retains a four-commit replay window, the way the daemon
+/// retains a thousand: `replay-expired` is then a handful of commits
+/// away rather than a thousand round trips.
 async fn harness(session: bool, limits: Option<PushLimits>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("roost.sock");
-    let workspace = Arc::new(Workspace::open(dir.path().join("state.json")));
+    let workspace = Arc::new(Workspace::open(dir.path().join("state.json")).with_replay(
+        ReplayBounds {
+            window: TEST_REPLAY_WINDOW,
+            budget_bytes: roost_engine::workspace::REPLAY_BUDGET_BYTES,
+        },
+    ));
     let supervisor = Arc::new(PtySupervisor::new());
     let mut handler = IpcHandler::new(
         Arc::clone(&workspace),
@@ -57,7 +73,7 @@ async fn harness(session: bool, limits: Option<PushLimits>) -> Harness {
     if session {
         handler = handler.with_session(
             SessionInfo {
-                session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
+                session_id: SESSION_ID.into(),
                 started_at: "2026-08-27T14:03:11Z".into(),
                 app_version: "9.9.9".into(),
                 payload_kinds: Vec::new(),
@@ -359,7 +375,7 @@ async fn a_subscriber_that_stops_draining_is_closed_and_can_heal() {
 async fn the_relay_gives_up_on_a_source_nobody_polls() {
     let workspace = Arc::new(Workspace::new());
     let mut subscription = event_push::spawn(
-        &workspace,
+        workspace.subscribe_live(),
         PushLimits {
             capacity: 1,
             stall: Duration::from_millis(100),
@@ -940,4 +956,187 @@ async fn the_ack_is_an_ordinary_response_envelope() {
     let result: EventsSubscribeResult =
         serde_json::from_value(response.result.expect("result")).expect("typed ack");
     assert_eq!(result.revision, h.workspace.revision());
+}
+
+// =====================================================================
+// Resuming from a fence (plan 052 §3.5)
+// =====================================================================
+
+/// One receiver per subscription, and it is the cut's own: the commit
+/// that lands between taking the cut and spawning the relay is already
+/// in that receiver, so it is delivered. A relay that opened a receiver
+/// of its own would have missed it — the hole `subscribe_from` exists to
+/// close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_between_the_cut_and_the_spawn_still_reaches_the_stream() {
+    let workspace = Arc::new(Workspace::new());
+    let cut = workspace.subscribe_live();
+    workspace.create_project("raced", "/tmp").unwrap();
+
+    let mut subscription =
+        event_push::spawn(cut, PushLimits::default(), Arc::new(event_push::FullFeed));
+    assert_eq!(
+        subscription.revision, 0,
+        "the cut was taken before the commit"
+    );
+
+    let value = tokio::time::timeout(TIMEOUT, subscription.source.next())
+        .await
+        .expect("the source must answer")
+        .expect("a frame");
+    let batch: EventBatch = serde_json::from_value(value).expect("typed batch");
+    assert_eq!(batch.revision, 1);
+}
+
+/// The whole feature end to end over a socket: a stream drops, commits
+/// land while nobody is listening, and the resumed stream carries the
+/// gap and then goes on live — one consecutive run, which is exactly
+/// what a client's gap check reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_replays_the_gap_and_then_goes_live() {
+    let h = harness(true, None).await;
+    let lease = h.lease().await;
+    let (reader, w, fence) = h.subscribe_with(&lease).await;
+    // The phone's link drops.
+    drop((reader, w));
+
+    h.workspace.create_project("gap-one", "/tmp").unwrap();
+    h.workspace.create_project("gap-two", "/tmp").unwrap();
+
+    let (mut reader, mut w) = h.dial().await;
+    request(
+        &mut w,
+        1,
+        ops::EVENTS_SUBSCRIBE,
+        serde_json::json!({"lease": lease, "from_revision": fence, "session_id": SESSION_ID}),
+    )
+    .await;
+    let ack = read_frame(&mut reader).await;
+    assert_eq!(ack["ok"], serde_json::json!(true), "ack: {ack}");
+    let result: EventsSubscribeResult =
+        serde_json::from_value(ack["result"].clone()).expect("typed ack");
+    assert_eq!(
+        result.revision, fence,
+        "a resume is acked with what the client already has"
+    );
+
+    for expected in [fence + 1, fence + 2] {
+        let batch = read_batch(&mut reader).await;
+        assert_eq!(batch.revision, expected);
+        assert_eq!(names(&batch), vec![ops::EVENT_PROJECT_CREATED]);
+    }
+
+    h.workspace.create_project("live", "/tmp").unwrap();
+    let batch = read_batch(&mut reader).await;
+    assert_eq!(
+        batch.revision,
+        fence + 3,
+        "the live half continues the replay with no gap and no repeat"
+    );
+}
+
+/// One refused resume, as an ordinary error response the connection
+/// carries on from.
+async fn refused_resume(
+    reader: &mut Reader,
+    w: &mut Writer,
+    id: i64,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    request(w, id, ops::EVENTS_SUBSCRIBE, params).await;
+    let reply = read_frame(reader).await;
+    assert_eq!(reply["ok"], serde_json::json!(false), "reply: {reply}");
+    assert_eq!(reply["id"], id.to_string(), "answered on the ack: {reply}");
+    reply
+}
+
+/// Every refusal is answered **on the ack**, before anything is spawned
+/// or registered — so the connection is still the request/response
+/// connection it was, and the client's fallback (a plain subscribe plus
+/// a `tab.list`) happens on that same one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_resume_is_answered_on_the_ack_and_the_connection_survives() {
+    let h = harness(true, None).await;
+    // Past the four-commit window, so a fence of 0 is out of it.
+    for i in 0..6 {
+        h.workspace
+            .create_project(&format!("p{i}"), "/tmp")
+            .unwrap();
+    }
+    let current = h.workspace.revision();
+    assert!(current > TEST_REPLAY_WINDOW as u64);
+
+    let (mut reader, mut w) = h.dial().await;
+
+    let mismatch = refused_resume(
+        &mut reader,
+        &mut w,
+        1,
+        serde_json::json!({"from_revision": current, "session_id": "01OTHERINCARNATION"}),
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], "session-mismatch");
+    assert!(
+        mismatch["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(SESSION_ID),
+        "the refusal names who did answer: {mismatch}"
+    );
+
+    let unnamed = refused_resume(
+        &mut reader,
+        &mut w,
+        2,
+        serde_json::json!({"from_revision": current}),
+    )
+    .await;
+    assert_eq!(unnamed["error"]["code"], "invalid-param");
+    assert!(
+        unnamed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session_id"),
+        "the refusal names the missing param: {unnamed}"
+    );
+
+    let ahead = refused_resume(
+        &mut reader,
+        &mut w,
+        3,
+        serde_json::json!({"from_revision": current + 1, "session_id": SESSION_ID}),
+    )
+    .await;
+    assert_eq!(ahead["error"]["code"], "revision-ahead");
+
+    let expired = refused_resume(
+        &mut reader,
+        &mut w,
+        4,
+        serde_json::json!({"from_revision": 0, "session_id": SESSION_ID}),
+    )
+    .await;
+    assert_eq!(expired["error"]["code"], "replay-expired");
+    let message = expired["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("oldest resumable") && message.contains(&current.to_string()),
+        "the refusal says how far back the session can catch a client up: {message}"
+    );
+
+    // The recovery, on the same connection: subscribe afresh.
+    request(
+        &mut w,
+        5,
+        ops::EVENTS_SUBSCRIBE,
+        serde_json::json!({"lease": ""}),
+    )
+    .await;
+    let ack = read_frame(&mut reader).await;
+    assert_eq!(ack["ok"], serde_json::json!(true), "ack: {ack}");
+    let result: EventsSubscribeResult =
+        serde_json::from_value(ack["result"].clone()).expect("typed ack");
+    assert_eq!(result.revision, current);
+
+    h.workspace.create_project("after", "/tmp").unwrap();
+    assert_eq!(read_batch(&mut reader).await.revision, current + 1);
 }

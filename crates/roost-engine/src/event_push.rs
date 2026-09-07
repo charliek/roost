@@ -14,8 +14,18 @@
 //! * **Close rather than lie.** Anything that would put a hole in the
 //!   stream — a lagged broadcast, a full queue, an internal
 //!   [`WorkspaceEvent::Resync`] that has no wire spelling — ends the
-//!   connection instead. The plain close *is* the resync signal: the
-//!   client reconnects, re-subscribes, and re-pulls `tab.list`.
+//!   connection instead. A close carries no message on this wire; what
+//!   the client does with it is dial back and resume from the fence it
+//!   reached, and the next `events.subscribe` is where the session says
+//!   how far back it can catch the client up — `replay-expired`, naming
+//!   the oldest revision it still holds, is the answer that means
+//!   "snapshot with `tab.list` instead".
+//!
+//! A replay drains into the same bounded queue while the live receiver
+//! is not being read, so a long enough drain can itself lag the live
+//! half and close the stream mid-replay. That is the rule working, not
+//! an edge: each resume advances the client's fence by whatever it did
+//! receive, so the retries converge.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +44,7 @@ use tokio::task::AbortHandle;
 use tracing::{debug, warn};
 
 use crate::workspace::TabEffectKind;
-use crate::{VersionedWorkspaceEvent, Workspace, WorkspaceEvent};
+use crate::{ResumeCut, VersionedWorkspaceEvent, WorkspaceEvent};
 
 /// What one subscription is allowed to see, asked at the instant a batch
 /// is enqueued.
@@ -342,7 +352,10 @@ pub fn batch_value(batch: &VersionedWorkspaceEvent, driver: bool) -> Option<serd
 /// Everything one [`spawn`]ed subscription hands back to its caller.
 pub struct Subscription {
     /// The revision the subscription starts from — the ack the client
-    /// is owed.
+    /// is owed, meaning "you already have everything up to this". On a
+    /// resume that is the `from_revision` the client presented, not the
+    /// cut's fence: the batches between the two are replayed, so the
+    /// first batch on the wire is `revision + 1` either way.
     pub revision: u64,
     /// What the server writes frames from.
     pub source: PushSource,
@@ -360,28 +373,29 @@ pub struct Subscription {
     pub inject: mpsc::WeakSender<serde_json::Value>,
 }
 
-/// Subscribe `workspace` and start relaying its commits through `gate`.
+/// Start relaying `cut`'s commits through `gate`.
 ///
-/// The ordering is the contract: the broadcast is subscribed **before**
-/// the revision is read, so no commit can slip through the gap. Commits
-/// that land in that window arrive on the channel *and* are already
-/// reflected in the revision, so the relay drops every batch at or below
-/// it — leaving the client's first batch exactly `revision + 1`.
+/// **Never subscribes a receiver of its own.** The one the workspace
+/// captured under its commit lock ([`crate::Workspace::subscribe_from`]) is the
+/// only one this subscription ever has, so there is exactly one receiver
+/// creation per subscription and no commit can fall between the ring
+/// copy and the receiver's existence — see [`ResumeCut`].
 ///
 /// The task ends (dropping its sender, which closes the connection) on
 /// any condition that would otherwise hide a loss: a lagged broadcast, a
 /// queue that stays full past [`PushLimits::stall`], a `Resync`, or a
 /// dropped receiver.
-pub fn spawn(
-    workspace: &Arc<Workspace>,
-    limits: PushLimits,
-    gate: Arc<dyn StreamGate>,
-) -> Subscription {
-    let rx = workspace.subscribe_versioned();
-    let revision = workspace.revision();
+pub fn spawn(cut: ResumeCut, limits: PushLimits, gate: Arc<dyn StreamGate>) -> Subscription {
+    // What the client already has. The ring is gapless, so a non-empty
+    // replay starts at exactly one past it; an empty replay means the
+    // client is already at the cut.
+    let revision = cut
+        .replay
+        .first()
+        .map_or(cut.fence, |batch| batch.revision.saturating_sub(1));
     let (tx, source_rx) = mpsc::channel(limits.capacity.max(1));
     let inject = tx.downgrade();
-    let task = tokio::spawn(relay(rx, tx, revision, limits, gate));
+    let task = tokio::spawn(relay(cut, tx, limits, gate));
     Subscription {
         revision,
         // The queue bound and the socket-write bound are the same
@@ -392,8 +406,9 @@ pub fn spawn(
     }
 }
 
-/// Relay `rx`'s batches into `tx`, dropping everything at or below
-/// `fence`, and return the moment the stream must end.
+/// Drain `cut`'s replay into `tx`, then relay its receiver's batches,
+/// dropping everything at or below the cut's fence, and return the
+/// moment the stream must end.
 ///
 /// Split out from [`spawn`] so the fence boundary and the teardown
 /// conditions can be driven with a hand-fed channel, without a
@@ -402,14 +417,29 @@ pub fn spawn(
 /// Capacity is reserved *before* `gate` is consulted, and the gate then
 /// classifies and enqueues in one step: waiting for room is the only
 /// part that can block, and it must not happen under the embedder's
-/// registry lock.
+/// registry lock. Replayed batches take that same path — they are
+/// already effect-free, so the gate's filter is a no-op on them, but a
+/// takeover notice parked on this stream must still come out ahead of
+/// them.
 async fn relay(
-    mut rx: tokio::sync::broadcast::Receiver<VersionedWorkspaceEvent>,
+    cut: ResumeCut,
     tx: mpsc::Sender<serde_json::Value>,
-    fence: u64,
     limits: PushLimits,
     gate: Arc<dyn StreamGate>,
 ) {
+    let ResumeCut {
+        mut rx,
+        replay,
+        fence,
+    } = cut;
+    for batch in replay {
+        // No `tx.closed()` arm is needed here: nothing is awaited but
+        // the reservation, which fails outright once the receiver is
+        // gone.
+        if let Step::Stop = push_batch(&batch, &tx, limits, &gate).await {
+            return;
+        }
+    }
     loop {
         let received = tokio::select! {
             // The connection went away. Without this arm the task parks
@@ -426,37 +456,8 @@ async fn relay(
             // with: it committed between the subscribe and the read.
             Ok(batch) if batch.revision <= fence => continue,
             Ok(batch) => {
-                // One batch can cost two permits. A takeover that found
-                // this queue full left its `session.driver_changed`
-                // with the gate; the gate spends the first permit on
-                // that notice and the batch is re-offered, which is
-                // what keeps the notice ahead of it. Each attempt gets
-                // the full stall budget, and a peer that never drains
-                // still dies on the first one.
-                loop {
-                    let permit = match tokio::time::timeout(limits.stall, tx.reserve()).await {
-                        Ok(Ok(permit)) => permit,
-                        // Receiver gone: the connection is already down.
-                        Ok(Err(_)) => return,
-                        Err(_) => {
-                            warn!(
-                                revision = batch.revision,
-                                "events subscriber is not draining; closing the connection"
-                            );
-                            return;
-                        }
-                    };
-                    match gate.deliver(permit, &batch) {
-                        Delivery::Delivered => break,
-                        Delivery::NoticeSentRetryBatch => continue,
-                        Delivery::End => {
-                            debug!(
-                                revision = batch.revision,
-                                "unpushable workspace event; closing the events connection"
-                            );
-                            return;
-                        }
-                    }
+                if let Step::Stop = push_batch(&batch, &tx, limits, &gate).await {
+                    return;
                 }
             }
             Err(RecvError::Lagged(missed)) => {
@@ -467,6 +468,53 @@ async fn relay(
                 return;
             }
             Err(RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Whether the relay may go on after one batch.
+enum Step {
+    Continue,
+    Stop,
+}
+
+/// Put one batch on the queue, waiting up to [`PushLimits::stall`] for
+/// room.
+///
+/// One batch can cost two permits. A takeover that found this queue full
+/// left its `session.driver_changed` with the gate; the gate spends the
+/// first permit on that notice and the batch is re-offered, which is
+/// what keeps the notice ahead of it. Each attempt gets the full stall
+/// budget, and a peer that never drains still dies on the first one.
+async fn push_batch(
+    batch: &VersionedWorkspaceEvent,
+    tx: &mpsc::Sender<serde_json::Value>,
+    limits: PushLimits,
+    gate: &Arc<dyn StreamGate>,
+) -> Step {
+    loop {
+        let permit = match tokio::time::timeout(limits.stall, tx.reserve()).await {
+            Ok(Ok(permit)) => permit,
+            // Receiver gone: the connection is already down.
+            Ok(Err(_)) => return Step::Stop,
+            Err(_) => {
+                warn!(
+                    revision = batch.revision,
+                    "events subscriber is not draining; closing the connection"
+                );
+                return Step::Stop;
+            }
+        };
+        match gate.deliver(permit, batch) {
+            Delivery::Delivered => return Step::Continue,
+            Delivery::NoticeSentRetryBatch => continue,
+            Delivery::End => {
+                debug!(
+                    revision = batch.revision,
+                    "unpushable workspace event; closing the events connection"
+                );
+                return Step::Stop;
+            }
         }
     }
 }
@@ -488,6 +536,18 @@ mod tests {
         }
     }
 
+    /// A cut with nothing to replay: a hand-fed receiver and a fence.
+    fn live_cut(
+        rx: tokio::sync::broadcast::Receiver<VersionedWorkspaceEvent>,
+        fence: u64,
+    ) -> ResumeCut {
+        ResumeCut {
+            rx,
+            replay: Vec::new(),
+            fence,
+        }
+    }
+
     async fn next(rx: &mut mpsc::Receiver<serde_json::Value>) -> Option<EventBatch> {
         let value = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -503,7 +563,7 @@ mod tests {
     async fn the_fence_drops_its_own_revision_and_keeps_the_next() {
         let (events, rx) = tokio::sync::broadcast::channel(16);
         let (tx, mut source) = mpsc::channel(8);
-        let task = tokio::spawn(relay(rx, tx, 7, TEST_LIMITS, Arc::new(FullFeed)));
+        let task = tokio::spawn(relay(live_cut(rx, 7), tx, TEST_LIMITS, Arc::new(FullFeed)));
 
         // Below, at, and above the fence, in one go: only the last two
         // may be delivered, and they must arrive in order.
@@ -527,7 +587,7 @@ mod tests {
     async fn a_dropped_receiver_ends_the_relay_without_a_commit() {
         let (events, rx) = tokio::sync::broadcast::channel(16);
         let (tx, source) = mpsc::channel(8);
-        let task = tokio::spawn(relay(rx, tx, 0, TEST_LIMITS, Arc::new(FullFeed)));
+        let task = tokio::spawn(relay(live_cut(rx, 0), tx, TEST_LIMITS, Arc::new(FullFeed)));
 
         drop(source);
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -605,5 +665,218 @@ mod tests {
             serde_json::from_value(batch_value(&commit, false).expect("a wire form")).unwrap();
         assert_eq!(observer.revision, 3);
         assert!(observer.events.is_empty());
+    }
+
+    // ================================================================
+    // Resuming: the replay half of a cut (plan 052 §3.6)
+    // ================================================================
+
+    fn effect_batch(revision: u64) -> VersionedWorkspaceEvent {
+        VersionedWorkspaceEvent {
+            revision,
+            events: vec![WorkspaceEvent::TabEffect {
+                tab_id: 1,
+                effect: TabEffectKind::Bell,
+            }],
+        }
+    }
+
+    async fn next_value(rx: &mut mpsc::Receiver<serde_json::Value>) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the relay must answer")
+            .expect("a frame")
+    }
+
+    /// The replay comes first and the live half picks up exactly where
+    /// it stopped — including dropping the fence's own revision, which
+    /// the replay already carried.
+    #[tokio::test]
+    async fn a_cut_drains_its_replay_before_its_live_batches() {
+        let (events, rx) = tokio::sync::broadcast::channel(16);
+        let (tx, mut source) = mpsc::channel(8);
+        let cut = ResumeCut {
+            rx,
+            replay: vec![batch(8), batch(9)],
+            fence: 9,
+        };
+        let task = tokio::spawn(relay(cut, tx, TEST_LIMITS, Arc::new(FullFeed)));
+
+        // The broadcast still holds the fence's own commit; the replay
+        // already delivered it, so it must not go out twice.
+        events.send(batch(9)).unwrap();
+        events.send(batch(10)).unwrap();
+
+        assert_eq!(next(&mut source).await.expect("a batch").revision, 8);
+        assert_eq!(next(&mut source).await.expect("a batch").revision, 9);
+        assert_eq!(next(&mut source).await.expect("a batch").revision, 10);
+
+        drop(events);
+        assert!(next(&mut source).await.is_none());
+        task.await.expect("the relay ends with its broadcast");
+    }
+
+    /// A full-window replay is far longer than the queue it drains into,
+    /// so most of it is delivered under backpressure — in order, one
+    /// reservation at a time, with no batch overtaking another.
+    #[tokio::test]
+    async fn a_replay_longer_than_the_queue_drains_in_order() {
+        let (events, rx) = tokio::sync::broadcast::channel(16);
+        let (tx, mut source) = mpsc::channel(2);
+        let cut = ResumeCut {
+            rx,
+            replay: (1..=12).map(batch).collect(),
+            fence: 12,
+        };
+        let task = tokio::spawn(relay(
+            cut,
+            tx,
+            PushLimits {
+                capacity: 2,
+                stall: Duration::from_secs(5),
+            },
+            Arc::new(FullFeed),
+        ));
+
+        let mut seen = Vec::new();
+        for _ in 1..=12 {
+            seen.push(next(&mut source).await.expect("a batch").revision);
+        }
+        assert_eq!(seen, (1..=12).collect::<Vec<_>>());
+
+        drop(events);
+        assert!(next(&mut source).await.is_none());
+        task.await.expect("the relay ends with its broadcast");
+    }
+
+    /// A takeover that lands mid-replay: the gate spends the next permit
+    /// on its `session.driver_changed`, and the batch it interrupted is
+    /// re-offered and classified *after* it — so the effect that would
+    /// have followed the announcement is filtered instead.
+    struct NoticeAfterFirst {
+        delivered: std::sync::atomic::AtomicUsize,
+        deposed: std::sync::atomic::AtomicBool,
+    }
+
+    impl StreamGate for NoticeAfterFirst {
+        fn deliver(
+            &self,
+            permit: mpsc::Permit<'_, serde_json::Value>,
+            batch: &VersionedWorkspaceEvent,
+        ) -> Delivery {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.delivered.load(SeqCst) == 1 && !self.deposed.swap(true, SeqCst) {
+                permit.send(serde_json::json!({ "event": "session.driver_changed" }));
+                return Delivery::NoticeSentRetryBatch;
+            }
+            let driver = !self.deposed.load(SeqCst);
+            match batch_value(batch, driver) {
+                Some(value) => {
+                    permit.send(value);
+                    self.delivered.fetch_add(1, SeqCst);
+                    Delivery::Delivered
+                }
+                None => Delivery::End,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_notice_parked_mid_replay_precedes_the_batch_it_reclassifies() {
+        let (events, rx) = tokio::sync::broadcast::channel(16);
+        let (tx, mut source) = mpsc::channel(8);
+        let cut = ResumeCut {
+            rx,
+            replay: vec![effect_batch(1), effect_batch(2)],
+            fence: 2,
+        };
+        let task = tokio::spawn(relay(
+            cut,
+            tx,
+            TEST_LIMITS,
+            Arc::new(NoticeAfterFirst {
+                delivered: std::sync::atomic::AtomicUsize::new(0),
+                deposed: std::sync::atomic::AtomicBool::new(false),
+            }),
+        ));
+
+        let first: EventBatch = serde_json::from_value(next_value(&mut source).await).unwrap();
+        assert_eq!(first.revision, 1);
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec![ops::EVENT_TAB_EFFECT]
+        );
+
+        let notice = next_value(&mut source).await;
+        assert_eq!(
+            notice["event"], "session.driver_changed",
+            "the notice comes out ahead of the batch it interrupted"
+        );
+
+        let second: EventBatch = serde_json::from_value(next_value(&mut source).await).unwrap();
+        assert_eq!(second.revision, 2);
+        assert!(
+            second.events.is_empty(),
+            "the re-offered batch is classified after the notice, so its effect is filtered"
+        );
+
+        drop(events);
+        assert!(next(&mut source).await.is_none());
+        task.await.expect("the relay ends with its broadcast");
+    }
+
+    /// The dynamic the module doc calls out: a slow drain lets the live
+    /// receiver lag, and the stream closes mid-stride. It is not a dead
+    /// end — the client resumes from what it did receive, and the next
+    /// cut carries on.
+    #[tokio::test]
+    async fn a_live_lag_during_a_replay_closes_and_the_next_cut_continues() {
+        let (events, rx) = tokio::sync::broadcast::channel(2);
+        let (tx, mut source) = mpsc::channel(8);
+        let cut = ResumeCut {
+            rx,
+            replay: vec![batch(1), batch(2), batch(3)],
+            fence: 3,
+        };
+        // More live commits than the broadcast holds, none of them read
+        // while the replay is draining.
+        for revision in 4..=9 {
+            events.send(batch(revision)).unwrap();
+        }
+        let task = tokio::spawn(relay(cut, tx, TEST_LIMITS, Arc::new(FullFeed)));
+
+        for revision in 1..=3 {
+            assert_eq!(next(&mut source).await.expect("a batch").revision, revision);
+        }
+        assert!(
+            next(&mut source).await.is_none(),
+            "the lagged live half closes the stream rather than skipping revisions"
+        );
+        task.await.expect("the relay ends on the lag");
+
+        // The client comes back with the fence it actually reached.
+        let mut subscription = spawn(
+            ResumeCut {
+                rx: events.subscribe(),
+                replay: vec![batch(4), batch(5)],
+                fence: 5,
+            },
+            TEST_LIMITS,
+            Arc::new(FullFeed),
+        );
+        assert_eq!(subscription.revision, 3, "the ack is what the client has");
+        events.send(batch(6)).unwrap();
+        for revision in 4..=6 {
+            let value = tokio::time::timeout(Duration::from_secs(5), subscription.source.next())
+                .await
+                .expect("the source must answer")
+                .expect("a frame");
+            let batch: EventBatch = serde_json::from_value(value).unwrap();
+            assert_eq!(batch.revision, revision);
+        }
     }
 }

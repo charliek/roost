@@ -1,0 +1,10 @@
+{
+  "id": "13",
+  "op": "events.subscribe",
+  "params": {
+    "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
+    "tab_id_filter": "0",
+    "from_revision": 1180,
+    "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN"
+  }
+}

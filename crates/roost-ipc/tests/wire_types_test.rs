@@ -14,21 +14,22 @@
 //! wire change (additive changes add new vectors); see
 //! `docs/reference/ipc-compatibility.md`.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
 use roost_ipc::messages::{
-    AgentHooksMode, AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode,
+    ops, AgentHooksMode, AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode,
     AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope,
-    ProjectReorderParams, ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity,
-    SessionConnectParams, SessionConnectResult, SessionDriverChangedEvent, SessionIdentify,
-    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
-    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams,
-    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
-    TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent, TabReorderParams,
-    TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef,
-    MAX_PUT_FILE_BYTES, SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES, SESSION_PROTOCOL_VERSION,
-    SESSION_STOPPING_EVENT,
+    EventsSubscribeParams, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
+    SessionBinaryIdentity, SessionConnectParams, SessionConnectResult, SessionDriverChangedEvent,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetAgentHooksResult, SessionSetFocusParams,
+    SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
+    SessionStoppingEvent, SkippedFile, TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent,
+    TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef,
+    WireTabRef, MAX_PUT_FILE_BYTES, SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -153,7 +154,7 @@ fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
         r#"{"app_version":"0.0.18","session_protocol":4,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
-        r#""features":["put_file"],"#,
+        r#""features":["put_file","events_resume"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
         r#""started_at":"2026-08-27T14:03:11Z"}"#,
@@ -290,11 +291,52 @@ fn decode_identify_vector(name: &str) -> SessionIdentify {
         .unwrap_or_else(|e| panic!("{name}: decode session identify: {e}"))
 }
 
+/// A duplicate-free view of a feature list, or `None` if it repeats
+/// itself — a list compared as a set has to *be* one.
+fn feature_set<'a>(features: impl IntoIterator<Item = &'a str>) -> Option<BTreeSet<&'a str>> {
+    let mut set = BTreeSet::new();
+    for feature in features {
+        if !set.insert(feature) {
+            return None;
+        }
+    }
+    Some(set)
+}
+
+/// The vector is frozen, so this proves it is a **valid** view of this
+/// generation, not the *current* one: every field matches except
+/// `features`, which is only asserted to be a subset of what this build
+/// advertises.
+///
+/// That is the executable form of the policy in
+/// `docs/reference/ipc-compatibility.md` — features are additive and
+/// monotonic within a generation, so the generation's vector pins the
+/// floor and a build that has grown one since is still serving exactly
+/// this shape. A capability that *disappeared* would fail here, which is
+/// the half that matters: removing one takes a
+/// `SESSION_PROTOCOL_VERSION` bump and a new vector.
 #[test]
 fn session_identify_vector_decodes_into_its_typed_result() {
     let result = decode_identify_vector(&identify_vector_name(SESSION_PROTOCOL_VERSION));
-    assert_eq!(result, sample_identify());
     assert_eq!(result.session_protocol, SESSION_PROTOCOL_VERSION);
+    assert_eq!(
+        result,
+        SessionIdentify {
+            features: result.features.clone(),
+            ..sample_identify()
+        },
+        "only `features` may differ from this build's identity"
+    );
+
+    let vector = feature_set(result.features.iter().map(String::as_str))
+        .expect("the vector's features repeat");
+    let current = feature_set(SESSION_FEATURES.iter().copied()).expect("SESSION_FEATURES repeats");
+    assert!(
+        vector.is_subset(&current),
+        "the v{SESSION_PROTOCOL_VERSION} vector advertises {:?}, which this build no longer \
+         does — removing a feature is a generation bump, not an edit",
+        vector.difference(&current).collect::<Vec<_>>()
+    );
 }
 
 /// Every prior generation's vector stays on disk and keeps decoding —
@@ -1565,4 +1607,109 @@ fn clipboard_write_carries_text_or_a_png_and_never_invents_the_other() {
         r#"{"target":"system","text":"a","html":"<b>a</b>"}"#
     )
     .is_err());
+}
+
+// ============================================================================
+// events.subscribe — the resume params (plan 052 §3.5)
+// ============================================================================
+
+fn decode_request_vector(name: &str) -> serde_json::Value {
+    let raw = read_vector(name);
+    let request: serde_json::Value = serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request["op"], ops::EVENTS_SUBSCRIBE, "{name}: wrong op");
+    request["params"].clone()
+}
+
+/// The four-direction rule for an additive request field
+/// (`docs/reference/ipc-compatibility.md`): a client that does not
+/// resume must put no new key on the wire at all, because an older
+/// server's `deny_unknown_fields` would refuse the whole request.
+#[test]
+fn events_subscribe_omits_the_resume_keys_when_they_are_unset() {
+    const GOLDEN: &str = r#"{"lease":"9f2c1d7a","tab_id_filter":"0"}"#;
+
+    let plain = EventsSubscribeParams {
+        lease: "9f2c1d7a".into(),
+        tab_id_filter: 0,
+        from_revision: None,
+        session_id: None,
+    };
+    round_trip(&plain);
+    assert_eq!(serde_json::to_string(&plain).unwrap(), GOLDEN);
+
+    // A pre-052 request decodes into the new shape unchanged — the
+    // other direction of the same rule.
+    let decoded: EventsSubscribeParams = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(decoded, plain);
+    assert_eq!(decoded.from_revision, None);
+    assert_eq!(decoded.session_id, None);
+
+    // Still strict: additive optional fields are not a licence for
+    // arbitrary keys.
+    let error = serde_json::from_str::<EventsSubscribeParams>(
+        r#"{"lease":"a","tab_id_filter":"0","from_rev":9}"#,
+    )
+    .expect_err("an unknown key must be refused");
+    assert!(
+        error.to_string().contains("unknown field"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A revision is a plain JSON number, not a string: it is an in-process
+/// counter, not an id, so the string-int64 convention the ids use does
+/// not apply to it (and the ack it is echoed in has always been one).
+#[test]
+fn events_subscribe_resume_matches_its_vector() {
+    let resume = EventsSubscribeParams {
+        lease: "9f2c1d7a4b6e08315c0d9a72e4f16b83".into(),
+        tab_id_filter: 0,
+        from_revision: Some(1180),
+        session_id: Some("01K3S8TQ4F0Q9YB2K6WZ5D7XN".into()),
+    };
+    round_trip(&resume);
+
+    let as_value = serde_json::to_value(&resume).unwrap();
+    assert_eq!(
+        as_value["from_revision"],
+        serde_json::json!(1180),
+        "a number, not the string-int64 an id would use: {as_value}"
+    );
+
+    let params = decode_request_vector("events.subscribe.resume.request.json");
+    assert_eq!(params, as_value);
+    let typed: EventsSubscribeParams = serde_json::from_value(params).expect("typed resume params");
+    assert_eq!(typed, resume);
+
+    let plain = decode_request_vector("events.subscribe.request.json");
+    assert!(
+        plain.get("from_revision").is_none() && plain.get("session_id").is_none(),
+        "the plain exemplar must carry neither resume key: {plain}"
+    );
+    let typed: EventsSubscribeParams = serde_json::from_value(plain).expect("typed plain params");
+    assert_eq!(typed.from_revision, None);
+    assert_eq!(typed.session_id, None);
+}
+
+/// The refusal a client feature-detects on: it is answered on the ack,
+/// so it arrives as an ordinary error envelope and the connection is
+/// still a request/response connection afterwards.
+#[test]
+fn events_subscribe_error_vector_decodes_as_replay_expired() {
+    let raw = read_vector("events.subscribe.error.json");
+    let response: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(!response.ok);
+    let error = response.error.expect("an error body");
+    assert_eq!(error.code, "replay-expired");
+    assert_eq!(
+        roost_ipc::client::ServerCode::from_wire(&error.code),
+        roost_ipc::client::ServerCode::ReplayExpired,
+        "every refusal maps to a variant by name"
+    );
+    assert!(
+        error.message.contains("oldest resumable"),
+        "the message must say how far back a resume can reach: {}",
+        error.message
+    );
 }

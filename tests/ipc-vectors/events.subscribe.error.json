@@ -1,0 +1,8 @@
+{
+  "id": "13",
+  "ok": false,
+  "error": {
+    "code": "replay-expired",
+    "message": "revision 1180 is outside the replay window (oldest resumable: 1602, current: 2631); snapshot with tab.list and subscribe afresh"
+  }
+}
