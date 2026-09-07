@@ -132,7 +132,10 @@ impl Harness {
         let lease: SessionConnectResult = client
             .call(
                 ops::SESSION_CONNECT,
-                SessionConnectParams { takeover: false },
+                SessionConnectParams {
+                    takeover: false,
+                    client_label: None,
+                },
             )
             .await
             .expect("session.connect");
@@ -938,7 +941,10 @@ async fn a_takeover_purges_the_displaced_leases_attach_tokens() {
     let taken: SessionConnectResult = new_client
         .call(
             ops::SESSION_CONNECT,
-            SessionConnectParams { takeover: true },
+            SessionConnectParams {
+                takeover: true,
+                client_label: None,
+            },
         )
         .await
         .expect("session.connect with takeover");

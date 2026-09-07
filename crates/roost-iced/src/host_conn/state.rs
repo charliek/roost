@@ -433,6 +433,7 @@ mod tests {
                 .iter()
                 .map(|k| AttachPayloadKind((*k).to_string()))
                 .collect(),
+            features: vec![],
             libghostty_build: build.into(),
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),

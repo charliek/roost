@@ -52,7 +52,7 @@ use roost_ipc::messages::{
     TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
     TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
     TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
-    WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    WireTabRef, MAX_PUT_FILE_BYTES, SESSION_FEATURES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -2224,6 +2224,7 @@ async fn dispatch_outcome(
                 app_version: session.info.app_version.clone(),
                 session_protocol: SESSION_PROTOCOL_VERSION,
                 payload_kinds: session.info.payload_kinds.clone(),
+                features: SESSION_FEATURES.iter().map(|f| (*f).to_string()).collect(),
                 libghostty_build: session.info.libghostty_build.clone(),
                 session_id: session.info.session_id.clone(),
                 started_at: session.info.started_at.clone(),

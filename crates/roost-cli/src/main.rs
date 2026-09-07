@@ -955,7 +955,14 @@ async fn main() -> Result<()> {
                 }
             };
             client
-                .call::<_, serde_json::Value>(ops::TAB_WRITE, TabWriteParams { tab_id, data })
+                .call::<_, serde_json::Value>(
+                    ops::TAB_WRITE,
+                    TabWriteParams {
+                        tab_id,
+                        data,
+                        lease: None,
+                    },
+                )
                 .await?;
         }
         Cmd::Tab(TabCmd::SendFile { tab, paths, json }) => {

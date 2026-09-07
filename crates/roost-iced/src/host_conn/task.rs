@@ -741,7 +741,10 @@ async fn connect(
     let raw = call(
         &mut control,
         ops::SESSION_CONNECT,
-        serde_json::json!(SessionConnectParams { takeover: true }),
+        serde_json::json!(SessionConnectParams {
+            takeover: true,
+            client_label: None,
+        }),
     )
     .await?;
     let connected: SessionConnectResult =
@@ -1001,6 +1004,17 @@ async fn serve(
                     }
                     Some(Ok(EventFrame::Stopping(stopping))) => {
                         return ConnEnd::Stopping(stopping.reason);
+                    }
+                    Some(Ok(EventFrame::DriverChanged(changed))) => {
+                        // Inert until the observer state machine lands
+                        // (plan 049 C5): the stream is still ours to
+                        // drain, and today's takeover story still
+                        // arrives as the terminal stopping envelope.
+                        tracing::debug!(
+                            host = %config.host,
+                            taken_by = %changed.taken_by,
+                            "host session driver changed"
+                        );
                     }
                     Some(Err(error)) => {
                         // A revision gap is loss and nothing else, and

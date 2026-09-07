@@ -424,6 +424,16 @@ struct IPCSessionIdentify: Codable, Equatable, Sendable {
     var appVersion: String
     var sessionProtocol: UInt32
     var payloadKinds: [IPCAttachPayloadKind]
+    /// Optional additive session ops the far side serves — an open
+    /// string list, like `payloadKinds`. Mirrors Rust's
+    /// `SessionIdentify.features`.
+    ///
+    /// Optional on purpose, not a defaulted `[String]`: a pre-`4`
+    /// session sends no such key, and the synthesized `Codable` reads
+    /// an Optional with `decodeIfPresent` (and writes it with
+    /// `encodeIfPresent`) — a non-optional array would *throw* on the
+    /// absent key, which is the opposite of decode-when-absent.
+    var features: [String]?
     var libghosttyBuild: String
     var sessionID: String
     var startedAt: String
@@ -432,9 +442,27 @@ struct IPCSessionIdentify: Codable, Equatable, Sendable {
         case appVersion = "app_version"
         case sessionProtocol = "session_protocol"
         case payloadKinds = "payload_kinds"
+        case features
         case libghosttyBuild = "libghostty_build"
         case sessionID = "session_id"
         case startedAt = "started_at"
+    }
+}
+
+/// `session.connect` params — the claim on the driver lease. Mirrors
+/// Rust's `SessionConnectParams`. The Mac serves no session socket; the
+/// twin exists so the shared golden vectors decode on both sides.
+struct IPCSessionConnectParams: Codable, Equatable, Sendable {
+    var takeover: Bool
+    /// Who the claimant reports itself as — display metadata, never
+    /// identity. `encodeIfPresent` on the Optional keeps an unlabeled
+    /// connect byte-identical to what it has always sent; an older
+    /// session rejects unknown keys outright.
+    var clientLabel: String?
+
+    enum CodingKeys: String, CodingKey {
+        case takeover
+        case clientLabel = "client_label"
     }
 }
 
@@ -477,6 +505,24 @@ struct IPCSessionStoppingEvent: Codable, Equatable, Sendable {
 /// The event name of that envelope. Mirrors Rust's
 /// `messages::SESSION_STOPPING_EVENT`.
 let ipcSessionStoppingEvent = "session.stopping"
+
+/// `data` of the `session.driver_changed` envelope — the other frame on
+/// an events connection that is not an `IPCEventBatch`. Unlike
+/// `session.stopping` it is **not terminal**: the stream keeps
+/// delivering after it, as an observer. `takenBy` is what the new
+/// holder reported itself as, or `"unknown client"`. Mirrors Rust's
+/// `SessionDriverChangedEvent`.
+struct IPCSessionDriverChangedEvent: Codable, Equatable, Sendable {
+    var takenBy: String
+
+    enum CodingKeys: String, CodingKey {
+        case takenBy = "taken_by"
+    }
+}
+
+/// The event name of that envelope. Mirrors Rust's
+/// `messages::SESSION_DRIVER_CHANGED_EVENT`.
+let ipcSessionDriverChangedEvent = "session.driver_changed"
 
 /// One atomic push on the events connection. A single workspace commit
 /// can publish several events under the same `revision`, so the batch —
@@ -651,10 +697,19 @@ let ipcProtocolVersion: UInt32 = 1
 /// the two move independently. Mirrors Rust's
 /// `messages::SESSION_PROTOCOL_VERSION`.
 ///
-/// The rule: an **additive op bumps this when a pre-bump peer could
-/// not refuse it meaningfully**. A new event name inside an existing
-/// batch does not — an old client ignores it — and neither does an op
-/// an old session never receives.
+/// The rule: an **additive session-socket op bumps this when a
+/// pre-bump peer could not refuse it meaningfully**, and it is now the
+/// fallback — `IPCSessionIdentify.features` advertises additive
+/// session ops so a client feature-detects them instead. A new event
+/// name inside an existing batch never bumped it — an old client
+/// ignores it — and neither does an op an old session never receives.
+///
+/// `4` is plan 049 R1's re-cut of what the lease owns, breaking in both
+/// directions: `events.subscribe` no longer requires a lease (it
+/// classifies on one), session-socket `tab.write` now does, and
+/// takeover leaves an event stream alive with a non-terminal
+/// `session.driver_changed` instead of the `session.stopping` a `3`
+/// client waits for.
 ///
 /// `3` is plan 047's bump for `session.put_file`: a pre-047 session
 /// answers `unknown-op` to a paste the user just performed, and no
@@ -663,7 +718,7 @@ let ipcProtocolVersion: UInt32 = 1
 /// `2` was HS-1b's breaking bump: `events.subscribe` and `tab.attach`
 /// require the lease `session.connect` mints, so a client written
 /// against `1` is rejected rather than served.
-let ipcSessionProtocolVersion: UInt32 = 3
+let ipcSessionProtocolVersion: UInt32 = 4
 
 /// Maximum length of a single framed line. Matches roost-ipc's
 /// `MAX_FRAME_BYTES`.
