@@ -2577,8 +2577,7 @@ async fn dispatch(
         }
         ops::TAB_CLOSE => {
             let p: TabCloseParams = decode(params)?;
-            h.supervisor.close(p.tab_id);
-            h.workspace.close_tab(p.tab_id).map_err(ws_err)?;
+            crate::application::close_tab(&h.workspace, &h.supervisor, p.tab_id).map_err(ws_err)?;
             Ok(serde_json::json!({}))
         }
         ops::TAB_LIST => {

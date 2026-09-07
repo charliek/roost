@@ -841,11 +841,11 @@ impl PtySupervisor {
         // the session is reachable: the reader only publishes once
         // this task hands it a status.
         tokio::task::spawn_blocking(move || {
-            let status = match child.wait() {
-                Ok(status) => status.exit_code() as i32,
+            let (status, exit) = match child.wait() {
+                Ok(exit) => (exit.exit_code() as i32, Some(exit)),
                 Err(err) => {
                     error!(tab_id, ?err, "child.wait failed");
-                    -1
+                    (-1, None)
                 }
             };
             // Mark reaped first so a concurrent `close()` SIGKILL
@@ -876,6 +876,11 @@ impl PtySupervisor {
             }
             let _ = status_tx.send(status);
             let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status });
+            // Logged only now: a subscriber that blocks or panics must
+            // not stand between the reap and the handoffs above.
+            if let Some(exit) = exit {
+                debug!(tab_id, ?pid, %exit, "pty child reaped");
+            }
             #[cfg(feature = "server-vt")]
             {
                 if let Some(exit_tx) = reap_exit_tx {
