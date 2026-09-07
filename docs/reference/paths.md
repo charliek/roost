@@ -30,7 +30,7 @@ The two sides treat an **unrecognized** `ROOST_BUNDLE_PROFILE` value differently
 
 The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-linux`, `Roost-iced`, or `RoostSession`/`RoostSessionDev` for a headless session.
 
-Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` and its `state.lock` live) — the socket, the socket lock, and the log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. Note the consequence: two UIs with different `ROOST_STATE_DIR` values no longer collide on state, so a collision that used to be loud is now silent isolation; the socket lock is what still catches a genuine second instance on one socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
+Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` and its `state.lock` live) — the socket, the socket lock, and the log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. A `roost-session` under the override also puts its [upload store](#session-profile) inside that directory rather than on the cache path, which is the point: an isolated session must not sweep a developer's real one at start. Note the consequence: two UIs with different `ROOST_STATE_DIR` values no longer collide on state, so a collision that used to be loud is now silent isolation; the socket lock is what still catches a genuine second instance on one socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
 
 One derivation rides on top of the seam, and it is asymmetric on purpose. When something **launches** a headless `roost-session` for you — the UI's Connect on a `localhost` host, or `roostctl session start` — and `ROOST_STATE_DIR` is set to a value the resolver honours, the daemon is handed `<that directory>/session` instead of inheriting the value verbatim. Without it the daemon would resolve its launcher's *own* state dir, find that launcher's `state.lock` already held, and refuse to start ("another session (pid N) is using this state directory") — the isolation seam colliding with itself. `roostctl session start` prints the derived path on stderr when it does this; the UI records it in its log. The daemon stays addressable either way, because the socket does not move with `ROOST_STATE_DIR` — `roostctl session status|stop` find it by socket. The other half of the asymmetry: the daemon's own reading of the variable is unchanged, so running `ROOST_STATE_DIR=/tmp/x roost-session start` **directly** still puts its state in `/tmp/x` verbatim. Only a launcher derives, and only from a value that would redirect its own state dir — an empty or relative value derives nothing and is passed through untouched.
 
@@ -119,13 +119,46 @@ start|stop|status` address this profile's socket directly instead as a
 pre-connect carve-out). Any other op reaches a session only through an
 explicit `roostctl --socket <path>`. Debug builds substitute
 `RoostSessionDev` / `roost-session-dev` for the directory name in **all**
-of the paths below (socket, state, and logs), so a dev session can never
-collide with a real one.
+of the paths below (socket, state, logs, and the upload store), so a dev
+session can never collide with a real one.
 
-| Platform | Socket | State | Logs |
-|---|---|---|---|
-| macOS | `~/Library/Caches/RoostSession/roost.sock` | `~/Library/Application Support/RoostSession/` | `~/Library/Logs/RoostSession/` |
-| Linux | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, falling back to `/tmp/roost-session-<uid>/roost.sock` | `$XDG_DATA_HOME/roost-session/` | `$XDG_STATE_HOME/roost-session/` |
+| Platform | Socket | State | Logs | Uploaded files |
+|---|---|---|---|---|
+| macOS | `~/Library/Caches/RoostSession/roost.sock` | `~/Library/Application Support/RoostSession/` | `~/Library/Logs/RoostSession/` | `~/Library/Caches/RoostSession/files/` |
+| Linux | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, falling back to `/tmp/roost-session-<uid>/roost.sock` | `$XDG_DATA_HOME/roost-session/` | `$XDG_STATE_HOME/roost-session/` | `$XDG_CACHE_HOME/roost-session/files/`, defaulting to `~/.cache/roost-session/files/` |
+
+The **files** column is where [`session.put_file`](ipc.md#sessionput_file)
+lands what a client uploads for a host tab — a pasted image, a dropped
+PDF. Each file gets a directory of its own named from 16 hex characters
+of OS entropy, so the basename an agent displays survives while two
+drops of the same name never collide; the root and those directories are
+`0700` and the files inside them `0600`. It is a *cache*
+root on purpose, and not the state dir: the bytes are reproducible from
+the client and disposable, the session sweeps the whole directory at
+start and on a clean stop, and 512 MiB of screenshots does not belong in
+`~/Library/Application Support` or `$XDG_DATA_HOME`. It is deliberately
+not `$XDG_RUNTIME_DIR` either — that is tmpfs, and an upload has to
+outlive the memory a session can spare for it.
+
+When `ROOST_STATE_DIR` is set to a value the resolver honours, the store
+follows it (`<state dir>/files/`) rather than staying on the cache path.
+That is the one place the override reaches past `state.json`, and it is
+what keeps a spawned dev session's sweep-on-start away from a
+developer's real `~/.cache/roost-session-dev/files`.
+
+**A path that cannot be pasted bare is not used.** `session.put_file`
+answers with a path the client pastes into a shell **unquoted**, so at
+start the session checks the *entire* absolute path it resolved against
+`[A-Za-z0-9._/-]`. One space in `$HOME` — `/Users/charlie k/…` — one
+accented character, or one byte that is not valid UTF-8 anywhere in it,
+and every upload would paste as something the agent on the far side
+parses as two arguments. So the store moves instead, to the profile's
+own `/tmp` root, and logs the substitution once:
+`/tmp/RoostSession/files` on macOS, `/tmp/roost-session-<uid>/files` on
+Linux (`RoostSessionDev` / `roost-session-dev` in debug builds, as
+everywhere else here). Per profile, never one shared directory — a debug
+and a release session on the same box would otherwise sweep each other's
+live uploads at start.
 
 Before creating any of the above, the daemon installs `umask 0077`, so
 the state dir, log dir, and socket directory it creates land at `0700`

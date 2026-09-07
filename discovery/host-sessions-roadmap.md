@@ -622,8 +622,9 @@ scoped below (HS-4).
   applied under that client's own `clipboard-write` setting; OSC 52
   *reads* stay parser-level default-deny on every path, local or
   remote — reading is the more sensitive direction over SSH, not
-  less, so there's no SSH-specific carve-out. Remote image paste
-  remains deferred (unchanged open question below).
+  less, so there's no SSH-specific carve-out. Remote image paste was
+  deferred here and has **since shipped** in plan 047 (#406) — see the
+  open-questions entry below.
 
 **Acceptance:** the automated lanes are the gate — the pipes-based
 bridge lane and a shed-sshd lane (`ssh <shed-name>@localhost -p 2222`
@@ -1192,12 +1193,26 @@ never retried.
 
 ## Open questions (deferred, with owners)
 
-- Remote image paste + OSC 52 *read* over SSH → **partially resolved by
-  the HS-3 transport slice (plan 038)**: OSC 52 *read* stays
-  parser-level default-deny on every path (settled, not deferred —
-  reading is the more sensitive direction over SSH, if anything).
-  Remote image paste remains genuinely deferred — still open, tracked
-  as a follow-on to HS-3.
+- ~~Remote image paste + OSC 52 *read* over SSH~~ → **resolved in two
+  slices.** OSC 52 *read* was settled by the HS-3 transport slice (plan
+  038): parser-level default-deny on every path, local or remote —
+  reading is the more sensitive direction over SSH, if anything.
+  **Remote image paste shipped in plan 047 (#406)**, the follow-on to
+  HS-3 this entry anticipated, and it is not a clipboard feature: every
+  agent reads the clipboard itself on Ctrl+V, which cannot cross SSH, so
+  the bytes move as an op and a **host path** is pasted. `session.put_file`
+  lands one file (lease-gated, one frame, a 10 MiB per-file cap, a
+  512 MiB per-host admission cap that never evicts, swept at start and
+  on a clean stop) and answers with the path; `tab.send_file` is the one
+  entry point a drop, a clipboard-image paste and `roostctl tab
+  send-file` share. The path is pasted **bare** — the one spelling every
+  agent unquotes identically — and the client re-validates it before it
+  becomes typed input. Any regular file uploads, not only images. Cost:
+  `SESSION_PROTOCOL_VERSION` 2 → 3, so every saved host needs its
+  session updated once. See
+  [ipc.md](../docs/reference/ipc.md#sessionput_file), the
+  [user guide](../docs/guides/host-sessions.md#pasting-images-and-files-into-a-host-tab),
+  and DL-22 in [vision.md](../docs/development/vision.md).
 - A session's own attention not reaching an attached client
   (`window_focused` always `true`, no way to correct it — HS-2's
   recorded gap) → **resolved by the HS-3 transport slice**:

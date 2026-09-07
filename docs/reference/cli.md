@@ -169,6 +169,54 @@ These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab 
 
 `--tab` on `dump` (and the `tab.dump_resolved` op, plus the test-only `tab.capture_pty_input`) accepts the same host-qualified `h<host>.<id>` spelling `tab focus` does, reading an attached host tab's **client-side** terminal — the UI's own copy, distinct from the session's own `tab dump` served over its socket. See [Host Sessions](../guides/host-sessions.md).
 
+## `tab send-file`
+
+```bash
+roostctl tab send-file --tab h2.7 ~/Desktop/shot.png
+roostctl tab send-file --tab h2.7 shot.png notes.pdf --json
+roostctl tab send-file --tab 5 ~/Desktop/shot.png       # a local tab
+```
+
+Send local files to a tab. On a **host** tab each file is uploaded to
+that host and the host paths are pasted, so an agent running there can
+actually read them; on a local tab it pastes the escaped local paths.
+Exactly what dropping the files onto the tab does — same route, same
+gesture queue — backed by the [`tab.send_file`](ipc.md#tabsend_file) op.
+
+| Flag | Effect |
+|---|---|
+| `--tab <id>` | **Required.** Bare engine id, or `h<host>.<id>` for a connected host's tab. |
+| `<path>…` | At least one. Canonicalized in **roostctl's own** working directory before sending. |
+| `--json` | Print the whole result — `pasted`, `uploads`, `skipped` — instead of just the pasted text. |
+
+`--tab` is required here and nowhere else in the `tab` family, and
+unlike the others it does **not** read `ROOST_TAB_ID`. The no-flag
+fallback every other verb has resolves the UI's **local active tab** via
+`identify`, which is never the host tab a caller sending files means;
+guessing it would paste a remote-looking gesture into a local
+shell. Paths are canonicalized on this side because the shell you typed
+them in is the only cwd that can resolve a relative one — the op itself
+refuses relative paths for exactly that reason — so a path that is not
+there fails locally, naming it (`cannot send shot.png: …`), rather than
+after a round trip.
+
+Default output is the pasted text on stdout — the host paths for a host
+tab, the escaped local paths for a local one. Files the gesture could
+not send (a directory, something unreadable, a file over the 10 MiB
+per-file cap) are reported in `--json`'s `skipped` and do not stop the
+rest; a request where *every* path was skipped is an error naming each
+one.
+
+**It blocks, and prints nothing until it is done.** The command returns
+when the paste has been queued in the tab, which for a 10 MiB file over
+a slow link is minutes. That is deliberate: there is no progress channel
+on this wire, and the pasted text is the only thing worth printing. The
+wait is bounded — 60 s plus 300 s per file, multiplied by
+`ROOST_TEST_TIMEOUT_SCALE` like every other budget — because `IpcClient`
+has no request timeout of its own and a wedged UI would otherwise hang
+the caller forever. On expiry it says so and warns that the paste may
+still land.
+
 ## `wait`
 
 Block until a tab reaches a condition, then exit `0` — the no-`sleep` synchronization primitive for scripts and tests. Polls the running UI on an interval; exits non-zero if `--timeout` elapses first. At least one condition is required; when several are given, all must hold.
