@@ -166,6 +166,44 @@ release workflow asserts they agree).
   See the [Host Sessions
   guide](docs/guides/host-sessions.md#surviving-reboots-launchd) and
   [`cli.md`](docs/reference/cli.md#session-autostart-install-uninstall).
+- **The `vt` fallback now says so, and a remote host can fix itself
+  in-app (#447)** — a libghostty build skew used to connect silently
+  (#420): the dot stayed green, and the only way to notice was to poll
+  `roostctl host status --json` after attaching a tab. A reduced-fidelity
+  connection now grows a `reduced fidelity` indicator on the sidebar's
+  host band the moment the connection is up — before any tab has
+  attached — and the first `vt` attach on it prints a one-time
+  status-bar sentence naming what is off (links, the alternate screen,
+  soft wrapping). On an ssh or `localhost` host that indicator, a row
+  underneath it, and a command-palette verb (`host:update:<id>` /
+  `host:restart:<id>`) all open the fix directly: over ssh, the
+  bootstrap consent card with the fidelity reason on it — no more
+  "needs a restart" prompt first, and no more manual-only route, closing
+  the one gap #420 left open; on `localhost`, the restart confirmation.
+  A Unix-socket target still gets no in-app offer — Roost cannot reach
+  in over a bare forwarded socket — and the indicator there is
+  informational text only. `roostctl host status` reports the new
+  `connect.reduced_fidelity` field (readable before any attach, unlike
+  `payload_kind`) and prints the fidelity line in its human form. See
+  the [host sessions
+  guide](docs/guides/host-sessions.md#when-a-build-skew-connects-instead-the-vt-fallback).
+- **A reconnect to a session you already hold a checkpoint for resumes
+  instead of re-snapshotting (#442)** — every reconnect, automatic or
+  manual, used to subscribe fresh and pull a whole-workspace `tab.list`,
+  purging every row keyed on the dead connection until the new one
+  landed — the host's sidebar section rendered empty for the whole
+  prologue, seconds over a flaky ssh link. A reconnect to the same
+  session now calls the resumable `events.subscribe {from_revision,
+  session_id}` (#422) from the last revision it applied, taking **no**
+  `tab.list`, and the sidebar keeps drawing the carried rows through
+  `Connecting` so the section never blanks. Any of the three refusals
+  (`replay-expired`, `revision-ahead`, `session-mismatch`) — a gap too
+  old, a session that outran the checkpoint, or a restarted session —
+  falls back to the ordinary fresh subscribe-and-snapshot on a new dial
+  and is never fatal to the connection. `roostctl host status` reports
+  `connect.resumed` and `connect.from_revision`, and the new `tabs`
+  count, so a caller can see the no-flicker behavior directly instead
+  of scraping the sidebar.
 
 ### Removed
 

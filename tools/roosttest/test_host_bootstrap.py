@@ -64,6 +64,17 @@ deliberately lacks, precisely because composing the ops is bypassing
 the consent this whole plan is about), there was no way to raise the
 *first* dialog to answer with `app.dialog_answer` at all.
 
+This is not the rule the plan 056 fidelity verbs (`host:update:<id>`,
+`host:restart:<id>`) follow, and that is deliberate rather than a gap
+this module papers over: they do not consult `origin` at all, exactly
+like `host:stop:` (`palettes.rs`). Plan 039 §3.5's rule is that a
+*machine* is never prompted by a connect it did not ask for — these
+verbs exist only on a person's already-connected, reduced-fidelity
+host, and a verb whose first remote activity is a consent card is
+already the person asking, `RequestOrigin::Ipc` included.
+
+
+
 So `HostConnectParams` grew one more `ROOST_TEST_MODE=1`-gated field,
 `test_user_origin` (`crates/roost-ipc/src/messages.rs`,
 `crates/roost-iced/src/app/servicing.rs::host_connect_op` — this
