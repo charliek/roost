@@ -1,6 +1,10 @@
 //! What a host's connection state says to the user (plan 037 §3.1,
 //! §3.7): the banner over its last frame, and the prompt its Connect
-//! verb raises when the builds disagree.
+//! verb raises when the session is one this client cannot talk to at
+//! all — a protocol it does not speak, no payload kind it can decode,
+//! or a build skew against a session too old to serve `vt`. A skew a
+//! session *can* serve connects instead, and says so only in the log
+//! and in `host.status`'s `payload_kind`.
 //!
 //! Pure, and deliberately kept away from the widgets: "which banner,
 //! which buttons, and is there a restart button at all" is the part that
@@ -14,7 +18,7 @@
 //! them side by side is how the copy stays consistent.
 
 use crate::host_conn::state::{
-    BuildMismatch, HostConnState, MismatchKind, RestartAction, REQUIRED_PAYLOAD_KIND,
+    BuildMismatch, HostConnState, MismatchKind, RestartAction, CLIENT_PAYLOAD_KINDS,
 };
 
 /// The banner drawn over a host tab's last frame.
@@ -292,7 +296,10 @@ fn detail(mismatch: &BuildMismatch) -> String {
             } else {
                 offered
             };
-            format!("it offers {offered}, this client needs {REQUIRED_PAYLOAD_KIND}")
+            format!(
+                "it offers {offered}, this client decodes {}",
+                CLIENT_PAYLOAD_KINDS.join(", ")
+            )
         }
         MismatchKind::Build => format!(
             "libghostty {} against this client's {}",
@@ -314,7 +321,7 @@ mod tests {
             client_protocol: SESSION_PROTOCOL_VERSION,
             session_build: "gb-old".into(),
             client_build: "gb-new".into(),
-            session_payload_kinds: vec!["vt".into()],
+            session_payload_kinds: vec!["sixel-mosaic".into()],
             restart,
         }
     }
@@ -612,7 +619,13 @@ mod tests {
             MismatchKind::PayloadKind,
             RestartAction::RestartLocal,
         ));
-        assert!(kind.contains("vt") && kind.contains(REQUIRED_PAYLOAD_KIND));
+        assert!(
+            kind.contains("sixel-mosaic")
+                && CLIENT_PAYLOAD_KINDS
+                    .iter()
+                    .all(|decodable| kind.contains(*decodable)),
+            "the detail names what was offered and what this client decodes: {kind}"
+        );
 
         // A session offering nothing at all still reads as a sentence.
         let mut empty = mismatch(MismatchKind::PayloadKind, RestartAction::RestartLocal);

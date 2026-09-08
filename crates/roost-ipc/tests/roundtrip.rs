@@ -282,6 +282,21 @@ fn host_connection_vectors_decode_as_typed_params_and_results() {
     assert_eq!(never.generation, 0);
     assert_eq!(never.retry, None);
     assert_eq!(never.rollup, None);
+    // Nothing has attached on either host, so neither names a payload
+    // kind — the variant vector below is where one does.
+    assert_eq!(armed.payload_kind, None);
+    assert_eq!(never.payload_kind, None);
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+
+    // The fallback shape: a connected host whose attach was served as a
+    // `vt` byte stream because the two libghostty builds disagree.
+    let response = vector("host.status.vt.response.json");
+    let result: HostStatusResult =
+        serde_json::from_value(response["result"].clone()).expect("host.status vt result decode");
+    assert_eq!(
+        result.hosts[0].payload_kind.as_deref(),
+        Some(AttachPayloadKind::VT)
+    );
     assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
 }
 

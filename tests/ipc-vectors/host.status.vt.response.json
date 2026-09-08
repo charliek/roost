@@ -1,0 +1,18 @@
+{
+  "id": "35",
+  "ok": true,
+  "result": {
+    "hosts": [
+      {
+        "id": "a1b2c3d4e5f60718",
+        "label": "shed",
+        "target": "localhost",
+        "last_connected": "2026-09-07T14:12:40Z",
+        "generation": 4,
+        "state": "connected",
+        "rollup": "2 agents",
+        "payload_kind": "vt"
+      }
+    ]
+  }
+}

@@ -2415,6 +2415,17 @@ pub struct HostStatus {
     /// the user asks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetrySchedule>,
+    /// What the last attach this client accepted on this host is being
+    /// decoded as — one of [`AttachPayloadKind`]'s spellings.
+    ///
+    /// `"vt"` is the fallback a libghostty build skew lands on, and the
+    /// only way to see it from outside: a host on it connects normally,
+    /// with no dot and no dialog, at that payload's documented fidelity.
+    /// Absent until a tab has actually attached over the live
+    /// connection — it reports what is being decoded, never what could
+    /// be — and it goes when that connection does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_kind: Option<String>,
 }
 
 /// An armed auto-reconnect: what was scheduled, not what is left.
@@ -4397,6 +4408,7 @@ mod tests {
                         .into(),
                 ),
             }),
+            payload_kind: None,
         };
         round_trip(&armed);
         // #399: `reason` says *why* the rung is armed while the band's
@@ -4428,6 +4440,20 @@ mod tests {
                 "generation": 0,
                 "state": "disconnected",
             })
+        );
+
+        // A host attached in the `vt` fallback is the only place that
+        // shows: the kind rides beside the state, and the never-attached
+        // host above proves the key is omitted rather than nulled.
+        let fallback = HostStatus {
+            state: host_state::CONNECTED.into(),
+            payload_kind: Some(AttachPayloadKind::VT.to_string()),
+            ..never.clone()
+        };
+        round_trip(&fallback);
+        assert_eq!(
+            serde_json::to_value(&fallback).unwrap()["payload_kind"],
+            AttachPayloadKind::VT
         );
 
         // Localhost's own retry knows a delay and nothing else — the

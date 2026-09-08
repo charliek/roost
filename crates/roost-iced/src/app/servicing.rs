@@ -1081,13 +1081,14 @@ impl App {
         frame: host_tab::HostTabFrame,
         pty: &mut TabOutputBatch,
     ) {
-        let step = match (self.host_attach.get_mut(&key), self.tabs.get_mut(&key)) {
+        let (step, payload_kind) = match (self.host_attach.get_mut(&key), self.tabs.get_mut(&key)) {
             (Some(attach), Some(tab)) => {
                 // The machine arms its own timers, so it needs the app
                 // runtime ambient the same way `begin` and `arm_reattach`
                 // below do — `tokio::spawn` panics without it.
                 let _guard = self.runtime.enter();
-                attach.on_frame(frame, tab, &self.feed_tx)
+                let step = attach.on_frame(frame, tab, &self.feed_tx);
+                (step, attach.payload_kind())
             }
             // A frame for a key with no attach state: the tab detached,
             // the tab dropped, or the whole incarnation is stale — every
@@ -1097,6 +1098,12 @@ impl App {
                 return;
             }
         };
+        if let Some(kind) = payload_kind {
+            // Read off the machine rather than the frame: only an accept
+            // it actually applied sets it, so a frame from a superseded
+            // attempt cannot rewrite what the host reports.
+            self.hosts.note_payload_kind(key.host, kind.wire());
+        }
         match step {
             host_tab::AttachStep::None => {}
             host_tab::AttachStep::Refresh => {
@@ -3058,6 +3065,10 @@ impl App {
                 // sidebar draws.
                 rollup: band.rollup.clone(),
                 retry: self.hosts.retry_schedule(&host.id),
+                // What this host's tabs are actually being decoded as —
+                // absent until one has attached over the live
+                // connection.
+                payload_kind: self.hosts.payload_kind(&host.id).map(str::to_string),
             });
         }
         Ok(HostStatusResult { hosts })
