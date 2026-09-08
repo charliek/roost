@@ -126,7 +126,14 @@ const unauthorized = (request) => {
   if (offered && offered.user === user && offered.password === password) {
     return null;
   }
-  return new Response("Unauthorized", { status: 401 });
+  // RFC 9110 requires a challenge on a 401, and this is opencode's own
+  // verbatim (`server/.../middleware/authorization.ts`'s WWW_AUTHENTICATE).
+  // Matching it rather than inventing a realm is the point: a caller must
+  // not be able to tell the proxy from the server it fronts.
+  return new Response("Unauthorized", {
+    status: 401,
+    headers: { "www-authenticate": 'Basic realm="Secure Area"' },
+  });
 };
 
 // One request, rebuilt against the in-process app.

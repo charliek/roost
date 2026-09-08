@@ -353,7 +353,9 @@ Three things worth stating as a stance rather than leaving implicit:
   Roost reports (see [OpenCode keys](#opencode-keys)) — and that server
   is the whole surface: the global session store, tool execution,
   permission replies. Any process on the same host can reach it,
-  unauthenticated unless `OPENCODE_SERVER_PASSWORD` is set. Roost's own
+  unauthenticated unless `OPENCODE_SERVER_PASSWORD` is set to a **non-empty**
+  value — an empty one means "no auth" to opencode itself, and so to this
+  front end. Roost's own
   sockets are unchanged and nothing binds off loopback — but this is a
   real widening of what a tab exposes, which is why
   `ROOST_OPENCODE_NO_SERVER=1` turns it off.
@@ -448,7 +450,7 @@ surface.
   server started with `--hostname 0.0.0.0` announces an address that
   fails that check and is dropped rather than stamped — that session is
   status-only.
-- **The password rule.** When `OPENCODE_SERVER_PASSWORD` is set, the
+- **The password rule.** When `OPENCODE_SERVER_PASSWORD` is set to a non-empty value, the
   loopback front end demands the same Basic credentials opencode's own
   server does (username from `OPENCODE_SERVER_USERNAME`, default
   `opencode`) and answers `401` otherwise. Roost carries no credentials

@@ -170,6 +170,7 @@ for (const probe of JSON.parse(process.env.ROOST_TEST_PROBES || "[]")) {
   );
   probes.push({
     status: response.status,
+    headers: Object.fromEntries(response.headers),
     upstream: upstream.length > before ? upstream[upstream.length - 1] : null,
   });
 }
@@ -1184,6 +1185,15 @@ fn the_proxy_demands_the_same_basic_credentials_opencode_does() {
     for i in 0..2 {
         assert_eq!(run.probes[i]["status"], json!(401), "probe {i}");
         assert_eq!(run.probes[i]["upstream"], json!(null), "probe {i}");
+        // RFC 9110 requires a challenge on a 401, and the value is
+        // opencode's own verbatim. A caller must not be able to tell the
+        // proxy from the server it fronts, so this is an equality test,
+        // not a "contains Basic".
+        assert_eq!(
+            run.probes[i]["headers"]["www-authenticate"],
+            json!("Basic realm=\"Secure Area\""),
+            "probe {i} must carry opencode's own challenge"
+        );
     }
     assert_eq!(run.probes[2]["status"], json!(200));
     assert_eq!(
