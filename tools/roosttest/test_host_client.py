@@ -346,6 +346,11 @@ def wait_live_connect(host: HostUnderTest, timeout: float = 60.0) -> dict:
     the state alone hands back that row perhaps one time in fifty — an
     attribute error rather than a verdict, which is a flake rather than
     an assertion.
+
+    It reads `.roost`, `.saved_id` and `.label` only, so
+    `test_host_bootstrap`'s `BootstrapHost` satisfies it too — the same
+    duck-typing `status`/`wait_for_a_settled_reason` already rely on
+    across these three modules.
     """
 
     def landed() -> dict | None:
@@ -914,6 +919,78 @@ def test_a_build_skew_connects_in_vt_fallback(roost, session_env):
         )
         assert mirrored["scrollback_text"] == served["scrollback_text"]
         assert mirrored["rows_text"] == served["rows_text"]
+
+
+def test_a_build_skew_is_named_before_any_attach_and_a_socket_host_is_offered_no_verb(
+    roost, session_env
+):
+    """Plan 056 R14: the same fallback, said out loud — and, on this
+    transport, said and nothing more.
+
+    The sibling above proves the fallback *renders*. This proves the
+    window can know about it, which is the hole #447 named: before plan
+    056 the only trace of a servable skew was `payload_kind`, and
+    `payload_kind` is written when an attach is **accepted**. A skewed
+    host nobody has clicked into showed nothing at all. So the first
+    read here is deliberately the row `wait_live_connect` hands back —
+    the first frame that carries connect facts, which cannot be later
+    than the first attach because this test has not made one yet — and
+    it must already say `reduced_fidelity`, with no `payload_kind`
+    beside it.
+
+    `session_id` is asserted against the session's own `session.identify`
+    because the whole card gate downstream (§3.6) is an equality on that
+    id: a client reporting some other id would open a consent card bound
+    to a session nobody is attached to.
+
+    Then §3.4's socket row, end to end. The harness's hosts are socket
+    *paths* (`saved_host` registers `env.socket`, which
+    `roost_ipc::ssh::classify` calls a `UnixSocket`), and a socket target
+    is somebody else's process reached over a transport that finds its
+    socket and not its binary — so neither `host:update:` nor
+    `host:restart:` may be offered for it. The negative is not vacuous:
+    the same row that must carry no verb is asserted, two lines up, to be
+    at reduced fidelity, which is the *only* condition under which either
+    verb is ever listed.
+    """
+    require_test_mode(roost)
+    start_session(session_env, ROOST_SESSION_FAKE_BUILD=FAKE_BUILD)
+    identity = session_env.identify()
+    assert identity["libghostty_build"] == FAKE_BUILD, identity
+
+    with session_env.client() as session:
+        tab = quiet_tab(session, first_project(session), session_env.launch_cwd)
+
+    with saved_host(roost, session_env) as under_test:
+        under_test.connect_and_wait()
+
+        row = wait_live_connect(under_test)
+        assert "payload_kind" not in row, (
+            "the fidelity verdict has to be readable before an attach writes "
+            f"`payload_kind` — that is the point of it: {row}"
+        )
+        facts = row["connect"]
+        assert facts["reduced_fidelity"] is True, row
+        assert facts["session_id"] == identity["session_id"], (facts, identity)
+
+        ids = host_row_ids(roost)
+        assert f"host:disconnect:{under_test.saved_id}" in ids, ids
+        assert f"host:update:{under_test.saved_id}" not in ids, ids
+        assert f"host:restart:{under_test.saved_id}" not in ids, ids
+
+        # And the attach still reports the kind it landed on: the new
+        # `connect` object sits beside `payload_kind`, not instead of it.
+        host_key(roost, tab)
+
+        def attached_status() -> dict | None:
+            row = host_status_row(roost, under_test.saved_id)
+            return row if "payload_kind" in row else None
+
+        attached = wait_until(
+            attached_status, 30.0, "the host to report the kind it attached as"
+        )
+        assert attached["payload_kind"] == "vt", attached
+        assert attached["connect"]["reduced_fidelity"] is True, attached
 
 
 def watched_tab_ids(roost: Roost, saved_id: str) -> set[int]:

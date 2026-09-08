@@ -104,6 +104,7 @@ import contextlib
 import functools
 import hashlib
 import http.server
+import json
 import os
 import platform
 import shutil
@@ -133,6 +134,7 @@ from test_host_client import (
     saved_host,
     start_session,
     wait_dump_contains,
+    wait_live_connect,
     wait_until,
 )
 from test_host_ssh import (
@@ -1111,6 +1113,209 @@ def test_running_mismatch_offers_remote_update_and_reconnects(
     answer(roost, "confirm")
     wait_no_dialog(roost)
     bootstrap_host.wait_connected()
+
+
+# ---------------------------------------------------------------------------
+# 5b. Plan 056 R14 — a servable skew, updated from the palette
+# ---------------------------------------------------------------------------
+
+
+#: `host_state::TAKEN_OVER` on the wire. Restated rather than derived,
+#: like this lane's other wire constants: the phantom takeover below is
+#: the whole point of the case, and a renamed state that silently stopped
+#: matching would turn the assertion green forever.
+TAKEN_OVER = "taken-over"
+
+
+@functools.cache
+def client_libghostty_build() -> str:
+    """The libghostty build *this* client pins, as a string.
+
+    `roost-session identify` is pure compile-time identity — no socket,
+    no profile — and this tree builds the daemon and the UI against one
+    pin, so what the binary prints is what `roost_vt::libghostty_build()`
+    answers inside the UI. Read from a **clean** environment on purpose:
+    this lane exports `ROOST_TEST_MODE=1`, which is exactly the gate that
+    would let a stray `ROOST_SESSION_FAKE_BUILD` in a developer's shell
+    hand back the fake string and make the card assertion below tautological.
+    """
+    result = subprocess.run(
+        [str(sessionlib.session_binary()), "identify"],
+        env={"PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(30),
+    )
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    return json.loads(result.stdout)["libghostty_build"]
+
+
+def watch_the_update_job(host: BootstrapHost, timeout: float = 180.0) -> tuple[dict, list[str]]:
+    """Poll until the host is back **connected at full fidelity**, and
+    hand back every state seen on the way.
+
+    The settle condition is `reduced_fidelity is False` rather than a
+    bare `connected`, because the connection the job is about to tear
+    down is itself connected: a wait on the state alone could be
+    satisfied by the frame before the confirm even landed, and the whole
+    sample would be an empty window.
+
+    Sampled continuously, and that is the assertion — see
+    [`test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_whole`].
+    A small interval rather than `test_host_ssh.watch_the_reconnect`'s
+    zero: that window is one dial wide, this one is a whole bootstrap job
+    wide, and every read is work on the UI's own thread — the same thread
+    the job's completion has to land on.
+    """
+    states: list[str] = []
+
+    def landed() -> dict | None:
+        row = status(host)
+        states.append(row["state"])
+        connect = row.get("connect")
+        if row["state"] != "connected" or connect is None or connect["reduced_fidelity"]:
+            return None
+        return row
+
+    row = wait_until(landed, timeout, "the update to land the host at full fidelity", interval=0.01)
+    return row, states
+
+
+def test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_whole(
+    bootstrap_host: BootstrapHost, roost: Roost
+):
+    """R14's headline route, the one plan 053 took away: an ssh host on
+    the `vt` fallback, updated from inside the window.
+
+    Scenario 5 above is its ancestor and its contrast. There the session
+    is one this client **cannot talk to** (`ROOST_SESSION_LEGACY_KINDS`
+    puts it back in the pre-`vt` shape), so it reaches `needs-restart`
+    and the pre-existing prompt raises the card. Here the daemon offers
+    `vt`, so the connection *succeeds* — quietly, at reduced fidelity —
+    and `needs-restart` never happens. Before plan 056 that host had no
+    in-app route to full fidelity at all.
+
+    The route is one handler (`App::host_fidelity_action_requested`)
+    behind three entry points; the palette verb is the one an op can
+    reach, so it is the one asserted. It is activated over plain IPC with
+    no `test_user_origin` seam, deliberately: these verbs do not consult
+    origin (§3.6, and `host:stop:` before them) — plan 039 §3.5's rule is
+    that a *machine* is never prompted by a connect it did not ask for,
+    and a verb listed only on a person's connected, reduced-fidelity host
+    whose first remote activity is a consent card is the person asking.
+
+    One card, not two: the entry point is already a decision to update,
+    so it skips the "needs a restart" prompt scenario 5 has to answer
+    first and opens the consent card directly, with the reason on it.
+    Both build strings, because a card that says "reduced fidelity" and
+    names neither side gives a reader nothing to act on.
+
+    The probed binary is this run's own `roost-session` — only the
+    *process* is stale — so this is the Compatible+Running row of the
+    action matrix: stop, await-gone, start, reconnect, and nothing
+    installed.
+
+    **Confirm letting go before the job runs is what this scenario
+    exists to fence** (§3.6, C6), and nothing else in the repo does:
+    `roost-iced` has no lib target, so no unit test constructs an `App`,
+    and deleting the disconnect leaves every Rust test green.
+
+    Three assertions carry it, deliberately at different distances:
+
+    * the host is `disconnected` with no `connect` object the instant
+      confirm returns — the sharp one, and the one that actually fails
+      when the call site goes. It is a fence rather than a race because
+      `app.dialog_answer` runs the confirm handler to completion before
+      it replies.
+    * no state outside `connected`/`disconnected`/`connecting` for the
+      whole job. `stopped` is the tell — that is what the far side's
+      `session.stopping` looks like to a client still listening, and it
+      is exactly what a build without the disconnect samples here.
+    * never `taken-over`, which is the harm §3.6 names: with a stream
+      still up when the job stops the session, the bridge can EOF before
+      `session.stopping` lands, `serve` returns `Dropped`, the ssh ladder
+      dials the session the job has just started, the `held_lease` probe
+      answers `NotCurrent` against a lease that session never issued, the
+      observing latch flips, and the band reads "taken over" by nobody.
+      That is a race, and this harness — every hop local, the whole job
+      inside a second — loses it politely rather than winning it, so this
+      assertion is the criterion rather than the detector. It is sampled
+      throughout the job rather than read once at the end because the
+      phantom heals itself at the job's own reconnect.
+    """
+    binary = bootstrap_host.jail.plant("$HOME/.local/bin/roost-session", sessionlib.session_binary())
+    # No `ROOST_SESSION_LEGACY_KINDS` — the premise here is a daemon that
+    # *does* offer `vt`, which is what makes the connection succeed.
+    start_daemon_in_jail(bootstrap_host.jail, binary, ROOST_SESSION_FAKE_BUILD=FAKE_BUILD)
+    fetched_before = len(_ASSET_SERVER.requests)
+
+    result = roost.call("host.connect", {"id": bootstrap_host.saved_id})
+    assert result["state"] in CONNECT_STARTED, result
+    bootstrap_host.wait_connected()
+
+    row = wait_live_connect(bootstrap_host)
+    assert row["connect"]["reduced_fidelity"] is True, row
+    assert row["connect"]["session_id"], row
+
+    update_id = f"host:update:{bootstrap_host.saved_id}"
+    assert update_id in host_row_ids(roost), sorted(host_row_ids(roost))
+
+    roost.palette_open("commands")
+    try:
+        roost.palette_activate(update_id)
+    finally:
+        roost.palette_dismiss()
+
+    dump = wait_dialog(roost, "bootstrap", "update")
+    assert FAKE_BUILD in dump["body"], dump
+    assert client_libghostty_build() in dump["body"], (client_libghostty_build(), dump)
+    # Compatible binary, stale process: the matrix says stop and start,
+    # and says so on the card before anyone confirms.
+    assert "Nothing will be installed" in dump["body"], dump
+
+    answer(roost, "confirm")
+    # Read once, immediately, with no wait in front of it — the whole
+    # claim is that the stream is *already* gone when confirm returns.
+    # `app.dialog_answer` runs `host_bootstrap_confirmed` to completion
+    # before it replies (`servicing.rs::AppDialogAnswer`), and the
+    # disconnect is synchronous inside it (`HostConnSet::disconnect`),
+    # so this is a fence and not a race: the job's first remote step
+    # cannot have run yet either way.
+    handed_over = status(bootstrap_host)
+    assert handed_over["state"] == "disconnected", (
+        "confirming has to let go of the session *before* the job owns it "
+        f"(§3.6) — the host was still {handed_over['state']!r}: {handed_over}"
+    )
+    assert handed_over.get("connect") is None, handed_over
+
+    row, states = watch_the_update_job(bootstrap_host)
+
+    assert TAKEN_OVER not in states, (
+        f"the host read {TAKEN_OVER!r} during the update job (states "
+        f"{sorted(set(states))} over {len(states)} samples) — confirming has to "
+        "disconnect before the job owns the session (§3.6)"
+    )
+    # Everything a *let-go* host can be while a job runs, and nothing
+    # else. `stopped` is the tell: it is what the far side's
+    # `session.stopping` looks like to a client that was still listening,
+    # which is precisely the client this confirm was supposed to have
+    # disconnected.
+    outside = sorted(set(states) - {"connected", "disconnected", "connecting"})
+    assert not outside, (
+        f"the host observed {outside} while the job ran — a disconnected client "
+        f"cannot hear the session it no longer holds (states {sorted(set(states))} "
+        f"over {len(states)} samples)"
+    )
+    # The sample is only worth its assertions if it covered the window.
+    assert {"disconnected", "connecting"} & set(states), (
+        f"never sampled the job's own window, so the {TAKEN_OVER!r} claim went "
+        f"unchecked: {sorted(set(states))}"
+    )
+    assert row["connect"]["reduced_fidelity"] is False, row
+    assert _ASSET_SERVER.requests[fetched_before:] == [], (
+        "a matching binary under a stale process is stop/start only — nothing is "
+        f"downloaded: {_ASSET_SERVER.requests[fetched_before:]}"
+    )
 
 
 # ---------------------------------------------------------------------------
