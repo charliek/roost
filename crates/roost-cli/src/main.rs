@@ -483,6 +483,14 @@ enum TabCmd {
         /// Emit the structured JSON result instead of plain text rows.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// History rows above the viewport to include. Printed before
+        /// the viewport rows with no separator, so `| grep` keeps
+        /// working over the larger window. Server-side clamped, so
+        /// this is passed through unvalidated; `0` (the default) omits
+        /// the field entirely, keeping the request byte-identical to
+        /// before this flag existed.
+        #[arg(long, default_value_t = 0)]
+        scrollback: u32,
     },
     /// Persist a new tab ordering within a project. `--order`
     /// is a comma-separated list of tab ids in the target
@@ -1002,22 +1010,26 @@ async fn main() -> Result<()> {
                 )
                 .await?;
         }
-        Cmd::Tab(TabCmd::Dump { tab, json }) => {
+        Cmd::Tab(TabCmd::Dump {
+            tab,
+            json,
+            scrollback,
+        }) => {
             let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
             let result: TabDumpResult = client
-                .call(
-                    ops::TAB_DUMP,
-                    TabDumpParams {
-                        tab_id,
-                        ..Default::default()
-                    },
-                )
+                .call(ops::TAB_DUMP, TabDumpParams { tab_id, scrollback })
                 .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                // Plain text: one line per visible row, reconstructing
-                // the screen for `roostctl tab dump | grep …` assertions.
+                // Plain text: history rows then viewport rows, no
+                // separator between them, reconstructing the screen for
+                // `roostctl tab dump | grep …` assertions. `scrollback_text`
+                // is empty when `--scrollback` is omitted, so this is
+                // byte-identical to the pre-flag output.
+                for line in &result.scrollback_text {
+                    println!("{line}");
+                }
                 for line in &result.rows_text {
                     println!("{line}");
                 }
@@ -2022,6 +2034,41 @@ mod tests {
         })
         .to_string();
         assert!(passed.contains("not-found"), "{passed:?}");
+    }
+
+    /// `--scrollback` defaults to `0` — the wire value that
+    /// `TabDumpParams` omits entirely — and otherwise parses through
+    /// unvalidated (server-side clamping is the contract, not the CLI).
+    #[test]
+    fn dump_scrollback_defaults_to_zero_and_otherwise_parses_through() {
+        let args = Args::try_parse_from(["roostctl", "tab", "dump", "--tab", "7"])
+            .expect("a bare tab id parses");
+        let Cmd::Tab(TabCmd::Dump {
+            tab,
+            json,
+            scrollback,
+        }) = args.command
+        else {
+            panic!("expected tab dump")
+        };
+        assert_eq!(tab.as_deref(), Some("7"));
+        assert!(!json);
+        assert_eq!(scrollback, 0);
+
+        let args = Args::try_parse_from([
+            "roostctl",
+            "tab",
+            "dump",
+            "--tab",
+            "7",
+            "--scrollback",
+            "500",
+        ])
+        .expect("--scrollback takes a count");
+        let Cmd::Tab(TabCmd::Dump { scrollback, .. }) = args.command else {
+            panic!("expected tab dump")
+        };
+        assert_eq!(scrollback, 500);
     }
 
     /// `tab send-file` requires `--tab` — unlike every other per-tab
