@@ -39,7 +39,7 @@ use roost_engine::workspace::{REPLAY_BUDGET_BYTES, REPLAY_WINDOW};
 use roost_engine::{
     LocalClient, PtySupervisor, ReplayBounds, ServerVtConfig, ServerVtWorkspace, Workspace,
 };
-use roost_ipc::messages::{ops, AttachPayloadKind, SessionStopParams};
+use roost_ipc::messages::{ops, SessionStopParams};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::{IpcClient, IpcServer};
 use tokio::sync::{oneshot, watch};
@@ -104,6 +104,13 @@ pub struct SessionConfig {
     /// config — the session e2e lane drives it by spawning a daemon
     /// with the env var set.
     pub fake_libghostty_build: Option<String>,
+    /// Whether this session advertises the pre-`vt` payload kinds
+    /// ([`crate::consts::LEGACY_KINDS_ENV`]).
+    ///
+    /// `false` in every shipped run, filled the same way
+    /// `fake_libghostty_build` is: read from the environment once, at
+    /// the edge, and only while `test_mode` is on.
+    pub legacy_payload_kinds: bool,
     /// How many committed batches this session retains for
     /// `events.subscribe {from_revision}`, when a test wants a window it
     /// can drive past.
@@ -147,6 +154,7 @@ impl SessionConfig {
             files_fallback: profile.files_dir_fallback(),
             test_mode,
             fake_libghostty_build,
+            legacy_payload_kinds: identity::legacy_kinds_env(test_mode),
             replay_window,
         }
     }
@@ -239,17 +247,16 @@ pub async fn serve(
         started_at: identity::rfc3339_utc(std::time::SystemTime::now()),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         // Both answered for real now that every tab has a server
-        // terminal behind it. The build string is the negotiation: a
-        // client whose libghostty pin differs cannot decode this
-        // session's snapshots, and `tab.attach` refuses it by name
-        // rather than letting the mismatch surface as a corrupt screen.
-        payload_kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
+        // terminal behind it. The list is what `tab.attach` negotiates
+        // against, in preference order; `identity::payload_kinds` is
+        // the one place it is decided.
+        payload_kinds: identity::payload_kinds(config.legacy_payload_kinds, test_mode),
         // One string, both uses: what `session.identify` reports and
-        // what `tab.attach` compares against. A test-mode override
-        // therefore makes a build mismatch reproducible end to end
-        // without a second binary (plan 037 §3.7) — and cannot make the
-        // two disagree, which would be a failure mode no client could
-        // make sense of.
+        // what `tab.attach` compares a GHOSTSNP offer against. A
+        // test-mode override therefore makes a build mismatch
+        // reproducible end to end without a second binary (plan 037
+        // §3.7) — and cannot make the two disagree, which would be a
+        // failure mode no client could make sense of.
         //
         // `identity::build_identity` is the one place this resolution
         // happens — `roost-session identify` (plan 039 §3.1) answers the

@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
+use roost_ipc::messages::{AttachPayloadKind, SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 
 /// This build's offline identity: what `roost-session identify` prints,
 /// and what `serve`'s `session.identify` answer's `libghostty_build`
@@ -96,6 +96,39 @@ pub(crate) fn test_mode_env() -> (bool, Option<String>) {
         .flatten()
         .filter(|value| !value.is_empty());
     (test_mode, fake_libghostty_build)
+}
+
+/// Reads [`crate::consts::LEGACY_KINDS_ENV`], gated on test mode, the
+/// way [`test_mode_env`] reads the fake build.
+pub(crate) fn legacy_kinds_env(test_mode: bool) -> bool {
+    test_mode && std::env::var(crate::consts::LEGACY_KINDS_ENV).is_ok_and(|value| value == "1")
+}
+
+/// What a running session advertises as `session.identify.payload_kinds`
+/// — every kind `tab.attach` can negotiate, in the order this session
+/// prefers them.
+///
+/// GHOSTSNP first: it carries both screens, soft-wrap flags and per-cell
+/// hyperlinks, none of which survive a `vt` replay, so a client whose
+/// libghostty matches should never be talked out of it. `vt` is the
+/// fallback that makes a build skew connect at all.
+///
+/// `legacy_kinds` re-gates on `test_mode` here rather than trusting the
+/// caller's gate alone, for the same reason
+/// [`resolve_libghostty_build`] does: hand-built test config with
+/// `test_mode: false` still gets the shipped answer.
+pub(crate) fn payload_kinds(legacy_kinds: bool, test_mode: bool) -> Vec<AttachPayloadKind> {
+    if legacy_kinds && test_mode {
+        tracing::warn!(
+            "advertising the pre-vt payload kinds: {} is set in test mode",
+            crate::consts::LEGACY_KINDS_ENV
+        );
+        return vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)];
+    }
+    vec![
+        AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+        AttachPayloadKind::from(AttachPayloadKind::VT),
+    ]
 }
 
 fn resolve_libghostty_build(fake_libghostty_build: Option<&str>, test_mode: bool) -> String {
@@ -217,6 +250,29 @@ mod tests {
         assert_eq!(now.len(), 20, "{now}");
         assert!(now.ends_with('Z'), "{now}");
         assert_eq!(now.as_bytes()[10], b'T', "{now}");
+    }
+
+    /// The same double gate the fake build has: a shipped daemon cannot
+    /// be talked into hiding `vt`, which would send a build-skewed
+    /// client back to the restart prompt this kind exists to retire.
+    #[test]
+    fn the_legacy_kinds_override_only_applies_under_test_mode() {
+        let shipped = vec![
+            AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+            AttachPayloadKind::from(AttachPayloadKind::VT),
+        ];
+        assert_eq!(payload_kinds(false, true), shipped);
+        assert_eq!(payload_kinds(false, false), shipped);
+        assert_eq!(
+            payload_kinds(true, false),
+            shipped,
+            "the flag is inert outside test mode"
+        );
+        assert_eq!(
+            payload_kinds(true, true),
+            vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)],
+            "the pre-vt daemon shape"
+        );
     }
 
     #[test]

@@ -19,9 +19,13 @@ use std::time::Duration;
 
 use roost_engine::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use roost_engine::osc::{OscColorSnapshot, OscRgb};
-use roost_engine::tab_task::{ServerVtConfig, ServerVtWorkspace, TabCmd, TabError};
+use roost_engine::tab_task::{
+    ServerVtConfig, ServerVtWorkspace, TabCmd, TabError, SERVER_VT_CONTINUATION_MAX,
+};
 use roost_engine::{PtyOutputEvent, PtySupervisor, TabEffectKind};
-use roost_ipc::messages::{bytes_base64, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
+use roost_ipc::messages::{
+    bytes_base64, AttachPayloadKind, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -770,9 +774,12 @@ async fn a_snapshot_carries_the_fence_and_the_stream_identity() {
     let commands = sup.tab_commands(920).expect("server-vt tab task");
 
     feed(&commands, b"\x1b[2J\x1b[Hsnapshot me").await;
-    let snapshot = ask(&commands, TabCmd::Snapshot)
-        .await
-        .expect("the server terminal encodes");
+    let snapshot = ask(&commands, |reply| TabCmd::Snapshot {
+        kind: AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+        reply,
+    })
+    .await
+    .expect("the server terminal encodes");
     assert_eq!(snapshot.seq, 1, "the fence is the last assigned PTY seq");
     assert_eq!(snapshot.server_epoch, sup.server_epoch().expect("epoch"));
     assert_eq!(
@@ -781,8 +788,62 @@ async fn a_snapshot_carries_the_fence_and_the_stream_identity() {
     );
     assert!(!snapshot.bytes.is_empty(), "a snapshot has content");
 
+    // Every kind the encoder serves is named. An unknown one fails
+    // rather than falling back to GHOSTSNP, which would put libghostty's
+    // binary state on the wire under a name no build check guards.
+    let unknown = ask(&commands, |reply| TabCmd::Snapshot {
+        kind: AttachPayloadKind::from("sixel-mosaic-v9"),
+        reply,
+    })
+    .await;
+    assert!(
+        matches!(unknown, Err(TabError::SnapshotFailed(_))),
+        "an unknown kind is not encodable, got {:?}",
+        unknown.map(|encoded| encoded.bytes.len())
+    );
+
     drop(commands);
     sup.close(920);
+}
+
+/// A `vt` encode that found the parser inside a sequence longer than the
+/// retained continuation parks: only a later chunk can change the
+/// answer. A tab that exits has no later chunks, so the reply is owed
+/// *then* — leaving it parked would make an attach that can never be
+/// satisfied sit out the client's whole time budget before failing, and
+/// the re-attach it prompts land in the same dead state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_vt_encode_is_failed_by_the_tab_s_exit() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(925, "/tmp", &sh("read _"), 20, 6, &socket("vt-park"))
+        .expect("spawn");
+    let commands = sup.tab_commands(925).expect("server-vt tab task");
+
+    // A DCS left open, its body past what libghostty retains. DCS rather
+    // than OSC so the unfinished sequence has no side effect of its own.
+    let mut unfinished = Vec::from(&b"\x1bP"[..]);
+    unfinished.extend(std::iter::repeat_n(b'x', 2 * SERVER_VT_CONTINUATION_MAX));
+    feed(&commands, &unfinished).await;
+
+    let (reply, parked) = oneshot::channel();
+    commands
+        .send(TabCmd::Snapshot {
+            kind: AttachPayloadKind::from(AttachPayloadKind::VT),
+            reply,
+        })
+        .await
+        .expect("tab task is alive");
+    sup.close(925);
+
+    let answer = timeout(BUDGET, parked)
+        .await
+        .expect("the exit answers the parked encode")
+        .expect("the reply is not dropped");
+    assert!(
+        matches!(answer, Err(TabError::SnapshotFailed(_))),
+        "a tab that cannot ever be encoded says so: {answer:?}"
+    );
 }
 
 /// A resize orders the server terminal ahead of TIOCSWINSZ and drains

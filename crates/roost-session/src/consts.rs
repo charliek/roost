@@ -29,6 +29,18 @@ pub use roost_ipc::session_launch::{timeout_scale, LAUNCH_CWD_ENV, MAX_VERDICT_B
 /// one-line fixture instead.
 pub const FAKE_BUILD_ENV: &str = "ROOST_SESSION_FAKE_BUILD";
 
+/// Test-mode override that makes this session advertise the payload
+/// kinds it had before `vt` existed — `["ghostty-snapshot"]` alone.
+///
+/// Read **only** when `ROOST_TEST_MODE=1`. A session that advertises
+/// `vt` lets a build-skewed client attach in fallback instead of being
+/// refused, which is the whole point of R3 — and which retires the only
+/// end-to-end route to the client's "this session needs a restart"
+/// flow. Setting this brings the pre-R3 daemon shape back so that flow
+/// keeps a test, the same way [`FAKE_BUILD_ENV`] keeps `build-mismatch`
+/// reachable without a second Ghostty pin.
+pub const LEGACY_KINDS_ENV: &str = "ROOST_SESSION_LEGACY_KINDS";
+
 /// Batch count for the workspace replay ring, overriding
 /// `roost_engine::workspace::REPLAY_WINDOW`.
 ///

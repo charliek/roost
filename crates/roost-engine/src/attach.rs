@@ -21,6 +21,14 @@
 //! through the READY record goes at full speed: that prefix is what the
 //! client renders from, and the history behind it is catch-up.
 //!
+//! How a client knows the snapshot half is over depends on the
+//! negotiated payload kind. GHOSTSNP says so inside its own framing (a
+//! FINISH record), so the pump sends nothing extra. A `vt` payload is a
+//! bare byte stream with no internal marks at all, so the pump ends it
+//! with **one zero-length SNAP frame** — the meaning `dataframe.rs`
+//! reserved for the empty frame, and the reason the whole payload, not
+//! a prefix of it, is what PTY traffic is held behind there.
+//!
 //! # The fence, and why gaps are fatal
 //!
 //! The forwarder subscribes to the tab's tee **before** it asks for the
@@ -75,7 +83,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::ipc::IpcHandler;
+use crate::ipc::{AdmittedAttach, IpcHandler};
 use crate::pty::PtyOutputEvent;
 use crate::tab_task::{SnapshotAt, TabCmd, TabError};
 
@@ -89,6 +97,25 @@ pub const SNAP_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 /// Cap on PTY bytes read off the tee but not yet written. Past it the
 /// peer is not reading and the connection ends rather than growing.
 pub const FORWARDER_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on one SNAP frame of a `vt` payload — deliberately far below
+/// [`MAX_DATA_FRAME_BYTES`], and for `vt` only.
+///
+/// The pump drains the tab's tee *between* writes, never during one, and
+/// a `vt` payload holds every PTY frame behind it (its ready prefix is
+/// the whole payload, not a marked prefix of it). So one write is a
+/// window in which the tee has to absorb everything the child produces:
+/// past the output broadcast's depth — 256 chunks of at most 4 KiB,
+/// about a megabyte — the subscription lags, and a lag ends the
+/// attach as `desync`, not as the `overflow` that
+/// [`FORWARDER_QUEUE_BYTES`] reports and that a re-attach recovers from
+/// cleanly. At 64 KiB a child has to outrun the client's link by ~16x
+/// *within a single write* to reach that; anything slower accumulates in
+/// the held batch instead, where the queue cap bounds it and names the
+/// failure correctly. The cost is 16 writes per megabyte instead of one.
+///
+/// GHOSTSNP keeps the full frame: its hold ends at READY, which is a
+/// prefix of the payload and not the whole of it.
+pub const VT_SNAP_FRAME_BYTES: usize = 64 * 1024;
 /// Cap on what one attach carries before its snapshot finishes: the
 /// snapshot payload plus the live PTY payload written alongside it.
 /// Counting only the snapshot would let an endless producer ride an
@@ -160,15 +187,7 @@ pub(crate) async fn serve_attach(
     };
 
     let tab_id = admitted.tab_id;
-    let outcome = attach_tab(
-        h,
-        admitted.tab_generation,
-        tab_id,
-        &handshake,
-        reader,
-        writer,
-        close,
-    );
+    let outcome = attach_tab(h, &admitted, &handshake, reader, writer, close);
     // Registered under the lease by the admission; deregistered here
     // however the forwarder ended, so a tab that is attached and
     // detached repeatedly does not accumulate entries.
@@ -179,13 +198,15 @@ pub(crate) async fn serve_attach(
 /// Fence the tab, answer the handshake, and pump until the end.
 async fn attach_tab(
     h: &IpcHandler,
-    tab_generation: u64,
-    tab_id: i64,
+    admitted: &AdmittedAttach,
     handshake: &AttachHandshake,
     reader: DataFrameReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     close: ConnCloseWatch,
 ) {
+    let tab_id = admitted.tab_id;
+    let tab_generation = admitted.tab_generation;
+    let kind = &admitted.kind;
     // Started before the snapshot is asked for, not after it arrives:
     // the encode queues behind `MAX_CONCURRENT_SNAPSHOTS` and is exactly
     // the part of an attach the time budget exists to bound.
@@ -195,7 +216,7 @@ async fn attach_tab(
     // under the same reply (D6).
     let attached = match resume_tab(h, tab_generation, tab_id, handshake).await {
         Some(attached) => attached,
-        None => match fence_tab(h, tab_generation, tab_id).await {
+        None => match fence_tab(h, tab_generation, tab_id, kind).await {
             Ok(fenced) => fenced,
             Err((code, message)) => {
                 reject(&mut writer, code, &message).await;
@@ -212,6 +233,8 @@ async fn attach_tab(
         tab_generation: live_generation,
         snapshot,
         ready_end,
+        terminator,
+        snap_frame_bytes,
         replay,
         stored_exit,
     } = attached;
@@ -229,7 +252,10 @@ async fn attach_tab(
     }
 
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
-        kind: AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+        // What `tab.attach` negotiated, carried here on the ticket: the
+        // data connection presents only a token, and a client that
+        // decoded the reply is entitled to hear the same answer twice.
+        kind: kind.clone(),
         mode,
         seq: fence,
         server_epoch,
@@ -253,6 +279,8 @@ async fn attach_tab(
         close,
         snapshot,
         ready_end,
+        terminator,
+        snap_frame_bytes,
         replay,
         stored_exit,
         fence,
@@ -279,6 +307,15 @@ struct Attached {
     /// Empty in resume mode — the client already has this history.
     snapshot: Vec<u8>,
     ready_end: usize,
+    /// Whether a zero-length `SNAP` frame ends the snapshot half.
+    ///
+    /// `vt`'s payload is a byte stream with no internal marker, so the
+    /// end of it is the only thing that can tell a client its terminal
+    /// is complete; GHOSTSNP carries FINISH and sends no empty frame.
+    /// False on a resume, which has no snapshot half at all.
+    terminator: bool,
+    /// Cap on one SNAP frame — see [`VT_SNAP_FRAME_BYTES`].
+    snap_frame_bytes: usize,
     /// Pre-fence records from the replay ring, sent as ordinary PTY
     /// frames ahead of the live tee. Empty in snapshot mode.
     replay: Vec<(u64, Vec<u8>)>,
@@ -295,6 +332,7 @@ async fn fence_tab(
     h: &IpcHandler,
     tab_generation: u64,
     tab_id: i64,
+    kind: &AttachPayloadKind,
 ) -> Result<Attached, (&'static str, String)> {
     let no_terminal = || ("not-found", "that tab has no live terminal".to_string());
     // Subscribed FIRST, before the snapshot is even asked for: the
@@ -321,7 +359,7 @@ async fn fence_tab(
         ));
     }
 
-    let snapshot = take_snapshot(&commands)
+    let snapshot = take_snapshot(&commands, kind)
         .await
         .map_err(|error| match error {
             // Re-attach is the recovery: the failure is about the terminal's
@@ -341,12 +379,21 @@ async fn fence_tab(
         ));
     }
 
-    let ready_end = roost_vt::ready_boundary(&snapshot.bytes).map_err(|error| {
-        (
-            "snapshot-failed",
-            format!("the encoded snapshot has no READY record: {error}"),
-        )
-    })?;
+    // What the client renders from, held ahead of every live PTY frame.
+    // GHOSTSNP marks it with a READY record partway through; a `vt`
+    // stream has no such marker, so its ready prefix is the whole
+    // payload — a client cannot draw a partially replayed screen.
+    let is_vt = kind.as_str() == AttachPayloadKind::VT;
+    let ready_end = if is_vt {
+        snapshot.bytes.len()
+    } else {
+        roost_vt::ready_boundary(&snapshot.bytes).map_err(|error| {
+            (
+                "snapshot-failed",
+                format!("the encoded snapshot has no READY record: {error}"),
+            )
+        })?
+    };
 
     Ok(Attached {
         tee,
@@ -357,6 +404,12 @@ async fn fence_tab(
         tab_generation: snapshot.tab_generation,
         snapshot: snapshot.bytes,
         ready_end,
+        terminator: is_vt,
+        snap_frame_bytes: if is_vt {
+            VT_SNAP_FRAME_BYTES
+        } else {
+            MAX_DATA_FRAME_BYTES
+        },
         replay: Vec::new(),
         stored_exit: None,
     })
@@ -431,18 +484,39 @@ async fn resume_tab(
         tab_generation: live_generation,
         snapshot: Vec::new(),
         ready_end: 0,
+        terminator: false,
+        snap_frame_bytes: MAX_DATA_FRAME_BYTES,
         replay: resumed.slice,
         stored_exit: resumed.stored_exit,
     })
 }
 
-async fn take_snapshot(commands: &mpsc::Sender<TabCmd>) -> Result<SnapshotAt, TabError> {
+async fn take_snapshot(
+    commands: &mpsc::Sender<TabCmd>,
+    kind: &AttachPayloadKind,
+) -> Result<SnapshotAt, TabError> {
     let (reply_tx, reply_rx) = oneshot::channel();
     commands
-        .send(TabCmd::Snapshot(reply_tx))
+        .send(TabCmd::Snapshot {
+            kind: kind.clone(),
+            reply: reply_tx,
+        })
         .await
         .map_err(|_| TabError::Gone)?;
-    reply_rx.await.map_err(|_| TabError::Gone)?
+    // Bounded here and not only in the pump: a `vt` encode defers while
+    // the parser sits mid-sequence with no retained continuation
+    // (`vt_dump`'s step 9), so this wait covers a terminal that never
+    // reaches a carryable state as well as the permit queue. Without it
+    // the budget the pump measures from the fence would never be
+    // reached, because the pump does not start until this returns.
+    tokio::time::timeout(ATTACH_TIME_BUDGET, reply_rx)
+        .await
+        .map_err(|_| {
+            TabError::SnapshotFailed(format!(
+                "the snapshot did not arrive within {ATTACH_TIME_BUDGET:?}"
+            ))
+        })?
+        .map_err(|_| TabError::Gone)?
 }
 
 /// Everything one live attach owns.
@@ -456,6 +530,10 @@ struct Pump {
     /// pump inert: no frames, no budgets, no scheduling floors.
     snapshot: Vec<u8>,
     ready_end: usize,
+    /// See [`Attached::terminator`].
+    terminator: bool,
+    /// See [`Attached::snap_frame_bytes`].
+    snap_frame_bytes: usize,
     /// Ring records replayed as PTY frames before the live tee.
     replay: Vec<(u64, Vec<u8>)>,
     stored_exit: Option<(u64, i32)>,
@@ -500,6 +578,10 @@ impl Pump {
         let client_task = tokio::spawn(read_client(reader, client_tx));
 
         let mut sent = 0usize;
+        // The end-of-snapshot marker `vt` owes its client, still unsent.
+        // Always false for GHOSTSNP, which is what makes every branch
+        // below reduce to exactly today's behaviour there.
+        let mut terminator_due = self.terminator;
         let mut pty_since_snap = 0usize;
         // PTY payload written while the snapshot was still going out.
         // It shares [`ATTACH_BYTE_BUDGET`] with the snapshot: what the
@@ -576,7 +658,12 @@ impl Pump {
             // active screen, sent at full speed) and stays bounded by
             // the queue cap below; the burst floor is irrelevant while
             // holding because no interleaving decision exists yet.
-            let holding = sent < self.ready_end;
+            // The terminator keeps the hold open past the payload's
+            // last byte: a PTY frame written between the two would put
+            // live output ahead of the marker that says the snapshot is
+            // over, and a client applying it would be writing into a
+            // terminal it has not finished building.
+            let holding = sent < self.ready_end || terminator_due;
             let mut drained_any = false;
             while tee.streaming() && (holding || tee.payload_bytes < PTY_BURST_BYTES) {
                 match self.tee.try_recv() {
@@ -628,7 +715,7 @@ impl Pump {
             // 4. EXIT is always the final frame, and it goes out only
             //    once everything before it has.
             if let Some((seq, code)) = tee.exit {
-                if sent >= self.snapshot.len() {
+                if sent >= self.snapshot.len() && !terminator_due {
                     let mut payload = seq.to_le_bytes().to_vec();
                     payload.extend_from_slice(&code.to_le_bytes());
                     let mut frame = Vec::new();
@@ -646,7 +733,7 @@ impl Pump {
             }
 
             // 5. Snapshot progress.
-            if sent < self.snapshot.len() {
+            if sent < self.snapshot.len() || terminator_due {
                 if self.started.elapsed() > ATTACH_TIME_BUDGET {
                     break Ending::Fault {
                         code: "desync",
@@ -671,7 +758,11 @@ impl Pump {
                 // `PTY_BURST_BYTES` of payload (step 2) — so the burst
                 // floor cannot be overrun by more than the record that
                 // crossed it.
-                let head = sent < self.ready_end;
+                // The terminator belongs to the head for the same
+                // reason the payload does: it is the frame that tells a
+                // `vt` client its terminal is complete, so pacing it
+                // against PTY would delay the client's first paint.
+                let head = sent < self.ready_end || terminator_due;
                 let due = !drained_any
                     || pty_since_snap >= PTY_BURST_BYTES
                     || last_snap.elapsed() >= SNAP_PROGRESS_INTERVAL;
@@ -679,15 +770,36 @@ impl Pump {
                     // Frames stop at the READY boundary so it stays
                     // observable on the wire rather than being buried
                     // mid-frame.
-                    let limit = if head {
+                    // Deliberately NOT `head`: that one includes the
+                    // terminator, and a kind whose ready prefix stopped
+                    // short of its payload would then cap `limit` at a
+                    // boundary already reached and make no progress.
+                    let limit = if sent < self.ready_end {
                         self.ready_end
                     } else {
                         self.snapshot.len()
                     };
-                    let end = limit.min(sent + MAX_DATA_FRAME_BYTES);
+                    let end = limit.min(sent + self.snap_frame_bytes);
                     snap.clear();
-                    let _ =
-                        write_data_frame(&mut snap, FRAME_SNAP, &self.snapshot[sent..end]).await;
+                    // Guarded, not assumed: a `vt` payload always
+                    // carries at least a cursor address, so `len == 0`
+                    // does not arise today — but "there are bytes for
+                    // this frame" and "the payload is fully out" are
+                    // separate questions, and the marker below must not
+                    // hang off the first one.
+                    if end > sent {
+                        let _ = write_data_frame(&mut snap, FRAME_SNAP, &self.snapshot[sent..end])
+                            .await;
+                    }
+                    // Written into the SAME buffer as the final payload
+                    // frame, never on a later pass: the next pass
+                    // flushes held PTY and may write EXIT, and both "no
+                    // PTY precedes the terminator" and "EXIT is last"
+                    // have to hold.
+                    if terminator_due && end == self.snapshot.len() {
+                        let _ = write_data_frame(&mut snap, FRAME_SNAP, &[]).await;
+                        terminator_due = false;
+                    }
                     if let Some(ending) = self.write_all(&snap).await {
                         break ending;
                     }
@@ -700,7 +812,7 @@ impl Pump {
 
             // 6. Nothing to do without waiting.
             let snap_due = last_snap + SNAP_PROGRESS_INTERVAL;
-            let more_snapshot = sent < self.snapshot.len();
+            let more_snapshot = sent < self.snapshot.len() || terminator_due;
             tokio::select! {
                 biased;
                 reason = self.close.closed() => break Ending::Closed(reason),

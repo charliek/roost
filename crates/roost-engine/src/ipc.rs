@@ -1226,15 +1226,22 @@ struct AttachToken {
     lease: String,
     tab_id: i64,
     tab_generation: u64,
+    /// What `tab.attach` negotiated. Carried on the ticket because the
+    /// data connection presents only the token: the encode and the
+    /// handshake reply both have to name the kind the control op
+    /// settled on, and re-deriving it there would let the two answers
+    /// drift.
+    kind: AttachPayloadKind,
     expires_at: std::time::Instant,
 }
 
 /// What consuming a token admitted, handed to the forwarder.
 #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct AdmittedAttach {
     pub(crate) tab_id: i64,
     pub(crate) tab_generation: u64,
+    pub(crate) kind: AttachPayloadKind,
 }
 
 struct Lease {
@@ -1556,6 +1563,7 @@ impl ClientRegistry {
         lease: &str,
         tab_id: i64,
         tab_generation: u64,
+        kind: AttachPayloadKind,
         ttl: Duration,
     ) -> Result<String, HandlerError> {
         let now = std::time::Instant::now();
@@ -1588,6 +1596,7 @@ impl ClientRegistry {
             lease: lease.to_string(),
             tab_id,
             tab_generation,
+            kind,
             expires_at: now + ttl,
         });
         Ok(token)
@@ -1655,6 +1664,7 @@ impl ClientRegistry {
             AdmittedAttach {
                 tab_id: ticket.tab_id,
                 tab_generation: ticket.tab_generation,
+                kind: ticket.kind,
             },
             displaced,
         ))
@@ -1798,12 +1808,13 @@ impl SessionState {
         lease: &str,
         tab_id: i64,
         tab_generation: u64,
+        kind: AttachPayloadKind,
     ) -> Result<String, HandlerError> {
         let mut guard = lock(&self.clients);
         if self.stopping.load(Ordering::Acquire) {
             return Err(shutting_down());
         }
-        guard.mint_token(lease, tab_id, tab_generation, self.attach_token_ttl())
+        guard.mint_token(lease, tab_id, tab_generation, kind, self.attach_token_ttl())
     }
 
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
@@ -2684,10 +2695,11 @@ async fn dispatch_outcome(
 ///
 /// The validation order is pinned (D5) and each earlier failure wins,
 /// because the codes instruct differently: `connect-required` means "go
-/// get a lease", `not-found` means "that tab is gone", `unsupported-kind`
-/// and `build-mismatch` both mean "we cannot talk", and only then does
-/// geometry get looked at. Reordering would tell a client to fix the
-/// wrong thing.
+/// get a lease", `not-found` means "that tab is gone",
+/// `unsupported-kind` means "offer something else", `build-mismatch`
+/// means "the offer we could serve needs the same libghostty on both
+/// ends", and only then does geometry get looked at. Reordering would
+/// tell a client to fix the wrong thing.
 #[cfg(feature = "server-vt")]
 async fn tab_attach(
     h: &IpcHandler,
@@ -2704,43 +2716,75 @@ async fn tab_attach(
         HandlerError::not_found(format!("tab {} has no live terminal to attach", p.tab_id))
     })?;
 
-    // A list mixing kinds this build has never heard of with one it
+    // A list mixing kinds this build has never heard of with ones it
     // serves is fine — the client states a preference order and the
-    // first servable entry wins. "Servable" is what `session.identify`
-    // ADVERTISED (`payload_kinds`), intersected with what this build
-    // can actually encode — the advertisement is the contract a client
+    // first entry that is both *servable* and *eligible* wins.
+    //
+    // Servable is what `session.identify` ADVERTISED
+    // (`payload_kinds`): the advertisement is the contract a client
     // negotiated against, so a kind absent from it must not be accepted
-    // even when the code could produce it.
-    let kind = p
+    // even when the code could produce it. Eligible is the kind's own
+    // requirement, which only GHOSTSNP has — it is libghostty's binary
+    // state, so both ends must be the same build.
+    //
+    // The two refusals stay separate because they instruct differently.
+    // Nothing servable at all is "offer something else"; servable but
+    // ineligible is "the two builds disagree", which is the answer a
+    // pre-`vt` client's whole restart flow hangs off. Splitting the walk
+    // in two is what keeps them apart: a client offering
+    // `[ghostty-snapshot, vt]` across a skew must land on `vt` rather
+    // than on either refusal.
+    let servable: Vec<&AttachPayloadKind> = p
         .kinds
         .iter()
-        .find(|kind| {
-            kind.as_str() == AttachPayloadKind::GHOSTTY_SNAPSHOT
-                && session.info.payload_kinds.contains(kind)
-        })
-        .cloned()
-        .ok_or_else(|| {
-            HandlerError::new(
-                "unsupported-kind",
-                format!(
-                    "this session serves {:?}; the client offered {:?}",
-                    session.info.payload_kinds, p.kinds
-                ),
-            )
-        })?;
-
-    // Exact match, both strings named: two libghostty builds that
-    // disagree cannot exchange a snapshot, and a client that sees only
-    // "mismatch" cannot tell which side to upgrade.
-    if p.libghostty_build != session.info.libghostty_build {
+        .filter(|kind| session.info.payload_kinds.contains(kind))
+        .collect();
+    if servable.is_empty() {
         return Err(HandlerError::new(
+            "unsupported-kind",
+            format!(
+                "this session serves {:?}; the client offered {:?}",
+                session.info.payload_kinds, p.kinds
+            ),
+        ));
+    }
+    let builds_match = p.libghostty_build == session.info.libghostty_build;
+    let mut eligible = None;
+    for kind in servable {
+        let holds = match kind.as_str() {
+            AttachPayloadKind::GHOSTTY_SNAPSHOT => builds_match,
+            // `vt` is a byte stream any VT parser replays, so the build
+            // it was encoded against is not this gate's business.
+            AttachPayloadKind::VT => true,
+            // Advertised by this session and unknown to this code, which
+            // can only be a misconfigured advertisement. Refused rather
+            // than waved through: "no requirement" is the answer for a
+            // kind whose requirement is *known* to be none, and guessing
+            // it for an unknown one is how a build-skewed client gets
+            // served GHOSTSNP under another name.
+            other => {
+                return Err(HandlerError::new(
+                    "internal",
+                    format!("this session advertises {other:?}, which it cannot serve"),
+                ))
+            }
+        };
+        if holds {
+            eligible = Some(kind.clone());
+            break;
+        }
+    }
+    // Exact match, both strings named: a client that sees only
+    // "mismatch" cannot tell which side to upgrade.
+    let kind = eligible.ok_or_else(|| {
+        HandlerError::new(
             "build-mismatch",
             format!(
                 "this session is {:?}; the client is {:?}",
                 session.info.libghostty_build, p.libghostty_build
             ),
-        ));
-    }
+        )
+    })?;
 
     // Zero cell pixels are legal — a headless client has no cell metrics
     // to report — but a zero-sized grid is not a grid.
@@ -2785,7 +2829,8 @@ async fn tab_attach(
             ))
         })?;
 
-    let attach_token = session.mint_attach_token(&p.lease, p.tab_id, tab_generation)?;
+    let attach_token =
+        session.mint_attach_token(&p.lease, p.tab_id, tab_generation, kind.clone())?;
     encode(&TabAttachResult {
         attach_token,
         kind,

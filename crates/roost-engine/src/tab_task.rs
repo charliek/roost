@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use portable_pty::PtySize;
-use roost_ipc::messages::{ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
+use roost_ipc::messages::{AttachPayloadKind, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
 use roost_vt::{Cell, Colors, CursorInfo, RenderState, RenderedRow, Terminal, TerminalOptions};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
@@ -71,6 +71,10 @@ pub const MAX_CONCURRENT_SNAPSHOTS: usize = 4;
 /// How often the task retries a PTY write it could not hand off because
 /// the writer channel was full.
 const PENDING_FLUSH_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+/// Why a parked `vt` encode gives up: nothing more will be ingested, so
+/// the parser can never leave the sequence it is stuck inside.
+const EXITED_MID_SEQUENCE: &str =
+    "the tab exited while its parser was inside an unfinished sequence too long to carry";
 
 /// The headless default theme. libghostty leaves fg/bg unset until
 /// something pushes them, and both the OSC color seed and the dump's
@@ -292,7 +296,14 @@ pub enum TabCmd {
     /// it is newer than the last one it took, so a stale fan-out racing
     /// a fresh one can never roll a terminal's colors back.
     SetTheme(OscColorSnapshot, u64),
-    Snapshot(oneshot::Sender<Result<SnapshotAt, TabError>>),
+    /// Encode this tab's terminal as the attach payload `kind`, fenced
+    /// at the last assigned PTY seq. The kind is the one `tab.attach`
+    /// negotiated and rides on the attach ticket, so the encode and the
+    /// handshake reply cannot disagree about what was produced.
+    Snapshot {
+        kind: AttachPayloadKind,
+        reply: oneshot::Sender<Result<SnapshotAt, TabError>>,
+    },
     Resume {
         from_seq: u64,
         reply: oneshot::Sender<Result<ResumeAt, TabError>>,
@@ -432,6 +443,9 @@ impl TabVt {
             capture,
             captured: Vec::new(),
             stored_exit: None,
+            deferred_snapshots: Vec::new(),
+            deferred_at: 0,
+            ingested: 0,
         };
         let theme_generation = task.vt.theme_generation;
         tokio::spawn(task.run(bytes_rx, exit_rx, cmd_rx));
@@ -506,6 +520,29 @@ struct TabTask {
     /// internally consistent, but nothing more is teed or ringed — the
     /// row is gone.
     stored_exit: Option<(u64, i32)>,
+    /// Attach requests whose `vt` encode found the parser mid-sequence
+    /// with libghostty's retained continuation unavailable — an
+    /// unfinished sequence longer than [`SERVER_VT_CONTINUATION_MAX`].
+    /// There is nothing encodable at that instant: a payload without the
+    /// cut bytes would leave the client's parser in a different state
+    /// than the server's, and the first live PTY frame would complete
+    /// the sequence on one side only.
+    ///
+    /// So the request waits rather than failing. It is retried after the
+    /// next chunk and answered at the first one that yields bytes, with
+    /// the fence seq moving to that chunk. Two things end the wait: the
+    /// tab's exit, after which no chunk can arrive at all
+    /// ([`Self::publish_exit`]), and otherwise the attach side's own
+    /// time budget.
+    deferred_snapshots: Vec<oneshot::Sender<Result<SnapshotAt, TabError>>>,
+    /// [`Self::ingested`] as of the last deferred-encode attempt, so a
+    /// retry is even asked its cheap question only when a chunk has
+    /// actually arrived to change the answer.
+    deferred_at: u64,
+    /// Chunks this task has put through [`Self::ingest`], counted rather
+    /// than derived from `last_byte_seq` because a chunk arriving after
+    /// the wire closed is assigned no seq and still moves the parser.
+    ingested: u64,
 }
 
 impl TabTask {
@@ -534,6 +571,9 @@ impl TabTask {
             // taken on, so a writer channel that drained since the last
             // pass is used immediately.
             self.flush_writer();
+            // Here and not at the end of `ingest`, which is synchronous
+            // while the encode's permit is an await.
+            self.retry_deferred_snapshots().await;
             // Deliberately NOT `biased`: a fixed poll order would let a
             // saturated command channel starve PTY ingestion (stalling
             // the child) or the reverse; random polling gives both sides
@@ -598,8 +638,95 @@ impl TabTask {
         self.stored_exit.is_some()
     }
 
+    /// Encode the server terminal as one attach payload. `Ok(None)` is
+    /// `vt`'s wait state only — see [`Self::deferred_snapshots`]; the
+    /// error is already a message, because the only thing done with it
+    /// is to hand it to whoever asked.
+    fn encode(&mut self, kind: &AttachPayloadKind) -> Result<Option<Vec<u8>>, String> {
+        match kind.as_str() {
+            AttachPayloadKind::VT => roost_vt::vt_snapshot(&self.vt.terminal, &mut self.vt.render)
+                .map_err(|error| error.to_string()),
+            AttachPayloadKind::GHOSTTY_SNAPSHOT => self
+                .vt
+                .terminal
+                .snapshot()
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            // Named rather than defaulted: encoding an unknown kind as
+            // GHOSTSNP would put libghostty's binary state on the wire
+            // under another name, past the build check that kind exists
+            // to enforce — the corrupt screen `build-mismatch` prevents.
+            other => Err(format!("this build cannot encode a {other:?} payload")),
+        }
+    }
+
+    fn snapshot_at(&self, seq: u64, bytes: Vec<u8>) -> SnapshotAt {
+        SnapshotAt {
+            seq,
+            server_epoch: self.vt.state.server_epoch,
+            tab_generation: self.vt.tab_generation,
+            bytes,
+        }
+    }
+
+    /// Park an encode that had nothing to carry — unless the wire is
+    /// already closed, in which case no chunk can ever arrive to change
+    /// the answer and the wait would only burn the attach's whole time
+    /// budget before failing anyway.
+    fn defer_snapshot(&mut self, reply: oneshot::Sender<Result<SnapshotAt, TabError>>) {
+        if self.wire_closed() {
+            let _ = reply.send(Err(TabError::SnapshotFailed(EXITED_MID_SEQUENCE.into())));
+            return;
+        }
+        self.deferred_at = self.ingested;
+        self.deferred_snapshots.push(reply);
+    }
+
+    fn fail_deferred_snapshots(&mut self, why: &str) {
+        for reply in std::mem::take(&mut self.deferred_snapshots) {
+            let _ = reply.send(Err(TabError::SnapshotFailed(why.to_string())));
+        }
+    }
+
+    /// Re-attempt every deferred encode, once a chunk has moved the
+    /// parser. Always as `vt`, because that is the only kind that can
+    /// defer. The fence moves with the retry: `last_byte_seq` is read
+    /// now, so the payload and the seq a client streams from describe
+    /// the same instant.
+    async fn retry_deferred_snapshots(&mut self) {
+        self.deferred_snapshots.retain(|reply| !reply.is_closed());
+        if self.deferred_snapshots.is_empty() || self.ingested == self.deferred_at {
+            return;
+        }
+        self.deferred_at = self.ingested;
+        // The cheap question first, and before the permit: a tab
+        // streaming one long unterminated sequence gets here on every
+        // chunk, and taking the global encode permit to compose nothing
+        // would stall this tab's own ingestion — and every other tab's
+        // encode — once per chunk.
+        match roost_vt::vt_carryable(&self.vt.terminal) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => return self.fail_deferred_snapshots(&error.to_string()),
+        }
+        let seq = self.last_byte_seq;
+        let _permit = Arc::clone(&self.vt.state.snapshot_permits)
+            .acquire_owned()
+            .await;
+        match self.encode(&AttachPayloadKind::from(AttachPayloadKind::VT)) {
+            Ok(None) => {}
+            Ok(Some(bytes)) => {
+                for reply in std::mem::take(&mut self.deferred_snapshots) {
+                    let _ = reply.send(Ok(self.snapshot_at(seq, bytes.clone())));
+                }
+            }
+            Err(why) => self.fail_deferred_snapshots(&why),
+        }
+    }
+
     /// One chunk through the whole pipeline, in the order §3 pins.
     fn ingest(&mut self, data: Vec<u8>) {
+        self.ingested += 1;
         // 1. seq — the tab task is the single authority (D3).
         let seq = (!self.wire_closed()).then(|| {
             let seq = self.next_seq;
@@ -798,6 +925,11 @@ impl TabTask {
             seq: final_seq,
             code,
         });
+        // The wire is closed, so no chunk can arrive to make a parked
+        // encode carryable. Failing them here is what turns an attach
+        // that can never be satisfied into a prompt `snapshot-failed`
+        // instead of one that sits out the client's whole attach budget.
+        self.fail_deferred_snapshots(EXITED_MID_SEQUENCE);
         self.vt.state.workspace.close_row(self.tab_id);
     }
 
@@ -863,7 +995,7 @@ impl TabTask {
                 // whatever wrote next.
                 self.take_replies();
             }
-            TabCmd::Snapshot(reply) => {
+            TabCmd::Snapshot { kind, reply } => {
                 let seq = self.last_byte_seq;
                 // Bounds aggregate encode memory across tabs. Held only
                 // around the encode, which is synchronous by C-API
@@ -871,17 +1003,18 @@ impl TabTask {
                 let _permit = Arc::clone(&self.vt.state.snapshot_permits)
                     .acquire_owned()
                     .await;
-                let encoded = self
-                    .vt
-                    .terminal
-                    .snapshot()
-                    .map_err(|error| TabError::SnapshotFailed(error.to_string()));
-                let _ = reply.send(encoded.map(|bytes| SnapshotAt {
-                    seq,
-                    server_epoch: self.vt.state.server_epoch,
-                    tab_generation: self.vt.tab_generation,
-                    bytes,
-                }));
+                match self.encode(&kind) {
+                    Ok(Some(bytes)) => {
+                        let _ = reply.send(Ok(self.snapshot_at(seq, bytes)));
+                    }
+                    // Not a failure: the parser is mid-sequence with no
+                    // retained continuation, so nothing encodable exists
+                    // yet. See [`Self::deferred_snapshots`].
+                    Ok(None) => self.defer_snapshot(reply),
+                    Err(why) => {
+                        let _ = reply.send(Err(TabError::SnapshotFailed(why)));
+                    }
+                }
             }
             TabCmd::Resume { from_seq, reply } => {
                 let _ = reply.send(self.resume(from_seq));

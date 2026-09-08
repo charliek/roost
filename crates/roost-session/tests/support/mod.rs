@@ -137,6 +137,10 @@ impl Layout {
             // mismatch fixture is driven out of process by the session
             // e2e lane, which spawns a daemon with the env var set.
             fake_libghostty_build: None,
+            // Likewise: these sessions advertise the shipped kinds, so
+            // `vt` is negotiable here. The pre-R3 shape is driven out of
+            // process by the host-client e2e lane.
+            legacy_payload_kinds: false,
             // Likewise: the shipped window, which no in-process test
             // drives past.
             replay_window: None,

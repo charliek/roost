@@ -69,7 +69,21 @@ impl ServerVtWorkspace for NoopWorkspace {
     fn tab_effect(&self, _tab_id: i64, _effect: roost_engine::TabEffectKind) {}
 }
 
+/// A session advertising both payload kinds, the way a shipped
+/// `roost-session` does.
 async fn harness() -> Harness {
+    harness_advertising(&[AttachPayloadKind::GHOSTTY_SNAPSHOT, AttachPayloadKind::VT]).await
+}
+
+/// The same, stating what `session.identify` advertises — the pre-`vt`
+/// daemon shape is one entry, and negotiation is defined against the
+/// advertisement, not against what the code can encode.
+async fn harness_advertising(payload_kinds: &[&str]) -> Harness {
+    let payload_kinds: Vec<AttachPayloadKind> = payload_kinds
+        .iter()
+        .copied()
+        .map(AttachPayloadKind::from)
+        .collect();
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("roost.sock");
     let workspace = Arc::new(Workspace::open(dir.path().join("state.json")));
@@ -93,7 +107,7 @@ async fn harness() -> Harness {
             session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
             started_at: "2026-08-27T14:03:11Z".into(),
             app_version: "9.9.9".into(),
-            payload_kinds: vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)],
+            payload_kinds,
             libghostty_build: roost_vt::libghostty_build(),
             default_tab_size: (80, 24),
             test_mode: true,
@@ -672,6 +686,125 @@ async fn a_malformed_handshake_is_answered_as_a_rejection() {
         .await
         .expect_err("an undecodable handshake is refused");
     assert_eq!(error.code, "parse-error");
+}
+
+/// Negotiation is by eligibility, not by a hard-coded kind: the client's
+/// list is walked in order and the first entry that is both *servable*
+/// (advertised by this session) and *eligible* (its own requirement
+/// holds) wins.
+///
+/// The skew is produced from the client's side, which is the only side a
+/// test can move: the session reports the real build, and a client
+/// claiming a different one is exactly the upgrade trap R3 exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_servable_and_eligible_kind_wins() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let skewed = "ghostty-0000000000000000+snapshot.v1";
+
+    let mut both = attach_params(&lease, tab_id);
+    both.kinds = vec![
+        AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+        AttachPayloadKind::from(AttachPayloadKind::VT),
+    ];
+    assert_eq!(
+        attach_with(&mut client, both.clone())
+            .await
+            .expect("a matching build serves its first choice")
+            .kind
+            .as_str(),
+        AttachPayloadKind::GHOSTTY_SNAPSHOT,
+        "GHOSTSNP is preferred whenever it is eligible"
+    );
+
+    let mut both_skewed = both.clone();
+    both_skewed.libghostty_build = skewed.into();
+    assert_eq!(
+        attach_with(&mut client, both_skewed)
+            .await
+            .expect("the skew falls through to the next offer")
+            .kind
+            .as_str(),
+        AttachPayloadKind::VT,
+        "an ineligible first choice must not refuse an eligible second one"
+    );
+
+    for build in [roost_vt::libghostty_build(), skewed.to_string()] {
+        let mut vt_only = attach_params(&lease, tab_id);
+        vt_only.kinds = vec![AttachPayloadKind::from(AttachPayloadKind::VT)];
+        vt_only.libghostty_build = build.clone();
+        assert_eq!(
+            attach_with(&mut client, vt_only)
+                .await
+                .expect("vt has no build requirement")
+                .kind
+                .as_str(),
+            AttachPayloadKind::VT,
+            "vt is a byte stream, so {build:?} is not its business"
+        );
+    }
+}
+
+/// The compatibility promise: a client that has never heard of `vt`
+/// negotiates exactly as it did before this session learned to serve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ghostsnp_only_client_is_unaffected_by_vt() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let mut only = attach_params(&lease, tab_id);
+    only.kinds = vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)];
+    assert_eq!(
+        attach_with(&mut client, only.clone())
+            .await
+            .expect("a matching build is served")
+            .kind
+            .as_str(),
+        AttachPayloadKind::GHOSTTY_SNAPSHOT
+    );
+
+    let mut skewed = only;
+    skewed.libghostty_build = "ghostty-0000000000000000+snapshot.v1".into();
+    assert_eq!(
+        attach_with(&mut client, skewed).await.unwrap_err(),
+        "build-mismatch",
+        "a client offering nothing else still has nowhere to fall back to"
+    );
+}
+
+/// A session that does not advertise `vt` cannot be talked into it, even
+/// though this build can encode one: the advertisement is the contract
+/// the client negotiated against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unadvertised_kind_is_not_servable() {
+    let h = harness_advertising(&[AttachPayloadKind::GHOSTTY_SNAPSHOT]).await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let mut vt_only = attach_params(&lease, tab_id);
+    vt_only.kinds = vec![AttachPayloadKind::from(AttachPayloadKind::VT)];
+    assert_eq!(
+        attach_with(&mut client, vt_only).await.unwrap_err(),
+        "unsupported-kind"
+    );
+}
+
+/// A kind this session advertised and this build has no rule for is
+/// refused outright. Only a misconfigured advertisement can produce it —
+/// which is exactly why it must not be waved through: "no requirement"
+/// belongs to a kind whose requirement is known to be none, and assuming
+/// it for an unknown one serves a build-skewed client GHOSTSNP under
+/// another name, the corrupt screen `build-mismatch` exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_advertised_kind_with_no_rule_is_refused() {
+    let h = harness_advertising(&["sixel-mosaic-v9"]).await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let mut mystery = attach_params(&lease, tab_id);
+    mystery.kinds = vec![AttachPayloadKind::from("sixel-mosaic-v9")];
+    assert_eq!(
+        attach_with(&mut client, mystery).await.unwrap_err(),
+        "internal"
+    );
 }
 
 /// The client asked for something this session cannot encode, or with a

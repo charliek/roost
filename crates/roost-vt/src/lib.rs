@@ -178,7 +178,7 @@ pub use terminal::{
 #[cfg(feature = "ffi")]
 pub use tracked_ref::TrackedRef;
 #[cfg(feature = "ffi")]
-pub use vt_dump::vt_snapshot;
+pub use vt_dump::{vt_carryable, vt_snapshot};
 
 /// Human-readable build identifier combining the pinned libghostty-vt
 /// commit (`third_party/ghostty/build.sh`'s `GHOSTTY_SHA`, captured at

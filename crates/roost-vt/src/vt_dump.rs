@@ -110,6 +110,17 @@ const ALT_SCREEN_MODES: &[u16] = &[1049, 47, 1047];
 /// viewport's resolved cells, and a stale snapshot would place the
 /// cursor on the wrong cell.
 pub fn vt_snapshot(terminal: &Terminal, render: &mut RenderState) -> Result<Option<Vec<u8>>> {
+    // Asked before any of the work below, not beside the append that
+    // consumes it: a caller retrying an `Ok(None)` would otherwise pay a
+    // render update, two formatter passes over the whole history and a
+    // walk of the viewport to be told again that there is nothing to
+    // carry. Only the *test* moves — the bytes are still emitted last,
+    // which is what makes the client's first live PTY frame complete the
+    // cut sequence exactly as it does on the server.
+    let Some(continuation) = terminal.continuation()? else {
+        return Ok(None);
+    };
+
     render.update(terminal)?;
 
     let mut out: Vec<u8> = Vec::new();
@@ -160,14 +171,22 @@ pub fn vt_snapshot(terminal: &Terminal, render: &mut RenderState) -> Result<Opti
 
     write_deferred_modes(terminal, row, cursor_col, &mut out)?;
 
-    // Last, so the client's first live PTY frame completes the cut
-    // sequence exactly as it does on the server.
-    let Some(continuation) = terminal.continuation()? else {
-        return Ok(None);
-    };
     out.extend_from_slice(&continuation);
 
     Ok(Some(out))
+}
+
+/// The gate [`vt_snapshot`] applies before it composes anything, on its
+/// own so a caller retrying an `Ok(None)` can ask the cheap question
+/// without paying for the encode — or for the global permit the encode
+/// queues behind.
+///
+/// One call answers it because libghostty's retained continuation is
+/// empty exactly at ground and unavailable exactly when the unfinished
+/// sequence outran `continuation_max_bytes`, and that is the only reason
+/// [`vt_snapshot`] ever defers.
+pub fn vt_carryable(terminal: &Terminal) -> Result<bool> {
+    Ok(terminal.continuation()?.is_some())
 }
 
 /// Step 0 — the program's colour *overrides*, never the server's theme.

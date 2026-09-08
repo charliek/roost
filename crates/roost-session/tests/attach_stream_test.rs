@@ -36,7 +36,7 @@ use roost_ipc::messages::{
     ops, AttachAccepted, AttachHandshake, AttachMode, AttachPayloadKind, ResolvedCell,
     TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
     TabCloseParams, TabDumpCursor, TabDumpResolvedResult, TabDumpResult, TabFeedPtyBytesParams,
-    WireTabRef,
+    TabWriteParams, WireTabRef,
 };
 use roost_ipc::IpcClient;
 use roost_vt::{
@@ -57,6 +57,15 @@ const ROWS: u16 = 24;
 /// its READY record — the viewport alone rides inside READY, so a
 /// smaller seed would make "history arrives and applies" vacuous.
 const HISTORY_LINES: usize = 1200;
+
+/// The geometry and line count [`a_vt_payload_always_ends_in_one_empty_snap`]
+/// needs: wide enough and long enough that the `vt` payload outgrows
+/// both a data frame and a Unix socket's send buffer, so the forwarder
+/// is provably still inside the payload when that test seeds a tee
+/// record. `WIDE_LINES` is the server terminal's own retention, which is
+/// as much history as any payload can carry.
+const WIDE_COLS: u16 = 560;
+const WIDE_LINES: usize = 2000;
 
 /// Budget for one blocking step — a frame, a dump that has not caught up
 /// yet, a whole snapshot. Scaled the same way every other session test's
@@ -105,16 +114,22 @@ impl Session {
     /// geometry is a no-op and the snapshot is taken at the same size
     /// the seeded content was laid out at.
     async fn quiet_tab(&mut self) -> i64 {
-        self.tab(&["/bin/sh", "-c", "exec sleep 300"]).await
+        self.quiet_tab_sized(COLS).await
     }
 
-    async fn tab(&mut self, argv: &[&str]) -> i64 {
+    /// The same at an explicit width — what the one case that needs a
+    /// payload larger than a socket buffer asks for.
+    async fn quiet_tab_sized(&mut self, cols: u16) -> i64 {
+        self.tab(&["/bin/sh", "-c", "exec sleep 300"], cols).await
+    }
+
+    async fn tab(&mut self, argv: &[&str], cols: u16) -> i64 {
         let cwd = self.layout.subdir("tab");
         let tab = support::open_tab(&mut self.control, self.project_id, &cwd, "", argv).await;
-        support::resize_tab(&mut self.control, tab.id, u32::from(COLS), u32::from(ROWS))
+        support::resize_tab(&mut self.control, tab.id, u32::from(cols), u32::from(ROWS))
             .await
             .expect("tab.resize");
-        self.wait_for_geometry(tab.id, COLS, ROWS).await;
+        self.wait_for_geometry(tab.id, cols, ROWS).await;
         tab.id
     }
 
@@ -161,15 +176,55 @@ impl Session {
             .expect("tab.close");
     }
 
+    /// Bytes toward the child, not into the terminal — the seam
+    /// [`Self::feed`] deliberately bypasses. The lease rides along
+    /// because a session socket refuses an unleased write.
+    async fn write_tab(&mut self, tab_id: i64, data: &[u8]) {
+        self.control
+            .call::<_, serde_json::Value>(
+                ops::TAB_WRITE,
+                TabWriteParams {
+                    tab_id,
+                    data: data.to_vec(),
+                    lease: Some(self.lease.clone()),
+                },
+            )
+            .await
+            .expect("tab.write");
+    }
+
+    /// Wait until the child's exit has been published. The tab task
+    /// closes the workspace row from `publish_exit` and nowhere else, so
+    /// the row's absence is the control socket's proof that the `Exit`
+    /// is on the tee — as long as nobody closed the tab by hand first,
+    /// which removes the row on the way in.
+    async fn wait_for_exit(&mut self, tab_id: i64) {
+        support::wait_for_tabs(
+            &mut self.control,
+            &format!("tab {tab_id}'s row to close at its child's exit"),
+            |tabs| !tabs.iter().any(|tab| tab.id == tab_id),
+        )
+        .await;
+    }
+
     async fn attach(&mut self, tab_id: i64) -> TabAttachResult {
+        self.attach_as(tab_id, AttachPayloadKind::GHOSTTY_SNAPSHOT, COLS)
+            .await
+    }
+
+    /// Attach offering exactly one payload kind, so the negotiation has
+    /// nothing to choose between and the stream under test is the one
+    /// the case names. `cols` is the tab's own width — an attach at any
+    /// other geometry would reflow the content the test just laid down.
+    async fn attach_as(&mut self, tab_id: i64, kind: &str, cols: u16) -> TabAttachResult {
         self.control
             .call(
                 ops::TAB_ATTACH,
                 TabAttachParams {
                     lease: self.lease.clone(),
                     tab_id,
-                    kinds: vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)],
-                    cols: COLS,
+                    kinds: vec![AttachPayloadKind::from(kind)],
+                    cols,
                     rows: ROWS,
                     cell_w_px: 0,
                     cell_h_px: 0,
@@ -753,6 +808,24 @@ fn seed_bytes(lines: usize) -> Vec<u8> {
     out
 }
 
+/// A seed whose rows nearly fill [`WIDE_COLS`], so the payload's size is
+/// a function of the geometry rather than of what happens to be on the
+/// screen. One SGR run per row keeps it representative without making
+/// the byte count depend on run boundaries.
+fn wide_seed_bytes(lines: usize) -> Vec<u8> {
+    // One short of the width: a row that reaches the last column leaves
+    // the cursor pending-wrap, and the next row would soft-wrap into it.
+    let width = usize::from(WIDE_COLS) - 1;
+    let mut out = Vec::new();
+    for index in 1..=lines {
+        let head = format!("line {index:04} ");
+        let fill: String = std::iter::repeat_n('w', width - head.len()).collect();
+        out.extend_from_slice(format!("\x1b[36m{head}{fill}\x1b[0m\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\x1b[35mWIDE_FENCE\x1b[0m\r\n");
+    out
+}
+
 /// What one seeded line renders to once the SGR runs above have been
 /// consumed by a parser — the twin of [`seed_bytes`], and the reference
 /// for content that has scrolled out of every viewport.
@@ -788,7 +861,7 @@ async fn fidelity_at_the_fence() {
     assert_eq!(
         accepted.kind.as_str(),
         AttachPayloadKind::GHOSTTY_SNAPSHOT,
-        "the only payload kind this session advertises"
+        "an offer of GHOSTSNP alone, on a matching build, is served as it always was"
     );
 
     let (mut decoded, trace) =
@@ -954,11 +1027,14 @@ async fn one_byte_at_a_time() {
 async fn input_echo_and_replies() {
     let mut session = Session::start().await;
     let tab_id = session
-        .tab(&[
-            "/bin/sh",
-            "-c",
-            "stty raw -echo; printf CAT_READY; exec cat",
-        ])
+        .tab(
+            &[
+                "/bin/sh",
+                "-c",
+                "stty raw -echo; printf CAT_READY; exec cat",
+            ],
+            COLS,
+        )
         .await;
     session.dump_showing(tab_id, "CAT_READY").await;
     // Nothing has been typed yet, so anything already queued would
@@ -1294,6 +1370,394 @@ async fn resize_mid_history() {
         dump_decoded(&decoded.terminal, 60),
         viewport_only(&server),
         "the viewport still matches; only the scrollback behind it was forfeit"
+    );
+
+    session.stop().await;
+}
+
+// ---------------------------------------------------------------------
+// 8. The `vt` payload kind
+// ---------------------------------------------------------------------
+
+/// What one `vt` attach's snapshot half put on the wire.
+///
+/// A `vt` payload has no framing of its own — it is the byte stream a
+/// terminal replays — so everything the client can learn about where it
+/// ends comes from the *frames*: SNAP payloads concatenate, and one
+/// zero-length SNAP says the snapshot is over. Collected rather than
+/// asserted inline so a violation reports what actually arrived.
+#[derive(Default)]
+struct VtPayload {
+    bytes: Vec<u8>,
+    /// SNAP frames carrying payload; the terminator is not counted.
+    frames: usize,
+    /// Whether the zero-length SNAP arrived at all.
+    terminated: bool,
+    /// Frames that reached the client before the terminator did. Both
+    /// kinds are contract violations: PTY would be live output applied
+    /// to a half-built terminal, EXIT would leave the snapshot
+    /// unfinishable.
+    pty_before_terminator: usize,
+    exit_before_terminator: bool,
+    last_seq: u64,
+}
+
+/// The bytes are a megabyte of terminal in the cases that matter, so a
+/// failing assertion states their length instead of printing them.
+impl std::fmt::Debug for VtPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VtPayload")
+            .field("bytes", &self.bytes.len())
+            .field("frames", &self.frames)
+            .field("terminated", &self.terminated)
+            .field("pty_before_terminator", &self.pty_before_terminator)
+            .field("exit_before_terminator", &self.exit_before_terminator)
+            .field("last_seq", &self.last_seq)
+            .finish()
+    }
+}
+
+/// Read one `vt` attach up to and including its terminator.
+async fn drain_vt_payload<R: AsyncRead + Unpin>(data: &mut DataClient<R>, fence: u64) -> VtPayload {
+    let mut payload = VtPayload {
+        last_seq: fence,
+        ..VtPayload::default()
+    };
+    let deadline = Instant::now() + budget();
+    while !payload.terminated {
+        assert!(
+            Instant::now() < deadline,
+            "the vt payload never ended in an empty SNAP frame; {payload:?}"
+        );
+        let frame = data.frame().await;
+        match frame.frame_type {
+            FRAME_SNAP if frame.payload.is_empty() => payload.terminated = true,
+            FRAME_SNAP => {
+                // Not the wire's 1 MiB cap: `vt` holds every PTY frame
+                // behind its whole payload, and the tee is only drained
+                // between writes, so the frame size is what bounds how
+                // long the tab's output goes unread.
+                assert!(
+                    frame.payload.len() <= roost_engine::attach::VT_SNAP_FRAME_BYTES,
+                    "a vt SNAP frame carried {} bytes, past the {}-byte cap",
+                    frame.payload.len(),
+                    roost_engine::attach::VT_SNAP_FRAME_BYTES
+                );
+                payload.frames += 1;
+                payload.bytes.extend_from_slice(&frame.payload);
+            }
+            FRAME_PTY => {
+                payload.pty_before_terminator += 1;
+                let (seq, _) = split_pty(&frame);
+                payload.last_seq = seq;
+            }
+            FRAME_EXIT => {
+                payload.exit_before_terminator = true;
+                break;
+            }
+            other => panic!("unexpected frame {other:#04x} inside a vt payload"),
+        }
+    }
+    assert_eq!(
+        payload.pty_before_terminator, 0,
+        "the terminator rides the same write as the payload's last frame, so no \
+         live output can precede it: {payload:?}"
+    );
+    assert!(
+        !payload.exit_before_terminator,
+        "EXIT is the connection's last frame and waits for the terminator: {payload:?}"
+    );
+    payload
+}
+
+/// A client's terminal, built the way a host client builds one and
+/// hydrated by replaying the payload into it.
+///
+/// `continuation_max_bytes: 0` on purpose: the client is not the side
+/// that encodes, and a `vt` client is by definition one that may not
+/// share this build at all. The scrollback is both UIs' 2000, which is
+/// also the server's retention — so nothing the payload carries is lost
+/// to the client's own eviction.
+fn hydrate_vt(payload: &[u8], cols: u16) -> Terminal {
+    let mut terminal = Terminal::new(roost_vt::TerminalOptions {
+        cols,
+        rows: ROWS,
+        max_scrollback: roost_engine::tab_task::SERVER_VT_SCROLLBACK,
+        continuation_max_bytes: 0,
+    })
+    .expect("build the client terminal");
+    terminal.vt_write(payload);
+    terminal
+}
+
+/// [`fidelity_at_the_fence`]'s `vt` twin: the client replays the payload
+/// into its own terminal rather than decoding libghostty's binary state,
+/// and lands on the same screen.
+///
+/// The whole-dump comparison drops the server's history halves
+/// ([`viewport_only`]) because the left-hand side is a viewport render
+/// walk, which has no history to state. History is not skipped, though
+/// — it is the half GHOSTSNP carries in pages and `vt` carries as
+/// replayed rows, so it is asserted separately and against the server's
+/// own `tab.dump {scrollback}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vt_fidelity_at_the_fence() {
+    let mut session = Session::start().await;
+    let tab_id = session.quiet_tab().await;
+    session.feed(tab_id, &seed_bytes(HISTORY_LINES)).await;
+    let server = session.dump_showing(tab_id, "SGR_FENCE").await;
+    let server_history = support::tab_dump_scrollback(&mut session.control, tab_id, u32::MAX).await;
+    let server_resolved = support::tab_dump_resolved(&mut session.control, tab_id).await;
+
+    let ticket = session.attach_as(tab_id, AttachPayloadKind::VT, COLS).await;
+    assert_eq!(ticket.kind.as_str(), AttachPayloadKind::VT);
+    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+        .await
+        .expect("the handshake is accepted");
+    assert_eq!(accepted.mode, AttachMode::Snapshot);
+    assert_eq!(
+        accepted.kind.as_str(),
+        AttachPayloadKind::VT,
+        "the data connection reports what tab.attach negotiated"
+    );
+
+    let payload = drain_vt_payload(&mut data, accepted.seq).await;
+    assert!(
+        payload.frames > 0,
+        "a seeded tab's payload is not empty: {payload:?}"
+    );
+    let mut terminal = hydrate_vt(&payload.bytes, COLS);
+
+    let grid = walk_decoded(&terminal, COLS);
+    assert_eq!(
+        grid.dump(COLS),
+        viewport_only(&server),
+        "the replayed viewport must equal the server's dump at the fence"
+    );
+    assert_row_colors_match(&grid, &server_resolved, row_showing(&server, "SGR_FENCE"));
+    assert_row_colors_match(
+        &grid,
+        &server_resolved,
+        row_showing(&server, &format!("line {HISTORY_LINES:04}")),
+    );
+
+    assert!(
+        server_history.scrollback_rows > 0,
+        "the seeded lines leave scrollback behind a 24-row viewport"
+    );
+    assert_eq!(
+        roost_vt::scrollback_text(&terminal, u32::MAX).expect("read the replayed history"),
+        server_history.scrollback_text,
+        "the payload carries the server's history, not just its viewport"
+    );
+
+    // The fence: bytes fed after the encode arrive as live frames and
+    // land on both sides identically.
+    session.feed(tab_id, b"\r\nVT_LIVE_TAIL\r\n").await;
+    let mut last_seq = payload.last_seq;
+    apply_pty_until(&mut data, &mut terminal, &mut last_seq, b"VT_LIVE_TAIL").await;
+    let server = session.dump_showing(tab_id, "VT_LIVE_TAIL").await;
+    assert_eq!(
+        dump_decoded(&terminal, COLS),
+        viewport_only(&server),
+        "the live frames apply to the replayed terminal exactly as they did to the server's"
+    );
+
+    session.stop().await;
+}
+
+/// The encode has nothing to carry: the tab's parser is inside a
+/// sequence longer than the continuation libghostty retains
+/// ([`roost_engine::tab_task::SERVER_VT_CONTINUATION_MAX`]), so a
+/// payload produced now would leave the client's parser in a state the
+/// server's is not, and the first live frame would complete the sequence
+/// on one side only.
+///
+/// That is a wait, not a failure. The attach hangs on the fence until a
+/// chunk leaves the terminal somewhere carryable, and then serves
+/// normally — with the fence moved to that chunk, which is why the byte
+/// that ended the sequence is inside the payload rather than arriving as
+/// live output the client would apply to a terminal that never saw the
+/// start of it.
+///
+/// A sentinel is fed *after* the terminator and applied through
+/// [`apply_pty_until`] for exactly that last clause: stopping at the
+/// terminator proves nothing about the fence, because a retry that
+/// answered with the seq it parked at would replay the sequence-closing
+/// chunk as a PTY frame the test never read. Applying the live frames
+/// and re-comparing the screen catches it — the closing chunk would land
+/// on the replica twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vt_encode_waits_for_a_carryable_parser_state() {
+    let mut session = Session::start().await;
+    let tab_id = session.quiet_tab().await;
+    session.feed(tab_id, b"BEFORE_DCS\r\n").await;
+    // A DCS whose body outgrows the retained continuation, left open.
+    // DCS rather than OSC so the unfinished sequence has no side effect
+    // of its own — a two-megabyte OSC 0 would set a two-megabyte title.
+    let mut unfinished = Vec::from(&b"\x1bP"[..]);
+    unfinished.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+    session.feed(tab_id, &unfinished).await;
+
+    let ticket = session.attach_as(tab_id, AttachPayloadKind::VT, COLS).await;
+    let socket = session.socket();
+    let token = ticket.attach_token.clone();
+    let mut dialing = tokio::spawn(async move { dial(&socket, handshake(&token)).await });
+    // A negative claim cannot be a poll: the only way to state "this has
+    // not answered" is to give it a window and see it elapse.
+    assert!(
+        timeout(support::scaled(Duration::from_millis(500)), &mut dialing)
+            .await
+            .is_err(),
+        "the fence cannot answer while the parser is mid-sequence with nothing to carry"
+    );
+
+    // ST closes the DCS; the next encode has a continuation again.
+    session.feed(tab_id, b"\x1b\\AFTER_DCS\r\n").await;
+    let (accepted, mut data) = timeout(budget(), dialing)
+        .await
+        .expect("the deferred encode answers once the parser is carryable")
+        .expect("join")
+        .expect("accepted");
+
+    let payload = drain_vt_payload(&mut data, accepted.seq).await;
+    let mut terminal = hydrate_vt(&payload.bytes, COLS);
+    let server = session.dump_showing(tab_id, "AFTER_DCS").await;
+    assert_eq!(
+        dump_decoded(&terminal, COLS),
+        viewport_only(&server),
+        "the fence moved to the chunk that closed the sequence, so the payload alone \
+         is the whole screen"
+    );
+
+    session.feed(tab_id, b"VT_AFTER_DEFERRAL\r\n").await;
+    let mut last_seq = payload.last_seq;
+    apply_pty_until(
+        &mut data,
+        &mut terminal,
+        &mut last_seq,
+        b"VT_AFTER_DEFERRAL",
+    )
+    .await;
+    let server = session.dump_showing(tab_id, "VT_AFTER_DEFERRAL").await;
+    assert_eq!(
+        dump_decoded(&terminal, COLS),
+        viewport_only(&server),
+        "the fence the retry answered with is the closing chunk's, so nothing inside \
+         the payload arrives again as live output"
+    );
+
+    session.stop().await;
+}
+
+/// The terminator's placement, on the three shapes that can move it: a
+/// tab whose payload is still going out when live output arrives, a tab
+/// that dies in the same window, and a fresh tab with nothing on its
+/// screen.
+///
+/// The first two need the pump to still be *inside* the payload when
+/// the tee gets a record, which is what [`WIDE_COLS`] buys: the payload
+/// outgrows the socket's send buffer, so the forwarder is blocked on a
+/// write that cannot finish until this test reads — and it does not read
+/// until the record it seeded is provably on the server. A terminator
+/// written on any later pass than the payload's final frame loses the
+/// race in both cases: the later pass flushes held PTY first, and it
+/// writes EXIT first.
+///
+/// The fresh tab is the smallest payload there is — a composition with
+/// no content at all is still the mode sweeps, the pad and a cursor
+/// address — and it is the case that pins the marker as *unconditional*:
+/// a terminator emitted only where the content made it worth one would
+/// still pass every case above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vt_payload_always_ends_in_one_empty_snap() {
+    let mut session = Session::start().await;
+
+    let flooded = session.quiet_tab_sized(WIDE_COLS).await;
+    session.feed(flooded, &wide_seed_bytes(WIDE_LINES)).await;
+    session.dump_showing(flooded, "WIDE_FENCE").await;
+    let ticket = session
+        .attach_as(flooded, AttachPayloadKind::VT, WIDE_COLS)
+        .await;
+    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
+    // Seeded and confirmed landed before a single frame is read, so the
+    // forwarder is provably still mid-payload with a tee record in hand.
+    session.feed(flooded, b"VT_AFTER_TERMINATOR\r\n").await;
+    session.dump_showing(flooded, "VT_AFTER_TERMINATOR").await;
+    let payload = drain_vt_payload(&mut data, accepted.seq).await;
+    // Not merely "more than one". `vt` holds every PTY frame behind its
+    // whole payload and drains the tee only between writes, so the frame
+    // size is what bounds how long a tab's output goes unread — and at
+    // the wire's own 1 MiB cap this megabyte-and-change fixture would be
+    // two frames, one drain apart.
+    assert!(
+        payload.frames >= 8,
+        "a vt payload is framed small enough to keep draining the tee: {payload:?}"
+    );
+    let mut terminal = hydrate_vt(&payload.bytes, WIDE_COLS);
+    let mut last_seq = payload.last_seq;
+    apply_pty_until(
+        &mut data,
+        &mut terminal,
+        &mut last_seq,
+        b"VT_AFTER_TERMINATOR",
+    )
+    .await;
+    drop(data);
+
+    // The child ends itself rather than being closed, because the wait
+    // below needs something the exit is what causes. `tab.close` removes
+    // the workspace row on the way in, so it leaves nothing to watch and
+    // "the tab died mid-payload" would be a hope; a child parked on
+    // `read` publishes its own exit, and `publish_exit` is what closes
+    // the row — so the row going away is proof the exit is teed.
+    let dying = session.tab(&["/bin/sh", "-c", "read _"], WIDE_COLS).await;
+    session.feed(dying, &wide_seed_bytes(WIDE_LINES)).await;
+    session.dump_showing(dying, "WIDE_FENCE").await;
+    let ticket = session
+        .attach_as(dying, AttachPayloadKind::VT, WIDE_COLS)
+        .await;
+    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
+    session.write_tab(dying, b"\n").await;
+    session.wait_for_exit(dying).await;
+    let payload = drain_vt_payload(&mut data, accepted.seq).await;
+    let mut last_seq = payload.last_seq;
+    let exit = loop {
+        let frame = data.frame().await;
+        match frame.frame_type {
+            FRAME_PTY => {
+                let (seq, _) = split_pty(&frame);
+                assert_eq!(seq, last_seq + 1, "PTY frames must stay contiguous");
+                last_seq = seq;
+            }
+            FRAME_EXIT => break frame,
+            other => panic!("unexpected frame {other:#04x} after the terminator"),
+        }
+    };
+    assert_eq!(exit.payload.len(), 12, "u64 final_seq + i32 code");
+    assert!(
+        data.next().await.is_none(),
+        "EXIT is still the connection's last frame"
+    );
+    drop(data);
+
+    let fresh = session.quiet_tab().await;
+    let ticket = session.attach_as(fresh, AttachPayloadKind::VT, COLS).await;
+    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
+    let payload = drain_vt_payload(&mut data, accepted.seq).await;
+    assert_eq!(
+        payload.frames, 1,
+        "a fresh tab's whole composition fits one frame: {payload:?}"
+    );
+    assert!(
+        payload.terminated,
+        "and it is still followed by the marker: {payload:?}"
     );
 
     session.stop().await;
