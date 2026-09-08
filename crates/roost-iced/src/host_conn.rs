@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use roost_ipc::messages::{ops, EventEnvelope, OscColorsParams, RetrySchedule};
+use roost_ipc::messages::{ops, AttachPayloadKind, EventEnvelope, OscColorsParams, RetrySchedule};
 use roost_ipc::ssh::{SshFailure, SshTunnel};
 use roost_ui_model::keys::{HostId, TabKey};
 use roost_ui_model::theme::Theme;
@@ -461,6 +461,16 @@ struct HostConn {
     /// this very struct — and a kind held over from the last one would
     /// report a fidelity nothing is actually delivering.
     payload_kind: Option<&'static str>,
+    /// Whether this connection has already said its reduced-fidelity
+    /// sentence (plan 056 §3.5).
+    ///
+    /// A latch rather than a derived answer: the status bar is told
+    /// once, on the first `vt` attach, and every frame after it is the
+    /// same attach still running. Cleared with `payload_kind` and for
+    /// the same reason — a reconnect into the same skew is a new
+    /// connection and says it again, which is the honest reading of a
+    /// session that has just been re-attached.
+    fidelity_announced: bool,
     /// What the prologue of the live incarnation learned about the
     /// session behind it — `host.status`'s `connect` object, and what
     /// every reduced-fidelity surface keys on.
@@ -1063,6 +1073,7 @@ impl HostConnSet {
             shutdown,
             incarnation: None,
             payload_kind: None,
+            fidelity_announced: false,
             facts: None,
             carried,
             focus_sent: None,
@@ -2276,10 +2287,22 @@ impl HostConnSet {
     /// Record what an accepted attach on this incarnation is decoding.
     /// A stale incarnation records nothing, same contract as
     /// [`Self::ops_for`].
-    pub(crate) fn note_payload_kind(&mut self, incarnation: HostId, kind: &'static str) {
-        if let Some(conn) = self.conn_at_mut(incarnation) {
-            conn.payload_kind = Some(kind);
-        }
+    ///
+    /// Answers `true` **exactly once per connection**: on the first
+    /// `vt` attach it is told about, which is the edge the window says
+    /// its reduced-fidelity sentence on (plan 056 §3.5). Every frame of
+    /// that attach comes through here, so the latch lives beside the
+    /// kind it is a fact about rather than at the call site, where
+    /// "have I said this already" would be a second bookkeeping of the
+    /// same connection.
+    pub(crate) fn note_payload_kind(&mut self, incarnation: HostId, kind: &'static str) -> bool {
+        let Some(conn) = self.conn_at_mut(incarnation) else {
+            return false;
+        };
+        conn.payload_kind = Some(kind);
+        let first = kind == AttachPayloadKind::VT && !conn.fidelity_announced;
+        conn.fidelity_announced |= first;
+        first
     }
 
     /// What this host's live connection last attached as, `None` until a
@@ -2736,6 +2759,7 @@ impl HostConnSet {
         if conn.incarnation != Some(incarnation) || !next.is_connected() {
             conn.focus_sent = None;
             conn.payload_kind = None;
+            conn.fidelity_announced = false;
             conn.facts = None;
         }
         conn.incarnation = Some(incarnation);
@@ -5697,6 +5721,88 @@ mod tests {
             set.payload_kind("h1"),
             None,
             "the kind outlived the connection that negotiated it"
+        );
+    }
+
+    /// The one-time sentence's latch (plan 056 §3.5). Every frame of an
+    /// attach comes through `note_payload_kind`, and a `vt` attach can
+    /// run for hours — so the window is told once and the rest of the
+    /// stream is silent.
+    #[tokio::test]
+    async fn the_reduced_fidelity_sentence_is_said_once_per_connection() {
+        use roost_ipc::messages::AttachPayloadKind;
+
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-fidelity-latch.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+
+        let stale = set.minter.mint("h1", set.conn("h1").generation - 1);
+        assert!(
+            !set.note_payload_kind(stale, AttachPayloadKind::VT),
+            "a replaced connection's attach describes nothing on screen"
+        );
+
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert!(
+            !set.note_payload_kind(incarnation, AttachPayloadKind::GHOSTTY_SNAPSHOT),
+            "a snapshot attach is full fidelity: nothing to say"
+        );
+        assert!(
+            set.note_payload_kind(incarnation, AttachPayloadKind::VT),
+            "and it did not consume the latch the first vt attach needs"
+        );
+        for frame in 0..3 {
+            assert!(
+                !set.note_payload_kind(incarnation, AttachPayloadKind::VT),
+                "frame {frame} of the same attach is the same attach"
+            );
+        }
+    }
+
+    /// The latch dies with the connection that set it, exactly as
+    /// `payload_kind` does — so a reconnect into the same skew says it
+    /// again, which is true: it is a new connection, and the person
+    /// just watched their terminal come back.
+    #[tokio::test]
+    async fn a_reconnect_into_the_same_skew_says_the_sentence_again() {
+        use roost_ipc::messages::AttachPayloadKind;
+
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-fidelity-relatch.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let old = set.mint_for("h1");
+        set.apply_state(old, HostConnState::Connected);
+        assert!(set.note_payload_kind(old, AttachPayloadKind::VT));
+
+        set.apply_state(old, dropped("the session closed"));
+        let new = set.mint_for("h1");
+        set.apply_state(
+            new,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        );
+        set.apply_state(new, HostConnState::Connected);
+        assert!(
+            set.note_payload_kind(new, AttachPayloadKind::VT),
+            "a new connection at the same fidelity is news again"
+        );
+        assert!(
+            !set.note_payload_kind(new, AttachPayloadKind::VT),
+            "and only once, on the new connection too"
         );
     }
 

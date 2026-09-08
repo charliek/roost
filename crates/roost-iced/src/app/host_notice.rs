@@ -21,6 +21,7 @@
 use crate::host_conn::state::{
     BuildMismatch, HostConnState, MismatchKind, RestartAction, Skew, CLIENT_PAYLOAD_KINDS,
 };
+use roost_ui_model::host_sidebar::FidelityAction;
 
 /// The banner drawn over a host tab's last frame.
 ///
@@ -260,6 +261,62 @@ pub(super) fn restart_prompt_for_skew(label: &str, skew: &Skew) -> RestartPrompt
         action: RestartAction::RestartLocal,
         confirm: Some("Restart session".to_string()),
     }
+}
+
+/// The band's pill, on every transport. The *fact* does not vary — this
+/// connection is on the `vt` fallback wherever the session lives — and
+/// only what can be done about it does.
+pub(super) const FIDELITY_PILL: &str = "reduced fidelity";
+
+/// The two things a reduced-fidelity section draws: the pill on its band
+/// and the inline row under it (plan 056 §3.4's matrix).
+///
+/// One value, because the pill and the row are one offer shown twice —
+/// a band that invites a press over a row that only points, or the
+/// reverse, would be the window disagreeing with itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FidelityChrome {
+    /// Whether both are buttons. `false` is a socket target: somebody
+    /// else's process, over a transport that reaches its socket and not
+    /// its binary, so there is nothing here to press.
+    pub(super) pressable: bool,
+    /// The inline row's whole text, glyph included.
+    pub(super) row: String,
+}
+
+/// What the band and the row say for one [`FidelityAction`].
+pub(super) fn fidelity_chrome(action: FidelityAction, label: &str) -> FidelityChrome {
+    match action {
+        FidelityAction::Update => FidelityChrome {
+            pressable: true,
+            row: "⬆ Update roost-session".to_string(),
+        },
+        FidelityAction::Restart => FidelityChrome {
+            pressable: true,
+            row: "↻ Restart session".to_string(),
+        },
+        FidelityAction::Manual => FidelityChrome {
+            pressable: false,
+            row: format!("Restart it on {label} to restore fidelity"),
+        },
+    }
+}
+
+/// The status-bar sentence a connection's **first** `vt` attach owes
+/// (plan 056 §3.5).
+///
+/// The one surface keyed on the attach rather than on the connection's
+/// own fidelity fact: the pill, the row and the verbs describe a
+/// property of the link and appear the moment it is up, while this is
+/// about the terminal the person is looking at, so it waits until there
+/// is one. It says what was lost without the build strings — those are
+/// on the card the pill opens, and a 5 s banner is not where a hex
+/// build id earns its space.
+pub(super) fn fidelity_sentence(label: &str) -> String {
+    format!(
+        "{label} is attached at reduced fidelity: links, the alternate screen and soft \
+         wrapping are off until its roost-session is updated."
+    )
 }
 
 /// What a Connect on a host whose compatibility gate already refused
@@ -721,5 +778,51 @@ mod tests {
         let mut empty = mismatch(MismatchKind::PayloadKind, RestartAction::RestartLocal);
         empty.session_payload_kinds.clear();
         assert!(detail(&empty).contains("offers nothing"));
+    }
+
+    /// Plan 056 §3.4's matrix, the two widget columns: what the band's
+    /// pill and the row under it draw for each action, and which of them
+    /// respond to a press.
+    #[test]
+    fn the_fidelity_matrix_answers_one_pair_of_widgets_per_action() {
+        let update = fidelity_chrome(FidelityAction::Update, "pop-os");
+        assert!(update.pressable, "an ssh host can be sent a build");
+        assert_eq!(update.row, "⬆ Update roost-session");
+
+        let restart = fidelity_chrome(FidelityAction::Restart, "localhost");
+        assert!(restart.pressable, "our own session is ours to restart");
+        assert_eq!(restart.row, "↻ Restart session");
+
+        let manual = fidelity_chrome(FidelityAction::Manual, "build-box");
+        assert!(
+            !manual.pressable,
+            "a socket target's process is not this client's to touch"
+        );
+        assert_eq!(manual.row, "Restart it on build-box to restore fidelity");
+        assert!(
+            !manual.row.starts_with('⬆') && !manual.row.starts_with('↻'),
+            "and it wears no action glyph, because it is not an action: {}",
+            manual.row
+        );
+    }
+
+    /// The pill says the same thing everywhere — the fact is the
+    /// connection's, not the transport's — and it never grows a second
+    /// spelling per action.
+    #[test]
+    fn the_pill_is_one_string_on_every_transport() {
+        assert_eq!(FIDELITY_PILL, "reduced fidelity");
+    }
+
+    /// The banner names the host and what it costs, and deliberately not
+    /// the two build strings: the card the pill opens carries those.
+    #[test]
+    fn the_first_vt_attach_says_what_was_lost() {
+        let said = fidelity_sentence("pop-os");
+        assert_eq!(
+            said,
+            "pop-os is attached at reduced fidelity: links, the alternate screen and soft \
+             wrapping are off until its roost-session is updated."
+        );
     }
 }

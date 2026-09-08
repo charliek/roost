@@ -2208,6 +2208,14 @@ struct HostView {
     /// placeholder can never collide with a real local key.
     host: HostId,
     state: host_sidebar::SectionState,
+    /// Whether the live connection is serving the `vt` fallback across a
+    /// libghostty build skew (plan 056 §3.4).
+    ///
+    /// Cached here with the rest of the band's inputs so the sidebar and
+    /// the palette read one value: [`host_sidebar::fidelity_action`]
+    /// derives both the pill and the verbs from it, and a fact fetched
+    /// twice is a fact that can be fetched at two different moments.
+    reduced_fidelity: bool,
     /// The connection's own one-line reason for the state it is in, when
     /// it has one — an ssh failure, a transport drop. Folded into the
     /// band's rollup; `None` renders the bare word.
@@ -3942,6 +3950,12 @@ impl App {
         ]
         .spacing(chrome::HOST_BAND_SPACING)
         .align_y(Alignment::Center);
+        // Beside the rollup, never in it: an agent count and a fidelity
+        // warning are different facts and neither replaces the other.
+        // The dot beside them both stays green — this connection is up.
+        if let (Some(action), Some(saved_id)) = (section.fidelity, section.saved_id.as_deref()) {
+            band = band.push(self.host_fidelity_pill(saved_id, &section.label, action));
+        }
         if let Some(rollup) = &section.rollup {
             band = band.push(
                 text(rollup.as_str())
@@ -3950,6 +3964,58 @@ impl App {
             );
         }
         sidebar_band(band)
+    }
+
+    /// The band's `reduced fidelity` pill (plan 056 §3.4).
+    ///
+    /// A `BAND_PILL_PADDING_Y` button, so a band that gains one is the
+    /// same 32px band it was — the sidebar header, the tab strip and
+    /// this all sit on one seam, and a taller host band would break it.
+    /// It is deliberately *not* under the reorder strip: that wraps the
+    /// project rows only, so the press lands here rather than being read
+    /// as the start of a drag (#300).
+    fn host_fidelity_pill(
+        &self,
+        saved_id: &str,
+        label: &str,
+        action: host_sidebar::FidelityAction,
+    ) -> Element<'_, Message> {
+        let pill = text(host_notice::FIDELITY_PILL)
+            .size(chrome::HOST_ROLLUP_SIZE)
+            .color(chrome::HOST_FIDELITY_TEXT);
+        if !host_notice::fidelity_chrome(action, label).pressable {
+            return pill.into();
+        }
+        button(pill)
+            .padding([chrome::BAND_PILL_PADDING_Y, 6.0])
+            .style(chrome::transparent_button)
+            .on_press(Message::HostFidelityAction(saved_id.to_string()))
+            .into()
+    }
+
+    /// The inline row under a reduced-fidelity section, in the slot the
+    /// ↻ Reconnect row uses (plan 056 §3.4).
+    ///
+    /// The same offer as the pill above it, spelled out — the pill says
+    /// what is wrong and this says what pressing it would do, which is
+    /// why one function answers both.
+    fn host_fidelity_row(
+        &self,
+        saved_id: &str,
+        label: &str,
+        action: host_sidebar::FidelityAction,
+    ) -> Element<'_, Message> {
+        let offer = host_notice::fidelity_chrome(action, label);
+        let body = text(offer.row).size(12).color(chrome::HOST_FIDELITY_TEXT);
+        if !offer.pressable {
+            return container(body).width(Fill).padding([6, 12]).into();
+        }
+        button(body)
+            .width(Fill)
+            .padding([6, 12])
+            .style(chrome::transparent_button)
+            .on_press(Message::HostFidelityAction(saved_id.to_string()))
+            .into()
     }
 
     /// The inline "↻ Reconnect" row under a section that is not
@@ -4091,8 +4157,15 @@ impl App {
                     } else {
                         list.push(rows)
                     };
+                    // Exclusive by construction, and written as one
+                    // chain so it stays that way: `offers_reconnect` is
+                    // every state but `Connected`, and a fidelity is
+                    // only ever `Connected`'s. One slot, one row.
                     if section.state.offers_reconnect() {
                         list = list.push(self.host_reconnect_row(&view.saved_id));
+                    } else if let Some(action) = section.fidelity {
+                        list =
+                            list.push(self.host_fidelity_row(&view.saved_id, &view.label, action));
                     }
                 }
                 (None, scrollable(list).height(Fill).into())
@@ -5518,10 +5591,16 @@ impl App {
                 label: view.label.as_str(),
                 state: view.state,
                 transport: view.transport,
-                // Not fed from the connection yet: the verbs this would
-                // list route to an entry point that arrives with the
-                // card they open.
-                fidelity: None,
+                // The band's own derivation, from the band's own
+                // inputs: what the palette offers and what the pill
+                // offers are the same offer, and deriving them twice
+                // through one function is what keeps them from becoming
+                // two.
+                fidelity: host_sidebar::fidelity_action(
+                    view.reduced_fidelity,
+                    view.transport,
+                    view.state,
+                ),
             })
             .collect()
     }
@@ -7195,6 +7274,7 @@ impl Message {
             Self::HostFrameReconnect { saved_id, frame } => {
                 app.host_frame_reconnect_requested(&saved_id, frame)
             }
+            Self::HostFidelityAction(saved_id) => app.host_fidelity_action_requested(&saved_id),
             Self::AddHostNameChanged(value) => app.add_host_name_changed(value),
             Self::AddHostSocketChanged(value) => app.add_host_socket_changed(value),
             Self::AddHostSubmit => return app.submit_add_host(),

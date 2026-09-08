@@ -1129,7 +1129,12 @@ impl App {
             // Read off the machine rather than the frame: only an accept
             // it actually applied sets it, so a frame from a superseded
             // attempt cannot rewrite what the host reports.
-            self.hosts.note_payload_kind(key.host, kind.wire());
+            let first_reduced_attach = self.hosts.note_payload_kind(key.host, kind.wire());
+            if first_reduced_attach {
+                if let Some(label) = self.host_view(key.host).map(|view| view.label.clone()) {
+                    self.set_status(host_notice::fidelity_sentence(&label));
+                }
+            }
         }
         match step {
             host_tab::AttachStep::None => {}
@@ -2147,6 +2152,7 @@ impl App {
                 };
                 // Taken before `host.id` is moved into the view.
                 let reason = self.hosts.section_reason(&host.id).map(str::to_string);
+                let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
                 super::HostView {
                     saved_id: host.id,
                     // The registry's label wins over the connection's:
@@ -2154,6 +2160,7 @@ impl App {
                     // one that exists before a connection does.
                     label: host.label,
                     transport: transport_kind(&host.target),
+                    reduced_fidelity,
                     reason,
                     host: incarnation.unwrap_or(HostId::LOCAL),
                     state,
@@ -2208,9 +2215,7 @@ impl App {
                     host: view.host,
                     state: view.state,
                     transport: view.transport,
-                    // Not fed from the connection yet: the pill this
-                    // answers arrives with the entry point it presses.
-                    reduced_fidelity: false,
+                    reduced_fidelity: view.reduced_fidelity,
                     agents: view.agents,
                     reason: view.reason.as_deref(),
                 })
@@ -4959,5 +4964,41 @@ mod tests {
         );
 
         supervisor.close(84);
+    }
+
+    /// [`App::apply_host_tab_frame`]'s reduced-fidelity edge (plan 056
+    /// §3.5), driven exactly as it drives it: one `note_payload_kind`
+    /// per frame, the sentence composed only when that answers `true`.
+    ///
+    /// A `vt` attach delivers frames for as long as the shell runs, so
+    /// the second frame — and the ten-thousandth — must say nothing. The
+    /// banner is last-writer-wins with a 5 s expiry, so a repeat would
+    /// not merely be noise: it would keep overwriting whatever the
+    /// person was actually being told.
+    #[tokio::test]
+    async fn only_the_first_frame_of_a_vt_attach_reaches_the_status_bar() {
+        use crate::host_conn::fixtures::{a_connected_ssh_host, a_set};
+        use roost_ipc::messages::AttachPayloadKind;
+
+        let (mut hosts, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut hosts, "/nonexistent/roost-fidelity.sock");
+
+        // The call site's own shape, four frames deep.
+        let mut said: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            if hosts.note_payload_kind(incarnation, AttachPayloadKind::VT) {
+                said.push(host_notice::fidelity_sentence("one"));
+            }
+        }
+
+        assert_eq!(
+            said,
+            vec![
+                "one is attached at reduced fidelity: links, the alternate screen and soft \
+                 wrapping are off until its roost-session is updated."
+                    .to_string()
+            ],
+            "four frames, one sentence"
+        );
     }
 }

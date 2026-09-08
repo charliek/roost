@@ -664,6 +664,34 @@ mod tests {
         }
     }
 
+    /// The inline fidelity row sits in the ↻ Reconnect row's slot, so
+    /// the two must never both apply — the adapter writes them as one
+    /// if/else chain, and this is why it may.
+    #[test]
+    fn the_fidelity_row_and_the_reconnect_row_never_both_apply() {
+        for transport in [
+            HostTransportKind::Ssh,
+            HostTransportKind::Localhost,
+            HostTransportKind::Socket,
+        ] {
+            for state in [
+                SectionState::Local,
+                SectionState::Connected,
+                SectionState::Connecting,
+                SectionState::Disconnected,
+                SectionState::NeedsRestart,
+                SectionState::TakenOver,
+                SectionState::Stopped,
+            ] {
+                assert!(
+                    !(state.offers_reconnect()
+                        && fidelity_action(true, transport, state).is_some()),
+                    "{transport:?} {state:?} would draw two rows in one slot"
+                );
+            }
+        }
+    }
+
     /// The pill is its own slot: it reaches the band beside the rollup,
     /// and the rollup is the agent count it always was.
     #[test]
