@@ -42,6 +42,10 @@ use roost_ipc::socket_state::{self, describe_file_type, SocketState};
 use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
 use roost_ipc::{ClientError, IpcClient};
 
+use crate::autostart::{
+    self, Activity, ArtifactState, Enablement, LingerState, Platform, ProbeTarget,
+};
+
 /// `IpcClient` has no read/write timeout of its own, so every leg of the
 /// conversation gets one here — "Roost is hung" must render as a failed
 /// check, not a hung doctor.
@@ -168,6 +172,24 @@ const DOC_TARGETS: &[(&str, Doc)] = &[
     ("agent.cursor.owning", doc!("guides/agents", "ownership")),
     ("agent.opencode.wired", doc!("guides/agents", "install")),
     ("agent.opencode.owning", doc!("guides/agents", "ownership")),
+    (
+        "session.autostart",
+        doc!("reference/cli", "session-autostart-install-uninstall"),
+    ),
+    (
+        "session.autostart_binary",
+        doc!("reference/cli", "session-autostart-install-uninstall"),
+    ),
+    // The remedies here are supervisor commands, which the guide's
+    // reboot-survival section is what explains.
+    (
+        "session.autostart_enabled",
+        doc!("guides/host-sessions", "surviving-reboots-launchd"),
+    ),
+    (
+        "session.autostart_active",
+        doc!("guides/host-sessions", "surviving-reboots-launchd"),
+    ),
 ];
 
 fn docs_for(check_id: &str) -> Option<&'static str> {
@@ -665,6 +687,11 @@ pub struct Inputs {
     pub agent_codex_trust: Vec<TrustEntry>,
     pub agent_codex_trust_error: Option<String>,
 
+    /// Will the host session come back on its own? Every fact typed,
+    /// each carrying its own reason for being unanswered — see
+    /// [`autostart::Probe`].
+    pub autostart: autostart::Probe,
+
     /// The legacy `~/.config/roost/claude-settings.json` this crate
     /// wrote before plan 046. `Some(true)` when it still exists.
     pub legacy_claude_settings_present: bool,
@@ -712,6 +739,7 @@ impl Default for Inputs {
             agent_status_error: None,
             agent_codex_trust: Vec::new(),
             agent_codex_trust_error: None,
+            autostart: autostart::Probe::default(),
             legacy_claude_settings_present: false,
             legacy_claude_alias_in_rc: false,
         }
@@ -727,17 +755,33 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
     let shell_usable = shell_path.as_deref().is_some_and(executable_regular_file);
     let parent_pid = std::os::unix::process::parent_id();
 
-    // Two independent I/O phases, concurrently: the three bounded
-    // subprocesses (§3.8) and the target → socket → IPC chain, which is
-    // ordered internally but depends on none of them. Doctor is reached
-    // for precisely when something is hung, so the wall clock must be
-    // the slower of the two, not their sum.
-    let (shell_version, parent_comm, claude_version, ui) = tokio::join!(
+    // The autostart facts split the same way `collect` does: the file
+    // side is cheap, and it decides which supervisor questions there are
+    // to ask at all.
+    let autostart_target = autostart_target();
+    let autostart_commands = match autostart_target.platform {
+        Some(platform) => autostart::probe_commands(
+            platform,
+            &autostart_target.names,
+            autostart_target.uid,
+            &autostart_target.artifact,
+        ),
+        None => Vec::new(),
+    };
+
+    // Independent I/O phases, concurrently: the bounded subprocesses
+    // (§3.8, the supervisor probe among them) and the target → socket →
+    // IPC chain, which is ordered internally but depends on none of
+    // them. Doctor is reached for precisely when something is hung, so
+    // the wall clock must be the slowest of them, not their sum.
+    let (shell_version, parent_comm, claude_version, ui, autostart_outcomes) = tokio::join!(
         shell_version(shell_path.as_deref(), shell_usable),
         parent_comm(parent_pid),
         capture_version("claude"),
         probe_ui(selector),
+        run_probe_commands(autostart_commands),
     );
+    let autostart = autostart::interpret_probe(autostart_target, &autostart_outcomes);
 
     let claude_settings_path = crate::claude_settings_path().ok();
     let (claude_settings, claude_hook_events, claude_hook_commands) =
@@ -800,9 +844,92 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
         agent_status_error,
         agent_codex_trust,
         agent_codex_trust_error,
+        autostart,
         legacy_claude_settings_present,
         legacy_claude_alias_in_rc,
     }
+}
+
+/// Everything about autostart that comes off the filesystem: which slot
+/// this build owns, what is in it, whether the binary it names can be
+/// run, and what is in the other profile's slot.
+///
+/// A `$HOME` that cannot be resolved is a fact about the artifact — the
+/// reason lands on [`ProbeTarget::artifact`] — and not a reason to skip
+/// the linger question, which is about the user rather than the file.
+fn autostart_target() -> ProbeTarget {
+    let names = autostart::host_names();
+    let uid = autostart::host_uid();
+    let Some(platform) = autostart::host_platform() else {
+        return ProbeTarget {
+            names,
+            uid,
+            ..ProbeTarget::default()
+        };
+    };
+    let home = match autostart::home_dir() {
+        Ok(home) => home,
+        Err(e) => {
+            return ProbeTarget {
+                platform: Some(platform),
+                names,
+                uid,
+                artifact: ArtifactState::Unavailable(format!("{e:#}")),
+                ..ProbeTarget::default()
+            }
+        }
+    };
+
+    let xdg = autostart::xdg_config_home();
+    let path = autostart::artifact_path(platform, &names, &home, xdg.as_deref());
+    let artifact = autostart::artifact_state(&autostart::read_artifact(&path), &names);
+    let binary_executable = match &artifact {
+        ArtifactState::Ours(a) => Some(is_executable_regular_file(&a.binary)),
+        _ => None,
+    };
+
+    let other = names.other();
+    let other_path = autostart::artifact_path(platform, &other, &home, xdg.as_deref());
+    let sibling = match autostart::artifact_state(&autostart::read_artifact(&other_path), &other) {
+        ArtifactState::Ours(a) => Some((other_path, a)),
+        _ => None,
+    };
+
+    ProbeTarget {
+        platform: Some(platform),
+        names,
+        uid,
+        artifact_path: Some(path),
+        artifact,
+        binary_executable,
+        sibling,
+    }
+}
+
+/// Every supervisor question at once, each under [`capture_command`]'s
+/// own bounds. Concurrent because doctor is reached for when something
+/// is wedged, and three deadlines in series is three times the wait.
+async fn run_probe_commands(
+    commands: Vec<autostart::Command>,
+) -> Vec<(autostart::Command, autostart::CommandOutcome)> {
+    let spawned: Vec<_> = commands
+        .into_iter()
+        .map(|command| {
+            let run = command.clone();
+            (
+                command,
+                tokio::spawn(async move { capture_command(&run).await }),
+            )
+        })
+        .collect();
+    let mut out = Vec::with_capacity(spawned.len());
+    for (command, handle) in spawned {
+        let outcome = handle
+            .await
+            .unwrap_or_else(|e| autostart::CommandOutcome::Failed(e.to_string()));
+        out.push((command, outcome));
+    }
+    out
 }
 
 /// `roost_agent_install::status` + `trust_entries` against
@@ -1105,6 +1232,41 @@ async fn capture_version(program: &str) -> SubprocessOutcome {
     capture(Command::new(program), ["--version"]).await
 }
 
+/// A `--version` banner, from wherever the program put it. One string
+/// is enough for a parser that only ever reads the first line.
+async fn capture<I, S>(mut cmd: Command, args: I) -> SubprocessOutcome
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    cmd.args(args);
+    match run_capped(cmd).await {
+        autostart::CommandOutcome::Ran(result) => {
+            // Some `--version` implementations answer on stderr.
+            let text = if result.stdout.bytes().any(|b| !b.is_ascii_whitespace()) {
+                result.stdout
+            } else {
+                result.stderr
+            };
+            SubprocessOutcome::Output(text)
+        }
+        autostart::CommandOutcome::Missing => SubprocessOutcome::Missing,
+        autostart::CommandOutcome::TimedOut => SubprocessOutcome::TimedOut,
+        autostart::CommandOutcome::Failed(e) => SubprocessOutcome::Failed(e),
+    }
+}
+
+/// One supervisor question, with the three halves of an answer kept
+/// apart: `systemctl is-enabled` answers on stdout *and* exits nonzero,
+/// and a dead bus answers on stderr with the same shape, so folding
+/// them the way [`capture`] does would erase the difference
+/// `autostart::interpret_probe` turns on.
+async fn capture_command(command: &autostart::Command) -> autostart::CommandOutcome {
+    let mut cmd = Command::new(&command.program);
+    cmd.args(&command.args);
+    run_capped(cmd).await
+}
+
 /// Run a read-only command under every bound plan §3.8 pins: stdin from
 /// `/dev/null` (some shells treat an unrecognized `--version` as a
 /// script and block reading stdin), a capped read of each pipe, a
@@ -1114,42 +1276,48 @@ async fn capture_version(program: &str) -> SubprocessOutcome {
 /// that leaves a process behind is not read-only in any sense the user
 /// cares about. Forked *grand*children still escape; killing the process
 /// group is out of scope (plan §9).
-async fn capture<I, S>(mut cmd: Command, args: I) -> SubprocessOutcome
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    cmd.args(args)
-        .stdin(Stdio::null())
+///
+/// The answer comes back with its three halves apart — `Missing` is the
+/// program not being on the machine at all, which for the absolute paths
+/// the autostart probe names is a fact rather than an error — and each
+/// caller folds only what it needs.
+async fn run_capped(mut cmd: Command) -> autostart::CommandOutcome {
+    use autostart::CommandOutcome;
+
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // These are version *parsers*, and every banner they parse is
-        // translated: `bash --version` says "Version" under de_DE and
-        // "versión" under es_ES, which silently degraded mark capability
-        // to undetermined for every non-English-locale user. The C locale
-        // is the one the parsers target.
+        // Every word doctor reads back here is translated: `bash
+        // --version` says "Version" under de_DE and "versión" under
+        // es_ES, which silently degraded mark capability to undetermined
+        // for every non-English-locale user, and `systemctl is-enabled`
+        // answers in the same locale. The C locale is the one the
+        // parsers target — `HostSupervisor::run` pins it for the same
+        // reason.
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SubprocessOutcome::Missing,
-        Err(e) => return SubprocessOutcome::Failed(e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CommandOutcome::Missing,
+        Err(e) => return CommandOutcome::Failed(e.to_string()),
     };
 
     match tokio::time::timeout(SUBPROCESS_TIMEOUT, drain_capped(&mut child)).await {
-        Ok(Ok(text)) => SubprocessOutcome::Output(text),
-        Ok(Err(e)) => SubprocessOutcome::Failed(e.to_string()),
+        Ok(Ok(result)) => CommandOutcome::Ran(result),
+        Ok(Err(e)) => CommandOutcome::Failed(e.to_string()),
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            SubprocessOutcome::TimedOut
+            CommandOutcome::TimedOut
         }
     }
 }
 
-async fn drain_capped(child: &mut tokio::process::Child) -> std::io::Result<String> {
+async fn drain_capped(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<autostart::CommandResult> {
     let mut out = Vec::new();
     let mut err = Vec::new();
     // Drain both pipes concurrently — reading one to the end while the
@@ -1167,14 +1335,12 @@ async fn drain_capped(child: &mut tokio::process::Child) -> std::io::Result<Stri
         }
     };
     tokio::join!(read_out, read_err);
-    child.wait().await?;
-    // Some `--version` implementations answer on stderr.
-    let bytes = if out.iter().any(|b| !b.is_ascii_whitespace()) {
-        out
-    } else {
-        err
-    };
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let status = child.wait().await?;
+    Ok(autostart::CommandResult {
+        status: status.code(),
+        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stderr: String::from_utf8_lossy(&err).into_owned(),
+    })
 }
 
 /// Doctor's view of `socket_state::probe`. The classification itself —
@@ -1782,6 +1948,14 @@ pub fn evaluate(inputs: &Inputs) -> Report {
                 Kind::Check,
                 "agent.hook_binary",
                 agent_checks(inputs, tabs, model),
+            ),
+            section(
+                "session",
+                "Host session autostart",
+                "process",
+                Kind::Check,
+                "session.autostart",
+                session_checks(inputs),
             ),
         ],
     }
@@ -3360,6 +3534,271 @@ fn agent_checks(inputs: &Inputs, tabs: Option<&TabListResult>, model: AgentModel
     out
 }
 
+// ------------------------------------------------------------- session
+
+/// Autostart is opt-in, so an absent artifact is not a finding — the
+/// same shape an uninstalled agent has.
+const NOT_INSTALLED: &str = "not installed (opt-in: roostctl session autostart install)";
+const NO_SUPERVISOR: &str = "no supervisor on this platform";
+
+/// The section answers "will the host session come back?", which is a
+/// question about a file and the supervisor holding it — never about
+/// whether a session is answering right now. `session status` is that
+/// verb (plan 055 §4).
+fn session_checks(inputs: &Inputs) -> Vec<Check> {
+    let probe = &inputs.autostart;
+    vec![
+        session_artifact_check(probe),
+        session_binary_check(probe),
+        session_enabled_check(probe),
+        session_active_check(probe),
+        session_sibling_observation(probe),
+        session_linger_observation(probe),
+    ]
+}
+
+/// Why the three entries after the first have nothing to judge, or
+/// `None` when the slot holds an artifact of ours and they do. Every
+/// `skipped` in the section says which artifact state it came from.
+fn autostart_skip(target: &ProbeTarget) -> Option<String> {
+    if target.platform.is_none() {
+        return Some(NO_SUPERVISOR.to_string());
+    }
+    match &target.artifact {
+        ArtifactState::Absent => Some(NOT_INSTALLED.to_string()),
+        ArtifactState::Unavailable(reason) => Some(unreadable_artifact(target, reason)),
+        ArtifactState::Foreign => Some(foreign_artifact(target)),
+        ArtifactState::Newer { .. } | ArtifactState::Ours(_) => None,
+    }
+}
+
+/// The path an entry names, or the reason there is none — `$HOME` gave
+/// nowhere to look, and the state carries that instead.
+fn artifact_at(target: &ProbeTarget) -> String {
+    target
+        .artifact_path
+        .as_deref()
+        .map_or_else(|| "an unresolved path".to_string(), redact_path)
+}
+
+fn unreadable_artifact(target: &ProbeTarget, reason: &str) -> String {
+    match target.artifact_path.as_deref() {
+        Some(path) => format!("{}: {}", redact_path(path), redact(reason)),
+        None => redact(reason),
+    }
+}
+
+fn foreign_artifact(target: &ProbeTarget) -> String {
+    format!("not written by roostctl: {}", artifact_at(target))
+}
+
+fn session_artifact_check(probe: &autostart::Probe) -> Check {
+    const ID: &str = "session.autostart";
+    const TITLE: &str = "Autostart artifact";
+    let target = &probe.target;
+    let Some(platform) = target.platform else {
+        return check(ID, TITLE, Status::Skipped, NO_SUPERVISOR);
+    };
+    let (status, detail) = match &target.artifact {
+        ArtifactState::Absent => (Status::Skipped, NOT_INSTALLED.to_string()),
+        ArtifactState::Unavailable(reason) => (Status::Warn, unreadable_artifact(target, reason)),
+        ArtifactState::Foreign => (Status::Warn, foreign_artifact(target)),
+        ArtifactState::Newer { found } => (
+            Status::Warn,
+            format!("written by a newer roostctl (format {found})"),
+        ),
+        ArtifactState::Ours(artifact) if artifact.format < autostart::ARTIFACT_FORMAT => (
+            Status::Warn,
+            format!(
+                "format {}; this roostctl writes format {} — rerun roostctl session autostart \
+                 install",
+                artifact.format,
+                autostart::ARTIFACT_FORMAT
+            ),
+        ),
+        ArtifactState::Ours(artifact) => (
+            Status::Ok,
+            format!(
+                "{} → {}",
+                autostart::supervisor_label(platform, &target.names),
+                redact_path(&artifact.binary)
+            ),
+        ),
+    };
+    check(ID, TITLE, status, detail)
+}
+
+fn session_binary_check(probe: &autostart::Probe) -> Check {
+    const ID: &str = "session.autostart_binary";
+    const TITLE: &str = "Autostart binary";
+    let target = &probe.target;
+    if let Some(reason) = autostart_skip(target) {
+        return check(ID, TITLE, Status::Skipped, reason);
+    }
+    // Keyed on the resolved fact rather than on the artifact's
+    // generation: a binary this probe managed to resolve and found
+    // unexecutable fails, whoever wrote the file. A newer generation's
+    // body is not this build's to read, so it resolves nothing and the
+    // binary it starts is unknown rather than missing.
+    let (status, detail) = match (target.binary(), target.binary_executable) {
+        (Some(binary), Some(true)) => (Status::Ok, redact_path(binary)),
+        (Some(binary), Some(false)) => (
+            Status::Fail,
+            format!("{} is not an executable file", redact_path(binary)),
+        ),
+        _ => (
+            Status::Skipped,
+            "the artifact names no binary this roostctl can read".to_string(),
+        ),
+    };
+    check(ID, TITLE, status, detail)
+}
+
+fn session_enabled_check(probe: &autostart::Probe) -> Check {
+    const ID: &str = "session.autostart_enabled";
+    const TITLE: &str = "Starts at login";
+    let target = &probe.target;
+    if let Some(reason) = autostart_skip(target) {
+        return check(ID, TITLE, Status::Skipped, reason);
+    }
+    let unit = target.names.unit();
+    let (status, detail) = match &probe.enablement {
+        Enablement::Enabled => (
+            Status::Ok,
+            match target.platform {
+                // launchd's database says only what is *dis*abled, so a
+                // label with no row is all this can claim.
+                Some(Platform::MacOs) => "not disabled",
+                _ => "enabled",
+            }
+            .to_string(),
+        ),
+        Enablement::EnabledUntilReboot => (
+            Status::Warn,
+            format!("enabled until the next reboot only (systemctl --user enable {unit})"),
+        ),
+        Enablement::Disabled(word) => (
+            Status::Fail,
+            format!(
+                "{}: it will not start at login ({})",
+                redact(word),
+                enable_remedy(target)
+            ),
+        ),
+        Enablement::Masked => (
+            Status::Fail,
+            format!("masked (systemctl --user unmask {unit})"),
+        ),
+        Enablement::NotSeen => (
+            Status::Fail,
+            format!(
+                "systemd --user does not see {} (systemctl --user daemon-reload, or check that \
+                 XDG_CONFIG_HOME matches the user manager's)",
+                artifact_at(target)
+            ),
+        ),
+        Enablement::NotProbed(reason) => (Status::Skipped, redact(reason)),
+    };
+    check(ID, TITLE, status, detail)
+}
+
+fn enable_remedy(target: &ProbeTarget) -> String {
+    match target.platform {
+        Some(Platform::MacOs) => format!(
+            "launchctl enable {}",
+            target.names.service_target(target.uid)
+        ),
+        _ => format!(
+            "systemctl --user enable {}, or rerun install",
+            target.names.unit()
+        ),
+    }
+}
+
+fn session_active_check(probe: &autostart::Probe) -> Check {
+    const ID: &str = "session.autostart_active";
+    const TITLE: &str = "Supervised session";
+    let target = &probe.target;
+    if let Some(reason) = autostart_skip(target) {
+        return check(ID, TITLE, Status::Skipped, reason);
+    }
+    let (status, detail) = match &probe.activity {
+        Activity::Running { pid: Some(pid) } => (Status::Ok, format!("running (pid {pid})")),
+        Activity::Running { pid: None } => (Status::Ok, "active".to_string()),
+        // A stopped session is legitimate: `session stop` exits 0 on
+        // purpose, and the supervisor is told not to undo it.
+        Activity::Idle(word) => (Status::Ok, redact(word)),
+        Activity::Failed(detail) => (
+            Status::Fail,
+            match target.platform {
+                Some(Platform::MacOs) => format!("last start failed ({})", redact(detail)),
+                _ => format!(
+                    "last start failed ({}; journalctl --user -u {})",
+                    redact(detail),
+                    target.names.unit()
+                ),
+            },
+        ),
+        Activity::NotLoaded => (
+            Status::Warn,
+            format!(
+                "not loaded now; it loads at the next login unless disabled (launchctl bootstrap \
+                 gui/{} {} loads it now)",
+                target.uid,
+                artifact_at(target)
+            ),
+        ),
+        Activity::NotProbed(reason) => (Status::Skipped, redact(reason)),
+    };
+    check(ID, TITLE, status, detail)
+}
+
+/// The other profile's slot. The only durable place a unit written by
+/// the *other* build becomes visible — it starts a session of its own at
+/// every login, which neither verb here will ever touch.
+fn session_sibling_observation(probe: &autostart::Probe) -> Check {
+    const ID: &str = "session.autostart_sibling";
+    const TITLE: &str = "Other profile's artifact";
+    match &probe.target.sibling {
+        None => observation(ID, TITLE, "none"),
+        Some((path, artifact)) => observation(
+            ID,
+            TITLE,
+            format!(
+                "{}-slot artifact also present: {} → {}",
+                probe.target.names.other().slot(),
+                redact_path(path),
+                redact_path(&artifact.binary)
+            ),
+        ),
+    }
+}
+
+fn session_linger_observation(probe: &autostart::Probe) -> Check {
+    const ID: &str = "session.linger";
+    const TITLE: &str = "Lingering";
+    match probe.target.platform {
+        None => unavailable(ID, TITLE, NO_SUPERVISOR),
+        Some(Platform::MacOs) => unavailable(
+            ID,
+            TITLE,
+            "not a launchd concept: a LaunchAgent starts at login",
+        ),
+        Some(Platform::Linux) => match &probe.linger {
+            LingerState::Yes => observation(ID, TITLE, "yes"),
+            LingerState::No => observation(
+                ID,
+                TITLE,
+                "no (the unit starts at login, not at boot — roostctl session autostart install \
+                 --linger)",
+            ),
+            LingerState::Unknown(reason) => {
+                unavailable(ID, TITLE, format!("unknown ({})", redact(reason)))
+            }
+        },
+    }
+}
+
 // ============================================================================
 // Renderers
 // ============================================================================
@@ -3801,6 +4240,63 @@ mod tests {
         }
     }
 
+    /// A Linux box whose own slot holds a current artifact, enabled and
+    /// running — the one shape in which every `session` entry scores.
+    /// Release names, so the strings a reader recognises are the ones
+    /// asserted on.
+    fn installed_autostart() -> autostart::Probe {
+        autostart::Probe {
+            target: ProbeTarget {
+                platform: Some(Platform::Linux),
+                names: autostart::Names::for_build(false),
+                uid: 1000,
+                artifact_path: Some(PathBuf::from(
+                    "/home/roost/.config/systemd/user/roost-session.service",
+                )),
+                artifact: ArtifactState::Ours(autostart::Artifact {
+                    platform: Platform::Linux,
+                    binary: PathBuf::from("/usr/bin/roost-session"),
+                    format: autostart::ARTIFACT_FORMAT,
+                }),
+                binary_executable: Some(true),
+                sibling: None,
+            },
+            enablement: Enablement::Enabled,
+            activity: Activity::Running { pid: Some(4242) },
+            linger: LingerState::Yes,
+        }
+    }
+
+    /// The same box with the unit disabled: installed, and it will not
+    /// come back.
+    fn disabled_autostart() -> autostart::Probe {
+        autostart::Probe {
+            enablement: Enablement::Disabled("disabled".into()),
+            activity: Activity::Idle("inactive".into()),
+            linger: LingerState::No,
+            ..installed_autostart()
+        }
+    }
+
+    /// `installed_autostart()` with something about it changed. A
+    /// closure rather than struct-update syntax because most edits are
+    /// to `Probe::target`, and `..probe.target` nested inside `..probe`
+    /// moves the same value twice.
+    fn autostart_but(edit: impl FnOnce(&mut autostart::Probe)) -> autostart::Probe {
+        let mut probe = installed_autostart();
+        edit(&mut probe);
+        probe
+    }
+
+    /// A `healthy()` box whose autostart half is this probe — the only
+    /// input the `session` section reads.
+    fn session_report(autostart: autostart::Probe) -> Report {
+        evaluate(&Inputs {
+            autostart,
+            ..healthy()
+        })
+    }
+
     fn find<'a>(report: &'a Report, id: &str) -> &'a Check {
         report
             .sections
@@ -3838,8 +4334,8 @@ mod tests {
         assert_eq!(c.status, Some(want), "{id}: {}", c.detail);
     }
 
-    /// The fixed inventory (§3.7): 31 checks + 8 observations.
-    const CHECK_COUNT: usize = 39;
+    /// The fixed inventory (§3.7): 35 checks + 10 observations.
+    const CHECK_COUNT: usize = 45;
 
     // ------------------------------------------------- applicability (AC 7)
 
@@ -5596,6 +6092,7 @@ mod tests {
         ("tab", "tab.derived"),
         ("claude", "claude.hook_events"),
         ("agents", "agent.hook_binary"),
+        ("session", "session.autostart"),
     ];
 
     fn section_of<'a>(report: &'a Report, id: &str) -> &'a Section {
@@ -5848,6 +6345,33 @@ mod tests {
                 "agents",
                 Some(Status::Fail),
                 "agent.claude.wired",
+            ),
+            (
+                "session ok",
+                Inputs {
+                    autostart: installed_autostart(),
+                    ..healthy()
+                },
+                "session",
+                Some(Status::Ok),
+                "session.autostart",
+            ),
+            (
+                "session skipped",
+                healthy(),
+                "session",
+                Some(Status::Skipped),
+                "session.autostart",
+            ),
+            (
+                "session fail",
+                Inputs {
+                    autostart: disabled_autostart(),
+                    ..healthy()
+                },
+                "session",
+                Some(Status::Fail),
+                "session.autostart_enabled",
             ),
         ];
 
@@ -6301,7 +6825,7 @@ mod tests {
     // ----------------------------------------------------- ids + doc links
 
     /// Ids are the stable API the e2e asserts on, and the section
-    /// inventory is fixed: all 26 appear in every report, in this order,
+    /// inventory is fixed: all 45 appear in every report, in this order,
     /// whatever the environment (§3.12). Titles are pinned alongside them
     /// because several checks build one id from more than one arm, and an
     /// inconsistent title there would otherwise ship silently.
@@ -6347,6 +6871,12 @@ mod tests {
             ("agent.cursor.owning", "Cursor — owning a tab"),
             ("agent.opencode.wired", "OpenCode — wired"),
             ("agent.opencode.owning", "OpenCode — owning a tab"),
+            ("session.autostart", "Autostart artifact"),
+            ("session.autostart_binary", "Autostart binary"),
+            ("session.autostart_enabled", "Starts at login"),
+            ("session.autostart_active", "Supervised session"),
+            ("session.autostart_sibling", "Other profile's artifact"),
+            ("session.linger", "Lingering"),
         ];
         assert_eq!(EXPECTED.len(), CHECK_COUNT);
         // Every fixture the suite has, so a check whose title differs
@@ -6384,6 +6914,8 @@ mod tests {
             "tab.ownership",
             "tab.derived",
             "tab.raw_osc",
+            "session.autostart_sibling",
+            "session.linger",
         ];
         for inputs in doc_url_battery() {
             let report = evaluate(&inputs);
@@ -6536,6 +7068,36 @@ mod tests {
                 claude_version: SubprocessOutcome::Output("2.1.220".into()),
                 ..healthy()
             },
+            Inputs {
+                autostart: installed_autostart(),
+                ..healthy()
+            },
+            Inputs {
+                autostart: disabled_autostart(),
+                ..healthy()
+            },
+            // The whole degraded set of the `session` section at once:
+            // an artifact nobody here wrote, a supervisor that could not
+            // be asked, and the other profile's slot occupied.
+            Inputs {
+                autostart: autostart_but(|p| {
+                    let no_systemctl = "/usr/bin/systemctl is not on this system";
+                    p.target.artifact = ArtifactState::Foreign;
+                    p.target.binary_executable = None;
+                    p.target.sibling = Some((
+                        PathBuf::from("/home/roost/.config/systemd/user/roost-session-dev.service"),
+                        autostart::Artifact {
+                            platform: Platform::Linux,
+                            binary: PathBuf::from("/build/debug/roost-session"),
+                            format: autostart::ARTIFACT_FORMAT,
+                        },
+                    ));
+                    p.enablement = Enablement::NotProbed(no_systemctl.into());
+                    p.activity = Activity::NotProbed(no_systemctl.into());
+                    p.linger = LingerState::Unknown("Failed to connect to bus".into());
+                }),
+                ..healthy()
+            },
         ]
     }
 
@@ -6573,20 +7135,51 @@ mod tests {
         p
     }
 
-    /// Conservative stand-in for Python-Markdown's toc slugify: lowercase,
-    /// spaces to hyphens, drop everything that isn't alphanumeric / `-` /
-    /// `_`. Every target below is a plain ASCII heading precisely so the
-    /// two agree.
+    /// Conservative stand-in for Python-Markdown's toc slugify: drop
+    /// everything that is not word-ish, lowercase, and collapse every
+    /// run of hyphens and whitespace into **one** hyphen. The collapse
+    /// is not cosmetic — `### \`session autostart install\` /
+    /// \`uninstall\`` leaves two gaps where the backticks and the slash
+    /// were, and one hyphen is what the generator emits for both.
     fn slugify(heading: &str) -> String {
         let mut out = String::new();
+        let mut pending = false;
         for c in heading.trim().to_lowercase().chars() {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
+            if c.is_alphanumeric() || c == '_' {
+                if pending && !out.is_empty() {
+                    out.push('-');
+                }
+                pending = false;
                 out.push(c);
-            } else if c == ' ' {
-                out.push('-');
+            } else if c == '-' || c.is_whitespace() {
+                pending = true;
             }
         }
         out
+    }
+
+    /// The anchor one heading actually publishes. `attr_list` is on (see
+    /// `zensical.toml`), so a trailing `{: #id }` **is** the anchor and
+    /// the heading text no longer decides it — which is how
+    /// `docs/guides/host-sessions.md` keeps a short, stable
+    /// `#surviving-reboots-launchd` under a longer title.
+    fn anchor_of(heading: &str) -> String {
+        // Only a *trailing* attribute list is one: the generator
+        // slugifies the whole heading when anything follows the `}`, so
+        // accepting `{: #id } trailing` here would pass an anchor the
+        // published page does not carry.
+        let trimmed = heading.trim_end();
+        let Some(attrs) = trimmed
+            .strip_suffix('}')
+            .and_then(|rest| rest.rsplit_once('{'))
+            .map(|(_, attrs)| attrs)
+        else {
+            return slugify(heading);
+        };
+        attrs
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('#'))
+            .map_or_else(|| slugify(heading), str::to_string)
     }
 
     /// Markdown headings only — `#` inside a fenced code block is a shell
@@ -6674,7 +7267,7 @@ mod tests {
             );
             let found = headings(&body)
                 .into_iter()
-                .any(|h| slugify(h) == target.anchor);
+                .any(|h| anchor_of(h) == target.anchor);
             assert!(
                 found,
                 "no heading in {rel} slugifies to `{}`",
@@ -6689,6 +7282,28 @@ mod tests {
     fn the_doc_anchor_helpers_reject_near_misses() {
         let body = "# Real\n\n```bash\n# 1. Allow it as a login shell\n```\n\n## Also Real\n";
         assert_eq!(headings(body), vec![" Real", " Also Real"]);
+
+        // Dropped punctuation leaves one hyphen, not one per gap.
+        assert_eq!(
+            anchor_of(" `session autostart install` / `uninstall`"),
+            "session-autostart-install-uninstall"
+        );
+        // An explicit `attr_list` id wins over the heading text.
+        assert_eq!(
+            anchor_of(" Surviving reboots and logouts {: #surviving-reboots-launchd }"),
+            "surviving-reboots-launchd"
+        );
+        assert_eq!(anchor_of(" How it loads"), "how-it-loads");
+        // An attribute list the generator would not honour, because
+        // something follows it, must not be read as an anchor either.
+        assert_eq!(
+            anchor_of(" Surviving reboots {: #ghost } and logouts"),
+            "surviving-reboots-ghost-and-logouts"
+        );
+        assert_eq!(
+            anchor_of(" Plain {not an attr list}"),
+            "plain-not-an-attr-list"
+        );
 
         let nav = "  { \"CLI\" = \"reference/cli.md\" },\n  # { \"Queries\" = \"reference/terminal-queries.md\" },\n";
         assert!(nav_lists(nav, "reference/cli.md"));
@@ -7702,5 +8317,340 @@ mod tests {
         };
         assert!(why.contains("fifo"), "{why}");
         assert_status(&evaluate(&inputs), "claude.settings", Status::Fail);
+    }
+
+    // ------------------------------------------------------------ session
+
+    /// The `session` section over every artifact state §3.6's table
+    /// names. The supervisor entries are `skipped` for anything but a
+    /// slot of ours, and every `skipped` says which state it came from
+    /// rather than going quiet.
+    #[test]
+    fn the_session_section_reports_every_artifact_state() {
+        let with = |artifact, binary_executable| {
+            autostart_but(|p| {
+                p.target.artifact = artifact;
+                p.target.binary_executable = binary_executable;
+            })
+        };
+        let outdated = ArtifactState::Ours(autostart::Artifact {
+            platform: Platform::Linux,
+            binary: PathBuf::from("/usr/bin/roost-session"),
+            format: autostart::ARTIFACT_FORMAT - 1,
+        });
+
+        let cases: Vec<(&str, autostart::Probe, Status, &str)> = vec![
+            (
+                "not installed",
+                with(ArtifactState::Absent, None),
+                Status::Skipped,
+                "not installed (opt-in: roostctl session autostart install)",
+            ),
+            (
+                "unreadable",
+                with(
+                    ArtifactState::Unavailable("not a regular file".into()),
+                    None,
+                ),
+                Status::Warn,
+                "not a regular file",
+            ),
+            (
+                "foreign",
+                with(ArtifactState::Foreign, None),
+                Status::Warn,
+                "not written by roostctl",
+            ),
+            (
+                "outdated",
+                with(outdated, Some(true)),
+                Status::Warn,
+                "rerun roostctl session autostart install",
+            ),
+            (
+                "newer",
+                with(ArtifactState::Newer { found: 9 }, None),
+                Status::Warn,
+                "written by a newer roostctl (format 9)",
+            ),
+            (
+                "ours, current",
+                installed_autostart(),
+                Status::Ok,
+                "systemd --user roost-session.service → /usr/bin/roost-session",
+            ),
+        ];
+
+        for (label, autostart, want, detail) in cases {
+            let asked = matches!(
+                autostart.target.artifact,
+                ArtifactState::Ours(_) | ArtifactState::Newer { .. }
+            );
+            let report = session_report(autostart);
+            let entry = find(&report, "session.autostart");
+            assert_eq!(entry.status, Some(want), "{label}: {}", entry.detail);
+            assert!(
+                entry.detail.contains(detail),
+                "{label}: `{}` does not carry `{detail}`",
+                entry.detail
+            );
+            for id in ["session.autostart_enabled", "session.autostart_active"] {
+                let entry = find(&report, id);
+                if asked {
+                    assert_ne!(entry.status, Some(Status::Skipped), "{label}: {id}");
+                } else {
+                    assert_eq!(entry.status, Some(Status::Skipped), "{label}: {id}");
+                    assert!(!entry.detail.is_empty(), "{label}: {id} skipped silently");
+                }
+            }
+        }
+    }
+
+    /// `$HOME` leaves doctor nowhere to look, so there is no path to
+    /// name — and lingering is a fact about the user, so it is reported
+    /// anyway.
+    #[test]
+    fn an_unresolved_home_still_reports_lingering() {
+        let report = session_report(autostart_but(|p| {
+            p.target.artifact_path = None;
+            p.target.artifact = ArtifactState::Unavailable("$HOME is not set".into());
+            p.target.binary_executable = None;
+            p.linger = LingerState::No;
+        }));
+        let artifact = find(&report, "session.autostart");
+        assert_eq!(artifact.status, Some(Status::Warn));
+        assert_eq!(artifact.detail, "$HOME is not set");
+        let linger = find(&report, "session.linger");
+        assert_eq!(linger.status, None);
+        assert!(linger.detail.starts_with("no ("), "{}", linger.detail);
+    }
+
+    /// The binary entry is the one that can fail over an artifact that
+    /// is otherwise perfectly fine — the `cargo clean` case #438 left
+    /// behind — and doctor exits 1 for it.
+    #[test]
+    fn a_missing_autostart_binary_fails_and_exits_1() {
+        let report = session_report(autostart_but(|p| p.target.binary_executable = Some(false)));
+        let entry = find(&report, "session.autostart_binary");
+        assert_eq!(entry.status, Some(Status::Fail));
+        assert_eq!(
+            entry.detail,
+            "/usr/bin/roost-session is not an executable file"
+        );
+        assert_eq!(report.exit_code(), 1);
+        let newer = session_report(autostart_but(|p| {
+            p.target.artifact = ArtifactState::Newer { found: 9 };
+            p.target.binary_executable = None;
+        }));
+        assert_status(&newer, "session.autostart_binary", Status::Skipped);
+    }
+
+    /// Every way the supervisor half can read, with the statuses §3.6's
+    /// table gives them.
+    #[test]
+    fn the_supervisor_entries_score_what_the_supervisor_said() {
+        let base = installed_autostart();
+        let enablement: Vec<(Enablement, Status, &str)> = vec![
+            (Enablement::Enabled, Status::Ok, "enabled"),
+            (
+                Enablement::EnabledUntilReboot,
+                Status::Warn,
+                "enabled until the next reboot only (systemctl --user enable \
+                 roost-session.service)",
+            ),
+            (
+                Enablement::Disabled("disabled".into()),
+                Status::Fail,
+                "disabled: it will not start at login (systemctl --user enable \
+                 roost-session.service, or rerun install)",
+            ),
+            (
+                Enablement::Masked,
+                Status::Fail,
+                "masked (systemctl --user unmask roost-session.service)",
+            ),
+            (
+                Enablement::NotSeen,
+                Status::Fail,
+                "systemd --user does not see",
+            ),
+            (
+                Enablement::NotProbed("/usr/bin/systemctl is not on this system".into()),
+                Status::Skipped,
+                "/usr/bin/systemctl is not on this system",
+            ),
+        ];
+        for (state, want, detail) in enablement {
+            let report = session_report(autostart::Probe {
+                enablement: state.clone(),
+                ..base.clone()
+            });
+            let entry = find(&report, "session.autostart_enabled");
+            assert_eq!(entry.status, Some(want), "{state:?}: {}", entry.detail);
+            assert!(entry.detail.contains(detail), "{state:?}: {}", entry.detail);
+        }
+
+        let activity: Vec<(Activity, Status, &str)> = vec![
+            (
+                Activity::Running { pid: Some(42) },
+                Status::Ok,
+                "running (pid 42)",
+            ),
+            (Activity::Running { pid: None }, Status::Ok, "active"),
+            (Activity::Idle("inactive".into()), Status::Ok, "inactive"),
+            (
+                Activity::Failed("the unit is in the failed state".into()),
+                Status::Fail,
+                "last start failed (the unit is in the failed state; journalctl --user -u \
+                 roost-session.service)",
+            ),
+            (
+                Activity::NotLoaded,
+                Status::Warn,
+                "launchctl bootstrap gui/1000",
+            ),
+            (
+                Activity::NotProbed("timed out".into()),
+                Status::Skipped,
+                "timed out",
+            ),
+        ];
+        for (state, want, detail) in activity {
+            let report = session_report(autostart::Probe {
+                activity: state.clone(),
+                ..base.clone()
+            });
+            let entry = find(&report, "session.autostart_active");
+            assert_eq!(entry.status, Some(want), "{state:?}: {}", entry.detail);
+            assert!(entry.detail.contains(detail), "{state:?}: {}", entry.detail);
+        }
+    }
+
+    /// macOS reads a different database, prints different remedies, and
+    /// has no lingering to report at all.
+    #[test]
+    fn the_macos_session_entries_name_launchd() {
+        let mac = autostart::Probe {
+            target: ProbeTarget {
+                platform: Some(Platform::MacOs),
+                uid: 501,
+                artifact_path: Some(PathBuf::from(
+                    "/Users/x/Library/LaunchAgents/ai.stridelabs.roost-session.plist",
+                )),
+                artifact: ArtifactState::Ours(autostart::Artifact {
+                    platform: Platform::MacOs,
+                    binary: PathBuf::from("/usr/local/bin/roost-session"),
+                    format: autostart::ARTIFACT_FORMAT,
+                }),
+                ..installed_autostart().target
+            },
+            enablement: Enablement::Enabled,
+            activity: Activity::NotLoaded,
+            linger: LingerState::Unknown("no loginctl here".into()),
+        };
+        let report = session_report(mac.clone());
+        assert_eq!(
+            find(&report, "session.autostart_enabled").detail,
+            "not disabled"
+        );
+        let active = find(&report, "session.autostart_active");
+        assert_eq!(active.status, Some(Status::Warn));
+        assert!(
+            active.detail.contains(
+                "launchctl bootstrap gui/501 \
+                 /Users/x/Library/LaunchAgents/ai.stridelabs.roost-session.plist"
+            ),
+            "{}",
+            active.detail
+        );
+        let linger = find(&report, "session.linger");
+        assert_eq!(linger.status, Some(Status::Skipped));
+        assert_eq!(
+            linger.detail,
+            "not a launchd concept: a LaunchAgent starts at login"
+        );
+
+        let disabled = session_report(autostart::Probe {
+            enablement: Enablement::Disabled("disabled in launchd's database".into()),
+            ..mac
+        });
+        let entry = find(&disabled, "session.autostart_enabled");
+        assert_eq!(entry.status, Some(Status::Fail));
+        assert_eq!(
+            entry.detail,
+            "disabled in launchd's database: it will not start at login (launchctl enable \
+             gui/501/ai.stridelabs.roost-session)"
+        );
+    }
+
+    #[test]
+    fn the_sibling_observation_names_the_other_slot() {
+        let none = evaluate(&healthy());
+        let entry = find(&none, "session.autostart_sibling");
+        assert_eq!(entry.status, None);
+        assert_eq!(entry.detail, "none");
+
+        let report = session_report(autostart_but(|p| {
+            p.target.sibling = Some((
+                PathBuf::from("/home/roost/.config/systemd/user/roost-session-dev.service"),
+                autostart::Artifact {
+                    platform: Platform::Linux,
+                    binary: PathBuf::from("/build/debug/roost-session"),
+                    format: autostart::ARTIFACT_FORMAT,
+                },
+            ));
+        }));
+        let entry = find(&report, "session.autostart_sibling");
+        assert_eq!(entry.status, None);
+        assert_eq!(
+            entry.detail,
+            "dev-slot artifact also present: \
+             /home/roost/.config/systemd/user/roost-session-dev.service → \
+             /build/debug/roost-session"
+        );
+    }
+
+    /// Supervisor text reaches a rendered line, and a newline in it
+    /// would open a line the report never wrote — a forged section
+    /// header among them.
+    #[test]
+    fn hostile_probe_text_never_reaches_a_rendered_line() {
+        let forged = "boom\n[✓] Host session autostart   all good\u{2028}really";
+        let report = session_report(autostart::Probe {
+            enablement: Enablement::NotProbed(forged.into()),
+            activity: Activity::Idle(forged.into()),
+            linger: LingerState::Unknown(forged.into()),
+            ..installed_autostart()
+        });
+        for id in [
+            "session.autostart_enabled",
+            "session.autostart_active",
+            "session.linger",
+        ] {
+            let detail = &find(&report, id).detail;
+            assert!(!detail.contains('\n'), "{id}: {detail}");
+            assert!(!detail.contains('\u{2028}'), "{id}: {detail}");
+            assert!(detail.contains("\\n"), "{id}: {detail}");
+        }
+        for view in [verbose_text(&report), summary_text(&report)] {
+            assert!(
+                !view
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("[✓]") && line.contains("all good")),
+                "{view}"
+            );
+        }
+    }
+
+    /// The section is `process`-scoped and sits after `agents`; adding
+    /// it is additive, so the schema version does not move.
+    #[test]
+    fn the_session_section_is_last_and_process_scoped() {
+        let report = evaluate(&healthy());
+        let last = report.sections.last().expect("a last section");
+        assert_eq!(last.id, "session");
+        assert_eq!(last.title, "Host session autostart");
+        assert_eq!(last.scope, "process");
+        assert_eq!(report.schema_version, 2);
     }
 }

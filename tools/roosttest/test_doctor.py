@@ -39,7 +39,7 @@ from agent_jail import Jail
 from client import scaled_timeout
 from util import roostctl_path, wait_shell_ready, wait_tab_attached
 
-# The fixed check-id inventory (plan §3.12): all 39 ids appear in every
+# The fixed check-id inventory (plan §3.12): all 45 ids appear in every
 # report, in every environment — a missing id is a bug, not a passing
 # check.
 EXPECTED_CHECK_IDS = {
@@ -82,6 +82,12 @@ EXPECTED_CHECK_IDS = {
     "agent.cursor.owning",
     "agent.opencode.wired",
     "agent.opencode.owning",
+    "session.autostart",
+    "session.autostart_binary",
+    "session.autostart_enabled",
+    "session.autostart_active",
+    "session.autostart_sibling",
+    "session.linger",
 }
 
 # The `tab` section's six axis checks (everything but `tab.selection`).
@@ -246,13 +252,13 @@ def snapshot_home(home: Path) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# a. --json parses; schema_version + exit_code present; the 39 ids, unique
+# a. --json parses; schema_version + exit_code present; the 45 ids, unique
 # ---------------------------------------------------------------------------
 
 
 def test_json_shape_and_full_check_inventory():
     """`doctor --json` parses, carries `schema_version` and `exit_code`,
-    and its check ids are exactly the fixed 39-id inventory (plan §3.12),
+    and its check ids are exactly the fixed 45-id inventory (plan §3.12),
     each appearing once — regardless of environment, since this process
     is not inside a Roost tab and no `--socket` is given."""
     env = dict(os.environ)
@@ -357,7 +363,7 @@ def test_socket_env_alone_does_not_claim_a_roost_tab(roost, project, target):
 def test_socket_env_override_is_honored_and_report_is_complete(tmp_path, roost):
     """`ROOST_SOCKET` pointed at a path nothing is listening on: `ui.socket`
     is `fail`, the process exits 1 (matching the report), and doctor still
-    produces the full 39-check report — it never aborts partway through
+    produces the full 45-check report — it never aborts partway through
     (plan §8 bullet 3 / AC 1).
 
     The failure is driven through the **env var**, not `--socket`, and the

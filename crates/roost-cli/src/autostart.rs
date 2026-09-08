@@ -285,7 +285,7 @@ impl Names {
     }
 
     /// How the profile is named in a sentence about the other slot.
-    fn slot(&self) -> &'static str {
+    pub fn slot(&self) -> &'static str {
         if self.debug_build {
             "dev"
         } else {
@@ -1314,16 +1314,21 @@ fn one_line(raw: &str) -> String {
         .join(" ")
 }
 
+/// The one wording for a linger question `loginctl` never answered. An
+/// install reaches it through the supervisor seam and doctor's probe
+/// through its own runner, and the two must not word it differently.
+fn linger_unavailable(reason: &str) -> LingerState {
+    LingerState::Unknown(format!("loginctl could not be run: {reason}"))
+}
+
 pub fn parse_linger(result: &Result<CommandResult>) -> LingerState {
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            return LingerState::Unknown(format!(
-                "loginctl could not be run: {}",
-                one_line(&format!("{error:#}"))
-            ))
-        }
-    };
+    match result {
+        Ok(result) => parse_linger_answer(result),
+        Err(error) => linger_unavailable(&one_line(&format!("{error:#}"))),
+    }
+}
+
+fn parse_linger_answer(result: &CommandResult) -> LingerState {
     if !result.ok() {
         let stderr = result.stderr.trim();
         return LingerState::Unknown(if stderr.is_empty() {
@@ -1370,9 +1375,12 @@ fn enable_linger_command(uid: u32) -> Command {
     )
 }
 
-fn linger_query_command(uid: u32) -> Command {
+/// `program` because `doctor` asks the same question through an
+/// absolute path — see [`LOGINCTL_PATH`] — while the install path keeps
+/// PATH resolution.
+fn linger_query_command(program: &str, uid: u32) -> Command {
     Command::new(
-        "loginctl",
+        program,
         &[
             "show-user",
             &uid.to_string(),
@@ -1421,7 +1429,404 @@ pub fn settle_linger(supervisor: &dyn Supervisor, step: LingerStep) -> LingerOut
     };
     LingerOutcome {
         grant_failure,
-        state: Some(parse_linger(&supervisor.run(&linger_query_command(uid)))),
+        state: Some(parse_linger(
+            &supervisor.run(&linger_query_command("loginctl", uid)),
+        )),
+    }
+}
+
+// ============================================================================
+// The doctor probe
+// ============================================================================
+
+/// The programs the probe runs, named by absolute path.
+///
+/// `roostctl doctor` has to be safe to run under a hostile `PATH` — the
+/// rule its own `/bin/ps` follows — and every command below only reads.
+/// The mutating verbs keep PATH resolution ([`HostSupervisor::run`]):
+/// they are user-invoked, and a layout that puts `systemctl` elsewhere
+/// (NixOS) has to stay installable.
+const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
+const LOGINCTL_PATH: &str = "/usr/bin/loginctl";
+const LAUNCHCTL_PATH: &str = "/bin/launchctl";
+
+/// What the artifact slot holds, with the read and the parse folded into
+/// one fact — the form every `doctor` entry keys on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactState {
+    Absent,
+    /// Something is there that [`read_artifact`] will not read, and why.
+    Unavailable(String),
+    Foreign,
+    Newer {
+        found: u32,
+    },
+    Ours(Artifact),
+}
+
+impl ArtifactState {
+    /// Is this a file this roostctl owns? A newer generation counts: its
+    /// marker names the unit, which is what every supervisor question is
+    /// about, even though its body is not this build's to read.
+    fn is_ours(&self) -> bool {
+        matches!(self, ArtifactState::Ours(_) | ArtifactState::Newer { .. })
+    }
+}
+
+pub fn artifact_state(read: &ArtifactRead, names: &Names) -> ArtifactState {
+    match read {
+        ArtifactRead::Absent => ArtifactState::Absent,
+        ArtifactRead::Unavailable(reason) => ArtifactState::Unavailable(one_line(reason)),
+        ArtifactRead::Text(text) => match parse_artifact(text, names) {
+            Parsed::Foreign => ArtifactState::Foreign,
+            Parsed::Newer { found } => ArtifactState::Newer { found },
+            Parsed::Ours(artifact) => ArtifactState::Ours(artifact),
+        },
+    }
+}
+
+/// What became of one probe command. Mirrors doctor's own subprocess
+/// outcome, so its runner maps onto this 1:1 and nothing here needs to
+/// know how the command was spawned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Ran(CommandResult),
+    /// The program is not on this system at all.
+    Missing,
+    TimedOut,
+    Failed(String),
+}
+
+/// Will the supervisor start the session at the next login?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enablement {
+    Enabled,
+    /// systemd's `enabled-runtime`: this boot only.
+    EnabledUntilReboot,
+    /// The supervisor's own word for "it will not start".
+    Disabled(String),
+    Masked,
+    /// The file is at the path and the manager does not see it.
+    NotSeen,
+    NotProbed(String),
+}
+
+/// Is a supervised session running right now?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activity {
+    Running {
+        pid: Option<u32>,
+    },
+    /// Not running, legitimately — the word observed. `session stop`
+    /// exits 0 on purpose, so a stopped session is a state, not a fault.
+    Idle(String),
+    Failed(String),
+    /// launchd holds no such job right now.
+    NotLoaded,
+    NotProbed(String),
+}
+
+/// The half of a probe that comes off the filesystem, before any
+/// supervisor is asked anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeTarget {
+    /// `None` where roost has no supervisor for this platform.
+    pub platform: Option<Platform>,
+    pub names: Names,
+    pub uid: u32,
+    /// `None` when `$HOME` left nowhere to look — the reason is then in
+    /// [`Self::artifact`], and the linger question is asked anyway.
+    pub artifact_path: Option<PathBuf>,
+    pub artifact: ArtifactState,
+    /// `None` when no artifact of ours named a binary to check.
+    pub binary_executable: Option<bool>,
+    /// The other profile's slot, when it holds an artifact of its own.
+    pub sibling: Option<(PathBuf, Artifact)>,
+}
+
+impl Default for ProbeTarget {
+    fn default() -> Self {
+        Self {
+            platform: None,
+            names: host_names(),
+            uid: host_uid(),
+            artifact_path: None,
+            artifact: ArtifactState::Absent,
+            binary_executable: None,
+            sibling: None,
+        }
+    }
+}
+
+/// Everything `roostctl doctor` knows about autostart. Every fact is
+/// typed so that "not answered" carries its own reason instead of
+/// collapsing into an absent `Option`.
+impl ProbeTarget {
+    /// The binary the artifact names, when this build could read the
+    /// artifact at all.
+    pub fn binary(&self) -> Option<&Path> {
+        match &self.artifact {
+            ArtifactState::Ours(artifact) => Some(&artifact.binary),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub target: ProbeTarget,
+    pub enablement: Enablement,
+    pub activity: Activity,
+    /// Asked on Linux whatever the artifact says: the grant is per-user
+    /// and outlives any unit.
+    pub linger: LingerState,
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        interpret_probe(ProbeTarget::default(), &[])
+    }
+}
+
+/// Every command doctor runs to answer "will it come back?" — all of
+/// them read-only, which a test pins by name.
+///
+/// The supervisor is asked only about a slot holding an artifact of
+/// ours: over an absent, foreign or unreadable one there is no unit of
+/// roost's to report on, and `is-enabled` against a name nobody wrote
+/// would answer about somebody else's file. Lingering is asked
+/// regardless — it is a property of the user, not of any artifact.
+pub fn probe_commands(
+    platform: Platform,
+    names: &Names,
+    uid: u32,
+    artifact: &ArtifactState,
+) -> Vec<Command> {
+    let ours = artifact.is_ours();
+    match platform {
+        Platform::Linux => {
+            let mut commands = Vec::new();
+            if ours {
+                commands.push(Command::new(
+                    SYSTEMCTL_PATH,
+                    &["--user", "is-enabled", &names.unit()],
+                ));
+                commands.push(Command::new(
+                    SYSTEMCTL_PATH,
+                    &["--user", "is-active", &names.unit()],
+                ));
+            }
+            commands.push(linger_query_command(LOGINCTL_PATH, uid));
+            commands
+        }
+        Platform::MacOs if ours => vec![
+            Command::new(LAUNCHCTL_PATH, &["print", &names.service_target(uid)]),
+            Command::new(LAUNCHCTL_PATH, &["print-disabled", &format!("gui/{uid}")]),
+        ],
+        Platform::MacOs => Vec::new(),
+    }
+}
+
+/// Which question a command asks, read back off the command itself so
+/// the runner may answer them in any order. The verb is the first
+/// argument that is not a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+    Enabled,
+    Active,
+    Print,
+    PrintDisabled,
+    Linger,
+}
+
+fn probe_kind(command: &Command) -> Option<ProbeKind> {
+    let verb = command.args.iter().find(|arg| !arg.starts_with('-'))?;
+    match verb.as_str() {
+        "is-enabled" => Some(ProbeKind::Enabled),
+        "is-active" => Some(ProbeKind::Active),
+        "print" => Some(ProbeKind::Print),
+        "print-disabled" => Some(ProbeKind::PrintDisabled),
+        "show-user" => Some(ProbeKind::Linger),
+        _ => None,
+    }
+}
+
+/// Fold a finished probe run into typed facts.
+///
+/// Each fact reads **its own** command's outcome, so a program that
+/// could not be run leaves every fact that needed it `NotProbed` /
+/// `Unknown` carrying that reason — the commands run concurrently, so
+/// one of them failing to spawn truncates nothing. A fact no command was
+/// issued for keeps the reason it was never asked ([`not_asked`]).
+pub fn interpret_probe(target: ProbeTarget, outcomes: &[(Command, CommandOutcome)]) -> Probe {
+    let unasked = not_asked(&target);
+    let label = target.names.label();
+    let mut probe = Probe {
+        enablement: Enablement::NotProbed(unasked.clone()),
+        activity: Activity::NotProbed(unasked.clone()),
+        linger: LingerState::Unknown(unasked),
+        target,
+    };
+    for (command, outcome) in outcomes {
+        match probe_kind(command) {
+            Some(ProbeKind::Enabled) => probe.enablement = read_is_enabled(command, outcome),
+            Some(ProbeKind::Active) => probe.activity = read_is_active(command, outcome),
+            Some(ProbeKind::Print) => probe.activity = read_launchctl_print(command, outcome),
+            Some(ProbeKind::PrintDisabled) => {
+                probe.enablement = read_print_disabled(command, outcome, &label);
+            }
+            Some(ProbeKind::Linger) => probe.linger = read_linger(command, outcome),
+            None => {}
+        }
+    }
+    probe
+}
+
+/// Why the supervisor was never asked. The report's entries settle on
+/// the artifact state before they look at these, so this is a backstop
+/// that keeps a `NotProbed` from carrying an empty reason.
+fn not_asked(target: &ProbeTarget) -> String {
+    match (target.platform, &target.artifact) {
+        (None, _) => "roost has no supervisor on this platform".to_string(),
+        (_, ArtifactState::Absent) => "the artifact is not installed".to_string(),
+        (_, ArtifactState::Unavailable(reason)) => reason.clone(),
+        (_, ArtifactState::Foreign) => "the artifact was not written by roostctl".to_string(),
+        (_, ArtifactState::Ours(_) | ArtifactState::Newer { .. }) => {
+            "the supervisor was not asked".to_string()
+        }
+    }
+}
+
+/// `systemctl is-enabled` answers with **one word on stdout** and an
+/// exit code that only repeats it (1 for disabled, 4 for not-found), so
+/// the word is the answer and the code is ignored. No word at all means
+/// the manager never answered — a dead bus, say — and what it said
+/// instead becomes the reason.
+fn read_is_enabled(command: &Command, outcome: &CommandOutcome) -> Enablement {
+    let CommandOutcome::Ran(result) = outcome else {
+        return Enablement::NotProbed(outcome_reason(command, outcome));
+    };
+    let Some(word) = result.stdout.split_whitespace().next() else {
+        return Enablement::NotProbed(ran_reason(result));
+    };
+    match word {
+        "enabled" => Enablement::Enabled,
+        "enabled-runtime" => Enablement::EnabledUntilReboot,
+        "disabled" => Enablement::Disabled(word.to_string()),
+        "masked" | "masked-runtime" => Enablement::Masked,
+        "not-found" => Enablement::NotSeen,
+        // Quoted, the way `parse_linger` quotes an answer it cannot
+        // place: a word this build does not know is reported, never
+        // guessed at.
+        other => Enablement::NotProbed(format!("unexpected is-enabled answer: {other:?}")),
+    }
+}
+
+/// `systemctl is-active`, read exactly like [`read_is_enabled`].
+fn read_is_active(command: &Command, outcome: &CommandOutcome) -> Activity {
+    let CommandOutcome::Ran(result) = outcome else {
+        return Activity::NotProbed(outcome_reason(command, outcome));
+    };
+    let Some(word) = result.stdout.split_whitespace().next() else {
+        return Activity::NotProbed(ran_reason(result));
+    };
+    match word {
+        "active" => Activity::Running { pid: None },
+        "inactive" | "activating" | "deactivating" => Activity::Idle(word.to_string()),
+        "failed" => Activity::Failed("the unit is in the failed state".to_string()),
+        other => Activity::NotProbed(format!("unexpected is-active answer: {other:?}")),
+    }
+}
+
+/// `launchctl print <target>`: exiting 0 means launchd holds the job,
+/// and the body says whether a process exists (`pid = N`) or how the
+/// last one ended (`last exit code = N`). "Could not find service" is
+/// the one nonzero exit that is an answer rather than a failure.
+fn read_launchctl_print(command: &Command, outcome: &CommandOutcome) -> Activity {
+    let CommandOutcome::Ran(result) = outcome else {
+        return Activity::NotProbed(outcome_reason(command, outcome));
+    };
+    if !result.ok() {
+        return if result.stderr.contains("Could not find service")
+            || result.stdout.contains("Could not find service")
+        {
+            Activity::NotLoaded
+        } else {
+            Activity::NotProbed(ran_reason(result))
+        };
+    }
+    if let Some(pid) = launchctl_field(&result.stdout, "pid").and_then(|v| v.parse().ok()) {
+        return Activity::Running { pid: Some(pid) };
+    }
+    match launchctl_field(&result.stdout, "last exit code").and_then(|v| v.parse::<i64>().ok()) {
+        Some(code) if code != 0 => Activity::Failed(format!("last exit code {code}")),
+        _ => Activity::Idle("loaded, not running".to_string()),
+    }
+}
+
+/// One `key = value` line out of a `launchctl print` body, matched on
+/// the whole key so `pid` cannot read `spawn type`'s value.
+fn launchctl_field<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    stdout.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        (name.trim() == key).then(|| value.trim())
+    })
+}
+
+/// `launchctl print-disabled gui/<uid>` lists the override database, one
+/// `"<label>" => disabled|enabled` row per label. The label is matched
+/// **whole and quoted**: `ai.stridelabs.roost-session` is a prefix of
+/// `ai.stridelabs.roost-session-dev`, so a substring test would read one
+/// profile's row as the other's. A label with no row is not disabled.
+fn read_print_disabled(command: &Command, outcome: &CommandOutcome, label: &str) -> Enablement {
+    let CommandOutcome::Ran(result) = outcome else {
+        return Enablement::NotProbed(outcome_reason(command, outcome));
+    };
+    // Unlike `is-enabled`, this one has no answer to give through its
+    // exit code: a nonzero exit is a failure to list the database.
+    if !result.ok() {
+        return Enablement::NotProbed(ran_reason(result));
+    }
+    let quoted = format!("\"{label}\"");
+    let disabled = result.stdout.lines().any(|line| {
+        matches!(line.split_once("=>"), Some((name, state))
+            if name.trim() == quoted && state.trim() == "disabled")
+    });
+    if disabled {
+        Enablement::Disabled("disabled in launchd's database".to_string())
+    } else {
+        Enablement::Enabled
+    }
+}
+
+/// The linger fact from a probe outcome — the install path's own
+/// answer reader, so a probe and an install can never word the same
+/// state differently.
+fn read_linger(command: &Command, outcome: &CommandOutcome) -> LingerState {
+    match outcome {
+        CommandOutcome::Ran(result) => parse_linger_answer(result),
+        other => linger_unavailable(&outcome_reason(command, other)),
+    }
+}
+
+/// Why a probe command left nothing usable behind, as one line.
+fn outcome_reason(command: &Command, outcome: &CommandOutcome) -> String {
+    match outcome {
+        CommandOutcome::Ran(result) => ran_reason(result),
+        CommandOutcome::Missing => format!("{} is not on this system", command.program),
+        CommandOutcome::TimedOut => format!("`{command}` timed out"),
+        CommandOutcome::Failed(reason) => one_line(reason),
+    }
+}
+
+fn ran_reason(result: &CommandResult) -> String {
+    let stderr = one_line(&result.stderr);
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    match result.status {
+        Some(code) => format!("exited {code} with no output"),
+        None => "was killed by a signal".to_string(),
     }
 }
 
@@ -1445,7 +1850,7 @@ impl HostSupervisor {
     }
 }
 
-fn host_uid() -> u32 {
+pub fn host_uid() -> u32 {
     // SAFETY: a plain getter with no arguments.
     unsafe { libc::getuid() }
 }
@@ -1484,7 +1889,7 @@ impl Supervisor for HostSupervisor {
     }
 }
 
-fn home_dir() -> Result<PathBuf> {
+pub fn home_dir() -> Result<PathBuf> {
     let raw = std::env::var_os("HOME").context("$HOME is not set")?;
     let path = PathBuf::from(raw);
     anyhow::ensure!(
@@ -1495,7 +1900,7 @@ fn home_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn xdg_config_home() -> Option<PathBuf> {
+pub fn xdg_config_home() -> Option<PathBuf> {
     std::env::var_os(XDG_CONFIG_HOME_ENV)
         .filter(|raw| !raw.is_empty())
         .map(PathBuf::from)
@@ -1503,7 +1908,7 @@ fn xdg_config_home() -> Option<PathBuf> {
 
 /// This build's profile. The one place the build profile is read — every
 /// other name in this module is derived from the [`Names`] it hands out.
-fn host_names() -> Names {
+pub fn host_names() -> Names {
     Names::for_build(cfg!(debug_assertions))
 }
 
@@ -4042,7 +4447,11 @@ mod tests {
     #[test]
     fn every_loginctl_invocation_carries_no_ask_password() {
         assert_eq!(enable_linger_command(501).to_string(), GRANT);
-        assert_eq!(linger_query_command(501).to_string(), PROBE);
+        assert_eq!(linger_query_command("loginctl", 501).to_string(), PROBE);
+        assert_eq!(
+            linger_query_command(LOGINCTL_PATH, 501).to_string(),
+            format!("/usr/bin/{PROBE}")
+        );
     }
 
     /// The two `loginctl` invocations as they are built, and as the fake
@@ -4224,5 +4633,564 @@ mod tests {
         ] {
             assert_eq!(install_exit_code(Some(outcome), &clean), 0, "{outcome:?}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The doctor probe
+    // ------------------------------------------------------------------
+
+    /// Every state a slot can be in, named for the assertion messages.
+    fn slot_states() -> Vec<(&'static str, ArtifactState)> {
+        vec![
+            ("absent", ArtifactState::Absent),
+            (
+                "unavailable",
+                ArtifactState::Unavailable("not a regular file".to_string()),
+            ),
+            ("foreign", ArtifactState::Foreign),
+            ("newer", ArtifactState::Newer { found: 9 }),
+            (
+                "ours",
+                ArtifactState::Ours(Artifact {
+                    platform: Platform::Linux,
+                    binary: PathBuf::from("/usr/bin/roost-session"),
+                    format: ARTIFACT_FORMAT,
+                }),
+            ),
+        ]
+    }
+
+    fn command_lines(commands: &[Command]) -> Vec<String> {
+        commands.iter().map(Command::to_string).collect()
+    }
+
+    const LINGER_PROBE: &str =
+        "/usr/bin/loginctl show-user 1000 --property=Linger --value --no-ask-password";
+
+    #[test]
+    fn the_linux_probe_asks_the_supervisor_only_about_an_artifact_of_ours() {
+        for (label, state) in slot_states() {
+            let lines = command_lines(&probe_commands(Platform::Linux, &release(), 1000, &state));
+            let want: Vec<String> = if state.is_ours() {
+                vec![
+                    "/usr/bin/systemctl --user is-enabled roost-session.service".to_string(),
+                    "/usr/bin/systemctl --user is-active roost-session.service".to_string(),
+                    LINGER_PROBE.to_string(),
+                ]
+            } else {
+                vec![LINGER_PROBE.to_string()]
+            };
+            assert_eq!(lines, want, "{label}");
+        }
+    }
+
+    #[test]
+    fn the_macos_probe_asks_the_supervisor_only_about_an_artifact_of_ours() {
+        for (label, state) in slot_states() {
+            let lines = command_lines(&probe_commands(Platform::MacOs, &release(), 501, &state));
+            let want: Vec<String> = if state.is_ours() {
+                vec![
+                    "/bin/launchctl print gui/501/ai.stridelabs.roost-session".to_string(),
+                    "/bin/launchctl print-disabled gui/501".to_string(),
+                ]
+            } else {
+                // launchd has no linger to ask about.
+                Vec::new()
+            };
+            assert_eq!(lines, want, "{label}");
+        }
+    }
+
+    #[test]
+    fn the_probe_names_the_profiles_own_unit_and_label() {
+        let ours = slot_states().pop().expect("the `ours` row").1;
+        assert_eq!(
+            command_lines(&probe_commands(Platform::Linux, &dev(), 1000, &ours)),
+            vec![
+                "/usr/bin/systemctl --user is-enabled roost-session-dev.service",
+                "/usr/bin/systemctl --user is-active roost-session-dev.service",
+                LINGER_PROBE,
+            ]
+        );
+        assert_eq!(
+            command_lines(&probe_commands(Platform::MacOs, &dev(), 501, &ours)),
+            vec![
+                "/bin/launchctl print gui/501/ai.stridelabs.roost-session-dev",
+                "/bin/launchctl print-disabled gui/501",
+            ]
+        );
+    }
+
+    /// Doctor reports; it never repairs. Every verb that would change
+    /// the supervisor's mind is named here, so a probe that grows one
+    /// fails rather than ships.
+    #[test]
+    fn no_probe_command_can_mutate_anything() {
+        const MUTATING: &[&str] = &[
+            "enable",
+            "disable",
+            "bootstrap",
+            "bootout",
+            "kickstart",
+            "enable-linger",
+            "disable-linger",
+            "daemon-reload",
+            "unmask",
+            "mask",
+            "start",
+            "stop",
+            "restart",
+        ];
+        for platform in [Platform::Linux, Platform::MacOs] {
+            for names in [release(), dev()] {
+                for (label, state) in slot_states() {
+                    for command in probe_commands(platform, &names, 1000, &state) {
+                        assert!(
+                            command.program.starts_with('/'),
+                            "{label}: {command} is PATH-resolved"
+                        );
+                        for arg in &command.args {
+                            assert!(
+                                !MUTATING.contains(&arg.as_str()),
+                                "{label}: {command} would mutate"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The probe as doctor hands it back: the file half untouched, the
+    /// supervisor half whatever the outcomes said.
+    fn linux_target() -> ProbeTarget {
+        ProbeTarget {
+            platform: Some(Platform::Linux),
+            names: release(),
+            uid: 1000,
+            artifact_path: Some(PathBuf::from(
+                "/home/x/.config/systemd/user/roost-session.service",
+            )),
+            artifact: ArtifactState::Ours(Artifact {
+                platform: Platform::Linux,
+                binary: PathBuf::from("/usr/bin/roost-session"),
+                format: ARTIFACT_FORMAT,
+            }),
+            binary_executable: Some(true),
+            sibling: None,
+        }
+    }
+
+    fn macos_target() -> ProbeTarget {
+        ProbeTarget {
+            platform: Some(Platform::MacOs),
+            names: release(),
+            uid: 501,
+            artifact_path: Some(PathBuf::from(
+                "/Users/x/Library/LaunchAgents/ai.stridelabs.roost-session.plist",
+            )),
+            artifact: ArtifactState::Ours(Artifact {
+                platform: Platform::MacOs,
+                binary: PathBuf::from("/usr/local/bin/roost-session"),
+                format: ARTIFACT_FORMAT,
+            }),
+            binary_executable: Some(true),
+            sibling: None,
+        }
+    }
+
+    /// One command's answer, paired with the command `probe_commands`
+    /// would have produced for it.
+    fn answered(
+        target: &ProbeTarget,
+        kind: ProbeKind,
+        outcome: CommandOutcome,
+    ) -> Vec<(Command, CommandOutcome)> {
+        let platform = target.platform.expect("a platform");
+        let command = probe_commands(platform, &target.names, target.uid, &target.artifact)
+            .into_iter()
+            .find(|c| probe_kind(c) == Some(kind))
+            .unwrap_or_else(|| panic!("no {kind:?} command"));
+        vec![(command, outcome)]
+    }
+
+    fn ran(status: i32, stdout: &str, stderr: &str) -> CommandOutcome {
+        CommandOutcome::Ran(CommandResult {
+            status: Some(status),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        })
+    }
+
+    fn enablement_of(target: &ProbeTarget, kind: ProbeKind, outcome: CommandOutcome) -> Enablement {
+        interpret_probe(target.clone(), &answered(target, kind, outcome)).enablement
+    }
+
+    fn activity_of(target: &ProbeTarget, kind: ProbeKind, outcome: CommandOutcome) -> Activity {
+        interpret_probe(target.clone(), &answered(target, kind, outcome)).activity
+    }
+
+    #[test]
+    fn is_enabled_is_read_from_its_first_word() {
+        let target = linux_target();
+        let cases: Vec<(i32, &str, Enablement)> = vec![
+            (0, "enabled\n", Enablement::Enabled),
+            (0, "enabled-runtime\n", Enablement::EnabledUntilReboot),
+            (
+                1,
+                "disabled\n",
+                Enablement::Disabled("disabled".to_string()),
+            ),
+            (1, "masked\n", Enablement::Masked),
+            (1, "masked-runtime\n", Enablement::Masked),
+            (4, "not-found\n", Enablement::NotSeen),
+            (
+                0,
+                "static\n",
+                Enablement::NotProbed("unexpected is-enabled answer: \"static\"".to_string()),
+            ),
+        ];
+        for (status, stdout, want) in cases {
+            assert_eq!(
+                enablement_of(&target, ProbeKind::Enabled, ran(status, stdout, "")),
+                want,
+                "{stdout:?}"
+            );
+        }
+    }
+
+    /// A user manager that is not there answers on stderr and prints no
+    /// word at all, which is a reason rather than an answer.
+    #[test]
+    fn a_dead_bus_leaves_the_enablement_unprobed_with_the_reason() {
+        let bus = "Failed to connect to bus: No medium found\n";
+        assert_eq!(
+            enablement_of(&linux_target(), ProbeKind::Enabled, ran(1, "", bus)),
+            Enablement::NotProbed("Failed to connect to bus: No medium found".to_string())
+        );
+        assert_eq!(
+            activity_of(&linux_target(), ProbeKind::Active, ran(1, "", bus)),
+            Activity::NotProbed("Failed to connect to bus: No medium found".to_string())
+        );
+    }
+
+    #[test]
+    fn is_active_is_read_from_its_first_word() {
+        let target = linux_target();
+        let cases: Vec<(i32, &str, Activity)> = vec![
+            (0, "active\n", Activity::Running { pid: None }),
+            (4, "inactive\n", Activity::Idle("inactive".to_string())),
+            (0, "activating\n", Activity::Idle("activating".to_string())),
+            (
+                0,
+                "deactivating\n",
+                Activity::Idle("deactivating".to_string()),
+            ),
+            (
+                3,
+                "failed\n",
+                Activity::Failed("the unit is in the failed state".to_string()),
+            ),
+            (
+                0,
+                "reloading\n",
+                Activity::NotProbed("unexpected is-active answer: \"reloading\"".to_string()),
+            ),
+        ];
+        for (status, stdout, want) in cases {
+            assert_eq!(
+                activity_of(&target, ProbeKind::Active, ran(status, stdout, "")),
+                want,
+                "{stdout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn launchctl_print_separates_running_from_failed_from_absent() {
+        let target = macos_target();
+        let running = "\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n";
+        assert_eq!(
+            activity_of(&target, ProbeKind::Print, ran(0, running, "")),
+            Activity::Running { pid: Some(4242) }
+        );
+        assert_eq!(
+            activity_of(
+                &target,
+                ProbeKind::Print,
+                ran(0, "\tstate = not running\n\tlast exit code = 78\n", "")
+            ),
+            Activity::Failed("last exit code 78".to_string())
+        );
+        assert_eq!(
+            activity_of(
+                &target,
+                ProbeKind::Print,
+                ran(0, "\tstate = not running\n\tlast exit code = 0\n", "")
+            ),
+            Activity::Idle("loaded, not running".to_string())
+        );
+        assert_eq!(
+            activity_of(
+                &target,
+                ProbeKind::Print,
+                ran(
+                    113,
+                    "",
+                    "Could not find service \"ai.stridelabs.roost-session\"\n"
+                )
+            ),
+            Activity::NotLoaded
+        );
+        assert_eq!(
+            activity_of(&target, ProbeKind::Print, ran(1, "", "Bad request.\n")),
+            Activity::NotProbed("Bad request.".to_string())
+        );
+    }
+
+    /// A database holding both labels in opposite states is the case a
+    /// substring match gets backwards.
+    #[test]
+    fn print_disabled_matches_the_whole_quoted_label() {
+        let both = |release_state: &str, dev_state: &str| {
+            format!(
+                "disabled services = {{\n\
+                 \t\"ai.stridelabs.roost-session\" => {release_state}\n\
+                 \t\"ai.stridelabs.roost-session-dev\" => {dev_state}\n\
+                 }}\n"
+            )
+        };
+        let disabled = Enablement::Disabled("disabled in launchd's database".to_string());
+        for (release_state, dev_state, want_release, want_dev) in [
+            ("disabled", "enabled", disabled.clone(), Enablement::Enabled),
+            ("enabled", "disabled", Enablement::Enabled, disabled.clone()),
+            ("disabled", "disabled", disabled.clone(), disabled.clone()),
+            (
+                "enabled",
+                "enabled",
+                Enablement::Enabled,
+                Enablement::Enabled,
+            ),
+        ] {
+            let stdout = both(release_state, dev_state);
+            for (names, want) in [(release(), &want_release), (dev(), &want_dev)] {
+                let target = ProbeTarget {
+                    names,
+                    ..macos_target()
+                };
+                assert_eq!(
+                    &enablement_of(&target, ProbeKind::PrintDisabled, ran(0, &stdout, "")),
+                    want,
+                    "{} in [{release_state}, {dev_state}]",
+                    names.label()
+                );
+            }
+        }
+
+        // A label the database says nothing about is not disabled.
+        assert_eq!(
+            enablement_of(
+                &macos_target(),
+                ProbeKind::PrintDisabled,
+                ran(
+                    0,
+                    "disabled services = {\n\t\"com.example.other\" => disabled\n}\n",
+                    ""
+                )
+            ),
+            Enablement::Enabled
+        );
+        assert_eq!(
+            enablement_of(
+                &macos_target(),
+                ProbeKind::PrintDisabled,
+                ran(1, "", "Could not find domain for\n")
+            ),
+            Enablement::NotProbed("Could not find domain for".to_string())
+        );
+    }
+
+    /// A command that never ran leaves the fact it was for unprobed,
+    /// naming what stopped it.
+    #[test]
+    fn a_command_that_could_not_run_carries_its_reason() {
+        let target = linux_target();
+        for (outcome, want) in [
+            (
+                CommandOutcome::Missing,
+                "/usr/bin/systemctl is not on this system".to_string(),
+            ),
+            (
+                CommandOutcome::TimedOut,
+                "`/usr/bin/systemctl --user is-enabled roost-session.service` timed out"
+                    .to_string(),
+            ),
+            (
+                CommandOutcome::Failed("permission denied\nsecond line".to_string()),
+                "permission denied second line".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                enablement_of(&target, ProbeKind::Enabled, outcome.clone()),
+                Enablement::NotProbed(want),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// The linger fact is the install path's own `parse_linger`, so a
+    /// probe and an install can never word the same state differently.
+    #[test]
+    fn the_probe_reads_lingering_the_way_an_install_does() {
+        let target = linux_target();
+        let linger = |outcome: CommandOutcome| {
+            interpret_probe(
+                target.clone(),
+                &answered(&target, ProbeKind::Linger, outcome),
+            )
+            .linger
+        };
+        assert_eq!(linger(ran(0, "yes\n", "")), LingerState::Yes);
+        assert_eq!(linger(ran(0, "no\n", "")), LingerState::No);
+        assert_eq!(
+            linger(ran(1, "", "Failed to look up user 1000\n")),
+            unknown("Failed to look up user 1000")
+        );
+        assert_eq!(
+            linger(CommandOutcome::Missing),
+            unknown("loginctl could not be run: /usr/bin/loginctl is not on this system")
+        );
+    }
+
+    /// Nothing asked is not the same as nothing to say: every unprobed
+    /// fact names why it was never asked, and the file half comes back
+    /// exactly as it went in.
+    #[test]
+    fn an_unasked_probe_keeps_its_reason_and_its_file_facts() {
+        let target = ProbeTarget {
+            artifact: ArtifactState::Foreign,
+            binary_executable: None,
+            ..linux_target()
+        };
+        let probe = interpret_probe(target.clone(), &[]);
+        assert_eq!(probe.target, target);
+        let reason = "the artifact was not written by roostctl".to_string();
+        assert_eq!(probe.enablement, Enablement::NotProbed(reason.clone()));
+        assert_eq!(probe.activity, Activity::NotProbed(reason.clone()));
+        assert_eq!(probe.linger, LingerState::Unknown(reason));
+
+        for (state, want) in [
+            (ArtifactState::Absent, "the artifact is not installed"),
+            (
+                ArtifactState::Unavailable("not a regular file".to_string()),
+                "not a regular file",
+            ),
+        ] {
+            let probe = interpret_probe(
+                ProbeTarget {
+                    artifact: state,
+                    binary_executable: None,
+                    ..linux_target()
+                },
+                &[],
+            );
+            assert_eq!(probe.enablement, Enablement::NotProbed(want.to_string()));
+        }
+
+        // No supervisor at all outranks whatever is on disk.
+        let nowhere = interpret_probe(ProbeTarget::default(), &[]);
+        assert_eq!(
+            nowhere.linger,
+            unknown("roost has no supervisor on this platform")
+        );
+    }
+
+    /// A whole run, mapped back onto the right facts however the runner
+    /// ordered the answers.
+    #[test]
+    fn a_full_run_lands_each_answer_on_its_own_fact() {
+        let target = linux_target();
+        let commands = probe_commands(Platform::Linux, &target.names, target.uid, &target.artifact);
+        let answers = [
+            ran(1, "disabled\n", ""),
+            ran(3, "failed\n", ""),
+            ran(0, "yes\n", ""),
+        ];
+        let mut outcomes: Vec<(Command, CommandOutcome)> =
+            commands.into_iter().zip(answers).collect();
+        outcomes.reverse();
+        let probe = interpret_probe(target, &outcomes);
+        assert_eq!(
+            probe.enablement,
+            Enablement::Disabled("disabled".to_string())
+        );
+        assert_eq!(
+            probe.activity,
+            Activity::Failed("the unit is in the failed state".to_string())
+        );
+        assert_eq!(probe.linger, LingerState::Yes);
+    }
+
+    /// Supervisor text reaches a report line, so a newline in it would
+    /// open a line the report never wrote.
+    #[test]
+    fn hostile_supervisor_output_cannot_forge_a_probe_line() {
+        let target = linux_target();
+        let forged = "boom\nlinger=yes\n";
+        let probe = interpret_probe(
+            target.clone(),
+            &answered(&target, ProbeKind::Linger, ran(1, "", forged)),
+        );
+        assert_eq!(probe.linger, unknown("boom linger=yes"));
+        assert_eq!(
+            enablement_of(&target, ProbeKind::Enabled, ran(1, "", forged)),
+            Enablement::NotProbed("boom linger=yes".to_string())
+        );
+        assert_eq!(
+            enablement_of(
+                &target,
+                ProbeKind::Enabled,
+                ran(0, "\u{1b}[2Kenabled\n", "")
+            ),
+            Enablement::NotProbed(
+                "unexpected is-enabled answer: \"\\u{1b}[2Kenabled\"".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_artifact_state_folds_the_read_and_the_parse() {
+        let text = render_unit(&release(), Path::new("/usr/bin/roost-session"));
+        assert_eq!(
+            artifact_state(&text_read(&text), &release()),
+            ArtifactState::Ours(ours(&text, &release()))
+        );
+        // The same bytes under the other profile's names are somebody
+        // else's file.
+        assert_eq!(
+            artifact_state(&text_read(&text), &dev()),
+            ArtifactState::Foreign
+        );
+        assert_eq!(
+            artifact_state(&ArtifactRead::Absent, &release()),
+            ArtifactState::Absent
+        );
+        assert_eq!(
+            artifact_state(
+                &ArtifactRead::Unavailable("not a regular file\nfoo".to_string()),
+                &release()
+            ),
+            ArtifactState::Unavailable("not a regular file foo".to_string())
+        );
+        let newer = text.replace(
+            &unit_marker(ARTIFACT_FORMAT),
+            &unit_marker(ARTIFACT_FORMAT + 1),
+        );
+        assert_eq!(
+            artifact_state(&text_read(&newer), &release()),
+            ArtifactState::Newer {
+                found: ARTIFACT_FORMAT + 1
+            }
+        );
     }
 }
