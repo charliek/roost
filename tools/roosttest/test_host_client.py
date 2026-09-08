@@ -329,6 +329,71 @@ def host_row(roost: Roost, row_id: str) -> dict | None:
     return next((item for item in host_rows(roost) if item["id"] == row_id), None)
 
 
+def host_status_row(roost: Roost, saved_id: str) -> dict:
+    """This host's one `host.status` row."""
+    return roost.host_status(id=saved_id)["hosts"][0]
+
+
+def wait_live_connect(host: HostUnderTest, timeout: float = 60.0) -> dict:
+    """Wait until `host.status` reports this host **connected with its
+    connect facts on the row**, and hand that row back.
+
+    Composite, and every wait that goes on to read `connect` has to be:
+    the connection's state and its `ConnectFacts` are two separate items
+    on the engine feed (`connect_loop` publishes the facts right after
+    the state for that incarnation), so there is a real frame where a row
+    reads `connected` and carries no `connect` object at all. A wait on
+    the state alone hands back that row perhaps one time in fifty — an
+    attribute error rather than a verdict, which is a flake rather than
+    an assertion.
+    """
+
+    def landed() -> dict | None:
+        row = host_status_row(host.roost, host.saved_id)
+        if row["state"] != "connected" or row.get("connect") is None:
+            return None
+        return row
+
+    return wait_until(landed, timeout, f"{host.label}'s connect facts to land")
+
+
+def listed_host_tabs(roost: Roost, saved_id: str) -> set[int]:
+    """The bare tab ids this host's sidebar section is listing.
+
+    Read off `app.sidebar_dump` rather than by probing for a key
+    ([`host_key`]): this is what the section *draws*, which is the thing
+    a resume has to get right, and reading it attaches nothing — so a
+    case can ask what the client knows without changing what it is
+    looking at.
+    """
+    section = roost.sidebar_host(saved_id)
+    if section is None:
+        return set()
+    return {
+        int(tab["key"].split(".", 1)[1])
+        for project in section["projects"]
+        for tab in project["tabs"]
+    }
+
+
+def caught_up(host: HostUnderTest, session: Roost) -> None:
+    """Wait until the client's section lists exactly the session's tabs.
+
+    What a resume presents is the client's *last applied* revision, so a
+    case that reads `tab.list.revision` while the client is still a batch
+    behind names a revision the client never reached — and its
+    `from_revision` assertion is off by one, at random. Tab identity is
+    the cheapest proof of catch-up there is, and every tab these cases
+    open is parked on a `sleep`, so nothing commits behind it.
+    """
+    served = {int(row["id"]) for row in session.tabs()}
+    wait_until(
+        lambda: listed_host_tabs(host.roost, host.saved_id) == served,
+        60.0,
+        "the client to list every tab the session has",
+    )
+
+
 def inbox_ids(roost: Roost) -> set[str]:
     """The notification inbox's row ids — `notif:<TabKey>`, so a host
     row's id carries its incarnation and a local row's does not.
@@ -495,6 +560,55 @@ def test_a_marker_written_before_a_disconnect_survives_the_reconnect(host, roost
             "the dead one could land on the new connection's tab"
         )
         wait_dump_contains(roost, again, line)
+
+
+def test_a_reconnect_resumes_the_stream_from_the_fence_it_left_at(host, roost):
+    """Plan 056 R11: coming back is a *resume*, not a re-list.
+
+    `host.disconnect` + `host.connect` is the only drop this lane can
+    force — a takeover of the client's own connection rather than a wire
+    that died — and that is exactly enough, because the fact being
+    resumed on is a fact about the **session**: the same `session_id`,
+    the same replay ring, the same fence. Which side hung up decides
+    nothing (§3.2), which is why the checkpoint lives on the host entry
+    and is seeded into every attempt whatever its cause.
+
+    Two claims, and the second is what makes the first mean something:
+    the client says it resumed, and it says it resumed *from the
+    revision the session was at when it left*. A client that reported
+    `resumed` off its own request rather than off the session's ack
+    would pass the first and fail the second.
+
+    The tab opened in the gap is the content half: it reaches the
+    section through the replay, because nothing else could have carried
+    it. (That no `tab.list` went out on the wire is the task-level
+    unit table's assertion — `Fake.tab_lists == 0`; this lane can only
+    see the verdict and the rows.)
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        quiet_tab(session, project, host.env.launch_cwd)
+        caught_up(host, session)
+        before = listed_host_tabs(roost, host.saved_id)
+        fence = session.call("tab.list")["revision"]
+
+        host.disconnect()
+        host.wait_not_connected()
+        gap = quiet_tab(session, project, host.env.launch_cwd)
+
+        host.connect()
+        row = wait_live_connect(host)
+        facts = row["connect"]
+        assert facts["resumed"] is True, row
+        assert facts["from_revision"] == fence, (facts, fence)
+        assert facts["session_id"] == host.env.identify()["session_id"], facts
+
+        wait_until(
+            lambda: listed_host_tabs(roost, host.saved_id) == before | {gap},
+            30.0,
+            "the replay to bring the gap's tab into the section",
+        )
 
 
 # ---------------------------------------------------------------------------
