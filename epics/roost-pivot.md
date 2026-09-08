@@ -39,22 +39,38 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R11 | [#442](https://github.com/charliek/roost/issues/442) | RP/M4 | the iced client still re-snapshots on reconnect, so R5's resume buys roost's own UI nothing |
 | R12 | [#443](https://github.com/charliek/roost/issues/443) | RP/M6 | autostart's first cut: a dev install repoints a release one, status cannot say whether it is enabled, reboot survival is two steps |
 | R13 | [#444](https://github.com/charliek/roost/issues/444) | — | CI: `pty_shutdown_test` cannot allocate a PTY on macOS, failing `rust-build` on unrelated diffs |
+| R14 | [#447](https://github.com/charliek/roost/issues/447) | RP/M5 | a `vt` fallback is silent and unactionable: nothing in the UI says fidelity dropped, and a remote host has no in-app way to update its daemon |
 
 **Sequencing.** R6 went first, as the XS item that shook down the
 issue → PR → `Closes` → board chain; R2 and R1 followed, then R8, then
-R7 and R5. What is left is R3, R4 and R10, which are independent of each
-other and of everything above, and **R9, the one not to rush** — it
-depends on R1 (landed) and changes the default every session runs under,
-so it wants living with the pieces before it, not speed. The board
-carries the current state; this paragraph is only the order and the
-reasoning behind it.
+R7 and R5, then R3 and R4 together. What is left is R10, independent of
+everything above, and **R9, the one not to rush** — it depends on R1
+(landed) and changes the default every session runs under, so it wants
+living with the pieces before it, not speed. The board carries the
+current state; this paragraph is only the order and the reasoning behind
+it.
 
-**R11–R13 are follow-ups from shipped work, and they land before the
+**R11–R14 are follow-ups from shipped work, and they land before the
 autostart and mobile surfaces are announced.** R12 is one pass over what
 R7 shipped — a defect plus the two things that first cut left unfinished
 — R11 is the client half R5 did not build, and R13 is a macOS CI flake
 that fails unrelated pull requests, because a red job nobody reads is how
 a real regression gets waved through.
+
+R14 is R3's own cost, and it is the one to read carefully before
+scheduling. R3 traded a loud failure for a quiet degradation: a build
+skew used to stop the client dead with a dialog, and now it connects and
+works at lower fidelity — links stop working, a full-screen program
+leaves a blank shell behind, wrapped lines replay as separate lines. The
+only way to know is `roostctl host status --json`. Two halves follow from
+that, and **the visible one is worth more than the button**: an
+indicator, so the degradation is not silent; and an on-demand
+restart-or-update action, because R3 removed the state the existing
+"Update roost-session on ‹host›" offer was raised from, leaving a remote
+host no in-app route. Its trigger is narrower than the issue title
+suggests — the restart dialog still fires on a *protocol* mismatch, which
+moves more often than the Ghostty pin, so R14 only bites when the pin
+moved and the protocol did not.
 
 ## Rules that apply in this repo
 
