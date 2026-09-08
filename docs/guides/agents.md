@@ -437,9 +437,11 @@ plugin runs *inside* that server process and is handed a client whose
 surface.
 
 - **In-process vs external.** When opencode is *already* listening on a
-  socket of its own — `opencode serve`, `opencode web`, `--port`,
-  `--hostname`, or `--mdns` — the plugin serves nothing and reports
-  opencode's own address instead.
+  socket of its own — `opencode serve`, `opencode web`, `--port`, and
+  the rest — the plugin serves nothing and reports opencode's own
+  address instead. It tells the two apart from the client opencode hands
+  the plugin, which carries an in-process `fetch` only when there is no
+  real listener, rather than by reading the command line.
 - **Loopback only.** Roost records `server_url` only when it parses as
   a token-free loopback base URL: `http://127.0.0.1:<port>`,
   `localhost`, or `[::1]`, with nothing after the port. An external
@@ -458,20 +460,23 @@ surface.
   start — one line on opencode's log, and nothing else changes.
 - **What the opt-out does *not* cover.** It suppresses the loopback
   listener **Roost creates**. It does not suppress reporting a server
-  *you* started: the external case is checked first, so `opencode serve`,
-  `opencode web`, `--port`, `--hostname`, or `--mdns` still report
-  opencode's own address as `server_url` even with the opt-out set.
-  That ordering is deliberate — Roost stands up no server there,
-  which is the whole of the variable's promise, and the address it
-  reports is a listener you explicitly asked for. If you want no
-  `server_url` at all, don't pass those flags.
-- **The mid-session limitation.** `server_url` rides the ownership
-  claim on `session.created`, and the key-by-key upsert on every event
-  after it. A plugin that loads mid-session — `opencode attach`, or an
-  install that happened while a session was already running — never
-  sees a `session.created`, and an upsert against a tab nobody owns
-  creates nothing. The key therefore first lands at the **next**
-  `session.created`; until then that session is status-only.
+  *you* started: the external case is checked first, so an opencode
+  already listening still reports its own address as `server_url` even
+  with the opt-out set. That ordering is deliberate — Roost stands up no
+  server there, which is the whole of the variable's promise, and the
+  address it reports is a listener you explicitly asked for. If you want
+  no `server_url` at all, don't start one.
+- **The mid-session limitation, and its bound.** `server_url` rides the
+  ownership claim on `session.created` *and* the key-by-key upsert on
+  every event after it — so a plugin that loads mid-session onto a tab
+  the same opencode session already owns lands the key on the very next
+  forwarded event, whatever kind it is. The limitation is only the
+  **unowned** tab: an upsert is authorized against the current owner, so
+  against a tab nobody owns it creates nothing, and `opencode attach` or
+  an install that happened while a session was already running never
+  sees the `session.created` that would claim one. There the key first
+  lands at the **next** `session.created`, and until then that session
+  is status-only.
 
 Treat it the way [`gx.remote`](#gx) is treated: a discovery hint, not
 liveness. `metadata` is merge-only with no delete channel, so the key

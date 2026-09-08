@@ -122,24 +122,27 @@ const serverUrl =
   rawServerUrl !== undefined && process.env.ROOST_TEST_INPUT_SERVER_URL_KIND === "url"
     ? new URL(rawServerUrl)
     : rawServerUrl;
+// opencode supplies the client `fetch` only when its server is
+// in-process (`plugin/index.ts` makes it the `else` of a real
+// `Server.url`), so leaving it off is exactly the shape an already
+// listening opencode hands over.
+const inProcess = process.env.ROOST_TEST_EXTERNAL !== "1";
+const clientFetch = async (request) => {
+  upstream.push({
+    url: request.url,
+    method: request.method,
+    headers: Object.fromEntries(request.headers),
+    body: await request.text(),
+  });
+  return new Response("upstream", { status: 200 });
+};
 const input = baseUrl
   ? {
       directory: process.env.ROOST_TEST_DIRECTORY,
       serverUrl,
       client: {
         _client: {
-          getConfig: () => ({
-            baseUrl,
-            fetch: async (request) => {
-              upstream.push({
-                url: request.url,
-                method: request.method,
-                headers: Object.fromEntries(request.headers),
-                body: await request.text(),
-              });
-              return new Response("upstream", { status: 200 });
-            },
-          }),
+          getConfig: () => ({ baseUrl, ...(inProcess ? { fetch: clientFetch } : {}) }),
         },
       },
     }
@@ -288,7 +291,12 @@ struct Harness {
     /// rebuilds requests against. Also what makes the harness hand the
     /// plugin a real `input` rather than `{}`.
     base_url: Option<&'static str>,
-    /// `input.serverUrl`: where opencode says it is already listening.
+    /// Drop `getConfig().fetch`, which is how opencode hands a client
+    /// over when its server is already listening on a socket of its own.
+    external: bool,
+    /// `input.serverUrl`: what opencode reports as its own address —
+    /// the real listener when there is one, and a hardcoded
+    /// `http://localhost:4096` fallback when there is not.
     input_server_url: Option<&'static str>,
     /// Hand `input.serverUrl` over as a `URL` — the type opencode
     /// declares — rather than as a string.
@@ -381,6 +389,9 @@ impl Harness {
         }
         if self.input_server_url_as_url {
             node.env("ROOST_TEST_INPUT_SERVER_URL_KIND", "url");
+        }
+        if self.external {
+            node.env("ROOST_TEST_EXTERNAL", "1");
         }
         for (key, value) in [
             ("ROOST_TEST_BASE_URL", self.base_url),
@@ -850,10 +861,10 @@ fn an_unspawnable_hook_is_reported_exactly_once() {
 // The loopback front end (plan 054 R10)
 // ---------------------------------------------------------------------
 
-/// A bare `opencode` binds nothing, so the plugin fronts the in-process
-/// app itself and puts the address on every forward — that address is
-/// the whole point, and a session that only gets it on its creation
-/// would lose it the moment the plugin loaded a beat late.
+/// The bare-`opencode` path end to end: the options the listener is
+/// opened with, the address riding *every* forward rather than only the
+/// creation, the close on `dispose`, and the key surviving the adapter
+/// onto ownership by both routes (`Claim`, then `Preserve`).
 #[test]
 fn the_in_process_server_is_fronted_on_loopback_and_announced_on_every_forward() {
     if node_is_missing() {
@@ -892,9 +903,8 @@ fn the_in_process_server_is_fronted_on_loopback_and_announced_on_every_forward()
     assert_eq!(metadata(&states[1]), SERVED);
 }
 
-/// opencode already listening on a socket of its own is the one case
-/// where a second front end would be pure duplication: its address is
-/// the one to report.
+/// A client with no `fetch` is opencode saying its server is already
+/// listening, so the plugin reports that address and binds nothing.
 #[test]
 fn an_already_external_server_is_reported_rather_than_fronted() {
     if node_is_missing() {
@@ -902,63 +912,27 @@ fn an_already_external_server_is_reported_rather_than_fronted() {
     }
 
     const EXTERNAL: &str = "http://127.0.0.1:4096";
-    for argv in [
-        &["serve"][..],
-        &["web"][..],
-        &["--port", "4096"][..],
-        &["--port=4096"][..],
-        &["--hostname", "127.0.0.1"][..],
-        &["--mdns"][..],
-        &["--mdns=true"][..],
-    ] {
-        let run = Harness {
-            fake_bun: true,
-            base_url: Some(UPSTREAM),
-            input_server_url: Some(EXTERNAL),
-            argv,
-            ..Harness::default()
-        }
-        .run(&json!([step(
-            "session.created",
-            &fixture_record("session.created")
-        )]));
-
-        assert_eq!(run.served, json!([]), "{argv:?}");
-        assert_eq!(run.server_urls(), [Some(EXTERNAL); 2], "{argv:?}");
+    let run = Harness {
+        fake_bun: true,
+        base_url: Some(UPSTREAM),
+        external: true,
+        input_server_url: Some(EXTERNAL),
+        ..Harness::default()
     }
+    .run(&json!([step(
+        "session.created",
+        &fixture_record("session.created")
+    )]));
+
+    assert_eq!(run.served, json!([]));
+    assert_eq!(run.server_urls(), [Some(EXTERNAL); 2]);
 }
 
-/// The negations are not the flag: `--no-mdns` and `--mdns=false` are
-/// opencode *not* listening, so the plugin still has to.
-#[test]
-fn the_mdns_negations_do_not_read_as_an_external_server() {
-    if node_is_missing() {
-        return;
-    }
-
-    for argv in [&["--no-mdns"][..], &["--mdns=false"][..]] {
-        let run = Harness {
-            fake_bun: true,
-            base_url: Some(UPSTREAM),
-            input_server_url: Some("http://127.0.0.1:4096"),
-            argv,
-            ..Harness::default()
-        }
-        .run(&json!([step(
-            "session.created",
-            &fixture_record("session.created")
-        )]));
-
-        assert_eq!(run.served.as_array().map(Vec::len), Some(1), "{argv:?}");
-        assert_eq!(run.server_urls(), [Some(SERVED); 2], "{argv:?}");
-    }
-}
-
-/// opencode declares `input.serverUrl` a `URL`, and a `URL` spells its
-/// empty path back out as a trailing `/`. Announced that way the address
-/// fails `loopback_base_url`, Roost drops the key, and a perfectly
-/// reachable external server reads as status-only — so the plugin
-/// announces one canonical shape however opencode spelled it.
+/// Both types opencode hands `input.serverUrl` over as, announced in
+/// one shape and carried through the validator into ownership. Without
+/// the canonicalization the `URL` spelling's trailing `/` fails
+/// `loopback_base_url` and a reachable external server reads as
+/// status-only.
 #[test]
 fn an_external_server_url_is_announced_in_the_shape_the_validator_takes() {
     if node_is_missing() {
@@ -972,9 +946,9 @@ fn an_external_server_url_is_announced_in_the_shape_the_validator_takes() {
         let run = Harness {
             fake_bun: true,
             base_url: Some(UPSTREAM),
+            external: true,
             input_server_url: Some(EXTERNAL),
             input_server_url_as_url: as_url,
-            argv: &["serve"],
             ..Harness::default()
         }
         .run(&json!([step(
@@ -1003,63 +977,37 @@ fn an_external_server_url_is_announced_in_the_shape_the_validator_takes() {
     }
 }
 
-/// `serve` and `web` are subcommands, so they only mean "already
-/// listening" in the subcommand position. `opencode run serve` is a
-/// *prompt* whose first word happens to be `serve`; read as external it
-/// would leave that tab with no listener and nothing able to drive it.
-///
-/// The flags are the other rule and keep it: opencode's own
-/// `hasArg("--port")` does not care where the flag sits.
+/// The regression the argv rule this replaced could not get right:
+/// `prompt` is a real string option on opencode's default TUI command,
+/// so `opencode --prompt serve` is a bare TUI whose prompt happens to
+/// read "serve" — in-process, and drivable only if the plugin fronts it.
+/// Reading the client rather than argv makes the word irrelevant.
 #[test]
-fn a_subcommand_word_reads_as_external_only_in_the_subcommand_position() {
+fn a_prompt_whose_text_names_a_subcommand_is_still_in_process() {
     if node_is_missing() {
         return;
     }
 
-    const EXTERNAL: &str = "http://127.0.0.1:4096";
-    for (argv, external) in [
-        // The prompt case: `serve` is this run's argument, not its
-        // command, and the first bare token says so.
-        (&["run", "serve"][..], false),
-        (&["run", "web"][..], false),
-        // The command position itself.
-        (&["serve"][..], true),
-        (&["web"][..], true),
-        // A command with its own flags behind it.
-        (&["serve", "--port", "1"][..], true),
-        // A flag with no command at all — position-independent, as
-        // opencode's own rule is.
-        (&["--port", "4096"][..], true),
-        // …including behind a command that is not one of ours.
-        (&["run", "--port", "4096"][..], true),
-    ] {
-        let run = Harness {
-            fake_bun: true,
-            base_url: Some(UPSTREAM),
-            input_server_url: Some(EXTERNAL),
-            argv,
-            ..Harness::default()
-        }
-        .run(&json!([step(
-            "session.created",
-            &fixture_record("session.created")
-        )]));
-
-        if external {
-            assert_eq!(run.served, json!([]), "{argv:?}");
-            assert_eq!(run.server_urls(), [Some(EXTERNAL); 2], "{argv:?}");
-        } else {
-            // A listener was stood up, and the address announced is that
-            // listener's rather than the one opencode reported.
-            assert_eq!(run.served.as_array().map(Vec::len), Some(1), "{argv:?}");
-            assert_eq!(run.server_urls(), [Some(SERVED); 2], "{argv:?}");
-        }
+    let run = Harness {
+        fake_bun: true,
+        base_url: Some(UPSTREAM),
+        // The bogus fallback `input.serverUrl` carries in this case:
+        // reported instead of the proxy's address it would be a dead URL.
+        input_server_url: Some("http://localhost:4096"),
+        argv: &["--prompt", "serve"],
+        ..Harness::default()
     }
+    .run(&json!([step(
+        "session.created",
+        &fixture_record("session.created")
+    )]));
+
+    assert_eq!(run.served.as_array().map(Vec::len), Some(1));
+    assert_eq!(run.server_urls(), [Some(SERVED); 2]);
 }
 
-/// The opt-out is the whole answer to "a bare `opencode` in a Roost tab
-/// is now reachable by any same-host process": nothing is served, and
-/// nothing is announced either.
+/// Both halves of the opt-out — nothing served, and nothing announced —
+/// with the forwards themselves untouched.
 #[test]
 fn the_opt_out_env_serves_nothing_and_announces_nothing() {
     if node_is_missing() {
@@ -1082,12 +1030,9 @@ fn the_opt_out_env_serves_nothing_and_announces_nothing() {
     assert_eq!(run.server_urls(), [None; 3]);
 }
 
-/// The precedence between the two, pinned rather than left to read as an
-/// accident: external is tested *first*, so the opt-out does not
-/// suppress a server the user started themselves. Roost still stands up
-/// nothing — the whole of what `NO_SERVER` promises — and the address
-/// announced is the listener `serve`/`--port` explicitly opened. Someone
-/// who wants no `server_url` at all doesn't pass those flags.
+/// The precedence between the two, pinned rather than left to read as
+/// an accident: external is tested *first*, so the opt-out suppresses
+/// only the listener Roost would have opened.
 #[test]
 fn the_opt_out_does_not_suppress_an_externally_started_server() {
     if node_is_missing() {
@@ -1095,28 +1040,28 @@ fn the_opt_out_does_not_suppress_an_externally_started_server() {
     }
 
     const EXTERNAL: &str = "http://127.0.0.1:4096";
-    for argv in [&["serve"][..], &["--port", "4096"][..]] {
-        let run = Harness {
-            fake_bun: true,
-            base_url: Some(UPSTREAM),
-            input_server_url: Some(EXTERNAL),
-            argv,
-            env: &[("ROOST_OPENCODE_NO_SERVER", "1")],
-            ..Harness::default()
-        }
-        .run(&json!([step(
-            "session.created",
-            &fixture_record("session.created")
-        )]));
-
-        assert_eq!(run.served, json!([]), "{argv:?}");
-        assert_eq!(run.server_urls(), [Some(EXTERNAL); 2], "{argv:?}");
+    let run = Harness {
+        fake_bun: true,
+        base_url: Some(UPSTREAM),
+        external: true,
+        input_server_url: Some(EXTERNAL),
+        env: &[("ROOST_OPENCODE_NO_SERVER", "1")],
+        ..Harness::default()
     }
+    .run(&json!([step(
+        "session.created",
+        &fixture_record("session.created")
+    )]));
+
+    assert_eq!(run.served, json!([]));
+    assert_eq!(run.server_urls(), [Some(EXTERNAL); 2]);
 }
 
-/// A runtime with no `Bun` is status-only, not an error: every `Bun`
-/// reference sits behind the guard, so nothing throws and the hooks
-/// forward exactly as they did before the listener existed.
+/// A runtime with no `Bun` is status-only, not an error — the hooks
+/// forward exactly as they did before the listener existed, and nothing
+/// reaches stderr. This is the node harness's own runtime, so it is
+/// also what guards every other cell here against a stray `Bun`
+/// reference outside the guard.
 #[test]
 fn a_runtime_without_bun_still_forwards_every_event() {
     if node_is_missing() {
@@ -1247,14 +1192,40 @@ fn the_proxy_demands_the_same_basic_credentials_opencode_does() {
     );
 }
 
-/// A credential the header cannot be *re-encoded* from still
-/// authenticates, because the check decodes what was offered instead.
-///
-/// `btoa` throws `InvalidCharacterError` on any codepoint outside
-/// Latin-1, so building the expected header from a password like `秘密`
-/// threw on every single request — the correctly authenticated ones
-/// included, which took the whole front end down rather than refusing
-/// anything.
+/// An *empty* `OPENCODE_SERVER_PASSWORD` is opencode's own "no auth
+/// required" — `server/auth.ts`'s `required()` is `isSome(password) &&
+/// value !== ""` — so a front end that challenged here would refuse a
+/// configuration opencode itself accepts. Pinned because the truthiness
+/// test reads like a slip until you have that file open.
+#[test]
+fn an_empty_password_does_not_make_the_proxy_demand_credentials() {
+    if node_is_missing() {
+        return;
+    }
+
+    let run = Harness {
+        fake_bun: true,
+        base_url: Some(UPSTREAM),
+        env: &[("OPENCODE_SERVER_PASSWORD", "")],
+        probes: json!([{ "url": "http://127.0.0.1:41234/session" }]),
+        ..Harness::default()
+    }
+    .run(&json!([step(
+        "session.created",
+        &fixture_record("session.created")
+    )]));
+
+    assert_eq!(run.probes[0]["status"], json!(200));
+    assert_eq!(
+        run.probes[0]["upstream"]["url"],
+        json!("http://127.0.0.1:5959/session"),
+    );
+}
+
+/// The `btoa` regression: a non-Latin-1 password used to throw on every
+/// single request, the correctly authenticated ones included, taking the
+/// whole front end down rather than refusing anything. Both outcomes are
+/// asserted, plus the empty stderr that separates "refused" from "threw".
 #[test]
 fn the_proxy_authenticates_a_password_btoa_cannot_encode() {
     if node_is_missing() {
@@ -1297,9 +1268,8 @@ fn the_proxy_authenticates_a_password_btoa_cannot_encode() {
     assert_eq!(run.stderr, "");
 }
 
-/// The credentials are split on the *first* colon: a username cannot
-/// contain one, a password can, and splitting on the last (or on every)
-/// colon would lock out anyone whose password has one.
+/// The first-colon split, from both sides: the whole remainder is the
+/// password, and the prefix before its inner colon is not.
 #[test]
 fn the_proxy_accepts_a_password_containing_a_colon() {
     if node_is_missing() {

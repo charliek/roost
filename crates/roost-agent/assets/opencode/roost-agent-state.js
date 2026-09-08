@@ -60,49 +60,6 @@ const DISPOSE_WAIT_MS = 2000;
 const text = (value) =>
   typeof value === "string" && value.length > 0 ? value : null;
 
-// opencode's own rule for "this run already listens on a real socket",
-// mirrored. In every one of these forms `input.serverUrl` is that
-// socket's address, so the plugin reports it and serves nothing rather
-// than standing up a second front end for the same app. The commands
-// count only in the subcommand position and the flags count anywhere —
-// see `startedExternally` for why they differ. The negations
-// (`--no-mdns`, `--mdns=false`) are not external, which is why `--mdns`
-// cannot be tested by prefix alone.
-const EXTERNAL_COMMANDS = ["serve", "web"];
-const EXTERNAL_FLAGS = ["--port", "--hostname"];
-
-const isExternalFlag = (arg) => {
-  const eq = arg.indexOf("=");
-  const flag = eq === -1 ? arg : arg.slice(0, eq);
-  if (EXTERNAL_FLAGS.includes(flag)) return true;
-  return flag === "--mdns" && (eq === -1 || arg.slice(eq + 1) === "true");
-};
-
-const startedExternally = () => {
-  // What opencode itself parses: `argv[0]` is the runtime and `[1]` the
-  // entrypoint, under `node` and a Bun single-file build alike.
-  const args = process.argv.slice(2);
-
-  // Flags count wherever they appear, because opencode's own rule
-  // (`hasArg("--port") || hasArg("--hostname") || mdns`) is
-  // position-independent.
-  if (args.some(isExternalFlag)) return true;
-
-  // A subcommand is not: `serve` and `web` are only those commands in
-  // the subcommand position, which is the first argument that is not an
-  // option. `opencode run serve` is a *prompt* that happens to read
-  // "serve", and mistaking it for a listener would leave that tab with
-  // no listener and nothing able to drive it.
-  //
-  // Known residual: `opencode --prompt serve` still reads as external,
-  // since telling a flag's value from a positional needs opencode's
-  // full flag-arity table, which is not worth vendoring here. It fails
-  // closed — no listener, status-only reporting — and is bounded to
-  // prompts whose first word is literally `serve` or `web`.
-  const command = args.find((arg) => !arg.startsWith("-"));
-  return command !== undefined && EXTERNAL_COMMANDS.includes(command);
-};
-
 // The address to announce for a server this plugin did not start.
 //
 // opencode hands `input.serverUrl` as a string in some paths and as a
@@ -125,10 +82,6 @@ const announced = (value) => {
   }
 };
 
-// opencode gates its own server on Basic auth whenever
-// `OPENCODE_SERVER_PASSWORD` is set, so a front end that did not would
-// be a hole punched in it. Read per request rather than once, because
-// the credentials are the environment's answer, not the listener's.
 // What an `Authorization: Basic` header offers, decoded — or `null` for
 // a header that is absent, not Basic, or not a credential pair at all.
 //
@@ -154,6 +107,17 @@ const offeredCredentials = (header) => {
   return { user: decoded.slice(0, colon), password: decoded.slice(colon + 1) };
 };
 
+// opencode gates its own server on Basic auth whenever
+// `OPENCODE_SERVER_PASSWORD` is set, so a front end that did not would
+// be a hole punched in it. Read per request rather than once, because
+// the credentials are the environment's answer, not the listener's.
+//
+// The falsy test is opencode's, not a shortcut: `server/auth.ts`'s
+// `required(config)` is `Option.isSome(config.password) &&
+// config.password.value !== ""`, and `serve`/`web` print "server is
+// unsecured" on a falsy `Flag.OPENCODE_SERVER_PASSWORD`. An empty
+// password means "no auth" there, so demanding credentials here that
+// opencode itself does not would refuse a config opencode accepts.
 const unauthorized = (request) => {
   const password = process.env.OPENCODE_SERVER_PASSWORD;
   if (!password) return null;
@@ -215,17 +179,27 @@ export const RoostAgentState = async (input) => {
   // up must not spend the single complaint a broken hook binary gets.
   let listenerFailed = false;
 
+  // Whether this run already listens on a socket of its own is read off
+  // the client opencode hands over, not re-derived from `process.argv`:
+  // `plugin/index.ts` builds `baseUrl` from `Server.url` and supplies a
+  // `fetch` only in the `else`, so a client `fetch` and a real listener
+  // are alternatives by construction. Its presence therefore *is*
+  // "the server is in-process", straight from opencode, with no CLI
+  // semantics to mirror and drift from.
+  //
   // External is tested before the opt-out deliberately: `NO_SERVER`
   // promises that Roost stands up no server, and in the external case it
   // doesn't — the address reported is the listener the user asked for.
   const exposeServer = async (input) => {
-    if (startedExternally()) return announced(input?.serverUrl);
-    if (process.env.ROOST_OPENCODE_NO_SERVER) return null;
     try {
       const cfg = input?.client?._client?.getConfig?.();
-      // No client fetch, or a runtime that cannot serve: neither is a
-      // failure, it just means this session is status-only.
-      if (typeof cfg?.fetch !== "function") return null;
+      // Already listening. `input.serverUrl` is the real `Server.url`
+      // here; the hardcoded `http://localhost:4096` its getter falls
+      // back to belongs to the in-process branch, which never reads it.
+      if (typeof cfg?.fetch !== "function") return announced(input?.serverUrl);
+      if (process.env.ROOST_OPENCODE_NO_SERVER) return null;
+      // A runtime that cannot serve is not a failure; it just means this
+      // session is status-only.
       if (typeof Bun === "undefined" || typeof Bun.serve !== "function") return null;
       server = Bun.serve({
         hostname: "127.0.0.1",
