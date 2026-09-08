@@ -1659,6 +1659,17 @@ impl App {
                 self.clear_palette_state();
                 self.open_host_stop_dialog(&saved_id, &label);
             }
+            // **Neither consults `origin`**, exactly like `Stop` above.
+            // Plan 039 §3.5's rule is that a machine is never *prompted
+            // by a connect it did not ask for*; these two exist only on
+            // a person's connected, reduced-fidelity host, and their
+            // first remote activity is a consent card. Listing them is
+            // still gated on `HostRow.fidelity`, which nothing fills in
+            // until the sidebar does.
+            HostVerb::Update(saved_id) | HostVerb::Restart(saved_id) => {
+                self.clear_palette_state();
+                self.host_fidelity_action_requested(&saved_id);
+            }
             HostVerb::Remove(saved_id) => {
                 self.clear_palette_state();
                 self.host_remove_requested(&saved_id)
@@ -2927,7 +2938,8 @@ mod tests {
             saved_id: "h1",
             label: "pop-os",
             state: host_sidebar::SectionState::Connected,
-            localhost: false,
+            transport: host_sidebar::HostTransportKind::Ssh,
+            fidelity: None,
         }];
 
         let frame = command_palette_frame(0, &config.providers, &bindings, &hosts);
@@ -2967,7 +2979,8 @@ mod tests {
             saved_id: "h1",
             label: "pop-os",
             state: host_sidebar::SectionState::Connected,
-            localhost: false,
+            transport: host_sidebar::HostTransportKind::Ssh,
+            fidelity: None,
         }];
         let frame = host_picker_frame(&hosts);
         assert_eq!(frame.id, HOST_PICKER_FRAME_ID);
@@ -2984,7 +2997,8 @@ mod tests {
             saved_id: "h1",
             label: "pop-os",
             state: host_sidebar::SectionState::Disconnected,
-            localhost: false,
+            transport: host_sidebar::HostTransportKind::Ssh,
+            fidelity: None,
         }];
         let items = host_verb_items(&hosts, Some("Alt+Shift+N"));
         for item in &items {

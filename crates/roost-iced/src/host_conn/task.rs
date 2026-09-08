@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, Notify};
 use super::mirror::{HostMirror, SharedMirror};
 use super::queue::{self, HostIntent, HostOpError, OpFault};
 use super::state::{
-    check_compatibility, Compatibility, HostConnState, HostStateMachine, HostTransport,
+    check_compatibility, ConnectFacts, HostConnState, HostStateMachine, HostTransport, ResumeFacts,
 };
 use super::upload::Uploads;
 use super::{HostIdMinter, HostWorkspaceEvent};
@@ -107,6 +107,44 @@ pub(crate) enum ConnectMode {
     Dial,
 }
 
+/// Where a reconnect picks a session's event stream back up: the
+/// session it was fenced against, and the mirror holding that fence.
+///
+/// The fence itself is deliberately **not** a field. It is
+/// `mirror.read().revision` read at the moment the resume is offered —
+/// a number copied when the checkpoint was made could be behind by
+/// however much the mirror's writer applied in between, and asking a
+/// session to replay commits the mirror already has is how a batch gets
+/// applied twice.
+pub(crate) struct Resume {
+    pub(crate) session_id: String,
+    pub(crate) mirror: Arc<SharedMirror>,
+}
+
+impl Resume {
+    /// The same checkpoint, on a handle nobody else can write.
+    ///
+    /// **A checkpoint handed to a task that does not exist yet must be
+    /// frozen.** A replaced connection is only *signalled* to stop
+    /// (`HostConn::drop` notifies and aborts asynchronously), so it can
+    /// still apply commit `N+1` to the handle it holds after the
+    /// replacement has read the fence `N`. Were that the same handle,
+    /// the session's replay of `N+1` would arrive at a mirror already
+    /// past it, [`SharedMirror::apply_batch`] would discard it as
+    /// already applied, and the envelopes it carried — a
+    /// `notification.fired` from the gap — would never be published.
+    /// A frozen copy cannot be advanced by the writer that is leaving.
+    ///
+    /// The copy is the workspace mirror, projects and tab rows, which is
+    /// cheap by construction.
+    pub(crate) fn freeze(&self) -> Resume {
+        Resume {
+            session_id: self.session_id.clone(),
+            mirror: Arc::new(SharedMirror::new(self.mirror.snapshot())),
+        }
+    }
+}
+
 /// Everything one connection task needs, fixed for its lifetime.
 pub(crate) struct ConnectionConfig {
     /// The saved host's stable id (`HostSnapshot.id`), for logs.
@@ -139,6 +177,13 @@ pub(crate) struct ConnectionConfig {
     /// them ever calls `session.connect`. `false` for every explicit
     /// Connect — taking the session back is what that button means.
     pub(crate) observer_only: bool,
+    /// Where this host's last connection left the event stream, if it
+    /// reached one — seeded by the set for **every** cause, because
+    /// what it describes is the session rather than who asked to dial
+    /// it. `None` until some connection has reached a session.
+    ///
+    /// Frozen by [`Resume::freeze`] on the way in; see why there.
+    pub(crate) resume: Option<Resume>,
     /// This session's pinned libghostty identity, compared exactly.
     pub(crate) client_build: String,
     /// The client's terminal palette, re-read on every (re)connect so a
@@ -365,6 +410,38 @@ struct Live {
     /// Shared with the UI: written here, read there. Never copied onto
     /// the feed.
     mirror: Arc<SharedMirror>,
+    /// What the prologue learned about the session on the other end.
+    /// Published once, right behind the state this connection reached.
+    facts: ConnectFacts,
+}
+
+impl Live {
+    /// Where this connection would be resumed from.
+    ///
+    /// Unfrozen on purpose, unlike the set's ([`Resume::freeze`]): the
+    /// only writer of this handle is the pump this very task drains, so
+    /// once the attempt has ended nothing can advance it behind the
+    /// next one's back.
+    fn checkpoint(&self) -> Resume {
+        Resume {
+            session_id: self.facts.session_id.clone(),
+            mirror: Arc::clone(&self.mirror),
+        }
+    }
+
+    /// The line a finished prologue writes. Driving and watching differ
+    /// only in `what`, so the fields cannot drift apart between them.
+    fn log(&self, config: &ConnectionConfig, what: &str) {
+        tracing::info!(
+            host = %config.host,
+            label = %config.label,
+            session = %self.facts.session_id,
+            revision = self.mirror.read().revision,
+            resume = self.facts.supports_resume,
+            resumed = self.facts.resumed.is_some(),
+            "{what}"
+        );
+    }
 }
 
 /// How this client names itself when it claims the lease (plan 049
@@ -525,6 +602,18 @@ async fn connect_loop(
     // spawns a fresh task rather than reusing this one, so a client
     // that has learned it is deposed can never auto-reclaim.
     let mut observing: Option<Option<String>> = config.observer_only.then_some(None);
+    // This task's own checkpoint, taken from every attempt that reached
+    // a session and preferred over the one the set seeded, which by then
+    // describes a strictly older fence. It saves an in-task retry a trip
+    // through the set and nothing more — the two agree by construction.
+    //
+    // Nothing clears it: every ending that would (`Stopping`, `Settled`,
+    // `Incompatible` — the session is gone, unreachable, or must be
+    // restarted) also ends this task, and the only ending that loops
+    // back here is a `Dropped`, which is the wire and says nothing about
+    // the session. The set's copy, which does outlive those, carries the
+    // same table as real clearing.
+    let mut resume: Option<Resume> = None;
 
     loop {
         // Mint (and therefore register the ownership) before anything is
@@ -537,10 +626,12 @@ async fn connect_loop(
         previous = Some(incarnation);
 
         let presented = held_lease.clone();
+        let checkpoint = resume.as_ref().or(config.resume.as_ref());
         let dialed = tokio::select! {
             biased;
             () = shutdown.requested() => None,
-            outcome = attempt(config, mode, &mut held_lease, &mut observing) => Some(outcome),
+            outcome = attempt(config, mode, &mut held_lease, &mut observing, checkpoint)
+                => Some(outcome),
         };
         // Only the first attempt may spawn or probe; a retry dials.
         mode = ConnectMode::Dial;
@@ -567,12 +658,23 @@ async fn connect_loop(
             None => ConnEnd::Shutdown,
             Some(Err(error)) => error.into(),
             Some(Ok(Attempt::Observer(live))) => {
+                // Taken before the connection is served rather than
+                // after: both halves of a checkpoint are known the
+                // moment the prologue ends, and the fence is read off
+                // the handle at use time, so a `Live` that has since
+                // been consumed leaves nothing behind.
+                resume = Some(live.checkpoint());
                 let taken_by = observing.clone().flatten();
                 if !publish_workspace(
                     feed,
                     incarnation,
                     HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
                 ) || !publish_state(feed, incarnation, machine.taken_over(taken_by))
+                    // Behind the state, never ahead of it: the set files
+                    // facts on the connection the state just installed,
+                    // and an observer resumes and shows a fidelity
+                    // indicator exactly like a driver.
+                    || !publish_facts(feed, incarnation, live.facts.clone())
                 {
                     ConnEnd::FeedClosed
                 } else {
@@ -582,11 +684,13 @@ async fn connect_loop(
                 }
             }
             Some(Ok(Attempt::Driver(live))) => {
+                resume = Some(live.checkpoint());
                 if !publish_workspace(
                     feed,
                     incarnation,
                     HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
                 ) || !publish_state(feed, incarnation, machine.connected())
+                    || !publish_facts(feed, incarnation, live.facts.clone())
                 {
                     ConnEnd::FeedClosed
                 } else {
@@ -627,7 +731,16 @@ async fn connect_loop(
             // Answers whatever the deposed driver still had queued
             // before the observer loop starts refusing new ones.
             queue::flush(ops_rx, &HostOpError::Disconnected);
-            ended = if publish_state(feed, incarnation, machine.taken_over(taken_by)) {
+            // Refiled, because the state below leaves `Connected` and
+            // that is what retires the prologue's facts. Nothing about
+            // the session changed — same id, same fidelity, same fence
+            // — and this connection is still reading it, so a reader
+            // that went blank here would be reporting the takeover as a
+            // loss of the session rather than of the lease.
+            let facts = live.facts.clone();
+            ended = if publish_state(feed, incarnation, machine.taken_over(taken_by))
+                && publish_facts(feed, incarnation, facts)
+            {
                 observe(config, incarnation, *live, ops_rx, feed, shutdown).await
             } else {
                 ConnEnd::FeedClosed
@@ -731,9 +844,12 @@ async fn attempt(
     mode: ConnectMode,
     held_lease: &mut Option<String>,
     observing: &mut Option<Option<String>>,
+    resume: Option<&Resume>,
 ) -> Result<Attempt, AttemptError> {
     if observing.is_some() {
-        return observe_prologue(config, mode).await.map(Attempt::Observer);
+        return observe_prologue(config, mode, resume)
+            .await
+            .map(Attempt::Observer);
     }
     if let Some(lease) = held_lease.as_deref() {
         match probe_lease(config, lease).await {
@@ -747,7 +863,9 @@ async fn attempt(
                 // on it watches until the user says otherwise.
                 *held_lease = None;
                 *observing = Some(None);
-                return observe_prologue(config, mode).await.map(Attempt::Observer);
+                return observe_prologue(config, mode, resume)
+                    .await
+                    .map(Attempt::Observer);
             }
             // Uncertainty NEVER authorizes a takeover. Retrying the
             // probe under the ladder's own backoff is the whole
@@ -756,7 +874,9 @@ async fn attempt(
             Probe::Unknown(reason) => return Err(AttemptError::Transport(reason)),
         }
     }
-    connect(config, mode, held_lease).await.map(Attempt::Driver)
+    connect(config, mode, held_lease, resume)
+        .await
+        .map(Attempt::Driver)
 }
 
 /// What presenting the held lease established.
@@ -872,7 +992,7 @@ async fn dial_control(
 async fn open_control(
     config: &ConnectionConfig,
     mode: ConnectMode,
-) -> Result<(IpcClient, SessionIdentify), AttemptError> {
+) -> Result<(IpcClient, ConnectFacts), AttemptError> {
     ensure_socket(config, mode).await?;
     let mut control = dial_control(config, mode).await?;
     let raw = call(
@@ -889,18 +1009,63 @@ async fn open_control(
         config.transport.restart_action(),
     )
     .map_err(|mismatch| AttemptError::Incompatible(Box::new(mismatch)))?;
-    if compatibility == Compatibility::BuildSkew {
-        // The one place the fallback is announced. There is no dot and
-        // no dialog for it — the connection is a working connection —
-        // so the log is what a user comparing two screens is pointed at.
+    let facts = ConnectFacts::new(&identity, &config.client_build, compatibility);
+    if facts.reduced_fidelity {
+        // Warn, not info: the connection is a working connection, but
+        // what it can render is a documented subset of a terminal, and
+        // the log is where a user comparing two screens is pointed.
         tracing::warn!(
-            session_build = %identity.libghostty_build,
-            client_build = %config.client_build,
+            session_build = %facts.skew.session_build,
+            client_build = %facts.skew.client_build,
             "libghostty build skew: attaching in the vt fallback, without the \
              inactive screen, soft-wrap flags or per-cell hyperlinks"
         );
     }
-    Ok((control, identity))
+    Ok((control, facts))
+}
+
+/// A prologue's subscription, and the mirror handle its connection will
+/// hold.
+///
+/// A fresh snapshot becomes a new handle; a resume **adopts the carried
+/// one**, which is the whole point — it already holds the rows the
+/// fence describes, the replayed batches land on top of them, and the
+/// `Reset` published under the new incarnation re-registers the very
+/// handle the UI is drawing.
+///
+/// `facts.resumed` is written here and nowhere else: it describes the
+/// *prologue*, so a mid-stream resync that fell back is logged rather
+/// than republished as a different verdict for the same connection.
+async fn subscribe_prologue(
+    socket: &Path,
+    lease: &str,
+    control: &mut IpcClient,
+    facts: &mut ConnectFacts,
+    resume: Option<&Resume>,
+) -> Result<(EventRx, tokio::task::AbortHandle, Arc<SharedMirror>), AttemptError> {
+    let plan = SubscribePlan {
+        resume,
+        session_id: &facts.session_id,
+        supports_resume: facts.supports_resume,
+    };
+    let offered = plan.offered();
+    let (events, pump, subscribed) = subscribe(socket, lease, control, plan).await?;
+    let mirror = match (subscribed, offered) {
+        (Subscribed::Fresh(mirror), _) => Arc::new(SharedMirror::new(mirror)),
+        (Subscribed::Resumed { ack }, Some(resume)) => {
+            facts.resumed = Some(ResumeFacts { from_revision: ack });
+            Arc::clone(&resume.mirror)
+        }
+        // Only an offered checkpoint can be resumed, so this pair does
+        // not arise — but building a mirror out of nothing would be a
+        // silently empty workspace, and a retryable failure is honest.
+        (Subscribed::Resumed { .. }, None) => {
+            return Err(AttemptError::Transport(
+                "the session resumed a stream this attempt never offered".into(),
+            ))
+        }
+    };
+    Ok((events, pump, mirror))
 }
 
 /// One connect attempt: the wire prologue, in the order `ipc.md` fixes.
@@ -912,9 +1077,10 @@ async fn connect(
     config: &ConnectionConfig,
     mode: ConnectMode,
     held_lease: &mut Option<String>,
+    resume: Option<&Resume>,
 ) -> Result<Live, AttemptError> {
     // 1. Identify, and gate on it.
-    let (mut control, identity) = open_control(config, mode).await?;
+    let (mut control, mut facts) = open_control(config, mode).await?;
 
     // 2. Claim the lease. Reconnect IS takeover — the lease outlives the
     //    connection it was minted on, so a client that reconnects has to
@@ -961,26 +1127,23 @@ async fn connect(
     )
     .await?;
 
-    // 4. Subscribe, then snapshot. That order is what makes the fence
-    //    sound: the ack names a commit the snapshot is guaranteed to be
-    //    at or past.
+    // 4. Subscribe — resuming from the carried fence where the session
+    //    can serve one, else subscribe then snapshot. That order is what
+    //    makes the fresh fence sound: the ack names a commit the
+    //    snapshot is guaranteed to be at or past.
     let (events, pump, mirror) =
-        subscribe_and_snapshot(&config.socket, &lease, &mut control).await?;
+        subscribe_prologue(&config.socket, &lease, &mut control, &mut facts, resume).await?;
 
-    tracing::info!(
-        host = %config.host,
-        label = %config.label,
-        session = %identity.session_id,
-        revision = mirror.revision,
-        "connected to host session"
-    );
-    Ok(Live {
+    let live = Live {
         control,
         lease,
         events,
         pump,
-        mirror: Arc::new(SharedMirror::new(mirror)),
-    })
+        mirror,
+        facts,
+    };
+    live.log(config, "connected to host session");
+    Ok(live)
 }
 
 /// The connection sequence that claims nothing (plan 049 §3.11).
@@ -1001,24 +1164,22 @@ async fn connect(
 async fn observe_prologue(
     config: &ConnectionConfig,
     mode: ConnectMode,
+    resume: Option<&Resume>,
 ) -> Result<Live, AttemptError> {
-    let (mut control, identity) = open_control(config, mode).await?;
-    let (events, pump, mirror) = subscribe_and_snapshot(&config.socket, "", &mut control).await?;
+    let (mut control, mut facts) = open_control(config, mode).await?;
+    let (events, pump, mirror) =
+        subscribe_prologue(&config.socket, "", &mut control, &mut facts, resume).await?;
 
-    tracing::info!(
-        host = %config.host,
-        label = %config.label,
-        session = %identity.session_id,
-        revision = mirror.revision,
-        "watching a host session another client drives"
-    );
-    Ok(Live {
+    let live = Live {
         control,
         lease: String::new(),
         events,
         pump,
-        mirror: Arc::new(SharedMirror::new(mirror)),
-    })
+        mirror,
+        facts,
+    };
+    live.log(config, "watching a host session another client drives");
+    Ok(live)
 }
 
 /// Probe, and on the first attempt only, spawn.
@@ -1098,6 +1259,144 @@ async fn socket_live(socket: &Path) -> bool {
     !socket_state::probe(socket, socket_state::PROBE_TIMEOUT)
         .await
         .safe_to_unlink()
+}
+
+/// What a subscription may offer the session it is about to make.
+struct SubscribePlan<'a> {
+    /// Where a previous connection left this host's stream, if any.
+    resume: Option<&'a Resume>,
+    /// The session this attempt actually reached, from
+    /// `session.identify`.
+    session_id: &'a str,
+    /// Whether that session serves `from_revision` at all.
+    supports_resume: bool,
+}
+
+impl<'a> SubscribePlan<'a> {
+    /// The plan a mid-connection resync presents: the checkpoint of the
+    /// connection it is rebuilding, which by construction names the
+    /// session that connection is already talking to — so only the
+    /// feature gate below can rule it out.
+    fn resuming(resume: &'a Resume, supports_resume: bool) -> SubscribePlan<'a> {
+        SubscribePlan {
+            resume: Some(resume),
+            session_id: &resume.session_id,
+            supports_resume,
+        }
+    }
+
+    /// The checkpoint this attempt may actually present, or `None` to
+    /// subscribe fresh.
+    ///
+    /// Both filters are decided **before any wire is touched**, and each
+    /// for its own reason. The session id is compared locally because
+    /// `session.identify` has already run: a session that restarted is
+    /// known to be a different one here, so a resume that could only
+    /// come back `session-mismatch` never costs a round trip — the
+    /// server's check stays the authority. The feature is checked
+    /// because a session from before it rejects `from_revision` as an
+    /// unknown field, which is an error *outside* the three refusals
+    /// this client knows how to fall back from.
+    fn offered(&self) -> Option<&'a Resume> {
+        self.resume
+            .filter(|_| self.supports_resume)
+            .filter(|resume| resume.session_id == self.session_id)
+    }
+}
+
+/// How a subscription was established, and what the caller owes the
+/// mirror because of it.
+enum Subscribed {
+    /// The session replayed from the checkpoint's fence. `ack` is the
+    /// fence it echoed; there is no snapshot, and the carried mirror is
+    /// current by construction.
+    Resumed { ack: u64 },
+    /// A fresh subscribe and a fenced `tab.list`.
+    Fresh(HostMirror),
+}
+
+/// Subscribe, resuming from the checkpoint when the session can serve
+/// one and taking a fresh snapshot when it cannot.
+///
+/// The single seam every subscription in this module goes through — two
+/// prologues and two resyncs — so "does this reconnect take a
+/// `tab.list`?" has exactly one answer to read.
+async fn subscribe(
+    socket: &Path,
+    lease: &str,
+    control: &mut IpcClient,
+    plan: SubscribePlan<'_>,
+) -> Result<(EventRx, tokio::task::AbortHandle, Subscribed), AttemptError> {
+    if let Some(resume) = plan.offered() {
+        if let Some(resumed) = resume_stream(socket, lease, resume).await? {
+            return Ok(resumed);
+        }
+    }
+    let (events, pump, mirror) = subscribe_and_snapshot(socket, lease, control).await?;
+    Ok((events, pump, Subscribed::Fresh(mirror)))
+}
+
+/// Offer the checkpoint. `Ok(None)` is the session refusing by name —
+/// the ring no longer reaches back that far, the fence names a commit
+/// it never made, or it is not the session that made it — which is
+/// never fatal: the caller subscribes fresh instead.
+///
+/// A fresh dial, because [`IpcClient::subscribe`] takes `self` by value
+/// and a refusal therefore consumes the client. The server deliberately
+/// leaves the refused connection reusable and a `&mut self` variant
+/// would save the exec an ssh re-dial costs, but `roost-ipc` is
+/// published and a refusal is the rare path.
+async fn resume_stream(
+    socket: &Path,
+    lease: &str,
+    resume: &Resume,
+) -> Result<Option<(EventRx, tokio::task::AbortHandle, Subscribed)>, AttemptError> {
+    // Read here rather than carried on the checkpoint: this is the
+    // moment the fence has to be true — see [`Resume`].
+    let from_revision = resume.mirror.read().revision;
+    let dialed = tokio::time::timeout(leg(), async {
+        IpcClient::connect(socket)
+            .await?
+            .resume_events(lease, from_revision, &resume.session_id)
+            .await
+    })
+    .await
+    .map_err(|_| AttemptError::Transport(format!("{} timed out", ops::EVENTS_SUBSCRIBE)))?;
+
+    let stream = match dialed {
+        Ok(stream) => stream,
+        Err(error) => {
+            let Some(code) = error.server_code().filter(|code| {
+                matches!(
+                    code,
+                    ServerCode::ReplayExpired
+                        | ServerCode::RevisionAhead
+                        | ServerCode::SessionMismatch
+                )
+            }) else {
+                return Err(AttemptError::from(error));
+            };
+            tracing::info!(
+                code = code.as_str(),
+                from_revision,
+                "the session refused to replay from here; subscribing and snapshotting instead"
+            );
+            return Ok(None);
+        }
+    };
+
+    let ack = stream.revision();
+    if ack != from_revision {
+        // The ack echoes the fence by contract. A different one with no
+        // snapshot behind it would leave the mirror silently stale —
+        // every commit between the two discarded as already applied —
+        // so this fails the attempt rather than trusting it.
+        return Err(AttemptError::Transport(format!(
+            "resume ack {ack} does not match from_revision {from_revision}"
+        )));
+    }
+    let (events, pump) = spawn_event_pump(stream);
+    Ok(Some((events, pump, Subscribed::Resumed { ack })))
 }
 
 /// Subscribe on a fresh connection, then snapshot on the control one,
@@ -1468,20 +1767,35 @@ async fn observe(
     }
 }
 
-/// Rebuild a watched mirror after a revision gap.
-///
-/// A fresh **leaseless** subscription on a fresh control connection: the
-/// one this client dialed as a driver was closed by the takeover that
-/// deposed it, so there is nothing here to reuse.
+/// [`resync`] for a watched connection: the same seam, **leaseless**
+/// and on a fresh control connection — the one this client dialed as a
+/// driver was closed by the takeover that deposed it, so there is
+/// nothing here to reuse.
 async fn observer_resync(config: &ConnectionConfig, live: &mut Live) -> Result<(), AttemptError> {
     let mut control = dial_control(config, ConnectMode::Dial).await?;
-    let (events, pump, mirror) = subscribe_and_snapshot(&config.socket, "", &mut control).await?;
-    live.pump.abort();
+    let resume = live.checkpoint();
+    let plan = SubscribePlan::resuming(&resume, live.facts.supports_resume);
+    let (events, pump, subscribed) = subscribe(&config.socket, "", &mut control, plan).await?;
     live.control = control;
+    reseat(live, events, pump, subscribed);
+    Ok(())
+}
+
+/// Move a live connection onto a re-established subscription.
+///
+/// The mirror handle is never replaced, only its contents — the UI holds
+/// that `Arc` and a resync is not a new connection. A resume replaces
+/// nothing at all: the fence it was granted is the one this very mirror
+/// is at, and the gap arrives behind it as ordinary batches.
+fn reseat(live: &mut Live, events: EventRx, pump: tokio::task::AbortHandle, what: Subscribed) {
+    // Before the field is overwritten, or the stale subscription's task
+    // keeps pushing onto a channel nobody drains.
+    live.pump.abort();
     live.events = events;
     live.pump = pump;
-    live.mirror.reset(mirror);
-    Ok(())
+    if let Subscribed::Fresh(mirror) = what {
+        live.mirror.reset(mirror);
+    }
 }
 
 /// What one control op left behind. Deliberately not a `ConnEnd`:
@@ -1562,19 +1876,16 @@ async fn run_intent(
     }
 }
 
-/// Rebuild the mirror after a revision gap: a fresh subscription and a
-/// fresh `tab.list`, fenced against the new ack exactly as at connect.
+/// Rebuild the mirror after a revision gap: a fresh subscription,
+/// replaying the gap where the session can and taking a fresh
+/// `tab.list` — fenced against the new ack exactly as at connect —
+/// where it cannot.
 async fn resync(config: &ConnectionConfig, live: &mut Live) -> Result<(), AttemptError> {
-    let (events, pump, mirror) =
-        subscribe_and_snapshot(&config.socket, &live.lease, &mut live.control).await?;
-    // Replacing the pump aborts the old one through `Live`'s field, so
-    // the stale subscription's task cannot keep pushing.
-    live.pump.abort();
-    live.events = events;
-    live.pump = pump;
-    // The handle stays the same one the UI already holds; only its
-    // contents are replaced.
-    live.mirror.reset(mirror);
+    let resume = live.checkpoint();
+    let plan = SubscribePlan::resuming(&resume, live.facts.supports_resume);
+    let (events, pump, subscribed) =
+        subscribe(&config.socket, &live.lease, &mut live.control, plan).await?;
+    reseat(live, events, pump, subscribed);
     Ok(())
 }
 
@@ -1616,6 +1927,10 @@ fn publish_lease(feed: &EngineFeedSender, host: HostId, lease: String) -> bool {
     feed.send(EngineFeed::HostLease(host, lease))
 }
 
+fn publish_facts(feed: &EngineFeedSender, host: HostId, facts: ConnectFacts) -> bool {
+    feed.send(EngineFeed::HostConnectFacts(host, facts))
+}
+
 async fn call(
     client: &mut IpcClient,
     op: &str,
@@ -1648,7 +1963,7 @@ pub(super) fn jitter() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use roost_ipc::messages::{EventEnvelope, Project};
+    use roost_ipc::messages::{EventEnvelope, EventsSubscribeParams, Project};
 
     use super::*;
 
@@ -1679,15 +1994,31 @@ mod tests {
     /// answers with — the one shape that clears the compatibility gate
     /// against the build [`config`] claims.
     fn identify_result() -> serde_json::Value {
+        identify_advertising(roost_ipc::messages::SESSION_FEATURES)
+    }
+
+    /// The same, from a session that lists exactly these features. `[]`
+    /// is a session from before they existed, which refuses the fields
+    /// they name outright.
+    fn identify_advertising(features: &[&str]) -> serde_json::Value {
         serde_json::json!({
             "app_version": "test",
             "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
             "payload_kinds": super::super::state::CLIENT_PAYLOAD_KINDS,
+            "features": features,
             "libghostty_build": "gb",
-            "session_id": "s1",
+            "session_id": SESSION_ID,
             "started_at": "2026-01-01T00:00:00Z",
         })
     }
+
+    /// The session id [`identify_advertising`] answers with, and the one
+    /// a checkpoint has to name to be offered.
+    const SESSION_ID: &str = "s1";
+
+    /// The revision every fake session's `tab.list` and fresh subscribe
+    /// agree on.
+    const SESSION_REVISION: u64 = 1;
 
     fn settled(error: &AttemptError) -> (&str, &str) {
         match error {
@@ -1889,6 +2220,61 @@ mod tests {
         assert_eq!(mirror.read().projects.len(), 1, "and nothing was applied");
     }
 
+    /// The hazard [`Resume::freeze`] exists for, walked end to end: a
+    /// commit the replaced connection folds in *after* the set has
+    /// seeded its replacement is still inside the gap the replacement
+    /// asks for, and the `notification.fired` it carries reaches the UI
+    /// exactly once, under the new incarnation.
+    #[tokio::test]
+    async fn a_frozen_checkpoint_survives_the_writer_it_replaces() {
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let held = Arc::new(seeded_mirror(7));
+        let seeded = Resume {
+            session_id: "s1".into(),
+            mirror: Arc::clone(&held),
+        }
+        .freeze();
+
+        let missed = EventBatch {
+            revision: 8,
+            events: vec![EventEnvelope {
+                event: ops::EVENT_TAB_NOTIFICATION.into(),
+                data: serde_json::json!({"tab_id": "7", "has_notification": true}),
+            }],
+        };
+        // The old task's last apply, landing after the seed.
+        assert!(held.apply_batch(&missed));
+
+        // The new task reads its fence here and offers it; commit 8 is
+        // inside the gap, so the session replays it.
+        assert_eq!(
+            seeded.mirror.read().revision,
+            7,
+            "a shared handle would already have been advanced to 8"
+        );
+        assert!(apply_batch(
+            &seeded.mirror,
+            missed.clone(),
+            HostId::new(9),
+            &feed,
+        ));
+
+        let published: Vec<u64> = feed_items(&mut rx)
+            .into_iter()
+            .filter_map(|item| match item {
+                EngineFeed::HostWorkspace(_, HostWorkspaceEvent::Applied { revision, .. }) => {
+                    Some(revision)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            vec![8],
+            "the replayed commit must reach the UI exactly once"
+        );
+    }
+
     /// A run of commits costs one mirror and N wakes, never N mirrors.
     /// The old shape put a full workspace clone on an *unbounded*
     /// channel per commit, so a chatty host grew the client without
@@ -1944,6 +2330,7 @@ mod tests {
             mode,
             held_lease: None,
             observer_only: false,
+            resume: None,
             client_build: "gb".into(),
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
             uploads: Uploads::default(),
@@ -2822,6 +3209,26 @@ mod tests {
         Refuse(&'static str),
     }
 
+    /// How [`Fake`] answers `events.subscribe`.
+    ///
+    /// Every arm scripts the **resume** only. A fresh subscribe always
+    /// succeeds, because a refusal that had nothing to fall back to
+    /// would prove nothing about the fallback.
+    #[derive(Clone, Copy)]
+    enum Subscribe {
+        /// Serve it: the ack echoes the fence, as the contract requires.
+        Serve,
+        /// Ack this revision instead — a session contradicting its own
+        /// echo.
+        Ack(u64),
+        /// Refuse with this code.
+        Refuse(&'static str),
+        /// Close the connection without answering, while
+        /// [`Fake::resume_drops`] lasts — the wire dying on the resume
+        /// dial, and then healing.
+        Close,
+    }
+
     /// A session that serves the whole prologue, scripts
     /// `session.put_file`, and can hold one control op unanswered or cut
     /// its event stream on cue.
@@ -2872,6 +3279,18 @@ mod tests {
         theme_refusal: Option<&'static str>,
         puts: Arc<AtomicUsize>,
         dials: Arc<AtomicUsize>,
+        /// What this session says it can do. `[]` is a session from
+        /// before `events_resume`.
+        features: Vec<&'static str>,
+        subscribe: Subscribe,
+        /// Remaining resume offers [`Subscribe::Close`] hangs up on.
+        resume_drops: Arc<AtomicUsize>,
+        /// Every `events.subscribe` this session was sent, in order.
+        /// The record "did this reconnect resume?" is read off.
+        subscribes: Arc<Mutex<Vec<EventsSubscribeParams>>>,
+        /// How many `tab.list` snapshots it has been asked for. A
+        /// resumed reconnect takes none, which is the whole of R11.
+        tab_lists: Arc<AtomicUsize>,
     }
 
     impl Fake {
@@ -2893,7 +3312,46 @@ mod tests {
                 theme_refusal: None,
                 puts: Arc::new(AtomicUsize::new(0)),
                 dials: Arc::new(AtomicUsize::new(0)),
+                features: roost_ipc::messages::SESSION_FEATURES.to_vec(),
+                subscribe: Subscribe::Serve,
+                resume_drops: Arc::new(AtomicUsize::new(0)),
+                subscribes: Arc::new(Mutex::new(Vec::new())),
+                tab_lists: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        /// A session from before `events_resume`, which would answer an
+        /// unknown-field error rather than one of the three refusals.
+        fn without_features(mut self) -> Fake {
+            self.features = Vec::new();
+            self
+        }
+
+        fn refusing_the_resume(mut self, code: &'static str) -> Fake {
+            self.subscribe = Subscribe::Refuse(code);
+            self
+        }
+
+        fn acking_the_resume(mut self, revision: u64) -> Fake {
+            self.subscribe = Subscribe::Ack(revision);
+            self
+        }
+
+        fn dropping_resumes(mut self, times: usize) -> Fake {
+            self.resume_drops.store(times, Ordering::Release);
+            self.subscribe = Subscribe::Close;
+            self
+        }
+
+        fn snapshots(&self) -> usize {
+            self.tab_lists.load(Ordering::Acquire)
+        }
+
+        fn subscribes(&self) -> Vec<EventsSubscribeParams> {
+            self.subscribes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
 
         fn deposing(self, times: usize) -> Fake {
@@ -2990,25 +3448,43 @@ mod tests {
                     self.release.requested().await;
                 }
                 let response = match op.as_str() {
-                    ops::SESSION_IDENTIFY => {
-                        serde_json::json!({"id": id, "ok": true, "result": identify_result()})
-                    }
+                    ops::SESSION_IDENTIFY => serde_json::json!({
+                        "id": id,
+                        "ok": true,
+                        "result": identify_advertising(&self.features),
+                    }),
                     ops::SESSION_CONNECT => {
                         self.connects.fetch_add(1, Ordering::AcqRel);
                         serde_json::json!({
                             "id": id,
                             "ok": true,
-                            "result": { "lease": "the-lease", "revision": 1 },
+                            "result": { "lease": "the-lease", "revision": SESSION_REVISION },
                         })
                     }
-                    ops::TAB_LIST => serde_json::json!({
-                        "id": id,
-                        "ok": true,
-                        "result": seeded_list(Some(1)),
-                    }),
+                    ops::TAB_LIST => {
+                        self.tab_lists.fetch_add(1, Ordering::AcqRel);
+                        serde_json::json!({
+                            "id": id,
+                            "ok": true,
+                            "result": seeded_list(Some(SESSION_REVISION)),
+                        })
+                    }
                     ops::EVENTS_SUBSCRIBE => {
-                        subscribed = true;
-                        serde_json::json!({"id": id, "ok": true, "result": {"revision": 1}})
+                        let params: EventsSubscribeParams =
+                            serde_json::from_value(request["params"].clone())
+                                .expect("subscribe params");
+                        let from_revision = params.from_revision;
+                        self.subscribes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(params);
+                        match self.subscribe_answer(from_revision, &id) {
+                            Some(answer) => {
+                                subscribed = answer["ok"] == serde_json::json!(true);
+                                answer
+                            }
+                            None => return,
+                        }
                     }
                     ops::SESSION_SET_THEME => match self.theme_refusal {
                         Some(code) => serde_json::json!({
@@ -3032,6 +3508,33 @@ mod tests {
                 {
                     return;
                 }
+            }
+        }
+
+        /// The scripted `events.subscribe` answer, or `None` for a
+        /// connection this session hangs up on instead of answering.
+        fn subscribe_answer(
+            &self,
+            from_revision: Option<u64>,
+            id: &serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            let ack = |revision: u64| serde_json::json!({"id": id, "ok": true, "result": {"revision": revision}});
+            let Some(from) = from_revision else {
+                return Some(ack(SESSION_REVISION));
+            };
+            match self.subscribe {
+                Subscribe::Serve => Some(ack(from)),
+                Subscribe::Ack(revision) => Some(ack(revision)),
+                Subscribe::Refuse(code) => Some(serde_json::json!({
+                    "id": id,
+                    "ok": false,
+                    "error": { "code": code, "message": "cannot replay from there" },
+                })),
+                Subscribe::Close if self.resume_drops.load(Ordering::Acquire) > 0 => {
+                    self.resume_drops.fetch_sub(1, Ordering::AcqRel);
+                    None
+                }
+                Subscribe::Close => Some(ack(from)),
             }
         }
 
@@ -3081,15 +3584,18 @@ mod tests {
             .unwrap_or_else(|_| panic!("{what}"));
     }
 
-    /// Every host state the task has published, drained as it goes.
+    /// Every host state the task has published, drained as it goes,
+    /// with the connect facts that rode behind them.
     #[derive(Default)]
-    struct States(Vec<HostConnState>);
+    struct States(Vec<HostConnState>, Vec<ConnectFacts>);
 
     impl States {
         fn drain(&mut self, rx: &mut crate::engine_feed::EngineFeedReceiver) {
             for item in feed_items(rx) {
-                if let EngineFeed::HostState(_, state) = item {
-                    self.0.push(state);
+                match item {
+                    EngineFeed::HostState(_, state) => self.0.push(state),
+                    EngineFeed::HostConnectFacts(_, facts) => self.1.push(facts),
+                    _ => {}
                 }
             }
         }
@@ -3142,21 +3648,29 @@ mod tests {
             transport: HostTransport,
             held_lease: Option<String>,
         ) -> Connected {
-            Connected::spawn_with(socket, transport, held_lease, false)
+            Connected::spawn_with(socket, transport, held_lease, false, None)
         }
 
-        /// The same, for a task the set has told it is not the driver.
+        /// The same, handed a checkpoint its prologue may resume from.
+        fn resuming(socket: PathBuf, transport: HostTransport, resume: Resume) -> Connected {
+            Connected::spawn_with(socket, transport, None, false, Some(resume))
+        }
+
+        /// The same, for a task the set has told it is not the driver,
+        /// or handed a checkpoint to resume from.
         fn spawn_with(
             socket: PathBuf,
             transport: HostTransport,
             held_lease: Option<String>,
             observer_only: bool,
+            resume: Option<Resume>,
         ) -> Connected {
             let (ops, ops_rx) = super::super::HostOps::channel();
             let mut config = config(socket, transport, ConnectMode::Dial);
             config.uploads = ops.uploads();
             config.held_lease = held_lease;
             config.observer_only = observer_only;
+            config.resume = resume;
             let (feed, rx) = crate::engine_feed::channel();
             let shutdown = Arc::new(Shutdown::default());
             let task = tokio::spawn(run(
@@ -3272,6 +3786,16 @@ mod tests {
             1,
             "watching is not connecting: the task never re-published Connected"
         );
+        // The prologue's, then the deposition's. `TakenOver` is not
+        // `Connected`, so the set retires the first pair on that edge —
+        // and a surviving observer that reported no session id and no
+        // fidelity would be describing a connection it is still reading.
+        assert_eq!(
+            states.1.len(),
+            2,
+            "the deposed connection must refile its facts behind the TakenOver it publishes"
+        );
+        assert_eq!(states.1[0], states.1[1], "same session, same fidelity");
     }
 
     /// Live observer → reconnecting observer → live observer, and never
@@ -3384,7 +3908,7 @@ mod tests {
         let fake = Fake::new(PutFile::Land);
         fake.serve(&socket);
 
-        let mut host = Connected::spawn_with(socket, HostTransport::Ssh, None, true);
+        let mut host = Connected::spawn_with(socket, HostTransport::Ssh, None, true, None);
         until_state(&mut host, "the task to settle as an observer", |state| {
             matches!(state, HostConnState::TakenOver { .. })
         })
@@ -3485,6 +4009,250 @@ mod tests {
             states.connections(),
             0,
             "a probe that came back non-current must never reach Connected"
+        );
+    }
+
+    // ---- resuming a stream (plan 056 §3.2) -----------------------------
+
+    /// A checkpoint on a mirror of its own, as the set seeds one.
+    fn checkpoint(session_id: &str, revision: u64) -> Resume {
+        Resume {
+            session_id: session_id.into(),
+            mirror: Arc::new(seeded_mirror(revision)),
+        }
+    }
+
+    /// The prologue's own verdict, off the facts it published.
+    fn resumed(states: &States) -> Option<ResumeFacts> {
+        states
+            .1
+            .last()
+            .expect("a connected task publishes its facts")
+            .resumed
+    }
+
+    fn reason(state: &HostConnState) -> &str {
+        match state {
+            HostConnState::Disconnected(disconnected) => &disconnected.reason,
+            other => panic!("expected a dropped connection, got {other:?}"),
+        }
+    }
+
+    /// **R11's headline.** A reconnect to the session the checkpoint
+    /// names offers the fence it is at, and the session replays from
+    /// there — so the whole-workspace `tab.list` every reconnect used to
+    /// cost is simply not sent.
+    #[tokio::test]
+    async fn a_matching_checkpoint_resumes_and_takes_no_snapshot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("resume.sock");
+        let fake = Fake::new(PutFile::Land);
+        fake.serve(&socket);
+
+        let mut host =
+            Connected::resuming(socket, HostTransport::UnixSocket, checkpoint(SESSION_ID, 7));
+        host.states.until_connected(&mut host.feed, 1).await;
+
+        assert_eq!(
+            fake.snapshots(),
+            0,
+            "a resumed reconnect must not re-list the workspace"
+        );
+        let subscribes = fake.subscribes();
+        assert_eq!(subscribes.len(), 1, "one subscribe, and it was the resume");
+        assert_eq!(subscribes[0].from_revision, Some(7));
+        assert_eq!(subscribes[0].session_id.as_deref(), Some(SESSION_ID));
+
+        let states = host.stop().await;
+        assert_eq!(
+            resumed(&states),
+            Some(ResumeFacts { from_revision: 7 }),
+            "and `host.status` reports the ack's fence, not the request's"
+        );
+    }
+
+    /// The three names a session has for "I cannot replay from there".
+    /// None of them fails the connection: each falls back to the
+    /// subscribe-then-snapshot prologue on a fresh dial, and the host
+    /// comes up as it always did.
+    #[tokio::test]
+    async fn every_refusal_falls_back_to_a_fresh_snapshot() {
+        for code in ["replay-expired", "revision-ahead", "session-mismatch"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let socket = dir.path().join("refused.sock");
+            let fake = Fake::new(PutFile::Land).refusing_the_resume(code);
+            fake.serve(&socket);
+
+            let mut host =
+                Connected::resuming(socket, HostTransport::UnixSocket, checkpoint(SESSION_ID, 7));
+            host.states.until_connected(&mut host.feed, 1).await;
+
+            assert_eq!(fake.snapshots(), 1, "{code}: exactly one fallback snapshot");
+            let subscribes = fake.subscribes();
+            assert_eq!(
+                subscribes
+                    .iter()
+                    .map(|params| params.from_revision)
+                    .collect::<Vec<_>>(),
+                vec![Some(7), None],
+                "{code}: the refused offer, then a fresh subscribe"
+            );
+
+            let states = host.stop().await;
+            assert_eq!(resumed(&states), None, "{code}: nothing was replayed");
+            assert_eq!(states.connections(), 1, "{code}: and it is a live host");
+        }
+    }
+
+    /// The ack echoes the fence by contract. One that does not, with no
+    /// snapshot behind it, would leave the mirror silently stale — every
+    /// commit between the two discarded as already applied — so the
+    /// attempt fails instead of trusting it.
+    #[tokio::test]
+    async fn an_ack_that_does_not_echo_the_fence_fails_the_attempt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("bad-ack.sock");
+        let fake = Fake::new(PutFile::Land).acking_the_resume(9);
+        fake.serve(&socket);
+
+        let mut host =
+            Connected::resuming(socket, HostTransport::UnixSocket, checkpoint(SESSION_ID, 7));
+        until_state(&mut host, "the attempt to fail", |state| {
+            matches!(state, HostConnState::Disconnected(_))
+        })
+        .await;
+
+        assert_eq!(
+            reason(host.states.last()),
+            "resume ack 9 does not match from_revision 7"
+        );
+        assert_eq!(fake.snapshots(), 0, "and it never fell back");
+    }
+
+    /// A resume dial that dies on the wire is the wire, not a refusal:
+    /// no snapshot is attempted, and the checkpoint is **kept** — the
+    /// next rung of the ladder presents the very same fence.
+    #[tokio::test]
+    async fn a_wire_failure_on_the_resume_keeps_the_checkpoint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("resume-wire.sock");
+        let fake = Fake::new(PutFile::Land).dropping_resumes(1);
+        fake.serve(&socket);
+
+        // Localhost, because its ladder is the one that retries inside
+        // this task.
+        let mut host = Connected::resuming(
+            socket,
+            HostTransport::LocalSession,
+            checkpoint(SESSION_ID, 7),
+        );
+        until_state(&mut host, "the resume dial to die", |state| {
+            matches!(state, HostConnState::Disconnected(_))
+        })
+        .await;
+        assert_eq!(
+            fake.snapshots(),
+            0,
+            "a wire failure is not a refusal: nothing may fall back to a snapshot"
+        );
+
+        host.states.until_connected(&mut host.feed, 1).await;
+        assert_eq!(
+            fake.subscribes()
+                .iter()
+                .map(|params| params.from_revision)
+                .collect::<Vec<_>>(),
+            vec![Some(7), Some(7)],
+            "the checkpoint survives the failure and is offered again"
+        );
+        assert_eq!(fake.snapshots(), 0, "and the retry resumed too");
+
+        let states = host.stop().await;
+        assert_eq!(resumed(&states), Some(ResumeFacts { from_revision: 7 }));
+    }
+
+    /// A session that restarted is a different session, and this client
+    /// already knows it — `session.identify` ran first. So the fence is
+    /// never offered: a `session-mismatch` round trip is spent for
+    /// nothing, and over ssh that round trip is an exec.
+    #[tokio::test]
+    async fn a_restarted_session_is_caught_locally_and_never_offered_a_fence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("restarted.sock");
+        let fake = Fake::new(PutFile::Land);
+        fake.serve(&socket);
+
+        let mut host = Connected::resuming(
+            socket,
+            HostTransport::UnixSocket,
+            checkpoint("a-session-that-has-since-restarted", 7),
+        );
+        host.states.until_connected(&mut host.feed, 1).await;
+
+        let subscribes = fake.subscribes();
+        assert_eq!(subscribes.len(), 1, "no offer was made and none refused");
+        assert_eq!(subscribes[0].from_revision, None);
+        assert_eq!(fake.snapshots(), 1);
+        assert_eq!(resumed(&host.stop().await), None);
+    }
+
+    /// A session from before `events_resume` has `deny_unknown_fields`
+    /// on the subscribe params: `from_revision` would come back as an
+    /// error **outside** the three refusals, failing the attempt
+    /// outright. The feature list is what stops it ever being sent.
+    #[tokio::test]
+    async fn a_session_that_lists_no_features_is_never_sent_a_fence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("pre-r5.sock");
+        let fake = Fake::new(PutFile::Land).without_features();
+        fake.serve(&socket);
+
+        let mut host =
+            Connected::resuming(socket, HostTransport::UnixSocket, checkpoint(SESSION_ID, 7));
+        host.states.until_connected(&mut host.feed, 1).await;
+
+        let subscribes = fake.subscribes();
+        assert_eq!(subscribes.len(), 1);
+        assert_eq!(subscribes[0].from_revision, None);
+        assert_eq!(fake.snapshots(), 1);
+        assert_eq!(resumed(&host.stop().await), None);
+    }
+
+    /// A localhost drop retries inside the same task, so it never goes
+    /// back to the set for a checkpoint — it keeps its own, taken from
+    /// the connection that just ended. Same fence, one fewer trip.
+    #[tokio::test]
+    async fn an_in_task_retry_resumes_from_the_connection_that_just_ended() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("in-task-retry.sock");
+        let fake = Fake::new(PutFile::Land).cutting(1);
+        fake.serve(&socket);
+
+        // No seeded checkpoint: this host has never connected before.
+        let mut host = Connected::start(socket, HostTransport::LocalSession).await;
+        assert_eq!(fake.snapshots(), 1, "the first connection is a fresh one");
+
+        fake.cut.request();
+        until_state(&mut host, "the stream to drop", |state| {
+            matches!(state, HostConnState::Disconnected(_))
+        })
+        .await;
+        host.states.until_connected(&mut host.feed, 2).await;
+
+        assert_eq!(
+            fake.subscribes()
+                .iter()
+                .map(|params| params.from_revision)
+                .collect::<Vec<_>>(),
+            vec![None, Some(SESSION_REVISION)],
+            "the retry offers what the ended connection had applied"
+        );
+        assert_eq!(fake.snapshots(), 1, "and takes no second snapshot");
+        assert_eq!(
+            resumed(&host.stop().await),
+            Some(ResumeFacts {
+                from_revision: SESSION_REVISION
+            })
         );
     }
 

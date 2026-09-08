@@ -226,6 +226,21 @@ fn host_connection_vectors_decode_as_typed_params_and_results() {
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
     }
 
+    /// A recorded `host.status` result, plus the always-serialized keys
+    /// [`HostStatus`] has grown since it was recorded.
+    ///
+    /// An existing vector is never edited to bless a wire change
+    /// (`ipc-compatibility.md`), so the expectation moves instead — and
+    /// pinning each grown key to the value a vector that omits it must
+    /// decode to is a stronger check than dropping it from both sides.
+    fn grown(recorded: &serde_json::Value) -> serde_json::Value {
+        let mut expected = recorded.clone();
+        for host in expected["hosts"].as_array_mut().expect("a hosts array") {
+            host["tabs"] = serde_json::json!(0);
+        }
+        expected
+    }
+
     let request = vector("host.connect.request.json");
     assert_eq!(request["op"], ops::HOST_CONNECT);
     let params: HostConnectParams =
@@ -286,7 +301,13 @@ fn host_connection_vectors_decode_as_typed_params_and_results() {
     // kind — the variant vector below is where one does.
     assert_eq!(armed.payload_kind, None);
     assert_eq!(never.payload_kind, None);
-    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+    // Neither host is live, so neither carries a `connect` object.
+    assert_eq!(armed.connect, None);
+    assert_eq!(never.connect, None);
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        grown(&response["result"])
+    );
 
     // The fallback shape: a connected host whose attach was served as a
     // `vt` byte stream because the two libghostty builds disagree.
@@ -297,6 +318,23 @@ fn host_connection_vectors_decode_as_typed_params_and_results() {
         result.hosts[0].payload_kind.as_deref(),
         Some(AttachPayloadKind::VT)
     );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        grown(&response["result"])
+    );
+
+    // The live shape: what the prologue established, plus the row count
+    // the section is drawing. `connect` is present exactly while the
+    // connection is, which is why the two vectors above omit it.
+    let response = vector("host.status.connect.response.json");
+    let result: HostStatusResult = serde_json::from_value(response["result"].clone())
+        .expect("host.status connect result decode");
+    let live = result.hosts[0].connect.as_ref().expect("a live connection");
+    assert_eq!(live.session_id, "5c1f0e2d3a4b5c6d");
+    assert!(live.reduced_fidelity);
+    assert!(live.resumed);
+    assert_eq!(live.from_revision, Some(4_312));
+    assert_eq!(result.hosts[0].tabs, 5);
     assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
 }
 

@@ -25,6 +25,8 @@ use roost_ipc::bootstrap::{
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 use roost_ipc::ssh::{SshTarget, SshTunnelOptions};
 
+use crate::host_conn::state::Skew;
+
 /// The triple a remote `roost-session` has to equal for this client to
 /// install it, and the one the running session is judged against
 /// afterwards.
@@ -123,23 +125,73 @@ pub(crate) struct OfferContext {
     /// remote branch (a running session, not a failure) and for the Add
     /// Host dialog, which verified without ever dialing.
     pub(crate) failure: Option<roost_ipc::ssh::SshFailure>,
+    /// Set when the entry point was the reduced-fidelity route (plan 056
+    /// §3.6) rather than a failed connect: this card is being offered
+    /// about a session that is *up and attached*, and it carries the
+    /// build pair its reason line prints.
+    pub(crate) fidelity: Option<FidelityOffer>,
+}
+
+/// The reduced-fidelity connection a card was opened about.
+///
+/// The session id is the load-bearing half. Every other entry point
+/// offers to act on a host that is not serving this client at all, so
+/// "the host is still in the state I planned against" is enough; this
+/// one offers to **stop a live session**, and a host can drop and come
+/// back behind the same saved id — as a different session, still at
+/// reduced fidelity — while the card sits on screen. Confirming then
+/// would reap the shells of a session nobody read a word about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FidelityOffer {
+    /// [`crate::host_conn::state::ConnectFacts::session_id`] as it was
+    /// when the card opened.
+    pub(crate) session_id: String,
+    pub(crate) skew: Skew,
 }
 
 /// The far side at the moment a card is confirmed, reduced to what the
 /// offer's honesty depends on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LiveState {
     /// A session is up that this client cannot talk to — the state the
     /// `Running` rows were planned against.
     NeedsRestart,
+    /// A session is up, attached, and serving the `vt` fallback across a
+    /// libghostty build skew (plan 056 §3.6) — the state the fidelity
+    /// entry points plan against. Carries the session's own id, because
+    /// "still reduced" is not the question: "still *this* session" is.
+    ConnectedReduced { session_id: String },
     /// Nothing is serving. `qualifies` is what a connect attempt on
     /// record still says about it; `None` means nothing dialed at all,
     /// which is the Add Host entry's normal shape rather than a host
     /// that moved.
     Cold { qualifies: Option<bool> },
-    /// Connecting, connected, taken over, stopped — anything the card
-    /// was not planned against.
+    /// Connecting, connected at full fidelity, taken over, stopped —
+    /// anything the card was not planned against.
     Other,
+}
+
+impl LiveState {
+    /// Whether confirming a card against this far side acts on a
+    /// connection this client still holds a **stream** to.
+    ///
+    /// Exactly one state does, and it is why both confirm paths
+    /// disconnect the host before they start their job. From every
+    /// other state there is nothing to tear down; from this one a live
+    /// driver stream races the reconnect ladder. If the bridge EOFs
+    /// before `session.stopping` arrives, `serve` returns `Dropped`,
+    /// the ladder dials a session mid-restart, the `held_lease` probe
+    /// answers `NotCurrent` against the new one, and the band says
+    /// `taken over` by nobody until the job's own reconnect. Handing
+    /// the session's lifecycle to the job for its duration is what
+    /// stops that; the retained rows keep drawing (plan 056 §3.3) and
+    /// the reconnect the job finishes with is unconditional.
+    pub(crate) fn holds_a_live_stream(&self) -> bool {
+        match self {
+            Self::ConnectedReduced { .. } => true,
+            Self::NeedsRestart | Self::Cold { .. } | Self::Other => false,
+        }
+    }
 }
 
 /// Whether the card the user is confirming still describes the far
@@ -158,12 +210,23 @@ pub(crate) enum LiveState {
 ///   the card was up, the install lands under a live process and the
 ///   job fails at `post_start_identify` — loudly, but describing the
 ///   wrong phase.
+/// * A **reduced-fidelity** plan stops a session this client is
+///   attached to and working in. Being reduced again is not enough to
+///   act on: a host that dropped and came back is a different session
+///   behind the same id, and the card the user read was about the one
+///   that is gone. Only [`FidelityOffer::session_id`] can tell those
+///   apart, so an offer that names a session stands only against that
+///   session — including against `NeedsRestart`, which names none.
 ///
 /// So the question is asked again at the moment the answer is acted on,
 /// exactly as `host_restart_confirmed` does with its own prompt.
-pub(crate) fn offer_still_stands(offered: SessionState, live: LiveState) -> bool {
-    match (offered, live) {
-        (SessionState::Running, LiveState::NeedsRestart) => true,
+pub(crate) fn offer_still_stands(offer: &OfferContext, live: &LiveState) -> bool {
+    match (offer.session, live) {
+        (SessionState::Running, LiveState::NeedsRestart) => offer.fidelity.is_none(),
+        (SessionState::Running, LiveState::ConnectedReduced { session_id }) => offer
+            .fidelity
+            .as_ref()
+            .is_some_and(|opened| &opened.session_id == session_id),
         (SessionState::NoSession, LiveState::Cold { qualifies }) => qualifies.unwrap_or(true),
         _ => false,
     }
@@ -366,6 +429,11 @@ pub(crate) struct CopyInputs<'a> {
     /// known for a protocol skew — two libghostty build strings that
     /// disagree are merely different (see `host_notice::vintage`).
     pub(crate) session_is_newer: bool,
+    /// The build pair a reduced-fidelity entry point is asking about,
+    /// which the card leads with: this user is not being told a session
+    /// is unreachable, they are being told why the one they are looking
+    /// at has lost its links.
+    pub(crate) fidelity: Option<&'a Skew>,
 }
 
 /// What the consent card says.
@@ -389,6 +457,10 @@ pub(crate) struct CopyInputs<'a> {
 /// * It says when the install is a **downgrade**, and still offers it.
 ///   The user may have a reason; what they may not have is the fact
 ///   hidden from them.
+/// * It leads with the **reason**, where the entry point had one. A
+///   person who pressed `reduced fidelity` on a connected host is owed
+///   the two builds that disagreed before they are told what an install
+///   would write.
 pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
     let CopyInputs {
         label,
@@ -398,6 +470,7 @@ pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
         source,
         plan,
         session_is_newer,
+        fidelity,
     } = inputs;
     let build = format!(
         "roost-session {} ({})",
@@ -459,6 +532,12 @@ pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
             "The session on {label} was started by a newer Roost, so this would install an older \
              build; upgrading this Roost is likely the fix."
         ));
+    }
+    if let Some(skew) = fidelity {
+        body = format!(
+            "{} {body}",
+            super::host_notice::reduced_fidelity_reason(skew)
+        );
     }
 
     BootstrapCopy {
@@ -668,7 +747,10 @@ pub(crate) enum BootstrapEvent {
     Probed {
         request: BootstrapRequest,
         offer: OfferContext,
-        result: Result<Probed, BootstrapError>,
+        /// Boxed: a whole [`Probe`] is several times what the
+        /// `Finished` arm carries, and this enum is a feed item every
+        /// other host event is queued behind at that width.
+        result: Box<Result<Probed, BootstrapError>>,
     },
     Finished {
         request: BootstrapRequest,
@@ -918,40 +1000,167 @@ mod tests {
         use LiveState::{Cold, NeedsRestart, Other};
         use SessionState::{NoSession, Running};
 
-        assert!(offer_still_stands(Running, NeedsRestart));
+        assert!(offer_still_stands(&offer(Running, None), &NeedsRestart));
         assert!(
-            !offer_still_stands(Running, Cold { qualifies: None }),
+            !offer_still_stands(&offer(Running, None), &Cold { qualifies: None }),
             "the session the plan would stop is gone"
         );
         assert!(
-            !offer_still_stands(Running, Other),
+            !offer_still_stands(&offer(Running, None), &Other),
             "a host that reconnected has a healthy attached session, and the plan reaps it"
         );
 
         assert!(
-            offer_still_stands(NoSession, Cold { qualifies: None }),
+            offer_still_stands(&offer(NoSession, None), &Cold { qualifies: None }),
             "the Add Host entry never dialed, so there is nothing on record to still agree with"
         );
         assert!(offer_still_stands(
-            NoSession,
-            Cold {
+            &offer(NoSession, None),
+            &Cold {
                 qualifies: Some(true)
             }
         ));
         assert!(
             !offer_still_stands(
-                NoSession,
-                Cold {
+                &offer(NoSession, None),
+                &Cold {
                     qualifies: Some(false)
                 }
             ),
             "the failure the offer answered is no longer what the host is saying"
         );
         assert!(
-            !offer_still_stands(NoSession, NeedsRestart),
+            !offer_still_stands(&offer(NoSession, None), &NeedsRestart),
             "a session started underneath: the plan skips the stop and would install under it"
         );
-        assert!(!offer_still_stands(NoSession, Other));
+        assert!(!offer_still_stands(&offer(NoSession, None), &Other));
+
+        // A `NeedsRestart` host is not the fidelity card's session — it
+        // is *no* session this client can name — so the entry that
+        // never carried an id keeps that row and the one that does
+        // loses it.
+        assert!(
+            !offer_still_stands(&offer(Running, Some("s-1")), &NeedsRestart),
+            "the card named a session; NeedsRestart names none"
+        );
+    }
+
+    /// The fidelity card stops a session the user is attached to and
+    /// working in, so "still reduced" is not the question — "still
+    /// *this* session" is. A host that dropped and came back is a
+    /// different session behind the same saved id, and the shells it is
+    /// running were never described by anything the user read.
+    #[test]
+    fn a_fidelity_card_stands_only_against_the_session_it_named() {
+        use LiveState::{Cold, ConnectedReduced, NeedsRestart, Other};
+        use SessionState::Running;
+
+        assert!(offer_still_stands(
+            &offer(Running, Some("s-1")),
+            &ConnectedReduced {
+                session_id: "s-1".into()
+            }
+        ));
+        assert!(
+            !offer_still_stands(
+                &offer(Running, Some("s-1")),
+                &ConnectedReduced {
+                    session_id: "s-2".into()
+                }
+            ),
+            "a second reduced-fidelity session behind the same host is not the one on the card"
+        );
+        assert!(
+            !offer_still_stands(&offer(Running, Some("s-1")), &Other),
+            "a host that reconnected at full fidelity has nothing left to update"
+        );
+        assert!(!offer_still_stands(
+            &offer(Running, Some("s-1")),
+            &Cold { qualifies: None }
+        ));
+
+        // And the converse: the connect-failure entries never name a
+        // session, so a host that came back at reduced fidelity is not
+        // theirs to act on either.
+        for session in [Running, SessionState::NoSession] {
+            assert!(
+                !offer_still_stands(
+                    &offer(session, None),
+                    &ConnectedReduced {
+                        session_id: "s-1".into()
+                    }
+                ),
+                "{session:?} was planned against a host this client could not talk to"
+            );
+        }
+        assert!(!offer_still_stands(
+            &offer(Running, Some("s-1")),
+            &NeedsRestart
+        ));
+    }
+
+    /// Which far side a confirm has to tear a stream down on before it
+    /// starts anything.
+    ///
+    /// Exhaustive on purpose: every other state is one where nothing is
+    /// attached, and a variant added later must be decided rather than
+    /// defaulted. Getting this wrong is not cosmetic — a driver stream
+    /// left up under a restart races the reconnect ladder into a
+    /// `taken over` the band cannot explain.
+    #[test]
+    fn only_a_live_connection_is_disconnected_before_the_job() {
+        assert!(LiveState::ConnectedReduced {
+            session_id: "s-1".into()
+        }
+        .holds_a_live_stream());
+        assert!(
+            !LiveState::NeedsRestart.holds_a_live_stream(),
+            "the gate refused; there is no stream to tear down"
+        );
+        assert!(!LiveState::Cold { qualifies: None }.holds_a_live_stream());
+        assert!(!LiveState::Cold {
+            qualifies: Some(true)
+        }
+        .holds_a_live_stream());
+        assert!(
+            !LiveState::Other.holds_a_live_stream(),
+            "and a card confirmed against one of these is already refused"
+        );
+    }
+
+    /// The card a person reaches from the band leads with **why** —
+    /// the two builds that disagreed — before it says what an install
+    /// would write. Row 5's shape, because that is what a matching
+    /// binary under a skewed session actually plans.
+    #[test]
+    fn the_fidelity_card_leads_with_the_two_builds_that_disagreed() {
+        let plan = plan_bootstrap(&compatible(), SessionState::Running);
+        let card = copy_with(&plan, "", false, Some(&skew()));
+        assert_eq!(card.confirm, "Update");
+        assert!(card.title.starts_with("Update roost-session on pop-os"));
+        assert!(
+            card.body.starts_with(
+                "This session is attached at reduced fidelity: it was started by a roost-session \
+                 built against gb-old, and this Roost is built against gb-new. Links, the \
+                 alternate screen and soft wrapping are off until it runs the matching build."
+            ),
+            "{card:?}"
+        );
+        assert!(
+            card.body.contains("Nothing will be installed"),
+            "the reason is prepended to the plan lines, not instead of them: {card:?}"
+        );
+        assert!(
+            card.body.contains("shells running in it end"),
+            "and the stop warning still rides at the end: {card:?}"
+        );
+
+        // Every other entry point is answering a connect that failed,
+        // and has no builds to name.
+        assert!(
+            !copy(&plan, "", false).body.contains("reduced fidelity"),
+            "a card raised from a failed connect invents no reason"
+        );
     }
 
     /// A probe answer is a multi-second round trip, and each of these
@@ -1123,6 +1332,15 @@ mod tests {
     /// plan contradicts — a Start card whose plan starts
     /// `/usr/bin/roost-session` asserting on `~/.local/bin`.
     fn copy(plan: &BootstrapPlan, source: &str, newer: bool) -> BootstrapCopy {
+        copy_with(plan, source, newer, None)
+    }
+
+    fn copy_with(
+        plan: &BootstrapPlan,
+        source: &str,
+        newer: bool,
+        fidelity: Option<&Skew>,
+    ) -> BootstrapCopy {
         bootstrap_copy(CopyInputs {
             label: "pop-os",
             identity: &identity(),
@@ -1131,7 +1349,27 @@ mod tests {
             source,
             plan,
             session_is_newer: newer,
+            fidelity,
         })
+    }
+
+    fn skew() -> Skew {
+        Skew {
+            session_build: "gb-old".into(),
+            client_build: "gb-new".into(),
+        }
+    }
+
+    fn offer(session: SessionState, fidelity: Option<&str>) -> OfferContext {
+        OfferContext {
+            session,
+            session_is_newer: false,
+            failure: None,
+            fidelity: fidelity.map(|session_id| FidelityOffer {
+                session_id: session_id.to_string(),
+                skew: skew(),
+            }),
+        }
     }
 
     /// The two spellings of one destination, and the reason the copy

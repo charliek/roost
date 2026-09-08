@@ -148,6 +148,12 @@ enum Message {
         saved_id: String,
         frame: app::host_notice::FrozenFrame,
     },
+    /// The band's `reduced fidelity` pill and the inline row under it,
+    /// carrying the saved host's stable id (plan 056 §3.4). The palette's
+    /// `host:update:` / `host:restart:` verbs land on the same app entry,
+    /// which is the one that decides — from the transport, re-read there
+    /// — which card the press opens.
+    HostFidelityAction(String),
     /// The Add Host dialog's two fields and its confirming button (plan
     /// 037 §3.1) — the one free-text flow in the host verb family.
     AddHostNameChanged(String),
@@ -619,6 +625,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::NewProject
         | Message::HostReconnect(_)
         | Message::HostFrameReconnect { .. }
+        | Message::HostFidelityAction(_)
         | Message::AddHostNameChanged(_)
         | Message::AddHostSocketChanged(_)
         | Message::AddHostSubmit

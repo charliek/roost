@@ -95,13 +95,17 @@ from util import runs_alone
 # palette reads, same incarnation probe. Only the transport differs.
 from test_host_client import (
     HostUnderTest,
+    caught_up,
     first_project,
     host_row_ids,
     in_the_jail,
+    inbox_ids,
+    listed_host_tabs,
     marker,
     quiet_tab,
     start_session,
     wait_dump_contains,
+    wait_live_connect,
     wait_until,
 )
 from test_host_client import host_key as _host_key
@@ -497,11 +501,17 @@ def session_env():
         made.teardown()
 
 
-@pytest.fixture
-def ssh_host(roost: Roost, session_env):
-    """A running session, reachable only over the fake `ssh`, saved as a
-    host, not yet connected."""
-    start_session(session_env)
+@contextlib.contextmanager
+def an_ssh_host(roost: Roost, session_env):
+    """Point the fake `ssh` at an **already running** `session_env` and
+    save it as a host, not yet connected.
+
+    Split out of [`ssh_host`] so a case that needs the daemon launched
+    with a knob of its own — `ROOST_SESSION_REPLAY_WINDOW`, which
+    `sessionlib` sanitizes out of the environment and so must be passed
+    per launch — gets the same registration, the same one-connected-host
+    guard and the same teardown as every other case here.
+    """
     write_session_env(session_env)
     configure_fake_ssh("ok")
 
@@ -538,6 +548,31 @@ def ssh_host(roost: Roost, session_env):
         # `ssh` master) down — before the session it reaches goes away.
         with contextlib.suppress(Exception):
             under_test.remove()
+
+
+@pytest.fixture
+def ssh_host(roost: Roost, session_env):
+    """A running session, reachable only over the fake `ssh`, saved as a
+    host, not yet connected."""
+    start_session(session_env)
+    with an_ssh_host(roost, session_env) as under_test:
+        yield under_test
+
+
+@pytest.fixture
+def narrow_ring_ssh_host(roost: Roost, session_env):
+    """The same, against a session whose replay ring holds two batches.
+
+    The ring is what a resume reaches back through, so a *refusal* needs
+    a gap wider than it — and three commits past a two-batch window is
+    a `replay-expired` by construction rather than by timing. The knob
+    is test-mode-only (`ROOST_SESSION_REPLAY_WINDOW`, plan 052 §3.6) and
+    `sessionlib` strips it from the daemon's environment, so it is
+    passed at this launch and nowhere else.
+    """
+    start_session(session_env, ROOST_SESSION_REPLAY_WINDOW="2")
+    with an_ssh_host(roost, session_env) as under_test:
+        yield under_test
 
 
 # ---------------------------------------------------------------------------
@@ -1183,6 +1218,168 @@ def test_quitting_during_a_scheduled_retry_leaves_no_ssh_children(
     # needs one alive, and `ROOST_SSH_BIN` reaches the replacement out of
     # the same environment the first launch read it from.
     ui.launch(target)
+
+
+# ---------------------------------------------------------------------------
+# 2b. Plan 056 R11 — the reconnect resumes, and the section never blanks
+# ---------------------------------------------------------------------------
+
+
+def watch_the_reconnect(host: HostUnderTest, timeout: float = 90.0) -> tuple[dict, list]:
+    """Poll until the host is connected **with its facts**, and hand back
+    every `(state, tabs)` the way there.
+
+    No sleep between reads and no `retry`-style filtering: the window
+    this exists to sample is one dial, one identify and one subscribe
+    wide, and R11's no-flicker claim is precisely about what the section
+    draws *inside* it. `tabs` is the row count the sidebar is rendering
+    (`host.status.tabs`), so a section that went briefly empty leaves a
+    zero in this list and nothing else does.
+    """
+    samples: list[tuple[str, int]] = []
+
+    def landed() -> dict | None:
+        row = status(host)
+        samples.append((row["state"], row["tabs"]))
+        if row["state"] != "connected" or row.get("connect") is None:
+            return None
+        return row
+
+    row = wait_until(landed, timeout, "the reconnect to land with its facts", interval=0.0)
+    return row, samples
+
+
+def test_a_dropped_link_resumes_the_stream_and_replays_the_gap(ssh_host, roost):
+    """AC (R11): the drop a remote transport really has, resumed.
+
+    The SIGKILL is the same one
+    [`test_killing_the_bridge_processes_auto_reconnects_and_restores_the_tab`]
+    uses — an unsolicited bare EOF, nothing asked for — and what plan 056
+    changes is what the ladder does when it gets back: it presents the
+    fence it left at instead of taking the whole workspace again.
+
+    Three claims, and each needs the others to mean anything:
+
+    * `resumed` says the session accepted the resume, and
+      `from_revision` says which fence it accepted — read off the
+      session's own `tab.list` *before* the drop, so a client reporting
+      its own request rather than the ack's echo fails here.
+    * the two tabs opened during the gap are in the section, and the
+      notification fired during the gap has its inbox row: the replay
+      carried them, because between the SIGKILL and the ack nothing else
+      could have.
+    * `tabs` never reads zero while the host is `connecting` — §3.3's
+      carried mirror, and the E2E twin of the `host_conn.rs` table.
+
+    The `unreachable` mode in front of the ladder is what makes the gap a
+    gap rather than a race: the first rungs cannot succeed, so every
+    commit below lands while the client is away, and `ok` goes back in
+    front of the *next* rung once they have. (That no `tab.list` went
+    out is the task-level unit table's assertion — `Fake.tab_lists == 0`;
+    what this lane can see is the verdict and the rows.)
+    """
+    connect_and_wait(ssh_host)
+    with ssh_host.client() as session:
+        project = first_project(session)
+        watched = quiet_tab(session, project, ssh_host.env.launch_cwd)
+        parked = quiet_tab(session, project, ssh_host.env.launch_cwd)
+        caught_up(ssh_host, session)
+        before = listed_host_tabs(roost, ssh_host.saved_id)
+        fence = session.call("tab.list")["revision"]
+
+        drop_the_link(ssh_host, "unreachable")
+
+        # The gap. Two tabs and one notification, committed while there
+        # is no client on the other end to hear them live. `watched` is
+        # not the session's own active row (the tabs below take that), so
+        # the notification is recorded rather than suppressed at source.
+        gap_a = quiet_tab(session, project, ssh_host.env.launch_cwd)
+        gap_b = quiet_tab(session, project, ssh_host.env.launch_cwd)
+        session.notify(watched, "attention", "please")
+        wait_until(
+            lambda: session.has_notification(watched),
+            15.0,
+            "the session to mark the tab during the gap",
+        )
+        configure_fake_ssh("ok")
+
+        row, samples = watch_the_reconnect(ssh_host)
+        facts = row["connect"]
+        assert facts["resumed"] is True, row
+        assert facts["from_revision"] == fence, (facts, fence)
+
+        # Summarized rather than dumped: the poll takes a couple of
+        # thousand samples, and what a failure needs is which states drew
+        # nothing, not every reading that did.
+        states = sorted({state for state, _ in samples})
+        blank = sorted({state for state, tabs in samples if tabs == 0})
+        assert not blank, (
+            f"the section listed no tabs while {blank} (over {len(samples)} samples, "
+            f"states {states}) — a reconnect must keep drawing the carried mirror (§3.3)"
+        )
+        assert "connecting" in states, (
+            f"never sampled the connecting window, so the no-flicker claim went "
+            f"unchecked: {states}"
+        )
+
+        wait_until(
+            lambda: listed_host_tabs(roost, ssh_host.saved_id)
+            == before | {gap_a, gap_b},
+            30.0,
+            "the replay to bring the gap's tabs into the section",
+        )
+        assert parked in listed_host_tabs(roost, ssh_host.saved_id)
+        wait_until(
+            lambda: any(
+                item.startswith("notif:h") and item.endswith(f".{watched}")
+                for item in inbox_ids(roost)
+            ),
+            30.0,
+            "the gap's notification to have an inbox row after the resume",
+        )
+
+
+def test_a_gap_wider_than_the_replay_ring_is_refused_and_re_snapshots(
+    narrow_ring_ssh_host, roost
+):
+    """AC (R11): a refusal is a fallback, never a failure.
+
+    The ring is bounded, so a client that was away long enough is going
+    to be told `replay-expired` — and the whole design rests on that
+    being ordinary: one `info` line, a fresh dial, `tab.list`, and a
+    connection nobody can tell from any other. Two batches of window
+    against three commits makes the refusal structural rather than a
+    matter of how long the test took.
+
+    `resumed` false is the verdict; `from_revision` absent is the shape
+    that goes with it (a fence the session never attested is not
+    reported as one); and the section holding exactly the session's tabs
+    is the proof that the fallback actually re-snapshotted rather than
+    coming back with a stale mirror it could not advance.
+    """
+    host = narrow_ring_ssh_host
+    connect_and_wait(host)
+    with host.client() as session:
+        project = first_project(session)
+        quiet_tab(session, project, host.env.launch_cwd)
+        caught_up(host, session)
+
+        drop_the_link(host, "unreachable")
+        for _ in range(3):
+            quiet_tab(session, project, host.env.launch_cwd)
+        configure_fake_ssh("ok")
+
+        row = wait_live_connect(host)
+        facts = row["connect"]
+        assert facts["resumed"] is False, row
+        assert "from_revision" not in facts, facts
+
+        served = {int(tab["id"]) for tab in session.tabs()}
+        wait_until(
+            lambda: listed_host_tabs(roost, host.saved_id) == served,
+            30.0,
+            "the fresh snapshot to restore the whole workspace",
+        )
 
 
 # ---------------------------------------------------------------------------

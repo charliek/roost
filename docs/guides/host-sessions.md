@@ -267,13 +267,21 @@ When the dot is showing, connecting again raises a dialog rather than a corrupte
 
 ### When a build skew connects instead: the `vt` fallback
 
-A skew against a plan-053-or-later session takes the other path. There is no dot and no dialog, so the one way to know you are on it is to ask:
+A skew against a plan-053-or-later session takes the other path, and it no longer connects silently. The dot stays green — this isn't a dot-level state — but the host band grows a `reduced fidelity` indicator the moment the connection is up, before you've attached to a single tab:
+
+> ‹label›  ●  reduced fidelity
+
+On a host reached over SSH or on `localhost`, that indicator is itself a button, and there's also a row under the band and a command-palette verb that open the same fix — see "Getting back to full fidelity" below. On a host reached over the fallback `ssh -L` forward (a Unix-socket target), the indicator and the row are plain text: Roost still can't reach in over a bare forwarded socket, so there's no button to press, only the manual steps below.
+
+The first time a tab actually attaches at reduced fidelity, a one-time status-bar message says so as well. And you can always ask directly:
 
 ```bash
-roostctl host status --id <id> --json   # look for "payload_kind": "vt"
+roostctl host status --id <id> --json
+# "connect": {"reduced_fidelity": true, ...}   -- known as soon as the connection is up
+# "payload_kind": "vt"                          -- known only once a tab has attached
 ```
 
-The field appears only once a tab on that host has actually attached — it reports what is being decoded, not what could be — and it goes away with the connection, so it can never claim a fallback you have since reconnected out of.
+`connect.reduced_fidelity` is what the band indicator and the update/restart offers key on, so it's there before any tab has attached. `payload_kind` reports what's actually being decoded, so it appears only once a tab on that host has attached — and both fields go away with the connection, so neither can claim a fallback you have since reconnected out of.
 
 **What the fallback does not carry.** These are real gaps in a screen that otherwise looks right, which is why they are worth knowing about rather than discovering:
 
@@ -285,12 +293,13 @@ The field appears only once a tab on that host has actually attached — it repo
 
 The [IPC reference](../reference/ipc.md#payload-kinds) has the complete list, including the mode-by-mode reasoning. Everything else — the tab list, titles, agent status, notifications, typing, resizing, scrollback — behaves exactly as it does on a matched build.
 
-**Getting back to full fidelity.** Restart the session with a `roost-session` that matches your Roost:
+**Getting back to full fidelity.** Restart the session with a `roost-session` that matches your Roost. On a host reached over SSH or `localhost`, the fastest way there is the indicator itself: click the `reduced fidelity` text on the band, the row underneath it, or run the matching command-palette verb (`host:update:<id>` over SSH, `host:restart:<id>` on `localhost`) — all three land on the same dialog.
 
-- **On localhost**: `roostctl session stop`, then Connect again from Roost — a localhost connect spawns the session for you, and the one it spawns is the build shipped alongside the app. (Or `roostctl session start` yourself first.)
-- **On a remote SSH host**: **there is no in-app path today.** The "Update `roost-session` on ‹label›" offer is raised only from the "needs restart" state — the state a `vt` fallback deliberately stops reaching — so a skewed remote host connects instead of offering to fix itself, and there is currently no way to ask for the update on demand. Until an on-demand action exists ([#447](https://github.com/charliek/roost/issues/447)), do it by hand: SSH to the host, update the `roost-session` binary there, `roostctl session stop && roostctl session start`, then Connect again from Roost. Stopping the session ends its shells, exactly as an in-app restart would have. If you would rather have Roost install the matching binary for you, `roostctl session stop` over SSH *first* and then Connect — with nothing listening, the connect falls into the ordinary bootstrap ladder, which does offer to install and start one, with its usual consent card.
+- **On localhost**, that dialog is a restart confirmation naming both build strings: *"Restart the session on ‹label›?…"*. Confirming disconnects the host, stops the stale session, waits for the socket to actually go, spawns a fresh `roost-session`, and reconnects — the same layout-survives contract as any other restart, so every tab reopens in its saved directory, but whatever was running inside it is gone. (Equivalently, by hand: `roostctl session stop`, then Connect again from Roost — a localhost connect spawns the session for you, and the one it spawns is the build shipped alongside the app. Or `roostctl session start` yourself first.)
+- **On a remote SSH host**, that dialog is the same bootstrap consent card the [not-found row](#troubleshooting) below uses, opened directly with the fidelity reason on it — no intermediate "needs a restart?" prompt. It names both build strings, installs the matching `roost-session` build only when the probed binary actually mismatches (a matching binary under a stale process is just stopped and restarted), and shows what it's about to do before anything is touched. Confirming disconnects the host, runs that plan, and reconnects at full fidelity.
+- **On a host reached over the fallback `ssh -L` forward** (a Unix-socket target), there is still no in-app offer — Roost can't reach in over a bare forwarded socket, so the indicator and the row are informational only. Do it by hand: SSH to the host, update the `roost-session` binary there, `roostctl session stop && roostctl session start`, then Connect again from Roost. If you would rather have Roost install the matching binary for you, `roostctl session stop` over SSH *first* and then Connect — with nothing listening, the connect falls into the ordinary bootstrap ladder, which does offer to install and start one, with its usual consent card.
 
-This is a deliberate trade: connecting at reduced fidelity beats refusing to connect, and the missing update button is the price it is currently charging.
+This is a deliberate trade: connecting at reduced fidelity beats refusing to connect, and until you act on the indicator, that's the price you're paying.
 
 ## macOS note
 

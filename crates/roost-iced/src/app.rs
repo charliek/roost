@@ -33,9 +33,10 @@ use roost_engine::{
 use roost_ipc::agent;
 use roost_ipc::messages::{
     AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
-    HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult,
-    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost, SidebarDumpHostProject,
-    SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
+    HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
+    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
+    SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
+    WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;
@@ -2196,17 +2197,25 @@ struct HostView {
     /// `HostSnapshot.id`, which is what a reconnect verb is addressed to.
     saved_id: String,
     label: String,
-    /// Whether this host's target is this machine's own session. Read
-    /// from the registry rather than from the connection, so it is known
-    /// for a host that has never connected — which is exactly when the
-    /// macOS gate has to decide whether to offer a Connect verb.
-    localhost: bool,
+    /// How this host is reached. Read from the registry rather than from
+    /// the connection, so it is known for a host that has never
+    /// connected — which is exactly when the macOS gate has to decide
+    /// whether to offer a Connect verb.
+    transport: host_sidebar::HostTransportKind,
     /// The incarnation these rows are keyed at. `HostId::LOCAL` stands
     /// for "no connection has ever published rows for this host" — the
     /// section is then header-only, and `projects` is empty, so the
     /// placeholder can never collide with a real local key.
     host: HostId,
     state: host_sidebar::SectionState,
+    /// Whether the live connection is serving the `vt` fallback across a
+    /// libghostty build skew (plan 056 §3.4).
+    ///
+    /// Cached here with the rest of the band's inputs so the sidebar and
+    /// the palette read one value: [`host_sidebar::fidelity_action`]
+    /// derives both the pill and the verbs from it, and a fact fetched
+    /// twice is a fact that can be fetched at two different moments.
+    reduced_fidelity: bool,
     /// The connection's own one-line reason for the state it is in, when
     /// it has one — an ssh failure, a transport drop. Folded into the
     /// band's rollup; `None` renders the bare word.
@@ -3941,6 +3950,12 @@ impl App {
         ]
         .spacing(chrome::HOST_BAND_SPACING)
         .align_y(Alignment::Center);
+        // Beside the rollup, never in it: an agent count and a fidelity
+        // warning are different facts and neither replaces the other.
+        // The dot beside them both stays green — this connection is up.
+        if let (Some(action), Some(saved_id)) = (section.fidelity, section.saved_id.as_deref()) {
+            band = band.push(self.host_fidelity_pill(saved_id, &section.label, action));
+        }
         if let Some(rollup) = &section.rollup {
             band = band.push(
                 text(rollup.as_str())
@@ -3949,6 +3964,58 @@ impl App {
             );
         }
         sidebar_band(band)
+    }
+
+    /// The band's `reduced fidelity` pill (plan 056 §3.4).
+    ///
+    /// A `BAND_PILL_PADDING_Y` button, so a band that gains one is the
+    /// same 32px band it was — the sidebar header, the tab strip and
+    /// this all sit on one seam, and a taller host band would break it.
+    /// It is deliberately *not* under the reorder strip: that wraps the
+    /// project rows only, so the press lands here rather than being read
+    /// as the start of a drag (#300).
+    fn host_fidelity_pill(
+        &self,
+        saved_id: &str,
+        label: &str,
+        action: host_sidebar::FidelityAction,
+    ) -> Element<'_, Message> {
+        let pill = text(host_notice::FIDELITY_PILL)
+            .size(chrome::HOST_ROLLUP_SIZE)
+            .color(chrome::HOST_FIDELITY_TEXT);
+        if !host_notice::fidelity_chrome(action, label).pressable {
+            return pill.into();
+        }
+        button(pill)
+            .padding([chrome::BAND_PILL_PADDING_Y, 6.0])
+            .style(chrome::transparent_button)
+            .on_press(Message::HostFidelityAction(saved_id.to_string()))
+            .into()
+    }
+
+    /// The inline row under a reduced-fidelity section, in the slot the
+    /// ↻ Reconnect row uses (plan 056 §3.4).
+    ///
+    /// The same offer as the pill above it, spelled out — the pill says
+    /// what is wrong and this says what pressing it would do, which is
+    /// why one function answers both.
+    fn host_fidelity_row(
+        &self,
+        saved_id: &str,
+        label: &str,
+        action: host_sidebar::FidelityAction,
+    ) -> Element<'_, Message> {
+        let offer = host_notice::fidelity_chrome(action, label);
+        let body = text(offer.row).size(12).color(chrome::HOST_FIDELITY_TEXT);
+        if !offer.pressable {
+            return container(body).width(Fill).padding([6, 12]).into();
+        }
+        button(body)
+            .width(Fill)
+            .padding([6, 12])
+            .style(chrome::transparent_button)
+            .on_press(Message::HostFidelityAction(saved_id.to_string()))
+            .into()
     }
 
     /// The inline "↻ Reconnect" row under a section that is not
@@ -4090,8 +4157,15 @@ impl App {
                     } else {
                         list.push(rows)
                     };
+                    // Exclusive by construction, and written as one
+                    // chain so it stays that way: `offers_reconnect` is
+                    // every state but `Connected`, and a fidelity is
+                    // only ever `Connected`'s. One slot, one row.
                     if section.state.offers_reconnect() {
                         list = list.push(self.host_reconnect_row(&view.saved_id));
+                    } else if let Some(action) = section.fidelity {
+                        list =
+                            list.push(self.host_fidelity_row(&view.saved_id, &view.label, action));
                     }
                 }
                 (None, scrollable(list).height(Fill).into())
@@ -5432,7 +5506,13 @@ impl App {
             self.set_status(format!("{label} is already restarting"));
             return;
         }
-        self.open_host_restart_dialog(saved_id, host_notice::restart_prompt(&label, &mismatch));
+        // No expected session: this host is one nothing can talk to,
+        // so there is none to name.
+        self.open_host_restart_dialog(
+            saved_id,
+            host_notice::restart_prompt(&label, &mismatch),
+            None,
+        );
     }
 
     /// Connect a saved host again, from the sidebar's inline ↻ row.
@@ -5510,7 +5590,17 @@ impl App {
                 saved_id: view.saved_id.as_str(),
                 label: view.label.as_str(),
                 state: view.state,
-                localhost: view.localhost,
+                transport: view.transport,
+                // The band's own derivation, from the band's own
+                // inputs: what the palette offers and what the pill
+                // offers are the same offer, and deriving them twice
+                // through one function is what keeps them from becoming
+                // two.
+                fidelity: host_sidebar::fidelity_action(
+                    view.reduced_fidelity,
+                    view.transport,
+                    view.state,
+                ),
             })
             .collect()
     }
@@ -5614,11 +5704,21 @@ impl App {
     }
 
     /// Open the upgrade prompt for a host whose compatibility gate
-    /// refused (plan 037 §3.7).
-    fn open_host_restart_dialog(&mut self, saved_id: &str, prompt: host_notice::RestartPrompt) {
+    /// refused (plan 037 §3.7), or the restart prompt for one this
+    /// client is attached to at reduced fidelity (plan 056 §3.6).
+    ///
+    /// `expected_session` is what separates them at confirm time; see
+    /// [`host_awaits_restart`].
+    fn open_host_restart_dialog(
+        &mut self,
+        saved_id: &str,
+        prompt: host_notice::RestartPrompt,
+        expected_session: Option<String>,
+    ) {
         self.open_host_dialog(host_dialog::HostDialog::ConfirmRestart {
             saved_id: saved_id.to_string(),
             prompt,
+            expected_session,
         });
     }
 
@@ -5773,44 +5873,57 @@ impl App {
         self.host_stop_requested(&saved_id);
     }
 
-    /// The upgrade prompt's confirm, before either branch acts on it.
+    /// A restart prompt's confirm, before either branch acts on it.
     ///
     /// **The state is re-read here, and that is the load-bearing part.**
     /// The dialog is modal to the pointer, not to the world: an IPC
     /// `host connect`, a launch-time retry, or another window's takeover
-    /// can move this host off `NeedsRestart` while the prompt is still on
-    /// screen. Acting then would reap a session that is healthy and
-    /// attached — every shell on it, for a mismatch that no longer
-    /// exists. So the question is asked again at the moment the answer is
-    /// acted on, and a host that moved on is told so instead — `undone`
-    /// naming what the branch that was about to run did not do.
+    /// can move this host out from under either prompt while it is still
+    /// on screen. Acting then would reap a session that is healthy and
+    /// attached — every shell on it — for a question that no longer
+    /// applies. So it is asked again at the moment the answer is acted
+    /// on, by [`host_awaits_restart`], and a host that moved on is told
+    /// so instead: `undone` names what the compatibility-gate branch did
+    /// not do, and the skew branch says what it did not change.
     ///
-    /// Answers with the host, its label, and whether the session over
-    /// there is the newer of the two, which only the remote branch has a
-    /// use for.
-    fn take_confirmed_restart_prompt(&mut self, undone: &str) -> Option<(String, String, bool)> {
-        let Some(host_dialog::HostDialog::ConfirmRestart { saved_id, .. }) =
-            self.host_dialog.take()
+    /// Answers with the host, its label, and which of the two questions
+    /// the prompt was asking.
+    fn take_confirmed_restart_prompt(
+        &mut self,
+        undone: &str,
+    ) -> Option<(String, String, RestartOrigin)> {
+        let Some(host_dialog::HostDialog::ConfirmRestart {
+            saved_id,
+            expected_session,
+            ..
+        }) = self.host_dialog.take()
         else {
             return None;
         };
         let label = self
             .host_label(&saved_id)
             .unwrap_or_else(|| saved_id.clone());
-        let Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) =
-            self.hosts.state(&saved_id)
-        else {
+        let Some(origin) = host_awaits_restart(
+            self.hosts.state(&saved_id),
+            self.hosts.facts(&saved_id),
+            expected_session.as_deref(),
+        ) else {
             tracing::info!(
                 host = %saved_id,
-                "restart abandoned: the host left NeedsRestart while the prompt was up"
+                skew = expected_session.is_some(),
+                "restart abandoned: the host moved on while the prompt was up"
             );
-            self.set_status(format!(
-                "{label} is no longer waiting for a restart — nothing was {undone}"
-            ));
+            self.set_status(match expected_session {
+                Some(_) => {
+                    format!("{label} is no longer at reduced fidelity — nothing was changed.")
+                }
+                None => {
+                    format!("{label} is no longer waiting for a restart — nothing was {undone}")
+                }
+            });
             return None;
         };
-        let session_is_newer = host_notice::session_is_newer(mismatch);
-        Some((saved_id, label, session_is_newer))
+        Some((saved_id, label, origin))
     }
 
     /// "Restart session" — the client-side composition, step by step
@@ -5834,7 +5947,7 @@ impl App {
     /// load-bearing part; `undone` is what a host that moved on is told
     /// did not happen.
     pub fn host_restart_confirmed(&mut self) -> UiTask {
-        let Some((saved_id, label, _)) = self.take_confirmed_restart_prompt("stopped") else {
+        let Some((saved_id, label, origin)) = self.take_confirmed_restart_prompt("stopped") else {
             return UiTask::None;
         };
         let Some((socket, localhost)) = self.hosts.endpoint(&saved_id) else {
@@ -5853,6 +5966,11 @@ impl App {
             tracing::debug!(host = %saved_id, "a restart is already running for this host");
             self.set_status(format!("{label} is already restarting"));
             return UiTask::None;
+        }
+        // The ladder owns the session from here; the stream under it
+        // goes first (see [`RestartOrigin::holds_a_live_stream`]).
+        if origin.holds_a_live_stream() {
+            self.host_disconnect_requested(&saved_id);
         }
         tracing::info!(host = %saved_id, socket = %socket.display(), "restarting a host session");
         self.set_status(format!("restarting the session on {label}…"));
@@ -5892,63 +6010,13 @@ impl App {
     // are the seam, gated on `ROOST_TEST_MODE=1` at the servicing edge
     // and never a production surface.
 
-    /// What the host modal on screen is saying.
-    ///
-    /// Reads the same values the widgets do, one per arm, so the dump
-    /// and the card cannot disagree about the copy — the four titles and
-    /// bodies come from the very fields `host_dialog_modal` renders,
-    /// and the shared literals are named constants for exactly that
-    /// reason.
+    /// What the host modal on screen is saying — [`dialog_shape`], plus
+    /// the empty answer for no modal at all.
     pub(crate) fn dialog_dump(&self) -> roost_ipc::messages::AppDialogDumpResult {
-        use roost_ipc::messages::AppDialogDumpResult;
-
-        let Some(dialog) = self.host_dialog.as_ref() else {
-            return AppDialogDumpResult::default();
-        };
-        let (kind, variant, title, body, buttons, host) = match dialog {
-            host_dialog::HostDialog::Add(draft) => (
-                "add",
-                None,
-                ADD_HOST_TITLE.to_string(),
-                ADD_HOST_BODY.to_string(),
-                vec!["Cancel".to_string(), draft.confirm_label().to_string()],
-                None,
-            ),
-            host_dialog::HostDialog::ConfirmStop { saved_id, label } => (
-                "confirm_stop",
-                None,
-                stop_session_title(label),
-                STOP_SESSION_BODY.to_string(),
-                vec!["Cancel".to_string(), STOP_SESSION_CONFIRM.to_string()],
-                Some(saved_id.clone()),
-            ),
-            host_dialog::HostDialog::ConfirmRestart { saved_id, prompt } => (
-                "confirm_restart",
-                None,
-                prompt.title.clone(),
-                prompt.body.clone(),
-                std::iter::once(prompt.dismiss_label().to_string())
-                    .chain(prompt.confirm.clone())
-                    .collect(),
-                Some(saved_id.clone()),
-            ),
-            host_dialog::HostDialog::Bootstrap(draft) => (
-                "bootstrap",
-                Some(draft.plan.variant.wire_name()),
-                draft.copy.title.clone(),
-                draft.copy.body.clone(),
-                vec!["Cancel".to_string(), draft.copy.confirm.to_string()],
-                Some(draft.saved_id.clone()),
-            ),
-        };
-        AppDialogDumpResult {
-            dialog: Some(kind.to_string()),
-            variant: variant.map(str::to_string),
-            title,
-            body,
-            buttons,
-            host,
-        }
+        self.host_dialog
+            .as_ref()
+            .map(dialog_shape)
+            .unwrap_or_default()
     }
 
     /// Press the visible host modal's primary button, or dismiss it.
@@ -6033,20 +6101,86 @@ impl App {
     /// the pointer, not to the world, and a host that reconnected
     /// underneath it has nothing left to update.
     fn host_remote_update_requested(&mut self) {
-        let Some((saved_id, _, session_is_newer)) = self.take_confirmed_restart_prompt("changed")
-        else {
+        let Some((saved_id, _, origin)) = self.take_confirmed_restart_prompt("changed") else {
             return;
         };
         self.start_bootstrap_probe(
             &saved_id,
             bootstrap::OfferContext {
                 session: bootstrap::SessionState::Running,
-                session_is_newer,
+                session_is_newer: origin.session_is_newer(),
                 // A running session, not a failed connect — there is no
                 // family to still agree with when this is confirmed.
                 failure: None,
+                // The compatibility gate's own route: nothing is
+                // serving this client, so there is no live session to
+                // name and no reason line to lead with.
+                fidelity: None,
             },
         );
+    }
+
+    /// `reduced fidelity` was pressed — on the band pill, on the inline
+    /// row, or as a palette verb (plan 056 §3.6).
+    ///
+    /// One entry for all three, so what a press does is decided once.
+    /// The transport decides which card: ssh can be updated from here
+    /// and gets the consent card with the reason on it, this machine's
+    /// own session gets the restart card, and a socket target gets
+    /// nothing at all — the verb is never listed and the pill is inert
+    /// text, because somebody else's process is not ours to restart.
+    ///
+    /// The two refusals ahead of that are this entry's own, and
+    /// [`FidelityRefusal`] is where they and their order are decided.
+    pub fn host_fidelity_action_requested(&mut self, saved_id: &str) {
+        let Ok(host) = self.saved_host(saved_id) else {
+            return;
+        };
+        if let Some(refusal) = FidelityRefusal::of(
+            self.host_dialog.is_some(),
+            self.bootstraps.probing(saved_id),
+        ) {
+            self.set_status(refusal.message(&host.label));
+            return;
+        }
+        // Re-read rather than trusted from the row: `palette.activate`
+        // reaches this over the IPC socket, and a row composed a frame
+        // ago can name a host that has since reconnected at full
+        // fidelity.
+        if !self.hosts.reduced_fidelity(saved_id) {
+            tracing::debug!(host = %saved_id, "fidelity action for a host that is not reduced");
+            return;
+        }
+        let Some((session_id, skew)) = self
+            .hosts
+            .facts(saved_id)
+            .map(|facts| (facts.session_id.clone(), facts.skew.clone()))
+        else {
+            return;
+        };
+        match servicing::transport_kind(&host.target) {
+            host_sidebar::HostTransportKind::Ssh => self.start_bootstrap_probe(
+                saved_id,
+                bootstrap::OfferContext {
+                    // The session is up and attached — that is the
+                    // whole complaint — so the plan stops it.
+                    session: bootstrap::SessionState::Running,
+                    // A servable skew implies the protocols agree, and
+                    // two build strings do not order.
+                    session_is_newer: false,
+                    failure: None,
+                    fidelity: Some(bootstrap::FidelityOffer { session_id, skew }),
+                },
+            ),
+            host_sidebar::HostTransportKind::Localhost => {
+                let prompt = host_notice::restart_prompt_for_skew(&host.label, &skew);
+                self.open_host_restart_dialog(saved_id, prompt, Some(session_id));
+                self.reconcile();
+            }
+            host_sidebar::HostTransportKind::Socket => {
+                tracing::debug!(host = %saved_id, "a socket target's session is not ours to restart");
+            }
+        }
     }
 
     /// A user-driven connect failed; raise the offer if there is one.
@@ -6132,7 +6266,7 @@ impl App {
                 bootstrap::BootstrapEvent::Probed {
                     request,
                     offer,
-                    result,
+                    result: Box::new(result),
                 },
             )));
         });
@@ -6154,7 +6288,7 @@ impl App {
                 request,
                 offer,
                 result,
-            } => self.host_bootstrap_probed(request, offer, result),
+            } => self.host_bootstrap_probed(request, offer, *result),
             bootstrap::BootstrapEvent::Finished { request, result } => {
                 self.host_bootstrap_finished(request, result)
             }
@@ -6229,11 +6363,18 @@ impl App {
                 );
                 // Said as the entry point knew it, because the plan the
                 // card would have carried is not composed on this path.
-                let note = match offer.session {
-                    bootstrap::SessionState::Running => {
+                // The fidelity entry is the one whose host is already
+                // connected, so "connect again" would be a pointer at
+                // nothing.
+                let note = match (&offer.fidelity, offer.session) {
+                    (Some(_), _) => format!(
+                        "{label} is busy with another setup step; try Update again when it \
+                         finishes."
+                    ),
+                    (None, bootstrap::SessionState::Running) => {
                         format!("roost-session on {label} can be updated — connect again")
                     }
-                    bootstrap::SessionState::NoSession => {
+                    (None, bootstrap::SessionState::NoSession) => {
                         format!("{label} needs roost-session set up — connect again")
                     }
                 };
@@ -6274,6 +6415,7 @@ impl App {
             source: &source,
             plan: &plan,
             session_is_newer: offer.session_is_newer,
+            fidelity: offer.fidelity.as_ref().map(|opened| &opened.skew),
         });
         self.open_host_dialog(host_dialog::HostDialog::Bootstrap(
             bootstrap::BootstrapDraft {
@@ -6303,6 +6445,15 @@ impl App {
             Some(crate::host_conn::HostConnState::NeedsRestart(_)) => {
                 bootstrap::LiveState::NeedsRestart
             }
+            // A connection at full fidelity is `Other` exactly as it was
+            // before: there is nothing to offer and a `Running` plan
+            // would reap it.
+            Some(crate::host_conn::HostConnState::Connected) => match self.hosts.facts(saved_id) {
+                Some(facts) if facts.reduced_fidelity => bootstrap::LiveState::ConnectedReduced {
+                    session_id: facts.session_id.clone(),
+                },
+                _ => bootstrap::LiveState::Other,
+            },
             None | Some(crate::host_conn::HostConnState::Disconnected(_)) => {
                 bootstrap::LiveState::Cold {
                     qualifies: self.hosts.ssh_origin(saved_id).map(|origin| {
@@ -6359,7 +6510,7 @@ impl App {
             }
         };
         let live = self.live_bootstrap_state(&draft.saved_id);
-        if !bootstrap::offer_still_stands(draft.offer.session, live) {
+        if !bootstrap::offer_still_stands(&draft.offer, &live) {
             tracing::info!(
                 host = %draft.saved_id,
                 ?live,
@@ -6378,6 +6529,11 @@ impl App {
             tracing::debug!(claim = %draft.claim, "a bootstrap is already running for this target");
             self.set_status(format!("{} is already being set up", host.label));
             return;
+        }
+        // The job owns the session from here; the stream under it goes
+        // first (see [`bootstrap::LiveState::holds_a_live_stream`]).
+        if live.holds_a_live_stream() {
+            self.host_disconnect_requested(&draft.saved_id);
         }
         tracing::info!(
             host = %draft.saved_id,
@@ -6613,6 +6769,9 @@ impl App {
                             session,
                             session_is_newer: false,
                             failure: family,
+                            // The dialog verified and never connected;
+                            // there is no live session to be reduced.
+                            fidelity: None,
                         },
                     );
                 }
@@ -6795,6 +6954,180 @@ impl App {
     }
 }
 
+/// Which question a confirmed restart prompt was asking — the two
+/// arms of `HostDialog::ConfirmRestart`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestartOrigin {
+    /// The compatibility gate refused: nothing this client can talk to
+    /// is serving over there (plan 037 §3.7).
+    Mismatch(crate::host_conn::state::BuildMismatch),
+    /// A live session, attached across a libghostty build skew (plan
+    /// 056 §3.6).
+    Skew,
+}
+
+impl RestartOrigin {
+    /// Whether the session over there is the newer of the two — a
+    /// downgrade warning the remote branch carries onto its card.
+    /// `false` for a skew, for [`App::host_fidelity_action_requested`]'s
+    /// reason.
+    fn session_is_newer(&self) -> bool {
+        match self {
+            Self::Mismatch(mismatch) => host_notice::session_is_newer(mismatch),
+            Self::Skew => false,
+        }
+    }
+
+    /// [`bootstrap::LiveState::holds_a_live_stream`]'s question, asked
+    /// of the restart ladder's own two arms.
+    fn holds_a_live_stream(&self) -> bool {
+        match self {
+            Self::Skew => true,
+            Self::Mismatch(_) => false,
+        }
+    }
+}
+
+/// What a press on `reduced fidelity` runs into before it can ask
+/// anything, if anything.
+///
+/// [`bootstrap::Landed`]'s shape, for its reason: the refusals are a
+/// ladder with an order, and the copy for each is the part that has to
+/// be right. Both are things [`App::start_bootstrap_probe`] answers by
+/// returning silently — it is reached from a *connect failure*, where
+/// nothing was pressed — and a press that appears to do nothing is the
+/// one outcome a button must never have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FidelityRefusal {
+    /// A modal owns the pointer and the keyboard. Checked first: the
+    /// localhost card would not merely be silent, it would *replace*
+    /// the open one, and Enter routes to whichever is visible.
+    DialogOpen,
+    /// A probe for this host is already out. A second card for one host
+    /// is what pressing twice would otherwise make.
+    Probing,
+}
+
+impl FidelityRefusal {
+    fn of(dialog_open: bool, probing: bool) -> Option<Self> {
+        if dialog_open {
+            Some(Self::DialogOpen)
+        } else if probing {
+            Some(Self::Probing)
+        } else {
+            None
+        }
+    }
+
+    /// What the press is told. Each names the thing in the way and what
+    /// the user does about it, because "nothing happened" is what these
+    /// exist to replace.
+    fn message(self, label: &str) -> String {
+        match self {
+            Self::DialogOpen => "Close the open dialog, then try Update again.".to_string(),
+            Self::Probing => format!("{label} is still being checked."),
+        }
+    }
+}
+
+/// Whether a host is still one the open restart prompt can act on.
+///
+/// The prompt is modal to the pointer, not to the world, and both arms
+/// have a window in which the far side moves underneath them. What
+/// closes that window is different for each, and the difference is
+/// `expected`:
+///
+/// * The **compatibility-gate** arm names no session — nothing this
+///   client can talk to is serving — so "is it still refusing" is the
+///   whole question, and a host that reconnected has nothing left to
+///   restart.
+/// * The **skew** arm names one, because it is raised at a session this
+///   client is attached to and confirming *stops it*. Being reduced
+///   again is not enough: a host that dropped and came back is a
+///   different session behind the same saved id, running shells nobody
+///   read a word about.
+///
+/// So the two never answer each other's host: a prompt that named a
+/// session is refused everywhere but that session, and one that named
+/// none is refused on any live session at all.
+fn host_awaits_restart(
+    state: Option<&crate::host_conn::HostConnState>,
+    facts: Option<&crate::host_conn::state::ConnectFacts>,
+    expected: Option<&str>,
+) -> Option<RestartOrigin> {
+    match state? {
+        crate::host_conn::HostConnState::NeedsRestart(mismatch) if expected.is_none() => {
+            Some(RestartOrigin::Mismatch(mismatch.clone()))
+        }
+        crate::host_conn::HostConnState::Connected => {
+            let facts = facts?;
+            (facts.reduced_fidelity && expected == Some(facts.session_id.as_str()))
+                .then_some(RestartOrigin::Skew)
+        }
+        _ => None,
+    }
+}
+
+/// What a host modal says, as `app.dialog_dump` reports it.
+///
+/// Reads the same values the widgets do, one per arm, so the dump and
+/// the card cannot disagree about the copy — the four titles and bodies
+/// come from the very fields `host_dialog_modal` renders, and the
+/// shared literals are named constants for exactly that reason.
+///
+/// Free rather than a method so the four arms are testable without an
+/// `App`: the dump is `tools/roosttest/`'s only view of a card, and a
+/// card whose body lost its reason line would otherwise be caught by an
+/// E2E or by nothing.
+fn dialog_shape(dialog: &host_dialog::HostDialog) -> roost_ipc::messages::AppDialogDumpResult {
+    let (kind, variant, title, body, buttons, host) = match dialog {
+        host_dialog::HostDialog::Add(draft) => (
+            "add",
+            None,
+            ADD_HOST_TITLE.to_string(),
+            ADD_HOST_BODY.to_string(),
+            vec!["Cancel".to_string(), draft.confirm_label().to_string()],
+            None,
+        ),
+        host_dialog::HostDialog::ConfirmStop { saved_id, label } => (
+            "confirm_stop",
+            None,
+            stop_session_title(label),
+            STOP_SESSION_BODY.to_string(),
+            vec!["Cancel".to_string(), STOP_SESSION_CONFIRM.to_string()],
+            Some(saved_id.clone()),
+        ),
+        host_dialog::HostDialog::ConfirmRestart {
+            saved_id, prompt, ..
+        } => (
+            "confirm_restart",
+            None,
+            prompt.title.clone(),
+            prompt.body.clone(),
+            std::iter::once(prompt.dismiss_label().to_string())
+                .chain(prompt.confirm.clone())
+                .collect(),
+            Some(saved_id.clone()),
+        ),
+        host_dialog::HostDialog::Bootstrap(draft) => (
+            "bootstrap",
+            Some(draft.plan.variant.wire_name()),
+            draft.copy.title.clone(),
+            draft.copy.body.clone(),
+            vec!["Cancel".to_string(), draft.copy.confirm.to_string()],
+            Some(draft.saved_id.clone()),
+        ),
+    };
+    roost_ipc::messages::AppDialogDumpResult {
+        dialog: Some(kind.to_string()),
+        variant: variant.map(str::to_string),
+        title,
+        body,
+        buttons,
+        host,
+    }
+}
+
 fn canonical_pointer_shape(name: &str) -> &str {
     match name {
         "default" | "pointer" | "text" | "crosshair" | "grab" | "grabbing" | "not-allowed"
@@ -6941,6 +7274,7 @@ impl Message {
             Self::HostFrameReconnect { saved_id, frame } => {
                 app.host_frame_reconnect_requested(&saved_id, frame)
             }
+            Self::HostFidelityAction(saved_id) => app.host_fidelity_action_requested(&saved_id),
             Self::AddHostNameChanged(value) => app.add_host_name_changed(value),
             Self::AddHostSocketChanged(value) => app.add_host_socket_changed(value),
             Self::AddHostSubmit => return app.submit_add_host(),
@@ -8682,5 +9016,256 @@ mod tests {
             !persisted,
             "failed live application cannot reach persistence"
         );
+    }
+
+    // ── the reduced-fidelity route (plan 056 §3.6) ──────────────────
+
+    fn skew() -> crate::host_conn::state::Skew {
+        crate::host_conn::state::Skew {
+            session_build: "gb-old".into(),
+            client_build: "gb-new".into(),
+        }
+    }
+
+    fn facts(session_id: &str, reduced_fidelity: bool) -> crate::host_conn::state::ConnectFacts {
+        crate::host_conn::state::ConnectFacts {
+            session_id: session_id.to_string(),
+            skew: skew(),
+            reduced_fidelity,
+            supports_resume: true,
+            resumed: None,
+        }
+    }
+
+    fn build_mismatch() -> crate::host_conn::state::BuildMismatch {
+        crate::host_conn::state::BuildMismatch {
+            kind: crate::host_conn::state::MismatchKind::Build,
+            session_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+            client_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+            session_build: "gb-old".into(),
+            client_build: "gb-new".into(),
+            session_payload_kinds: vec!["cells".into()],
+            restart: crate::host_conn::state::RestartAction::RestartLocal,
+        }
+    }
+
+    /// The restart gate, both arms and every way the far side can have
+    /// moved under either.
+    ///
+    /// The row with teeth is the id mismatch: a localhost host that
+    /// dropped and came back at reduced fidelity looks *identical* to
+    /// the one the card was opened about, and confirming would stop a
+    /// session whose shells nobody read a word about. Only the session
+    /// id separates them.
+    #[test]
+    fn a_restart_prompt_acts_only_on_the_host_it_was_opened_about() {
+        use crate::host_conn::state::Disconnected;
+        use crate::host_conn::HostConnState;
+
+        let needs_restart = HostConnState::NeedsRestart(build_mismatch());
+        let reduced = facts("s-1", true);
+
+        // The compatibility-gate arm names no session, and answers only
+        // for a host that is still refusing.
+        assert_eq!(
+            host_awaits_restart(Some(&needs_restart), None, None),
+            Some(RestartOrigin::Mismatch(build_mismatch()))
+        );
+        assert_eq!(
+            host_awaits_restart(None, None, None),
+            None,
+            "a host with no connection at all has nothing to restart"
+        );
+        assert_eq!(
+            host_awaits_restart(Some(&HostConnState::Connected), Some(&reduced), None),
+            None,
+            "a prompt that named no session does not act on one that came up under it"
+        );
+
+        // The skew arm names one, and answers only for that one.
+        assert_eq!(
+            host_awaits_restart(Some(&HostConnState::Connected), Some(&reduced), Some("s-1")),
+            Some(RestartOrigin::Skew)
+        );
+        assert_eq!(
+            host_awaits_restart(
+                Some(&HostConnState::Connected),
+                Some(&facts("s-2", true)),
+                Some("s-1")
+            ),
+            None,
+            "a second reduced-fidelity session behind the same host is not the one on the card"
+        );
+        assert_eq!(
+            host_awaits_restart(
+                Some(&HostConnState::Connected),
+                Some(&facts("s-1", false)),
+                Some("s-1")
+            ),
+            None,
+            "the same session, reconnected at full fidelity, has nothing to restart for"
+        );
+        assert_eq!(
+            host_awaits_restart(Some(&HostConnState::Connected), None, Some("s-1")),
+            None,
+            "a connection with no facts published yet names no session either"
+        );
+        assert_eq!(
+            host_awaits_restart(Some(&needs_restart), None, Some("s-1")),
+            None,
+            "NeedsRestart names no session, so a card that named one cannot act on it"
+        );
+
+        // And no other state answers either arm, however the facts read.
+        for state in [
+            HostConnState::Connecting { previous: None },
+            HostConnState::TakenOver { taken_by: None },
+            HostConnState::Stopped,
+            HostConnState::Disconnected(Disconnected {
+                reason: "session ended".into(),
+                detail: None,
+                retry_in: None,
+            }),
+        ] {
+            for expected in [None, Some("s-1")] {
+                assert_eq!(
+                    host_awaits_restart(Some(&state), Some(&reduced), expected),
+                    None,
+                    "{state:?} / {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// The restart ladder's half of "which confirm tears a stream down
+    /// first" — [`bootstrap::LiveState::holds_a_live_stream`] is the
+    /// other, and the two have to agree because they are the same
+    /// question about the same two entry points.
+    #[test]
+    fn only_the_skew_arm_restarts_a_session_this_client_is_attached_to() {
+        assert!(RestartOrigin::Skew.holds_a_live_stream());
+        assert!(
+            !RestartOrigin::Mismatch(build_mismatch()).holds_a_live_stream(),
+            "the compatibility gate refused; nothing is attached to tear down"
+        );
+
+        assert!(
+            !RestartOrigin::Skew.session_is_newer(),
+            "a servable skew claims no direction"
+        );
+    }
+
+    /// Both refusals a fidelity press can hit, in the order they are
+    /// asked and with the copy each is answered with.
+    ///
+    /// They exist because `start_bootstrap_probe` returns *silently*
+    /// for both, and a pressed button that appears to do nothing is
+    /// exactly what this route must not ship. The order matters: a
+    /// modal is checked first, because the localhost card would replace
+    /// it rather than merely be swallowed.
+    #[test]
+    fn a_fidelity_press_always_says_why_it_could_not_ask() {
+        assert_eq!(FidelityRefusal::of(false, false), None);
+        assert_eq!(
+            FidelityRefusal::of(true, false),
+            Some(FidelityRefusal::DialogOpen)
+        );
+        assert_eq!(
+            FidelityRefusal::of(false, true),
+            Some(FidelityRefusal::Probing)
+        );
+        assert_eq!(
+            FidelityRefusal::of(true, true),
+            Some(FidelityRefusal::DialogOpen),
+            "the modal is the thing in the way; the probe is behind it"
+        );
+
+        assert_eq!(
+            FidelityRefusal::DialogOpen.message("pop-os"),
+            "Close the open dialog, then try Update again."
+        );
+        assert_eq!(
+            FidelityRefusal::Probing.message("pop-os"),
+            "pop-os is still being checked."
+        );
+    }
+
+    /// What the harness sees of the two cards this route opens.
+    ///
+    /// `dialog_dump` is `tools/roosttest/`'s only view of a modal, so a
+    /// card whose reason line went missing would be caught here or by
+    /// nothing. Composed through the production halves — `plan_bootstrap`
+    /// then `bootstrap_copy`, `restart_prompt_for_skew` — so the dump
+    /// and the widget cannot disagree.
+    #[test]
+    fn both_fidelity_cards_dump_the_reason_they_were_opened_for() {
+        // ssh: the consent card, at the variant a matching binary under
+        // a skewed session plans.
+        let plan = bootstrap::plan_bootstrap(
+            &roost_ipc::bootstrap::ProbeOutcome::Compatible {
+                path: "/usr/bin/roost-session".into(),
+            },
+            bootstrap::SessionState::Running,
+        );
+        let copy = bootstrap::bootstrap_copy(bootstrap::CopyInputs {
+            label: "pop-os",
+            identity: &bootstrap::client_identity(),
+            dest: &bootstrap::card_dest(&plan),
+            dest_on_disk: &bootstrap::dest_on_disk(&plan, "/home/u"),
+            source: "",
+            plan: &plan,
+            session_is_newer: false,
+            fidelity: Some(&skew()),
+        });
+        let card = dialog_shape(&host_dialog::HostDialog::Bootstrap(
+            bootstrap::BootstrapDraft {
+                saved_id: "h1".into(),
+                label: "pop-os".into(),
+                token: "tok".into(),
+                claim: "claim".into(),
+                arch: roost_ipc::bootstrap::RemoteArch::Amd64,
+                plan,
+                copy,
+                offer: bootstrap::OfferContext {
+                    session: bootstrap::SessionState::Running,
+                    session_is_newer: false,
+                    failure: None,
+                    fidelity: Some(bootstrap::FidelityOffer {
+                        session_id: "s-1".into(),
+                        skew: skew(),
+                    }),
+                },
+            },
+        ));
+        assert_eq!(card.dialog.as_deref(), Some("bootstrap"));
+        assert_eq!(card.variant.as_deref(), Some("update"));
+        assert_eq!(card.host.as_deref(), Some("h1"));
+        assert!(card.title.starts_with("Update roost-session on pop-os"));
+        assert!(
+            card.body.contains("gb-old") && card.body.contains("gb-new"),
+            "both builds reach the harness: {card:?}"
+        );
+        assert!(card.body.contains("reduced fidelity"), "{card:?}");
+        assert_eq!(card.buttons, vec!["Cancel", "Update"]);
+
+        // localhost: the restart card.
+        let restart = dialog_shape(&host_dialog::HostDialog::ConfirmRestart {
+            saved_id: "h2".into(),
+            prompt: host_notice::restart_prompt_for_skew("localhost", &skew()),
+            expected_session: Some("s-1".into()),
+        });
+        assert_eq!(restart.dialog.as_deref(), Some("confirm_restart"));
+        assert_eq!(restart.variant, None);
+        assert_eq!(restart.host.as_deref(), Some("h2"));
+        assert_eq!(restart.title, "Restart the session on localhost?");
+        assert!(
+            restart.body.contains("gb-old") && restart.body.contains("gb-new"),
+            "{restart:?}"
+        );
+        assert!(
+            restart.body.contains("Running programs end."),
+            "{restart:?}"
+        );
+        assert_eq!(restart.buttons, vec!["Not now", "Restart session"]);
     }
 }

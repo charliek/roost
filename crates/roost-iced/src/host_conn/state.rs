@@ -194,6 +194,91 @@ pub(crate) fn check_compatibility(
     Ok(Compatibility::Exact)
 }
 
+/// The `session.identify` feature that says a session can replay events
+/// from a revision (`events.subscribe {from_revision}`, plan 052 R5).
+/// A session that does not list it rejects the field outright, so the
+/// client has to ask before it offers.
+const EVENTS_RESUME: &str = "events_resume";
+
+/// What one connect attempt learned about the session it reached.
+///
+/// Facts, not state: they are established during the prologue, published
+/// once per incarnation, and read by surfaces that render or report
+/// rather than by anything that transitions. They ride beside
+/// [`HostConnState`] instead of on it precisely because a state carries
+/// what the machine acts on — putting a payload on `Connected` would
+/// ripple through every `match` and every exhaustive table for a value
+/// no transition depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectFacts {
+    /// The session's own id, from `session.identify`. It is what binds a
+    /// later decision — a resume, a consent card — to the session the
+    /// facts describe rather than to whatever is behind the host now.
+    pub(crate) session_id: String,
+    /// The two libghostty builds. Filled on every connection, skewed or
+    /// not, and only *read* when [`Self::reduced_fidelity`] is set: the
+    /// reason lines print the pair, and a pair assembled later would
+    /// have to re-identify to get it.
+    pub(crate) skew: Skew,
+    /// The connection is on the build-independent `vt` fallback: links,
+    /// the inactive screen and soft-wrap flags are gone until the
+    /// session runs a matching build.
+    ///
+    /// Known at the identify gate, which is why every state-like
+    /// surface keys on it rather than on the negotiated payload kind —
+    /// that one is `None` until a tab attaches, so a skewed host nobody
+    /// has clicked into would show nothing.
+    pub(crate) reduced_fidelity: bool,
+    /// The session advertises [`EVENTS_RESUME`].
+    pub(crate) supports_resume: bool,
+    /// How this attempt's prologue actually subscribed: `Some` when it
+    /// replayed from a carried fence, `None` when it took a fresh
+    /// snapshot.
+    pub(crate) resumed: Option<ResumeFacts>,
+}
+
+/// The two libghostty builds a reduced-fidelity connection sits between.
+///
+/// Kept verbatim rather than reduced to a verdict for the same reason
+/// [`BuildMismatch`] keeps them: a person reading "this session is at
+/// reduced fidelity" wants to see which two builds disagreed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Skew {
+    pub(crate) session_build: String,
+    pub(crate) client_build: String,
+}
+
+/// What a resumed prologue replayed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResumeFacts {
+    /// The subscribe **ack's** revision — server-attested, not the fence
+    /// the client asked from.
+    pub(crate) from_revision: u64,
+}
+
+impl ConnectFacts {
+    /// Everything the identify gate already established, kept.
+    ///
+    /// `resumed` is the prologue's to fill once it knows how it
+    /// subscribed.
+    pub(crate) fn new(
+        identity: &SessionIdentify,
+        client_build: &str,
+        compatibility: Compatibility,
+    ) -> Self {
+        Self {
+            session_id: identity.session_id.clone(),
+            skew: Skew {
+                session_build: identity.libghostty_build.clone(),
+                client_build: client_build.to_string(),
+            },
+            reduced_fidelity: compatibility == Compatibility::BuildSkew,
+            supports_resume: identity.features.iter().any(|f| f == EVENTS_RESUME),
+            resumed: None,
+        }
+    }
+}
+
 /// Why a host is showing as disconnected, and whether anything is
 /// scheduled.
 ///
@@ -254,6 +339,38 @@ pub(crate) enum HostConnState {
 impl HostConnState {
     pub(crate) fn is_connected(&self) -> bool {
         matches!(self, HostConnState::Connected)
+    }
+
+    /// Whether this connection's prologue got all the way to a session.
+    ///
+    /// An observer settlement reached one just as surely — it answered
+    /// the same identify and holds the same stream — even though
+    /// `TakenOver` projects as not-connected everywhere else (plan 049
+    /// §3.11). Readers that care about *having reached* the session ask
+    /// this; readers that care about *driving* it ask
+    /// [`Self::is_connected`].
+    pub(crate) fn reached_session(&self) -> bool {
+        self.is_connected() || matches!(self, HostConnState::TakenOver { .. })
+    }
+
+    /// Whether this state says the *session* is gone or cannot be talked
+    /// to — as opposed to the wire to it, which is what an ordinary
+    /// `Disconnected` and every `Connecting` describe.
+    ///
+    /// It stopped, it needs a restart before this client can speak to
+    /// it, or no retry will ever produce one ([`HostStateMachine::settled`], the
+    /// only writer of a `Disconnected`'s `detail`). What it gates is
+    /// anything held *about the session across connections*: a resume
+    /// point offered to a session that restarted names a history that
+    /// no longer exists, and revisions restart at zero in every process.
+    pub(crate) fn session_is_gone(&self) -> bool {
+        match self {
+            HostConnState::Stopped | HostConnState::NeedsRestart(_) => true,
+            HostConnState::Disconnected(disconnected) => disconnected.detail.is_some(),
+            HostConnState::Connecting { .. }
+            | HostConnState::Connected
+            | HostConnState::TakenOver { .. } => false,
+        }
     }
 
     /// How this state reads in the sidebar's host band (plan 037 §3.1) —
@@ -620,6 +737,44 @@ mod tests {
             check_compatibility(&skewed, "gb-new", RestartAction::RestartLocal),
             Ok(Compatibility::BuildSkew)
         );
+    }
+
+    /// The two facts a connection is judged on later: whether it is at
+    /// reduced fidelity, and whether it can be resumed. Both are read
+    /// off the identify reply the gate already has, and the build pair
+    /// is kept whether or not the builds disagree — the reason lines
+    /// that print it cannot go back and ask.
+    #[test]
+    fn the_prologues_facts_come_off_the_identify_reply() {
+        assert!(
+            roost_ipc::messages::SESSION_FEATURES.contains(&EVENTS_RESUME),
+            "the client is gating on a feature no session ever advertises"
+        );
+
+        let mut matched = identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-1");
+        matched.features = vec!["put_file".into(), EVENTS_RESUME.into()];
+        let exact = ConnectFacts::new(&matched, "gb-1", Compatibility::Exact);
+        assert!(!exact.reduced_fidelity);
+        assert!(exact.supports_resume);
+        assert_eq!(exact.session_id, "sess-1");
+        assert_eq!(
+            exact.skew,
+            Skew {
+                session_build: "gb-1".into(),
+                client_build: "gb-1".into(),
+            },
+            "the pair is filled on every connection, not only a skewed one"
+        );
+        assert_eq!(exact.resumed, None, "nothing has subscribed yet");
+
+        // A pre-R5 session lists no features at all, and offering it a
+        // `from_revision` would be an error outside the three refusals.
+        let skewed = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-old");
+        let reduced = ConnectFacts::new(&skewed, "gb-new", Compatibility::BuildSkew);
+        assert!(reduced.reduced_fidelity);
+        assert!(!reduced.supports_resume);
+        assert_eq!(reduced.skew.session_build, "gb-old");
+        assert_eq!(reduced.skew.client_build, "gb-new");
     }
 
     /// A session from before `vt` existed has only the build-coupled

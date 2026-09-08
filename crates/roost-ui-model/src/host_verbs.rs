@@ -15,7 +15,7 @@
 //! cannot reach a local session could hide the whole surface coherently
 //! — and both answers stay unit tests that run on any OS.
 
-use crate::host_sidebar::SectionState;
+use crate::host_sidebar::{FidelityAction, HostTransportKind, SectionState};
 
 /// Palette item ids. The prefix is what routes an activation back here;
 /// everything after the second colon is the saved host's id, which is
@@ -27,6 +27,8 @@ const DISCONNECT_PREFIX: &str = "host:disconnect:";
 const STOP_PREFIX: &str = "host:stop:";
 const REMOVE_PREFIX: &str = "host:remove:";
 const CREATE_ON_PREFIX: &str = "host:create_on:";
+const UPDATE_PREFIX: &str = "host:update:";
+const RESTART_PREFIX: &str = "host:restart:";
 
 /// The id of the seeded-localhost Connect row — the one verb addressed
 /// to a host that is not saved yet (plan 037 §3.5). Activating it saves
@@ -48,10 +50,15 @@ pub struct HostRow<'a> {
     pub saved_id: &'a str,
     pub label: &'a str,
     pub state: SectionState,
-    /// Whether this host's target is this machine's own session. Only
-    /// this flag rides the policy; a host reached over an `ssh -L`
-    /// forward keeps its full verb set under either answer.
-    pub localhost: bool,
+    /// How this host is reached. Only [`HostTransportKind::localhost`]
+    /// rides the policy; a host reached over an `ssh -L` forward keeps
+    /// its full verb set under either answer.
+    pub transport: HostTransportKind,
+    /// What this host's live connection offers about its fidelity, from
+    /// [`crate::host_sidebar::fidelity_action`]. `None` for every host
+    /// that is connected at exact fidelity or is not connected at all,
+    /// which is the ordinary case.
+    pub fidelity: Option<FidelityAction>,
 }
 
 /// The policy, as one value.
@@ -93,6 +100,11 @@ pub enum HostVerb {
     /// Stop the session (confirmed). Connected only — stopping requires
     /// being attached to what you stop.
     Stop(String),
+    /// Send this ssh host a matching `roost-session` and restart it, so
+    /// the connection leaves the `vt` fallback.
+    Update(String),
+    /// Restart this machine's own session, for the same reason.
+    Restart(String),
     Remove(String),
     /// Drill into the "New Project on…" picker.
     NewProjectOn,
@@ -122,6 +134,12 @@ pub fn parse(id: &str) -> Option<HostVerb> {
     }
     if let Some(host) = saved(STOP_PREFIX) {
         return Some(HostVerb::Stop(host));
+    }
+    if let Some(host) = saved(UPDATE_PREFIX) {
+        return Some(HostVerb::Update(host));
+    }
+    if let Some(host) = saved(RESTART_PREFIX) {
+        return Some(HostVerb::Restart(host));
     }
     if let Some(host) = saved(REMOVE_PREFIX) {
         return Some(HostVerb::Remove(host));
@@ -170,6 +188,11 @@ fn is_connected(state: SectionState) -> bool {
 ///   ways to leave it (disconnect keeps its shells, stop ends them); a
 ///   host that is not offers the way back in, plus Remove once it has
 ///   settled — removing a host mid-dial would race its own connection.
+/// * `Update` / `Restart` — only on a connected host whose `fidelity`
+///   names one of them, which is plan 056 §3.4's matrix: an ssh host is
+///   sent a matching build, this machine's own session is restarted,
+///   and a socket target lists neither because nothing here can reach
+///   its binary.
 /// * The seeded `localhost` row appears only on a fresh registry, and
 ///   only where the policy offers the localhost surface at all.
 /// * `New Project on…` appears once there is somewhere else to create,
@@ -194,7 +217,7 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
         // surface is withheld, a localhost host offers no connection
         // verbs at all. It still lists in the sidebar and can still be
         // removed, which is the only honest thing left to do with it.
-        let reachable = policy.localhost_surface || !host.localhost;
+        let reachable = policy.localhost_surface || !host.transport.localhost();
         if is_connected(host.state) {
             if reachable {
                 items.push(VerbItem::new(
@@ -207,6 +230,19 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
                     format!("Stop Session: {}", host.label),
                     "ends shells, keeps layout",
                 ));
+                match host.fidelity {
+                    Some(FidelityAction::Update) => items.push(VerbItem::new(
+                        format!("{UPDATE_PREFIX}{}", host.saved_id),
+                        format!("Update roost-session on {}", host.label),
+                        "installs a matching build and restarts it",
+                    )),
+                    Some(FidelityAction::Restart) => items.push(VerbItem::new(
+                        format!("{RESTART_PREFIX}{}", host.saved_id),
+                        format!("Restart session on {}", host.label),
+                        "stops and starts it; ends shells, keeps layout",
+                    )),
+                    Some(FidelityAction::Manual) | None => {}
+                }
             }
             continue;
         }
@@ -277,13 +313,15 @@ pub fn create_targets(hosts: &[HostRow<'_>], local_label: &str) -> Vec<VerbItem>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_sidebar::fidelity_action;
 
     fn host(saved_id: &str, state: SectionState) -> HostRow<'_> {
         HostRow {
             saved_id,
             label: saved_id,
             state,
-            localhost: false,
+            transport: HostTransportKind::Ssh,
+            fidelity: None,
         }
     }
 
@@ -393,7 +431,8 @@ mod tests {
             saved_id: "h1",
             label: "localhost",
             state: SectionState::Disconnected,
-            localhost: true,
+            transport: HostTransportKind::Localhost,
+            fidelity: None,
         };
         let remote = host("h2", SectionState::Disconnected);
 
@@ -436,12 +475,17 @@ mod tests {
             saved_id: "h1",
             label: "localhost",
             state: SectionState::Connected,
-            localhost: true,
+            transport: HostTransportKind::Localhost,
+            // Reduced fidelity is a connection verb too: a build that
+            // will not offer to leave a local session must not offer to
+            // restart one either.
+            fidelity: Some(FidelityAction::Restart),
         };
         let offered = verbs(&[connected], GATED);
         let items = ids(&offered);
         assert!(!items.contains(&"host:disconnect:h1"));
         assert!(!items.contains(&"host:stop:h1"));
+        assert!(!items.contains(&"host:restart:h1"));
     }
 
     /// Once a host exists, the picker row does too — and with none it
@@ -472,6 +516,132 @@ mod tests {
         assert_eq!(targets[0].title, "Local");
     }
 
+    /// Plan 056 §3.4's matrix, the palette's column — driven through the
+    /// same derivation the band's pill reads, so the two can never
+    /// disagree about what a host offers.
+    #[test]
+    fn the_fidelity_matrix_lists_exactly_the_verb_its_transport_can_act_on() {
+        use HostTransportKind::{Localhost, Socket, Ssh};
+        let connected = vec![ADD_ID, "host:disconnect:h", "host:stop:h"];
+        let cases = [
+            (
+                Ssh,
+                SectionState::Connected,
+                true,
+                vec![ADD_ID, "host:disconnect:h", "host:stop:h", "host:update:h"],
+            ),
+            (
+                Localhost,
+                SectionState::Connected,
+                true,
+                vec![ADD_ID, "host:disconnect:h", "host:stop:h", "host:restart:h"],
+            ),
+            // A socket target names somebody else's process, and there
+            // is no transport this client could reach its binary over.
+            (Socket, SectionState::Connected, true, connected.clone()),
+            // Connected at exact fidelity: the ordinary two verbs.
+            (Ssh, SectionState::Connected, false, connected.clone()),
+            (Localhost, SectionState::Connected, false, connected.clone()),
+            (Socket, SectionState::Connected, false, connected),
+            // Reduced and then dropped: the existing not-connected
+            // verbs, and neither fidelity verb — nothing live to act on.
+            (
+                Ssh,
+                SectionState::Disconnected,
+                true,
+                vec![ADD_ID, "host:connect:h", "host:remove:h"],
+            ),
+            (
+                Localhost,
+                SectionState::TakenOver,
+                true,
+                vec![ADD_ID, "host:connect:h", "host:remove:h"],
+            ),
+            (
+                Socket,
+                SectionState::Connecting,
+                true,
+                vec![ADD_ID, "host:connect:h"],
+            ),
+        ];
+        for (transport, state, reduced_fidelity, mut expected) in cases {
+            let row = HostRow {
+                transport,
+                fidelity: fidelity_action(reduced_fidelity, transport, state),
+                ..host("h", state)
+            };
+            expected.push(NEW_PROJECT_ON_ID);
+            assert_eq!(
+                ids(&verbs(&[row], FULL)),
+                expected,
+                "{transport:?} {state:?} reduced={reduced_fidelity}"
+            );
+        }
+    }
+
+    /// The two new verbs read the same "is it attached?" gate every
+    /// other connection verb does, so a row that arrives claiming an
+    /// action its state cannot support still offers nothing to press.
+    #[test]
+    fn a_fidelity_action_on_a_host_that_is_not_connected_offers_nothing() {
+        for state in [
+            SectionState::Connecting,
+            SectionState::Disconnected,
+            SectionState::NeedsRestart,
+            SectionState::TakenOver,
+            SectionState::Stopped,
+        ] {
+            for action in [
+                FidelityAction::Update,
+                FidelityAction::Restart,
+                FidelityAction::Manual,
+            ] {
+                let row = HostRow {
+                    fidelity: Some(action),
+                    ..host("h", state)
+                };
+                let offered = verbs(&[row], FULL);
+                let items = ids(&offered);
+                assert!(
+                    !items
+                        .iter()
+                        .any(|id| id.starts_with(UPDATE_PREFIX) || id.starts_with(RESTART_PREFIX)),
+                    "{state:?} {action:?}: {items:?}"
+                );
+            }
+        }
+    }
+
+    /// The titles the matrix names, verbatim — the palette row is one of
+    /// three entry points into the same action and they say the same
+    /// thing.
+    #[test]
+    fn the_fidelity_verbs_name_the_host_they_act_on() {
+        let title = |transport| {
+            verbs(
+                &[HostRow {
+                    label: "pop-os",
+                    transport,
+                    fidelity: fidelity_action(true, transport, SectionState::Connected),
+                    ..host("h", SectionState::Connected)
+                }],
+                FULL,
+            )
+            .into_iter()
+            .find(|item| item.id.starts_with(UPDATE_PREFIX) || item.id.starts_with(RESTART_PREFIX))
+            .map(|item| item.title)
+        };
+        assert_eq!(
+            title(HostTransportKind::Ssh).as_deref(),
+            Some("Update roost-session on pop-os")
+        );
+        assert_eq!(
+            title(HostTransportKind::Localhost).as_deref(),
+            Some("Restart session on pop-os")
+        );
+        assert_eq!(title(HostTransportKind::Socket), None);
+    }
+
     /// Every id the builders emit parses back to the verb that produced
     /// it — the round trip the adapter's activation depends on.
     #[test]
@@ -479,6 +649,16 @@ mod tests {
         let hosts = [
             host("live", SectionState::Connected),
             host("down", SectionState::Disconnected),
+            HostRow {
+                transport: HostTransportKind::Ssh,
+                fidelity: Some(FidelityAction::Update),
+                ..host("skewed", SectionState::Connected)
+            },
+            HostRow {
+                transport: HostTransportKind::Localhost,
+                fidelity: Some(FidelityAction::Restart),
+                ..host("mine", SectionState::Connected)
+            },
         ];
         let mut items = verbs(&hosts, FULL);
         items.extend(verbs(&[], FULL));
@@ -494,6 +674,14 @@ mod tests {
             Some(HostVerb::Connect("abc".into()))
         );
         assert_eq!(parse("host:stop:abc"), Some(HostVerb::Stop("abc".into())));
+        assert_eq!(
+            parse("host:update:abc"),
+            Some(HostVerb::Update("abc".into()))
+        );
+        assert_eq!(
+            parse("host:restart:abc"),
+            Some(HostVerb::Restart("abc".into()))
+        );
         assert_eq!(
             parse("host:remove:abc"),
             Some(HostVerb::Remove("abc".into()))

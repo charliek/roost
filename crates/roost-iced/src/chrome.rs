@@ -149,6 +149,16 @@ pub const HOST_BAND_SPACING: f32 = 7.0;
 /// step quieter than [`MUTED_TEXT`], as the mockup's `.hosthdr small`.
 pub const HOST_ROLLUP_TEXT: Color = Color::from_rgb8(0x6e, 0x74, 0x7a);
 pub const HOST_ROLLUP_SIZE: f32 = 10.0;
+/// The band's `reduced fidelity` pill (plan 056 §3.4), in the chrome's
+/// one "this wants your attention" amber — literally
+/// [`HOST_DOT_PENDING`]'s hue, because it is the same warning and a
+/// second amber would only invite the two to drift apart.
+///
+/// The dot beside it stays green on purpose: the connection is up and
+/// serving, which is exactly what the dot reports. The fidelity is a
+/// different fact and it gets its own slot rather than overloading a
+/// 7px circle.
+pub const HOST_FIDELITY_TEXT: Color = HOST_DOT_PENDING;
 /// A disconnected section's rows stay listed at this opacity (mockup
 /// `.dim`). Applied to the row colors rather than to a layer: iced has no
 /// container opacity, and scaling alpha composites identically over the

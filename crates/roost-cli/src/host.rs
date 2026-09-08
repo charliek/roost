@@ -23,7 +23,8 @@ use clap::Subcommand;
 
 use roost_ipc::messages::{
     ops, HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult,
-    HostDisconnectParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
+    HostDisconnectParams, HostListResult, HostRemoveParams, HostStatus, HostStatusParams,
+    HostStatusResult,
 };
 use roost_ipc::{ssh, IpcClient};
 
@@ -219,27 +220,51 @@ async fn status(client: &mut IpcClient, id: Option<&str>, json: bool) -> Result<
         println!("no saved hosts");
     } else {
         for h in &resp.hosts {
-            let rollup = h.rollup.as_deref().unwrap_or("");
-            let line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup);
-            println!("{}", line.trim_end());
-            // The band caps its line at 60 characters, so an ssh
-            // family's sentence (a changed host key, say) is ellipsized
-            // there; when the rollup did not carry the whole reason,
-            // print it in full underneath.
-            if let Some(reason) = h.reason.as_deref().filter(|r| !rollup.contains(r)) {
-                println!("    {reason}");
-            }
-            // The operator's copy of a settled launch failure (the three
-            // rungs the locate ladder tried) is only ever here and in
-            // the log.
-            if let Some(detail) = h.detail.as_deref() {
-                for line in detail.lines() {
-                    println!("    {line}");
-                }
+            for line in status_lines(h) {
+                println!("{line}");
             }
         }
     }
     Ok(0)
+}
+
+/// The sentence printed when a live connection's session pins a
+/// different libghostty build than this client (plan 056 §3.7) —
+/// verbatim, so a script `grep`ing the human form can match on it.
+const REDUCED_FIDELITY_LINE: &str =
+    "    reduced fidelity: this Roost and the session pin different libghostty builds; \
+     update or restart the session from the sidebar";
+
+/// The human form of one `host status` row, as lines of text — split out
+/// from `status` so it is assertable without a socket or stdout
+/// capture.
+///
+/// Keyed on `h.connect.reduced_fidelity`, **not** `payload_kind`: a
+/// build-skewed session is at reduced fidelity from the moment it
+/// connects, before any tab has attached to prove it (plan 056 §3.1).
+fn status_lines(h: &HostStatus) -> Vec<String> {
+    let mut lines = Vec::new();
+    let rollup = h.rollup.as_deref().unwrap_or("");
+    let line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup);
+    lines.push(line.trim_end().to_string());
+    // The band caps its line at 60 characters, so an ssh family's
+    // sentence (a changed host key, say) is ellipsized there; when the
+    // rollup did not carry the whole reason, print it in full
+    // underneath.
+    if let Some(reason) = h.reason.as_deref().filter(|r| !rollup.contains(r)) {
+        lines.push(format!("    {reason}"));
+    }
+    // The operator's copy of a settled launch failure (the three rungs
+    // the locate ladder tried) is only ever here and in the log.
+    if let Some(detail) = h.detail.as_deref() {
+        for line in detail.lines() {
+            lines.push(format!("    {line}"));
+        }
+    }
+    if h.connect.as_ref().is_some_and(|c| c.reduced_fidelity) {
+        lines.push(REDUCED_FIDELITY_LINE.to_string());
+    }
+    lines
 }
 
 async fn remove(client: &mut IpcClient, id: &str) -> Result<i32> {
@@ -303,6 +328,7 @@ async fn connection(client: &mut IpcClient, op: &str, id: &str) -> Result<i32> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use roost_ipc::messages::HostConnectStatus;
 
     /// A throwaway root so `clap` parses the subcommand exactly as
     /// `roostctl host …` does, without dragging the real `Cli` (and its
@@ -411,5 +437,69 @@ mod tests {
             parse(&["add", "--label", "l", "--target", "t", "--verify"]),
             HostCmd::Add { verify: true, .. },
         ));
+    }
+
+    /// A live, reduced-fidelity row's human form gains the fidelity
+    /// line verbatim (plan 056 §3.7), keyed on `connect.reduced_fidelity`
+    /// alone — not on whether a tab has attached.
+    #[test]
+    fn status_lines_print_reduced_fidelity_verbatim_when_live_and_skewed() {
+        let host = HostStatus {
+            id: "abc".to_string(),
+            label: "workbox".to_string(),
+            state: "connected".to_string(),
+            connect: Some(HostConnectStatus {
+                session_id: "s1".to_string(),
+                reduced_fidelity: true,
+                resumed: false,
+                from_revision: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&host),
+            vec![
+                "abc  workbox  connected".to_string(),
+                REDUCED_FIDELITY_LINE.to_string(),
+            ],
+        );
+    }
+
+    /// A live, full-fidelity row prints no such line.
+    #[test]
+    fn status_lines_omit_reduced_fidelity_when_live_and_exact() {
+        let host = HostStatus {
+            id: "abc".to_string(),
+            label: "workbox".to_string(),
+            state: "connected".to_string(),
+            connect: Some(HostConnectStatus {
+                session_id: "s1".to_string(),
+                reduced_fidelity: false,
+                resumed: false,
+                from_revision: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&host),
+            vec!["abc  workbox  connected".to_string()],
+        );
+    }
+
+    /// Not live at all — no `connect` object — prints no such line
+    /// either, whatever the last-known fidelity was.
+    #[test]
+    fn status_lines_omit_reduced_fidelity_when_not_live() {
+        let host = HostStatus {
+            id: "abc".to_string(),
+            label: "workbox".to_string(),
+            state: "disconnected".to_string(),
+            connect: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&host),
+            vec!["abc  workbox  disconnected".to_string()],
+        );
     }
 }

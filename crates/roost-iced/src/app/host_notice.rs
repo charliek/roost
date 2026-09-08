@@ -3,8 +3,9 @@
 //! verb raises when the session is one this client cannot talk to at
 //! all — a protocol it does not speak, no payload kind it can decode,
 //! or a build skew against a session too old to serve `vt`. A skew a
-//! session *can* serve connects instead, and says so only in the log
-//! and in `host.status`'s `payload_kind`.
+//! session *can* serve connects instead, at reduced fidelity, and is
+//! asked about from the band rather than from this gate —
+//! [`restart_prompt_for_skew`] is that question.
 //!
 //! Pure, and deliberately kept away from the widgets: "which banner,
 //! which buttons, and is there a restart button at all" is the part that
@@ -18,8 +19,9 @@
 //! them side by side is how the copy stays consistent.
 
 use crate::host_conn::state::{
-    BuildMismatch, HostConnState, MismatchKind, RestartAction, CLIENT_PAYLOAD_KINDS,
+    BuildMismatch, HostConnState, MismatchKind, RestartAction, Skew, CLIENT_PAYLOAD_KINDS,
 };
+use roost_ui_model::host_sidebar::FidelityAction;
 
 /// The banner drawn over a host tab's last frame.
 ///
@@ -217,6 +219,104 @@ pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPr
             confirm: None,
         },
     }
+}
+
+/// Why a connection is at reduced fidelity, and what that costs — the
+/// sentences both cards raised from the band lead with (plan 056 §3.6).
+///
+/// One string, because the localhost restart prompt below and the ssh
+/// consent card ([`super::bootstrap::bootstrap_copy`]) are the same
+/// explanation with different actions after it, and copy that only
+/// happens to match is copy that drifts.
+pub(super) fn reduced_fidelity_reason(skew: &Skew) -> String {
+    format!(
+        "This session is attached at reduced fidelity: it was started by a roost-session \
+         built against {}, and this Roost is built against {}. Links, the alternate screen \
+         and soft wrapping are off until it runs the matching build.",
+        skew.session_build, skew.client_build
+    )
+}
+
+/// Compose the restart dialog for a **localhost** session this client
+/// is attached to across a libghostty build skew (plan 056 §3.6).
+///
+/// The sibling of [`restart_prompt`]'s `RestartLocal` arm, and a
+/// separate function rather than a fourth arm of it because the two
+/// answer different questions. That one is raised at a host this client
+/// **cannot talk to**; this one at a host it is talking to right now,
+/// on the `vt` fallback, whose links and alternate screen are gone. The
+/// only way to reuse the arm would be to synthesize a [`BuildMismatch`]
+/// with a kind that lies about protocol fields it never had.
+///
+/// It claims no direction, for [`vintage`]'s reason: two libghostty
+/// build strings are merely different.
+pub(super) fn restart_prompt_for_skew(label: &str, skew: &Skew) -> RestartPrompt {
+    RestartPrompt {
+        title: format!("Restart the session on {label}?"),
+        body: format!(
+            "{} Restarting reopens every tab as a fresh shell in its directory. Running \
+             programs end.",
+            reduced_fidelity_reason(skew)
+        ),
+        action: RestartAction::RestartLocal,
+        confirm: Some("Restart session".to_string()),
+    }
+}
+
+/// The band's pill, on every transport. The *fact* does not vary — this
+/// connection is on the `vt` fallback wherever the session lives — and
+/// only what can be done about it does.
+pub(super) const FIDELITY_PILL: &str = "reduced fidelity";
+
+/// The two things a reduced-fidelity section draws: the pill on its band
+/// and the inline row under it (plan 056 §3.4's matrix).
+///
+/// One value, because the pill and the row are one offer shown twice —
+/// a band that invites a press over a row that only points, or the
+/// reverse, would be the window disagreeing with itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FidelityChrome {
+    /// Whether both are buttons. `false` is a socket target: somebody
+    /// else's process, over a transport that reaches its socket and not
+    /// its binary, so there is nothing here to press.
+    pub(super) pressable: bool,
+    /// The inline row's whole text, glyph included.
+    pub(super) row: String,
+}
+
+/// What the band and the row say for one [`FidelityAction`].
+pub(super) fn fidelity_chrome(action: FidelityAction, label: &str) -> FidelityChrome {
+    match action {
+        FidelityAction::Update => FidelityChrome {
+            pressable: true,
+            row: "⬆ Update roost-session".to_string(),
+        },
+        FidelityAction::Restart => FidelityChrome {
+            pressable: true,
+            row: "↻ Restart session".to_string(),
+        },
+        FidelityAction::Manual => FidelityChrome {
+            pressable: false,
+            row: format!("Restart it on {label} to restore fidelity"),
+        },
+    }
+}
+
+/// The status-bar sentence a connection's **first** `vt` attach owes
+/// (plan 056 §3.5).
+///
+/// The one surface keyed on the attach rather than on the connection's
+/// own fidelity fact: the pill, the row and the verbs describe a
+/// property of the link and appear the moment it is up, while this is
+/// about the terminal the person is looking at, so it waits until there
+/// is one. It says what was lost without the build strings — those are
+/// on the card the pill opens, and a 5 s banner is not where a hex
+/// build id earns its space.
+pub(super) fn fidelity_sentence(label: &str) -> String {
+    format!(
+        "{label} is attached at reduced fidelity: links, the alternate screen and soft \
+         wrapping are off until it runs a matching build."
+    )
 }
 
 /// What a Connect on a host whose compatibility gate already refused
@@ -512,6 +612,53 @@ mod tests {
         );
     }
 
+    /// The fourth prompt, and the one raised at a host this client is
+    /// **attached to**: it leads with the two builds that disagreed,
+    /// then says what a restart costs, and claims no direction.
+    #[test]
+    fn the_skew_prompt_names_both_builds_and_what_a_restart_costs() {
+        let skew = Skew {
+            session_build: "gb-old".into(),
+            client_build: "gb-new".into(),
+        };
+        let prompt = restart_prompt_for_skew("localhost", &skew);
+
+        assert_eq!(prompt.title, "Restart the session on localhost?");
+        assert_eq!(prompt.action, RestartAction::RestartLocal);
+        assert_eq!(prompt.confirm.as_deref(), Some("Restart session"));
+        assert_eq!(prompt.dismiss_label(), "Not now");
+        assert!(
+            prompt.body.starts_with(
+                "This session is attached at reduced fidelity: it was started by a roost-session \
+                 built against gb-old, and this Roost is built against gb-new."
+            ),
+            "{}",
+            prompt.body
+        );
+        assert!(
+            prompt
+                .body
+                .contains("Links, the alternate screen and soft wrapping are off"),
+            "the user is told what they have lost: {}",
+            prompt.body
+        );
+        assert!(
+            prompt.body.contains("Running programs end."),
+            "and what a restart costs: {}",
+            prompt.body
+        );
+        assert!(
+            !prompt.body.contains("older") && !prompt.body.contains("newer"),
+            "two build strings are merely different: {}",
+            prompt.body
+        );
+        assert!(
+            !prompt.body.contains("needs a restart"),
+            "this host is connected and serving; it is not waiting for anything: {}",
+            prompt.body
+        );
+    }
+
     /// Only a person is ever answered with a modal.
     ///
     /// `palette.activate` is a shipped, ungated IPC op with a
@@ -631,5 +778,51 @@ mod tests {
         let mut empty = mismatch(MismatchKind::PayloadKind, RestartAction::RestartLocal);
         empty.session_payload_kinds.clear();
         assert!(detail(&empty).contains("offers nothing"));
+    }
+
+    /// Plan 056 §3.4's matrix, the two widget columns: what the band's
+    /// pill and the row under it draw for each action, and which of them
+    /// respond to a press.
+    #[test]
+    fn the_fidelity_matrix_answers_one_pair_of_widgets_per_action() {
+        let update = fidelity_chrome(FidelityAction::Update, "pop-os");
+        assert!(update.pressable, "an ssh host can be sent a build");
+        assert_eq!(update.row, "⬆ Update roost-session");
+
+        let restart = fidelity_chrome(FidelityAction::Restart, "localhost");
+        assert!(restart.pressable, "our own session is ours to restart");
+        assert_eq!(restart.row, "↻ Restart session");
+
+        let manual = fidelity_chrome(FidelityAction::Manual, "build-box");
+        assert!(
+            !manual.pressable,
+            "a socket target's process is not this client's to touch"
+        );
+        assert_eq!(manual.row, "Restart it on build-box to restore fidelity");
+        assert!(
+            !manual.row.starts_with('⬆') && !manual.row.starts_with('↻'),
+            "and it wears no action glyph, because it is not an action: {}",
+            manual.row
+        );
+    }
+
+    /// The pill says the same thing everywhere — the fact is the
+    /// connection's, not the transport's — and it never grows a second
+    /// spelling per action.
+    #[test]
+    fn the_pill_is_one_string_on_every_transport() {
+        assert_eq!(FIDELITY_PILL, "reduced fidelity");
+    }
+
+    /// The banner names the host and what it costs, and deliberately not
+    /// the two build strings: the card the pill opens carries those.
+    #[test]
+    fn the_first_vt_attach_says_what_was_lost() {
+        let said = fidelity_sentence("pop-os");
+        assert_eq!(
+            said,
+            "pop-os is attached at reduced fidelity: links, the alternate screen and soft \
+             wrapping are off until it runs a matching build."
+        );
     }
 }

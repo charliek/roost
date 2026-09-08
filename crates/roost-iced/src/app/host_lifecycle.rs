@@ -281,6 +281,9 @@ pub(crate) fn bootstrap_offer(hosts: &HostConnSet, saved_id: &str) -> Option<Off
         session,
         session_is_newer: false,
         failure,
+        // A connect that failed: there is no live session to be at
+        // reduced fidelity with.
+        fidelity: None,
     })
 }
 
@@ -609,6 +612,7 @@ mod tests {
                 session: SessionState::NoSession,
                 session_is_newer: false,
                 failure: Some(SshFailure::NotFound),
+                fidelity: None,
             }),
             "the offer carries the family it is answering, so confirming can check it still holds"
         );

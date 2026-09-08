@@ -796,6 +796,33 @@ fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
         .ok_or_else(|| "\"paste\" did not resolve to a KeybindAction".to_string())
 }
 
+/// A saved host's target as the sidebar model names it.
+///
+/// [`host_sidebar::HostTransportKind`] mirrors
+/// [`crate::host_conn::HostTransport`], the connection set's own
+/// vocabulary, because `roost-ui-model` cannot
+/// depend on `roost-iced`. This is the one place the two are tied
+/// together, and both are decided by `roost_ipc::ssh`'s rules, so the
+/// band, the palette and the connection can never disagree about what a
+/// host is.
+///
+/// The sentinel is answered on its own rather than through `classify`:
+/// rule 2 resolves the session profile's socket path and can fail doing
+/// it, and a host saved as `localhost` is this machine's own session
+/// whether or not that path resolves. A target that classifies as
+/// nothing at all never connects (`host_lifecycle::dial_saved_host`
+/// refuses it), so it takes the transport that offers nothing.
+pub(super) fn transport_kind(target: &str) -> host_sidebar::HostTransportKind {
+    use host_sidebar::HostTransportKind;
+    if roost_ipc::ssh::target_is_localhost(target) {
+        return HostTransportKind::Localhost;
+    }
+    match roost_ipc::ssh::classify(target) {
+        Ok(roost_ipc::ssh::ResolvedTransport::Ssh(_)) => HostTransportKind::Ssh,
+        _ => HostTransportKind::Socket,
+    }
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // A full authoritative snapshot on every reconcile is the recovery
@@ -1102,7 +1129,12 @@ impl App {
             // Read off the machine rather than the frame: only an accept
             // it actually applied sets it, so a frame from a superseded
             // attempt cannot rewrite what the host reports.
-            self.hosts.note_payload_kind(key.host, kind.wire());
+            let first_reduced_attach = self.hosts.note_payload_kind(key.host, kind.wire());
+            if first_reduced_attach {
+                if let Some(label) = self.host_view(key.host).map(|view| view.label.clone()) {
+                    self.set_status(host_notice::fidelity_sentence(&label));
+                }
+            }
         }
         match step {
             host_tab::AttachStep::None => {}
@@ -1600,6 +1632,9 @@ impl App {
                 // Nothing renders off it — it is kept for the outage a
                 // later drop opens (plan 040 §3.7).
                 EngineFeed::HostLease(host, lease) => self.hosts.apply_lease(host, lease),
+                EngineFeed::HostConnectFacts(host, facts) => {
+                    self.hosts.note_connect_facts(host, facts)
+                }
                 EngineFeed::ReconnectDue { host, request } => {
                     self.host_reconnect_due(&host, request)
                 }
@@ -2117,20 +2152,15 @@ impl App {
                 };
                 // Taken before `host.id` is moved into the view.
                 let reason = self.hosts.section_reason(&host.id).map(str::to_string);
+                let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
                 super::HostView {
                     saved_id: host.id,
                     // The registry's label wins over the connection's:
                     // they are the same string, and the registry is the
                     // one that exists before a connection does.
                     label: host.label,
-                    // Same reason the label comes from here: the verb
-                    // policy has to know whether a host is this
-                    // machine's own *before* anything connects to it.
-                    // The classifier's own rule rather than a raw `==`:
-                    // the sentinel is trimmed before it is matched, so a
-                    // saved `" localhost"` is the local session
-                    // everywhere or nowhere.
-                    localhost: roost_ipc::ssh::target_is_localhost(&host.target),
+                    transport: transport_kind(&host.target),
+                    reduced_fidelity,
                     reason,
                     host: incarnation.unwrap_or(HostId::LOCAL),
                     state,
@@ -2184,6 +2214,8 @@ impl App {
                     label: view.label.as_str(),
                     host: view.host,
                     state: view.state,
+                    transport: view.transport,
+                    reduced_fidelity: view.reduced_fidelity,
                     agents: view.agents,
                     reason: view.reason.as_deref(),
                 })
@@ -3069,6 +3101,15 @@ impl App {
                 // absent until one has attached over the live
                 // connection.
                 payload_kind: self.hosts.payload_kind(&host.id).map(str::to_string),
+                // What the prologue established, present only while the
+                // connection that established it is live.
+                connect: self.hosts.facts(&host.id).map(|facts| HostConnectStatus {
+                    session_id: facts.session_id.clone(),
+                    reduced_fidelity: facts.reduced_fidelity,
+                    resumed: facts.resumed.is_some(),
+                    from_revision: facts.resumed.map(|resumed| resumed.from_revision),
+                }),
+                tabs: self.hosts.tabs(&host.id),
             });
         }
         Ok(HostStatusResult { hosts })
@@ -4923,5 +4964,41 @@ mod tests {
         );
 
         supervisor.close(84);
+    }
+
+    /// [`App::apply_host_tab_frame`]'s reduced-fidelity edge (plan 056
+    /// §3.5), driven exactly as it drives it: one `note_payload_kind`
+    /// per frame, the sentence composed only when that answers `true`.
+    ///
+    /// A `vt` attach delivers frames for as long as the shell runs, so
+    /// the second frame — and the ten-thousandth — must say nothing. The
+    /// banner is last-writer-wins with a 5 s expiry, so a repeat would
+    /// not merely be noise: it would keep overwriting whatever the
+    /// person was actually being told.
+    #[tokio::test]
+    async fn only_the_first_frame_of_a_vt_attach_reaches_the_status_bar() {
+        use crate::host_conn::fixtures::{a_connected_ssh_host, a_set};
+        use roost_ipc::messages::AttachPayloadKind;
+
+        let (mut hosts, _feed) = a_set();
+        let incarnation = a_connected_ssh_host(&mut hosts, "/nonexistent/roost-fidelity.sock");
+
+        // The call site's own shape, four frames deep.
+        let mut said: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            if hosts.note_payload_kind(incarnation, AttachPayloadKind::VT) {
+                said.push(host_notice::fidelity_sentence("one"));
+            }
+        }
+
+        assert_eq!(
+            said,
+            vec![
+                "one is attached at reduced fidelity: links, the alternate screen and soft \
+                 wrapping are off until it runs a matching build."
+                    .to_string()
+            ],
+            "four frames, one sentence"
+        );
     }
 }
