@@ -1659,6 +1659,12 @@ impl App {
                 self.clear_palette_state();
                 self.open_host_stop_dialog(&saved_id, &label);
             }
+            // Unreachable for now: nothing fills `HostRow.fidelity` in,
+            // so neither is ever listed. The handler both route to
+            // arrives with the consent card it opens.
+            HostVerb::Update(saved_id) | HostVerb::Restart(saved_id) => {
+                return Err(format!("host {saved_id} is not at reduced fidelity"));
+            }
             HostVerb::Remove(saved_id) => {
                 self.clear_palette_state();
                 self.host_remove_requested(&saved_id)
@@ -2927,7 +2933,8 @@ mod tests {
             saved_id: "h1",
             label: "pop-os",
             state: host_sidebar::SectionState::Connected,
-            localhost: false,
+            transport: host_sidebar::HostTransportKind::Ssh,
+            fidelity: None,
         }];
 
         let frame = command_palette_frame(0, &config.providers, &bindings, &hosts);
@@ -2967,7 +2974,8 @@ mod tests {
             saved_id: "h1",
             label: "pop-os",
             state: host_sidebar::SectionState::Connected,
-            localhost: false,
+            transport: host_sidebar::HostTransportKind::Ssh,
+            fidelity: None,
         }];
         let frame = host_picker_frame(&hosts);
         assert_eq!(frame.id, HOST_PICKER_FRAME_ID);
@@ -2984,7 +2992,8 @@ mod tests {
             saved_id: "h1",
             label: "pop-os",
             state: host_sidebar::SectionState::Disconnected,
-            localhost: false,
+            transport: host_sidebar::HostTransportKind::Ssh,
+            fidelity: None,
         }];
         let items = host_verb_items(&hosts, Some("Alt+Shift+N"));
         for item in &items {

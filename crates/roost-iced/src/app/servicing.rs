@@ -796,6 +796,33 @@ fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
         .ok_or_else(|| "\"paste\" did not resolve to a KeybindAction".to_string())
 }
 
+/// A saved host's target as the sidebar model names it.
+///
+/// [`host_sidebar::HostTransportKind`] mirrors
+/// [`crate::host_conn::HostTransport`], the connection set's own
+/// vocabulary, because `roost-ui-model` cannot
+/// depend on `roost-iced`. This is the one place the two are tied
+/// together, and both are decided by `roost_ipc::ssh`'s rules, so the
+/// band, the palette and the connection can never disagree about what a
+/// host is.
+///
+/// The sentinel is answered on its own rather than through `classify`:
+/// rule 2 resolves the session profile's socket path and can fail doing
+/// it, and a host saved as `localhost` is this machine's own session
+/// whether or not that path resolves. A target that classifies as
+/// nothing at all never connects (`host_lifecycle::dial_saved_host`
+/// refuses it), so it takes the transport that offers nothing.
+fn transport_kind(target: &str) -> host_sidebar::HostTransportKind {
+    use host_sidebar::HostTransportKind;
+    if roost_ipc::ssh::target_is_localhost(target) {
+        return HostTransportKind::Localhost;
+    }
+    match roost_ipc::ssh::classify(target) {
+        Ok(roost_ipc::ssh::ResolvedTransport::Ssh(_)) => HostTransportKind::Ssh,
+        _ => HostTransportKind::Socket,
+    }
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // A full authoritative snapshot on every reconcile is the recovery
@@ -2126,14 +2153,7 @@ impl App {
                     // they are the same string, and the registry is the
                     // one that exists before a connection does.
                     label: host.label,
-                    // Same reason the label comes from here: the verb
-                    // policy has to know whether a host is this
-                    // machine's own *before* anything connects to it.
-                    // The classifier's own rule rather than a raw `==`:
-                    // the sentinel is trimmed before it is matched, so a
-                    // saved `" localhost"` is the local session
-                    // everywhere or nowhere.
-                    localhost: roost_ipc::ssh::target_is_localhost(&host.target),
+                    transport: transport_kind(&host.target),
                     reason,
                     host: incarnation.unwrap_or(HostId::LOCAL),
                     state,
@@ -2187,6 +2207,10 @@ impl App {
                     label: view.label.as_str(),
                     host: view.host,
                     state: view.state,
+                    transport: view.transport,
+                    // Not fed from the connection yet: the pill this
+                    // answers arrives with the entry point it presses.
+                    reduced_fidelity: false,
                     agents: view.agents,
                     reason: view.reason.as_deref(),
                 })

@@ -2197,11 +2197,11 @@ struct HostView {
     /// `HostSnapshot.id`, which is what a reconnect verb is addressed to.
     saved_id: String,
     label: String,
-    /// Whether this host's target is this machine's own session. Read
-    /// from the registry rather than from the connection, so it is known
-    /// for a host that has never connected — which is exactly when the
-    /// macOS gate has to decide whether to offer a Connect verb.
-    localhost: bool,
+    /// How this host is reached. Read from the registry rather than from
+    /// the connection, so it is known for a host that has never
+    /// connected — which is exactly when the macOS gate has to decide
+    /// whether to offer a Connect verb.
+    transport: host_sidebar::HostTransportKind,
     /// The incarnation these rows are keyed at. `HostId::LOCAL` stands
     /// for "no connection has ever published rows for this host" — the
     /// section is then header-only, and `projects` is empty, so the
@@ -5511,7 +5511,11 @@ impl App {
                 saved_id: view.saved_id.as_str(),
                 label: view.label.as_str(),
                 state: view.state,
-                localhost: view.localhost,
+                transport: view.transport,
+                // Not fed from the connection yet: the verbs this would
+                // list route to an entry point that arrives with the
+                // card they open.
+                fidelity: None,
             })
             .collect()
     }

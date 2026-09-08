@@ -45,6 +45,45 @@ pub enum HostDot {
     Offline,
 }
 
+/// How a saved host is reached, as the render-agnostic model names it.
+///
+/// Not a `bool`. The sidebar asks two questions about a host — "is this
+/// our own session?" and "what can this client do about its build?" —
+/// and only the first has a yes/no answer: an ssh host can be sent a new
+/// `roost-session`, a socket path names somebody else's process and
+/// cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostTransportKind {
+    /// The `"localhost"` sentinel: this machine's own session.
+    Localhost,
+    /// Reached over `ssh`.
+    Ssh,
+    /// A Unix socket path, reached directly.
+    Socket,
+}
+
+impl HostTransportKind {
+    /// Whether this is this machine's own session — the one question the
+    /// verb policy asks.
+    pub fn localhost(self) -> bool {
+        matches!(self, Self::Localhost)
+    }
+}
+
+/// What this client can do about a connection running at reduced
+/// fidelity — one answer per transport, decided structurally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FidelityAction {
+    /// Reached over ssh: offer to install a matching `roost-session`.
+    Update,
+    /// This machine's own session: stop it and start it again.
+    Restart,
+    /// A socket target: somebody else's process, with no transport this
+    /// client could reach its binary over. The band says what is wrong
+    /// and names who can fix it; nothing is offered to press.
+    Manual,
+}
+
 impl SectionState {
     pub fn dot(self) -> HostDot {
         match self {
@@ -136,6 +175,28 @@ impl SectionState {
     }
 }
 
+/// What a host's band offers about its fidelity, if anything.
+///
+/// Only a **connected** host has a fidelity to report: the fact is a
+/// property of the live connection, and a host that dropped has nothing
+/// to update or restart until it is back — its band already offers
+/// ↻ Reconnect ([`SectionState::offers_reconnect`]), and a second offer
+/// beside it would compete for the same press.
+pub fn fidelity_action(
+    reduced_fidelity: bool,
+    transport: HostTransportKind,
+    state: SectionState,
+) -> Option<FidelityAction> {
+    if !reduced_fidelity || state != SectionState::Connected {
+        return None;
+    }
+    Some(match transport {
+        HostTransportKind::Ssh => FidelityAction::Update,
+        HostTransportKind::Localhost => FidelityAction::Restart,
+        HostTransportKind::Socket => FidelityAction::Manual,
+    })
+}
+
 /// The widest rollup the band draws, ellipsis included.
 pub const ROLLUP_MAX_CHARS: usize = 60;
 
@@ -150,6 +211,13 @@ pub struct HostInput<'a> {
     /// `HostId::LOCAL` never appears here.
     pub host: HostId,
     pub state: SectionState,
+    /// How this host is reached. Read from the registry rather than from
+    /// the connection, so it is known before anything has connected.
+    pub transport: HostTransportKind,
+    /// Whether the live connection is serving the `vt` fallback because
+    /// the two ends pin different libghostty builds — links, the
+    /// alternate screen and soft wrapping are off while it is true.
+    pub reduced_fidelity: bool,
     /// How many agent rows this host contributes, for the rollup.
     pub agents: usize,
     /// The connection's own one-line reason, when it has one worth
@@ -170,6 +238,11 @@ pub struct Section {
     /// The right-aligned rollup: an agent count for a connected host, or
     /// the state's own word. `None` renders a bare header.
     pub rollup: Option<String>,
+    /// The reduced-fidelity indicator, and what pressing it would do.
+    /// Drawn beside the rollup rather than in it — an agent count and a
+    /// fidelity warning are different facts and neither replaces the
+    /// other.
+    pub fidelity: Option<FidelityAction>,
 }
 
 impl Section {
@@ -198,6 +271,7 @@ pub fn sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
         // nothing else. A rollup answers "what is going on over there",
         // and for the local workspace there is no "over there".
         rollup: None,
+        fidelity: None,
     });
     for host in hosts {
         out.push(Section {
@@ -209,6 +283,7 @@ pub fn sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
                 .state
                 .status_text_with_reason(host.reason)
                 .or_else(|| agent_rollup(host.agents)),
+            fidelity: fidelity_action(host.reduced_fidelity, host.transport, host.state),
         });
     }
     out
@@ -310,8 +385,23 @@ mod tests {
             label: saved_id,
             host: HostId::new(1),
             state,
+            transport: HostTransportKind::Ssh,
+            reduced_fidelity: false,
             agents,
             reason: None,
+        }
+    }
+
+    /// The same host, connected and serving the `vt` fallback.
+    fn reduced(
+        saved_id: &'static str,
+        transport: HostTransportKind,
+        agents: usize,
+    ) -> HostInput<'static> {
+        HostInput {
+            transport,
+            reduced_fidelity: true,
+            ..host(saved_id, SectionState::Connected, agents)
         }
     }
 
@@ -524,6 +614,107 @@ mod tests {
             assert!(!state.interactive(), "{state:?}");
             assert!(state.offers_reconnect(), "{state:?}");
         }
+    }
+
+    /// Plan 056 §3.4's matrix, the band's column: which action a reduced
+    /// -fidelity host offers, one row per transport, and the two rows
+    /// that offer nothing at all.
+    #[test]
+    fn the_fidelity_matrix_answers_one_action_per_transport_while_connected() {
+        use FidelityAction::{Manual, Restart, Update};
+        use HostTransportKind::{Localhost, Socket, Ssh};
+
+        // Connected and reduced: one action per transport.
+        assert_eq!(
+            fidelity_action(true, Ssh, SectionState::Connected),
+            Some(Update)
+        );
+        assert_eq!(
+            fidelity_action(true, Localhost, SectionState::Connected),
+            Some(Restart)
+        );
+        assert_eq!(
+            fidelity_action(true, Socket, SectionState::Connected),
+            Some(Manual)
+        );
+
+        for transport in [Ssh, Localhost, Socket] {
+            // Connected at exact fidelity: nothing, on every transport.
+            assert_eq!(
+                fidelity_action(false, transport, SectionState::Connected),
+                None,
+                "{transport:?}"
+            );
+            // Not connected: a host that dropped while reduced offers
+            // nothing either — the ↻ Reconnect rule has the band.
+            for state in [
+                SectionState::Local,
+                SectionState::Connecting,
+                SectionState::Disconnected,
+                SectionState::NeedsRestart,
+                SectionState::TakenOver,
+                SectionState::Stopped,
+            ] {
+                assert_eq!(
+                    fidelity_action(true, transport, state),
+                    None,
+                    "{transport:?} {state:?}"
+                );
+            }
+        }
+    }
+
+    /// The pill is its own slot: it reaches the band beside the rollup,
+    /// and the rollup is the agent count it always was.
+    #[test]
+    fn the_pill_is_its_own_slot_and_the_rollup_stays_the_agent_count() {
+        let sections = sections(&[
+            reduced("a", HostTransportKind::Ssh, 2),
+            reduced("b", HostTransportKind::Localhost, 0),
+            reduced("c", HostTransportKind::Socket, 1),
+            host("d", SectionState::Connected, 3),
+            HostInput {
+                reduced_fidelity: true,
+                ..host("e", SectionState::Disconnected, 1)
+            },
+        ]);
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.fidelity)
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(FidelityAction::Update),
+                Some(FidelityAction::Restart),
+                Some(FidelityAction::Manual),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.rollup.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some("2 agents"),
+                None,
+                Some("1 agent"),
+                Some("3 agents"),
+                Some("disconnected"),
+            ]
+        );
+    }
+
+    /// The one question the verb policy asks, answered off the transport
+    /// rather than beside it.
+    #[test]
+    fn only_the_sentinel_transport_is_localhost() {
+        assert!(HostTransportKind::Localhost.localhost());
+        assert!(!HostTransportKind::Ssh.localhost());
+        assert!(!HostTransportKind::Socket.localhost());
     }
 
     fn a_ring() -> Vec<RingSection> {
