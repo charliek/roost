@@ -96,6 +96,13 @@ fn session_dir_names(debug_build: bool) -> (&'static str, &'static str) {
     }
 }
 
+/// The session profile's Linux namespace — the lower-case-dashed stem
+/// every per-profile session path descends from, and the one `roostctl
+/// session autostart` names its supervisor artifact after.
+pub fn session_namespace(debug_build: bool) -> &'static str {
+    session_dir_names(debug_build).1
+}
+
 /// Resolved paths for one bundle profile.
 ///
 /// `socket_path` is the Unix-domain-socket path the UI binds and any
@@ -642,6 +649,18 @@ mod tests {
             ("RoostSessionDev", "roost-session-dev"),
             "a debug session must never land in the shipped session's directories"
         );
+    }
+
+    #[test]
+    fn session_namespace_is_the_linux_half_of_the_pair() {
+        assert_eq!(session_namespace(false), "roost-session");
+        assert_eq!(session_namespace(true), "roost-session-dev");
+        for debug_build in [false, true] {
+            assert_eq!(
+                session_namespace(debug_build),
+                session_dir_names(debug_build).1
+            );
+        }
     }
 
     #[test]
