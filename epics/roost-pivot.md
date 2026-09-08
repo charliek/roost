@@ -37,9 +37,11 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R9 | [#426](https://github.com/charliek/roost/issues/426) | RP/M5 | local default flip (HS-5): the UI connects to a local `roost-session` |
 | R10 | [#439](https://github.com/charliek/roost/issues/439) | RP/M3 | a bare `opencode` binds no server, so nothing can drive the session roost reports — the plugin serves a loopback proxy and names it |
 | R11 | [#442](https://github.com/charliek/roost/issues/442) | RP/M4 | the iced client still re-snapshots on reconnect, so R5's resume buys roost's own UI nothing |
-| R12 | [#443](https://github.com/charliek/roost/issues/443) | RP/M6 | autostart's first cut: a dev install repoints a release one, status cannot say whether it is enabled, reboot survival is two steps |
+| R12 | [#443](https://github.com/charliek/roost/issues/443) | RP/M6 | ~~autostart's first cut: a dev install repoints a release one, status cannot say whether it is enabled, reboot survival is two steps~~ — superseded by R16 |
 | R13 | [#444](https://github.com/charliek/roost/issues/444) | — | CI: `pty_shutdown_test` cannot allocate a PTY on macOS, failing `rust-build` on unrelated diffs |
 | R14 | [#447](https://github.com/charliek/roost/issues/447) | RP/M5 | a `vt` fallback is silent and unactionable: nothing in the UI says fidelity dropped, and a remote host has no in-app way to update its daemon |
+| R15 | [#453](https://github.com/charliek/roost/issues/453) | RP/M5 | open `tab.write` and `tab.attach` to every same-UID client, tmux/herdr style; the lease stays as the *foreground* (effects, focus, geometry), never as an input gate |
+| R16 | [#454](https://github.com/charliek/roost/issues/454) | RP/M6 | remove `roostctl session autostart`: sessions come up on demand from the connecting client; supersedes R12 |
 
 **Sequencing.** R6 went first, as the XS item that shook down the
 issue → PR → `Closes` → board chain; R2 and R1 followed, then R8, then
@@ -72,6 +74,27 @@ suggests — the restart dialog still fires on a *protocol* mismatch, which
 moves more often than the Ghostty pin, so R14 only bites when the pin
 moved and the protocol did not.
 
+**R15 reverses one of R1's two halves, on purpose.** R1 made reads free
+and writes owned. Measured against tmux and herdr (2026-09-08), owned
+input is stricter than either substrate for no product gain: tmux lets
+every attached client type, herdr's multi-client attach has no owner at
+all, and both put bells, clipboard and sizing on one foreground client
+without ever gating input on it. Roost follows. Every same-UID client
+may type into and attach to any tab; the lease survives as the
+foreground. The wire change is additive at protocol 4 — shed pins one
+identify vector per generation and must not need a re-pin. Geometry is
+the herdr rule, last interactor wins; smallest-wins was rejected
+because a phone glancing at a tab would shrink the desktop.
+
+**R16 removes what R7 built and R12 was hardening.** A session comes up
+when a client asks for it — the localhost launch ladder, the SSH
+bootstrap ladder, or `roostctl session start` — and R9 makes the first
+of those the app's default. Nothing needs a session up before a client
+exists, a shed included: it gets a `roost-session` when a client joins
+it, like any machine. The supervisor artifact was costing a 2,500-line
+hardening pass with no consumer; it comes back only with a case that
+needs it named in its own acceptance box.
+
 ## Rules that apply in this repo
 
 - **Nothing shed-specific enters roost.** Every change here must serve
@@ -86,10 +109,16 @@ moved and the protocol did not.
 - **Sessions live in `roost-session`, never in the app's own process**
   (R9). Until R9 lands, work that needs a subscribable session must use a
   host session, not the app window.
-- **Write is three things.** Semantic writes go through the agent's API
-  (many writers, the agent serializes). Attach is one client at a time,
-  switched by takeover. `tab.write` follows attach. Reads are free to
-  everyone. R1 is the two-op swap that makes the lease match this.
+- **Write is two things, and reads are free.** Semantic writes go
+  through the agent's API (many writers, the agent serializes). Raw
+  input — `tab.write` and attach — is open to every same-UID client, the
+  tmux/herdr rule (R15, amending R1's "writes owned"). The lease is the
+  *foreground*: it decides who gets `tab.effect`, whose focus
+  suppresses notifications, and who sizes the PTY last; it never gates
+  input. Reads are free to everyone.
+- **No supervisor artifact.** A session comes up on demand from the
+  client that connects (R16). Do not add a unit, a plist, or a doctor
+  probe for one without a case that needs a session before any client.
 - The five-agent instrumentation (plan 046) is the status source of truth.
   Do not add screen-scraping as a competing authority; one status
   authority per tab.
