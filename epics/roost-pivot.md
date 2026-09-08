@@ -37,7 +37,7 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R9 | [#426](https://github.com/charliek/roost/issues/426) | RP/M5 | local default flip (HS-5): the UI connects to a local `roost-session` |
 | R10 | [#439](https://github.com/charliek/roost/issues/439) | RP/M3 | a bare `opencode` binds no server, so nothing can drive the session roost reports — the plugin serves a loopback proxy and names it |
 | R11 | [#442](https://github.com/charliek/roost/issues/442) | RP/M4 | the iced client still re-snapshots on reconnect, so R5's resume buys roost's own UI nothing |
-| R12 | [#443](https://github.com/charliek/roost/issues/443) | RP/M6 | autostart's artifact name is profile-independent, so a dev install repoints a release one at a build-tree binary |
+| R12 | [#443](https://github.com/charliek/roost/issues/443) | RP/M6 | autostart's first cut: a dev install repoints a release one, status cannot say whether it is enabled, reboot survival is two steps |
 | R13 | [#444](https://github.com/charliek/roost/issues/444) | — | CI: `pty_shutdown_test` cannot allocate a PTY on macOS, failing `rust-build` on unrelated diffs |
 
 **Sequencing.** R6 went first, as the XS item that shook down the
@@ -50,10 +50,11 @@ carries the current state; this paragraph is only the order and the
 reasoning behind it.
 
 **R11–R13 are follow-ups from shipped work, and they land before the
-autostart and mobile surfaces are announced.** R12 is a defect in what
-R7 shipped, R11 is the client half R5 did not build, and R13 is a macOS
-CI flake that fails unrelated pull requests — a red job nobody reads is
-how a real regression gets waved through.
+autostart and mobile surfaces are announced.** R12 is one pass over what
+R7 shipped — a defect plus the two things that first cut left unfinished
+— R11 is the client half R5 did not build, and R13 is a macOS CI flake
+that fails unrelated pull requests, because a red job nobody reads is how
+a real regression gets waved through.
 
 ## Rules that apply in this repo
 
