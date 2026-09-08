@@ -1481,14 +1481,27 @@ const MAX_KEY_CHARS: usize = 40;
 /// Metadata keys whose values are safe to print. Everything else prints
 /// its length only — `session_title` is derived from the user's own
 /// prompt, and any adapter can invent new keys.
-const METADATA_VALUE_ALLOWLIST: [&str; 6] = [
+const METADATA_VALUE_ALLOWLIST: [&str; 5] = [
     "model",
     "source",
     "background_tasks",
     "session_crons",
     "gx.remote",
-    "server_url",
 ];
+
+/// Keys whose value is printable only while it still passes the shape its
+/// producer promised. `tab.agent_report` takes arbitrary metadata and
+/// `validate_report` does not inspect it, so a caller can bypass the adapter
+/// that would have rejected the value and hand this renderer anything —
+/// userinfo, a query token — which a user then pastes into an issue. The
+/// adapter's own validator is the gate, applied again at the boundary that
+/// prints. Anything failing it falls back to the generic length.
+fn revalidated(key: &str, value: &str) -> Option<bool> {
+    match key {
+        "server_url" | "gx.remote" => Some(roost_agent::loopback_base_url(value)),
+        _ => None,
+    }
+}
 
 /// Escape control characters so an agent-supplied string cannot inject
 /// fake report lines or ANSI sequences into output a user pastes into an
@@ -1623,7 +1636,11 @@ fn redact_metadata(metadata: &BTreeMap<String, String>) -> String {
         .iter()
         .map(|(key, value)| {
             let shown = redact_to(key, MAX_KEY_CHARS);
-            if METADATA_VALUE_ALLOWLIST.contains(&key.as_str()) {
+            let printable = match revalidated(key, value) {
+                Some(ok) => ok,
+                None => METADATA_VALUE_ALLOWLIST.contains(&key.as_str()),
+            };
+            if printable {
                 format!("{shown}={}", redact(value))
             } else {
                 format!("{shown}=<{} chars>", value.chars().count())
@@ -5100,6 +5117,31 @@ mod tests {
             "a loopback URL is not a secret and is what makes the \
              handshake debuggable: {out}"
         );
+
+        // `tab.agent_report` takes arbitrary metadata and `validate_report`
+        // never looks at it, so a caller can hand this renderer a value the
+        // opencode adapter would have refused. Doctor output gets pasted into
+        // issues, so the shape is re-checked HERE, not trusted from upstream.
+        for hostile in [
+            "http://user:s3cr3t@127.0.0.1:41234",
+            "http://127.0.0.1:41234/?token=s3cr3t",
+            "http://127.0.0.1:41234/#s3cr3t",
+            "http://evil.example.com:41234",
+            "https://127.0.0.1:41234",
+            "http://127.0.0.1.evil.com:41234",
+        ] {
+            let mut m = BTreeMap::new();
+            m.insert("server_url".to_string(), hostile.to_string());
+            let out = redact_metadata(&m);
+            assert!(
+                !out.contains(hostile),
+                "a report that bypassed the adapter must not print verbatim: {out}"
+            );
+            assert!(
+                out.contains("<") && out.contains("chars>"),
+                "it must fall back to the generic length: {out}"
+            );
+        }
         assert!(
             out.contains("session_title=<13 chars>"),
             "an unlisted key must print its length only: {out}"

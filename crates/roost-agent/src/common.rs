@@ -72,7 +72,7 @@ pub(crate) fn array_len(payload: &Value, key: &str) -> usize {
 /// re-publishes it verbatim through `metadata`. Callers filter an
 /// absent/empty/non-string value with [`non_empty`] first; this only
 /// judges the shape once a non-empty string is in hand.
-pub(crate) fn loopback_base_url(value: &str) -> bool {
+pub fn loopback_base_url(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("http://") else {
         return false;
     };
