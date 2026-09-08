@@ -469,6 +469,16 @@ struct HostConn {
     /// earned by one incarnation describes nothing once another is
     /// serving the host.
     facts: Option<ConnectFacts>,
+    /// The rows the connection this one replaced had on screen, drawn
+    /// until this one publishes its own `Reset` (plan 056 §3.3).
+    ///
+    /// Without it a reconnect renders the host's section **empty** for
+    /// the whole prologue — seconds over ssh — because the incarnation
+    /// being replaced is purged the moment the attempt starts and
+    /// nothing takes its place until the snapshot or the replay lands.
+    /// Those shells are still running over there, which is the same
+    /// reading [`RetainedSection`] gives an explicit disconnect.
+    carried: Option<CarriedRows>,
     state: HostConnState,
     /// The last client focus this connection was told, so an unchanged
     /// one is not resent (`Some(None)` is "told: nothing here is
@@ -496,6 +506,19 @@ impl Drop for HostConn {
     }
 }
 
+/// Rows a replaced connection published, on their way to the connection
+/// replacing them. See [`HostConn::carried`].
+struct CarriedRows {
+    /// The incarnation that published them, kept only for the frames
+    /// before the replacement has one of its own: the section keys its
+    /// rows at the *live* incarnation as soon as there is one, but
+    /// `HostView::host` falls through to `HostId::LOCAL` when there is
+    /// none — and a host's rows keyed as local ones would mint `h0.…`
+    /// keys, which resolve against the local workspace.
+    incarnation: HostId,
+    mirror: Arc<SharedMirror>,
+}
+
 /// What an explicitly disconnected host leaves behind: the rows its last
 /// connection published, kept so the section renders dimmed rather than
 /// empty (plan 037 §3.1 — "rows stay listed at reduced opacity", because
@@ -504,9 +527,9 @@ impl Drop for HostConn {
 /// A *dropped* connection needs none of this: its `HostConn` is still in
 /// the set, so [`HostConnSet::section`] finds the mirror the ordinary
 /// way. Only an explicit disconnect removes the connection, and this is
-/// what stands in for it until a reconnect (which purges and rebuilds
-/// from a fresh `tab.list`) or a `host.remove` (which drops it with the
-/// host).
+/// what stands in for it until a reconnect (which hands the rows to
+/// [`HostConn::carried`] and rebuilds from a fresh `tab.list`) or a
+/// `host.remove` (which drops it with the host).
 struct RetainedSection {
     label: String,
     incarnation: HostId,
@@ -965,7 +988,27 @@ impl HostConnSet {
         // the session, not who asked to dial it, so an explicit Connect
         // resumes exactly as an auto-reconnect does.
         let resume = self.checkpoint_for(host);
-        self.forget(host);
+        // The rows `forget` just took off the screen, handed to the
+        // connection replacing them so the section never renders empty
+        // (§3.3) — but drawn from the *frozen* handle the task itself
+        // will resume on where there is one, never from the handle the
+        // replaced task may still be writing: on a resume the `Reset`
+        // that lands is that very handle, so the rows never move.
+        let carried = self.forget(host).map(|rows| CarriedRows {
+            incarnation: rows.incarnation,
+            mirror: match resume.as_ref() {
+                Some(resume) => Arc::clone(&resume.mirror),
+                // No checkpoint means a fresh snapshot is coming, so
+                // nothing downstream needs this handle's identity — and
+                // the task being replaced is only *signalled* to stop,
+                // so it can still apply a last batch to the handle it
+                // holds, under a section already drawing it. Frozen for
+                // the same reason [`task::Resume::freeze`] is, and it
+                // leaves one invariant: what a connection carries is
+                // never something another writer can move.
+                None => Arc::new(SharedMirror::new(rows.mirror.snapshot())),
+            },
+        });
         // An ssh attempt started at [`Self::open_ssh`] and was numbered
         // there, so the connect a working tunnel reaches carries that
         // number rather than minting a second one — one attempt is one
@@ -1021,6 +1064,7 @@ impl HostConnSet {
             incarnation: None,
             payload_kind: None,
             facts: None,
+            carried,
             focus_sent: None,
             // What the task is actually doing the moment it is spawned.
             // The feed's first `Connecting` replaces it — this is only
@@ -2060,7 +2104,7 @@ impl HostConnSet {
         // the one outcome nobody wants, and the lease the entry holds
         // has no owner left either.
         self.clear_outage(host);
-        let Some(conn) = self
+        let Some(mut conn) = self
             .entries
             .get_mut(host)
             .and_then(|entry| entry.conn.take())
@@ -2069,11 +2113,19 @@ impl HostConnSet {
             return None;
         };
         let incarnation = conn.incarnation;
-        // A host that never finished connecting published no rows, so
-        // there is nothing to keep and its section lists none.
-        if let Some((incarnation, mirror)) = incarnation
+        // Whatever the section was drawing, which during a prologue is
+        // the carried rows rather than a live mirror (§3.3): asking to
+        // disconnect a reconnecting host must leave the same rows dimmed
+        // that leaving it alone would have. A host that never published
+        // any has nothing to keep, and its section lists none.
+        let rows = incarnation
             .and_then(|incarnation| Some((incarnation, self.mirrors.remove(&incarnation)?)))
-        {
+            .or_else(|| {
+                conn.carried
+                    .take()
+                    .map(|carried| (carried.incarnation, carried.mirror))
+            });
+        if let Some((incarnation, mirror)) = rows {
             let retained = RetainedSection {
                 label: conn.label.clone(),
                 incarnation,
@@ -2116,26 +2168,51 @@ impl HostConnSet {
     /// This is the reconnect path, and it purges rather than retains on
     /// purpose: the fresh `tab.list` is authoritative, so a reconnect is
     /// purge-then-rebuild and never a merge (§3.2).
-    fn forget(&mut self, host: &str) {
-        if let Some(conn) = self
+    ///
+    /// The rows it took off the screen come back out, because purging
+    /// the *keys* is not the same as blanking the *section*: the
+    /// replacement keeps drawing them until its own `Reset` lands
+    /// (§3.3). Whichever of the three the host had — a live mirror, the
+    /// rows an earlier attempt of this same connection was already
+    /// carrying, or a retained section — is the one thing on screen, so
+    /// they cannot disagree.
+    fn forget(&mut self, host: &str) -> Option<CarriedRows> {
+        let mut carried = None;
+        if let Some(mut conn) = self
             .entries
             .get_mut(host)
             .and_then(|entry| entry.conn.take())
         {
-            if let Some(incarnation) = conn.incarnation {
-                self.mirrors.remove(&incarnation);
-            }
+            carried = conn
+                .incarnation
+                .and_then(|incarnation| {
+                    Some(CarriedRows {
+                        incarnation,
+                        mirror: self.mirrors.remove(&incarnation)?,
+                    })
+                })
+                // `HostConn` is a `Drop` type, so the rows an earlier
+                // attempt left are taken rather than moved out.
+                .or_else(|| conn.carried.take());
             // `Drop` notifies and aborts.
         }
         if let Some(entry) = self.entries.get_mut(host) {
-            entry.retained = None;
+            let retained = entry.retained.take().map(|retained| CarriedRows {
+                incarnation: retained.incarnation,
+                mirror: retained.mirror,
+            });
+            carried = carried.or(retained);
         }
         self.minter.forget_host(host);
+        carried
     }
 
-    fn purge(&mut self, incarnation: HostId) {
-        self.mirrors.remove(&incarnation);
+    /// Take an incarnation's rows out of the set. The handle comes back
+    /// so the caller can decide whether anything keeps drawing them.
+    fn purge(&mut self, incarnation: HostId) -> Option<Arc<SharedMirror>> {
+        let mirror = self.mirrors.remove(&incarnation);
         self.minter.forget_id(incarnation);
+        mirror
     }
 
     /// The op queue for a host, by saved id.
@@ -2319,8 +2396,21 @@ impl HostConnSet {
     /// The live mirror for an incarnation. C6/C7 read it through
     /// [`SharedMirror::read`] at draw time; there is no per-commit copy
     /// to hold on to.
+    ///
+    /// Falls back to the rows its connection is carrying, so it answers
+    /// about the same mirror [`Self::section`] is drawing — a caller
+    /// resolving a key the section handed out must not be told the rows
+    /// it can see do not exist.
     pub(crate) fn mirror(&self, incarnation: HostId) -> Option<&Arc<SharedMirror>> {
-        self.mirrors.get(&incarnation)
+        if let Some(mirror) = self.mirrors.get(&incarnation) {
+            return Some(mirror);
+        }
+        let host = self.owner_of(incarnation)?;
+        let conn = self.entries.get(&host)?.conn.as_ref()?;
+        conn.carried
+            .as_ref()
+            .filter(|_| conn.incarnation == Some(incarnation))
+            .map(|carried| &carried.mirror)
     }
 
     /// What one saved host's sidebar section renders from.
@@ -2329,22 +2419,28 @@ impl HostConnSet {
     /// connected, or removed — whose section renders as disconnected
     /// with no rows.
     ///
-    /// The mirror deliberately outlives both a *drop* and an explicit
-    /// *disconnect*: those shells are still running on the host, so the
-    /// section keeps listing them dimmed until the connection is back.
-    /// It does not outlive a *reconnect* — `Connecting { previous }`
-    /// purges it and the fresh `tab.list` rebuilds, which is §3.2's
-    /// purge-then-rebuild.
+    /// The mirror deliberately outlives a *drop*, an explicit
+    /// *disconnect* and a *reconnect*: those shells are still running on
+    /// the host, so the section keeps listing them until the connection
+    /// is back. A reconnect is still purge-then-rebuild in the *set* —
+    /// `Connecting { previous }` purges the incarnation and the fresh
+    /// `tab.list` or the replay is authoritative — but the rows it
+    /// purged keep being drawn ([`HostConn::carried`]) until the
+    /// replacement's `Reset` replaces them in place.
     pub(crate) fn section(&self, host: &str) -> Option<HostSectionView<'_>> {
         let entry = self.entries.get(host)?;
         if let Some(conn) = entry.conn.as_ref() {
+            let live = conn
+                .incarnation
+                .and_then(|incarnation| self.mirrors.get(&incarnation));
+            let carried = conn.carried.as_ref();
             return Some(HostSectionView {
                 label: conn.label.as_str(),
                 state: &conn.state,
-                incarnation: conn.incarnation,
-                mirror: conn
+                incarnation: conn
                     .incarnation
-                    .and_then(|incarnation| self.mirrors.get(&incarnation)),
+                    .or_else(|| carried.map(|carried| carried.incarnation)),
+                mirror: live.or(carried.map(|carried| &carried.mirror)),
             });
         }
         let retained = entry.retained.as_ref()?;
@@ -2606,15 +2702,30 @@ impl HostConnSet {
         }
         // The reconnect contract: purge the dead incarnation the moment
         // the new attempt starts, so nothing keyed on it survives into
-        // the rebuild that follows.
-        if let HostConnState::Connecting {
-            previous: Some(previous),
-        } = &next
-        {
-            self.purge(*previous);
-        }
+        // the rebuild that follows. Its rows are the exception, and they
+        // are not keyed on it any more — they are carried onto the
+        // connection that replaces it and drawn under *its* incarnation
+        // (§3.3). This arm is a task retrying inside its own loop, so
+        // the writer that published them has already stopped; a
+        // replacement task instead gets a frozen copy seeded at
+        // [`Self::connect`].
+        let carried = match &next {
+            HostConnState::Connecting {
+                previous: Some(previous),
+            } => self.purge(*previous).map(|mirror| CarriedRows {
+                incarnation: *previous,
+                mirror,
+            }),
+            _ => None,
+        };
 
         let conn = self.entries.get_mut(&host)?.conn.as_mut()?;
+        // Never a blind assignment: a replacement task's first
+        // `Connecting` names an incarnation this set already purged at
+        // `connect`, and the rows seeded there are the ones on screen.
+        if let Some(carried) = carried {
+            conn.carried = Some(carried);
+        }
         // A different incarnation, or one that is no longer connected,
         // knows nothing about what it was told before: the queue behind
         // it was flushed, and a session that comes back is back on its
@@ -2645,6 +2756,13 @@ impl HostConnSet {
         }
         if let HostWorkspaceEvent::Reset(mirror) = event {
             self.mirrors.insert(incarnation, mirror);
+            // The rows this connection was carrying have just been
+            // replaced in place — by a fresh snapshot, or by the very
+            // handle a resume carried on. Either way the section draws
+            // the live one from here on (§3.3).
+            if let Some(conn) = self.conn_at_mut(incarnation) {
+                conn.carried = None;
+            }
         }
     }
 
@@ -5277,9 +5395,11 @@ mod tests {
 
     /// What the dimmed section is built on: a dropped connection keeps
     /// the rows it published, because the shells they name are still
-    /// running on the host. A *reconnect* is the one thing that clears
-    /// them — the fresh `tab.list` is authoritative, so the rebuild is
-    /// purge-then-rebuild rather than a merge.
+    /// running on the host. A reconnect purges the *keys* they were
+    /// published under — the fresh `tab.list` is authoritative, so the
+    /// rebuild is never a merge — and carries the rows themselves
+    /// forward, so the section is drawn from something the whole way
+    /// through (plan 056 §3.3).
     #[tokio::test]
     async fn a_dropped_connection_keeps_its_rows_for_the_dimmed_section() {
         let (mut set, _feed) = a_set();
@@ -5324,10 +5444,20 @@ mod tests {
                 previous: Some(incarnation),
             },
         );
-        let section = set.section("h1").expect("still saved");
         assert!(
-            section.mirror.is_none(),
-            "a reconnect purges rather than merging (plan 037 §3.2)"
+            set.mirror(incarnation).is_none(),
+            "a reconnect purges the dead incarnation's key (plan 037 §3.2)"
+        );
+        let section = set.section("h1").expect("still saved");
+        assert_eq!(
+            section.incarnation,
+            Some(fresh),
+            "listed under the incarnation now serving the host"
+        );
+        assert!(
+            section.mirror.is_some(),
+            "and drawn from the rows it carried, rather than blanking \
+             for the whole prologue (plan 056 §3.3)"
         );
     }
 
@@ -5336,7 +5466,8 @@ mod tests {
     /// still holds those shells (plan 037 §3.1). It is the path that
     /// removes the `HostConn` the rows normally hang off, so it is the
     /// one that can silently empty the section — the regression this
-    /// pins. Reconnect still replaces them; remove still clears them.
+    /// pins. A reconnect carries them into its own prologue; remove
+    /// still clears them.
     #[tokio::test]
     async fn an_explicit_disconnect_keeps_the_rows_a_reconnect_replaces_and_remove_clears() {
         let (mut set, _feed) = a_set();
@@ -5376,8 +5507,10 @@ mod tests {
         assert_eq!(set.apply_state(incarnation, HostConnState::Connected), None);
         assert_eq!(set.connected().count(), 0);
 
-        // Reconnect: purge-then-rebuild, so the retained rows go with the
-        // incarnation that published them.
+        // Reconnect: the incarnation that published them is forgotten,
+        // and the rows are handed to the connection replacing it rather
+        // than dropped — a manual Connect draws them through its
+        // prologue exactly as an automatic one does (plan 056 §3.3).
         set.connect(
             "h1",
             "pop-os",
@@ -5386,10 +5519,12 @@ mod tests {
             ConnectMode::Dial,
             AttemptCause::Explicit,
         );
+        assert!(set.mirror(incarnation).is_none());
         let section = set.section("h1").expect("connecting hosts have sections");
         assert!(
-            section.mirror.is_none(),
-            "a reconnect rebuilds from a fresh tab.list (plan 037 §3.2)"
+            section.mirror.is_some(),
+            "the retained rows keep drawing until the fresh tab.list \
+             replaces them (plan 056 §3.3)"
         );
 
         // Remove: the rows go with the host.
@@ -5897,7 +6032,7 @@ mod tests {
     /// Explicit, automatic and observer-only attempts all start from the
     /// checkpoint — what it describes is the session, not who asked to
     /// dial it — and the `forget` every reconnect runs, which drops the
-    /// connection and the rows keyed on it, leaves it alone.
+    /// connection and every key on it, leaves it alone.
     #[tokio::test]
     async fn every_cause_reconnects_from_the_checkpoint() {
         for cause in [AttemptCause::Explicit, AttemptCause::AutoReconnect] {
@@ -5940,6 +6075,266 @@ mod tests {
 
         set.remove("h1");
         assert!(set.checkpoint_for("h1").is_none());
+    }
+
+    // ---- the rows drawn through a reconnect (plan 056 §3.3) ------------
+
+    /// A connected host with three tab rows across two projects on
+    /// screen — what every case below watches for while its connection
+    /// is replaced. The handle comes back so a case can tell the rows
+    /// it is looking at from a fresh snapshot of the same shape.
+    fn a_host_with_rows(set: &mut HostConnSet, socket: &str) -> (HostId, Arc<SharedMirror>) {
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from(socket),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        let mirror = Arc::new(SharedMirror::new(a_mirror(&[2, 1])));
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.apply_workspace(incarnation, HostWorkspaceEvent::Reset(Arc::clone(&mirror)));
+        assert_eq!(set.tabs("h1"), 3);
+        (incarnation, mirror)
+    }
+
+    /// What a connection carries is never a handle another writer can
+    /// move. A replaced task is only *signalled* to stop, so the mirror
+    /// it holds is still live when the replacement starts drawing it —
+    /// and rows shifting under a section nobody touched is exactly the
+    /// flicker §3.3 removes.
+    #[tokio::test]
+    async fn the_carried_rows_cannot_be_moved_by_the_task_that_left() {
+        let (mut set, _feed) = a_set();
+        // No checkpoint to seed from: `Stopped` clears it (§3.2), so
+        // the replacement takes a fresh snapshot and the rows it draws
+        // meanwhile come straight off the handle `forget` recovered.
+        let (old, live) = a_host_with_rows(&mut set, "/nonexistent/roost-set-carried-frozen.sock");
+        set.apply_state(old, HostConnState::Stopped);
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-carried-frozen.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        assert_eq!(
+            set.tabs("h1"),
+            3,
+            "the replacement draws them from the first frame"
+        );
+
+        // The departing task's last batch, applied after the handover.
+        live.reset(a_mirror(&[1]));
+        assert_eq!(
+            set.tabs("h1"),
+            3,
+            "a writer that has left cannot move the rows on screen"
+        );
+    }
+
+    /// Disconnecting a host mid-prologue leaves the same rows dimmed
+    /// that leaving it alone would have. The mirror map is empty during
+    /// a reconnect, so retaining only from it would blank the section on
+    /// exactly the click that means "stop, but keep what you were
+    /// showing me".
+    #[tokio::test]
+    async fn a_disconnect_during_a_reconnect_retains_the_rows_it_was_drawing() {
+        let (mut set, _feed) = a_set();
+        let (old, _rows) =
+            a_host_with_rows(&mut set, "/nonexistent/roost-set-carried-disconnect.sock");
+        set.apply_state(old, dropped("the stream closed"));
+        let retry = set.mint_for("h1");
+        set.apply_state(
+            retry,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        );
+        assert_eq!(set.tabs("h1"), 3, "drawn from the carried rows");
+
+        set.disconnect("h1");
+        assert_eq!(
+            set.tabs("h1"),
+            3,
+            "and still drawn, dimmed, after the disconnect"
+        );
+    }
+
+    /// The section draws rows for every frame of a reconnect, whichever
+    /// way the connection is replaced and however the attempt ends.
+    /// `host.status.tabs` is the number a caller polls across one, and
+    /// it never reads 0 while the far side still holds those shells —
+    /// the unit twin of the E2E's no-flicker assertion.
+    #[tokio::test]
+    async fn the_rows_are_carried_through_every_way_a_connection_is_replaced() {
+        // An in-task retry after a drop: the same `HostConn` mints a
+        // fresh incarnation and purges the one that just died.
+        let (mut set, _feed) = a_set();
+        let (old, rows) = a_host_with_rows(&mut set, "/nonexistent/roost-set-carried-retry.sock");
+        set.apply_state(old, dropped("the stream closed"));
+        assert_eq!(set.tabs("h1"), 3, "a drop keeps its rows, as it always did");
+
+        let retry = set.mint_for("h1");
+        set.apply_state(
+            retry,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        );
+        assert_eq!(set.tabs("h1"), 3, "and the prologue keeps drawing them");
+        let section = set.section("h1").expect("a connecting host has a section");
+        assert_eq!(
+            section.incarnation,
+            Some(retry),
+            "listed under the incarnation now serving the host, so a \
+             click attaches on it"
+        );
+        assert!(Arc::ptr_eq(section.mirror.expect("rows"), &rows));
+
+        // The attempt fails before it ever reaches a `Reset`: the rows
+        // stay listed under the Disconnected, the same reading a
+        // retained section gives an explicit disconnect.
+        set.apply_state(retry, dropped("connection refused"));
+        assert_eq!(set.tabs("h1"), 3);
+
+        // A second rung, from a state that never published rows of its
+        // own: what it carries is still the last thing that did.
+        let again = set.mint_for("h1");
+        set.apply_state(
+            again,
+            HostConnState::Connecting {
+                previous: Some(retry),
+            },
+        );
+        assert_eq!(set.tabs("h1"), 3);
+
+        // An explicit reconnect from `Connected`: a *fresh task*, so the
+        // rows come from what `forget` took off the screen rather than
+        // from a purge.
+        let (mut set, _feed) = a_set();
+        let (live, rows) =
+            a_host_with_rows(&mut set, "/nonexistent/roost-set-carried-explicit.sock");
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-carried-explicit.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        assert!(
+            set.mirror(live).is_none(),
+            "the replaced incarnation is forgotten all the same"
+        );
+        assert_eq!(set.tabs("h1"), 3);
+        let section = set.section("h1").expect("a connecting host has a section");
+        assert_eq!(
+            section.incarnation,
+            Some(live),
+            "keyed at the incarnation that published them until the \
+             replacement has one of its own — never at `HostId::LOCAL`, \
+             which a host's rows would resolve against the local \
+             workspace"
+        );
+        // The same rows, on a handle of their own: with no checkpoint
+        // to resume from there is nothing to keep the identity for, and
+        // the task being replaced can still write the one it holds.
+        assert!(!Arc::ptr_eq(section.mirror.expect("rows"), &rows));
+        assert_eq!(
+            section.mirror.expect("rows").read().tabs().count(),
+            rows.read().tabs().count()
+        );
+    }
+
+    /// A reconnect that has a checkpoint draws the *frozen* copy the
+    /// task itself will resume on, not the handle the task being
+    /// replaced may still be writing — so the `Reset` a resume publishes
+    /// is the handle already on screen and no row moves.
+    #[tokio::test]
+    async fn a_reconnect_with_a_checkpoint_draws_the_handle_it_will_resume_on() {
+        let (mut set, _feed, _, live) = a_host_with_a_checkpoint();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-carried-frozen.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        let drawn = set
+            .section("h1")
+            .and_then(|section| section.mirror)
+            .expect("the rows the prologue keeps drawing");
+        assert_eq!(set.tabs("h1"), 1);
+        assert!(
+            !Arc::ptr_eq(drawn, &live),
+            "the replaced task can still fold a commit into the live \
+             handle; the frozen one is what the replacement resumes from"
+        );
+    }
+
+    /// The `Reset` is where carrying ends: the rows are replaced in
+    /// place — stale to fresh, never through empty — and nothing is left
+    /// to fall back to.
+    #[tokio::test]
+    async fn the_reset_replaces_the_carried_rows_and_ends_the_fallback() {
+        let (mut set, _feed) = a_set();
+        let (old, _) = a_host_with_rows(&mut set, "/nonexistent/roost-set-carried-reset.sock");
+        let fresh = set.mint_for("h1");
+        set.apply_state(
+            fresh,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        );
+        assert!(set.conn("h1").carried.is_some());
+
+        let snapshot = Arc::new(SharedMirror::new(a_mirror(&[1])));
+        set.apply_state(fresh, HostConnState::Connected);
+        set.apply_workspace(fresh, HostWorkspaceEvent::Reset(Arc::clone(&snapshot)));
+        assert!(set.conn("h1").carried.is_none());
+        assert_eq!(set.tabs("h1"), 1, "one repaint, stale to fresh");
+        assert!(Arc::ptr_eq(
+            set.mirror(fresh).expect("the live handle"),
+            &snapshot
+        ));
+    }
+
+    /// Which readers fall back and which do not (§3.3). The section and
+    /// [`HostConnSet::mirror`] draw the carried rows, so a key the
+    /// section handed out resolves against something. `connected()` does
+    /// not: it is state-filtered, and it feeds the palette's
+    /// connected-only verbs — a host mid-reconnect can act on nothing.
+    #[tokio::test]
+    async fn a_carried_mirror_is_drawn_but_is_never_connected() {
+        let (mut set, _feed) = a_set();
+        let (old, rows) = a_host_with_rows(&mut set, "/nonexistent/roost-set-carried-readers.sock");
+        assert_eq!(set.connected().count(), 1);
+
+        let retry = set.mint_for("h1");
+        set.apply_state(
+            retry,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        );
+        assert!(Arc::ptr_eq(
+            set.mirror(retry).expect("the carried rows"),
+            &rows
+        ));
+        assert_eq!(
+            set.connected().count(),
+            0,
+            "a connecting host offers no connected-only verb"
+        );
+        assert!(
+            set.mirror(old).is_none(),
+            "and the incarnation it replaced answers nothing at all"
+        );
     }
 
     #[test]
