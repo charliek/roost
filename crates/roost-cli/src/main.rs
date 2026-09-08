@@ -28,7 +28,7 @@
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install        (alias of `agent install claude`)
 //!   roostctl session {start,stop,status}
-//!   roostctl session autostart {install [--force],uninstall}
+//!   roostctl session autostart {install [--force] [--linger],uninstall}
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
 //!

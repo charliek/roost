@@ -42,6 +42,14 @@
 //! upgrade would report a template that never changed as outdated and
 //! demand a restart for it.
 //!
+//! # Lingering
+//!
+//! `install --linger` grants `loginctl enable-linger`, which keeps the
+//! user manager — and with it the session — up from **boot** rather than
+//! from the next login. `uninstall` never revokes it: the grant is
+//! per-user and system-wide, and any other unit of that user may be
+//! relying on it.
+//!
 //! # Why the binary path is absolutized but never canonicalized
 //!
 //! A packaged `/usr/bin/roost-session` is usually a symlink into a
@@ -169,13 +177,21 @@ const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 #[derive(Subcommand, Debug)]
 pub enum AutostartCmd {
     /// Write the supervisor artifact for this platform, load it, and
-    /// confirm a session answers. Prints the artifact path and the
-    /// `roost-session` binary it names.
+    /// confirm a session answers. Prints the artifact path, the
+    /// `roost-session` binary it names, and — on Linux — whether
+    /// lingering is granted.
     Install {
         /// Replace a file at the artifact path that roostctl did not
         /// write. Its previous contents are echoed to stderr first.
         #[arg(long)]
         force: bool,
+        /// Linux: also `loginctl enable-linger`, so the session comes
+        /// back at boot and not just at the next login. A flag rather
+        /// than the default because it is a system-wide grant — every
+        /// `default.target` unit of this user starts at boot too.
+        /// Refused on macOS, which has no equivalent.
+        #[arg(long)]
+        linger: bool,
     },
     /// Remove the artifact and unload it. This **stops the supervised
     /// session** — a session the supervisor is not running is untouched.
@@ -186,7 +202,7 @@ pub enum AutostartCmd {
 /// keeps the one exit point.
 pub async fn run(cmd: &AutostartCmd) -> Result<i32> {
     match cmd {
-        AutostartCmd::Install { force } => install(*force).await,
+        AutostartCmd::Install { force, linger } => install(*force, *linger).await,
         AutostartCmd::Uninstall => uninstall().await,
     }
 }
@@ -1202,6 +1218,214 @@ pub fn uninstall_step(read: &ArtifactRead, names: &Names) -> UninstallStep {
 }
 
 // ============================================================================
+// Lingering
+// ============================================================================
+
+/// What macOS gets instead of a grant, printed verbatim.
+///
+/// Lingering *is* a logind concept: launchd starts a LaunchAgent at the
+/// next login and has nothing that means "and at boot, with nobody
+/// logged in". So the flag is refused by name rather than quietly
+/// ignored — and refused before the binary is resolved, before any file
+/// is read and before anything is printed, so a flag this platform
+/// cannot honour never leaves half an install behind.
+pub const MACOS_LINGER_REFUSAL: &str = "roostctl session autostart: --linger is a systemd-logind \
+     concept; a LaunchAgent starts at your next login and macOS has no equivalent \
+     (see the host-sessions guide)";
+
+pub fn linger_refusal(platform: Platform, linger: bool) -> Option<&'static str> {
+    (linger && platform == Platform::MacOs).then_some(MACOS_LINGER_REFUSAL)
+}
+
+/// What an install does about lingering once its outcome is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LingerStep {
+    /// Say nothing: there is nothing installed for lingering to keep
+    /// alive, or this platform has no such concept.
+    Skip,
+    /// Ask `show-user` and print the `linger=` line.
+    Report,
+    /// Grant it first, then ask `show-user` anyway.
+    GrantThenReport,
+}
+
+/// The `--linger` table: what the flag does for each way an install can
+/// end. `outcome` is `None` when no outcome was reached at all — a
+/// refusal before or at the write, or an activation that failed.
+///
+/// The grant is made only where the install actually succeeded.
+/// `enable-linger` is idempotent, so `Unchanged` with the flag is the
+/// natural "grant it now" gesture; `ActivationUnconfirmed` keeps the
+/// file but has no working session, so it reports the state without
+/// changing it.
+pub fn linger_step(
+    platform: Platform,
+    outcome: Option<InstallOutcome>,
+    linger: bool,
+) -> LingerStep {
+    if platform != Platform::Linux {
+        return LingerStep::Skip;
+    }
+    let Some(outcome) = outcome else {
+        return LingerStep::Skip;
+    };
+    match outcome {
+        InstallOutcome::ActivationUnconfirmed => LingerStep::Report,
+        InstallOutcome::Unchanged
+        | InstallOutcome::ReinstalledLoaded
+        | InstallOutcome::SupervisedFresh
+        | InstallOutcome::AlreadyRunningUntouched => {
+            if linger {
+                LingerStep::GrantThenReport
+            } else {
+                LingerStep::Report
+            }
+        }
+    }
+}
+
+/// Whether this user's manager stays up with nobody logged in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LingerState {
+    Yes,
+    No,
+    /// `loginctl` could not be run, or said something this command
+    /// cannot place — the reason, as it will be printed.
+    Unknown(String),
+}
+
+/// Read `loginctl show-user … --property=Linger --value`.
+///
+/// Takes the seam's whole `Result` so the one failure that produces no
+/// output at all — no `loginctl` on this box — is a state like any
+/// other rather than an error that would abort an install that has
+/// already succeeded.
+/// Supervisor words as one line of a report.
+///
+/// A failed `loginctl` puts its own text in front of the user, and a
+/// newline in it would open a line the report never wrote — a forged
+/// `linger=yes` among them. Every line break and control byte becomes a
+/// space, and runs of blanks collapse, so the text stays legible and
+/// stays one line.
+fn one_line(raw: &str) -> String {
+    raw.split(|c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn parse_linger(result: &Result<CommandResult>) -> LingerState {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return LingerState::Unknown(format!(
+                "loginctl could not be run: {}",
+                one_line(&format!("{error:#}"))
+            ))
+        }
+    };
+    if !result.ok() {
+        let stderr = result.stderr.trim();
+        return LingerState::Unknown(if stderr.is_empty() {
+            match result.status {
+                Some(code) => format!("loginctl exited {code}"),
+                None => "loginctl was killed by a signal".to_string(),
+            }
+        } else {
+            one_line(stderr)
+        });
+    }
+    match result.stdout.trim() {
+        "yes" => LingerState::Yes,
+        "no" => LingerState::No,
+        // Quoted, so an empty answer is visible and a hostile one
+        // cannot forge a line out of control bytes.
+        other => LingerState::Unknown(format!("unexpected loginctl answer: {other:?}")),
+    }
+}
+
+pub fn render_linger(state: &LingerState, uid: u32) -> String {
+    match state {
+        LingerState::Yes => "linger=yes".to_string(),
+        LingerState::No => format!(
+            "linger=no (the unit starts at login, not at boot; \
+             rerun with --linger or run: loginctl enable-linger {uid})"
+        ),
+        LingerState::Unknown(reason) => format!("linger=unknown ({reason})"),
+    }
+}
+
+const NO_ASK_PASSWORD: &str = "--no-ask-password";
+
+/// `--no-ask-password` on every `loginctl` invocation: [`HostSupervisor`]
+/// inherits this process's stdin, so without it a polkit check from an
+/// inactive session (over ssh, say) would put a password prompt in the
+/// middle of an install. With it the refusal is a deterministic stderr
+/// line instead — and the command printed for the user to run by hand
+/// deliberately omits the flag, because there the prompt is the point.
+fn enable_linger_command(uid: u32) -> Command {
+    Command::new(
+        "loginctl",
+        &["enable-linger", &uid.to_string(), NO_ASK_PASSWORD],
+    )
+}
+
+fn linger_query_command(uid: u32) -> Command {
+    Command::new(
+        "loginctl",
+        &[
+            "show-user",
+            &uid.to_string(),
+            "--property=Linger",
+            "--value",
+            NO_ASK_PASSWORD,
+        ],
+    )
+}
+
+/// What the linger half of an install has to say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LingerOutcome {
+    /// The stderr lines a refused grant prints, in order.
+    pub grant_failure: Vec<String>,
+    /// What `show-user` says, or `None` when the step was
+    /// [`LingerStep::Skip`].
+    pub state: Option<LingerState>,
+}
+
+/// Grant lingering if the step asks for it, then read the state back.
+///
+/// `show-user` is the authority either way: `enable-linger` exiting 0
+/// is a command that was accepted, not a state that was observed, and
+/// the printed line only ever claims what was observed.
+pub fn settle_linger(supervisor: &dyn Supervisor, step: LingerStep) -> LingerOutcome {
+    let uid = supervisor.uid();
+    let grant_failure = match step {
+        LingerStep::Skip => return LingerOutcome::default(),
+        LingerStep::Report => Vec::new(),
+        // `failure.detail`, not `ActivationFailure`'s `Display`: that
+        // names the command including `--no-ask-password`, which the
+        // manual line beside it deliberately omits.
+        LingerStep::GrantThenReport => {
+            match run_all(supervisor, &[enable_linger_command(uid)], |_| false) {
+                Ok(()) => Vec::new(),
+                Err(failure) => vec![
+                    format!(
+                        "roostctl session autostart: loginctl enable-linger {uid}: {}",
+                        one_line(&failure.detail)
+                    ),
+                    format!("run it by hand: loginctl enable-linger {uid}"),
+                ],
+            }
+        }
+    };
+    LingerOutcome {
+        grant_failure,
+        state: Some(parse_linger(&supervisor.run(&linger_query_command(uid)))),
+    }
+}
+
+// ============================================================================
 // I/O
 // ============================================================================
 
@@ -1423,7 +1647,11 @@ async fn current_session_id(socket: &Path) -> Option<String> {
         .map(|identity| identity.session_id)
 }
 
-async fn install(force: bool) -> Result<i32> {
+async fn install(force: bool, linger: bool) -> Result<i32> {
+    if let Some(refusal) = host_platform().and_then(|platform| linger_refusal(platform, linger)) {
+        eprintln!("{refusal}");
+        return Ok(1);
+    }
     let Some((platform, names, home, artifact)) = artifact_target()? else {
         return Ok(1);
     };
@@ -1492,34 +1720,82 @@ async fn install(force: bool) -> Result<i32> {
     }
 
     let supervisor = HostSupervisor::new(platform, names);
+    let uid = supervisor.uid();
     let wrote = matches!(step, WriteStep::Write);
-    let code = supervise_install(&supervisor, &artifact, existing, wrote).await?;
-    report_sibling(platform, &names, &home, supervisor.uid());
-    Ok(code)
+    let outcome = supervise_install(&supervisor, &artifact, existing, wrote).await?;
+
+    let lingering = settle_linger(&supervisor, linger_step(platform, outcome, linger));
+    let sibling = sibling_report(platform, &names, &home, xdg_config_home().as_deref(), uid);
+    for line in install_tail(sibling, &lingering, uid) {
+        match line {
+            Tail::Note(text) => eprintln!("{text}"),
+            Tail::Report(text) => println!("{text}"),
+        }
+    }
+    Ok(install_exit_code(outcome, &lingering))
+}
+
+/// One line the tail of an install prints, and which stream it belongs
+/// on: a note is advice about something this verb did not do, a report
+/// is a fact about the install that just ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tail {
+    Note(String),
+    Report(String),
+}
+
+/// Everything an install says after its outcome, in the order it says
+/// it: the other slot's artifact first — a fact about a file this verb
+/// deliberately left alone — then anything the grant had to say, and
+/// the `linger=` line last, as the closing word about this machine.
+fn install_tail(sibling: Option<String>, linger: &LingerOutcome, uid: u32) -> Vec<Tail> {
+    sibling
+        .map(Tail::Note)
+        .into_iter()
+        .chain(linger.grant_failure.iter().cloned().map(Tail::Note))
+        .chain(
+            linger
+                .state
+                .as_ref()
+                .map(|state| Tail::Report(render_linger(state, uid))),
+        )
+        .collect()
+}
+
+/// A refusal or a failed activation reached no outcome at all and exits
+/// 1; so does an outcome no session could be confirmed for, and so does
+/// a grant that was asked for and refused — the install itself
+/// succeeded there, and its artifact and unit stay where they are.
+fn install_exit_code(outcome: Option<InstallOutcome>, lingering: &LingerOutcome) -> i32 {
+    let failed = !lingering.grant_failure.is_empty()
+        || matches!(outcome, None | Some(InstallOutcome::ActivationUnconfirmed));
+    i32::from(failed)
 }
 
 /// The half of an install that runs once the bytes on disk are settled:
-/// load it, confirm a session, report. Split out so the one sentence
-/// about the other profile's slot has a single place to be printed from.
+/// load it, confirm a session, report. Split out so every way it can end
+/// returns to one place — the tail about the other profile's slot and
+/// about lingering. `None` is an activation that failed — nothing was
+/// classified, and the file is kept.
 async fn supervise_install(
     supervisor: &HostSupervisor,
     artifact: &Path,
     existing: Existing,
     wrote: bool,
-) -> Result<i32> {
+) -> Result<Option<InstallOutcome>> {
     let platform = supervisor.platform();
     let names = supervisor.names();
     let uid = supervisor.uid();
 
     if let Err(failure) = reload_after_write(supervisor, wrote) {
         eprintln!("roostctl session autostart: installed; activation failed: {failure}");
-        return Ok(1);
+        return Ok(None);
     }
     let loaded_before = supervisor.is_loaded()?;
 
     if let Some(settled) = settled_without_supervisor(existing, loaded_before) {
         report_install(settled, platform, names, artifact, uid, None);
-        return Ok(0);
+        return Ok(Some(settled));
     }
 
     let socket = BundleProfile::session()
@@ -1531,7 +1807,7 @@ async fn supervise_install(
         // The file is kept: a retry is `install` again, and `status`
         // reporting it as installed is the truth about what roost owns.
         eprintln!("roostctl session autostart: installed; activation failed: {failure}");
-        return Ok(1);
+        return Ok(None);
     }
 
     let after = confirm_serving(&socket, scaled(CONFIRM_TIMEOUT))
@@ -1549,19 +1825,7 @@ async fn supervise_install(
         after.as_deref(),
     );
     report_install(outcome, platform, names, artifact, uid, after.as_deref());
-    Ok(match outcome {
-        InstallOutcome::ActivationUnconfirmed => 1,
-        _ => 0,
-    })
-}
-
-/// Read the other profile's slot and print the note if it holds an
-/// artifact of its own. Never changes the exit code — it is a fact about
-/// a file this verb deliberately did not touch.
-fn report_sibling(platform: Platform, names: &Names, home: &Path, uid: u32) {
-    if let Some(note) = sibling_report(platform, names, home, xdg_config_home().as_deref(), uid) {
-        eprintln!("{note}");
-    }
+    Ok(Some(outcome))
 }
 
 /// The other slot's path, resolved from *these* names, read and judged.
@@ -1628,7 +1892,15 @@ async fn uninstall() -> Result<i32> {
     // Only once this verb has done what it could: a refusal says nothing
     // about the other slot, since nothing was uninstalled either way.
     if code == 0 {
-        report_sibling(platform, &names, &home, host_uid());
+        if let Some(note) = sibling_report(
+            platform,
+            &names,
+            &home,
+            xdg_config_home().as_deref(),
+            host_uid(),
+        ) {
+            eprintln!("{note}");
+        }
     }
     Ok(code)
 }
@@ -3577,5 +3849,380 @@ mod tests {
 
         assert!(result.ok(), "{result:?}");
         assert_eq!(result.stdout, "LC_ALL=C LANG=C\n");
+    }
+
+    // ------------------------------------------------------------------
+    // Lingering
+    // ------------------------------------------------------------------
+
+    /// Every way an install can end, including the `None` that covers a
+    /// refusal before or at the write and an activation that failed.
+    const ENDINGS: [Option<InstallOutcome>; 6] = [
+        None,
+        Some(InstallOutcome::Unchanged),
+        Some(InstallOutcome::ReinstalledLoaded),
+        Some(InstallOutcome::SupervisedFresh),
+        Some(InstallOutcome::AlreadyRunningUntouched),
+        Some(InstallOutcome::ActivationUnconfirmed),
+    ];
+
+    #[test]
+    fn the_linger_step_is_the_outcome_crossed_with_the_flag() {
+        let table = [
+            (None, LingerStep::Skip, LingerStep::Skip),
+            (
+                Some(InstallOutcome::Unchanged),
+                LingerStep::Report,
+                LingerStep::GrantThenReport,
+            ),
+            (
+                Some(InstallOutcome::ReinstalledLoaded),
+                LingerStep::Report,
+                LingerStep::GrantThenReport,
+            ),
+            (
+                Some(InstallOutcome::SupervisedFresh),
+                LingerStep::Report,
+                LingerStep::GrantThenReport,
+            ),
+            (
+                Some(InstallOutcome::AlreadyRunningUntouched),
+                LingerStep::Report,
+                LingerStep::GrantThenReport,
+            ),
+            (
+                Some(InstallOutcome::ActivationUnconfirmed),
+                LingerStep::Report,
+                LingerStep::Report,
+            ),
+        ];
+        assert_eq!(table.len(), ENDINGS.len());
+        for (outcome, without, with) in table {
+            assert_eq!(
+                linger_step(Platform::Linux, outcome, false),
+                without,
+                "{outcome:?} without the flag"
+            );
+            assert_eq!(
+                linger_step(Platform::Linux, outcome, true),
+                with,
+                "{outcome:?} with the flag"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_never_lingers_whatever_the_install_did() {
+        for outcome in ENDINGS {
+            for flag in [false, true] {
+                assert_eq!(
+                    linger_step(Platform::MacOs, outcome, flag),
+                    LingerStep::Skip,
+                    "{outcome:?} with the flag {flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_macos_refuses_the_linger_flag() {
+        assert_eq!(linger_refusal(Platform::MacOs, false), None);
+        assert_eq!(linger_refusal(Platform::Linux, true), None);
+        assert_eq!(
+            linger_refusal(Platform::MacOs, true),
+            Some(
+                "roostctl session autostart: --linger is a systemd-logind concept; a LaunchAgent \
+                 starts at your next login and macOS has no equivalent \
+                 (see the host-sessions guide)"
+            )
+        );
+    }
+
+    fn unknown(reason: &str) -> LingerState {
+        LingerState::Unknown(reason.to_string())
+    }
+
+    #[test]
+    fn parse_linger_reads_show_users_answer_and_every_way_it_can_fail() {
+        assert_eq!(parse_linger(&Ok(printed("yes\n"))), LingerState::Yes);
+        assert_eq!(parse_linger(&Ok(printed("no\n"))), LingerState::No);
+        assert_eq!(parse_linger(&Ok(printed("  yes \n\n"))), LingerState::Yes);
+        assert_eq!(parse_linger(&Ok(printed("\t no  "))), LingerState::No);
+
+        // No loginctl at all — the seam's own error, not a state.
+        let missing: Result<CommandResult> = Err(anyhow::anyhow!(
+            "run `loginctl show-user 1000 --property=Linger --value --no-ask-password`: \
+             No such file or directory (os error 2)"
+        ));
+        assert_eq!(
+            parse_linger(&missing),
+            unknown(
+                "loginctl could not be run: run `loginctl show-user 1000 --property=Linger \
+                 --value --no-ask-password`: No such file or directory (os error 2)"
+            )
+        );
+
+        // A nonzero exit says what it said, trimmed.
+        for stderr in [
+            "Failed to look up user 99999: No such process",
+            "Failed to connect to bus: No medium found",
+            "User ID 1000 is not logged in or lingering",
+        ] {
+            assert_eq!(
+                parse_linger(&Ok(exit(1, &format!("{stderr}\n")))),
+                unknown(stderr)
+            );
+        }
+        assert_eq!(
+            parse_linger(&Ok(exit(4, "  "))),
+            unknown("loginctl exited 4")
+        );
+
+        // Exit 0 saying something this command cannot place.
+        assert_eq!(
+            parse_linger(&Ok(printed("maybe\n"))),
+            unknown("unexpected loginctl answer: \"maybe\"")
+        );
+        assert_eq!(
+            parse_linger(&Ok(printed(""))),
+            unknown("unexpected loginctl answer: \"\"")
+        );
+        assert_eq!(
+            parse_linger(&Ok(printed("yes\nlinger=no"))),
+            unknown("unexpected loginctl answer: \"yes\\nlinger=no\"")
+        );
+    }
+
+    #[test]
+    fn supervisor_words_can_never_forge_a_line_of_the_report() {
+        // stderr carrying a newline would otherwise print a `linger=`
+        // line the report never wrote.
+        let hostile = exit(1, "failed)\nlinger=yes\nx");
+        let LingerState::Unknown(reason) = parse_linger(&Ok(hostile)) else {
+            panic!("a failed probe is unknown");
+        };
+        assert_eq!(reason, "failed) linger=yes x");
+        assert!(!render_linger(&LingerState::Unknown(reason), 1000).contains('\n'));
+
+        // Control bytes and the Unicode line separators go the same way.
+        let LingerState::Unknown(reason) = parse_linger(&Ok(exit(1, "a\u{7}b\u{2028}c\td"))) else {
+            panic!("a failed probe is unknown");
+        };
+        assert_eq!(reason, "a b c d");
+
+        // And the same for the grant's own failure line, through the seam.
+        let fake = FakeSupervisor::answering(
+            Platform::Linux,
+            vec![exit(1, "denied\nlinger=yes"), printed("no")],
+        );
+        let outcome = settle_linger(&fake, LingerStep::GrantThenReport);
+        for line in &outcome.grant_failure {
+            assert!(!line.contains('\n'), "{line:?}");
+        }
+        assert_eq!(
+            outcome.grant_failure[0],
+            "roostctl session autostart: loginctl enable-linger 501: denied linger=yes"
+        );
+    }
+
+    #[test]
+    fn the_linger_line_says_only_what_show_user_said() {
+        assert_eq!(render_linger(&LingerState::Yes, 1000), "linger=yes");
+        assert_eq!(
+            render_linger(&LingerState::No, 1000),
+            "linger=no (the unit starts at login, not at boot; \
+             rerun with --linger or run: loginctl enable-linger 1000)"
+        );
+        assert_eq!(
+            render_linger(&unknown("Failed to connect to bus: No medium found"), 1000),
+            "linger=unknown (Failed to connect to bus: No medium found)"
+        );
+    }
+
+    #[test]
+    fn every_loginctl_invocation_carries_no_ask_password() {
+        assert_eq!(enable_linger_command(501).to_string(), GRANT);
+        assert_eq!(linger_query_command(501).to_string(), PROBE);
+    }
+
+    /// The two `loginctl` invocations as they are built, and as the fake
+    /// records them at its own uid.
+    const GRANT: &str = "loginctl enable-linger 501 --no-ask-password";
+    const PROBE: &str = "loginctl show-user 501 --property=Linger --value --no-ask-password";
+
+    fn linger_calls(
+        outcome: Option<InstallOutcome>,
+        flag: bool,
+        answers: Vec<CommandResult>,
+    ) -> (Vec<String>, LingerOutcome) {
+        let fake = FakeSupervisor::answering(Platform::Linux, answers);
+        let lingering = settle_linger(&fake, linger_step(Platform::Linux, outcome, flag));
+        (fake.calls(), lingering)
+    }
+
+    #[test]
+    fn a_linux_install_probes_show_user_and_grants_only_when_asked() {
+        // A fresh install without the flag ends at the probe.
+        let (calls, lingering) = linger_calls(
+            Some(InstallOutcome::SupervisedFresh),
+            false,
+            vec![printed("no\n")],
+        );
+        assert_eq!(calls, [PROBE]);
+        assert_eq!(
+            lingering,
+            LingerOutcome {
+                grant_failure: Vec::new(),
+                state: Some(LingerState::No),
+            }
+        );
+
+        // The same install with the flag: grant first, then probe.
+        let (calls, lingering) = linger_calls(
+            Some(InstallOutcome::SupervisedFresh),
+            true,
+            vec![exit(0, ""), printed("yes\n")],
+        );
+        assert_eq!(calls, [GRANT, PROBE]);
+        assert_eq!(lingering.state, Some(LingerState::Yes));
+        assert!(lingering.grant_failure.is_empty());
+
+        // Nothing to write and the flag: it still grants.
+        let (calls, _) = linger_calls(
+            Some(InstallOutcome::Unchanged),
+            true,
+            vec![exit(0, ""), printed("yes\n")],
+        );
+        assert_eq!(calls, [GRANT, PROBE]);
+
+        // No session could be confirmed: probed, never granted.
+        let (calls, lingering) = linger_calls(
+            Some(InstallOutcome::ActivationUnconfirmed),
+            true,
+            vec![printed("no\n")],
+        );
+        assert_eq!(calls, [PROBE]);
+        assert_eq!(lingering.state, Some(LingerState::No));
+
+        // A refusal or a failed activation: neither command runs.
+        for flag in [false, true] {
+            let (calls, lingering) = linger_calls(None, flag, Vec::new());
+            assert_eq!(calls, Vec::<String>::new(), "with the flag {flag}");
+            assert_eq!(lingering, LingerOutcome::default());
+        }
+    }
+
+    #[test]
+    fn show_user_decides_the_line_whether_the_grant_worked_or_not() {
+        // Refused by polkit: the two stderr lines, and the verb exits 1.
+        let (calls, lingering) = linger_calls(
+            Some(InstallOutcome::SupervisedFresh),
+            true,
+            vec![
+                exit(
+                    1,
+                    "Failed to enable linger: Interactive authentication required.\n",
+                ),
+                printed("no\n"),
+            ],
+        );
+        assert_eq!(calls, [GRANT, PROBE]);
+        assert_eq!(
+            lingering.grant_failure,
+            [
+                "roostctl session autostart: loginctl enable-linger 501: \
+                 Failed to enable linger: Interactive authentication required.",
+                "run it by hand: loginctl enable-linger 501",
+            ]
+        );
+        assert_eq!(lingering.state, Some(LingerState::No));
+        assert_eq!(
+            install_exit_code(Some(InstallOutcome::SupervisedFresh), &lingering),
+            1
+        );
+
+        // A probe that fails leaves the line unknown, and the install
+        // still succeeded.
+        let (calls, lingering) = linger_calls(
+            Some(InstallOutcome::SupervisedFresh),
+            true,
+            vec![
+                exit(0, ""),
+                exit(1, "Failed to connect to bus: No medium found\n"),
+            ],
+        );
+        assert_eq!(calls, [GRANT, PROBE]);
+        assert!(lingering.grant_failure.is_empty());
+        assert_eq!(
+            lingering.state,
+            Some(unknown("Failed to connect to bus: No medium found"))
+        );
+        assert_eq!(
+            install_exit_code(Some(InstallOutcome::SupervisedFresh), &lingering),
+            0
+        );
+
+        // A grant with nothing to say for itself is still named, and
+        // still carries the manual command.
+        let (calls, lingering) = linger_calls(
+            Some(InstallOutcome::SupervisedFresh),
+            true,
+            vec![exit(1, "  "), printed("no\n")],
+        );
+        assert_eq!(calls, [GRANT, PROBE]);
+        assert_eq!(
+            lingering.grant_failure,
+            [
+                "roostctl session autostart: loginctl enable-linger 501: exit Some(1)",
+                "run it by hand: loginctl enable-linger 501",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_sibling_note_comes_first_and_the_linger_line_last() {
+        let note = "note: the dev-slot artifact also exists".to_string();
+        let lingering = LingerOutcome {
+            grant_failure: vec![
+                "roostctl session autostart: loginctl enable-linger 501: nope".to_string(),
+                "run it by hand: loginctl enable-linger 501".to_string(),
+            ],
+            state: Some(LingerState::No),
+        };
+        assert_eq!(
+            install_tail(Some(note.clone()), &lingering, 501),
+            [
+                Tail::Note(note),
+                Tail::Note(
+                    "roostctl session autostart: loginctl enable-linger 501: nope".to_string()
+                ),
+                Tail::Note("run it by hand: loginctl enable-linger 501".to_string()),
+                Tail::Report(render_linger(&LingerState::No, 501)),
+            ]
+        );
+
+        // Nothing to say about either.
+        assert_eq!(
+            install_tail(None, &LingerOutcome::default(), 501),
+            Vec::<Tail>::new()
+        );
+    }
+
+    #[test]
+    fn an_install_exits_1_only_for_a_failure_it_can_name() {
+        let clean = LingerOutcome::default();
+        assert_eq!(install_exit_code(None, &clean), 1);
+        assert_eq!(
+            install_exit_code(Some(InstallOutcome::ActivationUnconfirmed), &clean),
+            1
+        );
+        for outcome in [
+            InstallOutcome::Unchanged,
+            InstallOutcome::ReinstalledLoaded,
+            InstallOutcome::SupervisedFresh,
+            InstallOutcome::AlreadyRunningUntouched,
+        ] {
+            assert_eq!(install_exit_code(Some(outcome), &clean), 0, "{outcome:?}");
+        }
     }
 }
