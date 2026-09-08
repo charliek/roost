@@ -685,13 +685,24 @@ def test_a_build_mismatch_reaches_needs_restart_and_a_restart_restores_the_layou
     settles in `needs-restart`, which the palette reports as the Connect
     verb's subtitle.
 
+    Since plan 053 that takes a **second** knob. A session that offers
+    `vt` lets a skewed client connect in fallback instead of stopping
+    (the sibling case below), so reaching `needs-restart` at all now
+    means a session old enough to have no fallback to offer —
+    `ROOST_SESSION_LEGACY_KINDS` is what puts this daemon back into that
+    shape. Both knobs, or this case tests the wrong thing.
+
     The second half runs the restart the dialog's button runs — stop,
     wait for the socket to really go, start again — and asserts the
     thing that makes the warning honest: the layout comes back, as fresh
     shells, and the client attaches to it.
     """
     require_test_mode(roost)
-    start_session(session_env, ROOST_SESSION_FAKE_BUILD=FAKE_BUILD)
+    start_session(
+        session_env,
+        ROOST_SESSION_FAKE_BUILD=FAKE_BUILD,
+        ROOST_SESSION_LEGACY_KINDS="1",
+    )
     identity = session_env.identify()
     assert identity["libghostty_build"] == FAKE_BUILD, identity
 
@@ -719,6 +730,76 @@ def test_a_build_mismatch_reaches_needs_restart_and_a_restart_restores_the_layou
                 "the dialog promises fresh shells; a restored process would make it a lie"
             )
             host_key(roost, int(restored[0]["id"]))
+
+
+def test_a_build_skew_connects_in_vt_fallback(roost, session_env):
+    """The same skew, against a session that *has* a fallback to offer.
+
+    This is what plan 053 changes about the case above: `vt` is a VT
+    byte stream any parser replays, so a client whose libghostty pin
+    does not match no longer has to stop. It connects, hydrates and
+    renders — at the fidelity `vt` can carry, which is why the kind is
+    reported rather than hidden.
+
+    `payload_kind` is the observable, and it is the *agreed* kind: the
+    control reply and the data connection's handshake must name the same
+    one or the attach is refused, so one field says what this connection
+    is delivering. It is absent until an attach has actually happened,
+    which is why the saved-but-unconnected host is read first.
+
+    The fidelity claim is then made where it can be checked over IPC:
+    the client's mirror and the session's own terminal, both dumped with
+    history, agree row for row.
+    """
+    require_test_mode(roost)
+    start_session(session_env, ROOST_SESSION_FAKE_BUILD=FAKE_BUILD)
+    assert session_env.identify()["libghostty_build"] == FAKE_BUILD
+
+    with session_env.client() as session:
+        tab = quiet_tab(session, first_project(session), session_env.launch_cwd)
+
+    with saved_host(roost, session_env) as under_test:
+        before = roost.host_status(id=under_test.saved_id)["hosts"][0]
+        assert "payload_kind" not in before, before
+
+        under_test.connect_and_wait()
+        key = host_key(roost, tab)
+
+        # The field trails the connection: it is written when an attach
+        # is *accepted*, and a host tab answers a dump from its mirror
+        # before that. So the wait is the assertion — a host that never
+        # attached would sit here without one.
+        def attached_status() -> dict | None:
+            row = roost.host_status(id=under_test.saved_id)["hosts"][0]
+            return row if "payload_kind" in row else None
+
+        status = wait_until(
+            attached_status, 30.0, "the host to report the kind it attached as"
+        )
+        assert status["state"] == "connected", status
+        assert status["payload_kind"] == "vt", status
+
+        # Seeded past the viewport so there is history to compare, and
+        # after the attach so both terminals are already at the geometry
+        # the attach negotiated.
+        lines = 120
+        last = f"VTFALL-{lines - 1:04d}"
+        with session_env.client() as session:
+            session.tab_feed_pty_bytes(
+                tab, "".join(f"VTFALL-{i:04d}\r\n" for i in range(lines)).encode()
+            )
+            wait_session_dump_contains(session, tab, last)
+            wait_dump_contains(roost, key, last)
+            served = session.dump(tab, scrollback=200)
+        mirrored = roost.call("tab.dump", {"tab_id": key, "scrollback": 200})
+        assert served["scrollback_rows"] > 0, served
+        assert (mirrored["cols"], mirrored["rows"]) == (served["cols"], served["rows"])
+        assert mirrored["scrollback_rows"] == served["scrollback_rows"], (
+            mirrored["scrollback_rows"],
+            served["scrollback_rows"],
+        )
+        assert mirrored["scrollback_text"] == served["scrollback_text"]
+        assert mirrored["rows_text"] == served["rows_text"]
 
 
 def watched_tab_ids(roost: Roost, saved_id: str) -> set[int]:

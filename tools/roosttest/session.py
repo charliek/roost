@@ -111,6 +111,11 @@ _SANITIZE = (
     # libghostty build no client can match, so the cases that want it
     # pass it per launch and nothing else inherits one.
     "ROOST_SESSION_FAKE_BUILD",
+    # The pre-`vt` payload-kind override (plan 053 §3.2). A stray value
+    # would hide the `vt` kind from every session here, turning the
+    # negotiation and fallback cases into assertions about a shape only
+    # one of them asks for.
+    "ROOST_SESSION_LEGACY_KINDS",
     # The replay ring's test-mode window override (plan 052 §3.6), for
     # the same reason: a stray value in a developer's shell would shrink
     # (or widen) the ring under every resume case here, including the

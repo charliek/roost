@@ -19,27 +19,37 @@ response — so this is its own module for the same reason
 
 # What this deliberately does NOT do
 
-It never decodes a GHOSTSNP snapshot. The encoded stream that rides
-`SNAP` frames is libghostty's format, and there is exactly one client
-implementation of it in this repo — the Rust integration client
-(`crates/roost-session/tests/attach_stream_test.rs`), which drives the
-real `SnapshotDecoder`. A second, Python-side decoder would be a
-re-implementation that could agree with the wire while both disagreed
-with libghostty, which is the failure the single-implementation rule
-exists to prevent (architecture §12).
+It never decodes a payload. Neither kind's bytes are interpreted here:
 
-What this module does instead is *scan record tags* — the envelope is 10
-bytes and each record header is `u16 tag | u32 len | u32 crc`, so
-walking record boundaries needs no knowledge of any payload. That is
-enough to answer the questions the contract lane asks: did READY arrive,
-where, did it precede the history behind it, did FINISH land under load.
-The tags are boundary markers here, never semantics.
+* **`ghostty-snapshot`** rides libghostty's own binary format, and there
+  is exactly one client implementation of it in this repo — the Rust
+  integration client (`crates/roost-session/tests/attach_stream_test.rs`),
+  which drives the real `SnapshotDecoder`. A second, Python-side decoder
+  would be a re-implementation that could agree with the wire while both
+  disagreed with libghostty, which is the failure the
+  single-implementation rule exists to prevent (architecture §12).
+* **`vt`** is a VT byte stream, and replaying one is a terminal
+  emulator's job. The fidelity proof for `vt` is likewise Rust-side
+  (`roost-vt`'s corpus and `attach_stream_test`), where libghostty is
+  the parser.
+
+What this module does instead is **frame accounting** — plus, for
+GHOSTSNP, a walk of its record *boundaries*: the envelope is 10 bytes
+and each record header is `u16 tag | u32 len | u32 crc`, so finding
+boundaries needs no knowledge of any payload. That is enough to answer
+the questions the contract lane asks: did READY arrive, where, did it
+precede the history behind it, did FINISH land under load. The tags are
+boundary markers here, never semantics.
 
 # What it does do
 
-* [`SnapScanner`] — reassembles the `SNAP` byte stream across frames
-  (frames carry arbitrary byte windows; records are NOT frame-aligned)
-  and walks record boundaries.
+* [`SnapScanner`] — reassembles a GHOSTSNP `SNAP` byte stream across
+  frames (frames carry arbitrary byte windows; records are NOT
+  frame-aligned) and walks record boundaries.
+* [`VtPayload`] — the `vt` counterpart: it concatenates the payload and
+  watches for the one zero-length `SNAP` frame that closes it. Its
+  [`VtPayload.plain_rows`] is a row *count and position* cross-check
+  against `tab.dump`, not a replay — see the class docstring.
 * [`DataPlane`] — the connection: handshake, preamble, framed reads with
   cross-read reassembly, `INPUT`/`RESIZE` writes.
 * The invariants that hold on every connection, checked as frames
@@ -50,10 +60,13 @@ The tags are boundary markers here, never semantics.
     more. A gap is the one thing the protocol promises can never happen;
   - **terminal frames**: `ERROR` and `EXIT` both end the connection, so
     anything behind either is a protocol violation;
-  - **nothing precedes READY**: in snapshot mode the prefix goes out
-    whole, so no `PTY` or `EXIT` frame may arrive before the READY
-    record lands. Resume streams are exempt — they carry no snapshot;
-  - **FINISH closes the snapshot**: no `SNAP` frame follows it.
+  - **nothing precedes readiness**: in snapshot mode the prefix goes out
+    whole, so no `PTY` or `EXIT` frame may arrive before the payload's
+    readiness boundary lands — GHOSTSNP's READY record, or, under `vt`,
+    the empty-SNAP terminator that ends the whole payload. Resume
+    streams are exempt — they carry no payload;
+  - **the end marker closes the payload**: no `SNAP` frame follows
+    GHOSTSNP's FINISH record or `vt`'s empty terminator frame.
 
 Every public entry point takes a raw budget, scales it once through
 `client.scaled_timeout`, and turns it into an absolute deadline that
@@ -100,6 +113,12 @@ FRAME_NAMES = {
 
 SESSION_PROTOCOL_VERSION = 4
 GHOSTTY_SNAPSHOT = "ghostty-snapshot"
+VT = "vt"
+#: `roost_engine::attach::VT_SNAP_FRAME_BYTES`. Not the wire's 1 MiB
+#: cap: a `vt` attach holds every PTY frame behind its whole payload and
+#: drains the tee only between writes, so the frame size is what bounds
+#: how long a busy tab goes unread.
+VT_SNAP_FRAME_BYTES = 64 * 1024
 
 # ---------------------------------------------------------------------------
 # GHOSTSNP framing — TAG SCANNING ONLY (see the module docstring)
@@ -181,6 +200,12 @@ class SnapScanner:
     the cursor passes them, so a 2000-line snapshot does not sit in
     memory twice.
     """
+
+    #: What the two boundaries are called on the wire. [`DataPlane`]
+    #: reads these so its waits and its violation messages name the
+    #: marker of whichever kind is being served.
+    ready_name = "the snapshot's READY record"
+    end_name = "the snapshot's FINISH record"
 
     def __init__(self) -> None:
         self._buf = bytearray()
@@ -276,6 +301,139 @@ class SnapScanner:
 
 
 # ---------------------------------------------------------------------------
+# The `vt` payload
+# ---------------------------------------------------------------------------
+
+
+def strip_escapes(data: bytes) -> bytes:
+    """Remove every escape sequence, leaving the printed bytes.
+
+    Enough of the grammar to walk *past* a sequence, which is all the
+    row accounting below needs: CSI (`ESC [` … final `0x40`-`0x7e`), OSC
+    (`ESC ]` … `BEL` or `ESC \\`), the other string sequences (DCS, SOS,
+    PM, APC — same two terminators), and the two-or-three-byte escapes
+    (`ESC ( B`, `ESC H`, …). An unterminated string sequence runs to the
+    end of the payload, which is exactly what the retained continuation
+    at the tail of a `vt` payload is.
+
+    Nothing here interprets what it drops — a CSI is skipped, never
+    applied. See [`VtPayload`] for why that is the whole point.
+    """
+    out = bytearray()
+    at = 0
+    end = len(data)
+    while at < end:
+        byte = data[at]
+        if byte != 0x1B:
+            out.append(byte)
+            at += 1
+            continue
+        at += 1
+        if at >= end:
+            break
+        opener = data[at]
+        at += 1
+        if opener == 0x5B:  # CSI: parameters/intermediates, then a final byte
+            while at < end and 0x20 <= data[at] <= 0x3F:
+                at += 1
+            if at < end:
+                at += 1
+            continue
+        if opener in (0x5D, 0x50, 0x58, 0x5E, 0x5F):  # OSC, DCS, SOS, PM, APC
+            while at < end:
+                if data[at] == 0x07:
+                    at += 1
+                    break
+                if data[at] == 0x1B and at + 1 < end and data[at + 1] == 0x5C:
+                    at += 2
+                    break
+                at += 1
+            continue
+        # Everything else: zero or more intermediates, then a final byte
+        # that `opener` already is unless it was an intermediate.
+        while 0x20 <= opener <= 0x2F and at < end:
+            opener = data[at]
+            at += 1
+    return bytes(out)
+
+
+class VtPayload:
+    """Collect a `vt` payload and account for the frames carrying it.
+
+    The `vt` kind has no framing of its own — it is a plain VT byte
+    stream — so the only structure on the wire is the `SNAP` framing
+    around it plus the **one zero-length `SNAP` frame** that closes it
+    (`crates/roost-engine/src/attach.rs`). That marker is both the
+    readiness boundary and the end of the payload, which is why
+    `ready_seen` and `finish_seen` move together here where GHOSTSNP has
+    two distinct records.
+
+    There is no magic to check: the first byte of a `vt` payload is
+    whatever the composition starts with.
+    """
+
+    ready_name = "the vt payload's empty-SNAP terminator"
+    end_name = ready_name
+
+    def __init__(self) -> None:
+        self.payload = bytearray()
+        self.total_bytes = 0
+        self.ready_seen = False
+        self.finish_seen = False
+        #: Zero-length `SNAP` frames seen. The terminator is emitted
+        #: unconditionally and exactly once; [`DataPlane`] rejects any
+        #: `SNAP` frame behind it, so this can only ever be 0 or 1 — it
+        #: is counted so a test can say "exactly one" directly.
+        self.terminator_frames = 0
+
+    def feed(self, payload: bytes) -> None:
+        if not payload:
+            self.terminator_frames += 1
+            self.ready_seen = True
+            self.finish_seen = True
+            return
+        assert len(payload) <= VT_SNAP_FRAME_BYTES, (
+            f"a vt SNAP frame carried {len(payload)} bytes, past the "
+            f"{VT_SNAP_FRAME_BYTES}-byte cap"
+        )
+        self.total_bytes += len(payload)
+        self.payload += payload
+
+    def plain_rows(self) -> list[str]:
+        """The payload's rows, escapes removed, split on `\\r\\n` pairs.
+
+        A cross-check, not a replay. The composition writes one `\\r\\n`
+        per row and pads with bare ones up to the terminal's total row
+        count (plan 053 §3.1 step 3), and cells hold no C0 bytes — so
+        counting the pairs answers "did the payload carry a row for
+        every row the server has" and "did the seeded markers land at
+        the same offsets `tab.dump` reports them at". Nothing here
+        knows what a CSI *does*: the escapes are skipped, and a row's
+        text is whatever printable bytes were between two newlines.
+
+        Split on the pair alone, never a lone `\\r` or `\\n`, because
+        those two carry no row of their own in this stream.
+
+        The tail row is the one to read with care: it holds the cursor
+        cell the state pass re-prints, so it is a row of the terminal
+        but not a full picture of it.
+        """
+        return [
+            row.decode("utf-8", "replace")
+            for row in strip_escapes(bytes(self.payload)).split(b"\r\n")
+        ]
+
+
+def collector_for(kind: str):
+    """The payload accountant for a negotiated kind."""
+    if kind == VT:
+        return VtPayload()
+    if kind == GHOSTTY_SNAPSHOT:
+        return SnapScanner()
+    raise AssertionError(f"no payload accountant for kind {kind!r}")
+
+
+# ---------------------------------------------------------------------------
 # The connection
 # ---------------------------------------------------------------------------
 
@@ -313,13 +471,20 @@ class DataPlane:
     """One attach data connection.
 
     Open it, [`handshake`] with a ticket `tab.attach` handed out, then
-    read frames. Contiguity, the SNAP scan, and the terminal-frame
-    bookkeeping all happen as frames arrive, so a test asserts on the
-    *conclusion* rather than re-deriving it.
+    read frames. Contiguity, the payload accounting, and the
+    terminal-frame bookkeeping all happen as frames arrive, so a test
+    asserts on the *conclusion* rather than re-deriving it.
+
+    `kind` is the payload kind this connection expects to be served.
+    The handshake reply is what actually selects the accountant — it is
+    the authoritative statement of what the server negotiated — and a
+    reply naming a different kind than the caller asked for fails here
+    rather than being scanned as the wrong format.
     """
 
-    def __init__(self, socket_path, timeout: float = 15.0):
+    def __init__(self, socket_path, timeout: float = 15.0, kind: str = GHOSTTY_SNAPSHOT):
         self.path = str(socket_path)
+        self.kind = kind
         self._buf = b""
         self._eof = False
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -331,18 +496,21 @@ class DataPlane:
         #: be empty: a rejection is a JSON line and a close, never a
         #: preamble the client would then try to parse.
         self.trailing = b""
-        self.snap = SnapScanner()
+        self.snap = collector_for(kind)
         self.frames_read = 0
         self.pty_frames = 0
         self.pty_bytes = 0
-        #: `frames_read` at the moment the READY tag completed, and at
-        #: the first PTY frame — the ordering assertions compare them.
+        #: `frames_read` at the moment the readiness boundary landed,
+        #: and at the first PTY frame — the ordering assertions compare
+        #: them.
         self.ready_at_frame: int | None = None
         self.first_pty_at_frame: int | None = None
         self.snap_frames = 0
-        #: How many SNAP frames it took to deliver the READY prefix. The
+        #: How many SNAP frames it took to deliver the ready prefix. The
         #: server cuts its first frame exactly on the READY boundary, so
-        #: this is 1 for any prefix under the 1 MiB frame cap.
+        #: under GHOSTSNP this is 1 for any prefix under the 1 MiB frame
+        #: cap. Under `vt` the whole payload is the prefix, so it counts
+        #: every payload frame plus the terminator.
         self.snap_frames_at_ready: int | None = None
         #: The next seq a PTY frame must carry. Set from the handshake's
         #: fence and advanced on every frame.
@@ -355,9 +523,9 @@ class DataPlane:
         #: rather than something a client should keep parsing.
         self.terminal_frame: str | None = None
         #: Whether this connection was served a snapshot. Set from the
-        #: handshake reply, because the READY rules apply to exactly one
-        #: of the two modes: a resume stream has no snapshot and
-        #: therefore no READY to order anything against.
+        #: handshake reply, because the readiness rules apply to exactly
+        #: one of the two modes: a resume stream carries no payload and
+        #: therefore no boundary to order anything against.
         self.snapshot_mode: bool | None = None
 
     # -- lifecycle --------------------------------------------------------
@@ -395,6 +563,11 @@ class DataPlane:
         the caller's next read is the first frame. On refusal the socket
         is read to EOF into [`trailing`] — the contract is one line and a
         close, and a rejected client must never be handed binary.
+
+        The reply's `kind` is what the payload is read as: the data
+        connection's own handshake is the authoritative statement of
+        what was negotiated (plan 053 §3.3), so a client that guessed
+        would be reading a format nobody promised it.
         """
         request: dict = {"attach": token, "protocol_version": protocol_version}
         if resume_from_seq is not None:
@@ -417,6 +590,11 @@ class DataPlane:
                 server_epoch=int(raw["server_epoch"]),
                 tab_generation=int(raw["tab_generation"]),
             )
+            assert reply.kind == self.kind, (
+                f"this connection was opened to read {self.kind!r} but the session "
+                f"served {reply.kind!r}"
+            )
+            self.snap = collector_for(reply.kind)
             self._read_preamble(deadline)
             self.next_seq = reply.seq + 1
             self.snapshot_mode = reply.mode == "snapshot"
@@ -484,14 +662,15 @@ class DataPlane:
                 return frames
 
     def read_until_ready(self, timeout: float = 30.0) -> list[Frame]:
-        """Read until the READY record has landed in the SNAP stream."""
+        """Read until the payload's readiness boundary has landed."""
         return self.read_frames_until(
-            lambda _f: self.snap.ready_seen, timeout, "the snapshot's READY record"
+            lambda _f: self.snap.ready_seen, timeout, self.snap.ready_name
         )
 
     def read_until_finish(self, timeout: float = 60.0) -> list[Frame]:
+        """Read until the payload's end marker has landed."""
         return self.read_frames_until(
-            lambda _f: self.snap.finish_seen, timeout, "the snapshot's FINISH record"
+            lambda _f: self.snap.finish_seen, timeout, self.snap.end_name
         )
 
     def drain_to_close(self, timeout: float = 30.0, byte_cap: int | None = None) -> Ending:
@@ -626,11 +805,13 @@ class DataPlane:
                 f"{self.terminal_frame} frame on {self.path}"
             )
         if frame.frame_type == FRAME_SNAP:
-            # FINISH is the snapshot's last record; there are no bytes
-            # behind it to carry.
+            # The end marker is the last thing the payload carries;
+            # there are no bytes behind it. Under `vt` a frame here is
+            # the client-side `protocol-error` the plan names, so the
+            # harness treats it as the failure it is.
             if self.snap.finish_seen:
                 raise AssertionError(
-                    "a SNAP frame arrived after FINISH closed the snapshot stream"
+                    f"a SNAP frame arrived after {self.snap.end_name} closed the payload"
                 )
             self.snap_frames += 1
             self.snap.feed(frame.payload)
@@ -662,23 +843,26 @@ class DataPlane:
             raise AssertionError(f"unknown server frame type 0x{frame.frame_type:02x}")
 
     def _reject_before_ready(self, frame: Frame) -> None:
-        """Nothing but snapshot bytes precedes READY, in snapshot mode.
+        """Nothing but payload bytes precedes readiness, in snapshot mode.
 
-        READY is the point at which the client first has a terminal, and
-        a `PTY` frame ahead of it is a frame with nowhere to go — the
-        client would have to queue it itself, which is the queue the
-        server holds on its behalf (architecture §4.3 step 3, "queues the
-        rest"; `attach.rs`'s `holding = sent < self.ready_end`). So the
-        prefix goes out whole and live traffic starts flowing behind it.
+        The boundary is the point at which the client first has a
+        terminal, and a `PTY` frame ahead of it is a frame with nowhere
+        to go — the client would have to queue it itself, which is the
+        queue the server holds on its behalf (architecture §4.3 step 3,
+        "queues the rest"; `attach.rs`'s `holding = sent <
+        self.ready_end || terminator_due`). So the prefix goes out whole
+        and live traffic starts flowing behind it. Under `vt` the prefix
+        is the whole payload, which is why the terminator is what a
+        `PTY` frame must wait for there.
 
-        Resume streams are exempt and must be: they carry no snapshot at
+        Resume streams are exempt and must be: they carry no payload at
         all, so `ready_seen` is never true and every frame on them is a
         PTY frame by construction. `ERROR` is exempt in both modes — it
         can end a connection at any point, including during the prefix.
         """
         if self.snapshot_mode and not self.snap.ready_seen:
             raise AssertionError(
-                f"a {frame.name} frame arrived before the snapshot's READY record "
+                f"a {frame.name} frame arrived before {self.snap.ready_name} "
                 f"(after {self.snap_frames} SNAP frames, {self.snap.total_bytes} SNAP bytes)"
             )
 
