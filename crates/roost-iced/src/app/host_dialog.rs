@@ -263,6 +263,13 @@ pub(super) enum HostDialog {
     ConfirmRestart {
         saved_id: String,
         prompt: super::host_notice::RestartPrompt,
+        /// The session this prompt was composed about, for the
+        /// reduced-fidelity arm (plan 056 §3.6): that one is raised at
+        /// a host this client is **attached to**, and confirming stops
+        /// the session it names. `None` for the compatibility-gate arm,
+        /// which is raised at a host with no session this client can
+        /// name at all.
+        expected_session: Option<String>,
     },
     /// Consent to install, update or start `roost-session` on a host
     /// reached over ssh (plan 039 §3.5).

@@ -1659,11 +1659,16 @@ impl App {
                 self.clear_palette_state();
                 self.open_host_stop_dialog(&saved_id, &label);
             }
-            // Unreachable for now: nothing fills `HostRow.fidelity` in,
-            // so neither is ever listed. The handler both route to
-            // arrives with the consent card it opens.
+            // **Neither consults `origin`**, exactly like `Stop` above.
+            // Plan 039 §3.5's rule is that a machine is never *prompted
+            // by a connect it did not ask for*; these two exist only on
+            // a person's connected, reduced-fidelity host, and their
+            // first remote activity is a consent card. Listing them is
+            // still gated on `HostRow.fidelity`, which nothing fills in
+            // until the sidebar does.
             HostVerb::Update(saved_id) | HostVerb::Restart(saved_id) => {
-                return Err(format!("host {saved_id} is not at reduced fidelity"));
+                self.clear_palette_state();
+                self.host_fidelity_action_requested(&saved_id);
             }
             HostVerb::Remove(saved_id) => {
                 self.clear_palette_state();

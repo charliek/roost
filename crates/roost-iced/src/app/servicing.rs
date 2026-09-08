@@ -812,7 +812,7 @@ fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
 /// whether or not that path resolves. A target that classifies as
 /// nothing at all never connects (`host_lifecycle::dial_saved_host`
 /// refuses it), so it takes the transport that offers nothing.
-fn transport_kind(target: &str) -> host_sidebar::HostTransportKind {
+pub(super) fn transport_kind(target: &str) -> host_sidebar::HostTransportKind {
     use host_sidebar::HostTransportKind;
     if roost_ipc::ssh::target_is_localhost(target) {
         return HostTransportKind::Localhost;

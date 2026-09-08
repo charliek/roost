@@ -3,8 +3,9 @@
 //! verb raises when the session is one this client cannot talk to at
 //! all — a protocol it does not speak, no payload kind it can decode,
 //! or a build skew against a session too old to serve `vt`. A skew a
-//! session *can* serve connects instead, and says so only in the log
-//! and in `host.status`'s `payload_kind`.
+//! session *can* serve connects instead, at reduced fidelity, and is
+//! asked about from the band rather than from this gate —
+//! [`restart_prompt_for_skew`] is that question.
 //!
 //! Pure, and deliberately kept away from the widgets: "which banner,
 //! which buttons, and is there a restart button at all" is the part that
@@ -18,7 +19,7 @@
 //! them side by side is how the copy stays consistent.
 
 use crate::host_conn::state::{
-    BuildMismatch, HostConnState, MismatchKind, RestartAction, CLIENT_PAYLOAD_KINDS,
+    BuildMismatch, HostConnState, MismatchKind, RestartAction, Skew, CLIENT_PAYLOAD_KINDS,
 };
 
 /// The banner drawn over a host tab's last frame.
@@ -216,6 +217,48 @@ pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPr
             action: mismatch.restart,
             confirm: None,
         },
+    }
+}
+
+/// Why a connection is at reduced fidelity, and what that costs — the
+/// sentences both cards raised from the band lead with (plan 056 §3.6).
+///
+/// One string, because the localhost restart prompt below and the ssh
+/// consent card ([`super::bootstrap::bootstrap_copy`]) are the same
+/// explanation with different actions after it, and copy that only
+/// happens to match is copy that drifts.
+pub(super) fn reduced_fidelity_reason(skew: &Skew) -> String {
+    format!(
+        "This session is attached at reduced fidelity: it was started by a roost-session \
+         built against {}, and this Roost is built against {}. Links, the alternate screen \
+         and soft wrapping are off until it runs the matching build.",
+        skew.session_build, skew.client_build
+    )
+}
+
+/// Compose the restart dialog for a **localhost** session this client
+/// is attached to across a libghostty build skew (plan 056 §3.6).
+///
+/// The sibling of [`restart_prompt`]'s `RestartLocal` arm, and a
+/// separate function rather than a fourth arm of it because the two
+/// answer different questions. That one is raised at a host this client
+/// **cannot talk to**; this one at a host it is talking to right now,
+/// on the `vt` fallback, whose links and alternate screen are gone. The
+/// only way to reuse the arm would be to synthesize a [`BuildMismatch`]
+/// with a kind that lies about protocol fields it never had.
+///
+/// It claims no direction, for [`vintage`]'s reason: two libghostty
+/// build strings are merely different.
+pub(super) fn restart_prompt_for_skew(label: &str, skew: &Skew) -> RestartPrompt {
+    RestartPrompt {
+        title: format!("Restart the session on {label}?"),
+        body: format!(
+            "{} Restarting reopens every tab as a fresh shell in its directory. Running \
+             programs end.",
+            reduced_fidelity_reason(skew)
+        ),
+        action: RestartAction::RestartLocal,
+        confirm: Some("Restart session".to_string()),
     }
 }
 
@@ -509,6 +552,53 @@ mod tests {
         assert!(
             !none.body.contains("Restarting reopens"),
             "and is never told what a button it does not have would do"
+        );
+    }
+
+    /// The fourth prompt, and the one raised at a host this client is
+    /// **attached to**: it leads with the two builds that disagreed,
+    /// then says what a restart costs, and claims no direction.
+    #[test]
+    fn the_skew_prompt_names_both_builds_and_what_a_restart_costs() {
+        let skew = Skew {
+            session_build: "gb-old".into(),
+            client_build: "gb-new".into(),
+        };
+        let prompt = restart_prompt_for_skew("localhost", &skew);
+
+        assert_eq!(prompt.title, "Restart the session on localhost?");
+        assert_eq!(prompt.action, RestartAction::RestartLocal);
+        assert_eq!(prompt.confirm.as_deref(), Some("Restart session"));
+        assert_eq!(prompt.dismiss_label(), "Not now");
+        assert!(
+            prompt.body.starts_with(
+                "This session is attached at reduced fidelity: it was started by a roost-session \
+                 built against gb-old, and this Roost is built against gb-new."
+            ),
+            "{}",
+            prompt.body
+        );
+        assert!(
+            prompt
+                .body
+                .contains("Links, the alternate screen and soft wrapping are off"),
+            "the user is told what they have lost: {}",
+            prompt.body
+        );
+        assert!(
+            prompt.body.contains("Running programs end."),
+            "and what a restart costs: {}",
+            prompt.body
+        );
+        assert!(
+            !prompt.body.contains("older") && !prompt.body.contains("newer"),
+            "two build strings are merely different: {}",
+            prompt.body
+        );
+        assert!(
+            !prompt.body.contains("needs a restart"),
+            "this host is connected and serving; it is not waiting for anything: {}",
+            prompt.body
         );
     }
 
