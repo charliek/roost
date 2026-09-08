@@ -83,6 +83,10 @@ pub enum SessionCmd {
     /// Print the running session's identity and workspace size, or
     /// report that none is running (exit 3). Either way the
     /// `autostart=` line prints too — the two are independent.
+    ///
+    /// That line reads the supervisor artifact file and nothing else.
+    /// Whether the supervisor has it enabled or loaded is `roostctl
+    /// doctor`'s answer.
     Status,
     /// Install or remove the supervisor artifact that brings a session
     /// back after a login or a reboot (`systemd --user` on Linux,

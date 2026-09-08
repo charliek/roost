@@ -33,6 +33,15 @@
 //! `roost-session-dev.service` for a process that binds the *release*
 //! socket, and start it at every login.
 //!
+//! # How a template change reaches a file already on disk
+//!
+//! The marker carries a **format generation** ([`ARTIFACT_FORMAT`]): an
+//! artifact a generation behind is rewritten by a plain `install`, one
+//! written by a *newer* roostctl is refused until `--force`. The app
+//! version was rejected for this — it changes every release, so every
+//! upgrade would report a template that never changed as outdated and
+//! demand a restart for it.
+//!
 //! # Why the binary path is absolutized but never canonicalized
 //!
 //! A packaged `/usr/bin/roost-session` is usually a symlink into a
@@ -41,13 +50,11 @@
 //! vanish, so the path is only made absolute — lexically, `.`/`..`
 //! components folded — and written as itself.
 //!
-//! The split here is `session.rs`'s: the decisions ([`render_unit`],
-//! [`render_plist`], [`check_unit_path`], [`absolutize`],
-//! [`parse_artifact`], [`installed_state`], [`classify_install`],
-//! [`already_gone`]) are pure and table-tested, and the I/O around them
-//! is thin. Both renderers compile everywhere so those tables run on
-//! every platform; only the install/uninstall/status I/O picks by
-//! `cfg(target_os)`.
+//! The split here is `session.rs`'s: the decisions — rendering, path
+//! checking, parsing, and the install/uninstall state machines — are
+//! pure and table-tested, and the I/O around them is thin. Both
+//! renderers compile everywhere so those tables run on every platform;
+//! only the install/uninstall/status I/O picks by `cfg(target_os)`.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -68,15 +75,90 @@ use crate::session::scaled;
 /// it is the same wait.
 const CONFIRM_TIMEOUT: Duration = session_launch::DEFAULT_CONFIRM_BUDGET;
 
-/// The marker that makes an artifact ours, in each supervisor's comment
-/// syntax — the same sentence both times. Ownership hangs on this line
-/// alone: a description and a `--foreground` tail are things another
-/// program can carry by coincidence, and adopting such a file would
-/// overwrite it without `--force`.
-const UNIT_MARKER: &str =
-    "# Written by roostctl session autostart. Reinstalling replaces this file.";
-const PLIST_MARKER: &str =
-    "<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->";
+/// The generation of the rendered templates. Bump it whenever
+/// [`render_unit`] or [`render_plist`] would write different bytes for
+/// the same inputs — marker text, keys, ordering. One generation covers
+/// both renderers, so a bump made for one platform costs the other a
+/// single harmless rewrite.
+pub const ARTIFACT_FORMAT: u32 = 2;
+
+/// #438 wrote the marker sentence without a generation, so a file still
+/// carrying it is generation 1.
+const LEGACY_FORMAT: u32 = 1;
+
+/// The two halves of the marker sentence, with the generation between
+/// them. Ownership hangs on this line alone: a description and a
+/// `--foreground` tail are things another program can carry by
+/// coincidence, and adopting such a file would overwrite it without
+/// `--force`.
+const MARKER_HEAD: &str = "Written by roostctl session autostart";
+const MARKER_TAIL: &str = ". Reinstalling replaces this file.";
+
+fn marker_sentence(format: u32) -> String {
+    format!("{MARKER_HEAD} (format {format}){MARKER_TAIL}")
+}
+
+/// The marker in each supervisor's comment syntax — the same sentence
+/// both times.
+fn unit_marker(format: u32) -> String {
+    format!("# {}", marker_sentence(format))
+}
+
+fn plist_marker(format: u32) -> String {
+    format!("<!-- {} -->", marker_sentence(format))
+}
+
+/// Which comment syntax a marker line is written in. Part of the
+/// marker: the two artifacts are different languages, and a line only
+/// systemd could read has no authority over a plist (nor the reverse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerSyntax {
+    Unit,
+    Plist,
+}
+
+/// The generation one line declares, if it is a marker of `syntax` at
+/// all.
+///
+/// The whole trimmed line must be the marker, spelled the way this
+/// command writes it, so neither a marker quoted inside a longer line
+/// nor one in the other artifact's comment syntax is one. A generation
+/// of 0, one that does not fit a `u32`, and anything that is not plain
+/// digits are all read as "no marker", because an artifact this command
+/// cannot place in the sequence is not one it may rewrite.
+pub fn parse_marker(line: &str, syntax: MarkerSyntax) -> Option<u32> {
+    let line = line.trim();
+    let sentence = match syntax {
+        MarkerSyntax::Unit => line.strip_prefix("# ")?,
+        MarkerSyntax::Plist => line.strip_prefix("<!-- ")?.strip_suffix(" -->")?,
+    };
+    let rest = sentence.strip_prefix(MARKER_HEAD)?;
+    if rest == MARKER_TAIL {
+        return Some(LEGACY_FORMAT);
+    }
+    let digits = rest
+        .strip_prefix(" (format ")?
+        .strip_suffix(MARKER_TAIL)?
+        .strip_suffix(')')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|found| *found >= 1)
+}
+
+/// The generation a whole artifact declares, in one syntax. Two marker
+/// lines disagreeing about it leave nothing to trust, so the file is
+/// not ours.
+fn text_format(text: &str, syntax: MarkerSyntax) -> Option<u32> {
+    let mut found = None;
+    for format in text.lines().filter_map(|line| parse_marker(line, syntax)) {
+        if found.is_some_and(|seen| seen != format) {
+            return None;
+        }
+        found = Some(format);
+    }
+    found
+}
 
 /// The tail every artifact of ours ends in — `--foreground` is what
 /// keeps the daemon attached to its supervisor instead of forking away.
@@ -242,7 +324,7 @@ pub fn artifact_path(
 pub fn render_unit(names: &Names, bin: &Path) -> String {
     format!(
         "[Unit]\n\
-         {UNIT_MARKER}\n\
+         {marker}\n\
          {description}\n\
          \n\
          [Service]\n\
@@ -254,6 +336,7 @@ pub fn render_unit(names: &Names, bin: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
+        marker = unit_marker(ARTIFACT_FORMAT),
         description = names.description(),
         bin = bin.to_string_lossy(),
     )
@@ -269,7 +352,7 @@ pub fn render_plist(names: &Names, bin: &Path, home: &Path) -> String {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-{PLIST_MARKER}
+{marker}
 <dict>
     <key>Label</key>
     <string>{label}</string>
@@ -291,6 +374,7 @@ pub fn render_plist(names: &Names, bin: &Path, home: &Path) -> String {
 </dict>
 </plist>
 "#,
+        marker = plist_marker(ARTIFACT_FORMAT),
         label = names.label(),
         bin = xml_escape(&bin.to_string_lossy()),
         home = xml_escape(&home.to_string_lossy()),
@@ -417,6 +501,18 @@ pub fn absolutize(bin: &Path, cwd: &Path) -> PathBuf {
 pub struct Artifact {
     pub platform: Platform,
     pub binary: PathBuf,
+    pub format: u32,
+}
+
+/// Whose file this is, as far as this roostctl can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parsed {
+    Foreign,
+    /// Ours by the marker, from a generation this build does not know.
+    Newer {
+        found: u32,
+    },
+    Ours(Artifact),
 }
 
 /// Is this file ours, and which binary does it name?
@@ -426,16 +522,33 @@ pub struct Artifact {
 /// copy (extra `Environment=` lines, a reordered plist) still reads as
 /// ours and is overwritten on re-install; anything else, including a
 /// file hand-written from the docs, is foreign and needs `--force`.
-pub fn parse_artifact(text: &str, names: &Names) -> Option<Artifact> {
-    parse_unit(text, names).or_else(|| parse_plist(text, names))
+///
+/// A newer generation is settled from the marker **before** the other
+/// two parts are looked at: a template from the future may have changed
+/// exactly those parts, and the marker sentence is the one thing this
+/// command controls across generations.
+pub fn parse_artifact(text: &str, names: &Names) -> Parsed {
+    let unit = text_format(text, MarkerSyntax::Unit);
+    let plist = text_format(text, MarkerSyntax::Plist);
+    // A file carrying both syntaxes' markers is not one this command
+    // wrote, whatever the two of them say.
+    let (format, parsed) = match (unit, plist) {
+        (Some(_), Some(_)) | (None, None) => return Parsed::Foreign,
+        (Some(format), None) => (format, parse_unit(text, names, format)),
+        (None, Some(format)) => (format, parse_plist(text, names, format)),
+    };
+    if format > ARTIFACT_FORMAT {
+        return Parsed::Newer { found: format };
+    }
+    parsed.map_or(Parsed::Foreign, Parsed::Ours)
 }
 
 fn has_line(text: &str, marker: &str) -> bool {
     text.lines().any(|line| line.trim() == marker)
 }
 
-fn parse_unit(text: &str, names: &Names) -> Option<Artifact> {
-    if !has_line(text, UNIT_MARKER) || !has_line(text, &names.description()) {
+fn parse_unit(text: &str, names: &Names, format: u32) -> Option<Artifact> {
+    if !has_line(text, &names.description()) {
         return None;
     }
     let exec = text
@@ -452,13 +565,12 @@ fn parse_unit(text: &str, names: &Names) -> Option<Artifact> {
     Some(Artifact {
         platform: Platform::Linux,
         binary: PathBuf::from(binary),
+        format,
     })
 }
 
-fn parse_plist(text: &str, names: &Names) -> Option<Artifact> {
-    if !has_line(text, PLIST_MARKER)
-        || !text.contains(&format!("<string>{}</string>", names.label()))
-    {
+fn parse_plist(text: &str, names: &Names, format: u32) -> Option<Artifact> {
+    if !text.contains(&format!("<string>{}</string>", names.label())) {
         return None;
     }
     let array = text
@@ -479,6 +591,7 @@ fn parse_plist(text: &str, names: &Names) -> Option<Artifact> {
             Some(Artifact {
                 platform: Platform::MacOs,
                 binary: PathBuf::from(binary),
+                format,
             })
         }
         _ => None,
@@ -493,8 +606,14 @@ pub enum AutostartState {
     Foreign,
     /// Something is at the path that [`read_artifact`] will not read.
     Unreadable(String),
+    /// Ours, from a generation this build cannot read — so the binary it
+    /// names is unknown.
+    Newer {
+        found: u32,
+    },
     Installed {
         binary: PathBuf,
+        format: u32,
         binary_missing: bool,
     },
 }
@@ -505,15 +624,17 @@ pub enum AutostartState {
 /// so a dev build beside a release install would cry wolf.
 pub fn installed_state(
     read: &ArtifactRead,
-    parsed: Option<Artifact>,
+    parsed: Parsed,
     binary_executable: bool,
 ) -> AutostartState {
     match (read, parsed) {
         (ArtifactRead::Absent, _) => AutostartState::NotInstalled,
         (ArtifactRead::Unavailable(reason), _) => AutostartState::Unreadable(reason.clone()),
-        (ArtifactRead::Text(_), None) => AutostartState::Foreign,
-        (ArtifactRead::Text(_), Some(artifact)) => AutostartState::Installed {
+        (ArtifactRead::Text(_), Parsed::Foreign) => AutostartState::Foreign,
+        (ArtifactRead::Text(_), Parsed::Newer { found }) => AutostartState::Newer { found },
+        (ArtifactRead::Text(_), Parsed::Ours(artifact)) => AutostartState::Installed {
             binary: artifact.binary,
+            format: artifact.format,
             binary_missing: !binary_executable,
         },
     }
@@ -521,6 +642,10 @@ pub fn installed_state(
 
 /// The `autostart=…` line, in the plain one-line style the rest of
 /// `session status` prints.
+///
+/// "installed on disk" is the whole claim: this reads the file and
+/// nothing else, so whether the supervisor is enabled or loaded is
+/// `roostctl doctor`'s answer, not this line's.
 pub fn render_status_line(
     platform: Platform,
     names: &Names,
@@ -537,17 +662,27 @@ pub fn render_status_line(
             "autostart=not installed (unreadable: {}: {reason})",
             artifact.display()
         ),
+        AutostartState::Newer { found } => format!(
+            "autostart=installed on disk ({}; format {found}, newer than this roostctl)",
+            supervisor_label(platform, names)
+        ),
         AutostartState::Installed {
             binary,
+            format,
             binary_missing,
         } => {
             let mut line = format!(
-                "autostart=installed ({} → {})",
+                "autostart=installed on disk ({} → {})",
                 supervisor_label(platform, names),
                 binary.display()
             );
             if *binary_missing {
                 line.push_str(&format!(" (binary missing: {})", binary.display()));
+            }
+            if *format < ARTIFACT_FORMAT {
+                line.push_str(&format!(
+                    " (format {format}, outdated: rerun roostctl session autostart install)"
+                ));
             }
             line
         }
@@ -573,11 +708,10 @@ pub fn status_line() -> String {
     let read = read_artifact(&artifact);
     let parsed = match &read {
         ArtifactRead::Text(text) => parse_artifact(text, &names),
-        _ => None,
+        // Ignored — `installed_state` settles a non-`Text` read first.
+        _ => Parsed::Foreign,
     };
-    let executable = parsed
-        .as_ref()
-        .is_some_and(|a| is_executable_file(&a.binary));
+    let executable = matches!(&parsed, Parsed::Ours(a) if is_executable_file(&a.binary));
     let state = installed_state(&read, parsed, executable);
     render_status_line(platform, &names, &artifact, &state)
 }
@@ -586,7 +720,8 @@ pub fn status_line() -> String {
 /// one sentence either verb prints about a file it will not touch.
 ///
 /// A foreign file over there is nobody's business and yields nothing;
-/// nor does one this process cannot safely read.
+/// nor does one this process cannot safely read, nor one from a
+/// generation too new to name the binary it starts.
 pub fn sibling_notice(
     platform: Platform,
     other: &Names,
@@ -597,7 +732,9 @@ pub fn sibling_notice(
     let ArtifactRead::Text(text) = other_read else {
         return None;
     };
-    let artifact = parse_artifact(text, other)?;
+    let Parsed::Ours(artifact) = parse_artifact(text, other) else {
+        return None;
+    };
     let remedy = format!(
         "{} && rm {}",
         unload_command(platform, other, uid),
@@ -800,6 +937,30 @@ fn run_all(
     Ok(())
 }
 
+/// Tell the supervisor the bytes changed, before anything asks it what
+/// it holds.
+///
+/// systemd caches unit definitions: without this a rewrite over a loaded
+/// unit leaves `systemctl --user restart` — the very command the
+/// `ReinstalledLoaded` report tells the user to run — starting the *old*
+/// `ExecStart`. launchd re-reads the plist on `bootstrap`, so macOS
+/// needs nothing here.
+///
+/// [`activate`] keeps its own `daemon-reload` for the path where nothing
+/// was written (an identical file the supervisor never loaded), so a
+/// fresh install reloads twice. Idempotent, and it leaves each command
+/// list readable on its own.
+pub fn reload_after_write(
+    supervisor: &dyn Supervisor,
+    wrote: bool,
+) -> Result<(), ActivationFailure> {
+    let commands = match (supervisor.platform(), wrote) {
+        (Platform::Linux, true) => vec![Command::new("systemctl", &["--user", "daemon-reload"])],
+        _ => Vec::new(),
+    };
+    run_all(supervisor, &commands, |_| false)
+}
+
 /// Load a freshly written artifact.
 pub fn activate(supervisor: &dyn Supervisor, artifact: &Path) -> Result<(), ActivationFailure> {
     let commands = match supervisor.platform() {
@@ -873,21 +1034,42 @@ pub fn already_gone(platform: Platform, exit: Option<i32>, stderr: &str) -> bool
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Existing {
     Absent,
+    /// Something is there that [`read_artifact`] will not read.
+    Unreadable,
     /// Ours, byte-identical to what this install would write.
     Identical,
     /// Ours, different bytes — a hand edit, or a different binary.
     Changed,
+    /// Ours, from an older generation of the templates.
+    Outdated {
+        found: u32,
+    },
+    /// Ours, from a generation this build does not know. Only reaches
+    /// the state machine under `--force`.
+    Newer {
+        found: u32,
+    },
     /// Not ours. Only reaches the state machine under `--force`.
     Foreign,
 }
 
-/// Compare what is on disk with what this install would write.
-pub fn classify_existing(existing: Option<&str>, rendered: &str, names: &Names) -> Existing {
-    match existing {
-        None => Existing::Absent,
-        Some(text) if parse_artifact(text, names).is_none() => Existing::Foreign,
-        Some(text) if text == rendered => Existing::Identical,
-        Some(_) => Existing::Changed,
+/// Compare what is on disk with what this install would write. A
+/// generation mismatch can never be byte-identical, so `Identical` and
+/// `Changed` are answers about the current generation alone.
+pub fn classify_existing(read: &ArtifactRead, rendered: &str, names: &Names) -> Existing {
+    let text = match read {
+        ArtifactRead::Absent => return Existing::Absent,
+        ArtifactRead::Unavailable(_) => return Existing::Unreadable,
+        ArtifactRead::Text(text) => text,
+    };
+    match parse_artifact(text, names) {
+        Parsed::Foreign => Existing::Foreign,
+        Parsed::Newer { found } => Existing::Newer { found },
+        Parsed::Ours(artifact) if artifact.format < ARTIFACT_FORMAT => Existing::Outdated {
+            found: artifact.format,
+        },
+        Parsed::Ours(_) if text == rendered => Existing::Identical,
+        Parsed::Ours(_) => Existing::Changed,
     }
 }
 
@@ -895,10 +1077,17 @@ pub fn classify_existing(existing: Option<&str>, rendered: &str, names: &Names) 
 /// hears anything at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteStep {
+    /// Something is at the path this process will not read, so it cannot
+    /// say whose it is. `--force` does not help: the contents that would
+    /// be echoed are exactly what could not be read.
+    RefuseUnreadable,
     /// A file roostctl did not write. Refused by name rather than
     /// clobbered — the marker is the only thing standing between an
     /// install and somebody else's unit.
     RefuseForeign,
+    /// A file a newer roostctl wrote. Replacing it would be a downgrade,
+    /// which only `--force` asks for.
+    RefuseNewer { found: u32 },
     /// The bytes already match: leave the file exactly as it is.
     Keep,
     /// Write, echoing any previous contents to stderr first so a hand
@@ -908,7 +1097,9 @@ pub enum WriteStep {
 
 pub fn write_step(existing: Existing, force: bool) -> WriteStep {
     match existing {
+        Existing::Unreadable => WriteStep::RefuseUnreadable,
         Existing::Foreign if !force => WriteStep::RefuseForeign,
+        Existing::Newer { found } if !force => WriteStep::RefuseNewer { found },
         Existing::Identical => WriteStep::Keep,
         _ => WriteStep::Write,
     }
@@ -984,6 +1175,29 @@ pub fn classify_install(
         (Some(id), true) if Some(id) != before => InstallOutcome::SupervisedFresh,
         (Some(id), false) if Some(id) == before => InstallOutcome::AlreadyRunningUntouched,
         _ => InstallOutcome::ActivationUnconfirmed,
+    }
+}
+
+/// What an uninstall does with what is on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UninstallStep {
+    NothingToDo,
+    RefuseForeign,
+    RefuseUnreadable(String),
+    Remove,
+}
+
+/// Removing a newer artifact is not downgrading it — the user asked for
+/// it to be gone, and it is ours by the marker. Only a file this command
+/// cannot claim (foreign) or cannot read at all is left alone.
+pub fn uninstall_step(read: &ArtifactRead, names: &Names) -> UninstallStep {
+    match read {
+        ArtifactRead::Absent => UninstallStep::NothingToDo,
+        ArtifactRead::Unavailable(reason) => UninstallStep::RefuseUnreadable(reason.clone()),
+        ArtifactRead::Text(text) => match parse_artifact(text, names) {
+            Parsed::Foreign => UninstallStep::RefuseForeign,
+            Parsed::Newer { .. } | Parsed::Ours(_) => UninstallStep::Remove,
+        },
     }
 }
 
@@ -1224,21 +1438,23 @@ async fn install(force: bool) -> Result<i32> {
     let text = render_artifact(platform, &names, &bin, &home)?;
 
     let previous = read_artifact(&artifact);
-    let previous_text = match &previous {
-        ArtifactRead::Absent => None,
-        ArtifactRead::Text(text) => Some(text.as_str()),
-        ArtifactRead::Unavailable(reason) => {
-            eprintln!(
-                "roostctl session autostart: cannot read {}: {reason}",
-                artifact.display()
-            );
-            return Ok(1);
-        }
-    };
+    let existing = classify_existing(&previous, &text, &names);
+    let step = write_step(existing, force);
+
+    // Reported before the target line: a path this process could not
+    // read is not a path it is about to install into.
+    if let (WriteStep::RefuseUnreadable, ArtifactRead::Unavailable(reason)) = (step, &previous) {
+        eprintln!(
+            "roostctl session autostart: cannot read {}: {reason}",
+            artifact.display()
+        );
+        return Ok(1);
+    }
 
     println!("autostart: {} → {}", artifact.display(), bin.display());
-    let existing = classify_existing(previous_text, &text, &names);
-    match write_step(existing, force) {
+    match step {
+        // Reported above, before the target line.
+        WriteStep::RefuseUnreadable => return Ok(1),
         WriteStep::RefuseForeign => {
             eprintln!(
                 "roostctl session autostart: {} was not written by roostctl; \
@@ -1247,20 +1463,37 @@ async fn install(force: bool) -> Result<i32> {
             );
             return Ok(1);
         }
+        WriteStep::RefuseNewer { found } => {
+            eprintln!(
+                "roostctl session autostart: {} was written by a newer roostctl \
+                 (format {found}; this one writes {ARTIFACT_FORMAT}); \
+                 pass --force to downgrade it",
+                artifact.display()
+            );
+            return Ok(1);
+        }
         WriteStep::Keep => {}
         WriteStep::Write => {
-            if let Some(old) = previous_text {
-                eprintln!(
-                    "roostctl session autostart: replacing {}; previous contents follow\n{old}",
-                    artifact.display()
-                );
+            if let ArtifactRead::Text(old) = &previous {
+                match existing {
+                    Existing::Outdated { found } => eprintln!(
+                        "roostctl session autostart: upgrading {} from format {found} to \
+                         format {ARTIFACT_FORMAT}; previous contents follow\n{old}",
+                        artifact.display()
+                    ),
+                    _ => eprintln!(
+                        "roostctl session autostart: replacing {}; previous contents follow\n{old}",
+                        artifact.display()
+                    ),
+                }
             }
             write_artifact(&artifact, &text)?;
         }
     }
 
     let supervisor = HostSupervisor::new(platform, names);
-    let code = supervise_install(&supervisor, &artifact, existing).await?;
+    let wrote = matches!(step, WriteStep::Write);
+    let code = supervise_install(&supervisor, &artifact, existing, wrote).await?;
     report_sibling(platform, &names, &home, supervisor.uid());
     Ok(code)
 }
@@ -1272,10 +1505,16 @@ async fn supervise_install(
     supervisor: &HostSupervisor,
     artifact: &Path,
     existing: Existing,
+    wrote: bool,
 ) -> Result<i32> {
     let platform = supervisor.platform();
     let names = supervisor.names();
     let uid = supervisor.uid();
+
+    if let Err(failure) = reload_after_write(supervisor, wrote) {
+        eprintln!("roostctl session autostart: installed; activation failed: {failure}");
+        return Ok(1);
+    }
     let loaded_before = supervisor.is_loaded()?;
 
     if let Some(settled) = settled_without_supervisor(existing, loaded_before) {
@@ -1395,30 +1634,29 @@ async fn uninstall() -> Result<i32> {
 }
 
 fn remove_artifact(platform: Platform, names: Names, artifact: &Path) -> Result<i32> {
-    match read_artifact(artifact) {
-        ArtifactRead::Absent => {
+    match uninstall_step(&read_artifact(artifact), &names) {
+        UninstallStep::NothingToDo => {
             println!(
                 "autostart: nothing to uninstall (no {})",
                 artifact.display()
             );
             return Ok(0);
         }
-        ArtifactRead::Unavailable(reason) => {
+        UninstallStep::RefuseUnreadable(reason) => {
             eprintln!(
                 "roostctl session autostart: cannot read {}: {reason}; leaving it alone",
                 artifact.display()
             );
             return Ok(1);
         }
-        ArtifactRead::Text(previous) => {
-            if parse_artifact(&previous, &names).is_none() {
-                eprintln!(
-                    "roostctl session autostart: {} was not written by roostctl; leaving it alone",
-                    artifact.display()
-                );
-                return Ok(1);
-            }
+        UninstallStep::RefuseForeign => {
+            eprintln!(
+                "roostctl session autostart: {} was not written by roostctl; leaving it alone",
+                artifact.display()
+            );
+            return Ok(1);
         }
+        UninstallStep::Remove => {}
     }
 
     let supervisor = HostSupervisor::new(platform, names);
@@ -1553,6 +1791,63 @@ mod tests {
         ArtifactRead::Text(text.to_string())
     }
 
+    fn ours(text: &str, names: &Names) -> Artifact {
+        match parse_artifact(text, names) {
+            Parsed::Ours(artifact) => artifact,
+            other => panic!("expected ours, got {other:?}"),
+        }
+    }
+
+    /// The exact bytes #438 shipped: the marker without a generation.
+    /// This is the file a release install in the wild is upgraded from.
+    fn unit_438(bin: &str) -> String {
+        format!(
+            "[Unit]\n\
+             # Written by roostctl session autostart. Reinstalling replaces this file.\n\
+             Description=Roost host session (roost-session)\n\
+             \n\
+             [Service]\n\
+             Type=simple\n\
+             WorkingDirectory=%h\n\
+             ExecStart=\"{bin}\" start --foreground\n\
+             Restart=on-failure\n\
+             KillMode=mixed\n\
+             \n\
+             [Install]\n\
+             WantedBy=default.target\n"
+        )
+    }
+
+    fn plist_438(bin: &str, home: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->
+<dict>
+    <key>Label</key>
+    <string>ai.stridelabs.roost-session</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>{home}</string>
+</dict>
+</plist>
+"#
+        )
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "roostctl-autostart-test-{tag}-{}-{:?}",
@@ -1672,31 +1967,34 @@ mod tests {
         // marker, an ExecStart into somebody's build tree.
         let build_tree = Path::new("/home/u/roost/target/debug/roost-session");
         let unit = render_unit(&release(), build_tree);
-        assert_eq!(
-            parse_artifact(&unit, &release()).unwrap().binary,
-            build_tree.to_path_buf()
-        );
-        assert_eq!(parse_artifact(&unit, &dev()), None);
+        assert_eq!(ours(&unit, &release()).binary, build_tree.to_path_buf());
+        assert_eq!(parse_artifact(&unit, &dev()), Parsed::Foreign);
 
         let dev_unit = render_unit(&dev(), Path::new("/usr/bin/roost-session"));
-        assert_eq!(parse_artifact(&dev_unit, &release()), None);
-        assert!(parse_artifact(&dev_unit, &dev()).is_some());
+        assert_eq!(parse_artifact(&dev_unit, &release()), Parsed::Foreign);
+        assert!(matches!(parse_artifact(&dev_unit, &dev()), Parsed::Ours(_)));
 
         // The launchd twin, where the release label is a *prefix* of the
         // dev one: the `<string>` wrapper is what keeps them apart.
         let home = Path::new("/Users/u");
         let plist = render_plist(&release(), Path::new("/Apps/roost-session"), home);
-        assert!(parse_artifact(&plist, &release()).is_some());
-        assert_eq!(parse_artifact(&plist, &dev()), None);
+        assert!(matches!(
+            parse_artifact(&plist, &release()),
+            Parsed::Ours(_)
+        ));
+        assert_eq!(parse_artifact(&plist, &dev()), Parsed::Foreign);
         let dev_plist = render_plist(&dev(), Path::new("/Apps/roost-session"), home);
-        assert_eq!(parse_artifact(&dev_plist, &release()), None);
-        assert!(parse_artifact(&dev_plist, &dev()).is_some());
+        assert_eq!(parse_artifact(&dev_plist, &release()), Parsed::Foreign);
+        assert!(matches!(
+            parse_artifact(&dev_plist, &dev()),
+            Parsed::Ours(_)
+        ));
 
         // So a release-slot file hand-copied into the dev slot is a
         // foreign file to a dev install, not a definition to adopt.
         assert_eq!(
             classify_existing(
-                Some(&unit),
+                &text_read(&unit),
                 &render_unit(&dev(), Path::new("/usr/bin/roost-session")),
                 &dev()
             ),
@@ -1774,7 +2072,7 @@ mod tests {
         assert_eq!(
             rendered,
             "[Unit]\n\
-             # Written by roostctl session autostart. Reinstalling replaces this file.\n\
+             # Written by roostctl session autostart (format 2). Reinstalling replaces this file.\n\
              Description=Roost host session (roost-session)\n\
              \n\
              [Service]\n\
@@ -1801,7 +2099,7 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->
+<!-- Written by roostctl session autostart (format 2). Reinstalling replaces this file. -->
 <dict>
     <key>Label</key>
     <string>ai.stridelabs.roost-session</string>
@@ -1827,8 +2125,78 @@ mod tests {
         // The escapes survive the round trip, so an escaped path still
         // reads back as ours.
         assert_eq!(
-            parse_artifact(&rendered, &release()).unwrap().binary,
+            ours(&rendered, &release()).binary,
             PathBuf::from("/Apps/R&D <beta>/roost-session")
+        );
+    }
+
+    #[test]
+    fn what_is_rendered_reads_back_at_this_builds_format() {
+        assert_eq!(
+            ours(
+                &render_unit(&release(), Path::new("/usr/bin/roost-session")),
+                &release()
+            )
+            .format,
+            ARTIFACT_FORMAT
+        );
+        assert_eq!(
+            ours(
+                &render_plist(
+                    &release(),
+                    Path::new("/Apps/roost-session"),
+                    Path::new("/Users/a")
+                ),
+                &release()
+            )
+            .format,
+            ARTIFACT_FORMAT
+        );
+    }
+
+    /// The pairs of lines that differ, which must be zipped over texts of
+    /// the same shape to mean anything.
+    fn differing_lines(before: &str, after: &str) -> Vec<(String, String)> {
+        assert_eq!(
+            before.lines().count(),
+            after.lines().count(),
+            "the two renders must have the same line count"
+        );
+        before
+            .lines()
+            .zip(after.lines())
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_release_render_differs_from_438_in_the_marker_line_alone() {
+        let bin = "/usr/bin/roost-session";
+        assert_eq!(
+            differing_lines(&unit_438(bin), &render_unit(&release(), Path::new(bin))),
+            [(
+                "# Written by roostctl session autostart. Reinstalling replaces this file."
+                    .to_string(),
+                "# Written by roostctl session autostart (format 2). Reinstalling replaces \
+                 this file."
+                    .to_string(),
+            )]
+        );
+
+        let home = "/Users/u";
+        assert_eq!(
+            differing_lines(
+                &plist_438(bin, home),
+                &render_plist(&release(), Path::new(bin), Path::new(home))
+            ),
+            [(
+                "<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->"
+                    .to_string(),
+                "<!-- Written by roostctl session autostart (format 2). Reinstalling replaces \
+                 this file. -->"
+                    .to_string(),
+            )]
         );
     }
 
@@ -1953,9 +2321,10 @@ mod tests {
         let unit = render_unit(&release(), Path::new("/usr/bin/roost-session"));
         assert_eq!(
             parse_artifact(&unit, &release()),
-            Some(Artifact {
+            Parsed::Ours(Artifact {
                 platform: Platform::Linux,
                 binary: PathBuf::from("/usr/bin/roost-session"),
+                format: ARTIFACT_FORMAT,
             })
         );
 
@@ -1965,7 +2334,7 @@ mod tests {
             "Environment=RUST_LOG=debug\nRestart=always",
         );
         assert_eq!(
-            parse_artifact(&edited, &release()).unwrap().binary,
+            ours(&edited, &release()).binary,
             PathBuf::from("/usr/bin/roost-session")
         );
 
@@ -1976,9 +2345,10 @@ mod tests {
         );
         assert_eq!(
             parse_artifact(&plist, &release()),
-            Some(Artifact {
+            Parsed::Ours(Artifact {
                 platform: Platform::MacOs,
                 binary: PathBuf::from("/Apps/roost-session"),
+                format: ARTIFACT_FORMAT,
             })
         );
 
@@ -1991,8 +2361,194 @@ mod tests {
             "",
             "not an artifact at all",
         ] {
-            assert_eq!(parse_artifact(foreign, &release()), None, "{foreign}");
+            assert_eq!(
+                parse_artifact(foreign, &release()),
+                Parsed::Foreign,
+                "{foreign}"
+            );
         }
+    }
+
+    #[test]
+    fn parse_marker_reads_a_generation_off_a_whole_line_in_its_own_syntax() {
+        let legacy_unit =
+            "# Written by roostctl session autostart. Reinstalling replaces this file.";
+        let legacy_plist =
+            "<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->";
+
+        // Each syntax reads only its own comments: a plist marker has no
+        // authority over a unit, nor the reverse.
+        for (line, syntax) in [
+            (legacy_unit.to_string(), MarkerSyntax::Plist),
+            (legacy_plist.to_string(), MarkerSyntax::Unit),
+            (unit_marker(2), MarkerSyntax::Plist),
+            (plist_marker(2), MarkerSyntax::Unit),
+        ] {
+            assert_eq!(parse_marker(&line, syntax), None, "{line:?}");
+        }
+
+        // The spacing this command writes is part of the marker.
+        for line in [
+            "#Written by roostctl session autostart. Reinstalling replaces this file.",
+            "<!--Written by roostctl session autostart. Reinstalling replaces this file.-->",
+        ] {
+            for syntax in [MarkerSyntax::Unit, MarkerSyntax::Plist] {
+                assert_eq!(parse_marker(line, syntax), None, "{line:?}");
+            }
+        }
+
+        for (line, expected) in [
+            (legacy_unit.to_string(), Some(1)),
+            (legacy_plist.to_string(), Some(1)),
+            // Trailing whitespace survives an editor and is still ours.
+            (format!("{legacy_unit}   "), Some(1)),
+            (format!("  {legacy_plist}\t"), Some(1)),
+            (unit_marker(2), Some(2)),
+            (plist_marker(2), Some(2)),
+            (unit_marker(7), Some(7)),
+            (plist_marker(7), Some(7)),
+            // A generation this command cannot place in the sequence.
+            (unit_marker(0), None),
+            (plist_marker(0), None),
+            (
+                "# Written by roostctl session autostart (format 99999999999). \
+              Reinstalling replaces this file."
+                    .to_string(),
+                None,
+            ),
+            (
+                "# Written by roostctl session autostart (format two). \
+              Reinstalling replaces this file."
+                    .to_string(),
+                None,
+            ),
+            (
+                "# Written by roostctl session autostart (format +2). \
+              Reinstalling replaces this file."
+                    .to_string(),
+                None,
+            ),
+            (
+                "# Written by roostctl session autostart (format 2] \
+              Reinstalling replaces this file."
+                    .to_string(),
+                None,
+            ),
+            // Quoted inside a longer line, which is not a marker line.
+            (format!("ExecStart=/bin/echo \"{legacy_unit}\""), None),
+            (format!("{} extra", unit_marker(2)), None),
+            (format!("prefix {}", plist_marker(2)), None),
+            (
+                "# Written by somebody else. Reinstalling replaces this file.".to_string(),
+                None,
+            ),
+            (String::new(), None),
+        ] {
+            let syntax = if line.trim_start().starts_with("<!--") {
+                MarkerSyntax::Plist
+            } else {
+                MarkerSyntax::Unit
+            };
+            assert_eq!(parse_marker(&line, syntax), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_marker_in_the_other_artifacts_syntax_does_not_make_a_file_ours() {
+        // A hand-written unit carrying our description and exec tail,
+        // "authorised" by a plist-syntax comment. systemd would ignore
+        // the line entirely; so must this.
+        let unit = render_unit(&release(), Path::new("/usr/bin/roost-session"));
+        let smuggled = unit.replace(
+            &unit_marker(ARTIFACT_FORMAT),
+            &plist_marker(ARTIFACT_FORMAT),
+        );
+        assert_eq!(parse_artifact(&smuggled, &release()), Parsed::Foreign);
+        assert_eq!(
+            write_step(
+                classify_existing(&text_read(&smuggled), &unit, &release()),
+                false
+            ),
+            WriteStep::RefuseForeign
+        );
+
+        // And a file carrying both syntaxes' markers is nobody's.
+        let both = unit.replace(
+            &unit_marker(ARTIFACT_FORMAT),
+            &format!(
+                "{}\n{}",
+                unit_marker(ARTIFACT_FORMAT),
+                plist_marker(ARTIFACT_FORMAT)
+            ),
+        );
+        assert_eq!(parse_artifact(&both, &release()), Parsed::Foreign);
+    }
+
+    #[test]
+    fn two_markers_disagreeing_about_the_generation_are_no_marker_at_all() {
+        let unit = render_unit(&release(), Path::new("/usr/bin/roost-session"));
+        // The shape a half-applied hand edit leaves: the old sentence
+        // kept, the new one pasted in beside it.
+        let conflicted = unit.replace(
+            &unit_marker(ARTIFACT_FORMAT),
+            &format!(
+                "# Written by roostctl session autostart. Reinstalling replaces this file.\n{}",
+                unit_marker(ARTIFACT_FORMAT)
+            ),
+        );
+        assert_eq!(parse_artifact(&conflicted, &release()), Parsed::Foreign);
+        assert_eq!(
+            classify_existing(&text_read(&conflicted), &unit, &release()),
+            Existing::Foreign
+        );
+
+        // The same line twice says the same thing, and is still ours.
+        let doubled = unit.replace(
+            &unit_marker(ARTIFACT_FORMAT),
+            &format!("{0}\n{0}", unit_marker(ARTIFACT_FORMAT)),
+        );
+        assert_eq!(ours(&doubled, &release()).format, ARTIFACT_FORMAT);
+    }
+
+    #[test]
+    fn a_438_artifact_is_ours_at_format_1_and_upgrades_without_force() {
+        let bin = "/usr/bin/roost-session";
+        let home = "/Users/u";
+
+        for (previous, rendered) in [
+            (unit_438(bin), render_unit(&release(), Path::new(bin))),
+            (
+                plist_438(bin, home),
+                render_plist(&release(), Path::new(bin), Path::new(home)),
+            ),
+        ] {
+            let artifact = ours(&previous, &release());
+            assert_eq!(artifact.format, 1, "{previous}");
+            assert_eq!(artifact.binary, PathBuf::from(bin));
+
+            let existing = classify_existing(&text_read(&previous), &rendered, &release());
+            assert_eq!(existing, Existing::Outdated { found: 1 }, "{previous}");
+            assert_eq!(write_step(existing, false), WriteStep::Write, "{previous}");
+        }
+    }
+
+    #[test]
+    fn a_format_1_file_in_the_dev_slot_is_the_dev_profiles_own() {
+        // Synthetic: the format-1 files in the wild all carry the release
+        // description, since #438 wrote one name for both profiles. This
+        // is what a dev build would have to find to adopt one.
+        let unit = unit_438("/home/u/roost/target/debug/roost-session")
+            .replace("(roost-session)", "(roost-session-dev)");
+        assert_eq!(ours(&unit, &dev()).format, 1);
+        assert_eq!(parse_artifact(&unit, &release()), Parsed::Foreign);
+        assert_eq!(
+            classify_existing(
+                &text_read(&unit),
+                &render_unit(&dev(), Path::new("/x/roost-session")),
+                &dev()
+            ),
+            Existing::Outdated { found: 1 }
+        );
     }
 
     /// Every line but the marker, so a file can be made foreign without
@@ -2015,23 +2571,35 @@ mod tests {
             Path::new("/Apps/roost-session"),
             Path::new("/Users/a"),
         );
+        let unit_mark = unit_marker(ARTIFACT_FORMAT);
+        let plist_mark = plist_marker(ARTIFACT_FORMAT);
 
         // What this command writes reads back as ours, and the marker
         // sits where the docs say it does.
-        assert!(parse_artifact(&unit, &release()).is_some(), "{unit}");
-        assert!(parse_artifact(&plist, &release()).is_some(), "{plist}");
-        assert!(unit.contains(&format!("[Unit]\n{UNIT_MARKER}\n")), "{unit}");
         assert!(
-            plist.contains(&format!("<plist version=\"1.0\">\n{PLIST_MARKER}\n")),
+            matches!(parse_artifact(&unit, &release()), Parsed::Ours(_)),
+            "{unit}"
+        );
+        assert!(
+            matches!(parse_artifact(&plist, &release()), Parsed::Ours(_)),
+            "{plist}"
+        );
+        assert!(unit.contains(&format!("[Unit]\n{unit_mark}\n")), "{unit}");
+        assert!(
+            plist.contains(&format!("<plist version=\"1.0\">\n{plist_mark}\n")),
             "{plist}"
         );
 
         // The same text with the marker deleted is somebody else's file.
         for stripped in [
-            without_line(&unit, UNIT_MARKER),
-            without_line(&plist, PLIST_MARKER),
+            without_line(&unit, &unit_mark),
+            without_line(&plist, &plist_mark),
         ] {
-            assert_eq!(parse_artifact(&stripped, &release()), None, "{stripped}");
+            assert_eq!(
+                parse_artifact(&stripped, &release()),
+                Parsed::Foreign,
+                "{stripped}"
+            );
         }
 
         // The case the marker exists for: a foreign unit carrying our
@@ -2042,76 +2610,143 @@ mod tests {
                         \n\
                         [Service]\n\
                         ExecStart=\"/opt/other-daemon\" start --foreground\n";
-        assert_eq!(parse_artifact(impostor, &release()), None);
+        assert_eq!(parse_artifact(impostor, &release()), Parsed::Foreign);
         assert_eq!(
-            classify_existing(Some(impostor), &unit, &release()),
+            classify_existing(&text_read(impostor), &unit, &release()),
             Existing::Foreign
         );
         assert_eq!(
-            write_step(classify_existing(Some(impostor), &unit, &release()), false),
+            write_step(
+                classify_existing(&text_read(impostor), &unit, &release()),
+                false
+            ),
             WriteStep::RefuseForeign
         );
 
         // Its launchd twin: our label, our arguments, no marker.
         let impostor_plist =
-            without_line(&plist, PLIST_MARKER).replace("/Apps/roost-session", "/opt/other-daemon");
-        assert_eq!(parse_artifact(&impostor_plist, &release()), None);
+            without_line(&plist, &plist_mark).replace("/Apps/roost-session", "/opt/other-daemon");
+        assert_eq!(parse_artifact(&impostor_plist, &release()), Parsed::Foreign);
+
+        // And the same line settles a *newer* file before anything else
+        // is looked at: a template from the future may have changed the
+        // very parts the three-part rule reads, which would leave it
+        // read as foreign and this message unreachable.
+        let from_the_future = format!(
+            "[Unit]\n{}\nDescription=whatever they renamed it to\n\
+             \n[Service]\nExecCommand=who knows\n",
+            unit_marker(9)
+        );
+        assert_eq!(
+            parse_artifact(&from_the_future, &release()),
+            Parsed::Newer { found: 9 }
+        );
+        let existing = classify_existing(&text_read(&from_the_future), &unit, &release());
+        assert_eq!(existing, Existing::Newer { found: 9 });
+        assert_eq!(
+            write_step(existing, false),
+            WriteStep::RefuseNewer { found: 9 }
+        );
+        assert_eq!(write_step(existing, true), WriteStep::Write);
     }
 
     #[test]
     fn installed_state_covers_every_state() {
         assert_eq!(
-            installed_state(&ArtifactRead::Absent, None, false),
+            installed_state(&ArtifactRead::Absent, Parsed::Foreign, false),
             AutostartState::NotInstalled
         );
         assert_eq!(
-            installed_state(&text_read("nobody else's"), None, false),
+            installed_state(&text_read("nobody else's"), Parsed::Foreign, false),
             AutostartState::Foreign
         );
-        let ours = Artifact {
+        assert_eq!(
+            installed_state(
+                &ArtifactRead::Unavailable("not a regular file".to_string()),
+                Parsed::Foreign,
+                false
+            ),
+            AutostartState::Unreadable("not a regular file".to_string())
+        );
+        assert_eq!(
+            installed_state(&text_read("ours"), Parsed::Newer { found: 7 }, false),
+            AutostartState::Newer { found: 7 }
+        );
+        let mine = Artifact {
             platform: Platform::Linux,
             binary: PathBuf::from("/usr/bin/roost-session"),
+            format: ARTIFACT_FORMAT,
         };
         assert_eq!(
-            installed_state(&text_read("ours"), Some(ours.clone()), true),
+            installed_state(&text_read("ours"), Parsed::Ours(mine.clone()), true),
             AutostartState::Installed {
                 binary: PathBuf::from("/usr/bin/roost-session"),
+                format: ARTIFACT_FORMAT,
                 binary_missing: false,
             }
         );
         assert_eq!(
-            installed_state(&text_read("ours"), Some(ours), false),
+            installed_state(
+                &text_read("ours"),
+                Parsed::Ours(Artifact { format: 1, ..mine }),
+                false
+            ),
             AutostartState::Installed {
                 binary: PathBuf::from("/usr/bin/roost-session"),
+                format: 1,
                 binary_missing: true,
             }
         );
     }
 
     #[test]
-    fn the_status_line_names_the_supervisor_the_binary_and_both_qualifiers() {
+    fn the_status_line_names_the_supervisor_the_binary_and_every_qualifier() {
         let artifact = Path::new("/home/u/.config/systemd/user/roost-session.service");
+        let linux = |state: AutostartState| {
+            render_status_line(Platform::Linux, &release(), artifact, &state)
+        };
+
         assert_eq!(
-            render_status_line(
-                Platform::Linux,
-                &release(),
-                artifact,
-                &AutostartState::NotInstalled
-            ),
+            linux(AutostartState::NotInstalled),
             "autostart=not installed"
         );
         assert_eq!(
-            render_status_line(
-                Platform::Linux,
-                &release(),
-                artifact,
-                &AutostartState::Installed {
-                    binary: PathBuf::from("/usr/bin/roost-session"),
-                    binary_missing: false,
-                }
-            ),
-            "autostart=installed (systemd --user roost-session.service → /usr/bin/roost-session)"
+            linux(AutostartState::Installed {
+                binary: PathBuf::from("/usr/bin/roost-session"),
+                format: ARTIFACT_FORMAT,
+                binary_missing: false,
+            }),
+            "autostart=installed on disk \
+             (systemd --user roost-session.service → /usr/bin/roost-session)"
         );
+        // Both qualifiers at once, in the order they are appended.
+        assert_eq!(
+            linux(AutostartState::Installed {
+                binary: PathBuf::from("/usr/bin/roost-session"),
+                format: 1,
+                binary_missing: true,
+            }),
+            "autostart=installed on disk \
+             (systemd --user roost-session.service → /usr/bin/roost-session) \
+             (binary missing: /usr/bin/roost-session) \
+             (format 1, outdated: rerun roostctl session autostart install)"
+        );
+        assert_eq!(
+            linux(AutostartState::Newer { found: 7 }),
+            "autostart=installed on disk \
+             (systemd --user roost-session.service; format 7, newer than this roostctl)"
+        );
+        assert_eq!(
+            linux(AutostartState::Foreign),
+            "autostart=not installed (foreign file: not written by roostctl: \
+             /home/u/.config/systemd/user/roost-session.service)"
+        );
+        assert_eq!(
+            linux(AutostartState::Unreadable("not a regular file".to_string())),
+            "autostart=not installed (unreadable: \
+             /home/u/.config/systemd/user/roost-session.service: not a regular file)"
+        );
+
         assert_eq!(
             render_status_line(
                 Platform::MacOs,
@@ -2121,27 +2756,15 @@ mod tests {
                     binary: PathBuf::from(
                         "/Applications/Roost-Iced.app/Contents/MacOS/roost-session"
                     ),
+                    format: ARTIFACT_FORMAT,
                     binary_missing: true,
                 }
             ),
-            "autostart=installed (launchd ai.stridelabs.roost-session → \
+            "autostart=installed on disk (launchd ai.stridelabs.roost-session → \
              /Applications/Roost-Iced.app/Contents/MacOS/roost-session) \
              (binary missing: /Applications/Roost-Iced.app/Contents/MacOS/roost-session)"
         );
-        let foreign = render_status_line(
-            Platform::Linux,
-            &release(),
-            artifact,
-            &AutostartState::Foreign,
-        );
-        assert!(
-            foreign.contains("foreign file: not written by roostctl"),
-            "{foreign}"
-        );
-        assert!(
-            foreign.contains(&artifact.display().to_string()),
-            "{foreign}"
-        );
+        assert_eq!(UNAVAILABLE_LINE, "autostart=unavailable");
     }
 
     #[test]
@@ -2176,46 +2799,113 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn classify_existing_compares_bytes_only_for_a_file_of_ours() {
+    fn classify_existing_compares_bytes_only_for_a_file_of_ours_at_this_format() {
         let rendered = render_unit(&release(), Path::new("/usr/bin/roost-session"));
+        let classify = |read: &ArtifactRead| classify_existing(read, &rendered, &release());
+
+        assert_eq!(classify(&ArtifactRead::Absent), Existing::Absent);
         assert_eq!(
-            classify_existing(None, &rendered, &release()),
-            Existing::Absent
+            classify(&ArtifactRead::Unavailable("not a regular file".to_string())),
+            Existing::Unreadable
         );
+        assert_eq!(classify(&text_read(&rendered)), Existing::Identical);
+        // Ours, this generation, different bytes — a hand edit or a
+        // different binary, never an upgrade.
         assert_eq!(
-            classify_existing(Some(&rendered), &rendered, &release()),
-            Existing::Identical
-        );
-        assert_eq!(
-            classify_existing(
-                Some(&render_unit(&release(), Path::new("/opt/roost-session"))),
-                &rendered,
-                &release()
-            ),
+            classify(&text_read(&render_unit(
+                &release(),
+                Path::new("/opt/roost-session")
+            ))),
             Existing::Changed
         );
         assert_eq!(
-            classify_existing(
-                Some("[Unit]\nDescription=Someone else\n"),
-                &rendered,
-                &release()
-            ),
+            classify(&text_read(&rendered.replace(
+                "Restart=on-failure",
+                "Environment=RUST_LOG=debug\nRestart=on-failure"
+            ))),
+            Existing::Changed
+        );
+        assert_eq!(
+            classify(&text_read(&unit_438("/usr/bin/roost-session"))),
+            Existing::Outdated { found: 1 }
+        );
+        assert_eq!(
+            classify(&text_read(&format!(
+                "[Unit]\n{}\n{}\n\n[Service]\nExecStart=\"/x\" start --foreground\n",
+                unit_marker(9),
+                release().description()
+            ))),
+            Existing::Newer { found: 9 }
+        );
+        assert_eq!(
+            classify(&text_read("[Unit]\nDescription=Someone else\n")),
             Existing::Foreign
         );
     }
 
     #[test]
-    fn a_foreign_file_is_refused_until_force_and_identical_bytes_are_left_alone() {
+    fn a_file_this_install_may_not_replace_is_refused_and_identical_bytes_are_left_alone() {
         assert_eq!(
             write_step(Existing::Foreign, false),
             WriteStep::RefuseForeign
         );
         assert_eq!(write_step(Existing::Foreign, true), WriteStep::Write);
-        // `--force` has nothing to do with our own files.
+        assert_eq!(
+            write_step(Existing::Newer { found: 3 }, false),
+            WriteStep::RefuseNewer { found: 3 }
+        );
+        assert_eq!(
+            write_step(Existing::Newer { found: 3 }, true),
+            WriteStep::Write
+        );
+        // Nothing readable to echo and nothing to compare: `--force` has
+        // no meaning over a file this process could not read.
         for force in [false, true] {
+            assert_eq!(
+                write_step(Existing::Unreadable, force),
+                WriteStep::RefuseUnreadable
+            );
+            // `--force` has nothing to do with our own files.
             assert_eq!(write_step(Existing::Identical, force), WriteStep::Keep);
             assert_eq!(write_step(Existing::Changed, force), WriteStep::Write);
             assert_eq!(write_step(Existing::Absent, force), WriteStep::Write);
+            assert_eq!(
+                write_step(Existing::Outdated { found: 1 }, force),
+                WriteStep::Write
+            );
+        }
+    }
+
+    #[test]
+    fn an_uninstall_removes_a_newer_artifact_and_leaves_what_is_not_ours() {
+        let unit = render_unit(&release(), Path::new("/usr/bin/roost-session"));
+        let newer = format!(
+            "[Unit]\n{}\nDescription=whatever they renamed it to\n",
+            unit_marker(9)
+        );
+        for (read, expected) in [
+            (ArtifactRead::Absent, UninstallStep::NothingToDo),
+            (
+                ArtifactRead::Unavailable("not a regular file".to_string()),
+                UninstallStep::RefuseUnreadable("not a regular file".to_string()),
+            ),
+            (
+                text_read("[Unit]\nDescription=Someone else\n"),
+                UninstallStep::RefuseForeign,
+            ),
+            // The dev profile's unit in the release slot is not ours.
+            (
+                text_read(&render_unit(&dev(), Path::new("/x/roost-session"))),
+                UninstallStep::RefuseForeign,
+            ),
+            (text_read(&unit), UninstallStep::Remove),
+            (
+                text_read(&unit_438("/usr/bin/roost-session")),
+                UninstallStep::Remove,
+            ),
+            (text_read(&newer), UninstallStep::Remove),
+        ] {
+            assert_eq!(uninstall_step(&read, &release()), expected, "{read:?}");
         }
     }
 
@@ -2244,8 +2934,15 @@ mod tests {
             classify_install(Existing::Identical, untouched, None, None),
             InstallOutcome::ActivationUnconfirmed
         );
-        // A loaded supervisor is left alone, whatever was on disk.
-        for existing in [Existing::Absent, Existing::Changed, Existing::Foreign] {
+        // A loaded supervisor is left alone, whatever was on disk — an
+        // upgrade and a forced downgrade are rewrites like any other.
+        for existing in [
+            Existing::Absent,
+            Existing::Changed,
+            Existing::Foreign,
+            Existing::Outdated { found: 1 },
+            Existing::Newer { found: 9 },
+        ] {
             assert_eq!(
                 classify_install(existing, supervision(true, true), Some("old"), Some("old")),
                 InstallOutcome::ReinstalledLoaded,
@@ -2307,6 +3004,14 @@ mod tests {
         );
         assert_eq!(settled_without_supervisor(Existing::Changed, false), None);
         assert_eq!(settled_without_supervisor(Existing::Absent, false), None);
+        assert_eq!(
+            settled_without_supervisor(Existing::Outdated { found: 1 }, false),
+            None
+        );
+        assert_eq!(
+            settled_without_supervisor(Existing::Newer { found: 9 }, true),
+            Some(InstallOutcome::ReinstalledLoaded)
+        );
     }
 
     #[test]
@@ -2426,6 +3131,101 @@ mod tests {
         );
     }
 
+    /// The whole command sequence an install runs after the bytes are
+    /// settled, for each shape the write can take.
+    fn install_calls(
+        platform: Platform,
+        wrote: bool,
+        loaded: bool,
+        artifact: &Path,
+    ) -> Vec<String> {
+        let mut answers = Vec::new();
+        if platform == Platform::Linux && wrote {
+            answers.push(exit(0, "")); // the reload, which runs first
+        }
+        answers.push(if loaded {
+            exit(0, "")
+        } else {
+            exit(3, "inactive")
+        });
+        let fake = FakeSupervisor::answering(platform, answers);
+        reload_after_write(&fake, wrote).unwrap();
+        if !fake.is_loaded().unwrap() {
+            activate(&fake, artifact).unwrap();
+        }
+        fake.calls()
+    }
+
+    #[test]
+    fn every_linux_write_reloads_the_definition_before_anything_reads_it() {
+        let unit = Path::new("/home/u/.config/systemd/user/roost-session.service");
+
+        // The upgrade over a loaded unit: the manager is told the bytes
+        // changed, and nothing touches the running process — so the
+        // `systemctl --user restart` the report prints re-runs the NEW
+        // ExecStart.
+        assert_eq!(
+            install_calls(Platform::Linux, true, true, unit),
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user is-active roost-session.service",
+            ]
+        );
+
+        // A write the supervisor does not hold: reloaded twice, once
+        // here and once inside `activate` — see `reload_after_write`.
+        assert_eq!(
+            install_calls(Platform::Linux, true, false, unit),
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user is-active roost-session.service",
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now roost-session.service",
+            ]
+        );
+
+        // Nothing written (identical bytes the supervisor never loaded):
+        // the fresh path's own two commands and no more.
+        assert_eq!(
+            install_calls(Platform::Linux, false, false, unit),
+            [
+                "systemctl --user is-active roost-session.service",
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now roost-session.service",
+            ]
+        );
+
+        // launchd re-reads the plist on `bootstrap`, so a write adds
+        // nothing on macOS.
+        let plist = Path::new("/Users/u/Library/LaunchAgents/ai.stridelabs.roost-session.plist");
+        assert_eq!(
+            install_calls(Platform::MacOs, true, true, plist),
+            ["launchctl print gui/501/ai.stridelabs.roost-session"]
+        );
+        assert_eq!(
+            install_calls(Platform::MacOs, true, false, plist),
+            [
+                "launchctl print gui/501/ai.stridelabs.roost-session".to_string(),
+                format!("launchctl bootstrap gui/501 {}", plist.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_reload_is_reported_the_way_an_activation_failure_is() {
+        let broken = FakeSupervisor::answering(
+            Platform::Linux,
+            vec![exit(1, "Failed to reload daemon: Connection refused")],
+        );
+        let failure =
+            reload_after_write(&broken, true).expect_err("a failed daemon-reload must surface");
+        assert_eq!(
+            format!("installed; activation failed: {failure}"),
+            "installed; activation failed: systemctl --user daemon-reload: \
+             Failed to reload daemon: Connection refused"
+        );
+    }
+
     #[test]
     fn an_uninstall_runs_the_supervisor_commands_in_order_around_the_removal() {
         let linux = FakeSupervisor::new(Platform::Linux);
@@ -2528,6 +3328,7 @@ mod tests {
             ),
             AutostartState::Installed {
                 binary: PathBuf::from("/usr/bin/roost-session"),
+                format: ARTIFACT_FORMAT,
                 binary_missing: true,
             }
         );
@@ -2653,7 +3454,7 @@ mod tests {
         let artifact = Path::new("/home/u/.config/systemd/user/roost-session.service");
         let state = installed_state(
             &ArtifactRead::Unavailable("not a regular file".to_string()),
-            None,
+            Parsed::Foreign,
             false,
         );
         assert_eq!(
