@@ -6601,25 +6601,30 @@ mod tests {
     }
 
     /// The anchor one heading actually publishes. `attr_list` is on (see
-    /// `zensical.toml`), so a **trailing** `{: #id }` *is* the anchor and
-    /// the heading text no longer decides it — which is how
-    /// `docs/guides/host-sessions.md` keeps a short, stable
-    /// `#surviving-reboots-launchd` under a longer title. Only a trailing
-    /// one counts: the generator slugifies the whole heading when
-    /// anything follows the `}`.
+    /// `zensical.toml`), so a **trailing** brace group is consumed by the
+    /// generator rather than slugified: an `#id` in it *is* the anchor —
+    /// which is how `docs/guides/host-sessions.md` keeps a short, stable
+    /// `#surviving-reboots-launchd` under a longer title — and a group
+    /// carrying no `#id` still disappears from the text the anchor is
+    /// slugified from.
+    ///
+    /// Two details, both checked against `python-markdown` itself rather
+    /// than its prose: the `:` in `{: #id }` is **optional** (`{#id}` and
+    /// `{ #id }` publish the same anchor), and only a trailing group
+    /// counts — the generator slugifies the braces verbatim when anything
+    /// follows the `}`.
     fn anchor_of(heading: &str) -> String {
         let trimmed = heading.trim_end();
-        let Some(attrs) = trimmed
+        let Some((text, attrs)) = trimmed
             .strip_suffix('}')
             .and_then(|rest| rest.rsplit_once('{'))
-            .map(|(_, attrs)| attrs)
         else {
             return slugify(heading);
         };
         attrs
             .split_whitespace()
             .find_map(|word| word.strip_prefix('#'))
-            .map_or_else(|| slugify(heading), str::to_string)
+            .map_or_else(|| slugify(text), str::to_string)
     }
 
     /// Markdown headings only — `#` inside a fenced code block is a shell
@@ -6742,10 +6747,14 @@ mod tests {
             anchor_of(" Surviving reboots {: #ghost } and logouts"),
             "surviving-reboots-ghost-and-logouts"
         );
-        assert_eq!(
-            anchor_of(" Plain {not an attr list}"),
-            "plain-not-an-attr-list"
-        );
+        // The `:` is optional in `attr_list`'s own grammar, so all three
+        // spellings publish the same anchor.
+        assert_eq!(anchor_of(" Title {#nocolon}"), "nocolon");
+        assert_eq!(anchor_of(" Title { #spaced }"), "spaced");
+        assert_eq!(anchor_of(" Title {: #withcolon }"), "withcolon");
+        // A trailing group carrying no id is still consumed by the
+        // generator, so it is not part of what the anchor slugifies from.
+        assert_eq!(anchor_of(" Plain {not an attr list}"), "plain");
 
         let nav = "  { \"CLI\" = \"reference/cli.md\" },\n  # { \"Queries\" = \"reference/terminal-queries.md\" },\n";
         assert!(nav_lists(nav, "reference/cli.md"));
