@@ -69,6 +69,12 @@ toolchain move — putting the snapshot API in reach.
    shipped the `roost-vt` wrapper). The wire stays kind-tagged
    (`vt` | `ghostty-snapshot`) so a formatter fallback remains
    possible, but the formatter path is not built.
+   **Amended (plan 053, #420):** it is built now, and the principle
+   above still holds — `ghostty-snapshot` stays first in every
+   preference list and is what a matching build always gets. `vt`
+   is the fallback, chosen only when the binary format cannot be
+   served, and it cost no protocol bump. See
+   [`docs/reference/ipc.md` → Payload kinds](../docs/reference/ipc.md#payload-kinds).
 4. **Localhost auto-reconnects after first opt-in; SSH stays
    explicit.** Once a user has connected `localhost`, relaunching the
    UI reattaches automatically — persist feels native. SSH hosts
@@ -146,6 +152,22 @@ what changed or got confirmed by reading the actual code):
 - The formatter (VT dump) exists at the *current* pin and a
   whole-screen dump avoids the GridRef UB hazard; it's ~60 lines if
   ever needed as a fallback. Active screen only, no continuation.
+  **Amended (plan 053, #420):** built as `roost_vt::vt_snapshot`
+  (`crates/roost-vt/src/vt_dump.rs`). Two estimates here were wrong.
+  It is an order of magnitude more than ~60 lines: the formatter's
+  own emission order forces a two-pass composition with a blank-row
+  pad between the passes, an explicit mode allowlist (its `modes`
+  extra replays modes that would resize the client or write to its
+  PTY), an explicit background refill for text-free rows its
+  blank-row predicate drops, and a deferred `DECOM`/`IRM` restore
+  because setting origin mode homes the cursor. And **continuation
+  is carried** — `ghostty_terminal_continuation_buf` appends the
+  bytes of the sequence the fence cut, which is what keeps a `vt`
+  client in the same parser state as the server. "Active screen
+  only" held: the inactive screen is a documented non-carry, along
+  with soft-wrap flags, per-cell hyperlinks, the saved cursor and
+  the kitty stack — full list in
+  [`docs/reference/ipc.md` → Payload kinds](../docs/reference/ipc.md#payload-kinds).
 
 **Roost seams** (better than the discovery note assumed):
 
@@ -532,6 +554,10 @@ what actually shipped.
 the `roost-vt` wrapper shipped (plan 034, PR #371). The kind-tagged
 wire keeps the ~60-line formatter fallback possible as a swap, not a
 redesign, should a pin bump ever break the format.
+**Amended (plan 053, #420):** the swap was made, and the bet held —
+adding `vt` cost a new encoder plus a kind on the attach token, and
+no protocol bump. What did not hold is the sizing; see the note
+under HS-1's limitations above.
 
 **Acceptance:** start session → open tabs via `roostctl` → agents
 keep running with no UI anywhere → `tab.dump` shows live state →

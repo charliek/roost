@@ -13,6 +13,57 @@ release workflow asserts they agree).
 
 ### Added
 
+- **A libghostty build skew connects instead of demanding a restart
+  (#420)** — a host session and the Roost connecting to it used to have
+  to pin the *same* libghostty build, because the only attach payload
+  was libghostty's own binary snapshot. Upgrade Roost while a
+  `roost-session` from before the upgrade is still running and the host
+  went amber, listed no tabs, and offered one remedy: restart the
+  session, ending every shell on it. There is now a second payload
+  kind, **`vt`** — a plain VT byte stream the client replays into its
+  own terminal, so no build has to match — and a session serves it
+  beside `ghostty-snapshot`, picked automatically when the binary
+  format cannot be. A skewed host therefore just **connects**: no dot,
+  no dialog, tabs render, you type into them. `ghostty-snapshot` stays
+  first in every preference list, so nothing changes when the builds
+  agree. Amber "needs restart" now means the narrower pair of things it
+  should — a *protocol* mismatch, or a session too old to serve `vt` at
+  all. It is honestly a lower-fidelity connection, and the tradeoffs
+  are worth reading before relying on it: link hover and click stop
+  working on such a tab, attaching over a full-screen program leaves
+  the shell underneath blank when it exits, wrapped lines replay as
+  separate lines, and a coloured status bar that has scrolled into
+  history loses its fill. `roostctl host status --json` reports
+  `payload_kind` once a tab has attached, which is the only way to tell
+  from outside. One gap stated plainly: the "Update roost-session on
+  ‹host›" offer is raised only from the state a fallback now avoids, so
+  **a remote SSH host on `vt` has no in-app path to update its
+  daemon** — update the binary over ssh and restart the session there
+  by hand, or `roostctl session stop` over ssh and Connect again to get
+  the ordinary install offer, until an on-demand action lands (#447). See the
+  [host sessions guide](docs/guides/host-sessions.md#the-upgrade-restart-flow)
+  for the full list and the recovery routes, and
+  [ipc.md](docs/reference/ipc.md#payload-kinds) for the wire contract.
+- **`tab.dump` can return scrollback, not just the viewport (#421)** —
+  the op every test, script and `roostctl tab dump` reads a terminal
+  through has always answered with the visible grid alone, so anything
+  that scrolled off was unreachable even though all three terminals
+  retain 2000 rows of it. It now takes an optional `scrollback` row
+  count and answers with `scrollback_rows` (how much history exists
+  above what it is showing) plus `scrollback_text` (that many rows of
+  it). `roostctl tab dump --tab 5 --scrollback 200` prints the history
+  and then the viewport with no separator between them, so an existing
+  `| grep` keeps working over a much larger window. The history is
+  anchored on the **viewport that was dumped**, so its last row is
+  always the one directly above the first visible row — true on a tab
+  the user has scrolled up, not just at the live bottom. Asking for
+  more than exists is clamped rather than refused, which makes
+  `--scrollback 1000000` a legitimate way to say "all of it". Served
+  identically on a host session's socket, a UI socket, and by both the
+  Linux and macOS UIs; a session advertises it as `tab_dump_scrollback`
+  in `session.identify.features`. No protocol bump — but the request
+  key is new, so a Roost or session predating it answers `invalid-param`
+  to the flag rather than quietly ignoring it.
 - **`events.subscribe` can resume instead of re-snapshotting (#422)** — a
   phone dropping in and out of a flaky link used to pay a `tab.list`
   snapshot and a re-fence on every stall; a host session now keeps a

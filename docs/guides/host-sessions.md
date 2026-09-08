@@ -248,15 +248,49 @@ Only the **terminal frame** freezes. The tab list, titles, agent status, and not
 
 ## The upgrade / restart flow
 
-`roost-session` and the Roost client both pin the same libghostty build, and every tab's snapshot depends on the two agreeing exactly. The most common way this feature breaks — on literally every package upgrade, until the host itself is restarted — is a build (or protocol) mismatch: you upgrade Roost, but a `roost-session` you started before the upgrade is still running the old build.
+`roost-session` and the Roost client both pin the same libghostty build. The most common way that pairing comes apart — on literally every package upgrade, until the host itself is restarted — is a build mismatch: you upgrade Roost, but a `roost-session` you started before the upgrade is still running the old build.
 
-Roost catches this at Connect, before it ever tries to render anything, and shows the amber "needs restart" dot instead. Connecting again raises a dialog rather than a corrupted screen, and which one depends on how the host is reached:
+**Since plan 053 that mismatch no longer stops you.** A session that can serve the `vt` payload — a plain VT byte stream your Roost replays into its own terminal, rather than the exact-build binary snapshot — is attachable across a build skew, so Roost **connects normally**: no dot, no dialog, tabs list and render, you type into them. It is a *reduced-fidelity* connection, and the section below says exactly what that costs. Every `roost-session` from plan 053 on serves `vt`.
+
+So the amber **"needs restart"** dot now means one of two narrower things, both of which really are terminal:
+
+- a **protocol mismatch** — the two ends disagree about the wire itself, which no payload kind can bridge; or
+- a **session too old to serve `vt`** (anything predating plan 053) that also disagrees on the build — the binary snapshot was all it ever had, and the two builds cannot exchange one.
+
+When the dot is showing, connecting again raises a dialog rather than a corrupted screen, and which one depends on how the host is reached:
 
 - **On a localhost host you can restart**: *"Restart the session on ‹label›? This session was started by an older/newer Roost (…detail…). Restarting reopens every tab as a fresh shell in its directory — running programs end."* Buttons: **Not now** / **Restart session**. Restarting is `session.stop` → wait for the socket to actually go → spawn a fresh `roost-session` → reconnect, composed on the client side. It's the same layout-survives contract as any other restart — every tab reopens in its saved directory, but whatever was running inside it is gone.
 - **On a remote host reached over SSH, Roost offers to fix it for you.** *"The session on ‹label› needs a restart… Roost can install the matching roost-session on ‹label› over ssh and restart the session there — it will show you what it would do before anything is changed."* Button: **Update roost-session on ‹label›**. This runs the same install/upgrade flow as the [not-found row](#troubleshooting) below — a consent card naming exactly what will be installed and from where, shown before anything is touched — then installs the matching build, stops the stale session, waits for it to actually go, starts the new one, and reconnects. If the session on the far end happens to be *newer* than this Roost, the dialog says so instead — installing an older build isn't the fix there, upgrading Roost is.
 - **On a remote host reached over the [fallback `ssh -L` forward](#scripted-fallback-forwarding-with-ssh-n-l) (a plain Unix-socket target), this client still can't reach in and fix it for you** — the bootstrap flow only knows how to reach a host over Roost's own SSH transport. The dialog says so instead of offering a dead button: *"The session on ‹label› needs a restart… Only the machine running it can restart it — stop and start the session there (`roostctl session stop`, then `roostctl session start`)."* SSH into that machine and run those two commands yourself, then Connect again from here.
 
 **Roost never installs or restarts anything without asking first**, on every one of these paths — the consent card is always the first remote activity, and Cancel leaves the host exactly as it was. `roostctl` has no install, upgrade, or remote-restart verb of its own, and an IPC-originated connect (a script, a hook) never raises a dialog — a machine is never prompted, only a person looking at the window is.
+
+### When a build skew connects instead: the `vt` fallback
+
+A skew against a plan-053-or-later session takes the other path. There is no dot and no dialog, so the one way to know you are on it is to ask:
+
+```bash
+roostctl host status --id <id> --json   # look for "payload_kind": "vt"
+```
+
+The field appears only once a tab on that host has actually attached — it reports what is being decoded, not what could be — and it goes away with the connection, so it can never claim a fallback you have since reconnected out of.
+
+**What the fallback does not carry.** These are real gaps in a screen that otherwise looks right, which is why they are worth knowing about rather than discovering:
+
+- **Link hover and click stop working** on a tab attached this way. Roost turns hyperlinks on in every shell it spawns, so a tab full of `OSC 8` links from `gh`, `cargo` or a test runner still *looks* linked and no longer behaves that way.
+- **The other screen is empty.** If you attach while a full-screen program (vim, `htop`, a TUI agent) is running, the shell underneath comes back blank when that program exits — the alternate screen is what was captured, and only one screen travels.
+- **Wrapped lines replay as separate lines**, so selecting or resizing re-flows them differently than the same tab does on the host.
+- **Some scrolled-off rows lose their background fill** — a coloured status bar that scrolled into history comes back as blank space. On the visible screen it is repainted correctly.
+- **Kitty images do not survive** (nor do they under the binary snapshot), and neither does a saved cursor position or a pushed kitty-keyboard stack.
+
+The [IPC reference](../reference/ipc.md#payload-kinds) has the complete list, including the mode-by-mode reasoning. Everything else — the tab list, titles, agent status, notifications, typing, resizing, scrollback — behaves exactly as it does on a matched build.
+
+**Getting back to full fidelity.** Restart the session with a `roost-session` that matches your Roost:
+
+- **On localhost**: `roostctl session stop`, then Connect again from Roost — a localhost connect spawns the session for you, and the one it spawns is the build shipped alongside the app. (Or `roostctl session start` yourself first.)
+- **On a remote SSH host**: **there is no in-app path today.** The "Update `roost-session` on ‹label›" offer is raised only from the "needs restart" state — the state a `vt` fallback deliberately stops reaching — so a skewed remote host connects instead of offering to fix itself, and there is currently no way to ask for the update on demand. Until an on-demand action exists ([#447](https://github.com/charliek/roost/issues/447)), do it by hand: SSH to the host, update the `roost-session` binary there, `roostctl session stop && roostctl session start`, then Connect again from Roost. Stopping the session ends its shells, exactly as an in-app restart would have. If you would rather have Roost install the matching binary for you, `roostctl session stop` over SSH *first* and then Connect — with nothing listening, the connect falls into the ordinary bootstrap ladder, which does offer to install and start one, with its usual consent card.
+
+This is a deliberate trade: connecting at reduced fidelity beats refusing to connect, and the missing update button is the price it is currently charging.
 
 ## macOS note
 

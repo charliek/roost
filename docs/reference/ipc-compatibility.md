@@ -131,7 +131,11 @@ is only "additive" if it satisfies all four.
 The second row is the one that surprises people. Adding an optional
 request field is *not* free unless it is omitted from the serialized
 form when unset — a field that always serializes, even as `null`, makes
-every new client incompatible with every old server.
+every new client incompatible with every old server. The sentinel need
+not be `Option`: `tab.dump`'s `scrollback` (plan 053) is a `u32` skipped
+when it is `0`, so an unset request stays byte-identical to what
+pre-053 clients always sent, and only a client that actually asks for
+history is refused by a server that predates the key.
 
 ### Closed enums
 
@@ -191,15 +195,17 @@ at the token.
 worked example: the client reads the list, keeps the entries it does not
 recognize, and picks from the intersection with its own. Nothing about
 that logic mentions a version number, which is why adding a payload kind
-costs nothing.
+costs nothing — plan 053 spent that budget for real, adding the `vt`
+kind and its whole fallback path with no protocol bump.
 
 **`session.identify.features` is the same pattern applied to *ops and
 op parameters alike*.** An open string list, decode-when-absent like
 `payload_kinds`, naming the additive session capabilities this build
 serves — seeded with `"put_file"` (plan 049, R1) and joined by
 `"events_resume"` (plan 052) for `events.subscribe`'s
-`from_revision`/`session_id` pair, a capability that is a parameter on
-an existing op rather than a new one. It exists because the
+`from_revision`/`session_id` pair and `"tab_dump_scrollback"` (plan
+053) for `tab.dump`'s `scrollback` count, both capabilities that are a
+parameter on an existing op rather than a new one. It exists because the
 alternative, bumping `SESSION_PROTOCOL_VERSION` for every additive
 capability, conflates two different questions: "can this peer speak my
 generation of the wire at all" (the exact gate above) and "does this
