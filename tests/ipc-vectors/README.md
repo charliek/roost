@@ -18,6 +18,9 @@ envelope, or an event envelope. The naming convention is:
 - `<op>.<variant>.request.json` — a second exemplar of the same op,
   when one shape cannot carry both (an optional field set vs. omitted,
   a mode the flat form can't show). Additive: the plain vector stays.
+- `<op>.<variant>.response.json` — the answering half, when a variant
+  request is answered in a shape the plain response can't show (a
+  negotiated result that differs from the default). Additive too.
 - `<event-name>.event.json` — server-push event envelope.
 - `<op>.response.v<N>.json` — a response that embeds a protocol
   integer, one file per generation it has carried (`session.identify`

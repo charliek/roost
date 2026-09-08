@@ -438,6 +438,18 @@ with the versions shown. The `kind` field keeps a formatter
 fallback possible without protocol changes, but it is not built
 unless needed.
 
+**Shipped (plan 053, #420):** it was needed, and the `kind` field
+paid off exactly as designed — `vt` was added with **no protocol
+bump**. `crates/roost-vt/src/vt_dump.rs` composes the payload from
+libghostty's formatter; `tab.attach` negotiates by servability then
+eligibility, where only `ghostty-snapshot` carries the build
+requirement; the transport terminates the byte stream with one
+zero-length `SNAP` frame. The paragraph below described the trigger
+correctly and its remedy is now the *second* answer, not the first:
+a build skew connects on `vt` instead of demanding a restart. See
+[`docs/reference/ipc.md` → Payload kinds](../docs/reference/ipc.md#payload-kinds)
+for what the payload does and does not carry.
+
 **The localhost upgrade trap is the common case of this gate, not a
 corner.** Every package upgrade after a user opts into localhost
 persist produces exactly this mismatch on next launch: the running

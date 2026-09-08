@@ -346,16 +346,7 @@ impl TerminalTab {
         word_break_chars: String,
         session: TabHandle,
     ) -> Result<Self> {
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols,
-            rows,
-            max_scrollback: 2_000,
-            continuation_max_bytes: 0,
-        })?;
-        terminal.set_color_foreground(theme.foreground)?;
-        terminal.set_color_background(theme.background)?;
-        terminal.set_color_cursor(theme.cursor)?;
-        terminal.set_color_palette(&theme.palette)?;
+        let mut terminal = Self::new_terminal(cols, rows, &theme)?;
         let reply_buffer = Arc::new(Mutex::new(Vec::new()));
         terminal
             .set_write_pty_buffer(Arc::clone(&reply_buffer))
@@ -397,10 +388,40 @@ impl TerminalTab {
         })
     }
 
+    /// A blank terminal wearing `theme` — the one place a tab's terminal
+    /// is built, whether it is the tab's own or a replacement being
+    /// hydrated beside it.
+    fn new_terminal(cols: u16, rows: u16, theme: &Theme) -> Result<Terminal> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback: 2_000,
+            continuation_max_bytes: 0,
+        })?;
+        terminal.set_color_foreground(theme.foreground)?;
+        terminal.set_color_background(theme.background)?;
+        terminal.set_color_cursor(theme.cursor)?;
+        terminal.set_color_palette(&theme.palette)?;
+        Ok(terminal)
+    }
+
+    /// A terminal for a host attach to hydrate into, built exactly as
+    /// this tab's own was and wearing the theme it is wearing now.
+    ///
+    /// The `vt` payload carries only what the *program* changed, so the
+    /// colors underneath have to be the client's — and the reply buffer
+    /// is deliberately absent: [`Self::swap_terminal`] installs it at
+    /// the moment this terminal becomes the one being rendered, and a
+    /// hydration that never finishes must never have been able to write
+    /// to the wire.
+    pub(super) fn hydration_terminal(&self, cols: u16, rows: u16) -> Result<Terminal> {
+        Self::new_terminal(cols, rows, &self.theme)
+    }
+
     /// Attach the UI to a tab that lives on a connected host. No local
     /// backend is involved: `handle` queues input toward the host's data
     /// connection, and the terminal built here is the blank stand-in the
-    /// hydration swaps out at READY (`swap_terminal`) — which is also
+    /// hydration swaps out when it completes (`swap_terminal`) — also
     /// why a re-attach never blanks the tab: the old terminal keeps
     /// rendering until the new one is ready (plan 037 §3.4).
     pub(super) fn attach_host(
@@ -413,13 +434,15 @@ impl TerminalTab {
         Self::build(cols, rows, theme, word_break_chars, handle)
     }
 
-    /// Install a hydrated terminal in place of the one this tab renders
-    /// — the READY swap. The decoder built `terminal` from the host's
-    /// snapshot; from here on the tab's own `write_vt` drives it. The
-    /// reply buffer moves onto the new terminal (its replies are then
-    /// discarded under the host handle's policy), the selection drops
-    /// (its grid refs pointed into the old terminal), and the render
-    /// caches reset so the next `refresh_snapshot` rebuilds every row.
+    /// Install a hydrated terminal in place of the one this tab renders.
+    /// The attach built `terminal` from the host's payload — a decoded
+    /// snapshot, or a `vt` stream replayed into one of
+    /// [`Self::hydration_terminal`]'s — and from here on the tab's own
+    /// `write_vt` drives it. The reply buffer moves onto the new
+    /// terminal (its replies are then discarded under the host handle's
+    /// policy), the selection drops (its grid refs pointed into the old
+    /// terminal), and the render caches reset so the next
+    /// `refresh_snapshot` rebuilds every row.
     pub(super) fn swap_terminal(
         &mut self,
         mut terminal: Terminal,
@@ -1207,8 +1230,13 @@ impl TerminalTab {
         Ok(())
     }
 
-    pub(super) fn dump(&self) -> DumpData {
-        DumpData {
+    /// The viewport comes from the render snapshot and the history from
+    /// the live terminal, so the snapshot is republished first: a stale
+    /// one would put the two halves a PTY chunk apart and break the
+    /// adjacency `scrollback_text` promises.
+    pub(super) fn dump(&mut self, scrollback: u32) -> Result<DumpData> {
+        self.refresh_snapshot()?;
+        Ok(DumpData {
             cols: u32::from(self.snapshot.cols),
             rows: u32::from(self.snapshot.rows),
             cursor: self
@@ -1222,7 +1250,9 @@ impl TerminalTab {
                 .iter()
                 .map(|row| row.text.clone())
                 .collect(),
-        }
+            scrollback_rows: roost_vt::scrollback_rows(&self.terminal)?,
+            scrollback_text: roost_vt::scrollback_text(&self.terminal, scrollback)?,
+        })
     }
 
     pub(super) fn resolved_cells(&self) -> ResolvedCellsData {

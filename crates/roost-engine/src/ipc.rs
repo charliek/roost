@@ -53,7 +53,8 @@ use roost_ipc::messages::{
     TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
     TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
     WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
-    MAX_PUT_FILE_BYTES, SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES, SESSION_PROTOCOL_VERSION,
+    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES,
+    SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -71,6 +72,28 @@ pub struct DumpData {
     pub rows: u32,
     pub cursor: Option<(u32, u32, bool)>,
     pub rows_text: Vec<String>,
+    /// History rows above the viewport `rows_text` shows, and the last
+    /// `min(requested, scrollback_rows)` of them. Both halves are read
+    /// from one terminal state so `scrollback_text`'s final entry is the
+    /// row immediately above `rows_text[0]`.
+    pub scrollback_rows: u32,
+    pub scrollback_text: Vec<String>,
+}
+
+/// Why a UI-served `tab.dump` produced no [`DumpData`].
+///
+/// Typed rather than a message because `tab.dump` is served on two
+/// sockets — a session's own `tab_task` reader and the app's — and one
+/// op must answer the same code for the same condition: a tab the UI
+/// does not have is `not-found`, a terminal read that failed is
+/// `internal` (the session path's `TabError::Render`). Flattening both
+/// onto a `String` folds them onto one code and tells the client to fix
+/// the wrong thing — "that tab is gone" for a tab that is right there.
+pub enum DumpError {
+    /// No tab with that id on this UI.
+    NoTab(String),
+    /// The tab is there; reading its terminal failed.
+    Read(String),
 }
 
 /// Reply for a [`UiRequest::Screenshot`]: `(png_bytes, width, height)`
@@ -94,9 +117,9 @@ type SidebarDumpReply = tokio::sync::oneshot::Sender<Result<SidebarDumpResult, S
 /// zeroed struct rather than an error.
 type RenderStatsReply = tokio::sync::oneshot::Sender<Result<AppRenderStatsResult, String>>;
 
-/// Reply for a [`UiRequest::Dump`]: the viewport text on success, an
-/// error message (e.g. tab not found / no live terminal) on failure.
-type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
+/// Reply for a [`UiRequest::Dump`]: the viewport text on success, a
+/// [`DumpError`] — which failure it was — otherwise.
+type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, DumpError>>;
 
 /// Reply for the `palette.*` [`UiRequest`]s: the resulting palette state.
 /// Shared by all five — each mutating op answers with the state it
@@ -251,9 +274,11 @@ pub enum UiRequest {
     /// Read a tab's terminal viewport as text. `tab_id` is the wire
     /// form: bare = a local tab, host-qualified = an attached host
     /// tab's client-side terminal — the UI resolves both against its
-    /// keyed map (plan 037 §3.4).
+    /// keyed map (plan 037 §3.4). `scrollback` is the already-clamped
+    /// count of history rows to return alongside the viewport.
     Dump {
         tab_id: WireTabRef,
+        scrollback: u32,
         reply: DumpReply,
     },
     /// Open a command-palette root frame and reply with its state.
@@ -1201,15 +1226,22 @@ struct AttachToken {
     lease: String,
     tab_id: i64,
     tab_generation: u64,
+    /// What `tab.attach` negotiated. Carried on the ticket because the
+    /// data connection presents only the token: the encode and the
+    /// handshake reply both have to name the kind the control op
+    /// settled on, and re-deriving it there would let the two answers
+    /// drift.
+    kind: AttachPayloadKind,
     expires_at: std::time::Instant,
 }
 
 /// What consuming a token admitted, handed to the forwarder.
 #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct AdmittedAttach {
     pub(crate) tab_id: i64,
     pub(crate) tab_generation: u64,
+    pub(crate) kind: AttachPayloadKind,
 }
 
 struct Lease {
@@ -1531,6 +1563,7 @@ impl ClientRegistry {
         lease: &str,
         tab_id: i64,
         tab_generation: u64,
+        kind: AttachPayloadKind,
         ttl: Duration,
     ) -> Result<String, HandlerError> {
         let now = std::time::Instant::now();
@@ -1563,6 +1596,7 @@ impl ClientRegistry {
             lease: lease.to_string(),
             tab_id,
             tab_generation,
+            kind,
             expires_at: now + ttl,
         });
         Ok(token)
@@ -1630,6 +1664,7 @@ impl ClientRegistry {
             AdmittedAttach {
                 tab_id: ticket.tab_id,
                 tab_generation: ticket.tab_generation,
+                kind: ticket.kind,
             },
             displaced,
         ))
@@ -1773,12 +1808,13 @@ impl SessionState {
         lease: &str,
         tab_id: i64,
         tab_generation: u64,
+        kind: AttachPayloadKind,
     ) -> Result<String, HandlerError> {
         let mut guard = lock(&self.clients);
         if self.stopping.load(Ordering::Acquire) {
             return Err(shutting_down());
         }
-        guard.mint_token(lease, tab_id, tab_generation, self.attach_token_ttl())
+        guard.mint_token(lease, tab_id, tab_generation, kind, self.attach_token_ttl())
     }
 
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
@@ -2374,10 +2410,11 @@ mod served {
     pub(super) async fn dump(
         h: &IpcHandler,
         tab: WireTabRef,
+        scrollback: u32,
     ) -> Option<Result<DumpData, HandlerError>> {
         h.session.as_ref()?;
         Some(match bare(tab) {
-            Ok(tab_id) => tab_ask(h, tab_id, TabCmd::Dump).await,
+            Ok(tab_id) => tab_ask(h, tab_id, |reply| TabCmd::Dump { scrollback, reply }).await,
             Err(error) => Err(error),
         })
     }
@@ -2465,6 +2502,7 @@ mod served {
     pub(super) async fn dump(
         _: &IpcHandler,
         _: WireTabRef,
+        _: u32,
     ) -> Option<Result<DumpData, HandlerError>> {
         None
     }
@@ -2657,10 +2695,11 @@ async fn dispatch_outcome(
 ///
 /// The validation order is pinned (D5) and each earlier failure wins,
 /// because the codes instruct differently: `connect-required` means "go
-/// get a lease", `not-found` means "that tab is gone", `unsupported-kind`
-/// and `build-mismatch` both mean "we cannot talk", and only then does
-/// geometry get looked at. Reordering would tell a client to fix the
-/// wrong thing.
+/// get a lease", `not-found` means "that tab is gone",
+/// `unsupported-kind` means "offer something else", `build-mismatch`
+/// means "the offer we could serve needs the same libghostty on both
+/// ends", and only then does geometry get looked at. Reordering would
+/// tell a client to fix the wrong thing.
 #[cfg(feature = "server-vt")]
 async fn tab_attach(
     h: &IpcHandler,
@@ -2677,43 +2716,75 @@ async fn tab_attach(
         HandlerError::not_found(format!("tab {} has no live terminal to attach", p.tab_id))
     })?;
 
-    // A list mixing kinds this build has never heard of with one it
+    // A list mixing kinds this build has never heard of with ones it
     // serves is fine — the client states a preference order and the
-    // first servable entry wins. "Servable" is what `session.identify`
-    // ADVERTISED (`payload_kinds`), intersected with what this build
-    // can actually encode — the advertisement is the contract a client
+    // first entry that is both *servable* and *eligible* wins.
+    //
+    // Servable is what `session.identify` ADVERTISED
+    // (`payload_kinds`): the advertisement is the contract a client
     // negotiated against, so a kind absent from it must not be accepted
-    // even when the code could produce it.
-    let kind = p
+    // even when the code could produce it. Eligible is the kind's own
+    // requirement, which only GHOSTSNP has — it is libghostty's binary
+    // state, so both ends must be the same build.
+    //
+    // The two refusals stay separate because they instruct differently.
+    // Nothing servable at all is "offer something else"; servable but
+    // ineligible is "the two builds disagree", which is the answer a
+    // pre-`vt` client's whole restart flow hangs off. Splitting the walk
+    // in two is what keeps them apart: a client offering
+    // `[ghostty-snapshot, vt]` across a skew must land on `vt` rather
+    // than on either refusal.
+    let servable: Vec<&AttachPayloadKind> = p
         .kinds
         .iter()
-        .find(|kind| {
-            kind.as_str() == AttachPayloadKind::GHOSTTY_SNAPSHOT
-                && session.info.payload_kinds.contains(kind)
-        })
-        .cloned()
-        .ok_or_else(|| {
-            HandlerError::new(
-                "unsupported-kind",
-                format!(
-                    "this session serves {:?}; the client offered {:?}",
-                    session.info.payload_kinds, p.kinds
-                ),
-            )
-        })?;
-
-    // Exact match, both strings named: two libghostty builds that
-    // disagree cannot exchange a snapshot, and a client that sees only
-    // "mismatch" cannot tell which side to upgrade.
-    if p.libghostty_build != session.info.libghostty_build {
+        .filter(|kind| session.info.payload_kinds.contains(kind))
+        .collect();
+    if servable.is_empty() {
         return Err(HandlerError::new(
+            "unsupported-kind",
+            format!(
+                "this session serves {:?}; the client offered {:?}",
+                session.info.payload_kinds, p.kinds
+            ),
+        ));
+    }
+    let builds_match = p.libghostty_build == session.info.libghostty_build;
+    let mut eligible = None;
+    for kind in servable {
+        let holds = match kind.as_str() {
+            AttachPayloadKind::GHOSTTY_SNAPSHOT => builds_match,
+            // `vt` is a byte stream any VT parser replays, so the build
+            // it was encoded against is not this gate's business.
+            AttachPayloadKind::VT => true,
+            // Advertised by this session and unknown to this code, which
+            // can only be a misconfigured advertisement. Refused rather
+            // than waved through: "no requirement" is the answer for a
+            // kind whose requirement is *known* to be none, and guessing
+            // it for an unknown one is how a build-skewed client gets
+            // served GHOSTSNP under another name.
+            other => {
+                return Err(HandlerError::new(
+                    "internal",
+                    format!("this session advertises {other:?}, which it cannot serve"),
+                ))
+            }
+        };
+        if holds {
+            eligible = Some(kind.clone());
+            break;
+        }
+    }
+    // Exact match, both strings named: a client that sees only
+    // "mismatch" cannot tell which side to upgrade.
+    let kind = eligible.ok_or_else(|| {
+        HandlerError::new(
             "build-mismatch",
             format!(
                 "this session is {:?}; the client is {:?}",
                 session.info.libghostty_build, p.libghostty_build
             ),
-        ));
-    }
+        )
+    })?;
 
     // Zero cell pixels are legal — a headless client has no cell metrics
     // to report — but a zero-sized grid is not a grid.
@@ -2758,7 +2829,8 @@ async fn tab_attach(
             ))
         })?;
 
-    let attach_token = session.mint_attach_token(&p.lease, p.tab_id, tab_generation)?;
+    let attach_token =
+        session.mint_attach_token(&p.lease, p.tab_id, tab_generation, kind.clone())?;
     encode(&TabAttachResult {
         attach_token,
         kind,
@@ -3421,15 +3493,21 @@ async fn dispatch(
         }
         ops::TAB_DUMP => {
             let p: TabDumpParams = decode(params)?;
-            let data = match served::dump(h, p.tab_id).await {
+            // Clamped, never refused: a client asking for "everything"
+            // does not know the tab's retention. Once here, before the
+            // paths split, so the session and UI sockets share one
+            // ceiling.
+            let scrollback = p.scrollback.min(MAX_DUMP_SCROLLBACK);
+            let data = match served::dump(h, p.tab_id, scrollback).await {
                 Some(served) => served?,
                 None => h
                     .ui_call(|reply| UiRequest::Dump {
                         tab_id: p.tab_id,
+                        scrollback,
                         reply,
                     })
                     .await?
-                    .map_err(HandlerError::not_found)?,
+                    .map_err(dump_err)?,
             };
             encode(&TabDumpResult {
                 cols: data.cols,
@@ -3438,6 +3516,8 @@ async fn dispatch(
                     .cursor
                     .map(|(row, col, visible)| TabDumpCursor { row, col, visible }),
                 rows_text: data.rows_text,
+                scrollback_rows: data.scrollback_rows,
+                scrollback_text: data.scrollback_text,
             })
         }
         ops::PROJECT_CREATE => {
@@ -4382,6 +4462,16 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
         WorkspaceError::HostLabelEmpty
         | WorkspaceError::HostLabelReserved
         | WorkspaceError::HostLabelTaken(_) => HandlerError::invalid_param(e.to_string()),
+    }
+}
+
+/// The UI half of the `tab.dump` contract, mapped onto the codes the
+/// session half already gives: see [`DumpError`].
+#[allow(clippy::needless_pass_by_value)] // `Result::map_err` adapter owns its error.
+fn dump_err(e: DumpError) -> HandlerError {
+    match e {
+        DumpError::NoTab(msg) => HandlerError::not_found(msg),
+        DumpError::Read(msg) => HandlerError::new("internal", msg),
     }
 }
 

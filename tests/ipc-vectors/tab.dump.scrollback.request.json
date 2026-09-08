@@ -1,0 +1,8 @@
+{
+  "id": "13",
+  "op": "tab.dump",
+  "params": {
+    "tab_id": "5",
+    "scrollback": 50
+  }
+}

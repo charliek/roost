@@ -263,9 +263,18 @@ class Roost:
                    ready_timeout, f"tab {tab_id} shell prompt")
         self.send(tab_id, command + "\n")
 
-    def dump(self, tab_id: int) -> dict:
-        """Terminal viewport as text: {cols, rows, cursor?, rows_text}."""
-        return self.call("tab.dump", {"tab_id": str(tab_id)})
+    def dump(self, tab_id: int, scrollback: int = 0) -> dict:
+        """Terminal viewport as text: {cols, rows, cursor?, rows_text},
+        plus `scrollback_rows` and — when `scrollback` asks for any —
+        `scrollback_text`, the history immediately above `rows_text[0]`.
+
+        The key is omitted at 0 so an unset request is byte-identical to
+        what every pre-053 client puts on the wire, which is what a
+        strict params struct on an older server requires."""
+        params: dict = {"tab_id": str(tab_id)}
+        if scrollback:
+            params["scrollback"] = scrollback
+        return self.call("tab.dump", params)
 
     def dump_text(self, tab_id: int) -> str:
         return "\n".join(self.dump(tab_id)["rows_text"])

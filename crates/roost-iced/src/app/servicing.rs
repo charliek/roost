@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use roost_engine::ipc::{HostOpFailure, HostOpReply};
+use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::messages::{SentFile, SkippedFile, TabSendFileResult};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
 use roost_ui_model::keys::HostId;
@@ -1081,13 +1081,14 @@ impl App {
         frame: host_tab::HostTabFrame,
         pty: &mut TabOutputBatch,
     ) {
-        let step = match (self.host_attach.get_mut(&key), self.tabs.get_mut(&key)) {
+        let (step, payload_kind) = match (self.host_attach.get_mut(&key), self.tabs.get_mut(&key)) {
             (Some(attach), Some(tab)) => {
                 // The machine arms its own timers, so it needs the app
                 // runtime ambient the same way `begin` and `arm_reattach`
                 // below do — `tokio::spawn` panics without it.
                 let _guard = self.runtime.enter();
-                attach.on_frame(frame, tab, &self.feed_tx)
+                let step = attach.on_frame(frame, tab, &self.feed_tx);
+                (step, attach.payload_kind())
             }
             // A frame for a key with no attach state: the tab detached,
             // the tab dropped, or the whole incarnation is stale — every
@@ -1097,6 +1098,12 @@ impl App {
                 return;
             }
         };
+        if let Some(kind) = payload_kind {
+            // Read off the machine rather than the frame: only an accept
+            // it actually applied sets it, so a frame from a superseded
+            // attempt cannot rewrite what the host reports.
+            self.hosts.note_payload_kind(key.host, kind.wire());
+        }
         match step {
             host_tab::AttachStep::None => {}
             host_tab::AttachStep::Refresh => {
@@ -2310,12 +2317,20 @@ impl App {
                     task = task.then(UiTask::Focus(id));
                 }
             }
-            UiRequest::Dump { tab_id, reply } => {
-                let result = self
-                    .tabs
-                    .get(&self.wire_tab_key(tab_id))
-                    .map(TerminalTab::dump)
-                    .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
+            UiRequest::Dump {
+                tab_id,
+                scrollback,
+                reply,
+            } => {
+                let key = self.wire_tab_key(tab_id);
+                let result = match self.tabs.get_mut(&key) {
+                    Some(tab) => tab
+                        .dump(scrollback)
+                        .map_err(|error| DumpError::Read(error.to_string())),
+                    None => Err(DumpError::NoTab(format!(
+                        "tab {tab_id} has no live terminal"
+                    ))),
+                };
                 let _ = reply.send(result);
             }
             UiRequest::TabFeedPtyBytes {
@@ -3050,6 +3065,10 @@ impl App {
                 // sidebar draws.
                 rollup: band.rollup.clone(),
                 retry: self.hosts.retry_schedule(&host.id),
+                // What this host's tabs are actually being decoded as —
+                // absent until one has attached over the live
+                // connection.
+                payload_kind: self.hosts.payload_kind(&host.id).map(str::to_string),
             });
         }
         Ok(HostStatusResult { hosts })
@@ -4544,7 +4563,7 @@ mod tests {
             tab.refresh_snapshot().expect("refresh after the write");
             expected[row] = marker;
             assert_eq!(
-                tab.dump().rows_text,
+                tab.dump(0).expect("dump").rows_text,
                 expected,
                 "after step {step} (row {row}) every row must hold exactly its own content"
             );
@@ -4555,20 +4574,26 @@ mod tests {
 
     /// `TerminalSnapshot::blank` fills its rows with an empty string while
     /// `refresh_snapshot` builds `" "`-filled rows and trims them. Both
-    /// must land on `""`, because `tab.dump` — and the whole e2e suite
-    /// through it — reads one before the first refresh and the other
-    /// after.
+    /// must land on `""`, because a `view()` before the first refresh
+    /// renders one and everything after it renders the other.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_blank_snapshot_and_a_refreshed_empty_grid_dump_the_same_rows() {
         let (feed_tx, _) = engine_feed::channel();
         let (mut tab, supervisor) = attach_test_terminal(77, feed_tx);
-        let blank = tab.dump().rows_text;
+        // Straight off the snapshot: `dump` refreshes before it reads,
+        // so it can no longer observe the blank one.
+        let blank: Vec<String> = tab
+            .snapshot
+            .grid
+            .iter()
+            .map(|row| row.text.clone())
+            .collect();
         assert_eq!(blank, vec![String::new(); usize::from(DEFAULT_ROWS)]);
 
         tab.write_vt(b"\x1b[2J\x1b[H");
         tab.refresh_snapshot().expect("refresh the cleared grid");
         assert_eq!(
-            tab.dump().rows_text,
+            tab.dump(0).expect("dump").rows_text,
             blank,
             "a refreshed empty grid trims down to the same rows blank starts at"
         );
@@ -4826,7 +4851,7 @@ mod tests {
             tab.write_vt(format!("history-{line:04}\r\n").as_bytes());
         }
         tab.refresh_snapshot().expect("settle at the live bottom");
-        let before_text = tab.dump().rows_text;
+        let before_text = tab.dump(0).expect("dump").rows_text;
 
         let rebuilt_before = tab.render_stats.rows_rebuilt;
         let route = tab
@@ -4848,7 +4873,7 @@ mod tests {
             "a viewport move rebuilds every row rather than reusing the live-bottom cache"
         );
         assert_ne!(
-            tab.dump().rows_text,
+            tab.dump(0).expect("dump").rows_text,
             before_text,
             "the scrolled-back viewport must show different rows than the live bottom"
         );

@@ -475,24 +475,65 @@ Response: `{}`.
 
 Read the tab's live terminal *viewport* as text — the determinism
 backbone for automated tests (assert on exact content instead of
-OCR/pixel-matching a screenshot). Both UIs walk libghostty-vt's render
-state on the main thread. Viewport only for now (scrollback is a planned
-follow-up, so no `scrollback` param is accepted yet).
+OCR/pixel-matching a screenshot) — plus however many rows of history
+above it the request asks for. Both UIs walk libghostty-vt's render
+state on the main thread.
 
-Request: `{"params": {"tab_id": "3"}}`.
+Request: `{"params": {"tab_id": "3"}}`, or with history:
+`{"params": {"tab_id": "3", "scrollback": 50}}`.
 Response:
 
 ```json
 {"cols": 120, "rows": 30,
  "cursor": {"row": 1, "col": 14, "visible": true},
+ "scrollback_rows": 812,
+ "scrollback_text": ["…", "make: nothing to be done", "/tmp $ echo hi"],
  "rows_text": ["/tmp $ echo hi", "hi", "/tmp $", ""]}
 ```
 
 `rows_text` has one entry per visible row, trailing blanks trimmed (a
 blank cell renders as a space so columns line up). `cursor` is omitted
 when the cursor is off-viewport. Response is permissive, so per-cell
-color / scrollback fields can be added forward-compatibly. CLI:
+color fields can be added forward-compatibly. CLI:
 `roostctl tab dump --tab N` (plain rows) / `--json` (full result).
+
+**Scrollback (plan 053, #421).** `scrollback` is an optional row count,
+`0` (the default) meaning none. It is **omitted from the request when
+unset**, so a viewport-only ask stays byte-identical to what clients
+have always sent — which matters because `TabDumpParams` is strict: a
+server predating the key refuses the whole request with `unknown-field`
+rather than ignoring the field. Ask for more than
+`MAX_DUMP_SCROLLBACK` (10 000) and the count is **clamped, never
+refused**, so a client can ask for "everything" without knowing the
+tab's retention; a maximum exists at all because the rows are formatted
+synchronously on the thread that owns the terminal.
+
+Two response fields answer it, both `serde(default)` so a client built
+against this shape still decodes a pre-053 server's response:
+
+* `scrollback_rows` — how many history rows sit above the **current
+  viewport**, always present. This is the anchor for the whole
+  contract: it counts rows above what `rows_text` is showing, not above
+  the live bottom, so the two halves stay adjacent however far a UI tab
+  is scrolled up. A session socket never scrolls, so there it equals
+  the whole history; on the alternate screen it is `0`.
+* `scrollback_text` — the last `min(scrollback, scrollback_rows)` of
+  those rows, top to bottom, omitted when empty. Its final entry is
+  **always** the row immediately above `rows_text[0]`, at the bottom,
+  scrolled to the middle, or scrolled to the top. Rows are trimmed of
+  trailing spaces the same way `rows_text` and a copy of the same
+  selection are (libghostty's own trim is deliberately not used — it
+  eats a space carrying a combining mark), and blank rows are preserved
+  as `""` rather than dropped, so the array is exactly as long as the
+  count of rows returned and its numbering never silently shifts.
+
+Both halves describe **one instant**: the iced path refreshes its
+render snapshot before reading either, rather than straddling a PTY
+chunk. A session socket advertises the capability as
+`tab_dump_scrollback` in
+[`session.identify.features`](#sessionidentify), so a client
+feature-detects instead of probing for `unknown-field`. CLI:
+`roostctl tab dump --tab N --scrollback 50`.
 
 On a **host-session socket** this is answered from the tab's server
 Terminal instead of a UI's — same request, same response shape. It
@@ -521,7 +562,9 @@ cell carries the post-resolver fg/bg the production paint path computes.
 Ungated; useful both for debugging "why is this row gray" and as the
 resolver-walk regression op for #142. (The only theme-derived input to
 the resolver is the default fg/bg pair; no `bold-color` accent is
-applied today, on either socket.)
+applied today, on either socket.) Viewport only — it takes no
+`scrollback` param, and its params are strict, so passing one is
+`unknown-field`.
 
 Request: `{"params": {"tab_id": "3"}}`.
 Response (truncated):
@@ -1586,6 +1629,7 @@ A session socket answers `unknown-op` for every verb here — the same "no shado
 - `detail` — the long form behind `reason`, when there is one the band has no room for. One thing fills it: a **localhost session that could not be started**, where `reason` is the ≤45-character band line (`"cannot find roost-session"`, `"roost-session failed to start"`) and `detail` is what actually happened — the launch ladder's three rungs verbatim, the exec error, or the daemon's own start verdict. Such a host carries no `retry`: no retry could find a binary, so it settles once and waits for ↻ Reconnect.
 - `rollup` — the band's *output*, verbatim from the sidebar's reducer, capped at 60 characters with an ellipsis. For a **connected** host this is the agent count (`"3 agents"`), not state text; absent when the band shows no rollup at all. It is what the next frame draws — nothing here asserts a frame was painted.
 - `retry` — a `RetrySchedule`, absent unless an auto-reconnect is armed. `delay_ms` is the delay the timer was armed with (not what is left) and `armed_at` is when, so a caller can compute the remainder. `attempt` (1-based, the `3` in the band's `(3/10)`) and `budget` come with the **ssh** ladder only: a localhost retry is the connection task's own backoff whose counter never leaves the task, so it reports `delay_ms` alone.
+- `payload_kind` — what the last attach this client accepted on this host is being **decoded as**, one of [`payload_kinds`](#sessionidentify)' spellings. `"vt"` is the fallback a libghostty build skew lands on, and this field is the only way to see it from outside: such a host connects normally, with no dot and no dialog, at that payload's [documented fidelity](#payload-kinds). Absent until a tab has actually attached over the *live* connection — it reports what is being decoded, never what could be — and it goes when that connection does, so a reconnect to a matching daemon cannot keep claiming a fallback it is no longer on.
 - `retry.reason` — **why** this rung is armed: the classified failure's own copy, in the same words the give-up line uses for it. It is a separate field from the `reason` above because that one is the band's input and `rollup` is derived from it — while a rung is armed the band has to read `reconnecting in 8s (3/10)`, so the family needs its own slot or it is unreadable until the attempt settles. ssh-only, like `attempt`/`budget`. **The rule for a caller is simply: read it when it is present.** Do not gate on `attempt` — the number is not a proxy in either direction. Absence is ordinary rather than a fault: the drop that *starts* an outage is usually the live connection dying, a bare bridge EOF with nothing to classify, and the classified copy arrives with the next dial's failure; a later rung armed by another connection coming up and dying reads absent again for the same reason. And presence is not confined to later rungs — a suspend/wake resets the ladder to `attempt: 1` while deliberately carrying the family it already had, because it is still the same outage.
 
 Every optional field is omitted rather than `null`, so a host that has never connected is `{"id", "label", "target", "generation": 0, "state": "disconnected"}` and nothing else.
@@ -1968,7 +2012,9 @@ from construction. Three consequences a client can observe:
   attached and runs its own terminal over the same bytes must discard
   its own reply buffer, or the child sees the answer twice.
 * **The terminal is readable.** [`tab.dump`](#tabdump) and
-  [`tab.dump_resolved`](#tabdump_resolved) are served from it.
+  [`tab.dump_resolved`](#tabdump_resolved) are served from it — and
+  since plan 053 `tab.dump` reaches into those 2000 lines of history,
+  not just the viewport.
 * **The terminal is streamable.** [`tab.attach`](#tabattach) plus a
   [data connection](#data-plane) hand a client the whole terminal as a
   snapshot and then keep it live.
@@ -1988,7 +2034,7 @@ Params: `{}`. Response:
   "app_version": "0.0.18",
   "session_protocol": 4,
   "payload_kinds": ["ghostty-snapshot", "vt"],
-  "features": ["put_file", "events_resume"],
+  "features": ["put_file", "events_resume", "tab_dump_scrollback"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
   "started_at": "2026-08-27T14:03:11Z"
@@ -2031,7 +2077,9 @@ with `"put_file"` — plan 047's op is the case that prompted this: had
 `features` existed then, `session.put_file` would not have needed the
 `2` → `3` bump at all — and plan 052 added `"events_resume"` the same
 way, for the resume params documented under
-[`events.subscribe`](#eventssubscribe) above. **What a generation bump
+[`events.subscribe`](#eventssubscribe) above, with plan 053 adding
+`"tab_dump_scrollback"` for [`tab.dump`](#tabdump)'s history param
+right behind it. **What a generation bump
 itself covers is never listed here** — R1's own leaseless-subscribe /
 gated-write / `driver_changed` behaviors are what `4` covers, not
 `features` entries, because a client already knows its own generation.
@@ -2043,20 +2091,26 @@ policy that governs the list across generations.
 `payload_kinds` names what this session can encode a tab's attach
 payload as, in no particular order; it is an **open list of strings**,
 not a closed enum — a client preserves values it does not recognize and
-negotiates on the ones it does. The sample above shows a host offering
-two kinds, which is what a client's decode has to tolerate; the shipped
-`roost-session` advertises `["ghostty-snapshot"]` alone (`vt`, the
-replay-a-byte-stream fallback, is a named kind with no implementation
-behind it — architecture §4.4's escape hatch, not built).
+negotiates on the ones it does. The shipped `roost-session` advertises
+both kinds the sample shows, as of plan 053: `ghostty-snapshot`, the
+full-fidelity binary format, and `vt`, the replay-a-byte-stream
+fallback that architecture §4.4 named as the escape hatch and that is
+now built (see [Payload kinds](#payload-kinds) for what each carries).
+A pre-053 session advertises `["ghostty-snapshot"]` alone, which is
+what makes the list, not the build string, the thing a client's
+compatibility gate reads first.
 
 `libghostty_build` is this session's pinned Ghostty build identity,
 `ghostty-<first 16 hex of the pinned SHA>+snapshot.v<format version>`.
-It is the negotiation for `ghostty-snapshot`: two libghostty builds
-that disagree cannot exchange a snapshot, so `tab.attach` requires an
-**exact** string match and refuses a mismatch by name
-(`build-mismatch`) rather than letting it surface later as a corrupt
-screen. Both fields were empty in HS-1a, when there was nothing to
-attach to.
+It is the negotiation for `ghostty-snapshot` **and for that kind
+only**: two libghostty builds that disagree cannot exchange a binary
+snapshot, so `tab.attach` requires an exact string match before it will
+serve one and refuses a mismatch by name (`build-mismatch`) rather than
+letting it surface later as a corrupt screen. `vt` has no such
+requirement — it is bytes any VT parser replays — so a session
+advertising it can still be attached to across a skew, at that
+payload's [documented fidelity](#payload-kinds). Both fields were empty
+in HS-1a, when there was nothing to attach to.
 
 **Test seam:** with `ROOST_TEST_MODE=1` set, a session additionally
 reads `ROOST_SESSION_FAKE_BUILD` and reports *that* string as
@@ -2066,6 +2120,13 @@ build/protocol mismatch otherwise needs a second binary built against a
 second Ghostty pin, which no CI lane can produce; this makes it a
 one-line fixture (plan 037 §3.7). Ignored entirely outside test mode,
 so a production daemon can never be made to lie about its own build.
+
+A second variable under the same double gate, `ROOST_SESSION_LEGACY_KINDS=1`,
+makes the session advertise `["ghostty-snapshot"]` alone — the pre-053
+shape. It exists because the `vt` fallback *removes* the state the
+restart flow hangs off: with `vt` on offer a skewed client connects
+instead of refusing, so without this knob the only end-to-end test of
+the "needs restart" path would have had nothing left to reach.
 
 ### `session.connect`
 
@@ -2410,7 +2471,7 @@ Request:
 {"id": "4", "op": "tab.attach", "params": {
   "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83",
   "tab_id": "5",
-  "kinds": ["ghostty-snapshot"],
+  "kinds": ["ghostty-snapshot", "vt"],
   "cols": 120,
   "rows": 40,
   "cell_w_px": 9,
@@ -2430,8 +2491,20 @@ Response:
 ```
 
 `kinds` is the client's preference order and the server serves the
-first entry it supports; a list mixing kinds this build has never heard
-of with one it serves is fine.
+first entry that is both **servable** and **eligible**; a list mixing
+kinds this build has never heard of with one it serves is fine.
+*Servable* is what [`session.identify`](#sessionidentify) advertised in
+`payload_kinds` — the advertisement is the contract the client
+negotiated against, so a kind absent from it is never served even when
+the code could produce it. *Eligible* is the kind's own requirement,
+and only `ghostty-snapshot` has one: an exact `libghostty_build` match.
+`vt` requires nothing, so a client offering
+`["ghostty-snapshot", "vt"]` across a build skew lands on `vt` rather
+than on a refusal — which is the whole point of the fallback, decided
+server-side so a third-party client need not compare build strings
+itself. Reversing that preference order gets `vt` on a *matching*
+build too; nothing forces the binary format on a client that would
+rather replay bytes.
 
 **Validation order is part of the contract**, because each failure
 tells the client to fix a different thing and an earlier one must not
@@ -2442,10 +2515,20 @@ be masked by a later one:
 | 1 | lease is live | `connect-required` (unknown/absent) or `taken-over` (tombstoned) |
 | 2 | tab exists with a live terminal | `not-found` |
 | 3 | `kinds` contains something servable | `unsupported-kind` (message names both lists) |
-| 4 | `libghostty_build` matches exactly | `build-mismatch` (message names both strings) |
+| 4 | the negotiated kind's own requirement holds | `build-mismatch` (message names both strings) |
 | 5 | `cols` and `rows` both non-zero | `invalid-param` |
 | 6 | the tab accepts the geometry | `invalid-param` |
 | 7 | token quota not exhausted | `too-many-tokens` |
+
+Checks 3 and 4 stay two separate walks over the offered list rather
+than one predicate, because a single pass cannot tell "nothing
+servable" from "nothing eligible" and those instruct the client
+differently: `unsupported-kind` means *offer something else*, while
+`build-mismatch` means *the one kind we could have served needs the
+same libghostty on both ends* — the answer a pre-`vt` client's whole
+restart flow hangs off. Since plan 053 the second is reachable only
+when the client offers no kind but `ghostty-snapshot`, or is talking to
+a session too old to advertise `vt`.
 
 Zero `cell_w_px` / `cell_h_px` are legal — a headless client has no
 cell metrics to report — but a zero-sized grid is not a grid.
@@ -2597,7 +2680,7 @@ the bytes after it are frames:
 | `invalid-token` | unknown, expired, already-used, or purged by a takeover. |
 | `taken-over` | the lease the token was minted under is no longer current. |
 | `not-found` | the tab has no live terminal, or was respawned between `tab.attach` and this handshake. |
-| `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. |
+| `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. For `vt` this also covers a terminal whose VT parser sits mid-sequence with no retained continuation for the whole attach budget: the encode is parked and retried after each further chunk rather than emitting a payload that would desync the client, and the budget is what bounds that wait. |
 | `shutting-down` | `session.stop` has latched. |
 | `parse-error` | the handshake line did not decode. |
 | `not-supported` | this socket serves no data connections. |
@@ -2606,6 +2689,13 @@ the bytes after it are frames:
 client has everything up to and including it, and the first `PTY` frame
 carries `seq + 1`. In snapshot mode the fence is the snapshot's own
 encode point; in resume mode it is `resume_from_seq - 1`.
+
+`kind` is the kind [`tab.attach`](#tabattach) actually negotiated,
+carried here on the token rather than assumed — **this reply is the
+authoritative one**, and it is what a client selects its decoder from.
+The control-plane `TabAttachResult.kind` must agree; a client that sees
+them disagree treats it as `protocol-error` and re-attaches rather than
+guessing which to believe.
 
 #### Preamble and frames
 
@@ -2637,11 +2727,15 @@ what the server sends and vice versa:
   reader and writer. A client with a bigger paste **splits it across
   `INPUT` frames** — this is the client's job, not something the server
   will do for it. The server splits an oversized snapshot record across
-  `SNAP` frames for the same reason.
+  `SNAP` frames for the same reason. A `vt` payload is split at a
+  smaller **64 KiB** (`VT_SNAP_FRAME_BYTES`), which is a hold-window
+  fix rather than a wire-limit change — see [Payload
+  kinds](#payload-kinds).
 * Fixed-width payloads are exactly that width: `PTY` ≥ 9 bytes,
   `EXIT` == 12, `RESIZE` == 8.
-* A zero-length payload is meaningful only for `SNAP`. An empty `INPUT`
-  is a `protocol-error`.
+* A zero-length payload is meaningful only for `SNAP`, where it is the
+  `vt` payload's terminator (below). An empty `INPUT` is a
+  `protocol-error`.
 * An unknown type byte is a `protocol-error` naming the byte. The
   framer hands it up rather than failing the decode, precisely so the
   endpoint can name it.
@@ -2655,27 +2749,24 @@ both need them.
 
 Ordering, once the stream is running:
 
-1. The whole snapshot prefix **through Ghostty's READY record** goes
-   out at full speed, and live `PTY` frames are absorbed but **held**
-   until it has. A client has no terminal to apply a `PTY` frame to
-   before READY, and making it buffer them would move this queue into
-   every client. The window is tiny — that prefix is just the active
-   screen.
-2. After READY, `PTY` leads: a keystroke's echo must not wait behind a
-   scrollback page.
+1. The whole **ready prefix** goes out at full speed, and live `PTY`
+   frames are absorbed but **held** until it has. A client has no
+   terminal to apply a `PTY` frame to before that point, and making it
+   buffer them would move this queue into every client. For
+   `ghostty-snapshot` the prefix ends at Ghostty's own READY record and
+   the window is tiny — that prefix is just the active screen. For
+   `vt` the prefix is the **whole payload**: a replayed byte stream has
+   no partial-render marker, so the hold lasts as long as the payload
+   does at the client's link speed.
+2. After the ready prefix, `PTY` leads: a keystroke's echo must not
+   wait behind a scrollback page.
 3. But the snapshot cannot be starved. At least one `SNAP` frame goes
    out after 256 KiB of `PTY` payload **or** 50 ms since the last one,
    whichever comes first — a `yes`-style producer would otherwise hold
    FINISH off for as long as it kept running, and a slow-but-endless
    one would never trip a byte floor at all.
-4. `EXIT` goes out only once everything before it has.
-
-The snapshot's own record structure (GHOSTSNP: envelope, READY,
-history pages, FINISH) rides *inside* `SNAP` frames as an opaque byte
-stream — no record alignment, since Ghostty designed the format to be
-embedded and the client's decoder buffers to record boundaries itself.
-Ghostty's READY is the only READY in this design; the transport adds no
-second marker.
+4. `EXIT` goes out only once everything before it has — the `vt`
+   terminator included, even for a tab that exits mid-payload.
 
 `ERROR` frames carry a stable code:
 
@@ -2694,6 +2785,89 @@ rebuilds from a fresh snapshot, so there is nothing to gain by
 continuing. Every `ERROR` is best-effort: a peer that stopped reading
 made the write impossible, and EOF is the accepted fallback everywhere
 a label is promised.
+
+#### Payload kinds
+
+Two, negotiated at [`tab.attach`](#tabattach) and stated back on the
+[handshake](#the-handshake). They differ in fidelity and in how a
+client knows the payload has ended.
+
+**`ghostty-snapshot`** is libghostty's own binary format. Its record
+structure (GHOSTSNP: envelope, READY, history pages, FINISH) rides
+*inside* `SNAP` frames as an opaque byte stream — no record alignment,
+since Ghostty designed the format to be embedded and the client's
+decoder buffers to record boundaries itself. Ghostty's READY is the
+only READY in this design; the transport adds no second marker, and
+FINISH is how the client knows it has the whole thing. Both ends must
+be the same `libghostty_build`, which is what makes it a full-fidelity
+mirror and also what makes it refusable.
+
+**`vt`** is a plain VT byte stream: escape sequences and text that any
+conforming parser replays into a fresh terminal of the attach geometry
+to reproduce the server's active screen — its scrollback, viewport,
+cursor, pen, tabstops, scrolling region and an allowlist of modes,
+plus the parser's unfinished input so the first live `PTY` frame
+completes a sequence the fence cut exactly as it does on the server. It
+carries no build requirement, so it is what a client whose libghostty
+disagrees with the session's attaches with instead of being refused.
+
+Three transport consequences follow from `vt` having no internal
+framing of its own:
+
+* **One zero-length `SNAP` frame terminates it.** A byte stream has no
+  end marker, so the transport supplies one. It is written in the same
+  step as the final payload frame — never a later pass, because a later
+  pass could flush held `PTY` or write `EXIT` first, and both "no `PTY`
+  precedes the terminator" and "`EXIT` is last" have to hold. It is
+  sent unconditionally. A non-empty `SNAP` after it is a
+  `protocol-error`; re-attach. `ghostty-snapshot` sends no such frame,
+  and a client under that kind already treats an empty `SNAP` as a
+  no-op.
+* **Frames are capped at 64 KiB** (`VT_SNAP_FRAME_BYTES`), not the
+  wire's 1 MiB. The pump awaits a whole frame's write inline and drains
+  the tab's output tee only between writes, so holding `PTY` for a
+  1 MiB frame lets a busy child lag the tee and trip `desync` — the
+  unrecoverable code — where the smaller frame raises the
+  child-to-link ratio the tee tolerates 16× and pushes slower producers
+  into the bounded, recoverable `overflow` path instead.
+* **First paint waits for the whole payload**, since rule 1's prefix is
+  all of it. On a slow link that trails what `ghostty-snapshot` would
+  have painted at READY.
+
+**What a `vt` attach does not carry.** Stated here because a client on
+this kind is showing a real screen with real gaps in it, not a
+degraded-but-equivalent one:
+
+* the **inactive screen** — a tab attached while the alternate screen
+  is up gets an empty primary when the program exits alt mode
+  (`ghostty-snapshot` carries both);
+* **soft-wrap flags** — a wrapped row replays as a hard row, so copy
+  and reflow-on-resize differ from the server's;
+* **per-cell hyperlinks** — VT content emits `OSC 8` only for HTML, so
+  only the pen's link survives and **link hover and click stop working
+  on such a tab**. Roost injects `FORCE_HYPERLINK=1` into every tab, so
+  this is a visible loss, not a theoretical one;
+* **text-free background-only rows in history** — a row erased under a
+  background color with no text in it. Viewport rows of that shape are
+  refilled explicitly; history rows cannot be, there being no cursor
+  addressing into history;
+* **the saved cursor** (`DECSC`) and the **kitty-keyboard stack** —
+  only the live cursor and the current kitty flags are carried;
+* **modes outside the carried allowlist**, deliberately: `DECCOLM`
+  would resize the client away from the attach geometry, `?1048` moves
+  its cursor, mode `2048` and the visibility report *write a reply to
+  the PTY* on enable, and `?2026` can latch synchronized output and
+  freeze rendering mid-frame. A program that set two members of one
+  mouse-tracking or mouse-format family replays as the last of them,
+  since libghostty collapses each family onto a single field;
+* **Kitty images** — same as `ghostty-snapshot`;
+* **pending-wrap under origin mode** — restoring `DECOM` homes the
+  cursor in libghostty, so the repositioning that follows clears the
+  flag. This is the one cursor state `vt` cannot reproduce;
+* a **program color override that happens to equal the server's own
+  default** is indistinguishable from "unset" and is not carried. Only
+  the program's overrides ride the payload at all — the client keeps
+  its own theme.
 
 #### Resume
 
@@ -2752,6 +2926,14 @@ The budgets are behavior a client can hit, not tuning knobs:
 A slow consumer therefore gets cut off deterministically instead of
 growing the session's memory, and re-attaching immediately afterwards
 works — there is no thrash loop and no cooldown.
+
+The 60 s budget now also covers the **encode**, not just the streaming
+after it: the fence awaits the encoder under that timeout, so a
+terminal that never reaches an encodable state fails the attach with
+`snapshot-failed` instead of hanging it. That is what makes the wait a
+`vt` encode can take (parking mid-sequence, above) bounded — and it
+fixed the same hole for `ghostty-snapshot`, where a wedged encode
+previously awaited forever.
 
 **One ordering caveat, documented rather than solved:** control-plane
 [`tab.write`](#tabwrite) and data-plane `INPUT` frames have no

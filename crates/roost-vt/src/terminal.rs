@@ -117,6 +117,49 @@ impl ActiveScreen {
     }
 }
 
+/// One of libghostty's three dynamic colors — the slots `OSC 10`, `OSC
+/// 11` and `OSC 12` address, each of which has both an effective and a
+/// default value ([`Terminal::color`] / [`Terminal::default_color`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalColor {
+    Foreground,
+    Background,
+    Cursor,
+}
+
+#[cfg(feature = "ffi")]
+impl TerminalColor {
+    /// The OSC number that carries this color, so a caller emitting an
+    /// override does not re-derive the 10/11/12 mapping.
+    pub fn osc_code(self) -> u16 {
+        match self {
+            Self::Foreground => 10,
+            Self::Background => 11,
+            Self::Cursor => 12,
+        }
+    }
+
+    fn effective_data_id(self) -> sys::GhosttyTerminalData {
+        match self {
+            Self::Foreground => sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND,
+            Self::Background => sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND,
+            Self::Cursor => sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_CURSOR,
+        }
+    }
+
+    fn default_data_id(self) -> sys::GhosttyTerminalData {
+        match self {
+            Self::Foreground => {
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND_DEFAULT
+            }
+            Self::Background => {
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND_DEFAULT
+            }
+            Self::Cursor => sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_CURSOR_DEFAULT,
+        }
+    }
+}
+
 /// Which coordinate space a [`Point`] is interpreted in. Mirrors
 /// `GhosttyPointTag` 1:1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +463,53 @@ impl Terminal {
         Ok(out)
     }
 
+    /// The replay-safe VT continuation: the exact byte suffix that
+    /// reconstructs whatever escape sequence or UTF-8 codepoint the last
+    /// write left unfinished, so a terminal fed those bytes lands in the
+    /// same parser state.
+    ///
+    /// `Ok(None)` and `Ok(Some(vec![]))` are different answers and
+    /// callers depend on the difference. `None` is *unavailable* —
+    /// tracking is off, or the unfinished input outran the retained cap
+    /// ([`Self::set_continuation_max_bytes`]) — and nothing can be said
+    /// about the parser. An empty vector is the parser at ground, with
+    /// nothing to carry.
+    pub fn continuation(&self) -> Result<Option<Vec<u8>>> {
+        let mut needed: usize = 0;
+        // SAFETY: handle non-null; a null buffer with zero capacity is
+        // the size query this call documents, and `needed` is a real
+        // local.
+        let rc = unsafe {
+            sys::ghostty_terminal_continuation_buf(self.handle, ptr::null_mut(), 0, &mut needed)
+        };
+        match Error::from_result(rc) {
+            // A size query answers OUT_OF_SPACE even at ground, where
+            // the size it reports is zero.
+            Ok(()) | Err(Error::OutOfSpace) => {}
+            Err(Error::InvalidValue) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        if needed == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut buf = vec![0_u8; needed];
+        let mut written: usize = 0;
+        // SAFETY: handle non-null; `buf` is a live allocation of exactly
+        // the length passed, and `written` is a real local.
+        let rc = unsafe {
+            sys::ghostty_terminal_continuation_buf(
+                self.handle,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut written,
+            )
+        };
+        Error::from_result(rc)?;
+        buf.truncate(written);
+        Ok(Some(buf))
+    }
+
     /// Raw FFI handle. Pass-through for crates that need to call a
     /// not-yet-wrapped symbol (e.g. `crates/roost-iced/`'s key encoder
     /// sync). Stays `pub(crate)` deliberately — internal modules use
@@ -626,9 +716,27 @@ impl Terminal {
         })
     }
 
-    /// Read a DEC mode bit (e.g. mode 2004 for bracketed paste).
+    /// Total rows of the active screen — its scrollback plus its active
+    /// area.
+    pub fn total_rows(&self) -> Result<u64> {
+        let mut out: usize = 0;
+        // SAFETY: handle is non-null and `out` is a real local of the
+        // `size_t` type GHOSTTY_TERMINAL_DATA_TOTAL_ROWS documents.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_TOTAL_ROWS,
+                (&mut out) as *mut usize as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        Ok(out as u64)
+    }
+
+    /// Read a DEC-private mode bit (e.g. mode 2004 for bracketed paste).
     /// Returns `false` if the mode is not currently set or if the mode
-    /// number is unknown to libghostty.
+    /// number is unknown to libghostty. [`Self::ansi_mode_get`] is the
+    /// ANSI half.
     pub fn mode_get(&self, mode: u16) -> bool {
         // `mode` is packed DEC-private (ANSI bit clear) exactly as the
         // removed `ghostty_terminal_mode_get` took it; the caller-facing
@@ -649,6 +757,17 @@ impl Terminal {
         // Treat any non-success as "false" — the Mac UI does the same.
         Error::from_result(rc).ok();
         cfg.value
+    }
+
+    /// Read an ANSI (non-DEC-private) mode bit — IRM is ANSI mode 4,
+    /// where DECOM is DEC-private mode 6.
+    ///
+    /// libghostty distinguishes the two families by packing the ANSI
+    /// flag into bit 15 of `GhosttyMode` (`ghostty_mode_new(value,
+    /// ansi)`, `modes.h`), so an ANSI read is [`Self::mode_get`] with
+    /// that bit set. Same `false` fallback for an unknown mode.
+    pub fn ansi_mode_get(&self, mode: u16) -> bool {
+        self.mode_get(mode | 0x8000)
     }
 
     /// Encode the canonical xterm focus report when DEC mode 1004 is active.
@@ -724,6 +843,47 @@ impl Terminal {
         active
     }
 
+    /// The terminal's working directory as last reported by an escape
+    /// sequence — OSC 7 (`file://` URI), OSC 9 (ConEmu `CurrentDir`), or
+    /// OSC 1337 `CurrentDir` (iTerm2). `Ok(None)` is "unset" (including
+    /// an explicit clear via an empty OSC 7), not a failure — libghostty
+    /// documents GHOSTTY_TERMINAL_DATA_PWD's zero-length string as
+    /// exactly that, mirroring [`Self::continuation`]'s `None`/`Some`
+    /// split.
+    ///
+    /// libghostty stores whatever bytes the shell emitted, without
+    /// parsing, and hands back a pointer valid only until the next
+    /// mutating terminal call — copied into an owned `String` before
+    /// returning. Malformed UTF-8 is replaced via lossy conversion
+    /// rather than surfaced as an error: this value is informational
+    /// (mirrored into the vt-dump payload / UI title), not something
+    /// downstream code parses.
+    pub fn pwd(&self) -> Result<Option<String>> {
+        let mut out = sys::GhosttyString {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        // SAFETY: handle is non-null and `out` is a real local of the
+        // `GhosttyString` type GHOSTTY_TERMINAL_DATA_PWD documents as
+        // its out parameter.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_PWD,
+                (&mut out) as *mut sys::GhosttyString as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        if out.len == 0 {
+            return Ok(None);
+        }
+        // SAFETY: libghostty guarantees `ptr` is valid for `len` bytes
+        // until the next mutating call, and we make none before the
+        // copy below.
+        let bytes = unsafe { std::slice::from_raw_parts(out.ptr, out.len) };
+        Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+    }
+
     /// Read libghostty's currently-effective default colors — i.e. the
     /// values an OSC `]10;?` / `]11;?` / `]12;?` query should answer.
     /// Returns the post-OSC-override view: if the app has set the bg
@@ -788,6 +948,21 @@ impl Terminal {
     /// special-color queries); the index-into-256 form here answers OSC
     /// 4. The caller falls back to the static theme palette on error.
     pub fn live_palette(&self) -> Result<[crate::ColorRgb; 256]> {
+        self.read_palette(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_PALETTE)
+    }
+
+    /// libghostty's *default* 256-entry palette — what the palette would
+    /// answer with every program `OSC 4` override removed.
+    ///
+    /// Paired with [`Self::live_palette`], this is what separates "the
+    /// program recolored slot N" from "the embedder's theme set slot N":
+    /// only the first belongs in a payload replayed into someone else's
+    /// terminal.
+    pub fn default_palette(&self) -> Result<[crate::ColorRgb; 256]> {
+        self.read_palette(sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT)
+    }
+
+    fn read_palette(&self, data: sys::GhosttyTerminalData) -> Result<[crate::ColorRgb; 256]> {
         use crate::ColorRgb;
         // libghostty's PaletteC is `[256]RGB.C`, layout-compatible with
         // `[GhosttyColorRgb; 256]` (the top-of-file size/align guards
@@ -796,15 +971,66 @@ impl Terminal {
         let mut raw = [sys::GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256];
         // SAFETY: handle non-null; `raw` is a 256-entry buffer matching
         // the PaletteC layout libghostty writes.
+        let rc =
+            unsafe { sys::ghostty_terminal_get(self.handle, data, raw.as_mut_ptr() as *mut _) };
+        Error::from_result(rc)?;
+        Ok(raw.map(|c| ColorRgb::new(c.r, c.g, c.b)))
+    }
+
+    /// The effective value of one dynamic color — the program's `OSC
+    /// 10`/`11`/`12` override if it set one, else the embedder's default.
+    ///
+    /// `None` means neither exists. [`Self::live_colors`] reads the same
+    /// three at once for the renderer; this per-slot form exists so a
+    /// caller can compare against [`Self::default_color`] slot by slot
+    /// without an error path for the unset case.
+    pub fn color(&self, which: TerminalColor) -> Result<Option<crate::ColorRgb>> {
+        self.read_color(which.effective_data_id())
+    }
+
+    /// The *default* value of one dynamic color — what it would be with
+    /// the program's `OSC 10`/`11`/`12` override removed. See
+    /// [`Self::default_palette`] for why the distinction matters.
+    pub fn default_color(&self, which: TerminalColor) -> Result<Option<crate::ColorRgb>> {
+        self.read_color(which.default_data_id())
+    }
+
+    fn read_color(&self, data: sys::GhosttyTerminalData) -> Result<Option<crate::ColorRgb>> {
+        let mut raw = sys::GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        // SAFETY: handle non-null; `raw` is a real local of the type every
+        // `COLOR_*` data id documents as its out parameter.
         let rc = unsafe {
             sys::ghostty_terminal_get(
                 self.handle,
-                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_PALETTE,
-                raw.as_mut_ptr() as *mut _,
+                data,
+                (&mut raw) as *mut sys::GhosttyColorRgb as *mut _,
             )
         };
-        Error::from_result(rc)?;
-        Ok(raw.map(|c| ColorRgb::new(c.r, c.g, c.b)))
+        match Error::from_result(rc) {
+            Ok(()) => Ok(Some(crate::ColorRgb::new(raw.r, raw.g, raw.b))),
+            Err(Error::NoValue) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// True when the cursor sits at the right edge with its wrap
+    /// deferred: the next printable byte wraps to the following row
+    /// instead of overwriting the last column.
+    ///
+    /// Not part of the render state's cursor — the two UIs never need it
+    /// — but it is terminal state a replayed payload has to reproduce, so
+    /// the `vt` fidelity corpus asserts on it.
+    pub fn cursor_pending_wrap(&self) -> bool {
+        let mut pending: bool = false;
+        // SAFETY: handle non-null; out is a real local.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_PENDING_WRAP,
+                (&mut pending) as *mut bool as *mut _,
+            )
+        };
+        Error::from_result(rc).is_ok() && pending
     }
 
     /// Push the default foreground color into libghostty so SGR cells

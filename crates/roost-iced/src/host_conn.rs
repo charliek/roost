@@ -452,6 +452,15 @@ struct HostConn {
     /// The incarnation currently being served, once its `Connecting`
     /// has been drained off the feed.
     incarnation: Option<HostId>,
+    /// What the last attach this client accepted over *this* connection
+    /// is being decoded as — `host.status`'s `payload_kind`.
+    ///
+    /// It lives on the connection rather than the entry, and dies with
+    /// the *incarnation* that earned it ([`HostConnSet::apply_state`]):
+    /// a reconnect may reach a different daemon — an in-task one keeps
+    /// this very struct — and a kind held over from the last one would
+    /// report a fidelity nothing is actually delivering.
+    payload_kind: Option<&'static str>,
     state: HostConnState,
     /// The last client focus this connection was told, so an unchanged
     /// one is not resent (`Some(None)` is "told: nothing here is
@@ -976,6 +985,7 @@ impl HostConnSet {
             ops,
             shutdown,
             incarnation: None,
+            payload_kind: None,
             focus_sent: None,
             // What the task is actually doing the moment it is spawned.
             // The feed's first `Connecting` replaces it — this is only
@@ -2142,6 +2152,36 @@ impl HostConnSet {
         self.ops(&host)
     }
 
+    /// Record what an accepted attach on this incarnation is decoding.
+    /// A stale incarnation records nothing, same contract as
+    /// [`Self::ops_for`].
+    pub(crate) fn note_payload_kind(&mut self, incarnation: HostId, kind: &'static str) {
+        let Some(host) = self.owner_of(incarnation) else {
+            return;
+        };
+        if let Some(conn) = self
+            .entries
+            .get_mut(&host)
+            .and_then(|entry| entry.conn.as_mut())
+        {
+            conn.payload_kind = Some(kind);
+        }
+    }
+
+    /// What this host's live connection last attached as, `None` until a
+    /// tab has attached over it.
+    ///
+    /// Read through the connection's own state, because a frame from the
+    /// dying incarnation can still land after the drop cleared it (the
+    /// data plane is a connection of its own, and only the *next*
+    /// attempt's `Connecting` purges the incarnation) — and a kind
+    /// nothing is decoding is exactly the misinformation this field
+    /// exists to prevent.
+    pub(crate) fn payload_kind(&self, host: &str) -> Option<&'static str> {
+        let conn = self.entries.get(host)?.conn.as_ref()?;
+        conn.payload_kind.filter(|_| conn.state.is_connected())
+    }
+
     pub(crate) fn state(&self, host: &str) -> Option<&HostConnState> {
         self.entries
             .get(host)
@@ -2478,9 +2518,12 @@ impl HostConnSet {
         // knows nothing about what it was told before: the queue behind
         // it was flushed, and a session that comes back is back on its
         // headless default. Clearing here is what makes a reconnect
-        // re-assert the client's focus instead of deduping it away.
+        // re-assert the client's focus instead of deduping it away — and
+        // what stops the kind an attach negotiated with the *old*
+        // incarnation being reported for the one that replaced it.
         if conn.incarnation != Some(incarnation) || !next.is_connected() {
             conn.focus_sent = None;
+            conn.payload_kind = None;
         }
         conn.incarnation = Some(incarnation);
         conn.state = next;
@@ -5278,6 +5321,97 @@ mod tests {
             set.generation("h1"),
             0,
             "a removed host still remembers an attempt"
+        );
+    }
+
+    /// `host.status`'s `payload_kind` belongs to the connection that
+    /// earned it. A reconnect may reach a different daemon — one that
+    /// serves the snapshot the last one could not — so a kind held over
+    /// would report a fidelity nothing is delivering.
+    #[tokio::test]
+    async fn an_accepted_payload_kind_is_reported_until_its_connection_goes() {
+        use roost_ipc::messages::AttachPayloadKind;
+
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-payload-kind.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        assert_eq!(
+            set.payload_kind("h1"),
+            None,
+            "no tab has attached over this connection yet"
+        );
+
+        let stale = set.minter.mint("h1", set.conn("h1").generation - 1);
+        set.note_payload_kind(stale, AttachPayloadKind::VT);
+        assert_eq!(
+            set.payload_kind("h1"),
+            None,
+            "an accept from a replaced connection describes nothing that is live"
+        );
+
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.note_payload_kind(incarnation, AttachPayloadKind::VT);
+        assert_eq!(set.payload_kind("h1"), Some(AttachPayloadKind::VT));
+
+        set.disconnect("h1");
+        assert_eq!(
+            set.payload_kind("h1"),
+            None,
+            "the kind goes with the connection it described"
+        );
+    }
+
+    /// The in-task reconnect keeps the `HostConn` and only turns the
+    /// incarnation over, so a kind cleared nowhere would ride from one
+    /// daemon to the next — reporting `vt` for a session whose build now
+    /// matches, and reporting it forever if no tab ever attaches again.
+    #[tokio::test]
+    async fn an_automatic_reconnect_does_not_carry_the_old_payload_kind() {
+        use roost_ipc::messages::AttachPayloadKind;
+
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-reconnect-kind.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let old = set.mint_for("h1");
+        set.apply_state(old, HostConnState::Connected);
+        set.note_payload_kind(old, AttachPayloadKind::VT);
+        assert_eq!(set.payload_kind("h1"), Some(AttachPayloadKind::VT));
+
+        set.apply_state(old, dropped("the session closed"));
+        assert_eq!(
+            set.payload_kind("h1"),
+            None,
+            "nothing is decoding anything on a connection that is down"
+        );
+
+        // The task dials again on its own: a fresh incarnation under the
+        // same `HostConn`, where an explicit reconnect would have built
+        // a new one.
+        let new = set.mint_for("h1");
+        set.apply_state(
+            new,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        );
+        set.apply_state(new, HostConnState::Connected);
+        assert_eq!(
+            set.payload_kind("h1"),
+            None,
+            "the kind outlived the connection that negotiated it"
         );
     }
 

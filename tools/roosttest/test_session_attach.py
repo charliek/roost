@@ -50,6 +50,24 @@ pytestmark = pytest.mark.session_daemon
 # geometry its content was laid out at.
 COLS, ROWS = 80, 24
 
+# The geometry the `vt` terminator cases need, mirroring
+# `attach_stream_test.rs`'s fixture: wide enough and long enough that the
+# payload outgrows both a 64 KiB SNAP frame and the socket's send buffer,
+# so the forwarder is provably still inside the payload when one of those
+# cases seeds a tee record. `WIDE_LINES` is the server terminal's own
+# retention — as much history as any payload can carry.
+WIDE_COLS = 560
+WIDE_LINES = 2000
+
+# What a client whose libghostty pin differs from the session's puts on
+# the wire. Shaped like a build string, impossible to mistake for one.
+SKEWED_BUILD = "ghostty-0000000000000000+fake.plan053"
+
+# `roost_ipc::messages::MAX_DUMP_SCROLLBACK`. Restated rather than
+# imported, like every other wire constant here: a change to it fails a
+# case instead of being absorbed.
+MAX_DUMP_SCROLLBACK = 10_000
+
 # `ROOST_TEST_TIMEOUT_SCALE`-relative budgets from plan 036 D9. The
 # concurrent budget is the single-attach one doubled — the plan's
 # "budget ×2" — stated once here rather than multiplied at the assertion.
@@ -141,9 +159,15 @@ def attach_ticket(
     )
 
 
-def dial(env, ticket: dict, **handshake) -> tuple[DataPlane, dataplane.Reply]:
-    """Open a data connection and run the handshake with `ticket`'s token."""
-    conn = DataPlane(env.socket)
+def dial(
+    env, ticket: dict, *, kind: str = dataplane.GHOSTTY_SNAPSHOT, **handshake
+) -> tuple[DataPlane, dataplane.Reply]:
+    """Open a data connection and run the handshake with `ticket`'s token.
+
+    `kind` is what the connection reads the payload as; the handshake
+    fails loudly if the session serves anything else.
+    """
+    conn = DataPlane(env.socket, kind=kind)
     reply = conn.handshake(ticket["attach_token"], **handshake)
     return conn, reply
 
@@ -152,10 +176,26 @@ def attached(
     env, client: Roost, lease: str, tab_id: int
 ) -> tuple[DataPlane, dataplane.Reply, dict]:
     """The whole happy prologue: ticket, dial, accepted handshake."""
-    ticket = attach_ticket(client, lease, tab_id)
-    conn, reply = dial(env, ticket)
+    return attached_as(env, client, lease, tab_id, dataplane.GHOSTTY_SNAPSHOT)
+
+
+def attached_as(
+    env,
+    client: Roost,
+    lease: str,
+    tab_id: int,
+    kind: str,
+    cols: int = COLS,
+) -> tuple[DataPlane, dataplane.Reply, dict]:
+    """The same prologue, offering exactly one kind.
+
+    One kind on purpose: the negotiation then has nothing to choose
+    between, so the stream under test is the one the case names.
+    """
+    ticket = attach_ticket(client, lease, tab_id, cols=cols, kinds=[kind])
+    assert ticket["kind"] == kind, ticket
+    conn, reply = dial(env, ticket, kind=kind)
     assert reply.ok, (reply.code, reply.message)
-    assert reply.kind == dataplane.GHOSTTY_SNAPSHOT
     return conn, reply, ticket
 
 
@@ -183,9 +223,46 @@ def flooding_tab(client: Roost, project: int, cwd) -> int:
     return open_tab(client, project, cwd, ["/bin/sh", "-c", "while :; do echo spam; done"])
 
 
+def sized_tab(client: Roost, project: int, cwd, cols: int, argv: list[str]) -> int:
+    """A tab at an explicit width, opened and confirmed at that size.
+
+    The width has to be settled before anything is seeded: content laid
+    out at one geometry and attached at another would be compared across
+    a reflow.
+    """
+    tab = client.open_tab(
+        project, cwd=str(cwd), title="", cols=cols, rows=ROWS, argv=argv
+    )
+    def geometry() -> tuple[int, int]:
+        dumped = client.dump(tab)
+        return dumped["cols"], dumped["rows"]
+
+    sessionlib.wait_until(
+        lambda: geometry() == (cols, ROWS), 30.0, f"tab {tab} to settle at {cols}x{ROWS}"
+    )
+    return tab
+
+
 def seed_bytes(lines: int, prefix: str = "seed") -> bytes:
     body = "x" * 40
     return "".join(f"{prefix}-{i:04d} {body}\r\n" for i in range(lines)).encode()
+
+
+def wide_seed_bytes(lines: int) -> bytes:
+    """A seed whose rows nearly fill [`WIDE_COLS`], so the payload's size
+    is a function of the geometry rather than of what happens to be on
+    the screen. One SGR run per row keeps it representative — and makes
+    the row accounting read past real escape sequences rather than plain
+    text. One column short of the width: a row reaching the last column
+    leaves the cursor pending-wrap and the next row soft-wraps into it.
+    """
+    width = WIDE_COLS - 1
+    rows = []
+    for index in range(1, lines + 1):
+        head = f"line {index:04d} "
+        rows.append(f"\x1b[36m{head}{'w' * (width - len(head))}\x1b[0m\r\n")
+    rows.append("\x1b[35mWIDE_FENCE\x1b[0m\r\n")
+    return "".join(rows).encode()
 
 
 def seed(client: Roost, tab_id: int, data: bytes, chunk: int = 32 * 1024) -> None:
@@ -409,22 +486,26 @@ def test_tab_attach_refuses_what_it_cannot_serve(env):
         build = client.call("session.identify")["libghostty_build"]
 
         with pytest.raises(RoostError) as unknown:
-            attach_ticket(client, lease, tab, kinds=["vt", "sixel-mosaic"])
+            attach_ticket(client, lease, tab, kinds=["hologram", "sixel-mosaic"])
         assert unknown.value.code == "unsupported-kind", unknown.value
 
         # A list that MIXES an unknown kind with a servable one is fine:
         # the client states a preference order and the first servable
         # entry wins.
         mixed = attach_ticket(
-            client, lease, tab, kinds=["vt", dataplane.GHOSTTY_SNAPSHOT]
+            client, lease, tab, kinds=["sixel-mosaic", dataplane.GHOSTTY_SNAPSHOT]
         )
         assert mixed["kind"] == dataplane.GHOSTTY_SNAPSHOT
 
+        # `ghostty-snapshot` alone: the one kind whose eligibility
+        # depends on the build, so a skew has nothing left to fall back
+        # to. (Offer `vt` beside it and it does — the case below.)
         with pytest.raises(RoostError) as mismatch:
-            attach_ticket(client, lease, tab, libghostty_build=build + "-not-this-one")
+            attach_ticket(client, lease, tab, libghostty_build=SKEWED_BUILD)
         assert mismatch.value.code == "build-mismatch", mismatch.value
         # Both strings are named so a client can tell which side to move.
         assert build in mismatch.value.message
+        assert SKEWED_BUILD in mismatch.value.message
 
         with pytest.raises(RoostError) as zero:
             attach_ticket(client, lease, tab, cols=0, rows=ROWS)
@@ -437,6 +518,155 @@ def test_tab_attach_refuses_what_it_cannot_serve(env):
         with pytest.raises(RoostError) as gone:
             attach_ticket(client, lease, tab)
         assert gone.value.code == "not-found", gone.value
+
+    env.stop_over_the_wire()
+
+
+# ---------------------------------------------------------------------------
+# 2b. Negotiation: servable, then eligible, in the client's order
+# ---------------------------------------------------------------------------
+
+
+def test_a_matching_client_still_gets_ghostsnp_and_can_ask_for_vt(env):
+    """The two kinds, and what picks between them (plan 053 §3.2).
+
+    A kind is *servable* when the session advertises it and *eligible*
+    when its own requirement holds — an exact `libghostty_build` for
+    `ghostty-snapshot`, nothing at all for `vt`. The client's list is a
+    preference order over that, which is why the same session hands the
+    same tab a different kind depending only on what was asked for.
+    """
+    started(env)
+
+    with env.client() as client:
+        identity = client.call("session.identify")
+        assert identity["payload_kinds"] == [dataplane.GHOSTTY_SNAPSHOT, dataplane.VT], (
+            identity["payload_kinds"]
+        )
+        # R4's op parameter is feature-detected, not probed for with an
+        # `unknown-field` — same channel, asserted where the kinds are.
+        assert "tab_dump_scrollback" in identity["features"], identity["features"]
+
+        lease = connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
+        # Fidelity first: an unskewed client is served the snapshot,
+        # which `vt` never displaces.
+        both = attach_ticket(
+            client, lease, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
+        )
+        assert both["kind"] == dataplane.GHOSTTY_SNAPSHOT, both
+
+        # And a client that asks for `vt` alone gets it whatever its
+        # build says — the kind has no build requirement, so the string
+        # is not consulted at all.
+        assert attach_ticket(client, lease, tab, kinds=[dataplane.VT])["kind"] == (
+            dataplane.VT
+        )
+        skewed = attach_ticket(
+            client, lease, tab, kinds=[dataplane.VT], libghostty_build=SKEWED_BUILD
+        )
+        assert skewed["kind"] == dataplane.VT, skewed
+
+    env.stop_over_the_wire()
+
+
+def test_a_build_skew_lands_on_vt_unless_the_client_offers_nothing_else(env):
+    """The upgrade trap, from the server's side.
+
+    A session whose libghostty pin does not match the client's is the
+    common case R3 exists for — a package upgrade under a running
+    daemon. Offering `vt` is what turns it from a refusal into a
+    connection; a client that offers only `ghostty-snapshot` is still
+    refused, and told which of the two strings to move.
+
+    The session is the one wearing the fake build here, which is the
+    real shape: the client knows its own pin and cannot know it is the
+    one that moved.
+    """
+    started(env, ROOST_SESSION_FAKE_BUILD=SKEWED_BUILD)
+
+    with env.client() as client:
+        assert client.call("session.identify")["libghostty_build"] == SKEWED_BUILD
+        lease = connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        # This client's own pin, which the session no longer matches.
+        mine = "ghostty-1111111111111111+real.plan053"
+
+        fallback = attach_ticket(
+            client,
+            lease,
+            tab,
+            kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT],
+            libghostty_build=mine,
+        )
+        assert fallback["kind"] == dataplane.VT, fallback
+
+        with pytest.raises(RoostError) as refused:
+            attach_ticket(
+                client,
+                lease,
+                tab,
+                kinds=[dataplane.GHOSTTY_SNAPSHOT],
+                libghostty_build=mine,
+            )
+        assert refused.value.code == "build-mismatch", refused.value
+
+        # Servable-but-ineligible and not-servable-at-all stay different
+        # answers: one says "we cannot agree on a format", the other
+        # "I have never heard of that one".
+        with pytest.raises(RoostError) as unknown:
+            attach_ticket(
+                client, lease, tab, kinds=["sixel-mosaic"], libghostty_build=mine
+            )
+        assert unknown.value.code == "unsupported-kind", unknown.value
+
+    env.stop_over_the_wire()
+
+
+def test_the_legacy_kinds_knob_restores_the_pre_vt_session(env):
+    """The shape a client that predates `vt` has to keep working against.
+
+    `ROOST_SESSION_LEGACY_KINDS` exists for exactly one reason: with
+    `vt` served, a build skew connects, and the client's "this session
+    needs a restart" flow loses its only end-to-end route. This is the
+    session half of that fixture — the daemon advertises what it did
+    before R3, and a skew is refused again.
+    """
+    started(env, ROOST_SESSION_LEGACY_KINDS="1")
+
+    with env.client() as client:
+        identity = client.call("session.identify")
+        assert identity["payload_kinds"] == [dataplane.GHOSTTY_SNAPSHOT], (
+            identity["payload_kinds"]
+        )
+
+        lease = connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
+        # Not advertised is not servable: `vt` is refused as a kind this
+        # session has never heard of, not as one it declined to serve.
+        with pytest.raises(RoostError) as unknown:
+            attach_ticket(client, lease, tab, kinds=[dataplane.VT])
+        assert unknown.value.code == "unsupported-kind", unknown.value
+
+        assert attach_ticket(
+            client, lease, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
+        )["kind"] == dataplane.GHOSTTY_SNAPSHOT
+
+        # And the refusal the UI's restart prompt is raised from.
+        with pytest.raises(RoostError) as mismatch:
+            attach_ticket(
+                client,
+                lease,
+                tab,
+                kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT],
+                libghostty_build=SKEWED_BUILD,
+            )
+        assert mismatch.value.code == "build-mismatch", mismatch.value
 
     env.stop_over_the_wire()
 
@@ -568,6 +798,196 @@ def test_finish_arrives_under_a_flooding_producer(env):
         # Bounded on purpose: the loop burns a core, so it goes away as
         # soon as the case has its answer.
         client.close_tab(tab)
+
+    env.stop_over_the_wire()
+
+
+# ---------------------------------------------------------------------------
+# 3b. `vt`: one empty SNAP closes the payload, and nothing overtakes it
+# ---------------------------------------------------------------------------
+
+
+def wide_tab_seeded(client: Roost, project: int, cwd, argv: list[str]) -> int:
+    """A [`WIDE_COLS`]-wide tab filled to the retention limit.
+
+    The size is the point: the payload it produces outgrows the socket's
+    send buffer, so a forwarder that has not been read from is provably
+    still inside it.
+    """
+    tab = sized_tab(client, project, cwd, WIDE_COLS, argv)
+    seed(client, tab, wide_seed_bytes(WIDE_LINES), chunk=128 * 1024)
+    wait_dump_contains(client, tab, "WIDE_FENCE", timeout=120.0)
+    return tab
+
+
+def test_a_vt_payload_always_ends_in_one_empty_snap(env):
+    """The marker, on the two shapes that could lose it.
+
+    A VT byte stream says nothing about its own end — that is the whole
+    difference from GHOSTSNP, whose FINISH record is inside the format —
+    so the empty `SNAP` frame is the only thing telling a client its
+    terminal is complete. It rides the same write as the payload's last
+    frame, never a later pass, because a later pass flushes held PTY
+    first.
+
+    The first tab makes that ordering a real observation rather than a
+    lucky one: nothing is read until a live byte is *proved* to be
+    sitting on the server, so the forwarder is holding a tee record
+    while it is still mid-payload. The second is the smallest payload
+    there is, and pins the marker as unconditional — a terminator
+    emitted only where the content made it worth one would pass every
+    other case.
+    """
+    started(env)
+
+    with env.client() as client:
+        lease = connect_lease(client)
+        project = first_project(client)
+        flooded = wide_tab_seeded(
+            client, project, env.launch_cwd, ["/bin/sh", "-c", "exec sleep 300"]
+        )
+
+        conn, reply, _ticket = attached_as(
+            env, client, lease, flooded, dataplane.VT, cols=WIDE_COLS
+        )
+        assert reply.mode == "snapshot", reply
+        # Seeded and confirmed landed before a single frame is read.
+        client.tab_feed_pty_bytes(flooded, b"VT_AFTER_TERMINATOR\r\n")
+        wait_dump_contains(client, flooded, "VT_AFTER_TERMINATOR")
+
+        conn.read_until_finish(timeout=90.0)
+        assert conn.snap.terminator_frames == 1, conn.snap.terminator_frames
+        # Not merely "more than one": `vt` holds every PTY frame behind
+        # its whole payload and drains the tee only between writes, so
+        # the frame size is what bounds how long a tab goes unread. At
+        # the wire's own 1 MiB cap this megabyte-and-change fixture
+        # would be two frames, one drain apart.
+        payload_frames = conn.snap_frames - conn.snap.terminator_frames
+        assert payload_frames >= 8, (payload_frames, conn.snap.total_bytes)
+        # `DataPlane` fails the read itself on a PTY frame ahead of the
+        # terminator; this states the ordering directly, on the one tab
+        # that had live output waiting the whole time.
+        assert conn.first_pty_at_frame is None, conn.first_pty_at_frame
+
+        # And the record it was holding arrives behind the marker.
+        conn.read_frames_until(
+            lambda f: b"VT_AFTER_TERMINATOR" in pty_payload([f]),
+            timeout=30.0,
+            what="the live byte held through the payload",
+        )
+        assert conn.first_pty_at_frame > conn.ready_at_frame, (
+            conn.first_pty_at_frame,
+            conn.ready_at_frame,
+        )
+        conn.close()
+        client.close_tab(flooded)
+
+        fresh = quiet_tab(client, project, env.launch_cwd)
+        conn, _reply, _ticket = attached_as(env, client, lease, fresh, dataplane.VT)
+        conn.read_until_finish()
+        assert conn.snap.terminator_frames == 1, conn.snap.terminator_frames
+        assert conn.snap_frames == 2, (
+            f"a fresh tab's whole composition fits one frame plus the marker, "
+            f"got {conn.snap_frames} SNAP frames"
+        )
+        # A composition with no content at all is still the mode sweeps,
+        # the pad and a cursor address.
+        assert conn.snap.total_bytes > 0
+        conn.close()
+
+    env.stop_over_the_wire()
+
+
+def test_a_child_dying_inside_a_vt_payload_still_gets_exit_last(env):
+    """EXIT is the connection's last frame, terminator or not.
+
+    The child ends itself rather than being closed, because the wait
+    below needs something the exit is what causes: `tab.close` removes
+    the workspace row on the way in, so it would leave nothing to watch
+    and "the tab died mid-payload" would be a hope. A child parked on
+    `read` publishes its own exit, and that publish is what closes the
+    row — so the row going away is the control socket's proof the exit
+    is on the tee, with the forwarder still inside the payload.
+    """
+    started(env)
+
+    with env.client() as client:
+        lease = connect_lease(client)
+        project = first_project(client)
+        dying = wide_tab_seeded(
+            client, project, env.launch_cwd, ["/bin/sh", "-c", "read _"]
+        )
+
+        conn, _reply, _ticket = attached_as(
+            env, client, lease, dying, dataplane.VT, cols=WIDE_COLS
+        )
+        client.send(dying, b"\n", lease=lease)
+        sessionlib.wait_until(
+            lambda: dying not in tab_ids(client),
+            30.0,
+            f"tab {dying}'s row to close at its child's exit",
+        )
+
+        conn.read_until_finish(timeout=90.0)
+        assert conn.snap.terminator_frames == 1, conn.snap.terminator_frames
+        assert conn.first_pty_at_frame is None, conn.first_pty_at_frame
+
+        ending = conn.drain_to_close(timeout=60.0)
+        assert ending.kind == "exit", ending
+        conn.close()
+
+    env.stop_over_the_wire()
+
+
+def test_the_vt_payload_carries_a_row_for_every_row_the_dump_reports(env):
+    """The payload and `tab.dump` describe the same screen.
+
+    Frame accounting and row cross-checking, not a decode: the escapes
+    are skipped rather than applied (see `dataplane.VtPayload`), and
+    what is compared is how many rows the payload carried and where the
+    seeded lines sit among them. The composition pads to the terminal's
+    total row count precisely so a client's viewport lines up, which is
+    what makes the count exact rather than approximate — and `tab.dump`
+    asking for everything is the same terminal counted the other way.
+
+    Replay fidelity is proved where a real parser can do it:
+    `crates/roost-vt/tests/vt_dump_test.rs` and
+    `attach_stream_test::vt_fidelity_at_the_fence`.
+    """
+    started(env)
+
+    with env.client() as client:
+        lease = connect_lease(client)
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        seed(client, tab, seed_bytes(400))
+        wait_dump_contains(client, tab, "seed-0399")
+
+        conn, _reply, _ticket = attached_as(env, client, lease, tab, dataplane.VT)
+        conn.read_until_finish()
+        conn.close()
+
+        dumped = client.dump(tab, scrollback=MAX_DUMP_SCROLLBACK)
+        assert len(dumped["scrollback_text"]) == dumped["scrollback_rows"], dumped
+        assert len(dumped["rows_text"]) == dumped["rows"], dumped
+
+        rows = conn.snap.plain_rows()
+        assert len(rows) == dumped["scrollback_rows"] + dumped["rows"], (
+            f"the payload carried {len(rows)} rows; the dump reports "
+            f"{dumped['scrollback_rows']} of history above {dumped['rows']} viewport rows"
+        )
+
+        # Position for position, over every row that carries anything —
+        # a payload that lost or duplicated a blank row would still have
+        # the right total and the wrong offsets.
+        served = dumped["scrollback_text"] + dumped["rows_text"]
+        mismatched = [
+            (index, rows[index], text)
+            for index, text in enumerate(served)
+            if text and rows[index].rstrip() != text
+        ]
+        assert not mismatched, mismatched[:3]
+        assert sum(1 for text in served if text.startswith("seed-")) == 400, served[:3]
 
     env.stop_over_the_wire()
 
@@ -929,6 +1349,55 @@ def test_dumps_are_served_headless_from_the_server_terminal(env):
         assert plain["text"] == "P", plain
         assert red["text"] == "R", red
         assert red["fg"] != plain["fg"], (red, plain)
+
+    env.stop_over_the_wire()
+
+
+def test_tab_dump_serves_history_above_the_viewport(env):
+    """`scrollback` on a session socket: contiguous, clamped, opt-in.
+
+    The contract that makes the history usable is **adjacency** — the
+    last entry is the row immediately above `rows_text[0]`, so a caller
+    can concatenate the two and read a screen that scrolled past. A
+    session terminal is never scrolled, so here the history is all of
+    it; the scrolled anchor is the UI socket's case
+    (`test_tab_dump_scrollback.py`) and the reader's unit tests.
+
+    An oversized ask is clamped rather than refused: a client asking for
+    "everything" should not have to know the cap to avoid an error.
+    """
+    started(env)
+
+    with env.client() as client:
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        seed(client, tab, seed_bytes(400))
+        wait_dump_contains(client, tab, "seed-0399")
+
+        asked = client.dump(tab, scrollback=50)
+        assert len(asked["scrollback_text"]) == 50, asked["scrollback_text"]
+        assert asked["scrollback_rows"] > 50, asked["scrollback_rows"]
+        # The join is the whole point: history's tail and the viewport's
+        # head are consecutive lines of one seeded run.
+        above = asked["scrollback_text"][-1]
+        first = asked["rows_text"][0]
+        assert above.startswith("seed-") and first.startswith("seed-"), (above, first)
+        assert int(first.split()[0].removeprefix("seed-")) == (
+            int(above.split()[0].removeprefix("seed-")) + 1
+        ), (above, first)
+
+        # Past the cap: no error, and never more than the tab has.
+        everything = client.dump(tab, scrollback=1_000_000)
+        assert everything["scrollback_rows"] == asked["scrollback_rows"]
+        assert len(everything["scrollback_text"]) == everything["scrollback_rows"]
+        assert everything["scrollback_rows"] <= 2000, everything["scrollback_rows"]
+        assert everything["scrollback_text"][-50:] == asked["scrollback_text"]
+
+        # Unasked: the count still comes back — a client learns there is
+        # history without having to fetch any — but not a row of it.
+        plain = client.dump(tab)
+        assert "scrollback_text" not in plain, plain
+        assert plain["scrollback_rows"] == asked["scrollback_rows"], plain
 
     env.stop_over_the_wire()
 

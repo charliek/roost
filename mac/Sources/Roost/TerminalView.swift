@@ -2207,7 +2207,8 @@ final class TerminalView: NSView {
         return (0, cols)
     }
 
-    /// Text snapshot of the full viewport for the `tab.dump` IPC op.
+    /// Text snapshot of the full viewport for the `tab.dump` IPC op,
+    /// plus however many rows of history above it the request asked for.
     struct Dump {
         struct Cursor {
             let row: Int
@@ -2218,6 +2219,13 @@ final class TerminalView: NSView {
         let rows: Int
         let cursor: Cursor?
         let rowsText: [String]
+        /// How many history rows sit above the viewport `rowsText`
+        /// shows, whatever the request asked for.
+        let scrollbackRows: Int
+        /// The last `min(requested, scrollbackRows)` of those rows, top
+        /// to bottom, its final entry the row immediately above
+        /// `rowsText[0]`.
+        let scrollbackText: [String]
     }
 
     /// Post-resolver per-cell snapshot of the full viewport for the
@@ -2291,11 +2299,17 @@ final class TerminalView: NSView {
 
     /// Snapshot the whole viewport as text for `tab.dump`: one rstripped
     /// line per row (a blank cell becomes a space so columns line up)
-    /// plus the cursor. Mirrors `selectedPlainText` / `draw`'s
-    /// update→walk, but over every row. Main-thread-only — touches the
-    /// libghostty handle + render state.
+    /// plus the cursor, plus `scrollback` rows of history above it.
+    /// Mirrors `selectedPlainText` / `draw`'s update→walk, but over
+    /// every row. Main-thread-only — touches the libghostty handle +
+    /// render state.
+    ///
+    /// The render state is updated first and the history read from the
+    /// live terminal after, so both halves describe one instant: a stale
+    /// snapshot would put them a PTY chunk apart and break the adjacency
+    /// `SelectionFormatter.scrollbackText` promises.
     @MainActor
-    func dumpText() -> Dump {
+    func dumpText(scrollback: UInt32) throws -> Dump {
         if let terminal { renderState.update(terminal: terminal) }
         let cursorInfo = renderState.cursor()
         var lines = [String](repeating: "", count: Int(rows))
@@ -2313,7 +2327,22 @@ final class TerminalView: NSView {
         let cursor = cursorInfo.map {
             Dump.Cursor(row: Int($0.row), col: Int($0.col), visible: $0.visible)
         }
-        return Dump(cols: Int(cols), rows: Int(rows), cursor: cursor, rowsText: trimmed)
+        var scrollbackRows = 0
+        var scrollbackText: [String] = []
+        if let terminal {
+            scrollbackRows = Int(try SelectionFormatter.scrollbackRows(terminal: terminal))
+            scrollbackText = try SelectionFormatter.scrollbackText(
+                terminal: terminal, rows: scrollback
+            )
+        }
+        return Dump(
+            cols: Int(cols),
+            rows: Int(rows),
+            cursor: cursor,
+            rowsText: trimmed,
+            scrollbackRows: scrollbackRows,
+            scrollbackText: scrollbackText
+        )
     }
 
     /// Ask libghostty-vt whether the shell has enabled bracketed-paste

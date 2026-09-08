@@ -1951,13 +1951,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Read any tab's terminal viewport as text for the `tab.dump` IPC
-    /// op (not just the active one). `nil` when no `TabSession` holds
-    /// that id. Called on the main actor from `IPCHandlerImpl`.
+    /// Read any tab's terminal viewport as text, plus `scrollback` rows
+    /// of history above it, for the `tab.dump` IPC op (not just the
+    /// active one). `nil` when no `TabSession` holds that id; throws
+    /// when the terminal read itself failed. Called on the main actor
+    /// from `IPCHandlerImpl`.
     @MainActor
-    func dumpTab(tabID: Int64) -> TerminalView.Dump? {
+    func dumpTab(tabID: Int64, scrollback: UInt32) throws -> TerminalView.Dump? {
         guard let session = tabs.first(where: { $0.id == tabID }) else { return nil }
-        return session.terminalView.dumpText()
+        return try session.terminalView.dumpText(scrollback: scrollback)
     }
 
     /// Mirror the inbox count onto the Dock tile badge. `nil` at zero so
@@ -5678,7 +5680,8 @@ private func runProviderProcess(
 
 extension RoostApp: UiBridge {
     /// Expose the (private) window to the IPC handler via the bridge.
-    /// `dumpTab(tabID:)` (defined above) satisfies the rest of `UiBridge`.
+    /// `dumpTab(tabID:scrollback:)` (defined above) satisfies the rest
+    /// of `UiBridge`.
     var mainWindow: NSWindow? { window }
 
     /// Sidebar pane width + collapsed state for `app.window_metrics`.

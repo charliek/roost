@@ -5,10 +5,15 @@
 //! background tasks only move bytes — the dial task mints the token and
 //! runs the handshake, a reader task turns data-plane frames into
 //! [`HostTabFrame`]s on the engine feed, a writer task drains the tab's
-//! input queue onto the wire — while the [`SnapshotDecoder`] and both
-//! terminals (the old one still rendering, the new one hydrating) live
-//! in [`HostAttach`] on the main thread and are driven from the feed
-//! drain.
+//! input queue onto the wire — while the [`Hydrator`] and both terminals
+//! (the old one still rendering, the new one hydrating) live in
+//! [`HostAttach`] on the main thread and are driven from the feed drain.
+//!
+//! Which hydration a payload gets is the *server's* answer, not this
+//! client's preference: the data connection's handshake names the
+//! negotiated [`PayloadKind`], and a session whose libghostty build
+//! disagrees with ours answers `vt` — bytes to replay — where a matching
+//! one answers a snapshot to decode.
 //!
 //! Every frame carries the `attempt` that produced it. A re-attach
 //! aborts the previous attempt's tasks, but an abort is asynchronous —
@@ -26,21 +31,22 @@ use std::time::Duration;
 use roost_ipc::client::{ClientError, DataConnection, ServerCode, ServerFrame};
 use roost_ipc::messages::{ops, AttachHandshake, AttachPayloadKind, TabAttachResult};
 use roost_ui_model::keys::TabKey;
-use roost_vt::{HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder};
+use roost_vt::{HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder, Terminal};
 use tokio::sync::mpsc;
 
 use super::tab_backend::HostDataMsg;
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOps;
+use crate::host_conn::state::CLIENT_PAYLOAD_KINDS;
 
 /// History pages stepped per feed-drain pass. Bounds main-thread work so
 /// a large-scrollback attach never stalls a frame; the drain re-arms
 /// itself with [`HostTabFrame::StepDecoder`] while pages remain.
 const PAGES_PER_PASS: usize = 8;
 
-/// The pre-FINISH resize withhold (architecture §5: a resize mid-
-/// snapshot forfeits the remaining history pages, so a withheld one is
-/// sent at FINISH — but never held longer than this).
+/// The pre-swap resize withhold (architecture §5: a resize mid-snapshot
+/// forfeits the remaining history pages, so a withheld one is sent when
+/// the hydration completes — but never held longer than this).
 const WITHHOLD_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Re-attach backoff: base doubling, capped. Deterministic (no jitter):
@@ -57,6 +63,38 @@ pub(super) struct Geometry {
     pub(crate) cell_h: u32,
 }
 
+/// Which of [`CLIENT_PAYLOAD_KINDS`] an attach was accepted as, and so
+/// which hydration its payload gets.
+///
+/// The wire's `AttachPayloadKind` is an open string on purpose (a client
+/// must be able to read a newer session's list); this is the closed set
+/// of the two this client can actually decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadKind {
+    /// libghostty's own snapshot, decoded by [`SnapshotDecoder`].
+    GhosttySnapshot,
+    /// A VT byte stream replayed into a terminal of this client's own.
+    Vt,
+}
+
+impl PayloadKind {
+    fn from_wire(kind: &AttachPayloadKind) -> Option<Self> {
+        match kind.as_str() {
+            AttachPayloadKind::GHOSTTY_SNAPSHOT => Some(Self::GhosttySnapshot),
+            AttachPayloadKind::VT => Some(Self::Vt),
+            _ => None,
+        }
+    }
+
+    /// The wire spelling, as `host.status` reports it.
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::GhosttySnapshot => AttachPayloadKind::GHOSTTY_SNAPSHOT,
+            Self::Vt => AttachPayloadKind::VT,
+        }
+    }
+}
+
 /// Where a detached tab can pick its stream back up: the resume identity
 /// from `tab.attach` plus the next seq this client has not applied. Kept
 /// per tab across detach — refocus hands it back and the wire answers
@@ -71,10 +109,14 @@ pub(super) struct ResumePoint {
 
 /// One item of an attached host tab's traffic, riding the engine feed.
 pub(crate) enum HostTabFrame {
-    /// The handshake was accepted: the stream identity and the fence.
+    /// The handshake was accepted: the negotiated kind, the stream
+    /// identity and the fence.
     Accepted {
         attempt: u64,
         resumed: bool,
+        /// What the payload that follows is, taken from the data
+        /// connection's own reply (see [`negotiated_kind`]).
+        kind: PayloadKind,
         fence: u64,
         server_epoch: u64,
         tab_generation: u64,
@@ -158,27 +200,81 @@ pub(super) enum AttachStep {
     },
 }
 
-/// Hydration-phase state: the decoder plus the deferral and rendering it
-/// needs. Lives on the main thread only.
+/// How a payload becomes the terminal that will be swapped in — one
+/// arm per [`PayloadKind`].
+enum Hydrator {
+    /// GHOSTSNP: libghostty's decoder, fed frame by frame, its history
+    /// stepped after READY and finished by the payload's own FINISH
+    /// record.
+    Snapshot(SnapshotDecoder),
+    /// `vt`: a terminal of this client's own, at the attach geometry and
+    /// wearing this client's theme, that the payload's bytes are written
+    /// into as they arrive. The stream carries no marks of its own — the
+    /// server ends it with one zero-length SNAP frame, and that
+    /// terminator is the only signal the payload is whole.
+    Vt(Terminal),
+}
+
+impl Hydrator {
+    /// Drop a hydration in flight, **on this thread**. Which is the
+    /// whole reason it lives here and not on the task that reads frames:
+    /// an abort must never be what drops a decoder mid-`feed`.
+    fn abandon(self) {
+        match self {
+            Self::Snapshot(decoder) => drop(decoder.abandon()),
+            Self::Vt(terminal) => drop(terminal),
+        }
+    }
+}
+
+/// Hydration-phase state: the hydrator plus the deferral and rendering
+/// it needs. Lives on the main thread only.
 struct Hydration {
-    decoder: SnapshotDecoder,
+    hydrator: Hydrator,
     /// The stream identity + fence progress of THIS hydration. Promoted
-    /// to [`HostAttach::resume`] only at FINISH: until the swap, the
+    /// to [`HostAttach::resume`] only at the swap: until then, the
     /// rendered terminal is still the old one, and advertising the new
     /// fence early would let an aborted hydration "resume" onto a
     /// terminal that never took the snapshot — permanent divergence.
     identity: ResumePoint,
-    /// PTY frames that arrived before READY, replayed in order at READY.
-    /// The server holds live PTY until READY on its side too, so this is
-    /// belt-and-braces for the tiny window the two rules can miss.
+    /// PTY frames that arrived before the payload could take them,
+    /// replayed in order once it can. The server holds live PTY on its
+    /// side too, so this is belt-and-braces for the tiny window the two
+    /// rules can miss.
     deferred: VecDeque<Vec<u8>>,
     /// Bytes queued in `deferred` — bounded, because a server violating
-    /// hold-until-READY must not grow client memory without limit.
+    /// its own hold rule must not grow client memory without limit.
     deferred_bytes: usize,
+    /// The snapshot decoder passed READY: there is a screen to render
+    /// from, history left to step, and a resize could be mirrored.
+    ///
+    /// Never true of a [`Hydrator::Vt`], which has no such prefix — a
+    /// half-replayed VT stream is not a drawable screen, so a `vt`
+    /// hydration defers PTY and withholds a resize for the whole payload
+    /// and is finished by the terminator instead.
     ready: bool,
     /// Bounded stepping left pages behind; a `StepDecoder` self-wake is
     /// in flight.
     stepping: bool,
+}
+
+impl Hydration {
+    /// The decoder past READY — the only state with history to step or a
+    /// screen a mid-stream resize could be mirrored onto.
+    ///
+    /// A `vt` hydration answers `None` at every moment of its life: the
+    /// server composed those bytes for the attach geometry and they
+    /// cannot be re-cut, which is why a resize that will not wait
+    /// re-attaches there rather than being mirrored.
+    fn live_decoder(&mut self) -> Option<&mut SnapshotDecoder> {
+        if !self.ready {
+            return None;
+        }
+        match &mut self.hydrator {
+            Hydrator::Snapshot(decoder) => Some(decoder),
+            Hydrator::Vt(_) => None,
+        }
+    }
 }
 
 /// The deferral bound: the server's own queued-PTY budget. More than
@@ -207,6 +303,9 @@ pub(super) struct HostAttach {
     /// The stream identity + fence progress. `None` until the first
     /// accepted handshake.
     resume: Option<ResumePoint>,
+    /// What the last accepted attach on this tab negotiated. `None`
+    /// until one has been accepted; read by `host.status`.
+    kind: Option<PayloadKind>,
     /// The latest user resize withheld during hydration (latest-wins).
     withheld: Option<Geometry>,
     /// The geometry the current attempt negotiated (or is negotiating).
@@ -229,6 +328,7 @@ impl HostAttach {
             attempt: 0,
             phase: Phase::Requesting,
             resume: None,
+            kind: None,
             withheld: None,
             geometry,
             input_tx,
@@ -248,6 +348,12 @@ impl HostAttach {
     /// The sender the tab's `TabHandle` queues input on.
     pub(super) fn input_tx(&self) -> mpsc::UnboundedSender<HostDataMsg> {
         self.input_tx.clone()
+    }
+
+    /// What the last accepted attach negotiated — what the host's
+    /// `payload_kind` reports.
+    pub(super) fn payload_kind(&self) -> Option<PayloadKind> {
+        self.kind
     }
 
     /// Start (or restart) an attach attempt. Must be called inside the
@@ -273,7 +379,7 @@ impl HostAttach {
             ops::TAB_ATTACH,
             serde_json::json!({
                 "tab_id": key.tab.to_string(),
-                "kinds": [AttachPayloadKind::GHOSTTY_SNAPSHOT],
+                "kinds": CLIENT_PAYLOAD_KINDS,
                 "cols": geometry.cols,
                 "rows": geometry.rows,
                 "cell_w_px": geometry.cell_w,
@@ -307,6 +413,11 @@ impl HostAttach {
     /// other tasks so a re-attach or a detach cancels it. Must be called
     /// inside the app runtime.
     fn arm_timer(&mut self, delay: Duration, feed: &EngineFeedSender, frame: HostTabFrame) {
+        // A withhold deadline re-arms itself for as long as a hydration
+        // runs, so the fired ones are dropped here rather than kept to
+        // the end of the attempt: there is nothing left to abort in a
+        // timer that already sent.
+        self.tasks.retain(|task| !task.is_finished());
         let key = self.key;
         let feed = feed.clone();
         let timer = tokio::spawn(async move {
@@ -362,11 +473,13 @@ impl HostAttach {
         match frame {
             HostTabFrame::Accepted {
                 resumed,
+                kind,
                 fence,
                 server_epoch,
                 tab_generation,
                 ..
             } => {
+                self.kind = Some(kind);
                 let identity = ResumePoint {
                     server_epoch,
                     tab_generation,
@@ -390,20 +503,39 @@ impl HostAttach {
                         self.note_resize(geometry);
                     }
                 } else {
-                    // A fresh snapshot supersedes anything the old
-                    // stream had applied; the fence restarts the count —
-                    // inside the hydration, not in `self.resume`, which
-                    // keeps describing the terminal actually rendered.
+                    let hydrator = match kind {
+                        PayloadKind::GhosttySnapshot => Hydrator::Snapshot(SnapshotDecoder::new(
+                            SnapshotDecodeOptions::default(),
+                        )),
+                        // Built here rather than by the decoder: a `vt`
+                        // payload carries only what the *program*
+                        // changed, so the terminal it lands in is this
+                        // client's — its geometry, its scrollback, its
+                        // theme.
+                        PayloadKind::Vt => {
+                            match tab.hydration_terminal(self.geometry.cols, self.geometry.rows) {
+                                Ok(terminal) => Hydrator::Vt(terminal),
+                                Err(error) => {
+                                    tracing::warn!(key = %self.key, %error, "vt hydration terminal build failed; re-attaching");
+                                    return self.schedule_reattach();
+                                }
+                            }
+                        }
+                    };
+                    // A fresh payload supersedes anything the old stream
+                    // had applied; the fence restarts the count — inside
+                    // the hydration, not in `self.resume`, which keeps
+                    // describing the terminal actually rendered.
                     self.phase = Phase::Hydrating(Box::new(Hydration {
-                        decoder: SnapshotDecoder::new(SnapshotDecodeOptions::default()),
+                        hydrator,
                         identity,
                         deferred: VecDeque::new(),
                         deferred_bytes: 0,
                         ready: false,
                         stepping: false,
                     }));
-                    // The withhold deadline covers only snapshot mode; a
-                    // resume has no FINISH to wait for.
+                    // The withhold deadline covers only a hydration; a
+                    // resume has no completion to wait for.
                     let attempt = self.attempt;
                     self.arm_timer(
                         WITHHOLD_DEADLINE,
@@ -483,24 +615,36 @@ impl HostAttach {
                     return AttachStep::None;
                 };
                 let Some(geometry) = self.withheld.take() else {
+                    // Nothing on hold *yet*. What this bounds is the
+                    // hold, not the attach, so the next deadline is
+                    // armed here: a hydration outlives this one (a `vt`
+                    // payload by its whole length), and a resize
+                    // arriving from now on would otherwise have nothing
+                    // left to act on it until the payload ended.
+                    let attempt = self.attempt;
+                    self.arm_timer(
+                        WITHHOLD_DEADLINE,
+                        feed,
+                        HostTabFrame::WithholdDeadline { attempt },
+                    );
                     return AttachStep::None;
                 };
-                if !hydration.ready {
-                    // READY has not even landed after 2 s: the snapshot
-                    // has nothing worth keeping and a decoder that has
-                    // not reached READY cannot mirror a resize. Attach
-                    // fresh at the new geometry — attach is when the
+                let Some(decoder) = hydration.live_decoder() else {
+                    // Nothing to mirror it onto: a decoder short of READY
+                    // has no screen yet, and a `vt` payload was composed
+                    // for the attach geometry and cannot be re-cut.
+                    // Attach fresh at the new size — attach is when the
                     // server resizes.
-                    tracing::debug!(key = %self.key, "withhold deadline before READY; re-attaching at the new size");
+                    tracing::debug!(key = %self.key, "withhold deadline with no hydration to mirror it; re-attaching at the new size");
                     self.geometry = geometry;
                     return self.schedule_reattach();
-                }
+                };
                 // The decoder mirrors the resize before the RESIZE goes
                 // out — the remaining history pages are forfeited, which
                 // the decoder reports as zero-row pages (snapshot.h). A
                 // decoder that refuses leaves the wire untouched: the
                 // stream is about to be replaced anyway.
-                if let Err(error) = hydration.decoder.resize(
+                if let Err(error) = decoder.resize(
                     geometry.cols,
                     geometry.rows,
                     geometry.cell_w,
@@ -529,7 +673,7 @@ impl HostAttach {
     pub(super) fn detach(mut self) -> Option<ResumePoint> {
         self.abort_tasks();
         if let Phase::Hydrating(hydration) = std::mem::replace(&mut self.phase, Phase::Ended) {
-            drop(hydration.decoder.abandon());
+            hydration.hydrator.abandon();
         }
         self.resume
     }
@@ -565,7 +709,7 @@ impl HostAttach {
     fn schedule_reattach(&mut self) -> AttachStep {
         self.abort_tasks();
         if let Phase::Hydrating(hydration) = std::mem::replace(&mut self.phase, Phase::Requesting) {
-            drop(hydration.decoder.abandon());
+            hydration.hydrator.abandon();
         }
         let delay = BACKOFF_BASE
             .saturating_mul(1u32 << self.backoff_step.min(5))
@@ -581,36 +725,55 @@ impl HostAttach {
         feed: &EngineFeedSender,
     ) -> AttachStep {
         let Phase::Hydrating(hydration) = &mut self.phase else {
-            // SNAP outside hydration: the stream is confused. Rebuild.
+            // SNAP outside hydration — including a non-empty one after a
+            // `vt` terminator: the stream is confused. Rebuild.
             tracing::debug!(key = %self.key, "SNAP outside hydration; re-attaching");
             return self.schedule_reattach();
         };
-        if let Err(error) = hydration.decoder.feed(bytes) {
-            tracing::debug!(key = %self.key, %error, "snapshot decode failed; re-attaching");
-            return self.schedule_reattach();
-        }
-        if !hydration.ready {
-            match hydration.decoder.try_ready() {
-                Ok(ReadyState::NeedMoreBytes) => return AttachStep::None,
-                Ok(ReadyState::Ready) => {
-                    hydration.ready = true;
-                    // Replay the deferral in arrival order — these are
-                    // live bytes from after the snapshot's fence, and
-                    // the decoder interleaves them correctly from READY.
-                    while let Some(bytes) = hydration.deferred.pop_front() {
-                        if let Err(error) = hydration.decoder.vt_write(&bytes) {
-                            tracing::debug!(key = %self.key, %error, "deferred replay failed; re-attaching");
+        match &mut hydration.hydrator {
+            Hydrator::Vt(terminal) => {
+                if !bytes.is_empty() {
+                    terminal.vt_write(bytes);
+                    return AttachStep::None;
+                }
+                // The terminator: the payload is whole, so what the
+                // server held behind it goes in now, in arrival order —
+                // the same replay READY does on the other arm.
+                while let Some(deferred) = hydration.deferred.pop_front() {
+                    terminal.vt_write(&deferred);
+                }
+                self.finish_hydration(tab)
+            }
+            Hydrator::Snapshot(decoder) => {
+                if let Err(error) = decoder.feed(bytes) {
+                    tracing::debug!(key = %self.key, %error, "snapshot decode failed; re-attaching");
+                    return self.schedule_reattach();
+                }
+                if !hydration.ready {
+                    match decoder.try_ready() {
+                        Ok(ReadyState::NeedMoreBytes) => return AttachStep::None,
+                        Ok(ReadyState::Ready) => {
+                            hydration.ready = true;
+                            // Replay the deferral in arrival order —
+                            // these are live bytes from after the
+                            // snapshot's fence, and the decoder
+                            // interleaves them correctly from READY.
+                            while let Some(bytes) = hydration.deferred.pop_front() {
+                                if let Err(error) = decoder.vt_write(&bytes) {
+                                    tracing::debug!(key = %self.key, %error, "deferred replay failed; re-attaching");
+                                    return self.schedule_reattach();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(key = %self.key, %error, "snapshot READY failed; re-attaching");
                             return self.schedule_reattach();
                         }
                     }
                 }
-                Err(error) => {
-                    tracing::debug!(key = %self.key, %error, "snapshot READY failed; re-attaching");
-                    return self.schedule_reattach();
-                }
+                self.drive_decoder(tab, feed)
             }
         }
-        self.drive_decoder(tab, feed)
     }
 
     fn apply_pty(
@@ -635,22 +798,31 @@ impl HostAttach {
         match &mut self.phase {
             Phase::Hydrating(hydration) => {
                 hydration.identity.next_seq += 1;
-                if !hydration.ready {
-                    hydration.deferred_bytes += bytes.len();
-                    if hydration.deferred_bytes > MAX_DEFERRED_BYTES {
-                        tracing::debug!(
-                            key = %self.key,
-                            "peer streamed PTY past the pre-READY budget; re-attaching"
-                        );
-                        return self.schedule_reattach();
+                match hydration.live_decoder() {
+                    // Past READY the decoder interleaves live bytes with
+                    // the history it is still stepping.
+                    Some(decoder) => match decoder.vt_write(&bytes) {
+                        Ok(()) => AttachStep::Refresh,
+                        Err(error) => {
+                            tracing::debug!(key = %self.key, %error, "hydration vt_write failed; re-attaching");
+                            self.schedule_reattach()
+                        }
+                    },
+                    // Nothing can take them yet: a snapshot short of
+                    // READY, or a `vt` payload, which is only a screen
+                    // once it is whole. Hold them in arrival order.
+                    None => {
+                        hydration.deferred_bytes += bytes.len();
+                        if hydration.deferred_bytes > MAX_DEFERRED_BYTES {
+                            tracing::debug!(
+                                key = %self.key,
+                                "peer streamed PTY past the hold budget; re-attaching"
+                            );
+                            return self.schedule_reattach();
+                        }
+                        hydration.deferred.push_back(bytes);
+                        AttachStep::None
                     }
-                    hydration.deferred.push_back(bytes);
-                    AttachStep::None
-                } else if let Err(error) = hydration.decoder.vt_write(&bytes) {
-                    tracing::debug!(key = %self.key, %error, "hydration vt_write failed; re-attaching");
-                    self.schedule_reattach()
-                } else {
-                    AttachStep::Refresh
                 }
             }
             Phase::Live => {
@@ -677,11 +849,11 @@ impl HostAttach {
         let Phase::Hydrating(hydration) = &mut self.phase else {
             return AttachStep::None;
         };
-        if !hydration.ready {
+        let Some(decoder) = hydration.live_decoder() else {
             return AttachStep::None;
-        }
+        };
         for _ in 0..PAGES_PER_PASS {
-            match hydration.decoder.try_next() {
+            match decoder.try_next() {
                 Ok(HistoryStep::NeedMoreBytes) => return AttachStep::None,
                 Ok(HistoryStep::Page { .. }) => {}
                 Ok(HistoryStep::Finished) => return self.finish_hydration(tab),
@@ -708,16 +880,19 @@ impl HostAttach {
             unreachable!("finish_hydration is only called from the hydrating arm");
         };
         let identity = hydration.identity;
-        let decoded = match hydration.decoder.finish() {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::debug!(key = %self.key, %error, "snapshot finish failed; re-attaching");
-                return self.schedule_reattach();
-            }
+        let terminal = match hydration.hydrator {
+            Hydrator::Snapshot(decoder) => match decoder.finish() {
+                Ok(decoded) => decoded.terminal,
+                Err(error) => {
+                    tracing::debug!(key = %self.key, %error, "snapshot finish failed; re-attaching");
+                    return self.schedule_reattach();
+                }
+            },
+            // The terminator already said the payload was whole, and its
+            // bytes are in this terminal.
+            Hydrator::Vt(terminal) => terminal,
         };
-        if let Err(error) =
-            tab.swap_terminal(decoded.terminal, self.geometry.cols, self.geometry.rows)
-        {
+        if let Err(error) = tab.swap_terminal(terminal, self.geometry.cols, self.geometry.rows) {
             tracing::warn!(key = %self.key, %error, "hydrated terminal swap failed; re-attaching");
             return self.schedule_reattach();
         }
@@ -783,6 +958,28 @@ fn choose_handshake(result: &TabAttachResult, resume: Option<ResumePoint>) -> At
         }
         _ => AttachHandshake::snapshot(&result.attach_token),
     }
+}
+
+/// What the payload that is about to arrive will be decoded as.
+///
+/// The data connection's own `AttachAccepted.kind` is the authority: it
+/// rides the ticket the server admitted, and the bytes behind it are
+/// what that server composed. `tab.attach`'s reply must have said the
+/// same thing — two different answers to one negotiation is a protocol
+/// error, and picking either of them would be guessing which one the
+/// stream honors. Re-attaching is the recovery, as it is for every other
+/// stream this client cannot trust.
+fn negotiated_kind(
+    control: &AttachPayloadKind,
+    accepted: &AttachPayloadKind,
+) -> Result<PayloadKind, String> {
+    if control != accepted {
+        return Err(format!(
+            "tab.attach negotiated {control}, the data connection accepted {accepted}"
+        ));
+    }
+    PayloadKind::from_wire(accepted)
+        .ok_or_else(|| format!("the session accepted {accepted}, which this client never offered"))
 }
 
 /// Plan §3.4's ERROR mapping: which refusals are terminal, which mean
@@ -880,11 +1077,16 @@ async fn run_attempt(
                 )
             }
         };
+    let kind = match negotiated_kind(&result.kind, &accepted.kind) {
+        Ok(kind) => kind,
+        Err(message) => return fail(FailReason::Retryable(message), &feed),
+    };
     feed.send(EngineFeed::HostTab(
         key,
         HostTabFrame::Accepted {
             attempt,
             resumed: accepted.mode == roost_ipc::messages::AttachMode::Resume,
+            kind,
             fence: accepted.seq,
             server_epoch: accepted.server_epoch,
             tab_generation: accepted.tab_generation,
@@ -1026,13 +1228,30 @@ mod tests {
     }
 
     fn accepted(resumed: bool, fence: u64) -> HostTabFrame {
+        accepted_as(PayloadKind::GhosttySnapshot, resumed, fence)
+    }
+
+    fn accepted_as(kind: PayloadKind, resumed: bool, fence: u64) -> HostTabFrame {
         HostTabFrame::Accepted {
             attempt: 1,
             resumed,
+            kind,
             fence,
             server_epoch: 11,
             tab_generation: 2,
         }
+    }
+
+    fn snap(bytes: &[u8]) -> HostTabFrame {
+        HostTabFrame::Snap {
+            attempt: 1,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn screen(tab: &mut TerminalTab) -> String {
+        tab.refresh_snapshot().expect("refresh");
+        tab.dump(0).expect("dump").rows_text.join("\n")
     }
 
     fn pty(seq: u64, bytes: &[u8]) -> HostTabFrame {
@@ -1094,7 +1313,11 @@ mod tests {
         );
         tab.refresh_snapshot().expect("refresh");
         assert!(
-            tab.dump().rows_text.join("\n").contains("after-resume"),
+            tab.dump(0)
+                .expect("dump")
+                .rows_text
+                .join("\n")
+                .contains("after-resume"),
             "resumed PTY applies to the surviving terminal"
         );
     }
@@ -1110,7 +1333,11 @@ mod tests {
         attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
         assert!(matches!(attach.phase, Phase::Hydrating(_)));
         assert!(
-            tab.dump().rows_text.join("\n").contains("old-screen"),
+            tab.dump(0)
+                .expect("dump")
+                .rows_text
+                .join("\n")
+                .contains("old-screen"),
             "the old terminal renders through hydration — never blank"
         );
         let step = hydrate_fully(
@@ -1122,8 +1349,13 @@ mod tests {
         );
         assert_eq!(step, AttachStep::Refresh);
         assert!(matches!(attach.phase, Phase::Live));
+        assert_eq!(
+            attach.payload_kind(),
+            Some(PayloadKind::GhosttySnapshot),
+            "what host.status reports is what was accepted"
+        );
         tab.refresh_snapshot().expect("refresh");
-        let text = tab.dump().rows_text.join("\n");
+        let text = tab.dump(0).expect("dump").rows_text.join("\n");
         assert!(
             text.contains("fresh-host-screen"),
             "FINISH swaps the hydrated terminal in: {text:?}"
@@ -1150,7 +1382,7 @@ mod tests {
             snapshot_with("base"),
         );
         tab.refresh_snapshot().expect("refresh");
-        let text = tab.dump().rows_text.join("\n");
+        let text = tab.dump(0).expect("dump").rows_text.join("\n");
         assert!(
             text.contains("early-bytes"),
             "the deferral replays into the hydrated terminal: {text:?}"
@@ -1489,7 +1721,11 @@ mod tests {
         );
         tab.refresh_snapshot().expect("refresh");
         assert!(
-            !tab.dump().rows_text.join("\n").contains("from the dead"),
+            !tab.dump(0)
+                .expect("dump")
+                .rows_text
+                .join("\n")
+                .contains("from the dead"),
             "a dead attempt's bytes never touch the terminal"
         );
     }
@@ -1536,6 +1772,203 @@ mod tests {
             }),
             "the old point still describes what is rendered"
         );
+    }
+
+    /// A `vt` payload is a bare byte stream with no marks of its own: it
+    /// is not a screen until it is whole, and the zero-length SNAP
+    /// terminator is the only thing that says it is.
+    #[tokio::test]
+    async fn a_vt_terminator_swaps_the_replayed_terminal_in() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        tab.write_vt(b"old-screen");
+        attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
+        assert_eq!(
+            attach.payload_kind(),
+            Some(PayloadKind::Vt),
+            "what host.status reports is what was accepted"
+        );
+        assert_eq!(
+            attach.on_frame(snap(b"fresh-host-screen"), &mut tab, &feed_tx),
+            AttachStep::None
+        );
+        assert!(
+            screen(&mut tab).contains("old-screen"),
+            "the old terminal renders through hydration — never half a payload"
+        );
+
+        assert_eq!(
+            attach.on_frame(snap(b""), &mut tab, &feed_tx),
+            AttachStep::Refresh
+        );
+        assert!(matches!(attach.phase, Phase::Live));
+        let text = screen(&mut tab);
+        assert!(text.contains("fresh-host-screen"), "{text:?}");
+        assert!(!text.contains("old-screen"));
+        assert_eq!(
+            attach.detach(),
+            Some(ResumePoint {
+                server_epoch: 11,
+                tab_generation: 2,
+                next_seq: 101,
+            }),
+            "the terminator promotes the fence, exactly as FINISH does"
+        );
+    }
+
+    /// A `vt` hydration has no READY to interleave live bytes from, so
+    /// PTY defers for the whole payload and replays in arrival order
+    /// once the terminator lands.
+    #[tokio::test]
+    async fn a_vt_hydration_holds_pty_until_the_terminator() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
+        attach.on_frame(snap(b"base"), &mut tab, &feed_tx);
+        assert_eq!(
+            attach.on_frame(pty(101, b"-live"), &mut tab, &feed_tx),
+            AttachStep::None,
+            "there is no screen to apply it to yet"
+        );
+        attach.on_frame(snap(b""), &mut tab, &feed_tx);
+        let text = screen(&mut tab);
+        assert!(text.contains("base-live"), "{text:?}");
+    }
+
+    /// The decoder follows the accepted kind and nothing else: the same
+    /// bytes are a screen under `vt` and are not a snapshot under
+    /// `ghostty-snapshot`. A client that picked by its own preference
+    /// instead would build a terminal out of a stream it never parsed.
+    #[tokio::test]
+    async fn the_accepted_kind_chooses_the_decoder() {
+        let payload = b"plain-vt-bytes";
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
+        attach.on_frame(snap(payload), &mut tab, &feed_tx);
+        assert_eq!(
+            attach.on_frame(snap(b""), &mut tab, &feed_tx),
+            AttachStep::Refresh
+        );
+        assert!(screen(&mut tab).contains("plain-vt-bytes"));
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        tab.write_vt(b"old-screen");
+        attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
+        attach.on_frame(snap(payload), &mut tab, &feed_tx);
+        attach.on_frame(snap(b""), &mut tab, &feed_tx);
+        assert!(
+            screen(&mut tab).contains("old-screen"),
+            "the snapshot decoder never took those bytes for a screen"
+        );
+    }
+
+    /// The data connection's `AttachAccepted.kind` is the authority, and
+    /// `tab.attach`'s reply must have agreed with it: two answers to one
+    /// negotiation is a protocol error, not a coin toss.
+    #[test]
+    fn a_handshake_that_contradicts_the_control_reply_is_refused() {
+        let snapshot = AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT);
+        let vt = AttachPayloadKind::from(AttachPayloadKind::VT);
+        assert_eq!(
+            negotiated_kind(&snapshot, &snapshot),
+            Ok(PayloadKind::GhosttySnapshot)
+        );
+        assert_eq!(negotiated_kind(&vt, &vt), Ok(PayloadKind::Vt));
+
+        let disagreed = negotiated_kind(&snapshot, &vt).unwrap_err();
+        assert!(
+            disagreed.contains(AttachPayloadKind::GHOSTTY_SNAPSHOT)
+                && disagreed.contains(AttachPayloadKind::VT),
+            "the refusal names both answers: {disagreed}"
+        );
+
+        let unoffered = AttachPayloadKind::from("sixel-mosaic");
+        assert!(
+            negotiated_kind(&unoffered, &unoffered).is_err(),
+            "a kind this client never offered is not one it can decode"
+        );
+    }
+
+    /// A resize that runs out of patience during a `vt` payload
+    /// re-attaches at the new size instead of being mirrored: the server
+    /// composed those bytes for the old geometry, and unlike the
+    /// decoder's screen there is nothing here to re-cut.
+    #[tokio::test]
+    async fn a_withheld_resize_during_a_vt_payload_reattaches_at_the_new_size() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
+        attach.on_frame(snap(b"half a payload"), &mut tab, &feed_tx);
+        attach.note_resize(Geometry {
+            cols: 132,
+            rows: 50,
+            ..GEOMETRY
+        });
+        assert!(matches!(
+            attach.on_frame(
+                HostTabFrame::WithholdDeadline { attempt: 1 },
+                &mut tab,
+                &feed_tx,
+            ),
+            AttachStep::Reattach { .. }
+        ));
+        assert!(
+            attach.test_drain_input().is_empty(),
+            "no RESIZE rides a stream about to be replaced"
+        );
+        assert_eq!(
+            attach.geometry.cols, 132,
+            "the retry attaches at the new size"
+        );
+    }
+
+    /// The deadline bounds the *hold*, not the accept, so a resize that
+    /// arrives after one has already fired is still acted on within it.
+    /// A `vt` hydration is where this bites: it holds for the whole
+    /// payload, so most of its life is after that first deadline, and a
+    /// resize landing there would otherwise wait out the entire attach
+    /// and then be applied to a terminal replayed at the old size.
+    #[tokio::test(start_paused = true)]
+    async fn a_resize_after_the_deadline_is_still_bounded_by_it() {
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        attach.on_frame(accepted_as(PayloadKind::Vt, false, 100), &mut tab, &feed_tx);
+        attach.on_frame(snap(b"half a payload"), &mut tab, &feed_tx);
+
+        // The deadline armed at the accept, with nothing on hold.
+        let deadline = next_withhold_deadline(&mut feed_rx).await;
+        assert_eq!(
+            attach.on_frame(deadline, &mut tab, &feed_tx),
+            AttachStep::None
+        );
+
+        // Only now does the user drag the window, mid-payload.
+        attach.note_resize(Geometry {
+            cols: 132,
+            rows: 50,
+            ..GEOMETRY
+        });
+        let deadline = next_withhold_deadline(&mut feed_rx).await;
+        assert!(matches!(
+            attach.on_frame(deadline, &mut tab, &feed_tx),
+            AttachStep::Reattach { .. }
+        ));
+        assert_eq!(
+            attach.geometry.cols, 132,
+            "the retry attaches at the size the user is looking at"
+        );
+    }
+
+    /// Wait out the withhold deadline and take the frame its timer put
+    /// on the feed. Callers pause the clock, so this costs no real time.
+    async fn next_withhold_deadline(feed_rx: &mut EngineFeedReceiver) -> HostTabFrame {
+        tokio::time::sleep(WITHHOLD_DEADLINE + Duration::from_millis(1)).await;
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        loop {
+            let item = feed_rx
+                .try_next(&mut batch)
+                .expect("a withhold deadline on the feed");
+            if let EngineFeed::HostTab(_, frame @ HostTabFrame::WithholdDeadline { .. }) = item {
+                return frame;
+            }
+        }
     }
 
     /// FINISH promotes the hydration's fence — the moment it becomes

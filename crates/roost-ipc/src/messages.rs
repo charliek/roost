@@ -359,16 +359,36 @@ pub struct TabResizeParams {
 
 /// `tab.dump` request. Returns the tab's live terminal *viewport* as
 /// text — the determinism backbone for content assertions in automated
-/// tests (assert on exact text instead of OCR / pixel-matching).
-/// Scrollback above the viewport is a planned follow-up; today the dump
-/// is the visible grid only, so no `scrollback` param is accepted yet.
+/// tests (assert on exact text instead of OCR / pixel-matching) — plus
+/// however many rows of history above it `scrollback` asks for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabDumpParams {
     /// Bare engine id, or the `h<host>.<id>` wire spelling for an
     /// attached host tab's client-side terminal (UI socket only).
     pub tab_id: WireTabRef,
+    /// How many history rows above the viewport to return. `0` is no
+    /// scrollback; anything past [`MAX_DUMP_SCROLLBACK`] is clamped.
+    ///
+    /// Omitted when unset so a viewport-only request stays
+    /// byte-identical to what clients have always sent — this struct is
+    /// `deny_unknown_fields`, so a server predating the key rejects the
+    /// whole request rather than ignoring it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scrollback: u32,
 }
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// The most history rows one [`TabDumpParams`] may ask for. A larger
+/// request is **clamped, never refused**, so a client can ask for
+/// "everything" without knowing the tab's retention. A maximum exists
+/// at all because a dump is a synchronous read of a live terminal: the
+/// rows are formatted on the thread that owns it, so an unbounded ask
+/// would stall that terminal's rendering and input for the duration.
+pub const MAX_DUMP_SCROLLBACK: u32 = 10_000;
 
 /// Cursor position within the dumped viewport, 0-indexed from the top-left.
 /// Absent when the cursor is off-viewport or hidden by the terminal.
@@ -382,7 +402,7 @@ pub struct TabDumpCursor {
 /// `tab.dump` response. `rows_text` has one entry per visible row with
 /// trailing blanks trimmed, reconstructing what's on screen (a blank
 /// cell renders as a space so columns line up). Permissive on the wire
-/// so per-cell color / scrollback fields can be added forward-compatibly.
+/// so per-cell color fields can be added forward-compatibly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabDumpResult {
     pub cols: u32,
@@ -390,6 +410,18 @@ pub struct TabDumpResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<TabDumpCursor>,
     pub rows_text: Vec<String>,
+    /// How many history rows sit above the **current viewport** — the
+    /// one `rows_text` shows — so the two halves stay adjacent however
+    /// far the terminal is scrolled up.
+    ///
+    /// `default` so a client built against this shape still decodes a
+    /// response from a server that predates it.
+    #[serde(default)]
+    pub scrollback_rows: u32,
+    /// The last `min(requested, scrollback_rows)` of those rows, top to
+    /// bottom, its final entry the row immediately above `rows_text[0]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scrollback_text: Vec<String>,
 }
 
 // ============================================================================
@@ -1809,9 +1841,13 @@ pub const SESSION_PROTOCOL_VERSION: u32 = 4;
 /// generation's frozen vector stay valid — its list is a subset of this
 /// one, never an equal.
 ///
-/// `events_resume` is [`EventsSubscribeParams::from_revision`]: a
-/// capability that is an op *parameter*, not a new op.
-pub const SESSION_FEATURES: &[&str] = &["put_file", "events_resume"];
+/// An entry need not be a whole op. `events_resume` is
+/// [`EventsSubscribeParams::from_revision`] and `tab_dump_scrollback` is
+/// [`TabDumpParams::scrollback`]: both are additive *parameters* on ops
+/// every generation already serves, listed so a client can
+/// feature-detect them instead of probing for the `unknown-field` an
+/// older server answers.
+pub const SESSION_FEATURES: &[&str] = &["put_file", "events_resume", "tab_dump_scrollback"];
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -2379,6 +2415,17 @@ pub struct HostStatus {
     /// the user asks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetrySchedule>,
+    /// What the last attach this client accepted on this host is being
+    /// decoded as — one of [`AttachPayloadKind`]'s spellings.
+    ///
+    /// `"vt"` is the fallback a libghostty build skew lands on, and the
+    /// only way to see it from outside: a host on it connects normally,
+    /// with no dot and no dialog, at that payload's documented fidelity.
+    /// Absent until a tab has actually attached over the live
+    /// connection — it reports what is being decoded, never what could
+    /// be — and it goes when that connection does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_kind: Option<String>,
 }
 
 /// An armed auto-reconnect: what was scheduled, not what is left.
@@ -3795,6 +3842,8 @@ mod tests {
                 visible: true,
             }),
             rows_text: vec!["/tmp $ echo hi".into(), "hi".into()],
+            scrollback_rows: 2,
+            scrollback_text: vec!["older".into(), "lines".into()],
         };
         round_trip(&with_cursor);
 
@@ -3804,6 +3853,8 @@ mod tests {
             rows: 24,
             cursor: None,
             rows_text: vec![],
+            scrollback_rows: 0,
+            scrollback_text: vec![],
         };
         let json = serde_json::to_string(&no_cursor).unwrap();
         assert!(
@@ -4357,6 +4408,7 @@ mod tests {
                         .into(),
                 ),
             }),
+            payload_kind: None,
         };
         round_trip(&armed);
         // #399: `reason` says *why* the rung is armed while the band's
@@ -4388,6 +4440,20 @@ mod tests {
                 "generation": 0,
                 "state": "disconnected",
             })
+        );
+
+        // A host attached in the `vt` fallback is the only place that
+        // shows: the kind rides beside the state, and the never-attached
+        // host above proves the key is omitted rather than nulled.
+        let fallback = HostStatus {
+            state: host_state::CONNECTED.into(),
+            payload_kind: Some(AttachPayloadKind::VT.to_string()),
+            ..never.clone()
+        };
+        round_trip(&fallback);
+        assert_eq!(
+            serde_json::to_value(&fallback).unwrap()["payload_kind"],
+            AttachPayloadKind::VT
         );
 
         // Localhost's own retry knows a delay and nothing else — the

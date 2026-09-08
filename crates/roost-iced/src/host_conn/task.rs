@@ -41,7 +41,9 @@ use tokio::sync::{mpsc, Notify};
 
 use super::mirror::{HostMirror, SharedMirror};
 use super::queue::{self, HostIntent, HostOpError, OpFault};
-use super::state::{check_compatibility, HostConnState, HostStateMachine, HostTransport};
+use super::state::{
+    check_compatibility, Compatibility, HostConnState, HostStateMachine, HostTransport,
+};
 use super::upload::Uploads;
 use super::{HostIdMinter, HostWorkspaceEvent};
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
@@ -881,12 +883,23 @@ async fn open_control(
     .await?;
     let identity: SessionIdentify =
         serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_IDENTIFY, &error))?;
-    check_compatibility(
+    let compatibility = check_compatibility(
         &identity,
         &config.client_build,
         config.transport.restart_action(),
     )
     .map_err(|mismatch| AttemptError::Incompatible(Box::new(mismatch)))?;
+    if compatibility == Compatibility::BuildSkew {
+        // The one place the fallback is announced. There is no dot and
+        // no dialog for it — the connection is a working connection —
+        // so the log is what a user comparing two screens is pointed at.
+        tracing::warn!(
+            session_build = %identity.libghostty_build,
+            client_build = %config.client_build,
+            "libghostty build skew: attaching in the vt fallback, without the \
+             inactive screen, soft-wrap flags or per-cell hyperlinks"
+        );
+    }
     Ok((control, identity))
 }
 
@@ -1669,7 +1682,7 @@ mod tests {
         serde_json::json!({
             "app_version": "test",
             "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
-            "payload_kinds": [super::super::state::REQUIRED_PAYLOAD_KIND],
+            "payload_kinds": super::super::state::CLIENT_PAYLOAD_KINDS,
             "libghostty_build": "gb",
             "session_id": "s1",
             "started_at": "2026-01-01T00:00:00Z",

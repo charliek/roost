@@ -5789,7 +5789,10 @@ mod tests {
         tab.refresh_snapshot().expect("baseline snapshot");
         clear_captured_input(&tab);
         let bottom = viewport_offset(&tab);
-        assert_eq!(tab.dump().rows_text[0], format!("history-{bottom:03}"));
+        assert_eq!(
+            tab.dump(0).expect("dump").rows_text[0],
+            format!("history-{bottom:03}")
+        );
 
         let page = u64::from(DEFAULT_ROWS);
         for count in 1..=3 {
@@ -5802,7 +5805,7 @@ mod tests {
             let offset = viewport_offset(&tab);
             assert_eq!(bottom - offset, page * count, "page {count} moved one page");
             assert_eq!(
-                tab.dump().rows_text[0],
+                tab.dump(0).expect("dump").rows_text[0],
                 format!("history-{offset:03}"),
                 "the published snapshot follows the local viewport"
             );
@@ -6303,7 +6306,7 @@ mod tests {
             "a composition must not reach the PTY"
         );
         assert_eq!(
-            tab.dump().rows_text[0],
+            tab.dump(0).expect("dump").rows_text[0],
             "",
             "a preedit never enters the grid"
         );
@@ -6356,7 +6359,7 @@ mod tests {
         tab.write_vt(b"\x1b[2J\x1b[Hprompt$ ");
         tab.refresh_snapshot().expect("baseline snapshot");
         clear_captured_input(&tab);
-        let baseline = tab.dump().rows_text;
+        let baseline = tab.dump(0).expect("dump").rows_text;
 
         tab.set_preedit("你好".into(), Some(6..6)).expect("preedit");
         assert!(tab.clear_preedit().expect("cancel"));
@@ -6364,7 +6367,7 @@ mod tests {
         assert!(tab.preedit.is_none());
         assert!(tab.snapshot.preedit.is_none());
         assert!(captured_input(&tab).is_empty(), "cancel is never a commit");
-        assert_eq!(tab.dump().rows_text, baseline);
+        assert_eq!(tab.dump(0).expect("dump").rows_text, baseline);
         supervisor.close(402);
     }
 

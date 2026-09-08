@@ -45,7 +45,12 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
     // a two-crate edit.
     assert_eq!(
         session.payload_kinds,
-        vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)]
+        vec![
+            AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+            AttachPayloadKind::from(AttachPayloadKind::VT),
+        ],
+        "both kinds, GHOSTSNP first: it is the higher-fidelity one, and \
+         `tab.attach` walks the client's offer against this order"
     );
     assert!(
         session.libghostty_build.starts_with("ghostty-"),

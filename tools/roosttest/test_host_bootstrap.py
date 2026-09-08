@@ -1081,7 +1081,16 @@ def test_running_mismatch_offers_remote_update_and_reconnects(
     reconnect, with no install at all.
     """
     binary = bootstrap_host.jail.plant("$HOME/.local/bin/roost-session", sessionlib.session_binary())
-    start_daemon_in_jail(bootstrap_host.jail, binary, ROOST_SESSION_FAKE_BUILD=FAKE_BUILD)
+    # A skewed build alone no longer reaches `NeedsRestart` (#420): the
+    # daemon would offer `vt` and this client would connect on it.
+    # `ROOST_SESSION_LEGACY_KINDS` is what still produces a session it
+    # genuinely cannot talk to, which is this test's premise.
+    start_daemon_in_jail(
+        bootstrap_host.jail,
+        binary,
+        ROOST_SESSION_FAKE_BUILD=FAKE_BUILD,
+        ROOST_SESSION_LEGACY_KINDS="1",
+    )
 
     # First connect: the compat check that lands the host in
     # `NeedsRestart` is not itself origin-gated (only *raising the
@@ -1186,7 +1195,13 @@ def test_unix_socket_remote_keeps_the_docs_pointer_with_no_update_button(roost: 
     """
     session_env = sessionlib.make_env()
     try:
-        start_session(session_env, ROOST_SESSION_FAKE_BUILD=FAKE_BUILD)
+        # Skew *and* the pre-R3 payload-kind set — see the note in
+        # `test_running_mismatch_offers_remote_update_and_reconnects`.
+        start_session(
+            session_env,
+            ROOST_SESSION_FAKE_BUILD=FAKE_BUILD,
+            ROOST_SESSION_LEGACY_KINDS="1",
+        )
         with saved_host(roost, session_env) as host:
             # First connect settles NeedsRestart (the compat check is
             # not origin-gated); the second, from a "click", reaches

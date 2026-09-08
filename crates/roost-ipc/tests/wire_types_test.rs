@@ -26,10 +26,11 @@ use roost_ipc::messages::{
     SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
     SessionSetAgentHooksParams, SessionSetAgentHooksResult, SessionSetFocusParams,
     SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
-    SessionStoppingEvent, SkippedFile, TabAttachParams, TabAttachResult, TabEffect, TabEffectEvent,
-    TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef,
-    WireTabRef, MAX_PUT_FILE_BYTES, SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    SessionStoppingEvent, SkippedFile, TabAttachParams, TabAttachResult, TabDumpCursor,
+    TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
+    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
+    SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES, SESSION_PROTOCOL_VERSION,
+    SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -154,7 +155,7 @@ fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
         r#"{"app_version":"0.0.18","session_protocol":4,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
-        r#""features":["put_file","events_resume"],"#,
+        r#""features":["put_file","events_resume","tab_dump_scrollback"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
         r#""started_at":"2026-08-27T14:03:11Z"}"#,
@@ -727,6 +728,136 @@ fn tab_attach_vectors_decode_into_their_typed_shapes() {
     let result: TabAttachResult =
         serde_json::from_value(resp.result.expect("result body")).expect("decode attach result");
     assert_eq!(result, sample_attach_result());
+}
+
+/// The other end of the negotiation: a client offering both kinds, and
+/// the reply that settled on `vt`.
+#[test]
+fn tab_attach_vt_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("tab.attach.vt.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request.op, roost_ipc::messages::ops::TAB_ATTACH);
+    let params: TabAttachParams =
+        serde_json::from_value(request.params).expect("decode attach params");
+    assert_eq!(
+        params,
+        TabAttachParams {
+            kinds: vec![
+                AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
+                AttachPayloadKind::VT.into(),
+            ],
+            ..sample_attach_params()
+        }
+    );
+
+    let raw = read_vector("tab.attach.vt.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: TabAttachResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode attach result");
+    assert_eq!(
+        result,
+        TabAttachResult {
+            kind: AttachPayloadKind::VT.into(),
+            ..sample_attach_result()
+        }
+    );
+}
+
+#[test]
+fn tab_dump_vectors_decode_into_their_typed_shapes() {
+    for (name, scrollback) in [
+        ("tab.dump.request.json", 0),
+        ("tab.dump.scrollback.request.json", 50),
+    ] {
+        let raw = read_vector(name);
+        let request: roost_ipc::messages::RawRequest =
+            serde_json::from_str(&raw).expect("decode request envelope");
+        assert_eq!(request.op, roost_ipc::messages::ops::TAB_DUMP, "{name}");
+        let params: TabDumpParams =
+            serde_json::from_value(request.params).expect("decode dump params");
+        assert_eq!(
+            params,
+            TabDumpParams {
+                tab_id: WireTabRef::Local(5),
+                scrollback,
+            },
+            "{name}"
+        );
+    }
+
+    let raw = read_vector("tab.dump.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: TabDumpResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode dump result");
+    assert_eq!(
+        result,
+        TabDumpResult {
+            cols: 80,
+            rows: 24,
+            cursor: Some(TabDumpCursor {
+                row: 2,
+                col: 0,
+                visible: true,
+            }),
+            rows_text: vec!["/tmp $ echo hi".into(), "hi".into()],
+            scrollback_rows: 3,
+            scrollback_text: vec![
+                "/tmp $ ls".into(),
+                "README.md".into(),
+                "/tmp $ clear".into(),
+            ],
+        }
+    );
+    round_trip(&result);
+}
+
+/// The compatibility matrix's "old server → new client" row: a
+/// response minted before `tab.dump` grew history carries neither new
+/// field, and a client built against the new shape must still read it.
+#[test]
+fn a_pre_scrollback_tab_dump_result_still_decodes() {
+    let result: TabDumpResult = serde_json::from_str(
+        r#"{"cols":80,"rows":24,"cursor":{"row":2,"col":0,"visible":true},
+            "rows_text":["/tmp $ echo hi","hi"]}"#,
+    )
+    .expect("a pre-scrollback response must decode");
+    assert_eq!(result.scrollback_rows, 0);
+    assert!(result.scrollback_text.is_empty());
+}
+
+/// The strict-struct half of the same matrix, and the sharper one:
+/// `TabDumpParams` is `deny_unknown_fields`, so a viewport-only dump
+/// must not put the key on the wire at all or an older server rejects
+/// the whole request.
+#[test]
+fn tab_dump_params_omit_an_unset_scrollback() {
+    let viewport_only = TabDumpParams {
+        tab_id: WireTabRef::Local(5),
+        scrollback: 0,
+    };
+    assert_eq!(
+        serde_json::to_string(&viewport_only).unwrap(),
+        r#"{"tab_id":"5"}"#
+    );
+    round_trip(&viewport_only);
+
+    let with_history = TabDumpParams {
+        tab_id: WireTabRef::Local(5),
+        scrollback: 50,
+    };
+    assert_eq!(
+        serde_json::to_string(&with_history).unwrap(),
+        r#"{"tab_id":"5","scrollback":50}"#
+    );
+    round_trip(&with_history);
+
+    let decoded: TabDumpParams = serde_json::from_str(r#"{"tab_id":"5"}"#).unwrap();
+    assert_eq!(decoded.scrollback, 0);
 }
 
 #[test]

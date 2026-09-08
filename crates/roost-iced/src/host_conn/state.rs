@@ -3,18 +3,25 @@
 //!
 //! Pure: no sockets, no clock, no randomness. The retry delay takes its
 //! jitter as an argument and the transitions are ordinary method calls,
-//! so every rule below — a build mismatch is terminal, a takeover is
-//! terminal, only localhost auto-retries, the backoff caps — is a unit
-//! test rather than a timing experiment.
+//! so every rule below — a build skew a session cannot serve `vt` for
+//! is terminal, a takeover is terminal, only localhost auto-retries,
+//! the backoff caps — is a unit test rather than a timing experiment.
 
 use std::time::Duration;
 
 use roost_ipc::messages::{AttachPayloadKind, SessionIdentify, SESSION_PROTOCOL_VERSION};
 use roost_ui_model::keys::HostId;
 
-/// The payload kind the client can actually decode. A session that
-/// cannot offer it has nothing to hand us, whatever else it supports.
-pub(crate) const REQUIRED_PAYLOAD_KIND: &str = AttachPayloadKind::GHOSTTY_SNAPSHOT;
+/// The payload kinds this client can decode, in the order it offers
+/// them to `tab.attach`. A session that advertises none of them has
+/// nothing to hand us, whatever else it supports.
+///
+/// `ghostty-snapshot` leads because it carries what `vt` cannot (the
+/// inactive screen, soft-wrap flags, per-cell hyperlinks); `vt` is the
+/// build-independent fallback. Which one an attach lands on is the
+/// server's to negotiate — this list is only what may be asked for.
+pub(crate) const CLIENT_PAYLOAD_KINDS: [&str; 2] =
+    [AttachPayloadKind::GHOSTTY_SNAPSHOT, AttachPayloadKind::VT];
 
 /// First retry delay after a mid-session drop.
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
@@ -34,11 +41,28 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 pub(crate) enum MismatchKind {
     /// `session_protocol` is not [`SESSION_PROTOCOL_VERSION`].
     Protocol,
-    /// `payload_kinds` does not contain [`REQUIRED_PAYLOAD_KIND`].
+    /// `payload_kinds` contains none of [`CLIENT_PAYLOAD_KINDS`].
     PayloadKind,
-    /// `libghostty_build` differs. Two libghostty builds that disagree
-    /// cannot exchange a snapshot — the upgrade flow's common case.
+    /// `libghostty_build` differs **and** the session cannot serve `vt`
+    /// — a session older than the fallback, whose only payload is a
+    /// snapshot the two builds cannot exchange.
     Build,
+}
+
+/// What the gate found when it did not refuse.
+///
+/// It reports the *fact* it established, not a decision: which kind an
+/// attach ends up on is `tab.attach`'s to negotiate, per attach, and
+/// nothing here predicts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Compatibility {
+    /// Protocol and libghostty build both match.
+    Exact,
+    /// The two libghostty builds disagree, and the session serves the
+    /// build-independent `vt` payload. Connecting is fine; what a `vt`
+    /// payload carries is a documented subset of a terminal, so the
+    /// caller says so once, out loud.
+    BuildSkew,
 }
 
 /// How a saved host is reached — the one structural fact both the
@@ -90,6 +114,15 @@ pub(crate) enum RestartAction {
     /// Reached over `ssh`, so an update *can* be offered — whether a
     /// matching build actually exists to install is resolved when the
     /// user confirms, not now.
+    ///
+    /// **What a build skew no longer reaches.** This offer is raised
+    /// only from `NeedsRestart`, and a session that serves `vt` never
+    /// gets there: the host connects on the fallback instead. So a
+    /// remote ssh session on an older libghostty has no in-app path to
+    /// be updated any more — `roostctl session stop` over ssh and a
+    /// fresh Connect is the manual one — until an on-demand
+    /// restart/update action exists that does not need a terminal state
+    /// to hang off. Accepted deliberately: connecting beats refusing.
     OfferRemoteUpdate,
     /// A remote Unix-socket target: somebody else's process, with no
     /// transport this client could reach the binary over.
@@ -117,13 +150,13 @@ pub(crate) struct BuildMismatch {
 
 /// Run the compatibility gate against a `session.identify` reply.
 ///
-/// `Ok(())` means every negotiation this client depends on holds; the
-/// error is what the `NeedsRestart` state carries.
+/// `Ok` means every negotiation this client depends on holds; the error
+/// is what the `NeedsRestart` state carries.
 pub(crate) fn check_compatibility(
     identity: &SessionIdentify,
     client_build: &str,
     restart: RestartAction,
-) -> Result<(), BuildMismatch> {
+) -> Result<Compatibility, BuildMismatch> {
     let mismatch = |kind| BuildMismatch {
         kind,
         session_protocol: identity.session_protocol,
@@ -138,22 +171,27 @@ pub(crate) fn check_compatibility(
         restart,
     };
 
+    let serves = |wanted: &str| identity.payload_kinds.iter().any(|kind| kind.0 == wanted);
+
     if identity.session_protocol != SESSION_PROTOCOL_VERSION {
         return Err(mismatch(MismatchKind::Protocol));
     }
-    if !identity
-        .payload_kinds
-        .iter()
-        .any(|kind| kind.0 == REQUIRED_PAYLOAD_KIND)
-    {
+    if !CLIENT_PAYLOAD_KINDS.iter().any(|kind| serves(kind)) {
         return Err(mismatch(MismatchKind::PayloadKind));
     }
     // Exact string match, per `ipc.md` #sessionidentify — a prefix or a
     // "close enough" comparison is how a corrupt screen ships.
     if identity.libghostty_build != client_build {
-        return Err(mismatch(MismatchKind::Build));
+        // `vt` is a byte stream any VT parser replays, so a session that
+        // serves it can be attached to across a build skew — the gate
+        // refuses only a session too old to have it, where a snapshot
+        // the two builds cannot exchange is all there ever was.
+        if !serves(AttachPayloadKind::VT) {
+            return Err(mismatch(MismatchKind::Build));
+        }
+        return Ok(Compatibility::BuildSkew);
     }
-    Ok(())
+    Ok(Compatibility::Exact)
 }
 
 /// Why a host is showing as disconnected, and whether anything is
@@ -496,7 +534,7 @@ mod tests {
             client_protocol: SESSION_PROTOCOL_VERSION,
             session_build: "gb-old".into(),
             client_build: "gb-1".into(),
-            session_payload_kinds: vec![REQUIRED_PAYLOAD_KIND.to_string()],
+            session_payload_kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.to_string()],
             restart: RestartAction::RestartLocal,
         });
         let cases = [
@@ -544,7 +582,7 @@ mod tests {
         let ok = identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-1");
         assert_eq!(
             check_compatibility(&ok, "gb-1", RestartAction::RestartLocal),
-            Ok(())
+            Ok(Compatibility::Exact)
         );
         // An extra kind the client does not know is not a refusal — the
         // list is open by contract.
@@ -555,7 +593,46 @@ mod tests {
         );
         assert_eq!(
             check_compatibility(&extra, "gb-1", RestartAction::RestartLocal),
-            Ok(())
+            Ok(Compatibility::Exact)
+        );
+        // And neither is a session that serves only `vt` — one kind this
+        // client can decode is the whole requirement. The gate does not
+        // predict which one `tab.attach` will land on.
+        let vt_only = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-1");
+        assert_eq!(
+            check_compatibility(&vt_only, "gb-1", RestartAction::RestartLocal),
+            Ok(Compatibility::Exact)
+        );
+    }
+
+    /// The upgrade trap, answered: two libghostty builds that disagree
+    /// still connect, because `vt` is not a build-coupled payload. The
+    /// gate reports the skew so the connection can say so; it stays a
+    /// connection.
+    #[test]
+    fn a_build_skew_a_session_can_serve_vt_for_connects() {
+        let skewed = identity(
+            SESSION_PROTOCOL_VERSION,
+            &["ghostty-snapshot", "vt"],
+            "gb-old",
+        );
+        assert_eq!(
+            check_compatibility(&skewed, "gb-new", RestartAction::RestartLocal),
+            Ok(Compatibility::BuildSkew)
+        );
+    }
+
+    /// A session from before `vt` existed has only the build-coupled
+    /// payload, so the same skew is terminal there — the pre-R3 daemon
+    /// the restart flow is still for.
+    #[test]
+    fn a_build_skew_without_vt_is_still_terminal() {
+        let pre_vt = identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-old");
+        assert_eq!(
+            check_compatibility(&pre_vt, "gb-new", RestartAction::RestartLocal)
+                .unwrap_err()
+                .kind,
+            MismatchKind::Build
         );
     }
 
@@ -569,7 +646,7 @@ mod tests {
             MismatchKind::Protocol
         );
 
-        let no_kind = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-1");
+        let no_kind = identity(SESSION_PROTOCOL_VERSION, &["sixel-mosaic"], "gb-1");
         assert_eq!(
             check_compatibility(&no_kind, "gb-1", RestartAction::RestartLocal)
                 .unwrap_err()
@@ -635,6 +712,8 @@ mod tests {
         );
     }
 
+    /// The fixture is a session from before `vt` — the one build skew
+    /// that still reaches this state at all.
     #[test]
     fn a_build_mismatch_is_terminal_and_carries_its_details() {
         let mut machine = HostStateMachine::new(true);

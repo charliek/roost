@@ -144,9 +144,11 @@ mod snapshot;
 mod terminal;
 #[cfg(feature = "ffi")]
 mod tracked_ref;
+#[cfg(feature = "ffi")]
+mod vt_dump;
 
 #[cfg(feature = "ffi")]
-pub use formatter::UNWRAP_SOFT_WRAPPED_LINES;
+pub use formatter::{scrollback_rows, scrollback_text, UNWRAP_SOFT_WRAPPED_LINES};
 #[cfg(feature = "ffi")]
 pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
 #[cfg(feature = "ffi")]
@@ -170,10 +172,13 @@ pub use snapshot::{
 };
 #[cfg(feature = "ffi")]
 pub use terminal::{
-    ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Scrollbar, Terminal, TerminalOptions,
+    ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Scrollbar, Terminal, TerminalColor,
+    TerminalOptions,
 };
 #[cfg(feature = "ffi")]
 pub use tracked_ref::TrackedRef;
+#[cfg(feature = "ffi")]
+pub use vt_dump::{vt_carryable, vt_snapshot};
 
 /// Human-readable build identifier combining the pinned libghostty-vt
 /// commit (`third_party/ghostty/build.sh`'s `GHOSTTY_SHA`, captured at

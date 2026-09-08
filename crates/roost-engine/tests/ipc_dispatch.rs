@@ -1144,3 +1144,165 @@ async fn connect_with_retry(socket_path: &std::path::Path) -> IpcClient {
         last_err
     );
 }
+
+/// Plan 053 R4: the UI socket serves the same `tab.dump` contract the
+/// session socket does. The app's own reader is out of reach here — it
+/// lives in the iced binary — so this pins the two halves the dispatcher
+/// owns: the clamp the app is handed, and the history it hands back
+/// reaching the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tab_dump_clamps_the_scrollback_ask_and_returns_what_the_ui_read() {
+    use roost_engine::ipc::{DumpData, UiRequest};
+    use roost_ipc::messages::{TabDumpResult, MAX_DUMP_SCROLLBACK};
+
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = IpcHandler::new(
+        Arc::new(Workspace::new()),
+        Arc::new(PtySupervisor::new()),
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    )
+    .with_ui(ui_tx);
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Stand in for the app's main thread: record the count it was asked
+    // for and answer with a history whose size is that count, so the
+    // reply reports what crossed the seam.
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let recorder = Arc::clone(&asked);
+    tokio::spawn(async move {
+        while let Some(request) = ui_rx.recv().await {
+            if let UiRequest::Dump {
+                scrollback, reply, ..
+            } = request
+            {
+                recorder.lock().unwrap().push(scrollback);
+                let _ = reply.send(Ok(DumpData {
+                    cols: 80,
+                    rows: 2,
+                    cursor: None,
+                    rows_text: vec!["viewport".into(), String::new()],
+                    scrollback_rows: 7,
+                    scrollback_text: (0..scrollback).map(|i| format!("history-{i}")).collect(),
+                }));
+            }
+        }
+    });
+
+    let mut client = connect_with_retry(&server_socket).await;
+
+    let plain: TabDumpResult = client
+        .call(ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+        .await
+        .expect("tab.dump");
+    assert_eq!(plain.rows_text, vec!["viewport".to_string(), String::new()]);
+    assert_eq!(
+        plain.scrollback_rows, 7,
+        "the count the UI reported must reach the wire even when none was asked for"
+    );
+    assert!(plain.scrollback_text.is_empty());
+
+    let asked_for: TabDumpResult = client
+        .call(
+            ops::TAB_DUMP,
+            serde_json::json!({"tab_id": "7", "scrollback": 3}),
+        )
+        .await
+        .expect("tab.dump");
+    assert_eq!(
+        asked_for.scrollback_text,
+        vec!["history-0", "history-1", "history-2"],
+        "the history the UI read must reach the wire unmodified"
+    );
+
+    let clamped: TabDumpResult = client
+        .call(
+            ops::TAB_DUMP,
+            serde_json::json!({"tab_id": "7", "scrollback": u64::from(MAX_DUMP_SCROLLBACK) * 4}),
+        )
+        .await
+        .expect("an oversized scrollback ask is clamped, not refused");
+    assert_eq!(clamped.scrollback_text.len(), MAX_DUMP_SCROLLBACK as usize);
+
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec![0, 3, MAX_DUMP_SCROLLBACK],
+        "the app is never handed a count above the maximum"
+    );
+}
+
+/// Plan 053 §3.5: a failing history read is surfaced as `internal` —
+/// never as empty history or `not-found`. The session socket already
+/// answers that (`TabError::Render`); this pins the UI socket to the
+/// same two codes for the same two conditions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tab_dump_tells_a_missing_tab_apart_from_a_failed_read() {
+    use roost_engine::ipc::{DumpError, UiRequest};
+
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = IpcHandler::new(
+        Arc::new(Workspace::new()),
+        Arc::new(PtySupervisor::new()),
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    )
+    .with_ui(ui_tx);
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Stand in for the app's main thread: tab 7 is not in its keyed map,
+    // tab 8 is right there but reading its terminal fails.
+    tokio::spawn(async move {
+        while let Some(request) = ui_rx.recv().await {
+            if let UiRequest::Dump { tab_id, reply, .. } = request {
+                let _ = reply.send(Err(if tab_id.local() == Some(7) {
+                    DumpError::NoTab(format!("tab {tab_id} has no live terminal"))
+                } else {
+                    DumpError::Read("read scrollback rows: vt error".into())
+                }));
+            }
+        }
+    });
+
+    let mut client = connect_with_retry(&server_socket).await;
+
+    let missing = client
+        .call_raw(ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+        .await
+        .expect_err("a dump for a tab the UI does not have must be refused");
+    assert_eq!(
+        code(&missing),
+        "not-found",
+        "a tab the UI never had is still the client's mistake"
+    );
+
+    let failed = client
+        .call_raw(ops::TAB_DUMP, serde_json::json!({"tab_id": "8"}))
+        .await
+        .expect_err("a dump whose reader failed must be refused");
+    assert_eq!(
+        code(&failed),
+        "internal",
+        "a read that failed on a tab that is right there is the server's own problem"
+    );
+    let roost_ipc::ClientError::Server { message, .. } = &failed else {
+        unreachable!()
+    };
+    assert!(
+        message.contains("read scrollback rows"),
+        "the reader's own words must survive the mapping: {message}"
+    );
+}
