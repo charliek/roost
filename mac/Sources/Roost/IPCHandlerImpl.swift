@@ -454,14 +454,24 @@ actor IPCHandlerImpl: IPCHandler {
     @MainActor
     private func tabDump(params: AnyCodable?) async throws -> IPCTabDumpResult {
         let p = try decodeParams(
-            params, as: IPCTabDumpParams.self, expected: ["tab_id"]
+            params, as: IPCTabDumpParams.self, expected: ["tab_id", "scrollback"]
         )
         // Reach the running UI through the one registered bridge (the
         // handler is already on the main actor).
         guard let ui = RoostBackend.shared.ui else {
             throw IPCHandlerError.internalError("no UI to read terminal")
         }
-        guard let dump = ui.dumpTab(tabID: p.tabID) else {
+        let dumped: TerminalView.Dump?
+        do {
+            dumped = try ui.dumpTab(
+                tabID: p.tabID, scrollback: min(p.scrollback, maxDumpScrollback)
+            )
+        } catch {
+            // The tab is right there; reading its terminal failed. Not
+            // `not-found` — see `UiBridge.dumpTab`.
+            throw IPCHandlerError.internalError("tab \(p.tabID) dump failed: \(error)")
+        }
+        guard let dump = dumped else {
             throw IPCHandlerError(
                 code: "not-found",
                 message: "tab \(p.tabID) has no live terminal"
@@ -473,7 +483,9 @@ actor IPCHandlerImpl: IPCHandler {
             cursor: dump.cursor.map {
                 IPCTabDumpCursor(row: $0.row, col: $0.col, visible: $0.visible)
             },
-            rowsText: dump.rowsText
+            rowsText: dump.rowsText,
+            scrollbackRows: dump.scrollbackRows,
+            scrollbackText: dump.scrollbackText
         )
     }
 
@@ -717,7 +729,7 @@ actor IPCHandlerImpl: IPCHandler {
         // `drain=true` contract where two back-to-back calls
         // produce a non-empty + empty response.
         guard let ui = RoostBackend.shared.ui,
-              ui.dumpTab(tabID: p.tabID) != nil
+              (try? ui.dumpTab(tabID: p.tabID, scrollback: 0)) != nil
         else {
             throw IPCHandlerError(
                 code: "not-found",
@@ -1572,9 +1584,34 @@ private struct IPCTabFocusResult: Codable {
     }
 }
 
+/// The most history rows one `tab.dump` may ask for. A larger request is
+/// **clamped, never refused**, so a client can ask for "everything"
+/// without knowing the tab's retention. A maximum exists at all because
+/// a dump is a synchronous read of a live terminal: the rows are
+/// formatted on the thread that owns it, so an unbounded ask would stall
+/// that terminal's rendering and input for the duration. Twin of the
+/// Rust `MAX_DUMP_SCROLLBACK`.
+private let maxDumpScrollback: UInt32 = 10_000
+
 private struct IPCTabDumpParams: Codable {
-    @StringInt64 var tabID: Int64
-    enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
+    let tabID: Int64
+    /// Omitted by every client that predates the key, so it decodes as
+    /// `0` — a viewport-only dump, exactly what those clients got before.
+    let scrollback: UInt32
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case scrollback
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.tabID = try decodeStringInt64(c, .tabID)
+        self.scrollback = try c.decodeIfPresent(UInt32.self, forKey: .scrollback) ?? 0
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(String(tabID), forKey: .tabID)
+        try c.encode(scrollback, forKey: .scrollback)
+    }
 }
 
 /// Cursor position inside a dumped viewport. Plain JSON numbers (not
@@ -1591,11 +1628,33 @@ private struct IPCTabDumpResult: Codable {
     let rows: Int
     let cursor: IPCTabDumpCursor?
     let rowsText: [String]
+    /// How many history rows sit above the **current viewport** — the
+    /// one `rows_text` shows — so the two halves stay adjacent however
+    /// far the terminal is scrolled up.
+    let scrollbackRows: Int
+    /// The last `min(requested, scrollback_rows)` of those rows, top to
+    /// bottom, its final entry the row immediately above `rows_text[0]`.
+    /// Omitted when empty, matching the Rust
+    /// `skip_serializing_if = "Vec::is_empty"`.
+    let scrollbackText: [String]
     enum CodingKeys: String, CodingKey {
         case cols
         case rows
         case cursor
         case rowsText = "rows_text"
+        case scrollbackRows = "scrollback_rows"
+        case scrollbackText = "scrollback_text"
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(cols, forKey: .cols)
+        try c.encode(rows, forKey: .rows)
+        try c.encodeIfPresent(cursor, forKey: .cursor)
+        try c.encode(rowsText, forKey: .rowsText)
+        try c.encode(scrollbackRows, forKey: .scrollbackRows)
+        if !scrollbackText.isEmpty {
+            try c.encode(scrollbackText, forKey: .scrollbackText)
+        }
     }
 }
 

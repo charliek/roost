@@ -52,9 +52,16 @@ protocol UiBridge: AnyObject {
     func sidebarDump() -> (
         agentsVisible: Bool, projects: [(projectID: Int64, agents: [RenderedAgentRow])]
     )
-    /// Read a tab's terminal viewport as text (`tab.dump`); `nil` when
-    /// no live tab holds that id.
-    func dumpTab(tabID: Int64) -> TerminalView.Dump?
+    /// Read a tab's terminal viewport as text plus `scrollback` rows of
+    /// history above it (`tab.dump`); `nil` when no live tab holds that
+    /// id.
+    ///
+    /// Optional *and* throwing because the op answers two different
+    /// codes: a tab the UI does not have is `not-found`, a terminal read
+    /// that failed is `internal`. Folding the second onto the first
+    /// would tell the client "that tab is gone" about a tab that is
+    /// right there. Twin of the Rust `DumpError`.
+    func dumpTab(tabID: Int64, scrollback: UInt32) throws -> TerminalView.Dump?
 
     // Command-palette drive surface (`palette.*` ops). iced's
     // equivalent is the `UiRequest::Palette*` arms. Each returns the
