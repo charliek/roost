@@ -62,7 +62,7 @@ release workflow asserts they agree).
   identically on a host session's socket, a UI socket, and by both the
   Linux and macOS UIs; a session advertises it as `tab_dump_scrollback`
   in `session.identify.features`. No protocol bump — but the request
-  key is new, so a Roost or session predating it answers `invalid-param`
+  key is new, so a Roost or session predating it answers `unknown-field`
   to the flag rather than quietly ignoring it.
 - **`events.subscribe` can resume instead of re-snapshotting (#422)** — a
   phone dropping in and out of a flaky link used to pay a `tab.list`

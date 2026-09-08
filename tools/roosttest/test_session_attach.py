@@ -544,7 +544,7 @@ def test_a_matching_client_still_gets_ghostsnp_and_can_ask_for_vt(env):
             identity["payload_kinds"]
         )
         # R4's op parameter is feature-detected, not probed for with an
-        # `invalid-param` — same channel, asserted where the kinds are.
+        # `unknown-field` — same channel, asserted where the kinds are.
         assert "tab_dump_scrollback" in identity["features"], identity["features"]
 
         lease = connect_lease(client)

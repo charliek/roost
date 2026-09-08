@@ -1845,7 +1845,7 @@ pub const SESSION_PROTOCOL_VERSION: u32 = 4;
 /// [`EventsSubscribeParams::from_revision`] and `tab_dump_scrollback` is
 /// [`TabDumpParams::scrollback`]: both are additive *parameters* on ops
 /// every generation already serves, listed so a client can
-/// feature-detect them instead of probing for the `invalid-param` an
+/// feature-detect them instead of probing for the `unknown-field` an
 /// older server answers.
 pub const SESSION_FEATURES: &[&str] = &["put_file", "events_resume", "tab_dump_scrollback"];
 

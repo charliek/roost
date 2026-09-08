@@ -501,7 +501,7 @@ color fields can be added forward-compatibly. CLI:
 `0` (the default) meaning none. It is **omitted from the request when
 unset**, so a viewport-only ask stays byte-identical to what clients
 have always sent — which matters because `TabDumpParams` is strict: a
-server predating the key refuses the whole request with `invalid-param`
+server predating the key refuses the whole request with `unknown-field`
 rather than ignoring the field. Ask for more than
 `MAX_DUMP_SCROLLBACK` (10 000) and the count is **clamped, never
 refused**, so a client can ask for "everything" without knowing the
@@ -532,7 +532,7 @@ render snapshot before reading either, rather than straddling a PTY
 chunk. A session socket advertises the capability as
 `tab_dump_scrollback` in
 [`session.identify.features`](#sessionidentify), so a client
-feature-detects instead of probing for `invalid-param`. CLI:
+feature-detects instead of probing for `unknown-field`. CLI:
 `roostctl tab dump --tab N --scrollback 50`.
 
 On a **host-session socket** this is answered from the tab's server
@@ -564,7 +564,7 @@ resolver-walk regression op for #142. (The only theme-derived input to
 the resolver is the default fg/bg pair; no `bold-color` accent is
 applied today, on either socket.) Viewport only — it takes no
 `scrollback` param, and its params are strict, so passing one is
-`invalid-param`.
+`unknown-field`.
 
 Request: `{"params": {"tab_id": "3"}}`.
 Response (truncated):

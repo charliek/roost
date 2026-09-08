@@ -728,9 +728,19 @@ actor IPCHandlerImpl: IPCHandler {
         // empty bytes, not `not-found`. This matches the
         // `drain=true` contract where two back-to-back calls
         // produce a non-empty + empty response.
-        guard let ui = RoostBackend.shared.ui,
-              (try? ui.dumpTab(tabID: p.tabID, scrollback: 0)) != nil
-        else {
+        let probe: TerminalView.Dump?
+        if let ui = RoostBackend.shared.ui {
+            do {
+                probe = try ui.dumpTab(tabID: p.tabID, scrollback: 0)
+            } catch {
+                throw IPCHandlerError.internalError(
+                    "tab \(p.tabID) existence probe failed: \(error)"
+                )
+            }
+        } else {
+            probe = nil
+        }
+        guard probe != nil else {
             throw IPCHandlerError(
                 code: "not-found",
                 message: "tab \(p.tabID) has no live terminal"
