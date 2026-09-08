@@ -6573,20 +6573,58 @@ mod tests {
         p
     }
 
-    /// Conservative stand-in for Python-Markdown's toc slugify: lowercase,
-    /// spaces to hyphens, drop everything that isn't alphanumeric / `-` /
-    /// `_`. Every target below is a plain ASCII heading precisely so the
-    /// two agree.
+    /// Stand-in for Python-Markdown's toc slugify: lowercase, drop what
+    /// is neither alphanumeric nor `-`/`_`/whitespace, then collapse each
+    /// run of hyphens and whitespace into **one** hyphen.
+    ///
+    /// The collapse is what the generator does and what the old version
+    /// here did not: `### \`session autostart install\` / \`uninstall\``
+    /// leaves two gaps where the backticks and the slash were, and the
+    /// published anchor carries one hyphen for both. Without it this
+    /// helper rejects a correct anchor, so a doc link could not be added
+    /// to any heading carrying punctuation.
     fn slugify(heading: &str) -> String {
         let mut out = String::new();
+        let mut pending = false;
         for c in heading.trim().to_lowercase().chars() {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
+            if c.is_alphanumeric() || c == '_' {
+                if pending && !out.is_empty() {
+                    out.push('-');
+                }
+                pending = false;
                 out.push(c);
-            } else if c == ' ' {
-                out.push('-');
+            } else if c == '-' || c.is_whitespace() {
+                pending = true;
             }
         }
         out
+    }
+
+    /// The anchor one heading actually publishes. `attr_list` is on (see
+    /// `zensical.toml`), so a **trailing** brace group is consumed by the
+    /// generator rather than slugified: an `#id` in it *is* the anchor —
+    /// which is how `docs/guides/host-sessions.md` keeps a short, stable
+    /// `#surviving-reboots-launchd` under a longer title — and a group
+    /// carrying no `#id` still disappears from the text the anchor is
+    /// slugified from.
+    ///
+    /// Two details, both checked against `python-markdown` itself rather
+    /// than its prose: the `:` in `{: #id }` is **optional** (`{#id}` and
+    /// `{ #id }` publish the same anchor), and only a trailing group
+    /// counts — the generator slugifies the braces verbatim when anything
+    /// follows the `}`.
+    fn anchor_of(heading: &str) -> String {
+        let trimmed = heading.trim_end();
+        let Some((text, attrs)) = trimmed
+            .strip_suffix('}')
+            .and_then(|rest| rest.rsplit_once('{'))
+        else {
+            return slugify(heading);
+        };
+        attrs
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('#'))
+            .map_or_else(|| slugify(text), str::to_string)
     }
 
     /// Markdown headings only — `#` inside a fenced code block is a shell
@@ -6674,7 +6712,7 @@ mod tests {
             );
             let found = headings(&body)
                 .into_iter()
-                .any(|h| slugify(h) == target.anchor);
+                .any(|h| anchor_of(h) == target.anchor);
             assert!(
                 found,
                 "no heading in {rel} slugifies to `{}`",
@@ -6689,6 +6727,34 @@ mod tests {
     fn the_doc_anchor_helpers_reject_near_misses() {
         let body = "# Real\n\n```bash\n# 1. Allow it as a login shell\n```\n\n## Also Real\n";
         assert_eq!(headings(body), vec![" Real", " Also Real"]);
+
+        // Dropped punctuation leaves one hyphen, not one per gap — the
+        // anchor `docs/reference/cli.md` actually publishes for its
+        // autostart heading, and what the old slugify got wrong.
+        assert_eq!(
+            anchor_of(" `session autostart install` / `uninstall`"),
+            "session-autostart-install-uninstall"
+        );
+        // A trailing `attr_list` id wins over the heading text.
+        assert_eq!(
+            anchor_of(" Surviving reboots and logouts {: #surviving-reboots-launchd }"),
+            "surviving-reboots-launchd"
+        );
+        assert_eq!(anchor_of(" How it loads"), "how-it-loads");
+        // An attribute list the generator would not honour, because
+        // something follows it, is not an anchor either.
+        assert_eq!(
+            anchor_of(" Surviving reboots {: #ghost } and logouts"),
+            "surviving-reboots-ghost-and-logouts"
+        );
+        // The `:` is optional in `attr_list`'s own grammar, so all three
+        // spellings publish the same anchor.
+        assert_eq!(anchor_of(" Title {#nocolon}"), "nocolon");
+        assert_eq!(anchor_of(" Title { #spaced }"), "spaced");
+        assert_eq!(anchor_of(" Title {: #withcolon }"), "withcolon");
+        // A trailing group carrying no id is still consumed by the
+        // generator, so it is not part of what the anchor slugifies from.
+        assert_eq!(anchor_of(" Plain {not an attr list}"), "plain");
 
         let nav = "  { \"CLI\" = \"reference/cli.md\" },\n  # { \"Queries\" = \"reference/terminal-queries.md\" },\n";
         assert!(nav_lists(nav, "reference/cli.md"));
