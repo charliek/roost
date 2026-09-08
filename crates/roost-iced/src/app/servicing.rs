@@ -4995,7 +4995,7 @@ mod tests {
             said,
             vec![
                 "one is attached at reduced fidelity: links, the alternate screen and soft \
-                 wrapping are off until its roost-session is updated."
+                 wrapping are off until it runs a matching build."
                     .to_string()
             ],
             "four frames, one sentence"

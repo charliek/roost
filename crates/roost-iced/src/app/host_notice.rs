@@ -315,7 +315,7 @@ pub(super) fn fidelity_chrome(action: FidelityAction, label: &str) -> FidelityCh
 pub(super) fn fidelity_sentence(label: &str) -> String {
     format!(
         "{label} is attached at reduced fidelity: links, the alternate screen and soft \
-         wrapping are off until its roost-session is updated."
+         wrapping are off until it runs a matching build."
     )
 }
 
@@ -822,7 +822,7 @@ mod tests {
         assert_eq!(
             said,
             "pop-os is attached at reduced fidelity: links, the alternate screen and soft \
-             wrapping are off until its roost-session is updated."
+             wrapping are off until it runs a matching build."
         );
     }
 }
