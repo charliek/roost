@@ -445,42 +445,94 @@ behalf. `install` never interrupts a session that's already running;
 ```bash
 roostctl session autostart install
 roostctl session autostart install --force
+roostctl session autostart install --linger
 roostctl session autostart uninstall
 ```
 
+| Flag | Effect |
+|---|---|
+| `--force` | Replace a file at the artifact path that this `roostctl` did not write (a **foreign** file, or one written by a **newer** `roostctl` — see the format matrix below). The previous contents are echoed to stderr first, so nothing is silently lost. |
+| `--linger` | Linux only: also run `loginctl enable-linger`, so the session comes back at **boot**, not just at the next login. Refused on macOS — see below — because launchd has no equivalent. |
+
+**One naming rule, both platforms.** The artifact's stem is this
+build's session profile — `roost-session` for a release build,
+`roost-session-dev` for a debug one, the same string the session's
+socket and state directories already use — and one rule derives
+everything else from it: the systemd unit name is `<stem>.service`, the
+launchd label is `ai.stridelabs.<stem>`, and the plist file is
+`<label>.plist`. A debug build and a release build therefore own
+**different artifacts**, never the same file, exactly as they already
+own different sockets — installing from a dev checkout can never
+silently repoint a release install's unit (or vice versa).
+
 **What it writes, and where.**
 
-| Platform | Path | Contents |
+| Platform | Build | Path | Label / unit |
+|---|---|---|---|
+| Linux | release | `$XDG_CONFIG_HOME/systemd/user/roost-session.service` (default `~/.config/systemd/user/`), mode `0644` | `roost-session.service` |
+| Linux | debug | `$XDG_CONFIG_HOME/systemd/user/roost-session-dev.service`, mode `0644` | `roost-session-dev.service` |
+| macOS | release | `~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`, mode `0644` | `ai.stridelabs.roost-session` |
+| macOS | debug | `~/Library/LaunchAgents/ai.stridelabs.roost-session-dev.plist`, mode `0644` | `ai.stridelabs.roost-session-dev` |
+
+Contents, either profile: `Type=simple`, `WorkingDirectory=%h`,
+`ExecStart="<resolved binary>" start --foreground`, `Restart=on-failure`,
+`KillMode=mixed` on Linux; `ProgramArguments [<resolved binary>, start,
+--foreground]`, `RunAtLoad true`, `KeepAlive {SuccessfulExit: false}`,
+`WorkingDirectory <home>` on macOS. The binary is resolved with the same
+ladder `session start` uses (`ROOST_SESSION_BIN` → sibling of `roostctl`
+→ `PATH`), made absolute but never resolved through a symlink (a
+packaged `/usr/bin/roost-session` is written as itself, not as the
+versioned build it happens to point at), and printed on every install:
+`autostart: <artifact path> → <binary>`.
+
+**The artifact name follows the `roostctl` build — so `ROOST_SESSION_BIN`
+must name a binary of the same profile.** A debug `roostctl` pointed at
+a release `roost-session` would write `roost-session-dev.service` for a
+process that binds the *release* socket, and start that mismatched pair
+at every login; `install` cannot detect this cheaply, so it is a rule to
+follow, not a check it runs for you.
+
+**Ownership, the format generation, and `--force`.** Both files carry an
+explicit **ownership marker** as their first meaningful line — `#
+Written by roostctl session autostart (format 2). Reinstalling replaces
+this file.` (an XML comment of the same sentence in the plist) — and the
+number in it is a **template generation**, bumped only when
+`render_unit`/`render_plist` would write different bytes for the same
+inputs, never the app version (an app-version marker would call every
+release an "upgrade" for a template that never changed). A file is
+*ours* only if it carries a marker, our `Description`/`Label`, and an
+`ExecStart`/`ProgramArguments` ending in `start --foreground` — all
+three; a hand-edited copy of ours (an extra `Environment=` line, say)
+still reads as ours. What happens next depends on what generation it
+declares, relative to the generation this `roostctl` writes (currently
+2):
+
+| State | Without `--force` | With `--force` |
 |---|---|---|
-| Linux | `$XDG_CONFIG_HOME/systemd/user/roost-session.service` (default `~/.config/systemd/user/`), mode `0644` | `Type=simple`, `WorkingDirectory=%h`, `ExecStart="<resolved binary>" start --foreground`, `Restart=on-failure`, `KillMode=mixed` |
-| macOS | `~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`, mode `0644` | `Label ai.stridelabs.roost-session`, `ProgramArguments [<resolved binary>, start, --foreground]`, `RunAtLoad true`, `KeepAlive {SuccessfulExit: false}`, `WorkingDirectory <home>` |
+| **Foreign** (no marker, or the three-part check fails) — this deliberately includes an artifact hand-written from the launchd/systemd recipe text this guide used to show | Refused: `<path> was not written by roostctl; pass --force to replace it` | Replaced, old bytes echoed to stderr first |
+| **Outdated** (marker generation lower than this `roostctl`'s — a `#438`-era file with no `(format N)` at all parses as generation 1) | Rewritten anyway: `upgrading <path> from format 1 to format 2; previous contents follow` | Same — `--force` is not needed to move forward |
+| **Newer** (marker generation higher than this `roostctl`'s) | Refused: `<path> was written by a newer roostctl (format N; this one writes 2); pass --force to downgrade it` | Downgraded, old bytes echoed to stderr first |
+| **Unreadable** (not a regular file, or over the read cap) | Always refused: `cannot read <path>: <reason>` | Still refused — `--force` has nothing to compare against |
+| Identical bytes at the current generation | Kept, nothing written | — |
 
-Both files carry an explicit **ownership marker** as their first
-meaningful line — `# Written by roostctl session autostart. Reinstalling
-replaces this file.` (an XML comment of the same sentence in the plist) —
-which is what makes a re-`install` safe to overwrite: without it, a
-harmless-looking foreign file could be silently adopted. The binary is
-resolved with the same ladder `session start` uses
-(`ROOST_SESSION_BIN` → sibling of `roostctl` → `PATH`), made absolute
-but never resolved through a symlink (a packaged `/usr/bin/roost-session`
-is written as itself, not as the versioned build it happens to point
-at), and printed on every install: `autostart: <artifact path> →
-<binary>` — the artifact's name is fixed across build profiles, so this
-line is your only signal that a debug binary is about to take a release
-install's slot, or vice versa.
+A Linux rewrite over a **loaded** unit runs `systemctl --user
+daemon-reload` before reporting the outcome, so the manager's cached
+definition is never left stale after an upgrade or a forced downgrade.
 
-**`--force` and "foreign file."** Before writing, `install` reads back
-whatever is already at the artifact path. A file is *ours* only if it
-carries the marker line, our `Description`/`Label`, and an `ExecStart`
-/ `ProgramArguments` ending in `start --foreground` — all three; a
-hand-edited copy of ours (an extra `Environment=` line, say) still reads
-as ours and is replaced, with the old bytes echoed to stderr first so
-nothing is silently lost. Anything else is **foreign** and is refused
-by name unless `--force` is given. This deliberately includes an
-artifact you or an earlier doc had you hand-write from the launchd/systemd
-recipe text this guide used to show — it carries no marker, so it reads
-as foreign and needs `--force` exactly once; after that install it's
-ours and every later re-`install` proceeds without the flag.
+**The other profile's slot.** If the *other* profile's artifact path
+also holds a file this `roostctl` recognizes as its own (any
+generation), both `install` and `uninstall` print one line to stderr
+naming it and the remedy, and otherwise leave it completely alone:
+
+```text
+note: the release-slot artifact also exists (/home/charlie/.config/systemd/user/roost-session.service → /usr/bin/roost-session) and is left alone; to remove it: systemctl --user disable --now roost-session.service && rm /home/charlie/.config/systemd/user/roost-session.service
+```
+
+(macOS names `launchctl bootout gui/<uid>/<label> && rm <path>` instead).
+This note never appears when the verb itself is refused (foreign/newer
+without `--force`, an unreadable file, the macOS `--linger` refusal) —
+nothing was decided about the caller's own slot, so nothing is said
+about the other one either.
 
 **Uninstall stops the supervised session.** Removing the supervisor
 artifact stops whatever it's running, on both platforms — `uninstall`
@@ -488,30 +540,78 @@ says so (`stopping the supervised session (…)`) before it does it. A
 session the supervisor isn't running (it may be running unsupervised, or
 not at all) is left untouched, and `uninstall` says that too. Running it
 when nothing is installed succeeds and says there was nothing to do.
+Uninstalling a **newer** artifact proceeds (removing is not a downgrade);
+uninstalling a **foreign** or **unreadable** one is still refused.
+
+**`--linger`.** Every `loginctl` invocation this verb makes carries
+`--no-ask-password`, so a polkit refusal (an inactive session, e.g. over
+SSH) is a deterministic stderr line rather than a password prompt in the
+middle of an install. On macOS `--linger` is refused before anything
+else — before the binary is even resolved — with:
+
+```text
+roostctl session autostart: --linger is a systemd-logind concept; a LaunchAgent
+starts at your next login and macOS has no equivalent (see the host-sessions guide)
+```
+
+On Linux, the flag grants lingering on every install that actually
+succeeds (`Unchanged`, `ReinstalledLoaded`, `SupervisedFresh`,
+`AlreadyRunningUntouched`) — including a bare re-`install --linger` with
+nothing else to write, which is the natural way to grant lingering after
+the fact — and is skipped on a refusal or a failed activation. Either
+way, on every completed Linux install (with or without the flag) the
+verb asks `loginctl show-user … --property=Linger` and prints the
+answer as the closing line:
+
+```text
+linger=yes
+linger=no (the unit starts at login, not at boot; rerun with --linger or run: loginctl enable-linger 1000)
+linger=unknown (Failed to look up user 1000: No such process)
+```
+
+`uninstall` never runs `loginctl disable-linger` — the grant is
+per-user and system-wide, and another unit may depend on it.
 
 **`session status` and the `autostart=` line.** `session status` now
 prints an `autostart=` line in **both** of its branches — the running
 one and the not-running (exit 3) one — because whether the next login
-brings a session back is exactly what a stopped one raises. It reads
-straight off the artifact file on disk, never off the supervisor:
+brings a session back is exactly what a stopped one raises. `installed
+on disk` is the whole claim: the line reads the artifact file and
+nothing else, never the supervisor:
 
 ```text
-autostart=installed (systemd --user roost-session.service → /usr/bin/roost-session)
-autostart=installed (launchd ai.stridelabs.roost-session → /Applications/Roost-Iced.app/Contents/MacOS/roost-session) (binary missing: /Applications/Roost-Iced.app/Contents/MacOS/roost-session)
 autostart=not installed
+autostart=installed on disk (systemd --user roost-session.service → /usr/bin/roost-session)
+autostart=installed on disk (systemd --user roost-session.service → /usr/bin/roost-session) (binary missing: /usr/bin/roost-session) (format 1, outdated: rerun roostctl session autostart install)
+autostart=installed on disk (systemd --user roost-session.service; format 7, newer than this roostctl)
 autostart=not installed (foreign file: not written by roostctl: /home/charlie/.config/systemd/user/roost-session.service)
+autostart=not installed (unreadable: /home/charlie/.config/systemd/user/roost-session.service: not a regular file)
 autostart=unavailable
 ```
 
 `(binary missing: <path>)` appears when the named binary is no longer an
-executable file; `(foreign file: …)` appears when something is at the
-path but isn't ours; `unavailable` is what a platform with no supervisor
-roost knows how to write reports. **`status` deliberately never queries
-the supervisor** — whether the unit is enabled, loaded, or active is not
-part of this line, on purpose: the artifact file is what roost owns and
-can answer for, and `systemctl --user status roost-session` / `launchctl
-print gui/<uid>/ai.stridelabs.roost-session` remain the authority on
-everything past that.
+executable file; `(format N, outdated: …)` and the `; format N, newer
+than this roostctl` form report a generation mismatch; `(foreign file:
+…)` appears when something is at the path but isn't ours;
+`(unreadable: …)` when the path exists but this process cannot safely
+read it (not a regular file, or over the read cap); `unavailable` is
+what a platform with no supervisor roost knows how to write reports.
+**`status` deliberately never queries the supervisor** — whether the
+unit is enabled, loaded, or active is not part of this line, on purpose:
+the artifact file is what roost owns and can answer for. `roostctl
+doctor`'s `session` section (below) is where "is it actually enabled,
+will it fire" is answered; `systemctl --user status roost-session` /
+`launchctl print gui/<uid>/ai.stridelabs.roost-session` remain the
+supervisor's own authority on everything past that.
+
+**Exit codes.** `install` exits 0 on `Unchanged` / `ReinstalledLoaded` /
+`SupervisedFresh` / `AlreadyRunningUntouched` with no `--linger` grant
+failure, and 1 on any refusal (foreign/newer without `--force`,
+unreadable, the macOS `--linger` refusal), an activation that never got
+confirmed (`ActivationUnconfirmed`), or a `--linger` grant that was
+asked for and failed. `uninstall` exits 0 when there was nothing to
+remove or the removal succeeded, and 1 on a refusal (foreign, unreadable)
+or a failure unloading/removing the file.
 
 ## `host` subcommands
 
@@ -560,10 +660,10 @@ roostctl doctor --color=always
 |---|---|---|---|
 | `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Read directly from the env var rather than clap's `env = "ROOST_TAB_ID"`, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of a silent clap exit 2 |
 | `--json` | flag | `false` | Machine-readable report |
-| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 39 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
+| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 45 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
-The report is six sections. Each declares one of three scopes: **process**
+The report is seven sections. Each declares one of three scopes: **process**
 (the shell/process that invoked doctor), **ui** (the Roost instance doctor
 reached), **tab** (the selected tab) — a *process* fact is never used to
 judge a *tab* fact unless the selected tab is doctor's own tab.
@@ -576,6 +676,7 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, and whether raw OSC 9/99/777 is currently suppressed. Those six are observations, not verdicts. |
 | `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse and register every lifecycle event Roost maps, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? Pre-046 checks, kept for the settings-file shape they've always covered — see the `agents` section below for the other four agents and for Claude's newer, agent-hooks-specific facts |
 | `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent Hooks](../guides/agents.md) guide |
+| `session` | process | Is the [`session autostart`](#session-autostart-install-uninstall) artifact installed, at the current format generation, and owned by this `roostctl`'s binary; will the supervisor actually start it at login (enabled, not masked, seen by the manager); is a supervised session running right now, or did its last start fail; does the *other* build profile have an artifact of its own sitting there too; is this user's session manager set to linger past logout? Everything here is read-only — no `enable`, `bootstrap`, or `enable-linger` runs from `doctor`, only status queries. See the [Host Sessions guide](../guides/host-sessions.md#surviving-reboots-launchd) |
 
 Every entry carries a stable `id` (`env.tab_id`, `ui.socket`,
 `shell.marks_capability`, `claude.hook_command`, …) and a `kind`: `check`
@@ -613,27 +714,37 @@ scannable in a narrow terminal:
 ```text
 roostctl doctor — roostctl 0.0.19 (run `roostctl doctor -v` for the full report)
 
-[–] Environment         not running inside a Roost tab
-[✗] Roost UI            /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket file ou…
-[–] Shell integration   not running inside a Roost tab
-[–] Selected tab        no tab selected — pass --tab, set ROOST_TAB_ID, or give the UI an active tab
-[–] Claude Code         the selected tab's ownership is unavailable (no tab.list from a running UI)
-[–] Agents              not running inside a Roost tab
+[–] Environment              not running inside a Roost tab
+[✗] Roost UI                 /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket fi…
+[–] Shell integration        not running inside a Roost tab
+[–] Selected tab             no tab selected — pass --tab, set ROOST_TAB_ID, or give the UI an acti…
+[–] Claude Code              the selected tab's ownership is unavailable (no tab.list from a runnin…
+[–] Agents                   not running inside a Roost tab
+[–] Host session autostart   not installed (opt-in: roostctl session autostart install)
 
 • 2 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
     ✗ ui.socket    → https://charliek.github.io/roost/reference/cli/#environment
     ✗ ui.identify  → https://charliek.github.io/roost/reference/cli/#identify
 ```
 
-Notice `Claude Code` and `Agents` read `skipped`/`–`, not `fail`, even
-though no UI is reachable: everything in the `agents` section that
-doesn't need a live tab (`wired`, `trust`, `legacy_settings`) is read
-straight off the agents' own config files on disk, so it still has
-something to say with nothing running — only the tab-scoped `owning`
-checks and `agent.hook_binary` (which needs to be inside a tab at all)
-come back `skipped` here.
+The title column widens to fit the longest section title present — here
+"Host session autostart" — which is why it and the truncation point of
+the longer detail lines above shift compared to a report with fewer or
+shorter section titles; the column math (`title_w`/`headline_w`) is
+derived from the actual titles, not hand-tuned per report.
 
-`-v` prints all 39 entries grouped by section, with the status column
+Notice `Claude Code`, `Agents`, and `Host session autostart` read
+`skipped`/`–`, not `fail`, even though no UI is reachable and nothing is
+installed: everything in the `agents` section that doesn't need a live
+tab (`wired`, `trust`, `legacy_settings`) is read straight off the
+agents' own config files on disk, so it still has something to say with
+nothing running — only the tab-scoped `owning` checks and
+`agent.hook_binary` (which needs to be inside a tab at all) come back
+`skipped` here; `session` rolls up `skipped` the same way an uninstalled
+agent does, since autostart is opt-in and an uninstalled artifact is
+not a failure.
+
+`-v` prints all 45 entries grouped by section, with the status column
 blank for `null`-status observations (not for `skipped` — that word
 still prints, because it *is* a status) and a doc link under every
 `fail`/`warn`. Same capture, `-v`, trimmed with `[…]` to the sections
@@ -689,6 +800,14 @@ Agents (process)
   ok      agent.opencode.wired     wired@v3
   skipped agent.opencode.owning    unavailable (no tab.list from a running UI)
 
+Host session autostart (process)
+  skipped session.autostart        not installed (opt-in: roostctl session autostart install)
+  skipped session.autostart_binary not installed (opt-in: roostctl session autostart install)
+  skipped session.autostart_enabled not installed (opt-in: roostctl session autostart install)
+  skipped session.autostart_active not installed (opt-in: roostctl session autostart install)
+          session.autostart_sibling none
+          session.linger           no (the unit starts at login, not at boot — roostctl session autostart install --linger)
+
 • 2 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
     ✗ ui.socket    → https://charliek.github.io/roost/reference/cli/#environment
     ✗ ui.identify  → https://charliek.github.io/roost/reference/cli/#identify
@@ -700,6 +819,12 @@ absolute paths, not these. The five `agent.*.wired`/`agent.codex.trust`
 `roostctl agent ensure` for real — an agent whose config directory
 doesn't exist at all shows `skipped: not installed` instead, and a
 present-but-never-wired agent shows `warn: not wired` rather than `ok`.
+The `session` section above is this same machine with nothing installed
+— `session.autostart_sibling` is an observation (`null`/no status, not
+`skipped`) that names the *other* build profile's artifact when one is
+sitting there, and `session.linger` is asked regardless of whether
+anything is installed, since lingering is a property of the user, not of
+any one artifact.
 
 `--json` carries the same facts as JSON — a top-level `schema_version: 2`,
 an explicit `exit_code` (so a script never has to re-derive "did
@@ -708,8 +833,21 @@ anything fail" from the check list), and every entry's stable `id`,
 observations, one of `ok`/`warn`/`fail`/`skipped` for checks. That's the
 shape to script against; the text output's column widths are not.
 `--json` is also unaffected by `-v` and `--color`: it always carries all
-39 entries and never contains a color escape, regardless of either
+45 entries and never contains a color escape, regardless of either
 flag.
+
+**Exit code and the new `session` section.** `doctor` still exits 1 when
+**any** check's status is `fail`, unchanged — but the `session` section
+now puts more things in that category than a bare install/uninstall
+mistake: an artifact that is installed but **disabled**, **masked**, not
+seen by the running supervisor at all, whose binary is missing, or whose
+last start **failed** are each `fail`, not `warn`. A script that has
+been treating `roostctl doctor`'s exit code as "is Roost basically
+healthy" will now also see 1 for "the autostart unit exists but will
+not actually fire" — which is the point: a stale `ExecStart` used to
+retry silently in the background and never show up anywhere `doctor`
+looked. A session that is legitimately stopped (`session stop` exits 0
+on purpose) is not one of these cases — it reports `ok`.
 
 ## Environment
 

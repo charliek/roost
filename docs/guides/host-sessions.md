@@ -59,7 +59,7 @@ roostctl host connect --id <the id host add printed>
 
 A remote host never auto-connects at launch — Roost doesn't even reach for it, so it simply sits disconnected until you Connect. That's deliberate: connecting to a remote machine is an outbound decision that costs a handshake and can fail loudly, and when Roost has only just opened, nobody has asked for it. Once you've connected it, though, a remote host behaves like `localhost` again for a *mid-session* drop: close your laptop, let Wi-Fi hiccup, whatever kills the link — Roost notices and retries on its own, with a growing delay (up to 30 seconds) shown right in the sidebar band as `reconnecting in Ns (k/10)`. If ten attempts don't get it back it settles with `reconnect gave up after 10 tries`, and ↻ Reconnect — which was on screen the whole time — is exactly the button you'd have clicked anyway. Not every failure gets retried this way: a changed or unknown host key, a rejected login, and a session that's genuinely gone each settle immediately instead, because each of those needs a person to do something different — see [Troubleshooting](#troubleshooting) below for what a failed SSH connect looks like and how to recover.
 
-A rebooted remote machine is the one case that never grows a ladder: it comes back with no `roost-session` running at all, so the very first reconnect attempt classifies as "no session" and settles right away (see the [no-session row](#troubleshooting) below) rather than retrying. If you want a host to survive its own reboots without you having to reconnect by hand, run `roostctl session autostart install` on that machine to set up the `systemd --user` unit, then enable lingering for that user — `loginctl enable-linger <user>` — so the unit starts at boot instead of waiting for a login (the verb sets up the unit; it doesn't run `enable-linger` for you, since that's a system-wide `loginctl` grant, not something scoped to one artifact). With that in place the session is already up by the time Roost's client retries, and auto-reconnect covers the rest. See [Surviving reboots and logouts](#surviving-reboots-launchd) below for what the unit looks like and macOS's equivalent.
+A rebooted remote machine is the one case that never grows a ladder: it comes back with no `roost-session` running at all, so the very first reconnect attempt classifies as "no session" and settles right away (see the [no-session row](#troubleshooting) below) rather than retrying. If you want a host to survive its own reboots without you having to reconnect by hand, run `roostctl session autostart install --linger` on that machine — one command sets up the `systemd --user` unit *and* grants lingering for that user, so the unit starts at **boot** instead of waiting for a login. Lingering is a flag rather than the default because it's a system-wide grant, not something scoped to this one artifact: it keeps that user's whole session manager up with nobody logged in, so every other `default.target` unit of theirs starts at boot too, not just this one. With that in place the session is already up by the time Roost's client retries, and auto-reconnect covers the rest. See [Surviving reboots and logouts](#surviving-reboots-launchd) below for what the unit looks like, what `--linger` does on each platform, and macOS's equivalent.
 
 ### Scripted / fallback forwarding with `ssh -N -L`
 
@@ -305,7 +305,7 @@ This is a deliberate trade: connecting at reduced fidelity beats refusing to con
 The command *is* the recipe now, on either platform:
 
 ```bash
-roostctl session autostart install
+roostctl session autostart install --linger
 ```
 
 This writes and loads one supervisor artifact for `roost-session` — a
@@ -314,15 +314,26 @@ confirms a session answers before it returns. It's **opt-in**: nothing
 calls this for you, and it never interrupts a session that's already
 running — see [`session autostart install` /
 `uninstall`](../reference/cli.md#session-autostart-install-uninstall)
-for the full verb reference, including `--force` and what `roostctl
-session status`'s new `autostart=` line reports.
+for the full verb reference, including `--force`, `--linger`, and what
+`roostctl session status`'s `autostart=` line reports.
+
+**The artifact is named per build.** The stem is this build's session
+profile — `roost-session` for a release build, `roost-session-dev` for a
+debug one, the same string its socket and state directories already
+use — and one rule derives everything else from it: the systemd unit is
+`<stem>.service`, the launchd label is `ai.stridelabs.<stem>`, the plist
+file is `<label>.plist`. A dev build and a release build therefore own
+**different artifacts**, exactly as they own different sockets, and
+neither slot is ever read to decide anything about the other. The
+examples below are the **release** names; a debug build writes
+`roost-session-dev.service` / `ai.stridelabs.roost-session-dev` instead.
 
 **Linux** writes `~/.config/systemd/user/roost-session.service`
 (honoring `XDG_CONFIG_HOME` if you've moved it):
 
 ```ini
 [Unit]
-# Written by roostctl session autostart. Reinstalling replaces this file.
+# Written by roostctl session autostart (format 2). Reinstalling replaces this file.
 Description=Roost host session (roost-session)
 
 [Service]
@@ -342,7 +353,7 @@ WantedBy=default.target
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->
+<!-- Written by roostctl session autostart (format 2). Reinstalling replaces this file. -->
 <dict>
     <key>Label</key>
     <string>ai.stridelabs.roost-session</string>
@@ -367,7 +378,21 @@ WantedBy=default.target
 
 Both carry an ownership-marker line as their first meaningful line —
 that's what makes a later re-`install` safe to overwrite without
-clobbering a unit that merely happens to look like ours.
+clobbering a unit that merely happens to look like ours. The `(format
+2)` in it is a **template generation**, not the app version: it bumps
+only when the rendered unit/plist would come out different for the same
+inputs (this pass bumped it because the marker line itself changed), so
+an ordinary release never gets reported as "outdated" for a template
+that never moved. An artifact from an older `roostctl` (including one
+with no `(format N)` at all — the shape this file had before this
+change) is a generation *behind* and is upgraded in place the next time
+you run `install`, no `--force` needed; one written by a *newer*
+`roostctl` than the one currently running is left alone and refused
+until you pass `--force` to downgrade it. Either way the previous
+contents are echoed to stderr first, so a hand edit is never silently
+lost. See the [format matrix](../reference/cli.md#session-autostart-install-uninstall)
+for the full table, including the plain **foreign** case (no marker at
+all) that still needs `--force` exactly once.
 
 `KeepAlive` is deliberately `{SuccessfulExit: false}`, not bare `true`.
 A clean **Stop Session** (or `roostctl session stop`) exits `0` — under
@@ -405,26 +430,51 @@ roostctl session autostart uninstall
 
 This unloads it (`systemctl --user disable --now` / `launchctl
 bootout`), **stopping the supervised session** if one is running — the
-command says so before it does it — then deletes the file.
+command says so before it does it — then deletes the file. `uninstall`
+never runs `loginctl disable-linger`, even if `--linger` granted it:
+lingering is a per-user, system-wide grant, and some other unit of
+yours may depend on it staying on.
 
-Say what this actually buys you, honestly: a macOS `gui/$UID`
-LaunchAgent starts at your **next login**, not at boot, and it stops at
-**logout** — a materially smaller scope than Linux's `enable-linger`
-(which keeps a unit running with nobody logged in at all; see [Adding a
-remote host](#adding-a-remote-host-over-ssh) above for pairing the unit
-with it). A reboot brings your saved sidebar layout back either way, the
-next time Roost opens, but the *running shell processes* inside a
-session never survive a reboot, on any platform — what either
-supervisor buys you is not having to remember to start `roost-session`
-by hand after you log back in.
+Say what `--linger` actually buys you, honestly, because the two
+platforms are not the same shape here. **Linux**, with `--linger`
+granted, keeps your whole user session manager up with nobody logged
+in — the unit starts at **boot**. Without it (the default), the same
+unit still starts, just not until your **next login**. **macOS** has no
+equivalent concept at all: `--linger` is refused outright there (`exit
+1`, nothing written) with a message saying so, because a `gui/$UID`
+LaunchAgent fundamentally starts at your next login and stops at
+logout, in every case — there's no boot-time mode to opt into. A reboot
+brings your saved sidebar layout back either way, the next time Roost
+opens, but the *running shell processes* inside a session never survive
+a reboot, on any platform — what the supervisor buys you, on either
+platform, is not having to remember to start `roost-session` by hand
+after you log back in.
+
+**This only answers "is the file installed", not "will it actually
+fire."** A `systemd --user` unit whose `ExecStart` names a binary that
+no longer exists — the classic case being a `cargo clean` under a dev
+build the unit still points at — does not fail loudly: systemd retries
+it a handful of times over the next few seconds at your next login and
+then gives up silently with a start-limit failure, and nothing in
+`session status` or the band would tell you. `roostctl doctor`'s
+`session` section is where that question is actually answered — enabled
+or disabled, masked, seen by the running supervisor at all, the last
+start's outcome — see [`doctor`](../reference/cli.md#doctor). `roostctl
+session status`'s `autostart=` line, by contrast, only ever reads the
+artifact file on disk and says so (`installed on disk`); it never asks
+`systemctl` or `launchctl` anything.
 
 The verb resolves the binary itself, the same way `session start` does,
-and prints what it picked (`autostart: <artifact path> → <binary>`) —
-the artifact's name is fixed regardless of build profile, so running
-this from a debug checkout will overwrite a release install's artifact
-(and vice versa); that printed line is how you'd notice. Point
-`ROOST_SESSION_BIN` at your real install first if you're running this
-from a dev checkout and want the release build supervised instead.
+and prints what it picked (`autostart: <artifact path> → <binary>`).
+**The artifact name follows the `roostctl` build** — a debug `roostctl`
+always writes the dev-named artifact, a release one the release-named
+artifact — so `ROOST_SESSION_BIN` has to name a `roost-session` binary
+of the *same* profile. Pointing a debug `roostctl` at a release
+`roost-session` via `ROOST_SESSION_BIN` would write
+`roost-session-dev.service` for a process that binds the **release**
+socket, and start that mismatched pair at every login; `install` has no
+cheap way to catch this for you, so it's a rule to follow rather than a
+check it runs.
 
 ## Troubleshooting
 

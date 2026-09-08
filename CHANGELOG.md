@@ -211,6 +211,49 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **`session autostart` writes a per-build-profile artifact, carries a
+  versioned marker, can grant lingering in one step, and `doctor` now
+  says whether it will actually fire (#443)** — `roostctl session
+  autostart install|uninstall` (#438) wrote one supervisor artifact under
+  a name fixed regardless of build profile, so a debug `roostctl` read a
+  release install as its own file and silently rewrote its `ExecStart` to
+  a build-tree binary; after a `cargo clean` the unit named a binary that
+  no longer existed, and at the next login `systemd --user` retried it a
+  few times in a second and gave up with a start-limit failure that
+  nothing in Roost surfaced. The artifact is now named after the
+  session's own bundle profile — `roost-session.service` /
+  `ai.stridelabs.roost-session` for a release build,
+  `roost-session-dev.service` / `ai.stridelabs.roost-session-dev` for a
+  debug one, the same rule the socket and state directories already
+  follow — so a dev and a release install can never collide, and
+  `ROOST_SESSION_BIN` now has to name a binary of the *same* profile as
+  the `roostctl` running it. Installing over the pre-#443 shared name is
+  a one-time upgrade: a release `install` adopts and rewrites it in
+  place, a dev build only reports it (with the exact remedy command) and
+  leaves it untouched. The ownership marker now carries a **format
+  generation** (`# Written by roostctl session autostart (format 2).
+  Reinstalling replaces this file.`) instead of the app version, so a
+  template change has a real upgrade path — an older-generation artifact
+  is rewritten by a plain `install`, a newer one is refused until
+  `--force` — without every release relitigating a template that didn't
+  change; a Linux rewrite over a loaded unit now runs `systemctl --user
+  daemon-reload` immediately, so a printed `restart` command actually
+  restarts the new definition instead of the stale cached one. `install
+  --linger` runs `loginctl enable-linger` for you on Linux (refused with
+  a clear reason on macOS, which has no equivalent), turning the guide's
+  old two-step "install, then remember to enable lingering by hand"
+  reboot-survival recipe into one command. `session status`'s
+  `autostart=` line now says `installed on disk` rather than plain
+  `installed`, because it still only ever reads the artifact file — the
+  new `session` section in `roostctl doctor` (45 checks now, up from 39,
+  across seven sections rather than six) is where "is it actually
+  enabled, does the supervisor see it, did its last start fail" gets
+  answered, and `doctor` now exits 1 for a disabled, masked, or unseen
+  installed unit, a missing binary, or a failed last start — a behavior
+  change worth knowing about if a script greps `doctor`'s exit code.
+  See the [Host Sessions
+  guide](docs/guides/host-sessions.md#surviving-reboots-launchd) and
+  [`cli.md`](docs/reference/cli.md#session-autostart-install-uninstall).
 - **grok/gx: a continued turn's `stopHookActive: true` Stop fires keep the
   tab `working`, and a failed turn's banner carries the reason (#423)** —
   gx's `Stop` hook is a gate: when a blocking Stop hook continues the
