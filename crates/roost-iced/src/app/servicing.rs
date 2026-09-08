@@ -1600,6 +1600,9 @@ impl App {
                 // Nothing renders off it — it is kept for the outage a
                 // later drop opens (plan 040 §3.7).
                 EngineFeed::HostLease(host, lease) => self.hosts.apply_lease(host, lease),
+                EngineFeed::HostConnectFacts(host, facts) => {
+                    self.hosts.note_connect_facts(host, facts)
+                }
                 EngineFeed::ReconnectDue { host, request } => {
                     self.host_reconnect_due(&host, request)
                 }
@@ -3069,6 +3072,15 @@ impl App {
                 // absent until one has attached over the live
                 // connection.
                 payload_kind: self.hosts.payload_kind(&host.id).map(str::to_string),
+                // What the prologue established, present only while the
+                // connection that established it is live.
+                connect: self.hosts.facts(&host.id).map(|facts| HostConnectStatus {
+                    session_id: facts.session_id.clone(),
+                    reduced_fidelity: facts.reduced_fidelity,
+                    resumed: facts.resumed.is_some(),
+                    from_revision: facts.resumed.map(|resumed| resumed.from_revision),
+                }),
+                tabs: self.hosts.tabs(&host.id),
             });
         }
         Ok(HostStatusResult { hosts })

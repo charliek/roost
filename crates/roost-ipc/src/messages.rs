@@ -2426,6 +2426,45 @@ pub struct HostStatus {
     /// be — and it goes when that connection does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_kind: Option<String>,
+    /// What this host's live connection established about the session
+    /// behind it. Absent unless the connection is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect: Option<HostConnectStatus>,
+    /// How many tab rows this host's sidebar section is listing right
+    /// now — the "5 tabs" a person reads, and the observable a caller
+    /// polls to see that a reconnect never blanked the section.
+    ///
+    /// Always present, `0` included: a reader watching it across a
+    /// reconnect needs a number every time it asks, not a key that
+    /// comes and goes.
+    #[serde(default)]
+    pub tabs: usize,
+}
+
+/// What one connect attempt established about the session it reached
+/// (plan 056 §3.1) — the `connect` object on [`HostStatus`].
+///
+/// Facts about a live connection, so the whole object goes when the
+/// connection does. Everything here is settled during the prologue,
+/// before any tab has attached, which is what makes
+/// [`Self::reduced_fidelity`] readable earlier than
+/// [`HostStatus::payload_kind`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostConnectStatus {
+    /// The session's own id, as `session.identify` reports it.
+    pub session_id: String,
+    /// This client and the session pin different libghostty builds and
+    /// the connection fell back to the `vt` payload: links, the
+    /// inactive screen and soft wrapping are off until the session runs
+    /// a matching build.
+    pub reduced_fidelity: bool,
+    /// The connection replayed the events it missed instead of taking a
+    /// fresh `tab.list`. Describes the **prologue** only.
+    pub resumed: bool,
+    /// The revision the replay resumed from, as the session's subscribe
+    /// ack attested it. Absent unless [`Self::resumed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_revision: Option<u64>,
 }
 
 /// An armed auto-reconnect: what was scheduled, not what is left.
@@ -4409,6 +4448,8 @@ mod tests {
                 ),
             }),
             payload_kind: None,
+            connect: None,
+            tabs: 0,
         };
         round_trip(&armed);
         // #399: `reason` says *why* the rung is armed while the band's
@@ -4422,7 +4463,9 @@ mod tests {
         round_trip(&HostStatusResult::default());
 
         // Every optional is omitted rather than nulled, so a host that
-        // has never connected is four fields on the wire.
+        // has never connected is the registry fields, the counters and
+        // the state — `tabs` among them, serialized at `0` rather than
+        // dropped.
         let never = HostStatus {
             id: "a1b2c3d4e5f60718".into(),
             label: "shed".into(),
@@ -4439,6 +4482,7 @@ mod tests {
                 "target": "localhost",
                 "generation": 0,
                 "state": "disconnected",
+                "tabs": 0,
             })
         );
 
@@ -4454,6 +4498,49 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&fallback).unwrap()["payload_kind"],
             AttachPayloadKind::VT
+        );
+
+        // `connect` is the whole live prologue, so the object is present
+        // exactly while the connection is — the `never` host above
+        // proves it is omitted, not nulled, when there is none.
+        let resumed = HostStatus {
+            state: host_state::CONNECTED.into(),
+            connect: Some(HostConnectStatus {
+                session_id: "5c1f0e2d3a4b5c6d".into(),
+                reduced_fidelity: true,
+                resumed: true,
+                from_revision: Some(4_312),
+            }),
+            tabs: 5,
+            ..never.clone()
+        };
+        round_trip(&resumed);
+        assert_eq!(
+            serde_json::to_value(&resumed).unwrap()["connect"],
+            serde_json::json!({
+                "session_id": "5c1f0e2d3a4b5c6d",
+                "reduced_fidelity": true,
+                "resumed": true,
+                "from_revision": 4_312,
+            })
+        );
+
+        // A fresh snapshot resumed from nothing, so the fence is omitted
+        // rather than reported as a revision the session never attested.
+        let fresh = HostConnectStatus {
+            session_id: "5c1f0e2d3a4b5c6d".into(),
+            reduced_fidelity: false,
+            resumed: false,
+            from_revision: None,
+        };
+        round_trip(&fresh);
+        assert_eq!(
+            serde_json::to_value(&fresh).unwrap(),
+            serde_json::json!({
+                "session_id": "5c1f0e2d3a4b5c6d",
+                "reduced_fidelity": false,
+                "resumed": false,
+            })
         );
 
         // Localhost's own retry knows a delay and nothing else — the

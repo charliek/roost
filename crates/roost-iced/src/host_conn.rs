@@ -88,7 +88,7 @@ pub(crate) mod upload;
 pub(crate) use mirror::SharedMirror;
 pub(crate) use queue::{HostIntent, HostOpError, HostOps};
 pub(crate) use reconnect::{Decision, DropInput};
-pub(crate) use state::{HostConnState, HostTransport};
+pub(crate) use state::{ConnectFacts, HostConnState, HostTransport};
 pub(crate) use task::{ConnectMode, Shutdown};
 pub(crate) use upload::{UploadResult, UploadSource};
 
@@ -461,6 +461,14 @@ struct HostConn {
     /// this very struct — and a kind held over from the last one would
     /// report a fidelity nothing is actually delivering.
     payload_kind: Option<&'static str>,
+    /// What the prologue of the live incarnation learned about the
+    /// session behind it — `host.status`'s `connect` object, and what
+    /// every reduced-fidelity surface keys on.
+    ///
+    /// Cleared with `payload_kind` and for the same reason: a fact
+    /// earned by one incarnation describes nothing once another is
+    /// serving the host.
+    facts: Option<ConnectFacts>,
     state: HostConnState,
     /// The last client focus this connection was told, so an unchanged
     /// one is not resent (`Some(None)` is "told: nothing here is
@@ -986,6 +994,7 @@ impl HostConnSet {
             shutdown,
             incarnation: None,
             payload_kind: None,
+            facts: None,
             focus_sent: None,
             // What the task is actually doing the moment it is spawned.
             // The feed's first `Connecting` replaces it — this is only
@@ -2152,18 +2161,20 @@ impl HostConnSet {
         self.ops(&host)
     }
 
+    /// The connection an incarnation belongs to, to write on. `None`
+    /// for a stale one — [`Self::owner_of`] has already ruled on that,
+    /// which is what makes the recorders below silent no-ops rather than
+    /// misfiles onto whatever replaced it.
+    fn conn_at_mut(&mut self, incarnation: HostId) -> Option<&mut HostConn> {
+        let host = self.owner_of(incarnation)?;
+        self.entries.get_mut(&host)?.conn.as_mut()
+    }
+
     /// Record what an accepted attach on this incarnation is decoding.
     /// A stale incarnation records nothing, same contract as
     /// [`Self::ops_for`].
     pub(crate) fn note_payload_kind(&mut self, incarnation: HostId, kind: &'static str) {
-        let Some(host) = self.owner_of(incarnation) else {
-            return;
-        };
-        if let Some(conn) = self
-            .entries
-            .get_mut(&host)
-            .and_then(|entry| entry.conn.as_mut())
-        {
+        if let Some(conn) = self.conn_at_mut(incarnation) {
             conn.payload_kind = Some(kind);
         }
     }
@@ -2180,6 +2191,46 @@ impl HostConnSet {
     pub(crate) fn payload_kind(&self, host: &str) -> Option<&'static str> {
         let conn = self.entries.get(host)?.conn.as_ref()?;
         conn.payload_kind.filter(|_| conn.state.is_connected())
+    }
+
+    /// File what one incarnation's prologue learned. A stale incarnation
+    /// records nothing, same contract as [`Self::note_payload_kind`].
+    pub(crate) fn note_connect_facts(&mut self, incarnation: HostId, facts: ConnectFacts) {
+        if let Some(conn) = self.conn_at_mut(incarnation) {
+            conn.facts = Some(facts);
+        }
+    }
+
+    /// What this host's live connection learned about its session.
+    ///
+    /// Filtered on [`HostConnState::reached_session`] rather than on
+    /// driving it: an observer's facts describe something just as real —
+    /// it resumes on the same checkpoint and it is at the same fidelity.
+    pub(crate) fn facts(&self, host: &str) -> Option<&ConnectFacts> {
+        let conn = self.entries.get(host)?.conn.as_ref()?;
+        conn.facts.as_ref().filter(|_| conn.state.reached_session())
+    }
+
+    /// Whether this host is attached across a libghostty build skew.
+    ///
+    /// `Connected` only, unlike [`Self::facts`]: everything this answers
+    /// offers to *do* something about the skew — update, restart — and
+    /// none of that is a deposed client's to offer.
+    pub(crate) fn reduced_fidelity(&self, host: &str) -> bool {
+        self.facts(host).is_some_and(|facts| facts.reduced_fidelity)
+            && self.state(host).is_some_and(HostConnState::is_connected)
+    }
+
+    /// How many tab rows this host's section is currently listing.
+    ///
+    /// Read through [`Self::section`] rather than off a mirror this
+    /// picks itself, so it always counts what the sidebar is actually
+    /// drawing — including whatever the section falls back to while a
+    /// connection is being replaced.
+    pub(crate) fn tabs(&self, host: &str) -> usize {
+        self.section(host)
+            .and_then(|section| section.mirror)
+            .map_or(0, |mirror| mirror.read().tabs().count())
     }
 
     pub(crate) fn state(&self, host: &str) -> Option<&HostConnState> {
@@ -2422,14 +2473,7 @@ impl HostConnSet {
     /// echo of this client's own `set_focus` matches the claim and
     /// changes nothing.
     pub(crate) fn focus_claim_disagrees(&mut self, incarnation: HostId, tab_id: i64) -> bool {
-        let Some(host) = self.owner_of(incarnation) else {
-            return false;
-        };
-        let Some(conn) = self
-            .entries
-            .get_mut(&host)
-            .and_then(|entry| entry.conn.as_mut())
-        else {
+        let Some(conn) = self.conn_at_mut(incarnation) else {
             return false;
         };
         match conn.focus_sent {
@@ -2456,11 +2500,8 @@ impl HostConnSet {
         // Stamped once and never cleared until the next `open_ssh`: from
         // here on, every drop for this attempt is a *session going away*
         // rather than a connect that never worked, and the bootstrap
-        // offer turns on exactly that difference. An observer settlement
-        // reached the session just as surely — it answered the probe —
-        // even though `TakenOver` projects as not-connected everywhere
-        // else (plan 049 §3.11), so it counts here too.
-        if next.is_connected() || matches!(next, HostConnState::TakenOver { .. }) {
+        // offer turns on exactly that difference.
+        if next.reached_session() {
             if let Some(ssh) = self
                 .entries
                 .get_mut(&host)
@@ -2524,6 +2565,7 @@ impl HostConnSet {
         if conn.incarnation != Some(incarnation) || !next.is_connected() {
             conn.focus_sent = None;
             conn.payload_kind = None;
+            conn.facts = None;
         }
         conn.incarnation = Some(incarnation);
         conn.state = next;
@@ -2761,6 +2803,54 @@ pub(crate) mod fixtures {
             request,
             result: Err(ConnectFailure::classified("workbox", failure)),
         }
+    }
+
+    /// A snapshot with `tabs[i]` rows in the i-th project, fenced at
+    /// revision 1. Only the shape matters to the readers that count it.
+    pub(crate) fn a_mirror(tabs: &[usize]) -> mirror::HostMirror {
+        use roost_ipc::messages::{Project, Tab, TabListResult, TabState};
+
+        let mut next_id = 0;
+        let projects = tabs
+            .iter()
+            .enumerate()
+            .map(|(index, count)| Project {
+                id: index as i64 + 1,
+                name: format!("project-{index}"),
+                cwd: "/tmp".into(),
+                position: index as i32,
+                created_at: 0,
+                tabs: (0..*count)
+                    .map(|position| {
+                        next_id += 1;
+                        Tab {
+                            id: next_id,
+                            project_id: index as i64 + 1,
+                            title: format!("tab-{next_id}"),
+                            cwd: "/tmp".into(),
+                            state: TabState::None,
+                            has_notification: false,
+                            is_active: false,
+                            user_titled: false,
+                            position: position as i32,
+                            created_at: 0,
+                            last_active: 0,
+                            hook_active: false,
+                            shell_state: Default::default(),
+                            agent_lifecycle: Default::default(),
+                            ownership: None,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        mirror::HostMirror::from_list(
+            TabListResult {
+                projects,
+                revision: Some(1),
+            },
+            1,
+        )
     }
 
     pub(crate) fn dropped(reason: &str) -> HostConnState {
@@ -5413,6 +5503,177 @@ mod tests {
             None,
             "the kind outlived the connection that negotiated it"
         );
+    }
+
+    fn skewed_facts(session_id: &str) -> ConnectFacts {
+        ConnectFacts {
+            session_id: session_id.into(),
+            skew: state::Skew {
+                session_build: "gb-old".into(),
+                client_build: "gb-new".into(),
+            },
+            reduced_fidelity: true,
+            supports_resume: true,
+            resumed: None,
+        }
+    }
+
+    /// The facts a prologue published belong to the incarnation that
+    /// earned them, exactly as `payload_kind` does: a `session_id` or a
+    /// build pair held over would name a session nothing is talking to,
+    /// and every reduced-fidelity offer is bound to that id.
+    #[tokio::test]
+    async fn connect_facts_are_reported_until_their_connection_goes() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-connect-facts.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        assert_eq!(set.facts("h1"), None, "no prologue has finished yet");
+
+        let stale = set.minter.mint("h1", set.conn("h1").generation - 1);
+        set.note_connect_facts(stale, skewed_facts("sess-stale"));
+        assert_eq!(
+            set.facts("h1"),
+            None,
+            "a prologue from a replaced connection describes nothing that is live"
+        );
+        assert!(!set.reduced_fidelity("h1"));
+
+        let old = set.mint_for("h1");
+        set.apply_state(old, HostConnState::Connected);
+        set.note_connect_facts(old, skewed_facts("sess-1"));
+        assert_eq!(
+            set.facts("h1").map(|facts| facts.session_id.as_str()),
+            Some("sess-1")
+        );
+        assert!(set.reduced_fidelity("h1"));
+
+        set.apply_state(old, dropped("the session closed"));
+        assert_eq!(
+            set.facts("h1"),
+            None,
+            "a connection that is down establishes nothing"
+        );
+        assert!(!set.reduced_fidelity("h1"));
+
+        // The in-task reconnect keeps this very `HostConn` and only
+        // turns the incarnation over — a fresh session behind the same
+        // host would otherwise be described by the old one's facts.
+        let new = set.mint_for("h1");
+        set.apply_state(
+            new,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        );
+        set.apply_state(new, HostConnState::Connected);
+        assert_eq!(
+            set.facts("h1"),
+            None,
+            "the facts outlived the prologue that established them"
+        );
+    }
+
+    /// An observer reached the session and answered its identify just as
+    /// a driver did, so its facts are real — it is at the same fidelity
+    /// and it resumes on the same checkpoint. What it must not do is
+    /// *offer* anything about the skew: updating or restarting a session
+    /// somebody else is driving is not a deposed client's call.
+    #[tokio::test]
+    async fn an_observer_reports_its_facts_but_offers_nothing_about_them() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-observer-facts.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+
+        // The order a *deposed driver* takes: it was connected and had
+        // filed its facts, and being deposed leaves `Connected` — which
+        // is the edge that retires them. Nothing about the session
+        // changed, so the task refiles them behind the `TakenOver` it
+        // publishes (`task.rs`'s `ConnEnd::Deposed` arm), and that
+        // refiling is the only reason the answer below is not `None`.
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        assert_eq!(
+            set.facts("h1"),
+            None,
+            "leaving Connected retires the facts, refiled or not"
+        );
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+
+        assert_eq!(
+            set.facts("h1").map(|facts| facts.session_id.as_str()),
+            Some("sess-1")
+        );
+        assert!(
+            !set.reduced_fidelity("h1"),
+            "a deposed client must not be offered the update"
+        );
+
+        // The other order, which an observer prologue takes: it never
+        // drove, so `TakenOver` is the first state it ever publishes
+        // and the facts land behind it exactly as a driver's do.
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h2",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-observer-prologue.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h2");
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        set.note_connect_facts(incarnation, skewed_facts("sess-2"));
+        assert_eq!(
+            set.facts("h2").map(|facts| facts.session_id.as_str()),
+            Some("sess-2")
+        );
+    }
+
+    /// `host.status.tabs` is the section's own row count, so a caller
+    /// polling it across a reconnect sees exactly what the sidebar draws
+    /// — including whatever the section falls back to.
+    #[tokio::test]
+    async fn the_tab_count_is_whatever_the_section_is_listing() {
+        let (mut set, _feed) = a_set();
+        assert_eq!(set.tabs("h1"), 0, "an unknown host lists nothing");
+
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-tab-count.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert_eq!(set.tabs("h1"), 0, "no snapshot has landed yet");
+
+        set.apply_workspace(
+            incarnation,
+            HostWorkspaceEvent::Reset(Arc::new(SharedMirror::new(a_mirror(&[2, 1])))),
+        );
+        assert_eq!(set.tabs("h1"), 3, "three rows across two projects");
+
+        // An explicit disconnect keeps the rows listed dimmed — those
+        // shells are still running over there — so the count keeps
+        // describing them.
+        set.disconnect("h1");
+        assert_eq!(set.tabs("h1"), 3);
     }
 
     #[test]

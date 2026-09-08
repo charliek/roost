@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, Notify};
 use super::mirror::{HostMirror, SharedMirror};
 use super::queue::{self, HostIntent, HostOpError, OpFault};
 use super::state::{
-    check_compatibility, Compatibility, HostConnState, HostStateMachine, HostTransport,
+    check_compatibility, ConnectFacts, HostConnState, HostStateMachine, HostTransport,
 };
 use super::upload::Uploads;
 use super::{HostIdMinter, HostWorkspaceEvent};
@@ -365,6 +365,9 @@ struct Live {
     /// Shared with the UI: written here, read there. Never copied onto
     /// the feed.
     mirror: Arc<SharedMirror>,
+    /// What the prologue learned about the session on the other end.
+    /// Published once, right behind the state this connection reached.
+    facts: ConnectFacts,
 }
 
 /// How this client names itself when it claims the lease (plan 049
@@ -573,6 +576,11 @@ async fn connect_loop(
                     incarnation,
                     HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
                 ) || !publish_state(feed, incarnation, machine.taken_over(taken_by))
+                    // Behind the state, never ahead of it: the set files
+                    // facts on the connection the state just installed,
+                    // and an observer resumes and shows a fidelity
+                    // indicator exactly like a driver.
+                    || !publish_facts(feed, incarnation, live.facts.clone())
                 {
                     ConnEnd::FeedClosed
                 } else {
@@ -587,6 +595,7 @@ async fn connect_loop(
                     incarnation,
                     HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
                 ) || !publish_state(feed, incarnation, machine.connected())
+                    || !publish_facts(feed, incarnation, live.facts.clone())
                 {
                     ConnEnd::FeedClosed
                 } else {
@@ -627,7 +636,16 @@ async fn connect_loop(
             // Answers whatever the deposed driver still had queued
             // before the observer loop starts refusing new ones.
             queue::flush(ops_rx, &HostOpError::Disconnected);
-            ended = if publish_state(feed, incarnation, machine.taken_over(taken_by)) {
+            // Refiled, because the state below leaves `Connected` and
+            // that is what retires the prologue's facts. Nothing about
+            // the session changed — same id, same fidelity, same fence
+            // — and this connection is still reading it, so a reader
+            // that went blank here would be reporting the takeover as a
+            // loss of the session rather than of the lease.
+            let facts = live.facts.clone();
+            ended = if publish_state(feed, incarnation, machine.taken_over(taken_by))
+                && publish_facts(feed, incarnation, facts)
+            {
                 observe(config, incarnation, *live, ops_rx, feed, shutdown).await
             } else {
                 ConnEnd::FeedClosed
@@ -872,7 +890,7 @@ async fn dial_control(
 async fn open_control(
     config: &ConnectionConfig,
     mode: ConnectMode,
-) -> Result<(IpcClient, SessionIdentify), AttemptError> {
+) -> Result<(IpcClient, ConnectFacts), AttemptError> {
     ensure_socket(config, mode).await?;
     let mut control = dial_control(config, mode).await?;
     let raw = call(
@@ -889,18 +907,19 @@ async fn open_control(
         config.transport.restart_action(),
     )
     .map_err(|mismatch| AttemptError::Incompatible(Box::new(mismatch)))?;
-    if compatibility == Compatibility::BuildSkew {
-        // The one place the fallback is announced. There is no dot and
-        // no dialog for it — the connection is a working connection —
-        // so the log is what a user comparing two screens is pointed at.
+    let facts = ConnectFacts::new(&identity, &config.client_build, compatibility);
+    if facts.reduced_fidelity {
+        // Warn, not info: the connection is a working connection, but
+        // what it can render is a documented subset of a terminal, and
+        // the log is where a user comparing two screens is pointed.
         tracing::warn!(
-            session_build = %identity.libghostty_build,
-            client_build = %config.client_build,
+            session_build = %facts.skew.session_build,
+            client_build = %facts.skew.client_build,
             "libghostty build skew: attaching in the vt fallback, without the \
              inactive screen, soft-wrap flags or per-cell hyperlinks"
         );
     }
-    Ok((control, identity))
+    Ok((control, facts))
 }
 
 /// One connect attempt: the wire prologue, in the order `ipc.md` fixes.
@@ -914,7 +933,7 @@ async fn connect(
     held_lease: &mut Option<String>,
 ) -> Result<Live, AttemptError> {
     // 1. Identify, and gate on it.
-    let (mut control, identity) = open_control(config, mode).await?;
+    let (mut control, facts) = open_control(config, mode).await?;
 
     // 2. Claim the lease. Reconnect IS takeover — the lease outlives the
     //    connection it was minted on, so a client that reconnects has to
@@ -970,8 +989,9 @@ async fn connect(
     tracing::info!(
         host = %config.host,
         label = %config.label,
-        session = %identity.session_id,
+        session = %facts.session_id,
         revision = mirror.revision,
+        resume = facts.supports_resume,
         "connected to host session"
     );
     Ok(Live {
@@ -980,6 +1000,7 @@ async fn connect(
         events,
         pump,
         mirror: Arc::new(SharedMirror::new(mirror)),
+        facts,
     })
 }
 
@@ -1002,14 +1023,15 @@ async fn observe_prologue(
     config: &ConnectionConfig,
     mode: ConnectMode,
 ) -> Result<Live, AttemptError> {
-    let (mut control, identity) = open_control(config, mode).await?;
+    let (mut control, facts) = open_control(config, mode).await?;
     let (events, pump, mirror) = subscribe_and_snapshot(&config.socket, "", &mut control).await?;
 
     tracing::info!(
         host = %config.host,
         label = %config.label,
-        session = %identity.session_id,
+        session = %facts.session_id,
         revision = mirror.revision,
+        resume = facts.supports_resume,
         "watching a host session another client drives"
     );
     Ok(Live {
@@ -1018,6 +1040,7 @@ async fn observe_prologue(
         events,
         pump,
         mirror: Arc::new(SharedMirror::new(mirror)),
+        facts,
     })
 }
 
@@ -1614,6 +1637,10 @@ fn publish_workspace(feed: &EngineFeedSender, host: HostId, event: HostWorkspace
 
 fn publish_lease(feed: &EngineFeedSender, host: HostId, lease: String) -> bool {
     feed.send(EngineFeed::HostLease(host, lease))
+}
+
+fn publish_facts(feed: &EngineFeedSender, host: HostId, facts: ConnectFacts) -> bool {
+    feed.send(EngineFeed::HostConnectFacts(host, facts))
 }
 
 async fn call(
@@ -3081,15 +3108,18 @@ mod tests {
             .unwrap_or_else(|_| panic!("{what}"));
     }
 
-    /// Every host state the task has published, drained as it goes.
+    /// Every host state the task has published, drained as it goes,
+    /// with the connect facts that rode behind them.
     #[derive(Default)]
-    struct States(Vec<HostConnState>);
+    struct States(Vec<HostConnState>, Vec<ConnectFacts>);
 
     impl States {
         fn drain(&mut self, rx: &mut crate::engine_feed::EngineFeedReceiver) {
             for item in feed_items(rx) {
-                if let EngineFeed::HostState(_, state) = item {
-                    self.0.push(state);
+                match item {
+                    EngineFeed::HostState(_, state) => self.0.push(state),
+                    EngineFeed::HostConnectFacts(_, facts) => self.1.push(facts),
+                    _ => {}
                 }
             }
         }
@@ -3272,6 +3302,16 @@ mod tests {
             1,
             "watching is not connecting: the task never re-published Connected"
         );
+        // The prologue's, then the deposition's. `TakenOver` is not
+        // `Connected`, so the set retires the first pair on that edge —
+        // and a surviving observer that reported no session id and no
+        // fidelity would be describing a connection it is still reading.
+        assert_eq!(
+            states.1.len(),
+            2,
+            "the deposed connection must refile its facts behind the TakenOver it publishes"
+        );
+        assert_eq!(states.1[0], states.1[1], "same session, same fidelity");
     }
 
     /// Live observer → reconnecting observer → live observer, and never

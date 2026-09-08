@@ -104,6 +104,11 @@ pub(crate) enum EngineFeed {
     /// attempt over a dead ssh transport, which is a fresh task, can ask
     /// whether the session is still ours before taking it back.
     HostLease(HostId, String),
+    /// What one connection attempt learned about the session it reached
+    /// ([`crate::host_conn::ConnectFacts`], plan 056 §3.1), published
+    /// once per incarnation right behind the `Connected`/`TakenOver` it
+    /// belongs to — for an observer as much as for a driver.
+    HostConnectFacts(HostId, crate::host_conn::ConnectFacts),
     /// An ssh host's armed auto-reconnect came due (plan 040 §3.4).
     ///
     /// A one-shot timer on the engine runtime, because the dial it
@@ -215,6 +220,11 @@ impl EngineFeedReceiver {
                 // reconcile pulled forward mid-drain lands after one
                 // connection's arrival rather than inside it.
                 | EngineFeed::HostLease(..)
+                // Published in the same breath as the state above, and
+                // read by the same band and the same `host.status`:
+                // classified with it so a reconcile pulled forward
+                // mid-drain cannot split a connection's arrival.
+                | EngineFeed::HostConnectFacts(..)
                 // A due retry either dials or writes the give-up copy
                 // onto the band. Classified here so the second does not
                 // wait for an unrelated redraw.
@@ -626,6 +636,19 @@ mod tests {
                 },
             ),
             EngineFeed::HostState(HostId::new(3), crate::host_conn::HostConnState::Connected),
+            EngineFeed::HostConnectFacts(
+                HostId::new(3),
+                crate::host_conn::ConnectFacts {
+                    session_id: "sess-1".into(),
+                    skew: crate::host_conn::state::Skew {
+                        session_build: "gb-old".into(),
+                        client_build: "gb-new".into(),
+                    },
+                    reduced_fidelity: true,
+                    supports_resume: true,
+                    resumed: None,
+                },
+            ),
         ] {
             let (tx, mut rx) = channel();
             assert!(tx.send(item));
