@@ -353,6 +353,26 @@ impl HostConnState {
         self.is_connected() || matches!(self, HostConnState::TakenOver { .. })
     }
 
+    /// Whether this state says the *session* is gone or cannot be talked
+    /// to — as opposed to the wire to it, which is what an ordinary
+    /// `Disconnected` and every `Connecting` describe.
+    ///
+    /// It stopped, it needs a restart before this client can speak to
+    /// it, or no retry will ever produce one ([`HostStateMachine::settled`], the
+    /// only writer of a `Disconnected`'s `detail`). What it gates is
+    /// anything held *about the session across connections*: a resume
+    /// point offered to a session that restarted names a history that
+    /// no longer exists, and revisions restart at zero in every process.
+    pub(crate) fn session_is_gone(&self) -> bool {
+        match self {
+            HostConnState::Stopped | HostConnState::NeedsRestart(_) => true,
+            HostConnState::Disconnected(disconnected) => disconnected.detail.is_some(),
+            HostConnState::Connecting { .. }
+            | HostConnState::Connected
+            | HostConnState::TakenOver { .. } => false,
+        }
+    }
+
     /// How this state reads in the sidebar's host band (plan 037 §3.1) —
     /// which dot it paints, whether its rows respond, and what its
     /// rollup says. The mapping lives here so the section model in

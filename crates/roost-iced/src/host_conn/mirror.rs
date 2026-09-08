@@ -299,6 +299,12 @@ impl SharedMirror {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// A copy of the contents, detached from this handle — the workspace
+    /// as of now, with no writer behind it.
+    pub(crate) fn snapshot(&self) -> HostMirror {
+        self.read().clone()
+    }
+
     /// Replace the whole mirror: a fresh snapshot after a connect or a
     /// resync, which is purge-then-rebuild by contract.
     pub(crate) fn reset(&self, mirror: HostMirror) {

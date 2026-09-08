@@ -89,7 +89,7 @@ pub(crate) use mirror::SharedMirror;
 pub(crate) use queue::{HostIntent, HostOpError, HostOps};
 pub(crate) use reconnect::{Decision, DropInput};
 pub(crate) use state::{ConnectFacts, HostConnState, HostTransport};
-pub(crate) use task::{ConnectMode, Shutdown};
+pub(crate) use task::{ConnectMode, Resume, Shutdown};
 pub(crate) use upload::{UploadResult, UploadSource};
 
 /// How far wall-clock time may run past an armed delay before the
@@ -627,6 +627,27 @@ struct HostEntry {
     /// session back" and nothing else). An auto-reconnect never clears
     /// it, which is the point.
     observer_only: bool,
+    /// Where this host's last connection left the event stream, so the
+    /// next one can replay the gap instead of re-listing the workspace
+    /// (plan 056 §3.2).
+    ///
+    /// **On the entry rather than on the [`HostConn`]**, which is the
+    /// whole reason it works: a connection-scoped copy would be retired
+    /// the moment the connection left `Connected`, and the case this
+    /// exists for — an ssh ladder reconnecting after a drop — is
+    /// precisely a fresh task built while there is no connection at all.
+    ///
+    /// It is a fact about the *session*, so the wire going away does not
+    /// touch it: [`Self::conn`] being gone, a `Disconnected`, a
+    /// `Connecting`, a takeover, an explicit disconnect and the `forget`
+    /// a reconnect runs all leave it. Only the session being gone or
+    /// unreachable clears it — see [`HostConnState::session_is_gone`] —
+    /// because a new one has a new id the server would refuse anyway.
+    ///
+    /// Written by [`HostConnSet::note_connect_facts`], which overwrites
+    /// it wholesale: a fresh connect therefore heals a checkpoint that
+    /// named a session which has since restarted.
+    resume: Option<Resume>,
     /// What a bootstrap is doing to this host right now, or how it
     /// ended.
     ///
@@ -940,6 +961,10 @@ impl HostConnSet {
             .and_then(|entry| entry.conn.as_ref()?.incarnation);
         let held_lease = self.carried_lease(host, cause);
         let observer_only = self.observer_mode(host, cause);
+        // Every cause, deliberately: what the checkpoint describes is
+        // the session, not who asked to dial it, so an explicit Connect
+        // resumes exactly as an auto-reconnect does.
+        let resume = self.checkpoint_for(host);
         self.forget(host);
         // An ssh attempt started at [`Self::open_ssh`] and was numbered
         // there, so the connect a working tunnel reaches carries that
@@ -969,6 +994,7 @@ impl HostConnSet {
             mode,
             held_lease,
             observer_only,
+            resume,
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
@@ -2193,12 +2219,39 @@ impl HostConnSet {
         conn.payload_kind.filter(|_| conn.state.is_connected())
     }
 
-    /// File what one incarnation's prologue learned. A stale incarnation
-    /// records nothing, same contract as [`Self::note_payload_kind`].
+    /// File what one incarnation's prologue learned, and check the
+    /// session it reached in as this host's resume point. A stale
+    /// incarnation records nothing, same contract as
+    /// [`Self::note_payload_kind`].
+    ///
+    /// The mirror is present by the time this runs: a task publishes
+    /// `Reset` before the state and the state before the facts, so the
+    /// checkpoint is the very handle the sidebar is already drawing.
     pub(crate) fn note_connect_facts(&mut self, incarnation: HostId, facts: ConnectFacts) {
-        if let Some(conn) = self.conn_at_mut(incarnation) {
+        let Some(host) = self.owner_of(incarnation) else {
+            return;
+        };
+        let mirror = self.mirrors.get(&incarnation).map(Arc::clone);
+        let Some(entry) = self.entries.get_mut(&host) else {
+            return;
+        };
+        if let Some(mirror) = mirror {
+            entry.resume = Some(Resume {
+                session_id: facts.session_id.clone(),
+                mirror,
+            });
+        }
+        if let Some(conn) = entry.conn.as_mut() {
             conn.facts = Some(facts);
         }
+    }
+
+    /// The checkpoint a task dialing this host now would start from.
+    ///
+    /// Frozen rather than shared — [`Resume::freeze`] is where that
+    /// matters and why.
+    fn checkpoint_for(&self, host: &str) -> Option<Resume> {
+        Some(self.entries.get(host)?.resume.as_ref()?.freeze())
     }
 
     /// What this host's live connection learned about its session.
@@ -2508,6 +2561,13 @@ impl HostConnSet {
                 .and_then(|entry| entry.ssh.as_mut())
             {
                 ssh.reached_connected = true;
+            }
+        }
+        // The resume point outlives every way the wire can go, and
+        // nothing else — see [`HostEntry::resume`].
+        if next.session_is_gone() {
+            if let Some(entry) = self.entries.get_mut(&host) {
+                entry.resume = None;
             }
         }
         // Task-independent by design: the arm below ends this host's
@@ -5674,6 +5734,212 @@ mod tests {
         // describing them.
         set.disconnect("h1");
         assert_eq!(set.tabs("h1"), 3);
+    }
+
+    // ---- the resume point (plan 056 §3.2) ------------------------------
+
+    /// A host whose connection has reached a session, published its rows
+    /// and filed its facts — the state a checkpoint exists in. The
+    /// mirror handed back is the live one the connection holds.
+    fn a_host_with_a_checkpoint() -> (
+        HostConnSet,
+        crate::engine_feed::EngineFeedReceiver,
+        HostId,
+        Arc<SharedMirror>,
+    ) {
+        let (mut set, feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-resume.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        let mirror = Arc::new(SharedMirror::new(a_mirror(&[1])));
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.apply_workspace(incarnation, HostWorkspaceEvent::Reset(Arc::clone(&mirror)));
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+        (set, feed, incarnation, mirror)
+    }
+
+    fn a_mismatch() -> state::BuildMismatch {
+        state::BuildMismatch {
+            kind: state::MismatchKind::Protocol,
+            session_protocol: 3,
+            client_protocol: 4,
+            session_build: "gb-old".into(),
+            client_build: "gb-new".into(),
+            session_payload_kinds: vec!["ghostty-snapshot".into()],
+            restart: state::RestartAction::RestartLocal,
+        }
+    }
+
+    /// A commit with nothing in it. The fence is all these cases read.
+    fn a_commit(revision: u64) -> roost_ipc::messages::EventBatch {
+        roost_ipc::messages::EventBatch {
+            revision,
+            events: Vec::new(),
+        }
+    }
+
+    /// The one edge that fills a checkpoint: a prologue's facts landing
+    /// behind the `Reset` that registered its mirror. The mirror it
+    /// names is the very one the section is drawing.
+    #[tokio::test]
+    async fn a_prologues_facts_check_its_session_in_as_the_resume_point() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-resume-seed.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+        assert!(
+            set.checkpoint_for("h1").is_none(),
+            "with no mirror registered there is no fence to resume from"
+        );
+
+        set.apply_workspace(
+            incarnation,
+            HostWorkspaceEvent::Reset(Arc::new(SharedMirror::new(a_mirror(&[2])))),
+        );
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+        let checkpoint = set
+            .checkpoint_for("h1")
+            .expect("a prologue that reached a session left one");
+        assert_eq!(checkpoint.session_id, "sess-1");
+        assert_eq!(
+            checkpoint.mirror.read().tabs().count(),
+            2,
+            "the rows the section is already drawing"
+        );
+
+        let stale = set.minter.mint("h1", set.conn("h1").generation - 1);
+        set.note_connect_facts(stale, skewed_facts("sess-stale"));
+        assert_eq!(
+            set.checkpoint_for("h1").map(|resume| resume.session_id),
+            Some("sess-1".into()),
+            "a replaced connection checks nothing in, exactly as its facts do"
+        );
+    }
+
+    /// What the set seeds is a frozen copy, never the live handle — see
+    /// [`Resume::freeze`]. The connection being replaced can still fold
+    /// one more commit in after the seeding, and the new task's fence
+    /// must not move with it.
+    #[tokio::test]
+    async fn the_checkpoint_a_new_task_is_seeded_with_is_frozen() {
+        let (set, _feed, _incarnation, live) = a_host_with_a_checkpoint();
+        let seeded = set.checkpoint_for("h1").expect("a checkpoint");
+        assert!(
+            !Arc::ptr_eq(&seeded.mirror, &live),
+            "a seed sharing the live handle is the whole hazard"
+        );
+
+        assert!(
+            live.apply_batch(&a_commit(2)),
+            "the old writer's last apply"
+        );
+        assert_eq!(
+            seeded.mirror.read().revision,
+            1,
+            "the seed must not move with it, or the replay of commit 2 \
+             would be discarded as already applied"
+        );
+    }
+
+    /// The wire going away says nothing about the session, so none of
+    /// its states retire the checkpoint. The session going away — it
+    /// stopped, it needs a restart, or no retry will ever produce one —
+    /// is the only thing that does: revisions restart at zero in every
+    /// process, and the new one's id would be refused anyway.
+    #[tokio::test]
+    async fn only_the_session_going_away_clears_the_resume_point() {
+        for kept in [
+            HostConnState::Connecting { previous: None },
+            dropped("the stream closed"),
+            HostConnState::TakenOver { taken_by: None },
+        ] {
+            let (mut set, _feed, incarnation, _) = a_host_with_a_checkpoint();
+            set.apply_state(incarnation, kept.clone());
+            assert!(
+                set.checkpoint_for("h1").is_some(),
+                "{kept:?} is a fact about the wire, not the session"
+            );
+        }
+
+        for cleared in [
+            HostConnState::Stopped,
+            HostConnState::NeedsRestart(a_mismatch()),
+            HostConnState::Disconnected(state::Disconnected {
+                reason: "cannot find roost-session".into(),
+                detail: Some("no rung found a binary".into()),
+                retry_in: None,
+            }),
+        ] {
+            let (mut set, _feed, incarnation, _) = a_host_with_a_checkpoint();
+            set.apply_state(incarnation, cleared.clone());
+            assert!(
+                set.checkpoint_for("h1").is_none(),
+                "{cleared:?} means the next connection reaches a different session"
+            );
+        }
+    }
+
+    /// Explicit, automatic and observer-only attempts all start from the
+    /// checkpoint — what it describes is the session, not who asked to
+    /// dial it — and the `forget` every reconnect runs, which drops the
+    /// connection and the rows keyed on it, leaves it alone.
+    #[tokio::test]
+    async fn every_cause_reconnects_from_the_checkpoint() {
+        for cause in [AttemptCause::Explicit, AttemptCause::AutoReconnect] {
+            let (mut set, _feed, _, _) = a_host_with_a_checkpoint();
+            set.connect(
+                "h1",
+                "pop-os",
+                PathBuf::from("/nonexistent/roost-set-resume-cause.sock"),
+                HostTransport::UnixSocket,
+                ConnectMode::Dial,
+                cause,
+            );
+            assert!(set.checkpoint_for("h1").is_some(), "{cause:?}");
+        }
+
+        // Observer-only is an auto-reconnect after a takeover: a deposed
+        // client watches the same session and resumes on the same fence.
+        let (mut set, _feed, incarnation, _) = a_host_with_a_checkpoint();
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        set.connect(
+            "h1",
+            "pop-os",
+            PathBuf::from("/nonexistent/roost-set-resume-observer.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        assert!(set.observes_only("h1"), "the attempt is an observer's");
+        assert!(set.checkpoint_for("h1").is_some());
+    }
+
+    /// An explicit disconnect drops the wire and keeps the rows; it
+    /// keeps the checkpoint for the same reason — those shells are still
+    /// running over there. Removing the host takes everything.
+    #[tokio::test]
+    async fn a_disconnect_keeps_the_resume_point_and_a_remove_takes_it() {
+        let (mut set, _feed, _, _) = a_host_with_a_checkpoint();
+        set.disconnect("h1");
+        assert!(set.checkpoint_for("h1").is_some());
+
+        set.remove("h1");
+        assert!(set.checkpoint_for("h1").is_none());
     }
 
     #[test]
