@@ -872,6 +872,8 @@ for the wire contract, and
 [`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
 for the shipped mechanics.
 
+*Amended by [DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08) — the "attach input + `tab.write` owned" half is reversed; reads-free stands.*
+
 ### DL-24: no supervisor artifact — a session comes up on demand (2026-09-08)
 
 A session comes up exactly three ways: a client's own localhost
@@ -904,6 +906,68 @@ still shows a hand-written `systemd --user` unit and launchd LaunchAgent
 for anyone who wants reboot survival anyway — that is a recipe the
 reader owns and edits, not a feature roost ships, installs, or verifies
 for them.
+
+### DL-25: raw input is open to every same-UID client; the lease is the foreground (2026-09-08)
+
+[DL-23](#dl-23-the-interactive-lease-is-re-cut-reads-free-attach-input-tabwrite-owned-2026-09-07)
+(plan 049, R1) made reads free and writes owned: `events.subscribe`
+needed no lease any more, but attach input and `tab.write` did. Plan
+057 (R15, [#453](https://github.com/charliek/roost/issues/453))
+reverses the second half on purpose, leaving the first exactly as it
+was — this is not a retreat from R1, it is R1's other half turning out
+to have been the wrong call.
+
+The 2026-09-08 measurement against tmux and herdr, the two substrates
+roost keeps comparing itself to, is what forced the call: tmux lets
+every attached client type into a shared pane, and any same-UID process
+can `send-keys` into one whether or not it is attached at all; herdr's
+multi-client attach has no owner concept for input in the first place.
+Both still put bells, clipboard writes, and pane sizing on one
+foreground client — neither substrate gates *typing* on ownership, only
+the side effects that have to pick a single recipient. Roost's owned
+input was stricter than either for no product gain, and it had a real
+cost: the product's pitch is "start it on the desktop, pick it up on
+the phone, sit back down," and a phone that wanted to type one line had
+to depose the desktop to do it, which froze the desktop's grid in the
+old lease semantics. That is a worse multi-device story than either
+thing roost measures itself against ships today.
+
+**What the lease still means.** Being the foreground is exactly four
+things: the connection's `events.subscribe` stream is classified driver
+and receives `tab.effect` (bells, OSC 52 clipboard writes); its
+`session.set_focus` is the one that mutes notifications;
+`session.driver_changed` names it; and the session-wide settings and
+upload ops — `session.set_theme`, `session.set_agent_hooks`,
+`session.put_file`, `session.set_focus` — accept only its lease. It
+never again gates `tab.write` or `tab.attach`. `session.connect
+{takeover}` itself is unchanged: one holder, takeover invalidates and
+tombstones the old one, `already-connected` without `takeover` — what
+changed is what holding the lease is *for*, not how it changes hands.
+
+**Geometry follows the last client that interacted, not the lease.**
+herdr's rule — the last geometry-bearing interaction (a focused attach,
+a data-plane INPUT or RESIZE frame, `tab.resize`) sizes the PTY — is
+adopted as-is. Smallest-wins, the alternative considered, was rejected
+because it makes a phone glancing at a tab shrink the desktop's grid
+for everyone; last-interactor-wins at least ties the resize to someone
+actually doing something with the tab, even though two clients
+alternating keystrokes will flap the size between them. That flapping
+is accepted, not solved, here.
+
+**Additive, not a new generation.** `SESSION_PROTOCOL_VERSION` stays
+`4`; the reopened gate is advertised as `open_input` in
+`session.identify.features`, so a `4` session that has not yet picked
+this up still answers a leaseless write with `connect-required` and a
+client feature-detects the difference rather than assuming it from the
+number. Because nothing about `tests/ipc-vectors/session.identify.response.v4.json`
+moved — `features` is asserted as a subset, not compared field-for-field
+— shed's pinned identify vector needs no re-pin for this.
+
+See [`reference/ipc.md`](../reference/ipc.md#sessionconnect),
+[`reference/ipc-compatibility.md`](../reference/ipc-compatibility.md#version-bumps),
+and
+[`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
+for the shipped mechanics.
 
 ## Direction (under evaluation)
 

@@ -39,10 +39,11 @@ not.
 
 Two triggers revisit that decision:
 
-* the wire settles — R1 (the lease re-cut) through R5 are the changes
-  currently expected to move it; once they have landed and the shape has
-  stopped moving, git tags per protocol generation are the natural next
-  step, and cheap;
+* the wire settles — R1 (the lease re-cut) through R5, and R15 (plan
+  057, the lease re-cut *again*, opening `tab.write`/`tab.attach` back
+  up) are the changes currently expected to move it; once they have
+  landed and the shape has stopped moving, git tags per protocol
+  generation are the natural next step, and cheap;
 * a consumer appears outside charliek's repositories, for whom "pin a
   commit of someone else's application repo" is a worse contract than a
   published crate.
@@ -203,9 +204,12 @@ op parameters alike*.** An open string list, decode-when-absent like
 `payload_kinds`, naming the additive session capabilities this build
 serves — seeded with `"put_file"` (plan 049, R1) and joined by
 `"events_resume"` (plan 052) for `events.subscribe`'s
-`from_revision`/`session_id` pair and `"tab_dump_scrollback"` (plan
-053) for `tab.dump`'s `scrollback` count, both capabilities that are a
-parameter on an existing op rather than a new one. It exists because the
+`from_revision`/`session_id` pair, `"tab_dump_scrollback"` (plan
+053) for `tab.dump`'s `scrollback` count, and `"open_input"` (plan 057,
+R15) for the reopened `tab.write`/`tab.attach` gate and
+`tab.attach`'s `focus` parameter — the first three add a capability,
+the fourth *removes* a restriction the same generation had imposed, and
+`features` carries both kinds. It exists because the
 alternative, bumping `SESSION_PROTOCOL_VERSION` for every additive
 capability, conflates two different questions: "can this peer speak my
 generation of the wire at all" (the exact gate above) and "does this
@@ -215,8 +219,15 @@ answer the second question with, which is what set the now-superseded
 exception described under [Version bumps](#version-bumps) below. A
 client checks `features` the same way it checks `payload_kinds`: read
 the list, look for the name it cares about, degrade gracefully if it's
-missing. What a whole generation bump covers is never listed in
-`features` — a client already knows its own `session_protocol`.
+missing. The line between the two channels is not "capability vs.
+restriction" but assumption vs. reliance: a generation pins what a
+client may *assume* about the wire — a `4` client assumes leaseless
+subscribe and a lease-gated write, full stop — and a feature entry
+names what it may *additionally* rely on beyond that, including a
+reversal of what the generation otherwise implies. `open_input` is the
+case that makes this concrete: a `4` session without it still answers
+`connect-required` to a leaseless write, so a client feature-detects
+the reversal instead of assuming it from the number alone.
 
 **`features` is monotonic within a generation.** A capability already
 listed is never removed without a `SESSION_PROTOCOL_VERSION` bump —
@@ -309,6 +320,22 @@ request is refused or misunderstood, not merely a feature it lacks),
 which is the ordinary rule above, not the additive-op fallback. A new
 *event* a client can ignore, or a lease-gated op a client never sends,
 stays additive.
+
+**Plan 057 (R15) reopened `tab.write`'s and `tab.attach`'s gate, and
+that half is not the mirror of R1's.** Closing a gate is breaking —
+that is R1, above. Opening one back up is additive: an old (post-R1,
+pre-R15) client that still presents a `lease` on every write gets
+exactly the reply it always got, because a lease that is offered is
+now simply accepted and ignored rather than checked. Nothing about its
+request stops decoding or gets refused, so R15 needed no new
+generation — `SESSION_PROTOCOL_VERSION` stays `4` and the frozen `v4`
+identify vector is untouched. A client detects the reopened gate the
+ordinary capability-negotiation way, `open_input` in
+[`session.identify.features`](ipc.md#sessionidentify), not by
+generation: a `4` session that predates R15 carries no `open_input`
+entry and still answers a leaseless write with `connect-required`,
+which is the feature-detectable form of "this peer doesn't do that
+yet," not a decode failure.
 
 ## Fixtures are the contract
 

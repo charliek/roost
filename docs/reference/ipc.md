@@ -401,10 +401,14 @@ host until it is swept.
 **Error precedence**, in order:
 
 1. `not-found` — the `tab` ref resolves to no live terminal.
-2. `host-unavailable` — the host is frozen (taken over, stopped), not
-   connected, or it disconnected, reconnected or was taken over
-   mid-gesture; also a tab closed under the gesture and an app
-   shutting down. The message names the file where there is one.
+2. `host-unavailable` — the host is stopped, not connected, or it
+   disconnected, reconnected or was taken over mid-gesture; also a tab
+   closed under the gesture and an app shutting down. A taken-over host
+   folds in here too, but for a narrower reason than the others: an
+   upload is one of the session's foreground-only ops (plan 057, R15),
+   so a client that is live but not the foreground gets `host-unavailable`
+   with a message naming who has it (`NotForeground`) rather than a
+   dead connection. The message names the file where there is one.
 3. `invalid-param` — an empty or relative `paths`, or a request where
    **every** path was skipped, in which case the message lists each
    path with its reason (`nothing to send: /tmp/build (directory)`).

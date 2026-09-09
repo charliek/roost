@@ -236,6 +236,28 @@ release workflow asserts they agree).
 
 ### Changed
 
+- **A second window, or a phone, can type into a tab you already have
+  open — without taking it over (#453)** — attaching to a tab and
+  writing into it used to need the session's one interactive lease, so
+  picking up a session from a second device meant deposing whatever had
+  it first, which froze the first device's terminal grid. Typing and
+  attaching are now open to any client on the same machine and user; the
+  lease survives only as the tab's **foreground** — who gets bells and
+  clipboard writes, whose focus mutes notifications, and who can push
+  theme/agent-hook/file-upload changes. Taking over the foreground no
+  longer freezes anything: the desktop keeps typing, resizing, and
+  switching tabs, its status band names whoever now holds the
+  foreground, and **"Take the foreground"** takes it back in place —
+  no reconnect, no snapshot, no blink. A tab is now sized by whichever
+  client last interacted with it (typed, resized, or focus-attached),
+  not by the foreground alone, so two clients typing at different sizes
+  will flip the grid between them by design. On the wire:
+  `session.identify.features` gains `"open_input"`, `tab.attach` takes
+  an optional `focus` parameter, `taken-over`/`superseded` no longer
+  close a control or data connection, and `SESSION_PROTOCOL_VERSION`
+  stays `4`. **Skew note:** against a `roost-session` built before this
+  change, the old behavior still applies — a takeover still closes the
+  connection, and ↻ is a full reconnect rather than an in-place retake.
 - **`tab.reorder` / `project.reorder` narrow the ids they accept** — the
   new host-qualified ref parser requires the canonical integer spelling,
   so non-canonical forms like `"+4"` or `"04"`, which the old codec

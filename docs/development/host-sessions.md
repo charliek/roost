@@ -71,34 +71,146 @@ flowchart LR
 
 ## The lease/takeover lifecycle
 
-A session has one **interactive lease** at a time — authority to *write*: attach input and, as of plan 049 (R1), `tab.write` on this socket. Reconnecting is always a takeover on this wire (there is no separate "steal" op): the same `session.connect{takeover: true}` a fresh connect uses is what displaces a stale one. **Reading is not gated at all** — `events.subscribe` takes no lease; the lease it is *handed* only classifies which of two feeds the resulting stream gets. The lease is interactive-ownership coordination, not a security boundary: any same-UID client can take over on purpose, same as always — what changed is the axis it gates.
+A session has one **interactive lease** at a time, but as of plan 057
+(R15, [#453](https://github.com/charliek/roost/issues/453)) the lease
+is not authority to write — it never was going to hold up against
+"start on the desktop, pick it up on the phone, sit back down," and R1
+(plan 049) had it backwards anyway (reads gated, writes open). What the
+lease is now is authority to be the **foreground**: whichever
+connection holds it gets `tab.effect` (bells, OSC 52 clipboard writes)
+on its event stream, its `session.set_focus` is the one that mutes
+notifications, `session.driver_changed` names it, and it is the only
+connection the session-wide settings ops (`session.set_theme`,
+`session.set_agent_hooks`, `session.put_file`, `session.set_focus`)
+will accept. It never gates input: `tab.write` and `tab.attach` take no
+lease, from any same-UID client, at any time. Reconnecting is always a
+takeover on this wire (there is no separate "steal" op): the same
+`session.connect{takeover: true}` a fresh connect uses is what
+displaces a stale one. **Reading was already ungated by R1** —
+`events.subscribe` takes no lease; the lease it is *handed* only
+classifies which of two feeds the resulting stream gets. The lease is
+interactive-ownership coordination, not a security boundary: any
+same-UID client can take over on purpose, same as always.
 
 ```mermaid
 flowchart LR
   Sub(("events.subscribe<br/>(no lease required)")) -- "lease absent/stale/unknown" --> Observer["observer stream:<br/>state batches +<br/>notification.fired<br/>(no tab.effect)"]
   Sub -- "lease present + current" --> Driver["driver stream:<br/>state batches +<br/>tab.effect"]
-  NoLease(("no lease held")) -- "session.connect" --> Held["lease held<br/>(this connection may write)"]
-  Held -- "attach + tab.write" --> Driver
-  Held -- "another client:<br/>session.connect{takeover: true}" --> Takeover["takeover<br/>(old lease tombstoned,<br/>tokens purged,<br/>control/data conns closed)"]
-  Takeover -- "control/data connection" --> ErrorTO["ERROR / close<br/>{code: taken-over}"]
+  NoLease(("no lease held")) -- "session.connect" --> Held["lease held<br/>(this connection is the foreground)"]
+  AnyClient(("any same-UID client,<br/>lease or none")) -- "tab.attach + tab.write" --> Live["reads + writes flow either way —<br/>never lease-gated"]
+  Held -- "another client:<br/>session.connect{takeover: true}" --> Takeover["takeover<br/>(old lease invalidated + tombstoned;<br/>every control + data connection<br/>stays open)"]
   Takeover -- "every registered<br/>event stream" --> DriverChanged["session.driver_changed<br/>{taken_by}<br/>(non-terminal — stream survives)"]
   DriverChanged --> Observer
-  DriverChanged --> UIObs["iced: live observer —<br/>banner names taker,<br/>tab list/status/notifications live,<br/>grid frozen"]
+  DriverChanged --> UIObs["iced: still live —<br/>band names the new foreground,<br/>grid keeps typing + resizing,<br/>bells/clipboard/notif-mute move away"]
   Held -- "session.stop<br/>(any client)" --> Stopping["latches stopping;<br/>every control/data conn<br/>labeled + closed"]
   Stopping -- "every event stream<br/>(driver or observer)" --> StoppingS["session.stopping<br/>{reason: stop}<br/>(terminal)"]
   Stopping -- "data connection" --> ErrorS["ERROR<br/>{code: shutting-down}"]
   StoppingS --> UIS["iced: Stopped state —<br/>frozen frame + banner,<br/>Start a new session"]
 ```
 
-**One tombstone.** The session remembers only the *most recently* displaced lease, so its holder is told `taken-over` (someone else has it now) rather than the less informative `connect-required` (you were never connected) — a second takeover forgets the first tombstone in favor of the newest one, since the first holder has already been told. That tombstone answers `require_lease` on `tab.attach` and `tab.write`; it says nothing about event streams, which are never closed by a takeover at all (below).
+**One tombstone.** The session remembers only the *most recently*
+displaced lease, so its holder is told `taken-over` (someone else has
+it now) rather than the less informative `connect-required` (you were
+never connected) — a second takeover forgets the first tombstone in
+favor of the newest one, since the first holder has already been told.
+That tombstone answers `require_lease` on the foreground-only ops
+(`session.set_theme`, `session.set_agent_hooks`, `session.put_file`,
+`session.set_focus`); it says nothing about `tab.write` or
+`tab.attach`, which never ask for a lease at all, and nothing about
+event streams, which are never closed by a takeover either (below).
 
-**Takeover is non-terminal for event streams.** A control or data connection under the displaced lease still closes exactly as before — best-effort under a short deadline, a peer that stopped reading gets a bare `EOF` instead. An event stream is different: it is registered in a separate observer registry, never under the lease's own connection list, structurally so a takeover cannot close the stream it needs to reclassify. It gets one non-terminal `session.driver_changed{taken_by}` envelope, injected into its existing push queue, and **keeps delivering afterward** — reclassified from driver to observer if it was the deposed lease's own stream, unchanged if it was already an observer. `taken_by` is the new holder's normalized `client_label` (`"unknown client"` if none was given) — display metadata a UI renders as what the client *reports itself as*, never a verified identity. A stream whose queue is already full when the envelope would land never sees it: its relay ends and the peer gets a bare EOF, the same resync semantics event backpressure has always had, rather than the takeover blocking on a slow reader. `session.stopping` is the only *terminal* envelope on this wire; `session.driver_changed` is deliberately its non-terminal sibling and a client must not latch on it.
+**Takeover closes nothing — control or data.** Before R15 a takeover
+closed every connection registered under the displaced lease; now the
+registry tracks control connections independently of who holds the
+lease (a `controls` map keyed by connection, not by `Lease::conns`), so
+invalidating and tombstoning the lease touches only who is admitted to
+the foreground-only ops. The displaced client's control connection
+stays open and keeps answering everything that was never lease-gated;
+its data connections (its tab attaches) stay open and keep streaming
+and accepting input exactly as before the takeover. What *does* die
+with the takeover is its focus — clearing `focus_conn` at takeover is
+preserved from before R15, so the displaced client's notifications
+un-mute the moment it stops being the foreground, same as always.
 
-**The observer stream is a first-class state, not a degraded one.** `events.subscribe` with no lease, a stale one, or one that was just taken over all land on the same feed: every workspace batch plus `notification.fired`, never `tab.effect` (that stays the driver's own side-channel — bells, OSC 52 clipboard writes belong to whoever is actually typing). A revision whose only events were filtered out still arrives as an empty batch, so the strictly-consecutive revision fence a client relies on never sees a gap that isn't real loss. This is what lets a second Roost window, or a phone, watch a session's tab list, titles, and notifications live without ever claiming the lease — and it is what the deposed driver falls back to instead of losing its connection outright.
+**Event streams were already non-terminal on takeover, before R15.**
+An event stream is registered in a separate observer registry,
+structurally so a takeover cannot close the stream it needs to
+reclassify. It gets one non-terminal `session.driver_changed{taken_by}`
+envelope, injected into its existing push queue, and **keeps delivering
+afterward** — reclassified from driver to observer if it was the
+deposed lease's own stream, unchanged if it was already an observer.
+`taken_by` is the new holder's normalized `client_label` (`"unknown
+client"` if none was given) — display metadata a UI renders as what the
+client *reports itself as*, never a verified identity. A stream whose
+queue is already full when the envelope would land never sees it: its
+relay ends and the peer gets a bare EOF, the same resync semantics
+event backpressure has always had, rather than the takeover blocking on
+a slow reader. `session.stopping` is the only *terminal* envelope on
+this wire; `session.driver_changed` is deliberately its non-terminal
+sibling and a client must not latch on it.
 
-**The displaced window keeps its terminal frame, live everything else.** `TakenOver`'s tab list, titles, agent status, and notifications keep updating from the surviving observer stream; only the terminal *grid* freezes, because attach input is gone with the lease. `Stopped` is the one state that freezes everything, because the shells themselves are gone. The two banners promise different things on purpose: `TakenOver`'s "Reconnect here" is honest because the session is still alive, just held elsewhere and still being watched; `Stopped`'s "Start a new session" is deliberately not phrased as a reconnect. A banner click carries the human latency of a press, so it names the frame it was drawn on and is refused if the state has since moved on (e.g. a reconnect already started, or `TakenOver` has since become `Stopped`) — silently reinterpreting a stale click as "start fresh" would be exactly the silent scrollback loss plan 037 §3.2 forbids.
+**The observer stream is a first-class state, not a degraded one.**
+`events.subscribe` with no lease, a stale one, or one that was just
+taken over all land on the same feed: every workspace batch plus
+`notification.fired`, never `tab.effect` (that stays the foreground's
+own side-channel — bells, OSC 52 clipboard writes belong to whoever
+currently holds the lease, not to whoever is actually typing, since
+typing gates on nothing). A revision whose only events were filtered
+out still arrives as an empty batch, so the strictly-consecutive
+revision fence a client relies on never sees a gap that isn't real
+loss. This is what lets a second Roost window, or a phone, watch a
+session's tab list, titles, and notifications live without ever
+claiming the lease — and, since R15, it no longer has to give up
+typing to do so.
 
-**The reconnect probe never authorizes a silent steal-back.** A client whose connection merely dropped — the wire, not a takeover — has to find out which happened before it reconnects, because reconnecting as a driver *is* a takeover. It re-presents its held lease as a `session.set_theme` resend (lease-checked before mutation, so the reply is the verdict) rather than through `events.subscribe`, which no longer proves anything since it takes no lease at all. Exactly one outcome resumes as driver: the lease is still current. **Any non-current verdict — `taken-over` *or* `connect-required` — enters observer mode**, not just `taken-over`; a client displaced two takeovers ago sees the tombstone's fallback `connect-required`, and treating that as permission to reconnect would be exactly the steal-back this policy exists to prevent. A timeout or any other transport uncertainty **never** authorizes a takeover either — the client retries the probe under its normal backoff instead, because proving nothing is not the same as proving the lease moved. Only the explicit takeback affordance — the user pressing "take the session back" — promotes an observer to driver, on a fresh connection; auto-retry never does it on its own. `ROOST_LEASE` mirrors this for `roostctl tab send` against a session socket: presenting a lease is the only way to write, there is no flag (only the env var, so the token never rides argv or `ps`), and no auto-connect — a one-shot CLI minting its own lease would silently depose whatever was driving.
+**The displaced window keeps everything, including its terminal
+frame.** Before R15, `TakenOver` froze only the terminal *grid*,
+because attach input died with the lease; since attach input is no
+longer lease-gated at all, nothing freezes on a takeover. The iced
+client keeps its attach, keeps typing, keeps resizing, keeps switching
+tabs; what it loses is being the foreground — bells/clipboard stop
+arriving, its focus no longer mutes notifications, and the session-wide
+settings ops are refused locally until it takes the foreground back. A
+status strip overlaid on the grid names the new foreground and offers
+**"Take the foreground"**, which retakes it *in place* — one
+`session.connect{takeover: true}` on the existing control connection,
+a `session.set_theme` reseed, and a re-dial of only the event stream
+resuming from its checkpoint — no reattach, no new snapshot, no blink.
+`Stopped` is still the one state that freezes everything, because the
+shells themselves are gone, and it keeps its own scrim + "Start a new
+session" banner unchanged. A deposed connection to a session that
+predates R15 (no `open_input` in its `session.identify.features`) sees
+the old behavior instead: the server closes its data connections and
+its control connection, its attach ends, keys stop routing, and "Take
+the foreground" falls back to a full reconnect because there is no
+surviving control leg to retake in place.
+
+**The reconnect probe never authorizes a silent steal-back.** A client
+whose connection merely dropped — the wire, not a takeover — has to
+find out which happened before it reconnects as the foreground, because
+`session.connect{takeover: true}` always displaces whoever currently
+holds the lease. It re-presents its held lease as a `session.set_theme`
+resend (lease-checked before mutation, so the reply is the verdict)
+rather than through `events.subscribe`, which no longer proves anything
+since it takes no lease at all. Exactly one outcome resumes as
+foreground: the lease is still current. **Any non-current verdict —
+`taken-over` *or* `connect-required` — enters observer-of-foreground
+mode**, not just `taken-over`; a client displaced two takeovers ago
+sees the tombstone's fallback `connect-required`, and treating that as
+permission to retake would be exactly the steal-back this policy exists
+to prevent. A timeout or any other transport uncertainty **never**
+authorizes a takeover either — the client retries the probe under its
+normal backoff instead, because proving nothing is not the same as
+proving the lease moved. Only an explicit affordance — the user
+pressing "Take the foreground" — promotes an observer back to
+foreground, on the existing control connection (or a fresh one, for the
+pre-R15 fallback path); auto-retry never does it on its own.
+`ROOST_LEASE` still exists for `roostctl tab send` against a session
+socket, but as of R15 it is vestigial for the write itself — a write
+needs no credential, same-UID is the boundary — and is accepted and
+ignored if set; it remains the way a one-shot CLI could *also* present
+a lease without becoming the foreground, since presenting one on a
+write was never how the foreground changed hands.
 
 **Auto-reconnect never auto-spawns.** Launch-time reconnect — on both platforms — is *connect-if-present* and **localhost-only**: it probes that socket, and if nothing answers, the section shows disconnected with a manual ↻ rather than silently starting a daemon. A saved SSH host is not dialed at launch at all — `reconnect_saved_hosts` declines every non-localhost transport before resolving it, so an SSH host is skipped rather than probed and found wanting. Connecting to a remote machine is an outbound decision, and at launch nobody has asked for it. A *mid-session* drop is different. A `localhost` session that was running and *went away* is retried with jittered, capped backoff (`Backoff` in `host_conn/state.rs`, 250ms base up to a 30s ceiling); a saved SSH host runs the same kind of ladder once two gates hold at the moment of the drop — the host resolves to `ResolvedTransport::Ssh` (a plain `UnixSocket` target stays manual, unchanged) and the connection had actually reached `Connected` at least once, so a host that never worked in the first place doesn't grow a ladder off its own first failure. The SSH ladder runs its own schedule — 1s base, doubling, jittered `[0.5, 1.0]×`, capped at 30s — and gives up after 10 attempts, settling to `disconnected` with copy that says so; ↻ Reconnect never leaves the screen and is the recovery either way. Not every drop is retried: a changed or unknown host key, a refused login, and a session that is actually gone all settle immediately instead of looping, because each has a different correct next step (see the [user guide's troubleshooting table](../guides/host-sessions.md#troubleshooting) for the full set). Either way, if the session itself died, the host settles on "session ended" (or "no session," for SSH) and only an explicit Connect starts a fresh one — auto-reconnect never starts one for you.
 
@@ -108,7 +220,7 @@ flowchart LR
 
 Two small additions ride the existing events stream as new event types — additive, and of the kind that does not move `SESSION_PROTOCOL_VERSION` (an older client simply ignores an event name it doesn't recognize), so it stayed at `2` for HS-2. Plan 047 later moved it to `3` for `session.put_file`, which a pre-047 session could only answer `unknown-op` — see the versioning rule in [`ipc.md`](../reference/ipc.md#session-sockets):
 
-- **`tab.effect` events** — a session's per-tab OSC scan now emits `bell` and OSC 52 `clipboard-write` as client-directed effects on the events stream (`crates/roost-engine/src/tab_task.rs`), for whichever client currently holds the tab's lease to apply. Everything else the scanner sees (pointer shape, today) stays dropped and debug-logged in the tab task, by design — the envelope is scoped to these two effects rather than left open to "just one more."
+- **`tab.effect` events** — a session's per-tab OSC scan now emits `bell` and OSC 52 `clipboard-write` as client-directed effects on the events stream (`crates/roost-engine/src/tab_task.rs`), for the session's foreground (the lease holder) to apply — not for whoever is actually typing, since as of R15 anyone same-UID may type. Everything else the scanner sees (pointer shape, today) stays dropped and debug-logged in the tab task, by design — the envelope is scoped to these two effects rather than left open to "just one more."
 - **`session.set_theme`** — closes the reseed gap the architecture doc left open: a connecting client seeds every tab's server `Terminal` with its own palette (sent right after `session.connect`, before the first `tab.attach`), so a program that queries a color from a session gets back what the attached client is actually rendering, not the server's factory default.
 
 See [`reference/ipc.md`](../reference/ipc.md#events) for the full event catalog and [`session.set_theme`](../reference/ipc.md#sessionset_theme)'s wire shape.
@@ -150,7 +262,7 @@ client (roost-iced)                                    remote machine
 - **The reason overlay.** A failed connection attempt is classified into one of six families (`SshFailure` — changed/unknown host key, auth, no session, `roost-session` not found, or an opaque transport failure) with copy written for a user to act on. It reaches the sidebar band as `disconnected — <reason>`, `host.status`'s `reason`, and the log; an attempt the user asked for additionally raises a toast. See the [user guide's troubleshooting table](../guides/host-sessions.md#troubleshooting) for the full set and remedies. **Where to read the family while a retry is armed:** `reason` shows the armed-rung line (`reconnecting in 8s (3/10)`) — it is the band's input and the sidebar's rollup is derived from it — so the family lives in its own field, `retry.reason`, for exactly as long as that rung is armed ([#399](https://github.com/charliek/roost/issues/399)). Before writing an assertion against it: **read it when it is present, and do not gate on the attempt number.** Absence is ordinary — the drop that starts an outage is usually the live connection dying, a bare bridge EOF with nothing to classify, and the classified copy arrives with the next dial's failure — but it is not tied to the rung's position: a suspend/wake resets the ladder to attempt 1 and deliberately carries the family across, because it is still the same outage. A lane that waited for `attempt >= 2` would throw away a family that is legitimately there.
 - **The wire itself doesn't know it crossed a network.** The bridge is a pure byte pump — the same ROOSTDP2 control/events/data protocol reaches a session over SSH byte-identical to a local socket dial (see [`ipc.md`](../reference/ipc.md#session-sockets)).
 
-**Concurrency depends on the one-attach policy.** A connected host realistically holds on the order of 4-5 concurrent `ssh` channels over the shared master at once — the sequential connect prologue (control, then events) plus one attached tab's data connection, with headroom for an in-flight reconnect — comfortably under sshd's default `MaxSessions 10`. That estimate assumes today's [one-attached-tab-per-host policy](#known-limitations); a future multi-attach slice has to re-check it against `MaxSessions` before it can promise more than one live tab per host.
+**Concurrency depends on the one-attach policy.** A connected host realistically holds on the order of 4-5 concurrent `ssh` channels over the shared master at once — the sequential connect prologue (control, then events) plus one attached tab's data connection, with headroom for an in-flight reconnect — comfortably under sshd's default `MaxSessions 10`. That estimate assumes this client's own [one-attached-tab-per-host policy](#known-limitations) — attach-on-focus, unchanged by R15 — rather than any server-side limit; a future multi-attach-from-one-client slice has to re-check it against `MaxSessions` before it can promise more than one live tab per host from here.
 
 **Target classification is Rust-only.** `roost-ipc::ssh::classify` — the rule table that decides whether a saved host's `target` string is an SSH destination, a socket path, or the `localhost` sentinel — has no Swift twin. The Swift Mac app treats a host's `target` as an opaque display string (it round-trips the field through its `state.json` mirror per the HS-0 schema-twin rule, but never interprets it); `roostctl host *` against the Swift socket answers `unknown-op` regardless. A future Swift host-client surface needs the classifier's rule table (`ResolvedTransport`'s doc comment in `crates/roost-ipc/src/ssh.rs`) ported or shared, not re-derived from scratch.
 
@@ -351,7 +463,7 @@ Each of the five pytest lanes needs a UI **and** a daemon, so none of them rides
 - **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten when the lease turns over or its last connection closes. It remains true against a session too old to serve the op — that refusal is harmless (`unknown-op`, logged once per connection) and leaves HS-2's behavior: `notification.fired` never fires for whichever tab that session considers active.
 - **Kitty images render blank after attach.** The snapshot payload doesn't currently carry Kitty graphics protocol state (architecture §5).
 - **Missed-while-detached effects still are not replayed; notifications within the replay window now are.** A `tab.effect` (bell, clipboard write) that fired while nobody was attached is still gone, by design (non-goal, not a bug). But a reconnect to the same `session_id` that lands inside the session's bounded replay ring (`ROOST_SESSION_REPLAY_WINDOW`) now *resumes* `events.subscribe` from the last-applied revision instead of re-snapshotting, so any `notification.fired` committed during the gap replays onto the carried mirror and its inbox row appears — the once-only replay and the no-effect rule are the server's existing contract (R5, #440), inherited here rather than changed. A reconnect that falls outside the window, or that the session refuses for any other reason (`replay-expired`, `revision-ahead`, `session-mismatch`), falls back to the ordinary fresh subscribe + `tab.list` snapshot — never fatal, just back to *current* state, exactly as before R11.
-- **One data connection per tab, one attached tab per host at a time from this client.** Multi-attach / warm pools are explicit future work, not a current constraint anyone hits by accident — the server's own per-session token quota (16 outstanding) is nowhere close to being pressured by a single client's one-tab-at-a-time policy.
+- **One attached tab per host at a time from this client — a client policy, not a server limit.** As of R15 (plan 057) the server itself admits any number of data connections to one tab (bounded only by the outstanding-token quota per TTL plus the concurrent-snapshot cap, both named in [`ipc.md`](../reference/ipc.md)); a second window or a phone can attach to the same tab this client has open and both type, with neither displacing the other. What is unchanged is this client's own attach-on-focus policy: it dials a tab's data connection only while that tab is focused and detaches on blur, so it never itself holds more than one live data connection at a time. Multi-attach *from one client* (a warm pool of several tabs' connections at once) is still explicit future work.
 - **A drop classified `NoSession` settles immediately, not after a wait.** The far side dying and the far side merely restarting (a deploy, a reboot) look identical at the moment of the drop, and auto-reconnect settles on `NoSession` the first time it sees it rather than waiting to find out which — the same rule `localhost` already had, applied consistently. A session that would have come back on its own twenty seconds later still needs a manual ↻ (or, for a host that reboots on its own, running `roost-session` under a hand-written, lingering `systemd --user` unit — see the [user guide](../guides/host-sessions.md#adding-a-remote-host-over-ssh)). The same applies to a Mac's own `localhost` session across a reboot or logout, where the equivalent is a hand-written launchd LaunchAgent instead — see the guide's [recipe](../guides/host-sessions.md#surviving-reboots-launchd), whose `KeepAlive` is deliberately `{SuccessfulExit: false}` so an explicit Stop Session is not undone by the unit.
 
 ## See also
