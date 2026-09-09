@@ -880,7 +880,7 @@ async fn host_call<T: serde::de::DeserializeOwned>(
     params: serde_json::Value,
 ) -> Result<T, String> {
     let value = ops
-        .call(op, params, false)
+        .call(op, params, crate::host_conn::LeasePolicy::None)
         .await
         .map_err(|error| format!("{op}: {error}"))?;
     serde_json::from_value(value).map_err(|error| format!("{op} answered unexpectedly: {error}"))
@@ -928,7 +928,10 @@ async fn host_remove_call<T>(
     removed: T,
     already_gone: T,
 ) -> Result<T, String> {
-    match ops.call(op, params, false).await {
+    match ops
+        .call(op, params, crate::host_conn::LeasePolicy::None)
+        .await
+    {
         Ok(_) => Ok(removed),
         Err(crate::host_conn::HostOpError::Rejected {
             code: roost_ipc::client::ServerCode::NotFound,
@@ -9033,6 +9036,7 @@ mod tests {
             skew: skew(),
             reduced_fidelity,
             supports_resume: true,
+            supports_open_input: true,
             resumed: None,
         }
     }

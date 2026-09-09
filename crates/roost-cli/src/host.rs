@@ -247,6 +247,12 @@ fn status_lines(h: &HostStatus) -> Vec<String> {
     let rollup = h.rollup.as_deref().unwrap_or("");
     let line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup);
     lines.push(line.trim_end().to_string());
+    // Directly under the state it qualifies: `taken-over` says this
+    // client is not the foreground, and the only thing a person wants
+    // next is which of their machines is.
+    if let Some(taken_by) = h.taken_by.as_deref() {
+        lines.push(format!("    driven by {taken_by}"));
+    }
     // The band caps its line at 60 characters, so an ssh family's
     // sentence (a changed host key, say) is ellipsized there; when the
     // rollup did not carry the whole reason, print it in full
@@ -483,6 +489,30 @@ mod tests {
         assert_eq!(
             status_lines(&host),
             vec!["abc  workbox  connected".to_string()],
+        );
+    }
+
+    /// A taken-over host names its foreground under the state, and only
+    /// when the session actually named one (plan 057 §3.5).
+    #[test]
+    fn status_lines_name_the_client_that_took_the_foreground() {
+        let taken = |taken_by: Option<&str>| HostStatus {
+            id: "abc".to_string(),
+            label: "workbox".to_string(),
+            state: "taken-over".to_string(),
+            taken_by: taken_by.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&taken(Some("a phone"))),
+            vec![
+                "abc  workbox  taken-over".to_string(),
+                "    driven by a phone".to_string(),
+            ],
+        );
+        assert_eq!(
+            status_lines(&taken(None)),
+            vec!["abc  workbox  taken-over".to_string()],
         );
     }
 

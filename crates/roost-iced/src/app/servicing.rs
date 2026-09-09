@@ -3084,6 +3084,14 @@ impl App {
                 last_connected: host.last_connected,
                 generation: self.hosts.generation(&host.id),
                 state: band.state.wire().to_string(),
+                // Beside the state it explains, and from the connection
+                // rather than the band: the band's vocabulary has one
+                // `taken-over` and no room for who took it.
+                taken_by: self
+                    .hosts
+                    .state(&host.id)
+                    .and_then(crate::host_conn::HostConnState::taken_by)
+                    .map(str::to_string),
                 // The band's input, untruncated — the ssh failure
                 // families are written as sentences and the rollup
                 // beside them is capped at 60 characters.
@@ -3134,10 +3142,22 @@ impl App {
         &self,
         host: roost_engine::persistence::HostSnapshot,
     ) -> HostConnectionResult {
-        // Through the section state the sidebar itself reads, so the
-        // reply and the dot drawn beside it can never disagree. A host
-        // this app is not driving at all reads as disconnected, which is
-        // exactly what its section shows.
+        // A takeback asked of a deposed-but-serving task is an attempt in
+        // flight, and this op reports the ask (plan 057 §3.5). Nothing
+        // about the band moved for it — the grid is still live and the
+        // facts still stand — so the divergence is deliberate: a caller
+        // that wants the settled answer polls `host.status`, which is
+        // what that split has always meant.
+        if self.hosts.taking_foreground(&host.id) {
+            return HostConnectionResult {
+                host: host.into(),
+                state: host_sidebar::SectionState::Connecting.wire().to_string(),
+            };
+        }
+        // Otherwise through the section state the sidebar itself reads,
+        // so the reply and the dot drawn beside it can never disagree. A
+        // host this app is not driving at all reads as disconnected,
+        // which is exactly what its section shows.
         let state = self.hosts.state(&host.id).map_or_else(
             || {
                 if self.hosts.establishing(&host.id) {

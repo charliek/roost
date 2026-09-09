@@ -86,10 +86,10 @@ pub(crate) mod task;
 pub(crate) mod upload;
 
 pub(crate) use mirror::SharedMirror;
-pub(crate) use queue::{HostIntent, HostOpError, HostOps};
+pub(crate) use queue::{HostIntent, HostOpError, HostOps, LeasePolicy};
 pub(crate) use reconnect::{Decision, DropInput};
 pub(crate) use state::{ConnectFacts, HostConnState, HostTransport};
-pub(crate) use task::{ConnectMode, Resume, Shutdown};
+pub(crate) use task::{ConnectMode, Foreground, Resume, Shutdown};
 pub(crate) use upload::{UploadResult, UploadSource};
 
 /// How far wall-clock time may run past an armed delay before the
@@ -449,6 +449,13 @@ struct HostConn {
     generation: u64,
     ops: HostOps,
     shutdown: Arc<Shutdown>,
+    /// The in-place takeback seam this connection's task is watching.
+    /// `in_place()` is the task's own answer to whether ↻ is a takeback
+    /// or a full reconnect — see [`task::Foreground`].
+    foreground: Arc<Foreground>,
+    /// A takeback asked of that seam and not yet answered. See
+    /// [`HostConnSet::taking_foreground`].
+    taking_foreground: bool,
     /// The incarnation currently being served, once its `Connecting`
     /// has been drained off the feed.
     incarnation: Option<HostId>,
@@ -973,6 +980,14 @@ impl HostConnSet {
     ///
     /// `cause` decides one thing here: whether the task starts holding
     /// the previous connection's lease — see [`Self::carried_lease`].
+    ///
+    /// **The one exception is a host somebody else took over on a
+    /// session that closed nothing** (plan 057 §3.5): its task is still
+    /// serving on a live control connection, so Connect asks *that* task
+    /// for the foreground instead of replacing it. No new incarnation, no
+    /// reattach, no snapshot — and deliberately no new incarnation
+    /// especially, because [`Self::apply_state`] clears a connection's
+    /// facts, payload kind and focus the moment one appears.
     pub(crate) fn connect(
         &mut self,
         host: &str,
@@ -982,6 +997,9 @@ impl HostConnSet {
         mode: ConnectMode,
         cause: AttemptCause,
     ) {
+        if self.take_foreground_in_place(host, &socket, transport, cause) {
+            return;
+        }
         // The incarnation this reconnect displaces, threaded into the
         // replacement task so its FIRST `Connecting` carries it — that
         // is the one message consumers purge dead-incarnation state off,
@@ -1037,6 +1055,7 @@ impl HostConnSet {
 
         let (ops, ops_rx) = HostOps::channel();
         let shutdown = Arc::new(Shutdown::default());
+        let foreground = Arc::new(Foreground::default());
         let config = task::ConnectionConfig {
             host: host.to_string(),
             label: label.to_string(),
@@ -1051,6 +1070,7 @@ impl HostConnSet {
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
+            foreground: Arc::clone(&foreground),
         };
         // Detached on purpose: the task owns its own shutdown, bounds it
         // (`task::SHUTDOWN_GRACE`), and answers its queue on the way
@@ -1071,6 +1091,8 @@ impl HostConnSet {
             generation,
             ops,
             shutdown,
+            foreground,
+            taking_foreground: false,
             incarnation: None,
             payload_kind: None,
             fidelity_announced: false,
@@ -1083,6 +1105,71 @@ impl HostConnSet {
             // state the machine cannot produce.
             state: HostConnState::Connecting { previous: None },
         });
+    }
+
+    /// Ask a deposed-but-serving task for the foreground back, and say
+    /// whether it took the request (plan 057 §3.5).
+    ///
+    /// Three conditions, and each rules out a way this could be wrong:
+    ///
+    /// * the ask is a person's. An auto-reconnect that took the
+    ///   foreground back would be exactly the steal-back
+    ///   [`task::attempt`]'s probe exists to prevent;
+    /// * the ask is a person's. An auto-reconnect that took the
+    ///   foreground back would be exactly the steal-back [`task::attempt`]'s
+    ///   probe exists to prevent;
+    /// * the host is `TakenOver` — every other state either drives
+    ///   already or has no session to ask;
+    /// * its task says it is serving in place, which only an
+    ///   `open_input` session's takeover produces;
+    /// * and the endpoint is the one that task is already on. An ssh
+    ///   reconnect tears the tunnel down and comes back with a *new*
+    ///   bridge socket, so the old task's control connection is on its
+    ///   way out however healthy its flag still looks.
+    fn take_foreground_in_place(
+        &mut self,
+        host: &str,
+        socket: &std::path::Path,
+        transport: HostTransport,
+        cause: AttemptCause,
+    ) -> bool {
+        if cause != AttemptCause::Explicit {
+            return false;
+        }
+        let Some(conn) = self
+            .entries
+            .get_mut(host)
+            .and_then(|entry| entry.conn.as_mut())
+        else {
+            return false;
+        };
+        if !matches!(conn.state, HostConnState::TakenOver { .. })
+            || conn.socket != socket
+            || conn.transport != transport
+            || !conn.foreground.in_place()
+        {
+            return false;
+        }
+        tracing::info!(%host, "taking this host session's foreground back in place");
+        conn.foreground.request();
+        conn.taking_foreground = true;
+        true
+    }
+
+    /// Whether a takeback asked of a deposed-but-serving task has not
+    /// been answered yet.
+    ///
+    /// Deliberately **not** a state: the band, the facts and the grid all
+    /// stay exactly as they were, because none of them changed. What it
+    /// serves is `host.connect`'s own contract — that op answers what was
+    /// asked for, and from the ask until the task's next publication an
+    /// attempt is genuinely in flight. A caller that wants the settled
+    /// answer polls `host.status`, as it always did.
+    pub(crate) fn taking_foreground(&self, host: &str) -> bool {
+        self.entries
+            .get(host)
+            .and_then(|entry| entry.conn.as_ref())
+            .is_some_and(|conn| conn.taking_foreground)
     }
 
     /// Start an ssh-reached host's connection: open its tunnel, warm the
@@ -2316,7 +2403,7 @@ impl HostConnSet {
     /// exists to prevent.
     pub(crate) fn payload_kind(&self, host: &str) -> Option<&'static str> {
         let conn = self.entries.get(host)?.conn.as_ref()?;
-        conn.payload_kind.filter(|_| conn.state.is_connected())
+        conn.payload_kind.filter(|_| conn.state.is_foreground())
     }
 
     /// File what one incarnation's prologue learned, and check the
@@ -2371,7 +2458,7 @@ impl HostConnSet {
     /// none of that is a deposed client's to offer.
     pub(crate) fn reduced_fidelity(&self, host: &str) -> bool {
         self.facts(host).is_some_and(|facts| facts.reduced_fidelity)
-            && self.state(host).is_some_and(HostConnState::is_connected)
+            && self.state(host).is_some_and(HostConnState::is_foreground)
     }
 
     /// How many tab rows this host's section is currently listing.
@@ -2483,7 +2570,7 @@ impl HostConnSet {
     ) -> impl Iterator<Item = (&str, &str, HostId, &Arc<SharedMirror>)> {
         self.entries.iter().filter_map(|(host, entry)| {
             let conn = entry.conn.as_ref()?;
-            let incarnation = conn.incarnation.filter(|_| conn.state.is_connected())?;
+            let incarnation = conn.incarnation.filter(|_| conn.state.is_foreground())?;
             let mirror = self.mirrors.get(&incarnation)?;
             Some((host.as_str(), conn.label.as_str(), incarnation, mirror))
         })
@@ -2529,7 +2616,7 @@ impl HostConnSet {
                     ops::SESSION_SET_THEME,
                     serde_json::json!({ "osc_colors": colors }),
                 )
-                .with_lease(),
+                .requires_lease(),
             );
         }
     }
@@ -2563,7 +2650,7 @@ impl HostConnSet {
         let reply = conn.ops.call(
             ops::SESSION_SET_AGENT_HOOKS,
             serde_json::json!({ "mode": mode, "skip": skip, "client": client }),
-            true,
+            LeasePolicy::Required,
         );
         let feed = self.feed.clone();
         self.runtime.spawn(async move {
@@ -2608,7 +2695,7 @@ impl HostConnSet {
             .values_mut()
             .filter_map(|entry| entry.conn.as_mut())
         {
-            let Some(incarnation) = conn.incarnation.filter(|_| conn.state.is_connected()) else {
+            let Some(incarnation) = conn.incarnation.filter(|_| conn.state.is_foreground()) else {
                 continue;
             };
             let focused = claim
@@ -2624,7 +2711,7 @@ impl HostConnSet {
                     // on the wire, so an absent one would be refused.
                     serde_json::json!({ "focused_tab_id": focused.map(|id| id.to_string()) }),
                 )
-                .with_lease()
+                .requires_lease()
                 .quiet(),
             );
             // Recorded only once it is actually on the queue: an intent
@@ -2696,10 +2783,18 @@ impl HostConnSet {
         if matches!(next, HostConnState::TakenOver { .. }) {
             self.entry_mut(&host).observer_only = true;
         }
+        if next.is_foreground() {
+            self.entry_mut(&host).observer_only = false;
+        }
         match &next {
             // The outage is over, so the next one starts at the base
             // delay — and the lease this one carried has been superseded
             // by the one the fresh connection is about to publish.
+            //
+            // It is also the one edge that *proves* this client drives
+            // again, which an in-place takeback reaches without ever
+            // passing through [`Self::connect`] — the other place the
+            // latch is cleared.
             HostConnState::Connected
             // Terminal in the machine, and nothing is armed in any of
             // them: if the entry did not go here, nothing would ever
@@ -2749,19 +2844,29 @@ impl HostConnSet {
         if let Some(carried) = carried {
             conn.carried = Some(carried);
         }
-        // A different incarnation, or one that is no longer connected,
-        // knows nothing about what it was told before: the queue behind
-        // it was flushed, and a session that comes back is back on its
-        // headless default. Clearing here is what makes a reconnect
-        // re-assert the client's focus instead of deduping it away — and
-        // what stops the kind an attach negotiated with the *old*
-        // incarnation being reported for the one that replaced it.
-        if conn.incarnation != Some(incarnation) || !next.is_connected() {
-            conn.focus_sent = None;
+        // A different incarnation, or one that never reached a session,
+        // knows nothing about what this connection established: the kind
+        // an attach negotiated with the *old* incarnation must not be
+        // reported for the one that replaced it. A takeover retires none
+        // of it — the session is the same session, at the same fidelity,
+        // still being read (plan 057 §3.5).
+        if conn.incarnation != Some(incarnation) || !next.reached_session() {
             conn.payload_kind = None;
             conn.fidelity_announced = false;
             conn.facts = None;
         }
+        // Focus is the exception, and it is cleared on the **takeover
+        // edge too**: the session drops the displaced client's focus
+        // claim when it deposes it, so a client that came back to the
+        // foreground with this dedup intact would leave that host's
+        // notifications unmuted forever.
+        if conn.incarnation != Some(incarnation) || !next.is_foreground() {
+            conn.focus_sent = None;
+        }
+        // Whatever the task published, it published it after hearing the
+        // ask — so the takeback is no longer in flight, whether it worked
+        // or the connection went instead.
+        conn.taking_foreground = false;
         conn.incarnation = Some(incarnation);
         conn.state = next;
         Some(host)
@@ -5345,6 +5450,182 @@ mod tests {
         );
     }
 
+    /// The takeover edge, field by field (plan 057 §3.5).
+    ///
+    /// A takeover is a loss of the *foreground*, not of the session, so
+    /// the facts, the negotiated payload kind and the fidelity latch all
+    /// stand — the same session is still being read at the same
+    /// fidelity. **Focus is the exception**: the session drops the
+    /// displaced client's claim when it deposes it, so a dedup that
+    /// survived would leave that host's notifications unmuted for as
+    /// long as the window stayed on the same tab after taking the
+    /// foreground back.
+    #[tokio::test]
+    async fn a_takeover_clears_the_focus_dedup_and_keeps_everything_else() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-takeover-edge.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+        assert!(set.note_payload_kind(incarnation, AttachPayloadKind::VT));
+        set.conn_mut("h1").fidelity_announced = true;
+        set.conn_mut("h1").focus_sent = Some(Some(5));
+
+        set.apply_state(
+            incarnation,
+            HostConnState::TakenOver {
+                taken_by: Some("a phone".into()),
+            },
+        );
+
+        assert_eq!(
+            set.conn("h1").focus_sent,
+            None,
+            "the session dropped the claim, so the dedup must not suppress the re-send"
+        );
+        assert_eq!(
+            set.facts("h1").map(|facts| facts.session_id.as_str()),
+            Some("sess-1"),
+            "same session"
+        );
+        assert_eq!(
+            set.conn("h1").payload_kind,
+            Some(AttachPayloadKind::VT),
+            "same attach, still decoding"
+        );
+        assert!(
+            set.conn("h1").fidelity_announced,
+            "and the sentence was already said about this very connection"
+        );
+    }
+
+    /// Connect on a taken-over host whose task is still serving is a
+    /// takeback **in place**: no new incarnation, no reattach, and the
+    /// task hears the ask on its own seam (plan 057 §3.5).
+    #[tokio::test]
+    async fn connect_on_a_deposed_but_serving_host_asks_for_the_foreground_in_place() {
+        let (mut set, _feed) = a_set();
+        let socket = PathBuf::from("/nonexistent/roost-set-takeback.sock");
+        let connect = |set: &mut HostConnSet| {
+            set.connect(
+                "h1",
+                "one",
+                socket.clone(),
+                HostTransport::UnixSocket,
+                ConnectMode::Dial,
+                AttemptCause::Explicit,
+            )
+        };
+        connect(&mut set);
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        let generation = set.conn("h1").generation;
+
+        // The task has not said it is serving in place, so this is the
+        // ordinary reconnect it has always been.
+        connect(&mut set);
+        assert_ne!(
+            set.conn("h1").generation,
+            generation,
+            "a full reconnect numbers a new attempt"
+        );
+
+        // Now with the task's own answer. Rebuilt from scratch because
+        // the reconnect above replaced the connection.
+        let (mut set, _feed) = a_set();
+        connect(&mut set);
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        let generation = set.conn("h1").generation;
+        let foreground = Arc::clone(&set.conn("h1").foreground);
+        foreground.serving_for_test(true);
+
+        connect(&mut set);
+        assert_eq!(
+            set.conn("h1").generation,
+            generation,
+            "a takeback in place mints no new incarnation: `apply_state` would \
+             clear the facts and the payload kind under it"
+        );
+        assert_eq!(
+            set.facts("h1").map(|facts| facts.session_id.as_str()),
+            Some("sess-1"),
+            "and nothing this connection established was retired"
+        );
+        assert!(
+            foreground.took_the_request_for_test(),
+            "the task is the one that performs it, and it heard the ask"
+        );
+        assert!(
+            set.taking_foreground("h1"),
+            "an attempt is in flight, which is what `host.connect` answers with"
+        );
+        assert!(
+            matches!(set.state("h1"), Some(HostConnState::TakenOver { .. })),
+            "and nothing about the band, the grid or the facts moved for it"
+        );
+
+        // The task's own verdict replaces the optimistic write, and
+        // reaching the foreground clears the steal-back latch that a
+        // takeback never passing through `connect` would otherwise leave
+        // armed.
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert!(!set.taking_foreground("h1"), "answered by the task");
+        assert!(!set.observes_only("h1"));
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+
+        // An auto-reconnect never takes the foreground back: retaking is
+        // a takeover, and only a person asks for one.
+        foreground.serving_for_test(true);
+        set.connect(
+            "h1",
+            "one",
+            socket.clone(),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::AutoReconnect,
+        );
+        assert!(
+            !foreground.took_the_request_for_test(),
+            "a scheduled attempt must never ask for the foreground"
+        );
+
+        // A different endpoint is a different connection, however healthy
+        // the old task's flag still looks — an ssh reconnect rebuilds the
+        // bridge socket under it.
+        let generation = set.conn("h1").generation;
+        set.apply_state(
+            set.mint_for("h1"),
+            HostConnState::TakenOver { taken_by: None },
+        );
+        let foreground = Arc::clone(&set.conn("h1").foreground);
+        foreground.serving_for_test(true);
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-takeback-other.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        assert_ne!(
+            set.conn("h1").generation,
+            generation,
+            "a new endpoint is a full reconnect"
+        );
+    }
+
     /// Disconnecting drops everything keyed on the host, so a late item
     /// from its task lands nowhere.
     #[tokio::test]
@@ -5449,7 +5730,7 @@ mod tests {
         );
         let section = set.section("h1").expect("a saved host keeps its section");
         assert_eq!(section.label, "pop-os");
-        assert!(!section.state.is_connected());
+        assert!(!section.state.is_foreground());
         assert_eq!(section.incarnation, Some(incarnation));
         assert!(
             section.mirror.is_some(),
@@ -5815,6 +6096,7 @@ mod tests {
             },
             reduced_fidelity: true,
             supports_resume: true,
+            supports_open_input: true,
             resumed: None,
         }
     }
@@ -5899,18 +6181,18 @@ mod tests {
         let incarnation = set.mint_for("h1");
 
         // The order a *deposed driver* takes: it was connected and had
-        // filed its facts, and being deposed leaves `Connected` — which
-        // is the edge that retires them. Nothing about the session
-        // changed, so the task refiles them behind the `TakenOver` it
-        // publishes (`task.rs`'s `ConnEnd::Deposed` arm), and that
-        // refiling is the only reason the answer below is not `None`.
+        // filed its facts, and a takeover retires **none** of them (plan
+        // 057 §3.5) — same session, same fidelity, same fence, still
+        // being read. The task refiles them behind the `TakenOver` it
+        // publishes anyway, and that refiling is now a no-op rather than
+        // the only reason the answer below is not `None`.
         set.apply_state(incarnation, HostConnState::Connected);
         set.note_connect_facts(incarnation, skewed_facts("sess-1"));
         set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
         assert_eq!(
-            set.facts("h1"),
-            None,
-            "leaving Connected retires the facts, refiled or not"
+            set.facts("h1").map(|facts| facts.session_id.as_str()),
+            Some("sess-1"),
+            "a takeover is a loss of the foreground, not of the session"
         );
         set.note_connect_facts(incarnation, skewed_facts("sess-1"));
 

@@ -2493,6 +2493,16 @@ pub struct HostStatus {
     /// `host.connect` answers with, produced by the same classifier the
     /// band's dot reads.
     pub state: String,
+    /// Who this session says is driving it, when this client has been
+    /// told (plan 057 §3.5).
+    ///
+    /// Only a `taken-over` host carries it, and only when the
+    /// `session.driver_changed` envelope named the claimant — a takeover
+    /// this client merely *inferred* from a non-current lease probe knows
+    /// no name. Self-reported display metadata, never identity: the
+    /// session authenticates nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_by: Option<String>,
     /// The connection's own one-line reason, untruncated. This is the
     /// band's *input*; [`Self::rollup`] is what it renders.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4543,6 +4553,7 @@ mod tests {
             last_connected: Some("2026-09-01T17:40:02Z".into()),
             generation: 3,
             state: host_state::DISCONNECTED.into(),
+            taken_by: None,
             reason: Some("reconnecting in 8s (3/10)".into()),
             detail: None,
             rollup: Some("disconnected — reconnecting in 8s (3/10)".into()),
@@ -4634,6 +4645,27 @@ mod tests {
                 "from_revision": 4_312,
             })
         );
+
+        // `taken_by` rides beside the state and is additive: a host
+        // nobody took over omits the key, and one whose takeover this
+        // client only inferred omits it too — there is no name to give.
+        let deposed = HostStatus {
+            state: host_state::TAKEN_OVER.into(),
+            taken_by: Some("a phone".into()),
+            ..never.clone()
+        };
+        round_trip(&deposed);
+        assert_eq!(
+            serde_json::to_value(&deposed).unwrap()["taken_by"],
+            serde_json::json!("a phone")
+        );
+        assert!(serde_json::to_value(HostStatus {
+            state: host_state::TAKEN_OVER.into(),
+            ..never.clone()
+        })
+        .unwrap()
+        .get("taken_by")
+        .is_none());
 
         // A fresh snapshot resumed from nothing, so the fence is omitted
         // rather than reported as a revision the session never attested.

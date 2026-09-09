@@ -1178,7 +1178,7 @@ impl super::App {
             connected: saved.is_some_and(|saved| {
                 self.hosts
                     .state(saved)
-                    .is_some_and(crate::host_conn::HostConnState::is_connected)
+                    .is_some_and(crate::host_conn::HostConnState::is_foreground)
             }),
             live: saved.and_then(|saved| self.hosts.incarnation(saved)),
             tab_host: tab.host,

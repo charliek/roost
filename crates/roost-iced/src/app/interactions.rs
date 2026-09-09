@@ -401,7 +401,7 @@ impl App {
         let wire_op = target.wire_op();
         self.engine_op(
             async move {
-                ops.call(wire_op, params, false)
+                ops.call(wire_op, params, crate::host_conn::LeasePolicy::None)
                     .await
                     .map(drop)
                     .map_err(|error| error.to_string())
@@ -858,7 +858,11 @@ pub(super) fn host_reorder_call(
     let ops = hosts.ops_for(host)?.clone();
     let params = host_reorder_params(target, ordered_ids);
     let wire_op = target.wire_op();
-    Some(async move { ops.call(wire_op, params, false).await.map(drop) })
+    Some(async move {
+        ops.call(wire_op, params, crate::host_conn::LeasePolicy::None)
+            .await
+            .map(drop)
+    })
 }
 
 /// The completion a reorder dispatch answers with, whichever axis and

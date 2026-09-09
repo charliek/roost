@@ -386,7 +386,14 @@ impl HostAttach {
                 "cell_h_px": geometry.cell_h,
                 "libghostty_build": libghostty_build,
             }),
-            true,
+            // Lease **if available**, never required (plan 057 §3.5):
+            // an `open_input` session ignores the field, and one release
+            // older decodes `TabAttachParams::lease` as a required
+            // `String` — so a client that stopped presenting the lease it
+            // holds would fail every attach against it. A deposed
+            // connection presents none, which only such a session cares
+            // about and it is not one of them.
+            crate::host_conn::LeasePolicy::IfAvailable,
         );
         let input_rx = Arc::clone(&self.input_rx);
         let task = tokio::spawn(run_attempt(
@@ -1004,9 +1011,13 @@ fn classify_op_failure(error: &crate::host_conn::queue::HostOpError) -> FailReas
         // token mint at all; grouped with the two that do not retry
         // because an unexplained client-side refusal is not something a
         // second attach attempt would fix either.
-        HostOpError::Disconnected | HostOpError::Unavailable | HostOpError::Local(_) => {
-            FailReason::HostGone(error.to_string())
-        }
+        // `NotForeground` cannot reach a token mint either — `tab.attach`
+        // is `LeasePolicy::IfAvailable` and a deposed task serves it —
+        // and it is grouped here for the same reason `Local` is.
+        HostOpError::Disconnected
+        | HostOpError::Unavailable
+        | HostOpError::Local(_)
+        | HostOpError::NotForeground { .. } => FailReason::HostGone(error.to_string()),
         HostOpError::Transport(_) => FailReason::Retryable(error.to_string()),
     }
 }
@@ -1225,6 +1236,43 @@ mod tests {
             attach.input_tx(),
         );
         (attach, tab, feed_tx, feed_rx)
+    }
+
+    /// `tab.attach` is lease-**if-available**, and both halves of that
+    /// are load-bearing (plan 057 §3.5).
+    ///
+    /// A session advertising `open_input` ignores the field, so a deposed
+    /// client attaching without one is admitted — which is what keeps its
+    /// tabs switchable after a takeover. A session one release older
+    /// decodes `TabAttachParams::lease` as a required `String` and
+    /// refuses a missing key and a `null` alike, so a client that stopped
+    /// presenting the lease it holds would fail *every* attach against
+    /// it.
+    #[tokio::test]
+    async fn the_attach_intent_presents_a_lease_when_one_is_held_and_none_when_deposed() {
+        let (mut attach, _tab, feed_tx, _feed_rx) = rig();
+        let (ops, mut ops_rx) = crate::host_conn::HostOps::channel();
+
+        attach.begin(
+            &ops,
+            std::path::PathBuf::from("/nonexistent/roost-attach-lease.sock"),
+            "gb",
+            &feed_tx,
+        );
+
+        let intent = ops_rx.try_recv().expect("the attach intent is enqueued");
+        assert_eq!(intent.op, ops::TAB_ATTACH);
+        assert_eq!(intent.lease, crate::host_conn::LeasePolicy::IfAvailable);
+        assert_eq!(
+            intent.lease.present("the-lease"),
+            Some("the-lease"),
+            "the foreground presents what it holds, because an older session needs it"
+        );
+        assert_eq!(
+            intent.lease.present(""),
+            None,
+            "and a deposed client presents nothing rather than an empty claim"
+        );
     }
 
     fn accepted(resumed: bool, fence: u64) -> HostTabFrame {
