@@ -2066,19 +2066,25 @@ pub struct SessionConnectResult {
 /// — two libghostty builds that disagree cannot exchange a snapshot.
 /// The cell-pixel geometry is optional (a headless client has no cell
 /// metrics to report); `cols`/`rows` are not.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabAttachParams {
     /// The driver lease minted by [`ops::SESSION_CONNECT`], accepted and
     /// ignored — an attach is raw input and takes no lease (plan 057,
-    /// R15). Present on the wire at all only because a client that holds
-    /// one has no reason to strip it, and a session that predates
-    /// `open_input` still requires it.
+    /// R15). It stays on the wire because a session that predates
+    /// `open_input` **requires** it, and a client that holds one has no
+    /// reason to strip it.
     ///
-    /// Omitted when unset rather than sent as `null`: a session that
-    /// predates `open_input` decodes this key as a required `String`,
-    /// and `null` is not one — a client holding no lease would fail
-    /// every attach against it instead of only the ones it must.
+    /// Omitted when unset rather than sent as `null`, so that a client
+    /// which *does* hold a lease puts byte-identical bytes on the wire
+    /// to what it has always sent. That is the case compatibility turns
+    /// on. A client holding **no** lease cannot attach to a
+    /// pre-`open_input` session at all — that session decodes this key
+    /// as a required `String` and refuses both the missing key and a
+    /// `null` — which is correct, because such a session really does
+    /// gate attach on the lease. Present a lease whenever you have one:
+    /// it costs nothing here and is the difference between working and
+    /// not against an older peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<String>,
     #[serde(with = "string_int64")]
@@ -2091,6 +2097,50 @@ pub struct TabAttachParams {
     #[serde(default)]
     pub cell_h_px: u16,
     pub libghostty_build: String,
+    /// Whether this attach claims the tab's geometry.
+    ///
+    /// `true` (the default) resizes the tab to `cols`/`rows` during
+    /// negotiation, which is what an attach has always done. `false`
+    /// attaches at whatever size the tab already is, so a client that is
+    /// only watching cannot shrink the one that is typing; its geometry
+    /// still applies the moment it sends an `INPUT` or `RESIZE` frame,
+    /// which is why the grid must be non-zero either way.
+    ///
+    /// **Omitted from the wire when true**, and that is not a size
+    /// optimization: this struct is `deny_unknown_fields`, so a session
+    /// that predates `open_input` would refuse *every* attach carrying
+    /// the key — not just the ones that meant something by it. A client
+    /// sends `focus: false` only to a session advertising `open_input`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub focus: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// Hand-written so the Rust default and the serde default agree: a
+/// derived `Default` would make `focus` false, and a caller filling the
+/// rest of the struct with `..Default::default()` would silently ask for
+/// an unfocused attach.
+impl Default for TabAttachParams {
+    fn default() -> Self {
+        TabAttachParams {
+            lease: None,
+            tab_id: 0,
+            kinds: Vec::new(),
+            cols: 0,
+            rows: 0,
+            cell_w_px: 0,
+            cell_h_px: 0,
+            libghostty_build: String::new(),
+            focus: true,
+        }
+    }
 }
 
 /// [`ops::TAB_ATTACH`] result — a single-use ticket for one data
@@ -2182,6 +2232,17 @@ pub enum AttachMode {
 /// it, and the next `PTY` frame carries `seq + 1`. Snapshot mode fences
 /// at the snapshot's own encode point; resume mode fences at
 /// `resume_from_seq - 1`.
+///
+/// `snapshot_cols`/`snapshot_rows` are the geometry the payload was
+/// encoded at, sent only when it can differ from what the client asked
+/// for — an unfocused snapshot attach, which by definition did not
+/// resize the tab. A `vt` client builds its terminal at the attach
+/// geometry, so replaying a payload encoded at another width there
+/// wraps lines and misplaces absolute cursor moves; it hydrates at this
+/// size and resizes afterwards. Absent on a focused attach (the tab was
+/// just resized to the client's own geometry) and on a resume (no fresh
+/// snapshot), and absent from every reply a session predating
+/// `open_input` writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachAccepted {
     pub kind: AttachPayloadKind,
@@ -2189,6 +2250,10 @@ pub struct AttachAccepted {
     pub seq: u64,
     pub server_epoch: u64,
     pub tab_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_rows: Option<u16>,
 }
 
 /// The one JSON line a data connection gets back before the wire turns
@@ -2234,6 +2299,10 @@ struct RawAttachHandshakeReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tab_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<ResponseError>,
 }
 
@@ -2256,6 +2325,8 @@ impl TryFrom<RawAttachHandshakeReply> for AttachHandshakeReply {
                 tab_generation: raw
                     .tab_generation
                     .ok_or("accepted handshake reply is missing `tab_generation`")?,
+                snapshot_cols: raw.snapshot_cols,
+                snapshot_rows: raw.snapshot_rows,
             }))
         } else {
             Ok(AttachHandshakeReply::Rejected(
@@ -2276,6 +2347,8 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
                 seq: Some(a.seq),
                 server_epoch: Some(a.server_epoch),
                 tab_generation: Some(a.tab_generation),
+                snapshot_cols: a.snapshot_cols,
+                snapshot_rows: a.snapshot_rows,
                 error: None,
             },
             AttachHandshakeReply::Rejected(error) => RawAttachHandshakeReply {

@@ -116,6 +116,8 @@ pub fn accepted(mode: AttachMode, seq: u64) -> AttachAccepted {
         seq,
         server_epoch: STUB_EPOCH,
         tab_generation: STUB_GENERATION,
+        snapshot_cols: None,
+        snapshot_rows: None,
     }
 }
 

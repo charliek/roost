@@ -84,7 +84,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::ipc::{AdmittedAttach, IpcHandler};
-use crate::pty::PtyOutputEvent;
+use crate::pty::{Geometry, PtyOutputEvent};
 use crate::tab_task::{SnapshotAt, TabCmd, TabError};
 
 /// PTY payload that may go out between two SNAP frames before the
@@ -206,7 +206,7 @@ async fn attach_tab(
 ) {
     let tab_id = admitted.tab_id;
     let tab_generation = admitted.tab_generation;
-    let kind = &admitted.kind;
+    let kind = &admitted.terms.kind;
     // Started before the snapshot is asked for, not after it arrives:
     // the encode queues behind `MAX_CONCURRENT_SNAPSHOTS` and is exactly
     // the part of an attach the time budget exists to bound.
@@ -232,6 +232,7 @@ async fn attach_tab(
         server_epoch,
         tab_generation: live_generation,
         snapshot,
+        snapshot_size,
         ready_end,
         terminator,
         snap_frame_bytes,
@@ -252,6 +253,10 @@ async fn attach_tab(
         return;
     }
 
+    // Reported only when it can differ from what the client asked for:
+    // a focused attach resized the tab to its own geometry, and a resume
+    // encodes no snapshot at all.
+    let snapshot_size = snapshot_size.filter(|_| !admitted.terms.focus);
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
         // What `tab.attach` negotiated, carried here on the ticket: the
         // data connection presents only a token, and a client that
@@ -261,6 +266,8 @@ async fn attach_tab(
         seq: fence,
         server_epoch,
         tab_generation: live_generation,
+        snapshot_cols: snapshot_size.map(|(cols, _)| cols),
+        snapshot_rows: snapshot_size.map(|(_, rows)| rows),
     });
     let Ok(body) = serde_json::to_vec(&accepted) else {
         return;
@@ -275,6 +282,7 @@ async fn attach_tab(
     let ending = Pump {
         tab_id,
         commands,
+        geometry: admitted.terms.geometry,
         tee,
         writer,
         close,
@@ -307,6 +315,9 @@ struct Attached {
     tab_generation: u64,
     /// Empty in resume mode — the client already has this history.
     snapshot: Vec<u8>,
+    /// The grid the snapshot was encoded at, read on the tab task at the
+    /// encode. `None` in resume mode, which encodes nothing.
+    snapshot_size: Option<(u16, u16)>,
     ready_end: usize,
     /// Whether a zero-length `SNAP` frame ends the snapshot half.
     ///
@@ -403,6 +414,7 @@ async fn fence_tab(
         seq: snapshot.seq,
         server_epoch: snapshot.server_epoch,
         tab_generation: snapshot.tab_generation,
+        snapshot_size: Some((snapshot.cols, snapshot.rows)),
         snapshot: snapshot.bytes,
         ready_end,
         terminator: is_vt,
@@ -484,6 +496,7 @@ async fn resume_tab(
         server_epoch,
         tab_generation: live_generation,
         snapshot: Vec::new(),
+        snapshot_size: None,
         ready_end: 0,
         terminator: false,
         snap_frame_bytes: MAX_DATA_FRAME_BYTES,
@@ -524,6 +537,10 @@ async fn take_snapshot(
 struct Pump {
     tab_id: i64,
     commands: mpsc::Sender<TabCmd>,
+    /// What this connection says its viewport is: the `tab.attach`
+    /// geometry until a `RESIZE` frame moves it. Every `INPUT` frame
+    /// carries it, which is how the PTY follows whoever typed last.
+    geometry: Geometry,
     tee: broadcast::Receiver<PtyOutputEvent>,
     writer: OwnedWriteHalf,
     close: ConnCloseWatch,
@@ -883,7 +900,14 @@ impl Pump {
                         message: "an INPUT frame carried no bytes".into(),
                     });
                 }
-                self.send(TabCmd::Input(frame.payload)).await;
+                // Geometry rides the same command as the bytes, on the
+                // tab task's one channel: the resize it may cause is
+                // applied ahead of the keys it precedes without a fence.
+                self.send(TabCmd::Input {
+                    data: frame.payload,
+                    geometry: Some(self.geometry),
+                })
+                .await;
             }
             FRAME_RESIZE => {
                 // Fixed width, so a short or long payload is a client
@@ -898,13 +922,30 @@ impl Pump {
                     });
                 };
                 let read = |at: usize| u16::from_le_bytes([fields[at], fields[at + 1]]);
-                // No ack: a RESIZE frame is unacknowledged on the wire,
-                // so there is nobody to tell when it lands.
-                self.send(TabCmd::Resize {
+                let geometry = Geometry {
                     cols: read(0),
                     rows: read(2),
                     cell_w: u32::from(read(4)),
                     cell_h: u32::from(read(6)),
+                };
+                // Dropped rather than applied or fatal: `tab.attach`
+                // refuses a zero-sized grid, and the two paths state one
+                // client's geometry, so they have to agree about what a
+                // grid is.
+                if geometry.cols == 0 || geometry.rows == 0 {
+                    debug!(
+                        tab_id = self.tab_id,
+                        cols = geometry.cols,
+                        rows = geometry.rows,
+                        "ignored a RESIZE frame with a zero-sized grid"
+                    );
+                    return None;
+                }
+                self.geometry = geometry;
+                // No ack: a RESIZE frame is unacknowledged on the wire,
+                // so there is nobody to tell when it lands.
+                self.send(TabCmd::Resize {
+                    geometry,
                     ack: None,
                 })
                 .await;

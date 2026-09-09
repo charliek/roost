@@ -46,7 +46,7 @@ use tracing::{debug, warn};
 
 use crate::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use crate::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscColorState, OscRgb, OscRouter};
-use crate::pty::{PtyOutputEvent, WriterCmd};
+use crate::pty::{Geometry, PtyOutputEvent, WriterCmd};
 use crate::workspace::TabEffectKind;
 
 /// Scrollback the server Terminal retains, matching both UIs' policy.
@@ -230,6 +230,12 @@ pub struct SnapshotAt {
     pub server_epoch: u64,
     pub tab_generation: u64,
     pub bytes: Vec<u8>,
+    /// The grid the payload was encoded at, read at the encode itself so
+    /// it describes what the bytes actually say — an unfocused attach
+    /// reports it back, because that snapshot is at the tab's size and
+    /// not at the size the client asked for.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// The atomic resume handoff (D6): the ring records a client missed and a
@@ -274,7 +280,20 @@ impl From<roost_vt::Error> for TabError {
 /// gone" without inventing a sentinel.
 pub enum TabCmd {
     /// Client keystrokes / `tab.write`.
-    Input(Vec<u8>),
+    Input {
+        data: Vec<u8>,
+        /// The sending connection's declared geometry, applied ahead of
+        /// the bytes when it differs from the tab's — the PTY is sized
+        /// by the last geometry-bearing interaction, and typing is one
+        /// (plan 057, R15). The resize rides this same command rather
+        /// than a separate send, so it cannot arrive after the keys it
+        /// precedes.
+        ///
+        /// `None` for a control-plane `tab.write`: it carries no
+        /// geometry because there is no viewport behind it — a script
+        /// that pastes a line is not a client whose window has a size.
+        geometry: Option<Geometry>,
+    },
     /// Client RESIZE / `tab.resize`.
     ///
     /// `ack` fires once the server terminal AND the PTY winsize have
@@ -282,10 +301,7 @@ pub enum TabCmd {
     /// snapshot it mints a ticket for cannot be encoded at the old size;
     /// every other caller passes `None` and stays fire-and-forget.
     Resize {
-        cols: u16,
-        rows: u16,
-        cell_w: u32,
-        cell_h: u32,
+        geometry: Geometry,
         ack: Option<oneshot::Sender<Result<(), TabError>>>,
     },
     /// `session.set_theme` — re-seed this tab's terminal (and its color
@@ -362,8 +378,10 @@ pub(crate) struct TabVt {
     router: OscRouter,
     colors: OscColorState,
     render: RenderState,
-    cols: u16,
-    rows: u16,
+    /// The last geometry applied to this terminal and its child. All
+    /// four numbers, so a client at the same grid with different cell
+    /// metrics is still seen as a change.
+    geometry: Geometry,
     tab_generation: u64,
     /// Highest theme generation this terminal has taken — seeded at
     /// build, advanced by `TabCmd::SetTheme`, never rolled back.
@@ -409,8 +427,15 @@ impl TabVt {
             router: OscRouter::new(),
             colors,
             render,
-            cols,
-            rows,
+            // Cell metrics start unset: nothing has stated any yet, and
+            // the first interaction that does differs from this and is
+            // applied.
+            geometry: Geometry {
+                cols,
+                rows,
+                cell_w: 0,
+                cell_h: 0,
+            },
             tab_generation: state.next_generation.fetch_add(1, Ordering::SeqCst),
             theme_generation,
         })
@@ -666,6 +691,8 @@ impl TabTask {
             server_epoch: self.vt.state.server_epoch,
             tab_generation: self.vt.tab_generation,
             bytes,
+            cols: self.vt.geometry.cols,
+            rows: self.vt.geometry.rows,
         }
     }
 
@@ -875,6 +902,50 @@ impl TabTask {
         self.flush_writer();
     }
 
+    /// Size the tab: the server terminal first, then the child's
+    /// winsize. The single place either half moves — `TabCmd::Resize`
+    /// and a geometry-bearing `TabCmd::Input` both land here — so the
+    /// geometry recorded on [`TabVt`] cannot drift from what libghostty
+    /// and the child were told.
+    ///
+    /// Geometry that has not changed is not re-applied: two clients
+    /// alternating keystrokes at the same size would otherwise pay for a
+    /// terminal resize per frame.
+    fn apply_geometry(&mut self, geometry: Geometry) -> Result<(), TabError> {
+        if geometry == self.vt.geometry {
+            return Ok(());
+        }
+        self.vt.geometry = geometry;
+        let Geometry {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+        } = geometry;
+        let applied = self
+            .vt
+            .terminal
+            .resize(cols, rows, cell_w, cell_h)
+            .map_err(|error| {
+                warn!(tab_id = self.tab_id, %error, "server terminal resize failed");
+                TabError::from(error)
+            });
+        // Pixel geometry stays 0 on the PTY winsize, matching
+        // `PtySupervisor::resize`; libghostty gets the real cell metrics
+        // above, which is what its size reports read.
+        self.queue_resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        // Mode-2048 in-band size reports fire inside `resize`, outside
+        // any `vt_write` — draining only after writes would silently
+        // drop them.
+        self.take_replies();
+        applied
+    }
+
     fn flush_writer(&mut self) {
         if self.writer_gone {
             return;
@@ -935,37 +1006,19 @@ impl TabTask {
 
     async fn handle(&mut self, cmd: TabCmd) {
         match cmd {
-            TabCmd::Input(data) => self.queue_input(data),
-            TabCmd::Resize {
-                cols,
-                rows,
-                cell_w,
-                cell_h,
-                ack,
-            } => {
-                self.vt.cols = cols;
-                self.vt.rows = rows;
-                let applied =
-                    self.vt
-                        .terminal
-                        .resize(cols, rows, cell_w, cell_h)
-                        .map_err(|error| {
-                            warn!(tab_id = self.tab_id, %error, "server terminal resize failed");
-                            TabError::from(error)
-                        });
-                // Pixel geometry stays 0 on the PTY winsize, matching
-                // `PtySupervisor::resize`; libghostty gets the real cell
-                // metrics above, which is what its size reports read.
-                self.queue_resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-                // Mode-2048 in-band size reports fire inside `resize`,
-                // outside any `vt_write` — draining only after writes
-                // would silently drop them.
-                self.take_replies();
+            TabCmd::Input { data, geometry } => {
+                // A refused geometry is warned about inside and the
+                // bytes still go: an INPUT frame is unacknowledged, so
+                // there is nobody to answer, and dropping a client's
+                // keystrokes over a resize the terminal disliked would
+                // be the worse failure.
+                if let Some(geometry) = geometry {
+                    let _ = self.apply_geometry(geometry);
+                }
+                self.queue_input(data);
+            }
+            TabCmd::Resize { geometry, ack } => {
+                let applied = self.apply_geometry(geometry);
                 // Answered only here, with both halves applied: a waiter
                 // that resumed at the terminal resize alone could still
                 // snapshot a tab whose child had not been told.
@@ -1080,8 +1133,8 @@ impl TabTask {
         // there is no cache for the dirty flags to protect.
         vt.render.mark_full()?;
         let defaults = (colors.foreground, colors.background);
-        let cols = vt.cols;
-        let mut grid: Vec<RenderedRow> = (0..usize::from(vt.rows))
+        let cols = vt.geometry.cols;
+        let mut grid: Vec<RenderedRow> = (0..usize::from(vt.geometry.rows))
             .map(|_| RenderedRow::default())
             .collect();
         vt.render.walk_dirty(&vt.terminal, |row, cells: &[Cell]| {
@@ -1097,8 +1150,8 @@ impl TabTask {
         let scrollback_rows = roost_vt::scrollback_rows(&self.vt.terminal)?;
         let scrollback_text = roost_vt::scrollback_text(&self.vt.terminal, scrollback)?;
         Ok(DumpData {
-            cols: u32::from(self.vt.cols),
-            rows: u32::from(self.vt.rows),
+            cols: u32::from(self.vt.geometry.cols),
+            rows: u32::from(self.vt.geometry.rows),
             cursor: cursor
                 .filter(|cursor| cursor.visible)
                 .map(|cursor| (cursor.row, cursor.col, cursor.visible)),
@@ -1110,7 +1163,7 @@ impl TabTask {
 
     fn dump_resolved(&mut self) -> Result<ResolvedCellsData, TabError> {
         let (grid, colors, _) = self.render_grid()?;
-        let (cols, rows) = (self.vt.cols, self.vt.rows);
+        let (cols, rows) = (self.vt.geometry.cols, self.vt.geometry.rows);
         let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
         for row in 0..u32::from(rows) {
             // `RenderedRow::cells` is sparse but ascending by column, so

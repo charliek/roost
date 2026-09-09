@@ -573,6 +573,8 @@ async fn the_line_reader_residue_carries_into_the_frame_reader() {
         seq: 100,
         server_epoch: STUB_EPOCH,
         tab_generation: 3,
+        snapshot_cols: None,
+        snapshot_rows: None,
     });
     write_frame(&mut wire, &serde_json::to_vec(&reply).unwrap())
         .await
@@ -646,6 +648,8 @@ async fn a_mismatched_resume_identity_is_visible_on_both_sides() {
         seq: 0,
         server_epoch: STUB_EPOCH ^ 0xFFFF,
         tab_generation: 9,
+        snapshot_cols: None,
+        snapshot_rows: None,
     };
     let stub = Stub::start(Plan::new().handshake(Handshake::Accept(wrong.clone()))).await;
 

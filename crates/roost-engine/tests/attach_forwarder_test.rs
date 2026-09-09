@@ -188,6 +188,31 @@ impl Harness {
         (client, tab_id, data)
     }
 
+    /// Attach at an explicit viewport and read the snapshot through, so
+    /// the next frame is one the test caused. The accepted reply comes
+    /// back with the connection because the geometry tests read it.
+    async fn attached_at(
+        &self,
+        client: &mut IpcClient,
+        lease: &str,
+        tab_id: i64,
+        grid: (u16, u16),
+        cell: (u16, u16),
+        focus: bool,
+    ) -> (AttachAccepted, DataClient) {
+        let ticket = attach_with(
+            client,
+            sized_attach_params(lease, tab_id, grid, cell, focus),
+        )
+        .await
+        .expect("tab.attach");
+        let (accepted, mut data) = dial(&self.socket, handshake(&ticket.attach_token))
+            .await
+            .expect("accepted");
+        data.read_snapshot().await;
+        (accepted, data)
+    }
+
     /// A tab that has been attached once and has gone quiet again, with
     /// the data connection dropped the way a client's would be. The seq
     /// is the last record that client applied — what it would carry into
@@ -229,6 +254,27 @@ fn attach_params(lease: &str, tab_id: i64) -> TabAttachParams {
         cell_w_px: 0,
         cell_h_px: 0,
         libghostty_build: roost_vt::libghostty_build(),
+        focus: true,
+    }
+}
+
+/// The same at an explicit viewport. `focus` is the attach-time
+/// geometry claim: `true` resizes the tab, `false` attaches at whatever
+/// size it already is.
+fn sized_attach_params(
+    lease: &str,
+    tab_id: i64,
+    (cols, rows): (u16, u16),
+    (cell_w_px, cell_h_px): (u16, u16),
+    focus: bool,
+) -> TabAttachParams {
+    TabAttachParams {
+        cols,
+        rows,
+        cell_w_px,
+        cell_h_px,
+        focus,
+        ..attach_params(lease, tab_id)
     }
 }
 
@@ -1059,6 +1105,239 @@ async fn tab_attach_accepts_no_lease_an_empty_lease_and_a_stale_one() {
             .expect("accepted");
         data.read_snapshot().await;
     }
+}
+
+// ---------------------------------------------------------------------
+// Geometry: the last geometry-bearing interaction sizes the PTY
+// ---------------------------------------------------------------------
+
+/// Enable libghostty's mode-2048 in-band size reports on a tab. Every
+/// resize then writes one report toward the child, on the very queue
+/// keystrokes ride — which is what makes the order between a resize and
+/// the input that caused it observable from outside.
+async fn watch_size_reports(client: &mut IpcClient, tab_id: i64) {
+    feed(client, tab_id, b"\x1b[?2048h".to_vec()).await;
+}
+
+/// How many size reports for `grid` a captured stream carries. The
+/// report is `CSI 48 ; rows ; cols ; …` — the grid half is all these
+/// tests read, so a change in the pixel half cannot break them.
+fn size_reports(captured: &[u8], (cols, rows): (u16, u16)) -> usize {
+    String::from_utf8_lossy(captured)
+        .matches(&format!("48;{rows};{cols}"))
+        .count()
+}
+
+fn index_of(captured: &[u8], needle: &[u8]) -> usize {
+    captured
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .unwrap_or_else(|| {
+            panic!(
+                "{:?} is not in {:?}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(captured)
+            )
+        })
+}
+
+/// Typing is a geometry-bearing interaction: an INPUT frame carries its
+/// connection's declared geometry, and the tab takes that size *before*
+/// the bytes are written. Both ride one command channel, so the order is
+/// the task's receive order and needs no fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_input_frame_applies_its_connections_geometry_first() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_desktop, _a) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_phone, mut b) = h
+        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .await;
+    wait_for_dump(&mut client, tab_id, "the focused attach's geometry", |d| {
+        (d.cols, d.rows) == (100, 30)
+    })
+    .await;
+
+    watch_size_reports(&mut client, tab_id).await;
+    b.send(FRAME_INPUT, b"ROOST_TYPED").await;
+
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_TYPED"]).await;
+    let resized = index_of(&captured, b"48;20;60");
+    let typed = index_of(&captured, b"ROOST_TYPED");
+    assert!(
+        resized < typed,
+        "the resize must precede the bytes it carried: {:?}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert_eq!(
+        {
+            let d = dump(&mut client, tab_id).await;
+            (d.cols, d.rows)
+        },
+        (60, 20),
+        "the PTY follows whoever typed last"
+    );
+}
+
+/// Geometry is four numbers, not two. A connection at the tab's own grid
+/// but with different cell metrics is a different viewport — libghostty's
+/// size reports quote the pixel dimensions — so its input resizes the tab
+/// even though `tab.dump` cannot tell the difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_accepted, mut same) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_accepted, mut wider_cells) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (9, 16), false)
+        .await;
+
+    watch_size_reports(&mut client, tab_id).await;
+    same.send(FRAME_INPUT, b"ROOST_UNCHANGED").await;
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_UNCHANGED"]).await;
+    assert_eq!(
+        size_reports(&captured, (100, 30)),
+        0,
+        "geometry that has not changed is not re-applied ({:?})",
+        String::from_utf8_lossy(&captured)
+    );
+
+    wider_cells.send(FRAME_INPUT, b"ROOST_WIDER_CELLS").await;
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_WIDER_CELLS"]).await;
+    assert_eq!(
+        size_reports(&captured, (100, 30)),
+        1,
+        "the same grid at other cell metrics is still a resize ({:?})",
+        String::from_utf8_lossy(&captured)
+    );
+}
+
+/// Two clients typing into one tab do not race for the PTY's size: each
+/// INPUT applies its own geometry, and the tab ends up wherever the last
+/// command the task *received* asked for — not the last one sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_senders_linearize_in_receive_order() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_accepted, mut desktop) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_accepted, mut phone) = h
+        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .await;
+
+    // Sequenced, not raced: each marker is read back before the next
+    // sender types, so which command the task took first is a fact of
+    // the test rather than of the scheduler.
+    phone.send(FRAME_INPUT, b"ROOST_PHONE").await;
+    read_pty_input_until(&mut client, tab_id, &[b"ROOST_PHONE"]).await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (60, 20));
+
+    desktop.send(FRAME_INPUT, b"ROOST_DESKTOP").await;
+    read_pty_input_until(&mut client, tab_id, &[b"ROOST_DESKTOP"]).await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (100, 30));
+}
+
+/// `tab.attach` refuses a zero-sized grid, and a RESIZE frame states the
+/// same client's geometry, so the two agree: the frame is dropped rather
+/// than applied, and the connection carries on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_sized_resize_frame_is_ignored() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (_accepted, mut data) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+
+    let mut payload = Vec::new();
+    for value in [0u16, 20, 8, 16] {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    data.send(FRAME_RESIZE, &payload).await;
+
+    // Read a later frame back, so "nothing happened" is a fact about a
+    // tab that has processed the zero-sized one, not about timing.
+    data.send(FRAME_INPUT, b"ROOST_AFTER_ZERO").await;
+    read_pty_input_until(&mut client, tab_id, &[b"ROOST_AFTER_ZERO"]).await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!(
+        (d.cols, d.rows),
+        (100, 30),
+        "a zero-sized RESIZE leaves the tab alone"
+    );
+}
+
+/// An unfocused attach claims nothing: the tab keeps the size the
+/// focused client gave it, and the accepted handshake reports the
+/// geometry its snapshot was actually encoded at — which is what a `vt`
+/// client has to build its terminal at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (desktop, _a) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    assert_eq!(
+        (desktop.snapshot_cols, desktop.snapshot_rows),
+        (None, None),
+        "a focused attach just resized the tab to its own geometry"
+    );
+
+    let (phone, _b) = h
+        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .await;
+    assert_eq!(
+        (phone.snapshot_cols, phone.snapshot_rows),
+        (Some(100), Some(30))
+    );
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!(
+        (d.cols, d.rows),
+        (100, 30),
+        "a client that is only watching cannot shrink the one that is typing"
+    );
+}
+
+/// Reading is not an interaction. `tab.dump` carries no geometry, so it
+/// leaves the tab's size alone however often it is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dump_never_resizes() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (_accepted, mut data) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (100, 30));
+
+    let mut payload = Vec::new();
+    for value in [70u16, 22, 8, 16] {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    data.send(FRAME_RESIZE, &payload).await;
+    wait_for_dump(&mut client, tab_id, "the RESIZE frame to land", |d| {
+        (d.cols, d.rows) == (70, 22)
+    })
+    .await;
+
+    // A third client reading the tab changes nothing about it.
+    let mut reader = h.control().await;
+    let d = dump(&mut reader, tab_id).await;
+    assert_eq!((d.cols, d.rows), (70, 22));
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (70, 22));
 }
 
 /// A megabyte injected through the session's own test-mode arm has to

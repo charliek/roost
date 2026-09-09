@@ -22,7 +22,7 @@ use roost_engine::osc::{OscColorSnapshot, OscRgb};
 use roost_engine::tab_task::{
     ServerVtConfig, ServerVtWorkspace, TabCmd, TabError, SERVER_VT_CONTINUATION_MAX,
 };
-use roost_engine::{PtyOutputEvent, PtySupervisor, TabEffectKind};
+use roost_engine::{Geometry, PtyOutputEvent, PtySupervisor, TabEffectKind};
 use roost_ipc::messages::{
     bytes_base64, AttachPayloadKind, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES,
 };
@@ -530,7 +530,10 @@ async fn a_resume_after_the_exit_replays_the_stored_exit() {
         .expect("spawn");
     let commands = sup.tab_commands(916).expect("server-vt tab task");
     commands
-        .send(TabCmd::Input(b"\n".to_vec()))
+        .send(TabCmd::Input {
+            data: b"\n".to_vec(),
+            geometry: None,
+        })
         .await
         .expect("tab task is alive");
 
@@ -865,10 +868,12 @@ async fn a_resize_drains_the_in_band_size_report() {
 
     commands
         .send(TabCmd::Resize {
-            cols: 40,
-            rows: 12,
-            cell_w: 8,
-            cell_h: 16,
+            geometry: Geometry {
+                cols: 40,
+                rows: 12,
+                cell_w: 8,
+                cell_h: 16,
+            },
             ack: None,
         })
         .await

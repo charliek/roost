@@ -103,6 +103,22 @@ impl PtyOutputEvent {
     }
 }
 
+/// The size one interaction claims for a tab: the grid AND the cell
+/// metrics, compared as a whole. libghostty's mode-2048 in-band size
+/// reports quote the pixel dimensions, so the same grid at a different
+/// cell size is a different viewport and has to be applied.
+///
+/// It lives here rather than beside the tab task because an attach
+/// ticket carries it and the client registry compiles without the
+/// `server-vt` feature that gates that module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Geometry {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_w: u32,
+    pub cell_h: u32,
+}
+
 /// A tab's output channel plus its sequence counter.
 ///
 /// The counter bump and the `send` have to happen together under one
@@ -948,7 +964,10 @@ impl PtySupervisor {
         #[cfg(feature = "server-vt")]
         if let Some(tx) = task_tx {
             return tx
-                .send(crate::tab_task::TabCmd::Input(data))
+                .send(crate::tab_task::TabCmd::Input {
+                    data,
+                    geometry: None,
+                })
                 .await
                 .map_err(|_| PtyError::Closed(tab_id));
         }
@@ -979,10 +998,12 @@ impl PtySupervisor {
         if let Some(tx) = task_tx {
             return tx
                 .send(crate::tab_task::TabCmd::Resize {
-                    cols,
-                    rows,
-                    cell_w: 0,
-                    cell_h: 0,
+                    geometry: Geometry {
+                        cols,
+                        rows,
+                        cell_w: 0,
+                        cell_h: 0,
+                    },
                     ack: None,
                 })
                 .await

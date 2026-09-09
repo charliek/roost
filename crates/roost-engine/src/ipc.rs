@@ -630,6 +630,7 @@ pub enum ClipboardOp {
 
 use crate::event_push::{self, PushLimits};
 use crate::persistence::HostSnapshot;
+use crate::pty::Geometry;
 use crate::{
     AttentionSource, PtyError, PtySupervisor, ResumeCut, ResumeError, Workspace, WorkspaceError,
 };
@@ -1257,13 +1258,30 @@ struct AttachToken {
     minted_by: u64,
     tab_id: i64,
     tab_generation: u64,
-    /// What `tab.attach` negotiated. Carried on the ticket because the
-    /// data connection presents only the token: the encode and the
-    /// handshake reply both have to name the kind the control op
-    /// settled on, and re-deriving it there would let the two answers
-    /// drift.
-    kind: AttachPayloadKind,
+    terms: AttachTerms,
     expires_at: std::time::Instant,
+}
+
+/// What `tab.attach` settled on, carried to the forwarder.
+///
+/// The data connection presents only a token, so everything the control
+/// op decided has to ride the ticket: re-deriving any of it on the data
+/// side would let the two answers drift.
+#[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct AttachTerms {
+    /// The negotiated payload kind — the encode and the handshake reply
+    /// both have to name it.
+    pub(crate) kind: AttachPayloadKind,
+    /// The client's declared geometry: what the tab was resized to on a
+    /// focused attach, and what every `INPUT` frame from this connection
+    /// claims (plan 057, R15). A `RESIZE` frame moves it.
+    pub(crate) geometry: Geometry,
+    /// Whether the attach claimed the tab's geometry. A `false` here is
+    /// what makes the forwarder report the snapshot's own size back:
+    /// nothing resized the tab, so the payload is at whatever size it
+    /// already was.
+    pub(crate) focus: bool,
 }
 
 /// What consuming a token admitted, handed to the forwarder.
@@ -1272,7 +1290,7 @@ struct AttachToken {
 pub(crate) struct AdmittedAttach {
     pub(crate) tab_id: i64,
     pub(crate) tab_generation: u64,
-    pub(crate) kind: AttachPayloadKind,
+    pub(crate) terms: AttachTerms,
 }
 
 struct Lease {
@@ -1628,7 +1646,7 @@ impl ClientRegistry {
         minted_by: u64,
         tab_id: i64,
         tab_generation: u64,
-        kind: AttachPayloadKind,
+        terms: AttachTerms,
         ttl: Duration,
     ) -> Result<String, HandlerError> {
         let now = std::time::Instant::now();
@@ -1648,7 +1666,7 @@ impl ClientRegistry {
             minted_by,
             tab_id,
             tab_generation,
-            kind,
+            terms,
             expires_at: now + ttl,
         });
         Ok(token)
@@ -1695,7 +1713,7 @@ impl ClientRegistry {
         Ok(AdmittedAttach {
             tab_id: ticket.tab_id,
             tab_generation: ticket.tab_generation,
-            kind: ticket.kind,
+            terms: ticket.terms,
         })
     }
 
@@ -1844,7 +1862,7 @@ impl SessionState {
         ctx: &ConnCtx,
         tab_id: i64,
         tab_generation: u64,
-        kind: AttachPayloadKind,
+        terms: AttachTerms,
     ) -> Result<String, HandlerError> {
         let mut guard = lock(&self.clients);
         if self.stopping.load(Ordering::Acquire) {
@@ -1854,7 +1872,7 @@ impl SessionState {
             ctx.conn_id,
             tab_id,
             tab_generation,
-            kind,
+            terms,
             self.attach_token_ttl(),
         )
     }
@@ -2821,49 +2839,68 @@ async fn tab_attach(
     })?;
 
     // Zero cell pixels are legal — a headless client has no cell metrics
-    // to report — but a zero-sized grid is not a grid.
+    // to report — but a zero-sized grid is not a grid. Checked for an
+    // unfocused attach too: it is still this connection's declared
+    // geometry, which its first INPUT or RESIZE frame applies.
     if p.cols == 0 || p.rows == 0 {
         return Err(HandlerError::invalid_param(format!(
             "cols and rows must both be non-zero (got {}x{})",
             p.cols, p.rows
         )));
     }
+    let geometry = Geometry {
+        cols: p.cols,
+        rows: p.rows,
+        cell_w: u32::from(p.cell_w_px),
+        cell_h: u32::from(p.cell_h_px),
+    };
 
-    // The attach geometry is the client's, so the tab takes it now
-    // rather than at first frame: a snapshot encoded at the old size
-    // would be re-laid-out on the client the instant it resized.
-    // Detach never resizes back (roadmap D7).
+    // A focused attach is a geometry-bearing interaction, so the tab
+    // takes the client's size now rather than at first frame: a snapshot
+    // encoded at the old size would be re-laid-out on the client the
+    // instant it resized. Detach never resizes back (roadmap D7). An
+    // unfocused one resizes nothing — a client that is only watching
+    // must not shrink the one that is typing — and the reply tells it
+    // the size the snapshot was encoded at instead.
     //
     // Awaited, not fired and forgotten: the ticket minted below is the
     // client's authority to snapshot this tab, and a `Resize` still
     // sitting on the command channel would let that snapshot be encoded
     // at the geometry the attach exists to replace.
-    let (resized_tx, resized_rx) = tokio::sync::oneshot::channel();
-    commands
-        .send(crate::tab_task::TabCmd::Resize {
-            cols: p.cols,
-            rows: p.rows,
-            cell_w: u32::from(p.cell_w_px),
-            cell_h: u32::from(p.cell_h_px),
-            ack: Some(resized_tx),
-        })
-        .await
-        .map_err(|_| tab_gone(p.tab_id))?;
-    resized_rx
-        .await
-        // The task dropped the ack without answering, which only
-        // happens when the task itself is going away.
-        .map_err(|_| tab_gone(p.tab_id))?
-        // The terminal refused the geometry the client asked for, which
-        // is the client's parameter to fix.
-        .map_err(|error| {
-            HandlerError::invalid_param(format!(
-                "tab {} could not be resized to {}x{}: {error}",
-                p.tab_id, p.cols, p.rows
-            ))
-        })?;
+    if p.focus {
+        let (resized_tx, resized_rx) = tokio::sync::oneshot::channel();
+        commands
+            .send(crate::tab_task::TabCmd::Resize {
+                geometry,
+                ack: Some(resized_tx),
+            })
+            .await
+            .map_err(|_| tab_gone(p.tab_id))?;
+        resized_rx
+            .await
+            // The task dropped the ack without answering, which only
+            // happens when the task itself is going away.
+            .map_err(|_| tab_gone(p.tab_id))?
+            // The terminal refused the geometry the client asked for,
+            // which is the client's parameter to fix.
+            .map_err(|error| {
+                HandlerError::invalid_param(format!(
+                    "tab {} could not be resized to {}x{}: {error}",
+                    p.tab_id, p.cols, p.rows
+                ))
+            })?;
+    }
 
-    let attach_token = session.mint_attach_token(ctx, p.tab_id, tab_generation, kind.clone())?;
+    let attach_token = session.mint_attach_token(
+        ctx,
+        p.tab_id,
+        tab_generation,
+        AttachTerms {
+            kind: kind.clone(),
+            geometry,
+            focus: p.focus,
+        },
+    )?;
     encode(&TabAttachResult {
         attach_token,
         kind,

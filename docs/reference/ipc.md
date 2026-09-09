@@ -458,6 +458,40 @@ Headless resize of a tab's PTY (issues `TIOCSWINSZ`, which fires
 Request: `{"params": {"tab_id": "3", "cols": 100, "rows": 24}}`.
 Response: `{}`.
 
+**A tab is sized by the last geometry-bearing interaction with it**
+(plan 057, R15) — the rule that lets two clients at different sizes
+share one tab without either permanently shrinking the other. Four
+things carry geometry, and each one sizes the tab:
+
+* this op;
+* [`tab.attach`](#tabattach) with `focus: true` (the default), which
+  resizes during negotiation;
+* a data-plane `INPUT` frame, which applies its connection's declared
+  geometry ahead of the bytes when it differs — typing is how a client
+  says which viewport it is looking at;
+* a data-plane `RESIZE` frame, which applies and becomes that
+  connection's declared geometry.
+
+Nothing else does. [`tab.dump`](#tabdump), an
+[`events.subscribe`](#eventssubscribe) stream, a
+[`tab.write`](#tabwrite) (a control-plane write has no viewport behind
+it) and an idle client that attached with `focus: false` all leave the
+size exactly where it was.
+
+Geometry is the four numbers `(cols, rows, cell_w_px, cell_h_px)`
+compared together, not just the grid: libghostty's mode-2048 in-band
+size reports quote the pixel dimensions, so the same grid at different
+cell metrics is a different viewport. Unchanged geometry is not
+re-applied, so two clients typing at the same size cost nothing.
+
+Simultaneous interactions **linearize in the order the tab receives
+them**, not in wall-clock order: every one of them is a command on the
+tab's single channel. The consequence is the rule working as intended —
+two clients alternating keystrokes at different sizes flip the PTY's
+size each time. The tab tells nobody it was resized under them (see
+[Data plane](#data-plane)); a client at another size sees wrapping
+until it interacts again.
+
 ### `tab.dump`
 
 Read the tab's live terminal *viewport* as text — the determinism
@@ -2092,8 +2126,9 @@ assumes leaseless subscribe, `driver_changed`-on-takeover, and — until
 R15 — a lease-gated write. `open_input` names what it may rely on
 beyond that: [`tab.write`](#tabwrite) and [`tab.attach`](#tabattach)
 take no lease; a takeover preserves every control and data connection,
-moving only the foreground; and `tab.attach` accepts a `focus`
-parameter. It is a feature entry rather than a generation bump because
+moving only the foreground; and `tab.attach` takes a `focus` parameter,
+so a client can attach without claiming the tab's geometry. It is a
+feature entry rather than a generation bump because
 it takes nothing away — a `4` session *without* it still answers
 `connect-required` to a leaseless write, so the client feature-detects
 rather than sniffing the number.
@@ -2546,14 +2581,23 @@ be masked by a later one:
 | 2 | `kinds` contains something servable | `unsupported-kind` (message names both lists) |
 | 3 | the negotiated kind's own requirement holds | `build-mismatch` (message names both strings) |
 | 4 | `cols` and `rows` both non-zero | `invalid-param` |
-| 5 | the tab accepts the geometry | `invalid-param` |
+| 5 | the tab accepts the geometry (a focused attach only — an unfocused one resizes nothing) | `invalid-param` |
 | 6 | token quota not exhausted | `too-many-tokens` |
 
 **An attach takes no lease** (plan 057, R15). `lease` is accepted and
 ignored, exactly as on [`tab.write`](#tabwrite): attaching is reading
-plus raw input, and both are open to every same-UID client. A client
-that holds no lease omits the key rather than sending `null` — a
-session that predates `open_input` decodes it as a required string.
+plus raw input, and both are open to every same-UID client.
+
+**Send a lease anyway whenever you hold one.** A session that predates
+`open_input` decodes the key as a *required* string and refuses both a
+missing one and a `null`, so a client that strips it would fail every
+attach against an older peer rather than only the attaches that peer
+really means to refuse. Holding a lease and presenting it costs nothing
+here and is the difference between working and not; holding none means
+you cannot attach to a pre-`open_input` session at all, which is that
+session's own rule and correct for it. A client that has no lease omits
+the key rather than sending `null` — against this session both are the
+same answer, and against an older one neither works.
 
 Checks 2 and 3 stay two separate walks over the offered list rather
 than one predicate, because a single pass cannot tell "nothing
@@ -2566,16 +2610,47 @@ when the client offers no kind but `ghostty-snapshot`, or is talking to
 a session too old to advertise `vt`.
 
 Zero `cell_w_px` / `cell_h_px` are legal — a headless client has no
-cell metrics to report — but a zero-sized grid is not a grid.
+cell metrics to report — but a zero-sized grid is not a grid. That
+holds for an unfocused attach too: `cols`/`rows` are this connection's
+**declared geometry** either way, and its first `INPUT` or `RESIZE`
+frame applies them.
 
-**Attach is when the server resizes.** Between checks 4 and 6 the
-session resizes the tab (server terminal *and* `TIOCSWINSZ`) to the
-requested geometry and waits for that to land, so the snapshot the
-data connection is about to encode is already at client size and needs
-no post-READY resize. Detach never resizes back — the PTY keeps the
-last attached size, so a TUI agent does not get a `SIGWINCH` because
-somebody closed a laptop. This does not contradict that rule: attach is
-exactly when an in-process Roost resizes too.
+**`focus` says whether this attach claims the tab's geometry.** It
+defaults to `true`, and a focused attach is when the server resizes:
+between checks 4 and 6 the session resizes the tab (server terminal
+*and* `TIOCSWINSZ`) to the requested geometry and waits for that to
+land, so the snapshot the data connection is about to encode is already
+at client size and needs no post-READY resize. Detach never resizes
+back — the PTY keeps the last attached size, so a TUI agent does not
+get a `SIGWINCH` because somebody closed a laptop. This does not
+contradict that rule: attach is exactly when an in-process Roost
+resizes too.
+
+`focus: false` resizes **nothing** — the point of it is a client that
+wants to watch a tab without shrinking the one that is typing (a phone
+glancing at a desktop's session). Its geometry still counts the moment
+it interacts; see the sizing rule beside [`tab.resize`](#tabresize).
+
+`true` is **omitted from the wire**, so a request from a client that
+does not care is byte-identical to what clients have always sent. That
+is not a size optimization: `TabAttachParams` is strict, so a session
+that predates `open_input` would answer `unknown-field` to *every*
+attach that carried the key rather than only to the ones that meant
+something by it. Send `focus: false` only to a session advertising
+`open_input` in [`session.identify`](#sessionidentify).
+
+**The accepted handshake reports the snapshot's own geometry** when it
+can differ from what was asked for. `snapshot_cols` / `snapshot_rows`
+on the [data connection's](#the-handshake) accepted reply name the size
+the payload was encoded at, and are present only for an unfocused
+snapshot attach — a focused one just resized the tab to the client's
+own geometry, and a resume encodes no snapshot at all. A `vt` client
+needs them: that payload replays into a terminal *of the attach
+geometry*, and replaying it at another width wraps lines and misplaces
+absolute cursor moves, so such a client hydrates at this size and
+resizes its own terminal afterwards. Both keys are additive — a client
+that has never heard of them ignores them, and one reading an older
+session's reply simply finds neither.
 
 `attach_token` is 32 hex characters, the same bearer credential the
 lease is and under the same no-logging rule. It is:
@@ -2738,6 +2813,14 @@ The control-plane `TabAttachResult.kind` must agree; a client that sees
 them disagree treats it as `protocol-error` and re-attaches rather than
 guessing which to believe.
 
+`snapshot_cols` and `snapshot_rows` are **present only when the payload
+is not at the geometry the client asked for** — an unfocused snapshot
+attach (`tab.attach` with `focus: false`), which resized nothing. They
+name the size the snapshot was encoded at, and a `vt` client builds its
+terminal at that size before replaying, then resizes it to its own; see
+[`tab.attach`](#tabattach). Absent on a focused attach and on a resume,
+and absent from every reply a session predating `open_input` writes.
+
 #### Preamble and frames
 
 After an accepted reply the server writes the 8-byte magic
@@ -2786,7 +2869,18 @@ what the server sends and vice versa:
 own, so a client that has applied `PTY` frame `final_seq - 1` knows it
 missed nothing. Pixel dimensions on `RESIZE` are load-bearing, not
 decoration: the server terminal's resize and mode-2048 size reports
-both need them.
+both need them, and they are part of the geometry the tab compares
+against (see [`tab.resize`](#tabresize)). A `RESIZE` naming zero cols
+or zero rows is **ignored**, not fatal and not applied —
+[`tab.attach`](#tabattach) refuses a zero-sized grid and the two state
+the same client's geometry, so they have to agree about what a grid is.
+
+Both `INPUT` and `RESIZE` size the tab: a `RESIZE` applies and becomes
+the connection's declared geometry, and an `INPUT` applies that
+geometry ahead of its bytes when the tab is at another one. Neither is
+answered, and the server never tells an attached client that somebody
+else resized the tab under it — a client at another size sees wrapping
+until it next interacts.
 
 Ordering, once the stream is running:
 
@@ -2951,6 +3045,11 @@ is now only what a session predating `open_input` emits.
 **A takeover closes none of them.** It moves the foreground — see
 [`session.connect`](#sessionconnect) — and leaves every control and data
 connection exactly where it was.
+
+**The tab is sized by whichever of them interacted last**, per the rule
+beside [`tab.resize`](#tabresize): a client that only watches (attached
+with `focus: false`, never typing) never changes the size out from
+under the one that is working.
 
 What bounds the count is not a per-tab limit: it is the token quota (16
 unconsumed tickets per TTL window, see [`tab.attach`](#tabattach)) and

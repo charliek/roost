@@ -423,6 +423,7 @@ fn sample_attach_params() -> TabAttachParams {
         cell_w_px: 9,
         cell_h_px: 18,
         libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
+        focus: true,
     }
 }
 
@@ -576,6 +577,45 @@ fn tab_attach_params_omit_an_absent_lease() {
     );
 }
 
+/// The compatibility guarantee `focus` is built around: a focused
+/// attach — the default, and what every client sends today — serializes
+/// to **no key at all**, so a new client's request stays byte-identical
+/// against a session that predates `open_input` and
+/// `deny_unknown_fields`-refuses anything it has not heard of. Only
+/// `false`, which a client sends only to a session advertising the
+/// feature, appears on the wire.
+#[test]
+fn tab_attach_params_omit_a_focused_attach_and_spell_out_an_unfocused_one() {
+    const NO_FOCUS_KEY: &str =
+        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b"}"#;
+
+    let decoded: TabAttachParams = serde_json::from_str(NO_FOCUS_KEY).expect("a missing key");
+    assert!(decoded.focus, "an absent `focus` is a focused attach");
+    assert!(
+        !serde_json::to_string(&decoded).unwrap().contains("focus"),
+        "a focused attach carries no `focus` key"
+    );
+
+    let decoded: TabAttachParams = serde_json::from_str(
+        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b",
+            "focus":false}"#,
+    )
+    .expect("an explicit false");
+    assert!(!decoded.focus);
+    assert_eq!(
+        serde_json::to_string(&decoded).unwrap(),
+        concat!(
+            r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"#,
+            r#""libghostty_build":"b","focus":false}"#
+        )
+    );
+
+    // The Rust default has to agree with the serde one, or filling the
+    // rest of the struct with `..Default::default()` would quietly ask
+    // for an unfocused attach.
+    assert!(TabAttachParams::default().focus);
+}
+
 #[test]
 fn tab_attach_result_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
@@ -657,6 +697,8 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         seq: 900,
         server_epoch: EPOCH,
         tab_generation: 3,
+        snapshot_cols: None,
+        snapshot_rows: None,
     });
     round_trip(&accepted);
     assert_eq!(serde_json::to_string(&accepted).unwrap(), ACCEPTED);
@@ -679,6 +721,47 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
             message: "unknown or expired token".into(),
         })
     );
+}
+
+/// The snapshot geometry rides the accepted arm only when the server
+/// has something to report — an unfocused attach, whose payload is at
+/// the tab's size and not the client's. Both directions are additive:
+/// an old client ignores the keys, and a new client decoding a reply
+/// that has none reads `None`.
+#[test]
+fn an_accepted_handshake_reply_round_trips_with_and_without_the_snapshot_geometry() {
+    const WITH: &str = concat!(
+        r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
+        r#""snapshot_cols":100,"snapshot_rows":30}"#,
+    );
+
+    let sized = AttachHandshakeReply::Accepted(AttachAccepted {
+        kind: AttachPayloadKind::VT.into(),
+        mode: AttachMode::Snapshot,
+        seq: 900,
+        server_epoch: EPOCH,
+        tab_generation: 3,
+        snapshot_cols: Some(100),
+        snapshot_rows: Some(30),
+    });
+    round_trip(&sized);
+    assert_eq!(serde_json::to_string(&sized).unwrap(), WITH);
+    assert_eq!(
+        serde_json::from_str::<AttachHandshakeReply>(WITH).unwrap(),
+        sized
+    );
+
+    let AttachHandshakeReply::Accepted(bare) =
+        serde_json::from_str::<AttachHandshakeReply>(concat!(
+            r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
+            r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
+        ))
+        .expect("a reply from a session that never heard of the keys")
+    else {
+        panic!("the accepted arm");
+    };
+    assert_eq!((bare.snapshot_cols, bare.snapshot_rows), (None, None));
 }
 
 /// `ok` is the discriminant, so an accepted arm missing a field it
