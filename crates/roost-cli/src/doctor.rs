@@ -6631,10 +6631,11 @@ mod tests {
     ///
     /// The collapse is what the generator does and what the old version
     /// here did not: `### \`session autostart install\` / \`uninstall\``
-    /// leaves two gaps where the backticks and the slash were, and the
-    /// published anchor carries one hyphen for both. Without it this
-    /// helper rejects a correct anchor, so a doc link could not be added
-    /// to any heading carrying punctuation.
+    /// leaves two gaps where the backticks and the slash were, and a
+    /// correctly published anchor carries one hyphen for both — a
+    /// punctuation-heavy heading the old slugify got wrong. Without the
+    /// collapse this helper rejects a correct anchor, so a doc link
+    /// could not be added to any heading carrying punctuation.
     fn slugify(heading: &str) -> String {
         let mut out = String::new();
         let mut pending = false;
@@ -6780,9 +6781,10 @@ mod tests {
         let body = "# Real\n\n```bash\n# 1. Allow it as a login shell\n```\n\n## Also Real\n";
         assert_eq!(headings(body), vec![" Real", " Also Real"]);
 
-        // Dropped punctuation leaves one hyphen, not one per gap — the
-        // anchor `docs/reference/cli.md` actually publishes for its
-        // autostart heading, and what the old slugify got wrong.
+        // Dropped punctuation leaves one hyphen, not one per gap — a
+        // punctuation-heavy heading (backticks, a slash) that the old
+        // slugify got wrong; pinned here as a pure algorithm check on
+        // this literal, independent of any doc that publishes it.
         assert_eq!(
             anchor_of(" `session autostart install` / `uninstall`"),
             "session-autostart-install-uninstall"
