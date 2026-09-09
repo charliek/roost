@@ -328,12 +328,17 @@ pub(crate) enum HostConnState {
         previous: Option<HostId>,
     },
     Connected,
-    /// Another client holds the lease. This client keeps *watching* —
-    /// the stream survives a takeover now (plan 049 §3.8) and observer
-    /// batches still land — but it drives nothing: the frame is frozen,
-    /// no lease-bearing intent is sent, and no auto-retry ever takes the
-    /// session back, because retrying is taking it back and that is a
-    /// decision only the user makes.
+    /// Another client holds the **foreground**. Since plan 057 §3.5 that
+    /// is all it holds: the session closes nothing on a takeover, so this
+    /// client keeps its control connection, its event stream and every
+    /// attach — the grid stays live, keys still route, tabs still switch.
+    /// What it loses is what the lease now means — `tab.effect`, the
+    /// focus that mutes notifications, and the session-wide settings ops,
+    /// which are refused locally as
+    /// [`crate::host_conn::HostOpError::NotForeground`].
+    ///
+    /// No auto-retry ever takes the session back, because retrying is
+    /// taking it back and that is a decision only the user makes.
     ///
     /// `taken_by` is the claimant's self-reported label from the
     /// `session.driver_changed` envelope — display metadata, never
@@ -653,11 +658,13 @@ mod tests {
     }
 
     /// The sidebar's three-dot vocabulary, pinned against every
-    /// connection state: green only while actually connected, amber while
+    /// connection state: green while the session is reached, amber while
     /// something is in flight or waiting on the user, grey once the
-    /// connection is gone. And only a connected section is interactive —
-    /// which is what makes a dimmed section's rows unclickable everywhere
-    /// at once (plan 037 §3.1).
+    /// connection is gone. A taken-over host is green and interactive
+    /// (plan 057 §3.5) — it is connected, and only the foreground moved —
+    /// so `reached_session` is the predicate the section reads, and it is
+    /// what makes a dimmed section's rows unclickable everywhere at once
+    /// (plan 037 §3.1).
     #[test]
     fn every_connection_state_maps_to_a_section_state() {
         use roost_ui_model::host_sidebar::{HostDot, SectionState};
@@ -694,8 +701,8 @@ mod tests {
             assert_eq!(state.section_state(), expected, "{state:?}");
             assert_eq!(
                 state.section_state().interactive(),
-                state.is_foreground(),
-                "only a connected host's rows respond ({state:?})"
+                state.reached_session(),
+                "a host whose session is reached has responsive rows ({state:?})"
             );
         }
         assert_eq!(
@@ -712,6 +719,11 @@ mod tests {
             HostConnState::TakenOver { taken_by: None }
                 .section_state()
                 .dot(),
+            HostDot::Connected,
+            "the host is live; the band's word is where the takeover is said"
+        );
+        assert_eq!(
+            HostConnState::Stopped.section_state().dot(),
             HostDot::Offline
         );
     }

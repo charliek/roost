@@ -85,11 +85,17 @@ pub enum FidelityAction {
 }
 
 impl SectionState {
+    /// The header's connection dot.
+    ///
+    /// `TakenOver` is a *connected* dot (plan 057 §3.5): the takeover
+    /// moved the foreground and closed nothing, so that host is live —
+    /// streaming, listing, taking input. The band's word beside the dot
+    /// is where "somebody else is driving" is said.
     pub fn dot(self) -> HostDot {
         match self {
-            Self::Local | Self::Connected => HostDot::Connected,
+            Self::Local | Self::Connected | Self::TakenOver => HostDot::Connected,
             Self::Connecting | Self::NeedsRestart => HostDot::Pending,
-            Self::Disconnected | Self::TakenOver | Self::Stopped => HostDot::Offline,
+            Self::Disconnected | Self::Stopped => HostDot::Offline,
         }
     }
 
@@ -99,9 +105,11 @@ impl SectionState {
     /// A disconnected host still *lists* its rows — those shells are
     /// still running over there and the sidebar should not pretend
     /// otherwise — but nothing about them is actionable until the
-    /// connection is back, so focusing one cannot be attempted.
+    /// connection is back, so focusing one cannot be attempted. A
+    /// taken-over host is not that: it is connected, and switching tabs
+    /// on it works exactly as it does on any other (plan 057 §3.5).
     pub fn interactive(self) -> bool {
-        matches!(self, Self::Local | Self::Connected)
+        matches!(self, Self::Local | Self::Connected | Self::TakenOver)
     }
 
     /// The header's right-aligned word when the section is not simply
@@ -118,13 +126,17 @@ impl SectionState {
     }
 
     /// [`Self::status_text`] with the connection's own one-line reason
-    /// folded in: `disconnected — the host key for box has CHANGED…`.
+    /// folded in: `disconnected — the host key for box has CHANGED…`,
+    /// or `taken over by a phone`.
     ///
-    /// Only the disconnected word takes a reason, and only one that adds
-    /// something. An explicit disconnect's reason is the word itself
-    /// (`"disconnected"`), and `disconnected — disconnected` says less
-    /// than the bare word does — so a reason that merely repeats the
-    /// word, or is blank once trimmed, renders bare.
+    /// Two words take a reason, and each joins it its own way because
+    /// they are different facts: a disconnect's reason is *why*, set off
+    /// with a dash, and a takeover's is *who*, which reads as a clause.
+    /// Only a reason that adds something is folded in — an explicit
+    /// disconnect's reason is the word itself (`"disconnected"`), and
+    /// `disconnected — disconnected` says less than the bare word does,
+    /// so a reason that merely repeats the word, or is blank once
+    /// trimmed, renders bare.
     ///
     /// The result is capped at [`ROLLUP_MAX_CHARS`] *including* the
     /// ellipsis, by the same rule `agent_palette` ellipsizes its rows
@@ -133,12 +145,16 @@ impl SectionState {
     /// full text is what the toast and the log carry.
     pub fn status_text_with_reason(self, reason: Option<&str>) -> Option<String> {
         let word = self.status_text()?;
+        let joiner = match self {
+            Self::Disconnected => " — ",
+            Self::TakenOver => " by ",
+            _ => return Some(word.to_string()),
+        };
         let reason = reason
-            .filter(|_| self == Self::Disconnected)
             .map(str::trim)
             .filter(|reason| !reason.is_empty() && !reason.eq_ignore_ascii_case(word));
         Some(match reason {
-            Some(reason) => truncate_chars(&format!("{word} — {reason}"), ROLLUP_MAX_CHARS),
+            Some(reason) => truncate_chars(&format!("{word}{joiner}{reason}"), ROLLUP_MAX_CHARS),
             None => word.to_string(),
         })
     }
@@ -146,7 +162,8 @@ impl SectionState {
     /// Whether an inline "↻ Reconnect" row sits under the section.
     /// Everything that is not connected offers it — including
     /// `NeedsRestart`, where connecting again is how the upgrade dialog
-    /// (C8) gets raised.
+    /// (C8) gets raised, and `TakenOver`, where it is how the foreground
+    /// comes back (plan 057 §3.5).
     pub fn offers_reconnect(self) -> bool {
         !matches!(self, Self::Local | Self::Connected)
     }
@@ -531,15 +548,14 @@ mod tests {
         assert!(!rollup.ends_with('…'));
     }
 
-    /// Only `disconnected` takes a reason. The other words already name
-    /// a specific outcome, and a transport line beside "taken over" would
-    /// describe the connection that ended rather than the state.
+    /// Two words take a reason and the rest do not. `disconnected` takes
+    /// *why*, `taken over` takes *who*, and the others already name a
+    /// specific outcome that a line beside them could only muddy.
     #[test]
-    fn only_the_disconnected_word_takes_a_reason() {
+    fn only_the_disconnected_and_taken_over_words_take_a_reason() {
         for state in [
             SectionState::Connecting,
             SectionState::NeedsRestart,
-            SectionState::TakenOver,
             SectionState::Stopped,
         ] {
             assert_eq!(
@@ -551,6 +567,34 @@ mod tests {
         for state in [SectionState::Local, SectionState::Connected] {
             assert_eq!(state.status_text_with_reason(Some("a reason")), None);
         }
+    }
+
+    /// The takeover band names the taker when the session named one, and
+    /// says only "taken over" when it did not — a takeover this client
+    /// inferred from a probe rather than being told about. A label too
+    /// long for the slot is ellipsized like any other rollup, because the
+    /// name is whatever the other client typed for itself.
+    #[test]
+    fn the_takeover_band_names_the_taker_when_there_is_one() {
+        let band = |reason: Option<&str>| {
+            SectionState::TakenOver
+                .status_text_with_reason(reason)
+                .expect("a taken-over section has a rollup")
+        };
+        assert_eq!(band(Some("a phone")), "taken over by a phone");
+        assert_eq!(band(None), "taken over");
+        assert_eq!(
+            band(Some("   ")),
+            "taken over",
+            "a blank label is not a name"
+        );
+
+        let long = band(Some(&"n".repeat(ROLLUP_MAX_CHARS)));
+        assert_eq!(long.chars().count(), ROLLUP_MAX_CHARS);
+        assert!(
+            long.starts_with("taken over by ") && long.ends_with('…'),
+            "{long}"
+        );
     }
 
     /// A reason reaches the band through `sections`, and the agent count
@@ -575,8 +619,10 @@ mod tests {
         assert_eq!(SectionState::Connected.dot(), HostDot::Connected);
         assert_eq!(SectionState::Connecting.dot(), HostDot::Pending);
         assert_eq!(SectionState::NeedsRestart.dot(), HostDot::Pending);
+        // A takeover moved the foreground and closed nothing: that host
+        // is live, and the band's word is where it says who is driving.
+        assert_eq!(SectionState::TakenOver.dot(), HostDot::Connected);
         assert_eq!(SectionState::Disconnected.dot(), HostDot::Offline);
-        assert_eq!(SectionState::TakenOver.dot(), HostDot::Offline);
         assert_eq!(SectionState::Stopped.dot(), HostDot::Offline);
     }
 
@@ -608,12 +654,15 @@ mod tests {
             SectionState::Connecting,
             SectionState::Disconnected,
             SectionState::NeedsRestart,
-            SectionState::TakenOver,
             SectionState::Stopped,
         ] {
             assert!(!state.interactive(), "{state:?}");
             assert!(state.offers_reconnect(), "{state:?}");
         }
+        // The one state that is both: a taken-over host is live, so its
+        // rows respond — and the ↻ row is how the foreground comes back.
+        assert!(SectionState::TakenOver.interactive());
+        assert!(SectionState::TakenOver.offers_reconnect());
     }
 
     /// Plan 056 §3.4's matrix, the band's column: which action a reduced

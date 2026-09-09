@@ -120,6 +120,11 @@ pub(crate) enum HostTabFrame {
         fence: u64,
         server_epoch: u64,
         tab_generation: u64,
+        /// The geometry the payload was encoded at, when the session
+        /// says it is not the one this attach asked for — an unfocused
+        /// attach, which resizes nothing. `None` on a focused attach, on
+        /// a resume, and from every session predating `open_input`.
+        snapshot_size: Option<(u16, u16)>,
     },
     /// The attach op or the dial failed before any frame flowed.
     Failed {
@@ -256,6 +261,12 @@ struct Hydration {
     /// Bounded stepping left pages behind; a `StepDecoder` self-wake is
     /// in flight.
     stepping: bool,
+    /// The cols/rows the terminal being built here is at — the attach
+    /// geometry, or the snapshot's own where the session reported one
+    /// (`AttachAccepted.snapshot_cols/rows`, an unfocused attach). What
+    /// [`HostAttach::finish_hydration`] resizes *from* once the payload
+    /// is whole; nothing else touches it while the hydration runs.
+    built_at: (u16, u16),
 }
 
 impl Hydration {
@@ -354,6 +365,17 @@ impl HostAttach {
     /// `payload_kind` reports.
     pub(super) fn payload_kind(&self) -> Option<PayloadKind> {
         self.kind
+    }
+
+    /// Whether input queued here still has a reader (plan 057 §3.5).
+    ///
+    /// True for every phase but [`Phase::Ended`]. `Requesting` and
+    /// `Hydrating` queue rather than drop — the input queue outlives an
+    /// attempt, which is the whole reason it lives on the attach and not
+    /// on the attempt's task — and a *deposed* attach is `Live` like any
+    /// other, because a takeover closes nothing.
+    pub(super) fn live(&self) -> bool {
+        !matches!(self.phase, Phase::Ended)
     }
 
     /// Start (or restart) an attach attempt. Must be called inside the
@@ -484,6 +506,7 @@ impl HostAttach {
                 fence,
                 server_epoch,
                 tab_generation,
+                snapshot_size,
                 ..
             } => {
                 self.kind = Some(kind);
@@ -510,6 +533,16 @@ impl HostAttach {
                         self.note_resize(geometry);
                     }
                 } else {
+                    // The payload's own geometry when the session named
+                    // one, this attach's otherwise. A session names one
+                    // only for an unfocused attach, which resized
+                    // nothing — and replaying a payload composed at
+                    // another width into a terminal of this width wraps
+                    // its lines and misplaces its absolute cursor moves,
+                    // so the terminal is built at the payload's size and
+                    // resized to this client's afterwards.
+                    let built_at =
+                        snapshot_size.unwrap_or((self.geometry.cols, self.geometry.rows));
                     let hydrator = match kind {
                         PayloadKind::GhosttySnapshot => Hydrator::Snapshot(SnapshotDecoder::new(
                             SnapshotDecodeOptions::default(),
@@ -517,17 +550,14 @@ impl HostAttach {
                         // Built here rather than by the decoder: a `vt`
                         // payload carries only what the *program*
                         // changed, so the terminal it lands in is this
-                        // client's — its geometry, its scrollback, its
-                        // theme.
-                        PayloadKind::Vt => {
-                            match tab.hydration_terminal(self.geometry.cols, self.geometry.rows) {
-                                Ok(terminal) => Hydrator::Vt(terminal),
-                                Err(error) => {
-                                    tracing::warn!(key = %self.key, %error, "vt hydration terminal build failed; re-attaching");
-                                    return self.schedule_reattach();
-                                }
+                        // client's — its scrollback, its theme.
+                        PayloadKind::Vt => match tab.hydration_terminal(built_at.0, built_at.1) {
+                            Ok(terminal) => Hydrator::Vt(terminal),
+                            Err(error) => {
+                                tracing::warn!(key = %self.key, %error, "vt hydration terminal build failed; re-attaching");
+                                return self.schedule_reattach();
                             }
-                        }
+                        },
                     };
                     // A fresh payload supersedes anything the old stream
                     // had applied; the fence restarts the count — inside
@@ -540,6 +570,7 @@ impl HostAttach {
                         deferred_bytes: 0,
                         ready: false,
                         stepping: false,
+                        built_at,
                     }));
                     // The withhold deadline covers only a hydration; a
                     // resume has no completion to wait for.
@@ -887,6 +918,7 @@ impl HostAttach {
             unreachable!("finish_hydration is only called from the hydrating arm");
         };
         let identity = hydration.identity;
+        let built_at = hydration.built_at;
         let terminal = match hydration.hydrator {
             Hydrator::Snapshot(decoder) => match decoder.finish() {
                 Ok(decoded) => decoded.terminal,
@@ -899,7 +931,7 @@ impl HostAttach {
             // bytes are in this terminal.
             Hydrator::Vt(terminal) => terminal,
         };
-        if let Err(error) = tab.swap_terminal(terminal, self.geometry.cols, self.geometry.rows) {
+        if let Err(error) = tab.swap_terminal(terminal, built_at.0, built_at.1) {
             tracing::warn!(key = %self.key, %error, "hydrated terminal swap failed; re-attaching");
             return self.schedule_reattach();
         }
@@ -912,17 +944,20 @@ impl HostAttach {
         self.backoff_step = 0;
         if let Some(geometry) = self.withheld.take() {
             // Held through hydration; send it now, in order behind any
-            // buffered input — and mirror it onto the freshly swapped
-            // terminal, which was decoded at the attach geometry and
-            // would otherwise stay there (no later resize pass runs
-            // unless the window moves again).
+            // buffered input.
             self.queue_geometry(geometry);
-            if let Err(error) = tab.resize_for_host(
-                geometry.cols,
-                geometry.rows,
-                geometry.cell_w,
-                geometry.cell_h,
-            ) {
+        }
+        // The swapped-in terminal is at the geometry its payload was
+        // composed for, which is not always this client's: a resize
+        // withheld through the hydration has just moved it, and an
+        // unfocused attach hydrated at the snapshot's own size. Either
+        // way nothing else would ever correct it — no later resize pass
+        // runs unless the window moves again.
+        let target = self.geometry;
+        if built_at != (target.cols, target.rows) {
+            if let Err(error) =
+                tab.resize_for_host(target.cols, target.rows, target.cell_w, target.cell_h)
+            {
                 tracing::warn!(key = %self.key, %error, "post-swap resize failed; re-attaching");
                 return self.schedule_reattach();
             }
@@ -1101,6 +1136,9 @@ async fn run_attempt(
             fence: accepted.seq,
             server_epoch: accepted.server_epoch,
             tab_generation: accepted.tab_generation,
+            // Both or neither: the pair names one geometry, and half of
+            // one is not a size to build a terminal at.
+            snapshot_size: accepted.snapshot_cols.zip(accepted.snapshot_rows),
         },
     ));
     let (mut reader, mut writer) = conn.into_split();
@@ -1280,6 +1318,18 @@ mod tests {
     }
 
     fn accepted_as(kind: PayloadKind, resumed: bool, fence: u64) -> HostTabFrame {
+        accepted_at(kind, resumed, fence, None)
+    }
+
+    /// The accepted handshake as an *unfocused* attach gets it: the
+    /// session reports the geometry it composed the payload at, because
+    /// it did not resize the tab to this client's.
+    fn accepted_at(
+        kind: PayloadKind,
+        resumed: bool,
+        fence: u64,
+        snapshot_size: Option<(u16, u16)>,
+    ) -> HostTabFrame {
         HostTabFrame::Accepted {
             attempt: 1,
             resumed,
@@ -1287,6 +1337,7 @@ mod tests {
             fence,
             server_epoch: 11,
             tab_generation: 2,
+            snapshot_size,
         }
     }
 
@@ -1860,6 +1911,103 @@ mod tests {
                 next_seq: 101,
             }),
             "the terminator promotes the fence, exactly as FINISH does"
+        );
+    }
+
+    /// An **unfocused** attach gets a payload composed at the server's
+    /// geometry, not at the one it asked for — it resized nothing — and
+    /// the accepted handshake says so (plan 057 §3.3). A `vt` client has
+    /// to build its terminal at that size, because those bytes replay
+    /// into a terminal *of the payload's* width: replaying them into a
+    /// narrower one wraps their lines and misplaces their absolute cursor
+    /// moves. Then it resizes to its own, which nothing else would ever
+    /// do — no resize pass runs again unless the window moves.
+    ///
+    /// Roost's own client always attaches focused today, so this is the
+    /// path a future unfocused attacher takes; the negative control below
+    /// is the one this build exercises.
+    #[tokio::test]
+    async fn a_vt_payload_hydrates_at_the_snapshot_geometry_and_then_takes_this_clients() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(PayloadKind::Vt, false, 100, Some((100, 30))),
+            &mut tab,
+            &feed_tx,
+        );
+        let Phase::Hydrating(hydration) = &attach.phase else {
+            panic!("a fresh vt payload hydrates");
+        };
+        assert_eq!(
+            hydration.built_at,
+            (100, 30),
+            "the terminal the payload replays into is the payload's size"
+        );
+
+        attach.on_frame(
+            snap(b"\x1b[30;1Hbottom-of-the-servers-screen"),
+            &mut tab,
+            &feed_tx,
+        );
+        assert_eq!(
+            attach.on_frame(snap(b""), &mut tab, &feed_tx),
+            AttachStep::Refresh
+        );
+        tab.refresh_snapshot().expect("refresh");
+        assert_eq!(
+            tab.dump(0).expect("dump").rows_text.len(),
+            usize::from(GEOMETRY.rows),
+            "and the swapped-in terminal is then this client's size, not the server's"
+        );
+    }
+
+    /// The negative control, and the path every attach roost makes today
+    /// takes: a focused attach resized the tab to this client's geometry
+    /// before composing, so the handshake reports no snapshot size and
+    /// nothing resizes after the swap.
+    #[tokio::test]
+    async fn a_focused_attach_hydrates_at_its_own_geometry_and_resizes_nothing() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(
+            accepted_at(PayloadKind::Vt, false, 100, None),
+            &mut tab,
+            &feed_tx,
+        );
+        let Phase::Hydrating(hydration) = &attach.phase else {
+            panic!("a fresh vt payload hydrates");
+        };
+        assert_eq!(hydration.built_at, (GEOMETRY.cols, GEOMETRY.rows));
+
+        attach.on_frame(snap(b"focused"), &mut tab, &feed_tx);
+        attach.on_frame(snap(b""), &mut tab, &feed_tx);
+        tab.refresh_snapshot().expect("refresh");
+        let dump = tab.dump(0).expect("dump");
+        assert_eq!(dump.rows_text.len(), usize::from(GEOMETRY.rows));
+        assert!(dump.rows_text.join("\n").contains("focused"));
+    }
+
+    /// Input queued at an attach has a reader in every phase but the
+    /// last: `Requesting` and `Hydrating` queue (the input queue outlives
+    /// an attempt), `Live` writes, and only `Ended` — the entry about to
+    /// be dropped — has nothing to drain it. The keyboard route and the
+    /// paste gate both read this, so a tab that takes keys cannot refuse
+    /// a paste.
+    #[tokio::test]
+    async fn input_has_a_reader_in_every_phase_but_ended() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        assert!(matches!(attach.phase, Phase::Requesting));
+        assert!(attach.live(), "a dial in flight queues rather than drops");
+
+        attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
+        assert!(matches!(attach.phase, Phase::Hydrating(_)));
+        assert!(attach.live(), "so does a hydration");
+
+        attach.phase = Phase::Live;
+        assert!(attach.live());
+
+        attach.phase = Phase::Ended;
+        assert!(
+            !attach.live(),
+            "nothing will drain this queue; the route must go elsewhere"
         );
     }
 

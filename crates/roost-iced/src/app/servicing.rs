@@ -2150,8 +2150,10 @@ impl App {
                     }
                     None => (host_sidebar::SectionState::Disconnected, None, None),
                 };
-                // Taken before `host.id` is moved into the view.
-                let reason = self.hosts.section_reason(&host.id).map(str::to_string);
+                // Taken before `host.id` is moved into the view. The
+                // band's reason, not `host.status`'s: a taken-over host's
+                // is the taker's name.
+                let reason = self.hosts.band_reason(&host.id).map(str::to_string);
                 let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
                 super::HostView {
                     saved_id: host.id,

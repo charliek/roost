@@ -421,8 +421,8 @@ fn modal_buttons<'a>(
     buttons.spacing(8).align_y(Alignment::Center)
 }
 
-/// A host tab's last frame, kept on screen under a scrim and a banner
-/// (plan 037 §3.1's takeover treatment, reused for "session ended").
+/// A host tab's last frame, kept on screen under a scrim and a banner:
+/// the session ended and nothing will update these pixels again.
 ///
 /// Not a modal: the rest of the window stays live, because the user's
 /// local tabs and every other host are unaffected — only *this* frame
@@ -435,24 +435,59 @@ fn frozen_frame<'a>(
     frame: host_notice::FrozenFrame,
     banner: host_notice::HostBanner,
 ) -> Element<'a, Message> {
+    // The frame travels with the press: the button's promise is this
+    // frame's, and honoring it against a host that has since moved on
+    // would mean aborting a connect already running.
+    let press = Message::HostFrameReconnect {
+        saved_id: saved_id.to_string(),
+        frame,
+    };
+    let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
+        .style(chrome::host_frame_scrim);
+    stack![content, scrim, host_strip(banner, press)]
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
+/// A host tab's **live** grid with a one-line status strip over its top
+/// edge: another client holds the foreground (plan 057 §3.5).
+///
+/// The one thing this must not do is take a row. `App::resize` derives
+/// the grid from the window and the chrome around it, so a strip that
+/// participated in terminal layout would shrink the grid — and since a
+/// client's geometry is what sizes the shared PTY, the takeover itself
+/// would resize the session out from under whoever took it. Hence the
+/// stack: the same overlay the frozen banner uses, minus the scrim,
+/// because these pixels are still being updated.
+fn foreground_strip<'a>(
+    content: Element<'a, Message>,
+    saved_id: &str,
+    banner: host_notice::HostBanner,
+) -> Element<'a, Message> {
+    // An ordinary Connect, which on a deposed-but-serving host is a
+    // takeback in place — no reattach, no snapshot, no blink.
+    let press = Message::HostReconnect(saved_id.to_string());
+    stack![content, host_strip(banner, press)]
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
+/// The strip itself: a sentence, a button, and the hairline under it.
+/// Shared so the two lines a host tab can carry cannot drift apart in
+/// padding, type size or colour.
+fn host_strip<'a>(banner: host_notice::HostBanner, press: Message) -> Column<'a, Message> {
     let strip = container(
         row![
             text(banner.message)
                 .size(chrome::HOST_BANNER_TEXT_SIZE)
                 .color(chrome::HOST_BANNER_TEXT),
             iced::widget::Space::new().width(Fill),
-            // The frame travels with the press: the button's promise is
-            // this frame's, and honoring it against a host that has
-            // since moved on would mean either aborting a reconnect
-            // already running or quietly starting a new session under a
-            // button that said "reconnect".
             button(text(banner.action).size(chrome::HOST_BANNER_ACTION_SIZE))
                 .padding([2, 9])
                 .style(chrome::host_banner_button)
-                .on_press(Message::HostFrameReconnect {
-                    saved_id: saved_id.to_string(),
-                    frame,
-                }),
+                .on_press(press),
         ]
         .spacing(10)
         .align_y(Alignment::Center),
@@ -462,12 +497,7 @@ fn frozen_frame<'a>(
     .style(chrome::host_banner);
     let edge = container(iced::widget::Space::new().width(Fill).height(1.0))
         .style(chrome::host_banner_edge);
-    let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
-        .style(chrome::host_frame_scrim);
-    stack![content, scrim, column![strip, edge]]
-        .width(Fill)
-        .height(Fill)
-        .into()
+    column![strip, edge]
 }
 
 /// The Add Host card's heading, and the Stop confirmation's.
@@ -1415,17 +1445,22 @@ fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
 }
 
 /// Whether the terminal the window is drawing can take a keystroke: it
-/// has a session, and the frame it is showing is still being updated.
+/// has a session, and something on the other end will read what is
+/// queued for it.
 ///
-/// A frozen host frame is a picture of a session this window no longer
-/// drives (plan 037 §3.1) — its input queue is gone with the connection,
-/// so routing keys there swallows them silently, which reads to a user
-/// as a hung terminal. Answering `false` sends the route to
-/// [`KeyboardRoute::None`], where accelerators still fire and the modal
-/// routes above still win, and the banner's button is the only thing the
-/// dead frame offers.
-fn active_terminal_live(has_session: bool, frame_frozen: bool) -> bool {
-    has_session && !frame_frozen
+/// `attach_live` is the *attach's* answer, not the host connection's
+/// (plan 057 §3.5). A takeover moves the foreground and closes nothing,
+/// so a deposed window is still attached, still streaming and still
+/// typing — asking its `HostConnState` would take the keyboard away from
+/// a terminal that works. What genuinely has no reader is a host tab
+/// whose attach ended: the session stopped, the build gate refused, the
+/// shell exited. Routing keys there swallows them silently, which reads
+/// to a user as a hung terminal.
+///
+/// Answering `false` sends the route to [`KeyboardRoute::None`], where
+/// accelerators still fire and the modal routes above still win.
+fn active_terminal_live(has_session: bool, attach_live: bool) -> bool {
+    has_session && attach_live
 }
 
 fn resolve_keyboard_route(
@@ -3541,9 +3576,28 @@ impl App {
             active_tab,
             active_terminal_live(
                 self.tabs.contains_key(&active_tab),
-                self.frozen_host_frame().is_some(),
+                self.attach_live(active_tab),
             ),
         )
+    }
+
+    /// Whether input aimed at `tab` reaches something that will read it.
+    ///
+    /// A local tab always does. A host tab does while its attach has not
+    /// ended — including `Requesting` and `Hydrating`, which queue: the
+    /// input queue is persistent across attach attempts, so keys typed
+    /// during one are delivered when its writer takes over. No attach at
+    /// all is the "ended" answer too, because that entry is dropped the
+    /// moment its attach ends.
+    ///
+    /// The one predicate behind both the keyboard route and the paste
+    /// gate, so a tab that takes keys cannot refuse a paste.
+    pub(super) fn attach_live(&self, tab: TabKey) -> bool {
+        tab.is_local()
+            || self
+                .host_attach
+                .get(&tab)
+                .is_some_and(host_tab::HostAttach::live)
     }
 
     pub fn set_window_focus(&mut self, focused: bool) {
@@ -4455,11 +4509,16 @@ impl App {
             }
         };
         // A frozen host frame keeps its pixels and says why (plan 037
-        // §3.1). With no host selection this is `None` and the terminal
+        // §3.1); a live one somebody else is driving keeps them *and*
+        // keeps updating, and says who has the foreground (plan 057
+        // §3.5). With no host selection both are `None` and the terminal
         // element goes through untouched.
         let terminal = match self.host_frame_banner() {
             Some((saved_id, frame, banner)) => frozen_frame(terminal, saved_id, frame, banner),
-            None => terminal,
+            None => match self.host_foreground_strip() {
+                Some((saved_id, strip)) => foreground_strip(terminal, saved_id, strip),
+                None => terminal,
+            },
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
         let content: Element<'_, Message> = if collapsed {
@@ -5309,14 +5368,24 @@ impl App {
         &self,
     ) -> Option<(&str, host_notice::FrozenFrame, host_notice::HostBanner)> {
         let (view, frozen) = self.frozen_host_frame()?;
-        let taken_by = self
-            .hosts
-            .section(&view.saved_id)
-            .and_then(|section| section.state.taken_by());
+        Some((view.saved_id.as_str(), frozen, frozen.banner(&view.label)))
+    }
+
+    /// The status strip the window owes a live host grid whose
+    /// foreground another client holds (plan 057 §3.5), and the host its
+    /// button takes it back from.
+    ///
+    /// Composed here, at the draw, for [`Self::host_frame_banner`]'s
+    /// reason — and mutually exclusive with it by construction, because
+    /// [`host_notice::frozen_frame`] and
+    /// [`host_notice::foreground_strip`] answer on disjoint states.
+    fn host_foreground_strip(&self) -> Option<(&str, host_notice::HostBanner)> {
+        let selection = self.host_selection?;
+        let view = self.host_view(selection.tab.host)?;
+        let section = self.hosts.section(&view.saved_id)?;
         Some((
             view.saved_id.as_str(),
-            frozen,
-            frozen.banner(&view.label, taken_by),
+            host_notice::foreground_strip(section.state, &view.label)?,
         ))
     }
 
@@ -6857,12 +6926,15 @@ impl App {
         };
         let tab = pending.tab;
         // Read off the views this reconcile has already refreshed, so
-        // "still connected" is the same fact the section is drawing.
-        // Anything else — dropped, reconnecting, taken over, gone — can
-        // no longer answer for this row.
-        let connected = self.host_views.iter().any(|view| {
-            view.host == tab.host && view.state == host_sidebar::SectionState::Connected
-        });
+        // "still live" is the same fact the section is drawing — and the
+        // same predicate that decides whether its rows respond at all, so
+        // a row the user can click cannot be one this refuses to land on.
+        // Anything else — dropped, reconnecting, gone — can no longer
+        // answer for this row.
+        let connected = self
+            .host_views
+            .iter()
+            .any(|view| view.host == tab.host && view.state.interactive());
         if !connected {
             tracing::debug!(%tab, "dropped a pending selection whose host is no longer connected");
             self.pending_host_selection = None;
@@ -8360,22 +8432,25 @@ mod tests {
         );
     }
 
-    /// A frozen host frame is not a keyboard target (plan 037 §3.1). The
-    /// tab still has a session object — that is what draws the pixels
-    /// under the scrim — so liveness has to be the *frame's*, not the
-    /// map's, or every keystroke is queued at a connection that is gone
-    /// and the terminal reads as hung.
+    /// A host tab with nothing attached is not a keyboard target (plan
+    /// 037 §3.1, issue #376). The tab still has a session object — that
+    /// is what draws the pixels under the scrim — so liveness has to be
+    /// the *attach's*, not the map's, or every keystroke is queued at a
+    /// connection that is gone and the terminal reads as hung.
     ///
     /// What it must NOT do is take the keyboard away from the surfaces
     /// that still need it: accelerators run off `KeyboardRoute::None`,
     /// and the upgrade dialog's Esc/Enter outrank the terminal route
     /// either way.
     #[test]
-    fn a_frozen_host_frame_stops_being_a_keyboard_target() {
+    fn a_host_tab_with_no_live_attach_stops_being_a_keyboard_target() {
         let host = TabKey::new(HostId::new(3), 7);
-        assert!(active_terminal_live(true, false));
-        assert!(!active_terminal_live(true, true), "the frame is a corpse");
-        assert!(!active_terminal_live(false, false), "and it has no session");
+        assert!(active_terminal_live(true, true));
+        assert!(
+            !active_terminal_live(true, false),
+            "nothing is reading that queue"
+        );
+        assert!(!active_terminal_live(false, true), "and it has no session");
 
         assert_eq!(
             resolve_keyboard_route(
@@ -8384,7 +8459,7 @@ mod tests {
                 false,
                 false,
                 host,
-                active_terminal_live(true, true)
+                active_terminal_live(true, false)
             ),
             KeyboardRoute::None,
             "typing into the dimmed frame reaches no PTY"
@@ -8396,7 +8471,7 @@ mod tests {
                 false,
                 false,
                 host,
-                active_terminal_live(true, true)
+                active_terminal_live(true, false)
             ),
             KeyboardRoute::HostDialog,
             "and the upgrade prompt over it still owns Esc and Enter"

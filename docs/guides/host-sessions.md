@@ -232,19 +232,30 @@ This feature moved the session protocol version, which means a Roost with it **c
 
 ## Takeover
 
-A session holds one interactive lease at a time — the authority to type into a tab. If you connect to the same host from a second window (a second machine, or the same machine after a crash left the first window's connection stale), the new connection **takes over**: it gets the lease, and the *displaced* window is told who took it.
+**Two windows can type into the same tab at the same time.** A second Roost window, a script, a phone — any client on the same machine as the session may attach to a tab and put bytes in it. Nothing has to be taken from anybody first, and nothing is closed when somebody else joins.
 
-The displaced window's banner now names the taker, whenever the connecting client stated one:
+What a session does hold one of is the **foreground**. Connecting to a host claims it, and connecting from somewhere else moves it. The foreground is a short list:
 
-> **‹label› was taken over by a client reporting itself as ‹taken_by›.** [Reconnect here]
+- **effects** — a bell, an OSC 52 clipboard write, an agent notification — go to the foreground client, so a copy from a shell lands on the machine you are sitting at rather than on all of them;
+- **focus** — which tab your window has open, and therefore which notifications are muted, is the foreground client's to declare;
+- **who sized the PTY last** — every client that types or resizes sets the tab's size, and taking the foreground does not by itself resize anything;
+- and the session-wide settings: the theme, the agent-hook mode, and file uploads (`tab.send_file`, drag-and-drop, a pasted image).
 
-(or, when the new connection gave no name: "‹label› was taken over by another client.") "Reporting itself as" is deliberate wording, not a hedge you can ignore: the name is whatever the connecting client typed for itself — a hostname, an app name — and nothing here verifies it. Treat it as a hint, not an identity.
+So when another client connects to a host you have open, **nothing freezes**. Your terminal keeps redrawing, your keystrokes keep landing, your tabs keep switching, your sidebar keeps listing. A line appears over the top of the grid saying who has the foreground:
 
-Only the **terminal frame** freezes. The tab list, titles, agent status, and notifications for that host keep updating live underneath the banner — you can still see what's running and get notified about it, you just can't type into it or watch the screen redraw until you take it back. That's a deliberate split: watching a session is not the same act as driving it, so losing the lease doesn't mean losing the picture.
+> **‹label› is driven by a client reporting itself as ‹taken_by›.** [Take the foreground]
 
-"Reconnect here" is an ordinary Connect: it takes the lease back, and the terminal frame comes back live with it. There's no data loss either way — the shells themselves don't care who's driving; only the interactive connection moves.
+(or, when the new connection gave no name: "‹label› is driven by another client.") "Reporting itself as" is deliberate wording, not a hedge you can ignore: the name is whatever the connecting client typed for itself — a hostname, an app name — and nothing here verifies it. Treat it as a hint, not an identity. The sidebar band says the same thing more briefly — *taken over by ‹taken_by›* — beside a dot that stays green, because the host really is connected.
 
-**Reading a session never needs the lease at all**, which is the same mechanism that keeps the displaced window's tab list and notifications live above. A second client that dials a host and asks only to watch — a script, a monitoring tool, a future phone client — sees the same live tab list, titles, and notifications, with no terminal frame and no risk of displacing whoever is actually driving, because it never asks for the lease in the first place. Watching is not degraded driving; it is the normal way to look at a session you don't hold.
+While another client has the foreground, an upload is refused with *"‹label› is driven by ‹taken_by›; take the foreground to upload"* rather than attempted, and effects for that host go to them instead of you.
+
+**"Take the foreground"** — the line's button, the sidebar's ↻ row, and the palette's Connect verb are all the same action — takes it back **in place**. No reconnect, no reattach, no fresh snapshot: the connection you already have claims the foreground again and the grid does not blink. It does not resize the tab either, so whatever size the other client left it at is the size it stays until somebody types.
+
+**Reading a session never needs the foreground at all** — and since this change, neither does typing into one. A client that dials a host and asks only to watch — a script, a monitoring tool, a future phone client — sees the same live tab list, titles and notifications with no risk of moving the foreground, because it never asks for it. Watching is not degraded driving; it is the normal way to look at a session you don't hold.
+
+### Against an older session
+
+A `roost-session` from before this change closes the displaced client's connections on a takeover, exactly as it always did. Against one of those you get the old behaviour: the terminal frame stops updating, the band reads *taken over*, and ↻ is a **full reconnect** — a new connection, a fresh attach, and a takeover of its own. Nothing is lost either way; you just watch it come back rather than never seeing it go. Update the session (see [the upgrade / restart flow](#the-upgrade-restart-flow)) and the in-place behaviour above is what you get.
 
 ## The upgrade / restart flow
 

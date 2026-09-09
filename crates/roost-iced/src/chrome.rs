@@ -470,9 +470,10 @@ pub fn host_banner_edge(_: &Theme) -> container::Style {
     container::Style::default().background(HOST_BANNER_BORDER)
 }
 
-/// The banner's one action ("Reconnect here"). Outlined in the band's
-/// own border shade — a filled accent button here would compete with the
-/// message for the eye, and the mockup's `.banner .btn` does not.
+/// The one action a host tab's banner or status strip offers. Outlined
+/// in the band's own border shade — a filled accent button here would
+/// compete with the message for the eye, and the mockup's `.banner .btn`
+/// does not.
 pub fn host_banner_button(_: &Theme, status: button::Status) -> button::Style {
     let background = match status {
         button::Status::Hovered | button::Status::Pressed => Some(Background::Color(

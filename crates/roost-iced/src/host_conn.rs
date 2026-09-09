@@ -1402,6 +1402,24 @@ impl HostConnSet {
         disconnected_reason(&entry.retained.as_ref()?.state)
     }
 
+    /// [`Self::section_reason`] as the **sidebar band** wants it: the
+    /// same ladder, except that a taken-over host's reason is *who* took
+    /// it, which `SectionState::status_text_with_reason` renders as
+    /// "taken over by ‹taker›".
+    ///
+    /// Separate from `section_reason` on purpose. That one is
+    /// `host.status`'s `reason` field, which reports why a connection is
+    /// in trouble; who holds the foreground is not trouble and rides its
+    /// own `taken_by` field there.
+    pub(crate) fn band_reason(&self, host: &str) -> Option<&str> {
+        if let Some(conn) = self.entries.get(host).and_then(|entry| entry.conn.as_ref()) {
+            if matches!(conn.state, HostConnState::TakenOver { .. }) {
+                return conn.state.taken_by();
+            }
+        }
+        self.section_reason(host)
+    }
+
     /// The long form behind [`Self::section_reason`], when the reason is
     /// a band line too short to carry what happened.
     ///
@@ -2401,9 +2419,14 @@ impl HostConnSet {
     /// attempt's `Connecting` purges the incarnation) — and a kind
     /// nothing is decoding is exactly the misinformation this field
     /// exists to prevent.
+    ///
+    /// `reached_session` rather than `is_foreground`: since plan 057 a
+    /// takeover closes no data connection, so a deposed client's attach
+    /// is still decoding this very kind. Reporting nothing there would be
+    /// the same misinformation with the sign flipped.
     pub(crate) fn payload_kind(&self, host: &str) -> Option<&'static str> {
         let conn = self.entries.get(host)?.conn.as_ref()?;
-        conn.payload_kind.filter(|_| conn.state.is_foreground())
+        conn.payload_kind.filter(|_| conn.state.reached_session())
     }
 
     /// File what one incarnation's prologue learned, and check the
@@ -3772,6 +3795,42 @@ mod tests {
         set.disconnect("h1");
         assert_eq!(set.tunnel_ready(failed("h1", second, "cancelled")), None);
         assert_eq!(set.section_reason("h1"), None);
+    }
+
+    /// The band and `host.status` ask different questions of a
+    /// taken-over host (plan 057 §3.5). The band wants *who* has the
+    /// foreground, because `SectionState::status_text_with_reason` is
+    /// what renders "taken over by ‹taker›"; `host.status`'s `reason`
+    /// reports why a connection is in trouble, and holding the
+    /// foreground is not trouble — it rides `taken_by` there.
+    #[tokio::test]
+    async fn the_band_names_the_taker_and_host_status_reason_does_not() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-band-reason.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert_eq!(set.band_reason("h1"), None);
+
+        set.apply_state(
+            incarnation,
+            HostConnState::TakenOver {
+                taken_by: Some("a phone".into()),
+            },
+        );
+        assert_eq!(set.band_reason("h1"), Some("a phone"));
+        assert_eq!(set.section_reason("h1"), None);
+
+        // A takeover this client only inferred names nobody, and the
+        // band falls back to the bare word.
+        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        assert_eq!(set.band_reason("h1"), None);
     }
 
     /// The band prefers the live connection's own reason. An ssh failure
@@ -5499,6 +5558,11 @@ mod tests {
             set.conn("h1").payload_kind,
             Some(AttachPayloadKind::VT),
             "same attach, still decoding"
+        );
+        assert_eq!(
+            set.payload_kind("h1"),
+            Some(AttachPayloadKind::VT),
+            "and `host.status` says so: the attach the takeover did not close is decoding this"
         );
         assert!(
             set.conn("h1").fidelity_announced,

@@ -536,8 +536,12 @@ enum Attempt {
     Driver(Live),
     /// Another client drives this session. The connection is real and
     /// the stream is live — batches, titles, agent status and
-    /// notifications all land — but nothing lease-bearing is sent and
-    /// the frame is frozen (plan 049 §3.11).
+    /// notifications all land — but nothing lease-bearing is sent (plan
+    /// 049 §3.11). Reached only where there is nothing else to do: a
+    /// probe that found the session already taken, or a takeover by a
+    /// session predating `open_input`, which closed the data connections
+    /// with it and so really did stop the frame. An `open_input`
+    /// takeover keeps serving instead ([`serve_deposed`]).
     Observer(Live),
 }
 
