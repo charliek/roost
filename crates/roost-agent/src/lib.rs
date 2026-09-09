@@ -31,9 +31,9 @@ pub mod grok;
 pub mod hook;
 pub mod opencode;
 
-pub use common::loopback_base_url;
 pub use claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};
 pub use codex::{codex_event_to_reports, CODEX_HOOK_EVENTS};
+pub use common::loopback_base_url;
 pub use cursor::{cursor_event_to_reports, CURSOR_HOOK_EVENTS};
 pub use grok::{grok_event_to_reports, GROK_HOOK_EVENTS};
 pub use opencode::{opencode_event_to_reports, OPENCODE_HOOK_EVENTS};
