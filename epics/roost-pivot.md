@@ -32,7 +32,7 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R4 | [#421](https://github.com/charliek/roost/issues/421) | RP/M5 | scrollback on `tab.dump` |
 | R5 | [#422](https://github.com/charliek/roost/issues/422) | RP/M4 | resume-from-revision for `events.subscribe` |
 | R6 | [#423](https://github.com/charliek/roost/issues/423) | RP/M2 | grok adapter: `Stop` re-fires per continuation → false idle; add `StopFailure` |
-| R7 | [#424](https://github.com/charliek/roost/issues/424) | RP/M6 | hygiene: lifecycle ops, autostart artifact, dead `pty_replaced` path |
+| R7 | [#424](https://github.com/charliek/roost/issues/424) | RP/M6 | hygiene: lifecycle ops, ~~autostart artifact~~ (removed by R16), dead `pty_replaced` path |
 | R8 | [#425](https://github.com/charliek/roost/issues/425) | RP/M2 | gx opt-in indicator via the `metadata` map — no new agent variant |
 | R9 | [#426](https://github.com/charliek/roost/issues/426) | RP/M5 | local default flip (HS-5): the UI connects to a local `roost-session` |
 | R10 | [#439](https://github.com/charliek/roost/issues/439) | RP/M3 | a bare `opencode` binds no server, so nothing can drive the session roost reports — the plugin serves a loopback proxy and names it |
@@ -52,9 +52,10 @@ before it, not speed. The board carries the current state; this
 paragraph is only the order and the reasoning behind it.
 
 **R11–R14 are follow-ups from shipped work, and they land before the
-autostart and mobile surfaces are announced.** R12 is one pass over what
-R7 shipped — a defect plus the two things that first cut left unfinished
-— R11 is the client half R5 did not build, and R13 is a macOS CI flake
+mobile surface is announced** (the autostart one was removed by R16).
+R12 is one pass over what R7 shipped — a defect plus the two things that
+first cut left unfinished — R11 is the client half R5 did not build, and
+R13 is a macOS CI flake
 that fails unrelated pull requests, because a red job nobody reads is how
 a real regression gets waved through.
 

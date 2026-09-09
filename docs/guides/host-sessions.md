@@ -59,7 +59,7 @@ roostctl host connect --id <the id host add printed>
 
 A remote host never auto-connects at launch — Roost doesn't even reach for it, so it simply sits disconnected until you Connect. That's deliberate: connecting to a remote machine is an outbound decision that costs a handshake and can fail loudly, and when Roost has only just opened, nobody has asked for it. Once you've connected it, though, a remote host behaves like `localhost` again for a *mid-session* drop: close your laptop, let Wi-Fi hiccup, whatever kills the link — Roost notices and retries on its own, with a growing delay (up to 30 seconds) shown right in the sidebar band as `reconnecting in Ns (k/10)`. If ten attempts don't get it back it settles with `reconnect gave up after 10 tries`, and ↻ Reconnect — which was on screen the whole time — is exactly the button you'd have clicked anyway. Not every failure gets retried this way: a changed or unknown host key, a rejected login, and a session that's genuinely gone each settle immediately instead, because each of those needs a person to do something different — see [Troubleshooting](#troubleshooting) below for what a failed SSH connect looks like and how to recover.
 
-A rebooted remote machine is the one case that never grows a ladder: it comes back with no `roost-session` running at all, so the very first reconnect attempt classifies as "no session" and settles right away (see the [no-session row](#troubleshooting) below) rather than retrying. If you want a host to survive its own reboots without you having to reconnect by hand, run `roostctl session autostart install` on that machine to set up the `systemd --user` unit, then enable lingering for that user — `loginctl enable-linger <user>` — so the unit starts at boot instead of waiting for a login (the verb sets up the unit; it doesn't run `enable-linger` for you, since that's a system-wide `loginctl` grant, not something scoped to one artifact). With that in place the session is already up by the time Roost's client retries, and auto-reconnect covers the rest. See [Surviving reboots and logouts](#surviving-reboots-launchd) below for what the unit looks like and macOS's equivalent.
+A rebooted remote machine is the one case that never grows a ladder: it comes back with no `roost-session` running at all, so the very first reconnect attempt classifies as "no session" and settles right away (see the [no-session row](#troubleshooting) below) rather than retrying. Roost ships no supervisor for `roost-session` itself; if you want a host to survive its own reboots without reconnecting by hand, run `roost-session` under a unit you write yourself. See [Surviving reboots and logouts](#surviving-reboots-launchd) below for a unit that works and the reasoning behind it.
 
 ### Scripted / fallback forwarding with `ssh -N -L`
 
@@ -311,28 +311,20 @@ This is a deliberate trade: connecting at reduced fidelity beats refusing to con
 
 ## Surviving reboots and logouts {: #surviving-reboots-launchd }
 
-The command *is* the recipe now, on either platform:
+Roost ships no supervisor artifact for `roost-session` — nothing installs
+a unit or a LaunchAgent for you, and nothing needs to: a session comes up
+on demand from whichever client connects first, whether that's the
+localhost launch ladder, the SSH bootstrap ladder, or `roostctl session
+start` run by hand. If you want a host to survive its own reboots
+anyway — so it's already up by the time your next reconnect attempt
+lands — write the unit yourself. Here's one that works.
 
-```bash
-roostctl session autostart install
-```
-
-This writes and loads one supervisor artifact for `roost-session` — a
-`systemd --user` unit on Linux, a `launchd` LaunchAgent on macOS — and
-confirms a session answers before it returns. It's **opt-in**: nothing
-calls this for you, and it never interrupts a session that's already
-running — see [`session autostart install` /
-`uninstall`](../reference/cli.md#session-autostart-install-uninstall)
-for the full verb reference, including `--force` and what `roostctl
-session status`'s new `autostart=` line reports.
-
-**Linux** writes `~/.config/systemd/user/roost-session.service`
-(honoring `XDG_CONFIG_HOME` if you've moved it):
+**Linux** — `~/.config/systemd/user/roost-session.service` (honoring
+`XDG_CONFIG_HOME` if you've moved it):
 
 ```ini
 [Unit]
-# Written by roostctl session autostart. Reinstalling replaces this file.
-Description=Roost host session (roost-session)
+Description=Roost host session
 
 [Service]
 Type=simple
@@ -345,13 +337,20 @@ KillMode=mixed
 WantedBy=default.target
 ```
 
-**macOS** writes `~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`:
+```bash
+systemctl --user enable --now roost-session
+loginctl enable-linger $USER
+```
+
+`enable-linger` is what makes the unit start at boot instead of waiting
+for a login.
+
+**macOS** — `~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->
 <dict>
     <key>Label</key>
     <string>ai.stridelabs.roost-session</string>
@@ -374,9 +373,13 @@ WantedBy=default.target
 </plist>
 ```
 
-Both carry an ownership-marker line as their first meaningful line —
-that's what makes a later re-`install` safe to overwrite without
-clobbering a unit that merely happens to look like ours.
+```bash
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.stridelabs.roost-session.plist
+```
+
+Substitute your own home directory in `WorkingDirectory` — launchd
+expands neither `~` nor `$HOME` in a plist, so the literal path is the
+only spelling that works.
 
 `KeepAlive` is deliberately `{SuccessfulExit: false}`, not bare `true`.
 A clean **Stop Session** (or `roostctl session stop`) exits `0` — under
@@ -398,23 +401,12 @@ always does, instead of every shell in the unit's cgroup getting
 `SIGTERM` at once and racing it; `WorkingDirectory` (`%h` on Linux, the
 literal home path in the plist) is what seeds the daemon's first
 project when it starts from an empty `state.json` — without it a
-supervisor-launched daemon would seed `/`.
+unit-launched daemon would seed `/`.
 
 **Stop Session** and `roostctl session stop` still work exactly as they
-always do under supervision: the daemon ends and, because of the rule
-above, stays ended — the supervisor starts a fresh session again only at
+always do under a unit like this: the daemon ends and, because of the
+rule above, stays ended — your unit starts a fresh session again only at
 your next login (macOS) or the unit's next trigger (Linux).
-
-To remove the artifact entirely — not just stop the current process,
-but stop it from coming back at your next login too:
-
-```bash
-roostctl session autostart uninstall
-```
-
-This unloads it (`systemctl --user disable --now` / `launchctl
-bootout`), **stopping the supervised session** if one is running — the
-command says so before it does it — then deletes the file.
 
 Say what this actually buys you, honestly: a macOS `gui/$UID`
 LaunchAgent starts at your **next login**, not at boot, and it stops at
@@ -423,17 +415,9 @@ LaunchAgent starts at your **next login**, not at boot, and it stops at
 remote host](#adding-a-remote-host-over-ssh) above for pairing the unit
 with it). A reboot brings your saved sidebar layout back either way, the
 next time Roost opens, but the *running shell processes* inside a
-session never survive a reboot, on any platform — what either
-supervisor buys you is not having to remember to start `roost-session`
-by hand after you log back in.
-
-The verb resolves the binary itself, the same way `session start` does,
-and prints what it picked (`autostart: <artifact path> → <binary>`) —
-the artifact's name is fixed regardless of build profile, so running
-this from a debug checkout will overwrite a release install's artifact
-(and vice versa); that printed line is how you'd notice. Point
-`ROOST_SESSION_BIN` at your real install first if you're running this
-from a dev checkout and want the release build supervised instead.
+session never survive a reboot, on any platform — what a unit like this
+buys you is not having to remember to start `roost-session` by hand
+after you log back in.
 
 ## Troubleshooting
 

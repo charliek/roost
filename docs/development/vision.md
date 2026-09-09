@@ -872,6 +872,39 @@ for the wire contract, and
 [`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
 for the shipped mechanics.
 
+### DL-24: no supervisor artifact — a session comes up on demand (2026-09-08)
+
+A session comes up exactly three ways: a client's own localhost
+`Connect` walking the launch ladder, the SSH bootstrap ladder reaching a
+remote box, or `roostctl session start` run by hand. All three are
+client-initiated. Nothing needs a session up *before* a client exists to
+connect to it — a reboot ends every shell inside a session regardless of
+whether the session itself was pre-started, and the only thing a
+pre-started session buys over the first `Connect` starting it fresh is
+skipping the few hundred milliseconds it takes to open shells in their
+saved directories, which the first `Connect` does anyway.
+
+The opt-in daemon from [DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)
+shipped a supervisor artifact for it in this cycle — `roostctl session
+autostart install|uninstall`, writing a `systemd --user` unit or a
+launchd LaunchAgent (plan 052, [#424](https://github.com/charliek/roost/issues/424)).
+It grew a profile-collision defect
+([#438](https://github.com/charliek/roost/issues/438)) whose fix was a
+~2,500-line hardening pass (plan 055) that was abandoned rather than
+landed. Decision: remove the artifact
+([#454](https://github.com/charliek/roost/issues/454)) before it ever
+shipped in a release, rather than pay that hardening cost for a verb
+with no consumer. herdr, the substrate roost measures itself against,
+ships no supervisor either.
+
+The standing rule going forward: do not add a unit, a plist, or a
+doctor probe for one, without a case that needs a session up before any
+client exists. The [user guide](../guides/host-sessions.md#surviving-reboots-launchd)
+still shows a hand-written `systemd --user` unit and launchd LaunchAgent
+for anyone who wants reboot survival anyway — that is a recipe the
+reader owns and edits, not a feature roost ships, installs, or verifies
+for them.
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

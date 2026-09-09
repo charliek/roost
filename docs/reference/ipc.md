@@ -1969,9 +1969,8 @@ enumerate or select among. The seam for more than one session on a
 single host — a **named** session such as `workbox:agents` (HS-4e) — is
 one more path component in the profile resolver (`BundleProfile` →
 socket dir + state dir) plus a `--name` flag on `session start` / `stop`
-/ `status`, and on the autostart artifact's own name (see
-[`cli.md`](cli.md#session-autostart-install-uninstall)); it is not a
-registry op, and nothing on this wire needs to change to support it.
+/ `status`; it is not a registry op, and nothing on this wire needs to
+change to support it.
 `session.identify.session_id` distinguishes **process incarnations** of
 one session (it changes across a restart) — it names a run, not a
 session.

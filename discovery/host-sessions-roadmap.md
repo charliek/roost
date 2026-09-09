@@ -835,7 +835,9 @@ live; the first real per-host setting when something needs one
 (#388's pinned convention); ~~a `roostctl session install-unit`-style
 supervision helper if the launchd/systemd doc recipes prove popular~~
 **shipped as `roostctl session autostart install|uninstall` (plan
-052)** — see the guide's [Surviving reboots and
+052), then removed by R16 (plan 057, #454)** — roost ships no
+supervisor artifact; the guide keeps a hand-written recipe, see
+[Surviving reboots and
 logouts](../docs/guides/host-sessions.md#surviving-reboots-launchd).
 Named sessions per host remain on the usage signal, same as the rest of
 this list.
@@ -1257,11 +1259,14 @@ never retried.
   plain daemon) → plain daemon shipped; the `enable-linger` systemd
   recipe is documented (plan 040 C6), the launchd sibling lands with
   HS-4b's docs, and an `install-unit` helper — parked as HS-4e if the
-  recipes proved popular — **shipped as `roostctl session autostart
-  install|uninstall` (plan 052)**: one generated `systemd --user` unit
-  or launchd LaunchAgent per platform, opt-in, reported by `roostctl
-  session status`'s new `autostart=` line. See the guide's [Surviving
-  reboots and logouts](../docs/guides/host-sessions.md#surviving-reboots-launchd).
+  recipes proved popular — **shipped, then removed**: `roostctl session
+  autostart install|uninstall` (plan 052) generated one `systemd --user`
+  unit or launchd LaunchAgent per platform, opt-in, reported by
+  `roostctl session status`'s `autostart=` line; R16 (plan 057, #454)
+  removed it before it ever shipped in a release. Roost ships no
+  supervisor artifact, and the guide keeps a hand-written recipe. See
+  the guide's [Surviving reboots and
+  logouts](../docs/guides/host-sessions.md#surviving-reboots-launchd).
 - ~~Whether the Mac iced app ships host-sessions before general
   iced-on-Mac parity messaging~~ **Resolved by events**: the Mac iced
   build shipped the client surface with HS-2 (localhost hidden per
