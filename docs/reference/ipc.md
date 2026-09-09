@@ -2643,18 +2643,22 @@ attach that carried the key rather than only to the ones that meant
 something by it. Send `focus: false` only to a session advertising
 `open_input` in [`session.identify`](#sessionidentify).
 
-**The accepted handshake reports the snapshot's own geometry** when it
-can differ from what was asked for. `snapshot_cols` / `snapshot_rows`
-on the [data connection's](#the-handshake) accepted reply name the size
-the payload was encoded at, and are present only for an unfocused
-snapshot attach — a focused one just resized the tab to the client's
-own geometry, and a resume encodes no snapshot at all. A `vt` client
-needs them: that payload replays into a terminal *of the attach
+**The accepted handshake reports the snapshot's own geometry.**
+`snapshot_cols` / `snapshot_rows` on the [data
+connection's](#the-handshake) accepted reply name the size the payload
+was encoded at, and are present for every snapshot attach — focused or
+not. A focused attach did resize the tab, but on the control connection
+and before this data connection was dialed; raw input is open, so
+another client's geometry-bearing frame can land in between and resize
+the tab again, and only the encode knows what it composed. A `vt` client
+needs the answer: that payload replays into a terminal *of the attach
 geometry*, and replaying it at another width wraps lines and misplaces
 absolute cursor moves, so such a client hydrates at this size and
-resizes its own terminal afterwards. Both keys are additive — a client
-that has never heard of them ignores them, and one reading an older
-session's reply simply finds neither.
+resizes its own terminal afterwards. When the size matches what was
+asked for the fields change nothing. A resume encodes no snapshot and
+carries neither. Both keys are additive — a client that has never heard
+of them ignores them, and one reading an older session's reply simply
+finds neither.
 
 `attach_token` is 32 hex characters, the same bearer credential the
 lease is and under the same no-logging rule. It is:
@@ -2667,14 +2671,18 @@ lease is and under the same no-logging rule. It is:
   shorten it, which is how the expiry case is tested in seconds; a
   production daemon ignores that variable entirely;
 * **quota-bounded** — at most 16 unconsumed tokens
-  (`MAX_OUTSTANDING_TOKENS`) exist at once. Past that, minting is
-  refused with `too-many-tokens` rather than evicting a token some
-  other connection is about to present. Reaching it means a client
-  minted 16 tickets inside one TTL and dialed none of them; a healthy
-  attach consumes its ticket within a round trip;
+  (`MAX_OUTSTANDING_TOKENS`) exist at once, and at most 8
+  (`MAX_TOKENS_PER_CONNECTION`) of them on any one control connection.
+  Past either bound, minting is refused with `too-many-tokens` rather
+  than evicting a token some other connection is about to present.
+  Reaching one means a client minted tickets inside one TTL and dialed
+  none of them; a healthy attach consumes its ticket within a round
+  trip. The per-connection share is what keeps a single looping client
+  from answering everybody else's attach with `too-many-tokens` — before
+  raw input was open, holding the lease was what stood in its way;
 * **connection-bound** — reclaimed when the connection that minted it
   closes, which is what keeps the quota above from being held for a
-  whole TTL by a client that minted 16 tickets and vanished. A takeover
+  whole TTL by a client that minted its share and vanished. A takeover
   purges nothing: a ticket outlives the lease that happened to be live
   when it was minted, because it was never bound to one;
 * **pipeline-bound** — stamped with the `tab_generation` below, so a
@@ -2817,13 +2825,14 @@ The control-plane `TabAttachResult.kind` must agree; a client that sees
 them disagree treats it as `protocol-error` and re-attaches rather than
 guessing which to believe.
 
-`snapshot_cols` and `snapshot_rows` are **present only when the payload
-is not at the geometry the client asked for** — an unfocused snapshot
-attach (`tab.attach` with `focus: false`), which resized nothing. They
-name the size the snapshot was encoded at, and a `vt` client builds its
-terminal at that size before replaying, then resizes it to its own; see
-[`tab.attach`](#tabattach). Absent on a focused attach and on a resume,
-and absent from every reply a session predating `open_input` writes.
+`snapshot_cols` and `snapshot_rows` name **the size the snapshot was
+actually encoded at**, and are present on every snapshot reply —
+`focus: true` included, because a focused attach resizes the tab from
+the control connection and any other client may resize it again before
+the encode runs. A `vt` client builds its terminal at that size before
+replaying, then resizes it to its own; see [`tab.attach`](#tabattach).
+Absent on a resume (there is no fresh snapshot), and absent from every
+reply a session predating `open_input` writes.
 
 #### Preamble and frames
 
@@ -3056,8 +3065,9 @@ with `focus: false`, never typing) never changes the size out from
 under the one that is working.
 
 What bounds the count is not a per-tab limit: it is the token quota (16
-unconsumed tickets per TTL window, see [`tab.attach`](#tabattach)) and
-the session's 4 concurrent snapshot encodes. Over time the number of
+unconsumed tickets per TTL window, 8 of them per control connection —
+see [`tab.attach`](#tabattach)) and the session's 4 concurrent snapshot
+encodes. Over time the number of
 admitted connections is open, which is the honest statement — the
 per-attach machinery is what keeps that affordable.
 

@@ -2234,15 +2234,19 @@ pub enum AttachMode {
 /// `resume_from_seq - 1`.
 ///
 /// `snapshot_cols`/`snapshot_rows` are the geometry the payload was
-/// encoded at, sent only when it can differ from what the client asked
-/// for — an unfocused snapshot attach, which by definition did not
-/// resize the tab. A `vt` client builds its terminal at the attach
+/// actually encoded at. A `vt` client builds its terminal at the attach
 /// geometry, so replaying a payload encoded at another width there
 /// wraps lines and misplaces absolute cursor moves; it hydrates at this
-/// size and resizes afterwards. Absent on a focused attach (the tab was
-/// just resized to the client's own geometry) and on a resume (no fresh
-/// snapshot), and absent from every reply a session predating
-/// `open_input` writes.
+/// size and resizes afterwards.
+///
+/// Sent on **every** snapshot, focused or not. A focused attach did
+/// resize the tab to its own geometry — but on the control connection,
+/// before this data connection was dialed, and raw input is open (plan
+/// 057 R15): any other client's geometry-bearing frame can land in
+/// between and resize the tab again, so "the client asked for it" is not
+/// evidence the payload was composed at it. When the two agree the field
+/// is a no-op. Absent only on a resume (no fresh snapshot), and absent
+/// from every reply a session predating `open_input` writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachAccepted {
     pub kind: AttachPayloadKind,

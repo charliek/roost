@@ -5341,7 +5341,8 @@ impl App {
         let selection = self.host_selection?;
         let view = self.host_view(selection.tab.host)?;
         let section = self.hosts.section(&view.saved_id)?;
-        Some((view, host_notice::frozen_frame(section.state)?))
+        let frozen = host_notice::frozen_frame(section.state, section.serving_in_place)?;
+        Some((view, frozen))
     }
 
     /// [`Self::frozen_host_frame`]'s twin for a specific tab rather than
@@ -5357,7 +5358,7 @@ impl App {
         }
         let view = self.host_view(tab.host)?;
         let section = self.hosts.section(&view.saved_id)?;
-        host_notice::frozen_frame(section.state)
+        host_notice::frozen_frame(section.state, section.serving_in_place)
     }
 
     /// The banner the window owes the frame it is showing, the host its
@@ -5367,8 +5368,12 @@ impl App {
     fn host_frame_banner(
         &self,
     ) -> Option<(&str, host_notice::FrozenFrame, host_notice::HostBanner)> {
-        let (view, frozen) = self.frozen_host_frame()?;
-        Some((view.saved_id.as_str(), frozen, frozen.banner(&view.label)))
+        let selection = self.host_selection?;
+        let view = self.host_view(selection.tab.host)?;
+        let section = self.hosts.section(&view.saved_id)?;
+        let frozen = host_notice::frozen_frame(section.state, section.serving_in_place)?;
+        let banner = frozen.banner(&view.label, section.state.taken_by());
+        Some((view.saved_id.as_str(), frozen, banner))
     }
 
     /// The status strip the window owes a live host grid whose
@@ -5383,10 +5388,9 @@ impl App {
         let selection = self.host_selection?;
         let view = self.host_view(selection.tab.host)?;
         let section = self.hosts.section(&view.saved_id)?;
-        Some((
-            view.saved_id.as_str(),
-            host_notice::foreground_strip(section.state, &view.label)?,
-        ))
+        let strip =
+            host_notice::foreground_strip(section.state, &view.label, section.serving_in_place)?;
+        Some((view.saved_id.as_str(), strip))
     }
 
     /// The frozen-frame banner's button (plan 037 §3.1).
@@ -5402,7 +5406,7 @@ impl App {
         let current = self
             .hosts
             .section(saved_id)
-            .and_then(|section| host_notice::frozen_frame(section.state));
+            .and_then(|section| host_notice::frozen_frame(section.state, section.serving_in_place));
         if !host_notice::click_still_lands(frame, current) {
             tracing::debug!(
                 host = %saved_id,

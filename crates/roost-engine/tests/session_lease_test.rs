@@ -667,6 +667,53 @@ async fn a_stop_after_two_takeovers_labels_every_control_connection() {
     }
 }
 
+/// A control connection that never presented a lease is still owed the
+/// labeled goodbye (review F1).
+///
+/// R15 is what makes this the normal case: a client that only does
+/// `tab.attach` + `tab.write` + `tab.list` mints nothing, so a registry
+/// that tracked only leased connections would have no record of it — and
+/// a stop could give it a bare EOF, which is indistinguishable from the
+/// wire dying. A client that re-dials on that reading walks straight
+/// into a socket being unlinked.
+///
+/// The second half is the other edge: a connection that has already
+/// ended must be *gone*, not merely closed twice. A probe that dials,
+/// asks one question and hangs up would otherwise accumulate in the
+/// registry for the life of the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_labels_a_connection_that_never_presented_a_lease() {
+    let f = fixture();
+    let leaseless = conn(1);
+    f.handler
+        .handle(&leaseless.ctx, ops::SESSION_IDENTIFY, serde_json::json!({}))
+        .await
+        .expect("a leaseless op");
+
+    let probe = conn(2);
+    f.handler
+        .handle(&probe.ctx, ops::SESSION_IDENTIFY, serde_json::json!({}))
+        .await
+        .expect("a leaseless op");
+    f.handler.connection_ended(2);
+
+    f.handler
+        .handle(&conn(3).ctx, ops::SESSION_STOP, serde_json::json!({}))
+        .await
+        .expect("session.stop");
+
+    assert_eq!(
+        leaseless.watch.reason(),
+        Some(CloseReason::ShuttingDown),
+        "a client that never asked for the lease still gets told the session stopped"
+    );
+    assert_eq!(
+        probe.watch.reason(),
+        None,
+        "a connection that already ended was forgotten, not kept for the sweep"
+    );
+}
+
 /// A UI socket has no session, so it has no lease to hand out either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ui_socket_does_not_know_session_connect() {

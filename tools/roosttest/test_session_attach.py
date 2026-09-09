@@ -127,7 +127,7 @@ def connect_lease(client: Roost, takeover: bool = False, label: str | None = Non
 
 def attach_ticket(
     client: Roost,
-    lease: str,
+    lease: str | None,
     tab_id: int,
     cols: int = COLS,
     rows: int = ROWS,
@@ -149,11 +149,15 @@ def attach_ticket(
     predating `open_input` depends on (it decodes strictly and would
     refuse the key). Every other case in this module goes on exercising
     that shape by saying nothing.
+
+    `lease=None` **omits the key**, which is a different wire shape from
+    `lease=""` and the one the compatibility story turns on: since R15
+    the field is optional, so a client written against an `open_input`
+    session never sends it at all.
     """
     if libghostty_build is None:
         libghostty_build = client.call("session.identify")["libghostty_build"]
     params = {
-        "lease": lease,
         "tab_id": str(tab_id),
         "kinds": kinds if kinds is not None else [dataplane.GHOSTTY_SNAPSHOT],
         "cols": cols,
@@ -162,6 +166,8 @@ def attach_ticket(
         "cell_h_px": 0,
         "libghostty_build": libghostty_build,
     }
+    if lease is not None:
+        params["lease"] = lease
     if focus is not None:
         params["focus"] = focus
     return client.call("tab.attach", params)
@@ -517,6 +523,40 @@ def test_two_clients_attached_to_one_tab_both_see_output_and_both_type(env):
     env.stop_over_the_wire()
 
 
+def test_an_attach_that_omits_the_lease_entirely_is_admitted(env):
+    """The `lease` key is optional on `tab.attach` since R15, and the
+    *omitted* shape is the one the compatibility story turns on.
+
+    A client written against an `open_input` session has no lease to
+    send and no reason to invent one, so it sends no key — which is a
+    different wire shape from `"lease": ""` and the one a strict decoder
+    would refuse. This case sends it while another client holds the
+    foreground, so nothing about the answer can be "there was no lease to
+    be wrong about".
+    """
+    started(env)
+
+    with env.client() as driver, env.client() as bare:
+        connect_lease(driver)
+        project = first_project(driver)
+        tab = echoing_tab(driver, project, env.launch_cwd)
+
+        ticket = attach_ticket(bare, None, tab)
+        conn, reply = dial(env, ticket)
+        assert reply.ok, (reply.code, reply.message)
+        conn.read_until_ready()
+
+        # A real stream, not just an accepted handshake.
+        seen = bytearray()
+        conn.send_input(b"\n")
+        wait_for_bytes(conn, seen, CHILD_UP)
+        conn.send_input(b"BARE_TYPED\n")
+        wait_for_bytes(conn, seen, b"BARE_TYPED")
+        conn.close()
+
+    env.stop_over_the_wire()
+
+
 def test_geometry_follows_the_last_client_that_interacted(env):
     """The tab is the size of whoever last did something with it.
 
@@ -564,9 +604,12 @@ def test_geometry_follows_the_last_client_that_interacted(env):
             rows=desktop_rows,
         )
         assert geometry() == (desktop_cols, desktop_rows)
-        assert (big_reply.snapshot_cols, big_reply.snapshot_rows) == (None, None), (
-            "a focused attach was just resized to its own grid; there is no other "
-            "geometry to report"
+        assert (big_reply.snapshot_cols, big_reply.snapshot_rows) == (
+            desktop_cols,
+            desktop_rows,
+        ), (
+            "the reply names the geometry the payload was encoded at, focused or "
+            "not — here the one this attach asked for"
         )
         big.read_until_ready()
 

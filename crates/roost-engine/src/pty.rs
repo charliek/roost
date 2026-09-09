@@ -28,7 +28,7 @@ use anyhow::Context;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Depth of a tab's output fan-out. A consumer that falls this far
@@ -237,7 +237,16 @@ impl Victim {
 /// the writer loop applies them in the exact order they were sent (#80).
 pub(crate) enum WriterCmd {
     Input(Vec<u8>),
-    Resize(PtySize),
+    /// Set the child's winsize, and — when a caller is waiting on the
+    /// answer — say whether the `ioctl` landed.
+    ///
+    /// The ack exists because `TabCmd::Resize`'s own reply promises both
+    /// halves were applied, and this is the half that happens on another
+    /// task: without it a failed `TIOCSWINSZ` was logged and swallowed,
+    /// and the waiter resumed as though the child had been told.
+    /// `None` for the fire-and-forget callers, which is all of them but
+    /// `tab.attach`.
+    Resize(PtySize, Option<oneshot::Sender<Result<(), String>>>),
 }
 
 pub struct PtySupervisor {
@@ -758,9 +767,13 @@ impl PtySupervisor {
                             break;
                         }
                     }
-                    WriterCmd::Resize(size) => {
-                        if let Err(err) = master.resize(size) {
+                    WriterCmd::Resize(size, ack) => {
+                        let applied = master.resize(size).map_err(|err| {
                             warn!(tab_id, ?err, "pty resize failed");
+                            err.to_string()
+                        });
+                        if let Some(ack) = ack {
+                            let _ = ack.send(applied);
                         }
                     }
                 }
@@ -1016,12 +1029,15 @@ impl PtySupervisor {
                 .map(|s| s.cmd_tx.clone())
                 .ok_or(PtyError::NotFound(tab_id))?
         };
-        tx.send(WriterCmd::Resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }))
+        tx.send(WriterCmd::Resize(
+            PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            None,
+        ))
         .await
         .map_err(|_| PtyError::Closed(tab_id))?;
         Ok(())

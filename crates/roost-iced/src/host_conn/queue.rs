@@ -120,13 +120,31 @@ impl LeasePolicy {
     ///
     /// One function so the rule is stated once: an empty `held` is a
     /// deposed connection, and a `"lease": ""` on the wire would be a
-    /// claim rather than an omission. `Required` never reaches here
-    /// deposed — it is refused before the wire — so it and
-    /// `IfAvailable` answer the same way.
+    /// claim rather than an omission — so `IfAvailable` omits the key.
+    ///
+    /// `Required` does not, and the difference is load-bearing. Every op
+    /// that declares it (`session.set_theme`, `session.set_focus`,
+    /// `session.set_agent_hooks`, `session.put_file`) has a **required**
+    /// `lease: String` in its params, so omitting the key turns what
+    /// should be `taken-over` — "somebody else is driving, stop" — into
+    /// `invalid-param`, which reads as a client bug. It is unreachable
+    /// today because a deposed connection refuses these before the wire;
+    /// stating it here rather than relying on that is what keeps a third
+    /// caller of `run_intent` from finding out the hard way. The
+    /// `tracing::error!` is the invariant made audible: it does not
+    /// compile away the way a `debug_assert!` would.
     pub(crate) fn present(self, held: &str) -> Option<&str> {
         match self {
             LeasePolicy::None => None,
-            LeasePolicy::IfAvailable | LeasePolicy::Required => (!held.is_empty()).then_some(held),
+            LeasePolicy::IfAvailable => (!held.is_empty()).then_some(held),
+            LeasePolicy::Required => {
+                if held.is_empty() {
+                    tracing::error!(
+                        "a lease-required intent reached the wire with no lease;                          it should have been refused as not-foreground"
+                    );
+                }
+                Some(held)
+            }
         }
     }
 }
@@ -206,6 +224,10 @@ impl HostIntent {
 /// The UI-side handle. Cloneable, cheap, and never blocks: enqueuing
 /// happens on the main thread, so a full queue is refused rather than
 /// awaited.
+///
+/// [`HostOps::queued_for_test`] is how a set-level case says "nothing
+/// was enqueued": the worker owns the receiving half, so there is no
+/// other way to look.
 #[derive(Debug, Clone)]
 pub(crate) struct HostOps {
     tx: mpsc::Sender<HostIntent>,
@@ -215,6 +237,12 @@ pub(crate) struct HostOps {
 }
 
 impl HostOps {
+    /// How many intents are queued and unread. See the struct doc.
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
+
     pub(crate) fn channel() -> (HostOps, mpsc::Receiver<HostIntent>) {
         let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
         (
@@ -514,7 +542,13 @@ mod tests {
         // Deposed. An empty string on the wire is a claim, not an
         // omission, and a pre-`open_input` session tells the two apart.
         assert_eq!(LeasePolicy::IfAvailable.present(""), None);
-        assert_eq!(LeasePolicy::Required.present(""), None);
+        // `Required` is the exception, and it is unreachable by design:
+        // a deposed connection refuses these before the wire. Should a
+        // third caller ever get one here, the key still goes out —
+        // every op that declares `Required` has a required `lease`
+        // param, so omitting it would turn `taken-over` into
+        // `invalid-param` and hide which side is at fault.
+        assert_eq!(LeasePolicy::Required.present(""), Some(""));
     }
 
     #[test]

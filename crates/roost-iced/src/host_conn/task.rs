@@ -1892,6 +1892,15 @@ async fn deposed_rounds(
         // Answers whatever the deposed driver still had queued before
         // the loop below starts refusing the lease-required ones.
         queue::flush(ops_rx, &HostOpError::Disconnected);
+        // The transport decision, taken **before** the state is
+        // published. `TakenOver` alone cannot say which of the two
+        // deposed worlds this is, so the UI reads this flag the moment
+        // it sees the state to decide whether the frame is live or
+        // frozen — and a raise that landed afterwards would paint one
+        // scrim frame over a grid that never stopped streaming.
+        let serving_in_place = !control_lost && live.facts.supports_open_input;
+        config.foreground.serving(serving_in_place);
+
         // Refiled, because `TakenOver` is not `Connected` and a reader
         // that went blank here would be reporting the takeover as a loss
         // of the session rather than of the lease. Nothing about the
@@ -1904,7 +1913,7 @@ async fn deposed_rounds(
             return ConnEnd::FeedClosed;
         }
 
-        if control_lost || !live.facts.supports_open_input {
+        if !serving_in_place {
             // The old-session path, and the one where the leg died under
             // us: the server closed the data connections and the control
             // one, so the frame stops and there is nothing to serve.
@@ -1916,7 +1925,6 @@ async fn deposed_rounds(
         // upload must not claim the host disconnected when it is right
         // there under somebody else's foreground.
         config.uploads.deposed(&config.label, taken_by.as_deref());
-        config.foreground.serving(true);
         let outcome = serve_deposed(
             config,
             incarnation,
@@ -1931,11 +1939,13 @@ async fn deposed_rounds(
             observing,
         )
         .await;
-        config.foreground.serving(false);
         config.uploads.foreground();
 
         match outcome {
-            DeposedEnd::Ended(end) => ended = end,
+            DeposedEnd::Ended(end) => {
+                config.foreground.serving(false);
+                ended = end;
+            }
             DeposedEnd::Retaken { live, lease } => {
                 // `held_lease` and `observing` were written the moment
                 // the lease moved on the wire — see [`retake_foreground`].
@@ -1946,6 +1956,10 @@ async fn deposed_rounds(
                 {
                     return ConnEnd::FeedClosed;
                 }
+                // Lowered only once `Connected` is on the feed, the
+                // mirror of the raise above: while the UI still reads
+                // `TakenOver`, this flag is what keeps the frame live.
+                config.foreground.serving(false);
                 let _lane = config.uploads.open(config.socket.clone(), lease);
                 ended = serve(
                     config,
@@ -4375,8 +4389,21 @@ mod tests {
             let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
 
             fake.depose.request();
+            // Asserted the instant the state lands, not after: the UI
+            // reads this flag to decide whether the deposed frame is
+            // live or frozen, so it has to be true *by the time*
+            // `TakenOver` is on the feed (review F3).
+            let seam = Arc::clone(&host.foreground);
             until_state(&mut host, "the client to be deposed", |state| {
-                taken_by(state) == Some(Some("a phone"))
+                if taken_by(state) != Some(Some("a phone")) {
+                    return false;
+                }
+                assert_eq!(
+                    seam.in_place(),
+                    open_input,
+                    "the in-place answer must be settled before TakenOver is published"
+                );
+                true
             })
             .await;
 

@@ -563,6 +563,16 @@ pub(crate) struct HostSectionView<'a> {
     pub(crate) state: &'a HostConnState,
     pub(crate) incarnation: Option<HostId>,
     pub(crate) mirror: Option<&'a Arc<SharedMirror>>,
+    /// Whether this host's task is deposed but still serving on the
+    /// control connection it holds — the task's own answer, read off
+    /// [`task::Foreground::in_place`].
+    ///
+    /// It rides the section because a `TakenOver` state alone cannot say
+    /// it: the same state covers a session too old to keep the
+    /// connections open and an observer-only connection, and both of
+    /// those leave a frame nothing is feeding. See
+    /// [`crate::app::host_notice::frozen_frame`].
+    pub(crate) serving_in_place: bool,
 }
 
 /// Every connected host, and the mirrors their tasks publish.
@@ -2574,6 +2584,7 @@ impl HostConnSet {
                     .incarnation
                     .or_else(|| carried.map(|carried| carried.incarnation)),
                 mirror: live.or(carried.map(|carried| &carried.mirror)),
+                serving_in_place: conn.foreground.in_place(),
             });
         }
         let retained = entry.retained.as_ref()?;
@@ -2582,6 +2593,9 @@ impl HostConnSet {
             state: &retained.state,
             incarnation: Some(retained.incarnation),
             mirror: Some(&retained.mirror),
+            // A retained section has no task at all, so nothing is
+            // serving it by definition.
+            serving_in_place: false,
         })
     }
 
@@ -2631,6 +2645,13 @@ impl HostConnSet {
             .entries
             .values()
             .filter_map(|entry| entry.conn.as_ref())
+            // The foreground only. A deposed connection refuses a
+            // lease-required intent before the wire, and this one has no
+            // reply channel — so sending it would buy nothing but a
+            // warning per deposed host on an ordinary theme change. The
+            // takeback re-seeds from the shared slot above, which is
+            // where a deposed host's colors come from anyway.
+            .filter(|conn| conn.state.is_foreground())
         {
             // Lease-gated, and it rides the same queue as everything
             // else so it cannot interleave with an attach.
@@ -5687,6 +5708,102 @@ mod tests {
             set.conn("h1").generation,
             generation,
             "a new endpoint is a full reconnect"
+        );
+    }
+
+    /// A theme change goes to the foreground and nobody else (review
+    /// F5).
+    ///
+    /// `session.set_theme` is a lease-required intent with no reply
+    /// channel, so a deposed connection would refuse it locally and the
+    /// refusal would land on `HostIntent::answer`'s nobody-listening arm
+    /// — a `warn!` per deposed host every time the user changes theme.
+    /// Nothing is lost by skipping it: the shared slot above is what a
+    /// takeback re-seeds from.
+    #[tokio::test]
+    async fn a_theme_change_is_only_sent_to_hosts_this_client_still_drives() {
+        let (mut set, _feed) = a_set();
+        for host in ["h1", "h2"] {
+            set.connect(
+                host,
+                host,
+                PathBuf::from(format!("/nonexistent/roost-set-theme-{host}.sock")),
+                HostTransport::UnixSocket,
+                ConnectMode::Dial,
+                AttemptCause::Explicit,
+            );
+        }
+        let driven = set.mint_for("h1");
+        set.apply_state(driven, HostConnState::Connected);
+        let deposed = set.mint_for("h2");
+        set.apply_state(
+            deposed,
+            HostConnState::TakenOver {
+                taken_by: Some("a phone".into()),
+            },
+        );
+
+        // Nothing has awaited since the spawns, so no worker has run and
+        // whatever is in these queues is what was enqueued.
+        let before = (
+            set.conn("h1").ops.queued_for_test(),
+            set.conn("h2").ops.queued_for_test(),
+        );
+        set.set_theme(&Theme::roost_dark_fallback());
+        assert_eq!(
+            set.conn("h1").ops.queued_for_test(),
+            before.0 + 1,
+            "the foreground is told"
+        );
+        assert_eq!(
+            set.conn("h2").ops.queued_for_test(),
+            before.1,
+            "a deposed host is not: it would refuse the intent and warn about it"
+        );
+    }
+
+    /// The section carries the task's in-place answer, which is the
+    /// only honest way to tell the two deposed worlds apart (review F3).
+    ///
+    /// `TakenOver` alone covers a session that kept the connections
+    /// open, a session too old to, and a connection that was only ever
+    /// an observer. The last two leave a frame nothing is feeding, and
+    /// the terminal area decides which of the two lines to draw off this
+    /// flag — so it has to survive the trip from the task's seam to the
+    /// section the draw reads.
+    #[tokio::test]
+    async fn a_deposed_section_reports_whether_its_task_is_still_serving() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-serving.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+            AttemptCause::Explicit,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert!(
+            !set.section("h1").expect("a section").serving_in_place,
+            "a foreground connection is not deposed at all"
+        );
+
+        set.apply_state(
+            incarnation,
+            HostConnState::TakenOver {
+                taken_by: Some("a phone".into()),
+            },
+        );
+        assert!(
+            !set.section("h1").expect("a section").serving_in_place,
+            "deposed with nothing serving: the frame is frozen"
+        );
+
+        Arc::clone(&set.conn("h1").foreground).serving_for_test(true);
+        assert!(
+            set.section("h1").expect("a section").serving_in_place,
+            "deposed but serving: the frame is live and takes keys"
         );
     }
 

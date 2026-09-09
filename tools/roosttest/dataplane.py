@@ -462,10 +462,11 @@ class Reply:
     server_epoch: int = 0
     tab_generation: int = 0
     #: The geometry the payload was encoded at, when the server said —
-    #: only an unfocused snapshot attach, which by definition did not
-    #: resize the tab to the client's own grid. `None` on a focused
-    #: attach and on a resume, so an absent pair is an answer rather
-    #: than a missing field.
+    #: every snapshot attach, focused or not: a focused attach resizes
+    #: from the control connection, and anything else may resize the tab
+    #: again before the encode runs. `None` on a resume (no fresh
+    #: snapshot) and from a session predating `open_input`, so an absent
+    #: pair is an answer rather than a missing field.
     snapshot_cols: int | None = None
     snapshot_rows: int | None = None
     code: str = ""

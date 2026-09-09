@@ -1069,6 +1069,22 @@ pub const ATTACH_TTL_OVERRIDE_ENV: &str = "ROOST_SESSION_ATTACH_TTL_MS";
 /// connection is about to present.
 pub const MAX_OUTSTANDING_TOKENS: usize = 16;
 
+/// How many of those one control connection may hold at once.
+///
+/// Half the pool, so no single connection can exhaust it: before R15
+/// minting required the lease, which meant only the foreground could
+/// reach [`MAX_OUTSTANDING_TOKENS`] at all. Raw input is open now, so
+/// any same-UID client can loop `tab.attach` without ever dialing — and
+/// without this sub-cap one buggy agent script would answer every other
+/// client's attach with `too-many-tokens` for a whole TTL.
+///
+/// Eight is far above anything healthy: a client consumes each ticket
+/// within a round trip, so even a UI attaching several tabs at once
+/// holds one or two. Half rather than a smaller share because the
+/// interesting property is only that a second connection always has
+/// room, and a low cap would start refusing legitimate bursts.
+pub const MAX_TOKENS_PER_CONNECTION: usize = MAX_OUTSTANDING_TOKENS / 2;
+
 /// What a takeover reports when the claimant stated no label.
 ///
 /// Display copy, not a sentinel: `taken_by` is always a non-empty string
@@ -1169,7 +1185,8 @@ impl Observer {
 ///
 /// Data connections are not bounded by construction any more (plan 057,
 /// R15): a tab admits as many as clients dial. What bounds them is the
-/// token quota — [`MAX_OUTSTANDING_TOKENS`] tickets per TTL window — and
+/// token quota — [`MAX_OUTSTANDING_TOKENS`] tickets per TTL window,
+/// [`MAX_TOKENS_PER_CONNECTION`] of them per connection — and
 /// the tab task's `MAX_CONCURRENT_SNAPSHOTS` simultaneous fences (named
 /// rather than linked: that module is `server-vt`-gated and this one is
 /// not); over time the count is open. That is affordable because nothing is
@@ -1194,6 +1211,11 @@ struct ClientRegistry {
     /// was held on outlive it — and a stop must still be able to hand
     /// each of them the labeled `shutting-down` close. [`Lease::conns`]
     /// is membership for the focus bookkeeping and nothing else.
+    ///
+    /// Every connection that sends a single op on this socket is in
+    /// here, not only the ones that present a lease: since R15 a client
+    /// that only attaches and writes never mints one, and it is owed the
+    /// same labeled goodbye as the foreground.
     controls: std::collections::HashMap<u64, ConnCloser>,
     /// Every live data connection, by tab id. Kept so a stop can close
     /// them and so a forwarder unwinding can drop its own entry — no
@@ -1248,13 +1270,15 @@ struct AttachToken {
     token: String,
     /// The control connection that asked for this ticket.
     ///
-    /// A ticket is authority, and authority nobody can revoke is a leak:
-    /// a client that mints the full [`MAX_OUTSTANDING_TOKENS`] quota and
-    /// vanishes would otherwise hold it against everyone else for a
-    /// whole TTL. `forget_connection` purges on this field, which is the
-    /// connection-scoped replacement for the lease-scoped purge a
-    /// takeover used to do — takeovers no longer invalidate tickets,
-    /// because an attach takes no lease.
+    /// Two things read it, and they cover the two ways one client could
+    /// hold the pool against the others. `mint_token` counts a
+    /// connection's own live tickets against
+    /// [`MAX_TOKENS_PER_CONNECTION`], which is what bounds a **live**
+    /// client that mints and never dials. `forget_connection` purges on
+    /// it, which is what releases a **vanished** one's tickets instead
+    /// of leaving them to time out — the connection-scoped replacement
+    /// for the lease-scoped purge a takeover used to do, since takeovers
+    /// no longer invalidate tickets and an attach takes no lease.
     minted_by: u64,
     tab_id: i64,
     tab_generation: u64,
@@ -1277,11 +1301,6 @@ pub(crate) struct AttachTerms {
     /// focused attach, and what every `INPUT` frame from this connection
     /// claims (plan 057, R15). A `RESIZE` frame moves it.
     pub(crate) geometry: Geometry,
-    /// Whether the attach claimed the tab's geometry. A `false` here is
-    /// what makes the forwarder report the snapshot's own size back:
-    /// nothing resized the tab, so the payload is at whatever size it
-    /// already was.
-    pub(crate) focus: bool,
 }
 
 /// What consuming a token admitted, handed to the forwarder.
@@ -1535,7 +1554,7 @@ impl ClientRegistry {
     }
 
     /// Track a control connection's closer, independently of whatever
-    /// authority it just presented.
+    /// authority it just presented — or never presented at all.
     ///
     /// [`ClientRegistry::controls`] is the authority for closing and
     /// [`Lease::conns`] is membership for the focus, which is why the
@@ -1656,6 +1675,24 @@ impl ClientRegistry {
                 "too-many-tokens",
                 format!(
                     "{MAX_OUTSTANDING_TOKENS} attach tokens are already outstanding; \
+                     dial the data connections you asked for"
+                ),
+            ));
+        }
+        // The per-connection share, checked second so the session-wide
+        // answer stays the one a client hears when the session really is
+        // full. See [`MAX_TOKENS_PER_CONNECTION`].
+        if self
+            .tokens
+            .iter()
+            .filter(|t| t.minted_by == minted_by)
+            .count()
+            >= MAX_TOKENS_PER_CONNECTION
+        {
+            return Err(HandlerError::new(
+                "too-many-tokens",
+                format!(
+                    "this connection already holds {MAX_TOKENS_PER_CONNECTION} attach tokens; \
                      dial the data connections you asked for"
                 ),
             ));
@@ -1809,6 +1846,28 @@ impl SessionState {
                 "run session.connect first: this op requires a session lease",
             )),
         }
+    }
+
+    /// Note this connection as a live control connection, whatever it is
+    /// about to ask for.
+    ///
+    /// The one choke point, called from [`Handler::handle`] before any
+    /// dispatch, because since plan 057 R15 a control connection that
+    /// never presents a lease is ordinary: a client that only attaches,
+    /// writes and lists is first-class and would otherwise appear in
+    /// none of `controls`, `data_conns` or `observers` — so a stop could
+    /// only give it a bare EOF, and a client that distinguishes "the
+    /// session stopped" from "the wire died" would re-dial a socket
+    /// being unlinked.
+    ///
+    /// Registration is refused after the stop sweep for
+    /// [`Self::require_lease`]'s reason: an entry added past the sweep
+    /// is one no closer will ever reach.
+    fn register_control(&self, ctx: &ConnCtx) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        lock(&self.clients).register_control(ctx);
     }
 
     /// Is `lease` still the live one?
@@ -2143,7 +2202,16 @@ impl Handler for IpcHandler {
         op: &'a str,
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<HandlerOutcome, HandlerError>> + Send + 'a>> {
-        Box::pin(async move { dispatch_outcome(self, ctx, op, params).await })
+        Box::pin(async move {
+            // Every op on a session socket passes through here, which is
+            // why the registration is here: see
+            // [`SessionState::register_control`] for why a leaseless
+            // connection has to be tracked too.
+            if let Some(session) = self.session.as_ref() {
+                session.register_control(ctx);
+            }
+            dispatch_outcome(self, ctx, op, params).await
+        })
     }
 
     /// The other half of `session.set_focus`'s lifetime rule: a focus a
@@ -2285,7 +2353,7 @@ fn tab_err(e: crate::tab_task::TabError) -> HandlerError {
     use crate::tab_task::TabError;
     match e {
         TabError::Gone | TabError::RingMiss { .. } => HandlerError::not_found(e.to_string()),
-        TabError::SnapshotFailed(_) | TabError::Render(_) => {
+        TabError::SnapshotFailed(_) | TabError::Render(_) | TabError::WinsizeFailed(_) => {
             HandlerError::new("internal", e.to_string())
         }
     }
@@ -2898,7 +2966,6 @@ async fn tab_attach(
         AttachTerms {
             kind: kind.clone(),
             geometry,
-            focus: p.focus,
         },
     )?;
     encode(&TabAttachResult {

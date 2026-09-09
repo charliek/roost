@@ -253,10 +253,15 @@ async fn attach_tab(
         return;
     }
 
-    // Reported only when it can differ from what the client asked for:
-    // a focused attach resized the tab to its own geometry, and a resume
-    // encodes no snapshot at all.
-    let snapshot_size = snapshot_size.filter(|_| !admitted.terms.focus);
+    // Reported for every snapshot, focused or not (a resume encodes none
+    // and carries nothing). A focused attach did resize the tab to its
+    // own geometry — but on the *control* connection, before this one
+    // was dialed, and a `vt` encode can defer and retry inside the
+    // attach budget. Any other client's geometry-bearing INPUT landing
+    // in that window resizes the tab again, and this is the only place
+    // that says what the payload was actually composed at. Sending it
+    // costs a client that already agrees nothing: it hydrates at a size
+    // it is already at.
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
         // What `tab.attach` negotiated, carried here on the ticket: the
         // data connection presents only a token, and a client that

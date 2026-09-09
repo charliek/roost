@@ -71,6 +71,14 @@ pub const MAX_CONCURRENT_SNAPSHOTS: usize = 4;
 /// How often the task retries a PTY write it could not hand off because
 /// the writer channel was full.
 const PENDING_FLUSH_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+/// How long an acked resize waits for the child's `TIOCSWINSZ`.
+///
+/// Bounded because the winsize shares one FIFO with client input (#80),
+/// and a child that has stopped reading can hold that FIFO open
+/// indefinitely — an unbounded wait would turn a wedged shell into a
+/// `tab.attach` that never answers. Generous because everything short of
+/// that case is one `ioctl` away.
+const WINSIZE_ACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// Why a parked `vt` encode gives up: nothing more will be ingested, so
 /// the parser can never leave the sequence it is stuck inside.
 const EXITED_MID_SEQUENCE: &str =
@@ -250,10 +258,36 @@ pub struct ResumeAt {
     pub stored_exit: Option<(u64, i32)>,
 }
 
+/// The child half of a resize, still in flight. See
+/// [`WriterCmd::Resize`](crate::pty::WriterCmd).
+type WinsizeAck = oneshot::Receiver<Result<(), String>>;
+
+/// Wait out the child half of a resize and report what happened to it.
+///
+/// A dropped sender is **not** a failure: it means the PTY writer task
+/// is gone, so there is no child left to tell — which is the state an
+/// exited tab sits in while it still serves snapshots, and failing an
+/// attach to one would be a worse answer than the truth.
+async fn await_winsize(tab_id: i64, ack: WinsizeAck) -> Result<(), TabError> {
+    match tokio::time::timeout(WINSIZE_ACK_BUDGET, ack).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(TabError::WinsizeFailed(error)),
+        Ok(Err(_dropped)) => {
+            debug!(tab_id, "no pty writer left to resize; the child is gone");
+            Ok(())
+        }
+        Err(_elapsed) => Err(TabError::WinsizeFailed(
+            "the child did not take the new size within the budget".into(),
+        )),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TabError {
     #[error("the tab task is gone")]
     Gone,
+    #[error("the child's window size could not be set: {0}")]
+    WinsizeFailed(String),
     #[error("snapshot encode failed: {0}")]
     SnapshotFailed(String),
     #[error("reading the tab's screen failed: {0}")]
@@ -297,9 +331,11 @@ pub enum TabCmd {
     /// Client RESIZE / `tab.resize`.
     ///
     /// `ack` fires once the server terminal AND the PTY winsize have
-    /// both been given the new geometry. `tab.attach` waits on it so the
-    /// snapshot it mints a ticket for cannot be encoded at the old size;
-    /// every other caller passes `None` and stays fire-and-forget.
+    /// both been given the new geometry — and reports the failure of
+    /// either half, including the child's, which happens on the PTY
+    /// writer's own task. `tab.attach` waits on it so the snapshot it
+    /// mints a ticket for cannot be encoded at the old size; every other
+    /// caller passes `None` and stays fire-and-forget.
     Resize {
         geometry: Geometry,
         ack: Option<oneshot::Sender<Result<(), TabError>>>,
@@ -897,9 +933,18 @@ impl TabTask {
         self.flush_writer();
     }
 
-    fn queue_resize(&mut self, size: PtySize) {
-        self.pending.push_back(WriterCmd::Resize(size));
+    /// Queue the child's winsize, handing back the receiver when the
+    /// caller wants to hear whether the `ioctl` landed.
+    fn queue_resize(&mut self, size: PtySize, acked: bool) -> Option<WinsizeAck> {
+        let (ack, rx) = if acked {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        self.pending.push_back(WriterCmd::Resize(size, ack));
         self.flush_writer();
+        rx
     }
 
     /// Size the tab: the server terminal first, then the child's
@@ -910,12 +955,21 @@ impl TabTask {
     ///
     /// Geometry that has not changed is not re-applied: two clients
     /// alternating keystrokes at the same size would otherwise pay for a
-    /// terminal resize per frame.
-    fn apply_geometry(&mut self, geometry: Geometry) -> Result<(), TabError> {
+    /// terminal resize per frame. Which is exactly why a **failed**
+    /// resize must record nothing: with the short-circuit above, a
+    /// geometry stored before libghostty accepted it would make every
+    /// retry of that same size a silent no-op, and the tab would report
+    /// a grid it never took for the rest of its life.
+    ///
+    /// `acked` asks for the child half's verdict; see [`WinsizeAck`].
+    fn apply_geometry(
+        &mut self,
+        geometry: Geometry,
+        acked: bool,
+    ) -> Result<Option<WinsizeAck>, TabError> {
         if geometry == self.vt.geometry {
-            return Ok(());
+            return Ok(None);
         }
-        self.vt.geometry = geometry;
         let Geometry {
             cols,
             rows,
@@ -930,20 +984,35 @@ impl TabTask {
                 warn!(tab_id = self.tab_id, %error, "server terminal resize failed");
                 TabError::from(error)
             });
-        // Pixel geometry stays 0 on the PTY winsize, matching
-        // `PtySupervisor::resize`; libghostty gets the real cell metrics
-        // above, which is what its size reports read.
-        self.queue_resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        // The child is told nothing the terminal refused, and nothing is
+        // recorded either: the two halves move together or not at all.
+        // Queued ahead of the drain below so the winsize `ioctl` still
+        // precedes the in-band size report the resize just emitted — a
+        // program that reads the report and then asks `TIOCGWINSZ` must
+        // not be told two different sizes.
+        let queued = if applied.is_ok() {
+            self.vt.geometry = geometry;
+            // Pixel geometry stays 0 on the PTY winsize, matching
+            // `PtySupervisor::resize`; libghostty gets the real cell
+            // metrics above, which is what its size reports read.
+            self.queue_resize(
+                PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                acked,
+            )
+        } else {
+            None
+        };
         // Mode-2048 in-band size reports fire inside `resize`, outside
         // any `vt_write` — draining only after writes would silently
         // drop them.
         self.take_replies();
-        applied
+        applied?;
+        Ok(queued)
     }
 
     fn flush_writer(&mut self) {
@@ -1013,17 +1082,36 @@ impl TabTask {
                 // keystrokes over a resize the terminal disliked would
                 // be the worse failure.
                 if let Some(geometry) = geometry {
-                    let _ = self.apply_geometry(geometry);
+                    let _ = self.apply_geometry(geometry, false);
                 }
                 self.queue_input(data);
             }
             TabCmd::Resize { geometry, ack } => {
-                let applied = self.apply_geometry(geometry);
-                // Answered only here, with both halves applied: a waiter
+                let applied = self.apply_geometry(geometry, ack.is_some());
+                // Answered only once BOTH halves are applied: a waiter
                 // that resumed at the terminal resize alone could still
                 // snapshot a tab whose child had not been told.
                 if let Some(ack) = ack {
-                    let _ = ack.send(applied);
+                    match applied {
+                        // Off the task, because the child half is
+                        // another task's FIFO: a tab that blocked here
+                        // would stop rendering its own output behind a
+                        // child that stopped reading its input.
+                        Ok(Some(winsize)) => {
+                            let tab_id = self.tab_id;
+                            tokio::spawn(async move {
+                                let _ = ack.send(await_winsize(tab_id, winsize).await);
+                            });
+                        }
+                        // Nothing to wait for: the geometry was already
+                        // this one, so both halves are at it already.
+                        Ok(None) => {
+                            let _ = ack.send(Ok(()));
+                        }
+                        Err(error) => {
+                            let _ = ack.send(Err(error));
+                        }
+                    }
                 }
             }
             TabCmd::SetTheme(seed, generation) => {
@@ -1219,6 +1307,6 @@ async fn await_status(tab_id: i64, exit_rx: &mut mpsc::UnboundedReceiver<ExitSig
 fn writer_cmd_len(cmd: &WriterCmd) -> usize {
     match cmd {
         WriterCmd::Input(data) => data.len(),
-        WriterCmd::Resize(_) => 0,
+        WriterCmd::Resize(..) => 0,
     }
 }

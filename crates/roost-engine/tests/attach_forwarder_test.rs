@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle, MAX_OUTSTANDING_TOKENS};
+use roost_engine::ipc::{
+    IpcHandler, SessionInfo, StopHandle, MAX_OUTSTANDING_TOKENS, MAX_TOKENS_PER_CONNECTION,
+};
 use roost_engine::tab_task::{ServerVtConfig, ServerVtWorkspace};
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::dataframe::{
@@ -29,7 +31,7 @@ use roost_ipc::messages::{
     SessionConnectParams, SessionConnectResult, SessionStopParams, SessionStopResult,
     TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
     TabCloseParams, TabDumpParams, TabDumpResult, TabFeedPtyBytesParams, TabOpenParams,
-    TabOpenResult, WireTabRef, SESSION_PROTOCOL_VERSION,
+    TabOpenResult, TabResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -1280,6 +1282,12 @@ async fn a_zero_sized_resize_frame_is_ignored() {
 /// focused client gave it, and the accepted handshake reports the
 /// geometry its snapshot was actually encoded at — which is what a `vt`
 /// client has to build its terminal at.
+///
+/// A focused attach hears it too. Its resize ran on the control
+/// connection before this one was dialed, and raw input is open, so
+/// "what I asked for" is not evidence of what the encode composed —
+/// `a_focused_attach_reports_the_size_it_was_actually_encoded_at` is the
+/// case where the two differ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
     let h = harness().await;
@@ -1290,8 +1298,8 @@ async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
         .await;
     assert_eq!(
         (desktop.snapshot_cols, desktop.snapshot_rows),
-        (None, None),
-        "a focused attach just resized the tab to its own geometry"
+        (Some(100), Some(30)),
+        "the size the payload was encoded at, which here is what was asked for"
     );
 
     let (phone, _b) = h
@@ -1306,6 +1314,64 @@ async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
         (d.cols, d.rows),
         (100, 30),
         "a client that is only watching cannot shrink the one that is typing"
+    );
+}
+
+/// A focused attach hears the snapshot's real geometry too, and it is
+/// the encode's answer rather than the request's (review F7).
+///
+/// The resize a focused `tab.attach` performs runs on the **control**
+/// connection and finishes before the data connection is even dialed.
+/// Raw input is open, so anything else may size the tab in that window —
+/// here a plain `tab.resize` from a second client, which is the same
+/// interaction a phone's first keystroke would be. The payload is then
+/// composed at the other client's size, and a `vt` client that hydrated
+/// at its own would wrap every line and misplace every absolute cursor
+/// move. Suppressing the field on `focus: true` — on the premise that a
+/// focused attacher already knows the size — is exactly what R15
+/// invalidated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_focused_attach_reports_the_size_it_was_actually_encoded_at() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    // The attach negotiates 100x30 and mints a ticket. Nothing has been
+    // dialed yet, so nothing has been encoded yet either.
+    let ticket = attach_with(
+        &mut client,
+        sized_attach_params(&lease, tab_id, (100, 30), (8, 16), true),
+    )
+    .await
+    .expect("tab.attach");
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (100, 30), "the focused attach sized it");
+
+    // Somebody else interacts before the ticket is presented.
+    let mut other = h.control().await;
+    let _resized: serde_json::Value = other
+        .call(
+            ops::TAB_RESIZE,
+            TabResizeParams {
+                tab_id,
+                cols: 60,
+                rows: 20,
+            },
+        )
+        .await
+        .expect("tab.resize");
+    wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
+        (d.cols, d.rows) == (60, 20)
+    })
+    .await;
+
+    let (accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
+    data.read_snapshot().await;
+    assert_eq!(
+        (accepted.snapshot_cols, accepted.snapshot_rows),
+        (Some(60), Some(20)),
+        "the reply names the geometry the encode used, not the one asked for"
     );
 }
 
@@ -1412,8 +1478,8 @@ async fn a_session_stop_labels_a_live_data_connection() {
 /// what reclaims the quota is the minting connection going away.
 ///
 /// The quota is the registry's bound, so it has to be reclaimable
-/// without waiting out a TTL — a client that mints all 16 and vanishes
-/// must not lock everyone else out for a minute.
+/// without waiting out a TTL — a client that mints its whole share and
+/// vanishes must not lock everyone else out for a minute.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
     let h = harness().await;
@@ -1440,15 +1506,22 @@ async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
     data.read_snapshot().await;
 
     // The quota is per session, and the displaced client — still
-    // attaching on its stale lease, which is accepted and ignored — can
-    // fill the whole of it.
+    // attaching on its stale lease, which is accepted and ignored —
+    // takes its full share of it. Filling the rest takes a second
+    // connection, because no single one may hold the whole pool.
     let mut minted = Vec::new();
-    for _ in 0..MAX_OUTSTANDING_TOKENS {
+    for _ in 0..MAX_TOKENS_PER_CONNECTION {
         minted.push(
             attach(&mut old_client, &old_lease, tab_id)
                 .await
                 .attach_token,
         );
+    }
+    let mut filler = h.control().await;
+    for _ in 0..(MAX_OUTSTANDING_TOKENS - MAX_TOKENS_PER_CONNECTION) {
+        attach_with(&mut filler, attach_params("", tab_id))
+            .await
+            .expect("a second connection fills the rest of the pool");
     }
     assert_eq!(
         attach_with(&mut new_client, attach_params("", tab_id))
@@ -1483,6 +1556,41 @@ async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
     let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
         .await
         .expect("the freshly minted ticket is accepted");
+    data.read_snapshot().await;
+}
+
+/// One connection cannot hold the whole ticket pool (review F2).
+///
+/// Before R15 minting required the lease, so only the foreground could
+/// reach the session-wide quota at all. Raw input is open now: any
+/// same-UID process can loop `tab.attach` without ever dialing, and
+/// without a per-connection share one buggy script would answer the real
+/// UI's attach with `too-many-tokens` for a whole TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_connection_cannot_mint_away_everybody_elses_attach() {
+    let h = harness().await;
+    let (mut hog, lease, tab_id) = h.leased_tab().await;
+
+    for _ in 0..MAX_TOKENS_PER_CONNECTION {
+        attach(&mut hog, &lease, tab_id).await;
+    }
+    assert_eq!(
+        attach_with(&mut hog, attach_params(&lease, tab_id))
+            .await
+            .unwrap_err(),
+        "too-many-tokens",
+        "its own share is spent"
+    );
+
+    // And the session is not: another client — leaseless, as R15 allows
+    // — still gets a ticket, and a usable one.
+    let mut other = h.control().await;
+    let ticket = attach_with(&mut other, attach_params("", tab_id))
+        .await
+        .expect("a second connection still has room in the pool");
+    let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
     data.read_snapshot().await;
 }
 
