@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import re
+from pathlib import Path
 
 import pytest
 import session as sessionlib
@@ -453,26 +454,26 @@ def test_set_theme_is_lease_gated_and_validates_its_palette(env):
 
 
 # ---------------------------------------------------------------------------
-# 2b. tab.write is the driver's
+# 2b. tab.write is nobody's — raw input is open
 # ---------------------------------------------------------------------------
 
 
-def test_a_session_write_needs_the_driver_lease(env):
-    """Writing into a tab is an interactive act, so on a session socket
-    it belongs to whoever holds the lease.
+def test_a_session_write_needs_no_lease(env):
+    """Writing into a tab takes no lease (plan 057, R15): same-UID is the
+    whole boundary, and the lease is the foreground, not a write fence.
 
-    The child copies its first bytes to a file: that file is the only
-    honest proof the leased write reached the terminal rather than
-    merely being admitted. `stty raw -echo` so the six bytes arrive
-    unlineated and nothing is echoed back.
+    Each variant — no lease, an empty one, and one this session has
+    displaced — gets **its own tab and its own sink**. The child copies
+    exactly six bytes and moves on, so one shared sink could only ever
+    prove the first write landed. `stty raw -echo` so the six bytes
+    arrive unlineated and nothing is echoed back.
     """
     started(env)
-    sink = env.launch_cwd / "written"
 
-    with env.client() as client:
-        project = first_project(client)
+    def a_tab_with_a_sink(client, name: str) -> tuple[int, Path]:
+        sink = env.launch_cwd / name
         tab = client.open_tab(
-            project,
+            first_project(client),
             cwd=str(env.launch_cwd),
             cols=COLS,
             rows=ROWS,
@@ -482,33 +483,28 @@ def test_a_session_write_needs_the_driver_lease(env):
                 f"stty raw -echo; dd bs=1 count=6 of='{sink}' 2>/dev/null; exec sleep 300",
             ],
         )
+        return tab, sink
 
-        # No lease at all, and an empty one: both are "this client never
-        # connected", and neither may move a byte.
-        for presented in (None, ""):
-            with pytest.raises(RoostError) as refused:
-                client.send(tab, b"NOPE!!", lease=presented)
-            assert refused.value.code == "connect-required", refused.value
+    with env.client() as client:
+        # Minted and then displaced, so the third variant presents a
+        # lease this session actively remembers as dead.
+        stale = connect_lease(client)
+        with env.client() as taker:
+            connect_lease(taker, takeover=True, label="taker")
 
-        lease = connect_lease(client)
-        client.send(tab, b"LEASED", lease=lease)
-        sessionlib.wait_until(
-            lambda: sink.is_file() and sink.stat().st_size == 6,
-            30.0,
-            "the child to receive the leased write",
-        )
-        assert sink.read_bytes() == b"LEASED"
-
-    # And the displaced lease buys nothing once someone else drives. The
-    # check runs on a fresh connection because the takeover closes every
-    # connection registered under the lease it displaces — including the
-    # one that just wrote.
-    with env.client() as taker:
-        connect_lease(taker, takeover=True, label="taker")
-        with env.client() as stranger:
-            with pytest.raises(RoostError) as stale:
-                stranger.send(tab, b"STALE!", lease=lease)
-            assert stale.value.code == "taken-over", stale.value
+            for name, presented in (
+                ("unleased", None),
+                ("empty", ""),
+                ("displaced", stale),
+            ):
+                tab, sink = a_tab_with_a_sink(client, name)
+                client.send(tab, b"TYPED!", lease=presented)
+                sessionlib.wait_until(
+                    lambda sink=sink: sink.is_file() and sink.stat().st_size == 6,
+                    30.0,
+                    f"the child to receive the {name} write",
+                )
+                assert sink.read_bytes() == b"TYPED!", name
 
     env.stop_over_the_wire()
 

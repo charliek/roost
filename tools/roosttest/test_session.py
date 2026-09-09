@@ -1012,7 +1012,7 @@ def test_a_resume_across_a_takeover_replays_the_facts_and_none_of_the_effects(en
     over. And `session.driver_changed` is not replayable either — it is
     per-stream state, not a commit — so the resumed stream never sees
     one and finds out the way any client that missed the envelope does:
-    from its next lease-bearing op, which answers `taken-over`.
+    from its next *foreground* op, which answers `taken-over`.
     """
     started(env, ROOST_TEST_MODE="1")
 
@@ -1052,9 +1052,12 @@ def test_a_resume_across_a_takeover_replays_the_facts_and_none_of_the_effects(en
             assert "tab.effect" not in event_names(replayed), replayed
             assert resumed.driver_changes == [], resumed.driver_changes
 
+        # A *foreground* op, because that is the only kind a stale lease
+        # is still noticed on: `tab.write` takes no lease at all now
+        # (plan 057, R15).
         with env.client() as stale:
             with pytest.raises(RoostError) as refused:
-                stale.send(tab, "x", lease=lease)
+                stale.call("session.set_focus", {"lease": lease, "focused_tab_id": None})
             assert refused.value.code == "taken-over", refused.value
 
         phone.call("session.stop")

@@ -331,11 +331,12 @@ pub struct TabWriteParams {
     pub data: Vec<u8>,
     /// The driver lease minted by [`ops::SESSION_CONNECT`].
     ///
-    /// **Required on a session socket** — a write is an interactive
-    /// act and belongs to whoever holds the lease. On a UI socket the
-    /// key is accepted and ignored: that socket mints no leases, and
-    /// rejecting it would make one `roostctl` build unable to talk to
-    /// both.
+    /// **Accepted and ignored on every socket.** Raw input is open to
+    /// every same-UID client (plan 057, R15): the lease is the session's
+    /// *foreground*, not a write fence. The key stays on the wire so a
+    /// client that holds a lease sends byte-identical bytes to what it
+    /// always has — and so a session that predates `open_input` still
+    /// accepts them.
     ///
     /// Omitted when unset so a lease-less client's request is
     /// byte-identical to what it has always sent — an older server
@@ -1821,6 +1822,14 @@ pub struct AgentReportChangedEvent {
 /// [`SessionConnectParams::client_label`] and
 /// [`SessionIdentify::features`] ride along additively.
 ///
+/// R15 (plan 057) re-opened the write half **within** this generation:
+/// [`ops::TAB_WRITE`] and [`ops::TAB_ATTACH`] take no lease again. That
+/// is additive — a gate that stops refusing breaks no client — so the
+/// number stays `4` and the reversal is advertised as `open_input` in
+/// [`SESSION_FEATURES`]. A `4` session without that entry still answers
+/// `connect-required` to a leaseless write, which is why a client
+/// feature-detects instead of reading this number.
+///
 /// `3` (plan 047) adds [`ops::SESSION_PUT_FILE`] under that rule.
 ///
 /// `2` (plan 036, HS-1b) was a **breaking** bump from HS-1a's `1`:
@@ -1847,7 +1856,19 @@ pub const SESSION_PROTOCOL_VERSION: u32 = 4;
 /// every generation already serves, listed so a client can
 /// feature-detect them instead of probing for the `unknown-field` an
 /// older server answers.
-pub const SESSION_FEATURES: &[&str] = &["put_file", "events_resume", "tab_dump_scrollback"];
+///
+/// `open_input` is the third kind — a *rule* this session serves that a
+/// same-generation session may not. It promises three things:
+/// [`ops::TAB_WRITE`] and [`ops::TAB_ATTACH`] take no lease; a takeover
+/// preserves every control and data connection, moving only the
+/// foreground; and [`ops::TAB_ATTACH`] accepts a `focus` parameter (a
+/// client sends `focus: false` only to a session advertising this).
+pub const SESSION_FEATURES: &[&str] = &[
+    "put_file",
+    "events_resume",
+    "tab_dump_scrollback",
+    "open_input",
+];
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -2048,7 +2069,18 @@ pub struct SessionConnectResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabAttachParams {
-    pub lease: String,
+    /// The driver lease minted by [`ops::SESSION_CONNECT`], accepted and
+    /// ignored — an attach is raw input and takes no lease (plan 057,
+    /// R15). Present on the wire at all only because a client that holds
+    /// one has no reason to strip it, and a session that predates
+    /// `open_input` still requires it.
+    ///
+    /// Omitted when unset rather than sent as `null`: a session that
+    /// predates `open_input` decodes this key as a required `String`,
+    /// and `null` is not one — a client holding no lease would fail
+    /// every attach against it instead of only the ones it must.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
     #[serde(with = "string_int64")]
     pub tab_id: i64,
     pub kinds: Vec<AttachPayloadKind>,
@@ -2909,9 +2941,14 @@ pub mod ops {
     /// workspace, tear every PTY down, reply with the reap report, and
     /// only then run the process-level shutdown tail.
     pub const SESSION_STOP: &str = "session.stop";
-    /// Take the session's single interactive lease. Every lease-gated
-    /// op (`events.subscribe`, `tab.attach`) presents what this mints;
-    /// administrative ops stay lease-free. A lease lives until it is
+    /// Take the session's single interactive lease — the session's
+    /// *foreground*. Its holder is the one whose `session.set_focus`,
+    /// `session.set_theme`, `session.set_agent_hooks` and
+    /// `session.put_file` are accepted, and the one whose
+    /// `events.subscribe` stream is classified driver (so it receives
+    /// `tab.effect`) and named by `session.driver_changed`. Input is
+    /// not the lease's: `tab.write` and `tab.attach` take none. A lease
+    /// lives until it is
     /// replaced or the session stops — losing the connection does not
     /// release it, so a reconnecting client always arrives as a
     /// takeover.

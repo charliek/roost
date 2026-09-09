@@ -239,10 +239,11 @@ async fn attach_tab(
         stored_exit,
     } = attached;
 
-    // The fence is a round trip through the tab task, and a supersede or
-    // a takeover during it means this client lost authority before it
-    // ever saw a byte. Answering `accepted` now would hand it a stream
-    // it must not have.
+    // The fence is a round trip through the tab task, and a stop during
+    // it means there is no session left to stream from. Answering
+    // `accepted` now would hand this client a stream nothing will ever
+    // write to. (A takeover cannot land here: since R15 it closes no
+    // data connection.)
     if close.reason().is_some() {
         debug!(
             tab_id,
@@ -621,11 +622,12 @@ impl Pump {
         }
 
         let ending = 'pump: loop {
-            // 0. Whether this connection still has authority. Sticky and
-            //    checked first, ahead of every drain: a superseded or
-            //    taken-over client must stop receiving data — and lose
-            //    its input authority — within one pass, not whenever the
-            //    pump next happens to have nothing to do.
+            // 0. Whether this connection is still open. Sticky and
+            //    checked first, ahead of every drain: a client the
+            //    server has closed — a stop, today the only reason —
+            //    must stop receiving data, and stop writing input,
+            //    within one pass rather than whenever the pump next
+            //    happens to have nothing to do.
             if let Some(reason) = self.close.reason() {
                 break Ending::Closed(reason);
             }

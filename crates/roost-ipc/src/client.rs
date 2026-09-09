@@ -685,7 +685,10 @@ pub enum ServerCode {
     Desync,
     /// The client is not reading fast enough.
     Overflow,
-    /// A newer data connection took this tab.
+    /// A newer data connection took this tab. Only a **pre-R15** session
+    /// emits it — a tab admits any number of data connections now — and
+    /// the decode stays so a current client still maps an older
+    /// session's supersede onto a clean detach.
     Superseded,
     /// The client sent something the framing forbids.
     ProtocolError,

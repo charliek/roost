@@ -218,7 +218,7 @@ async fn attach(client: &mut IpcClient, lease: &str, tab_id: i64) -> TabAttachRe
 
 fn attach_params(lease: &str, tab_id: i64) -> TabAttachParams {
     TabAttachParams {
-        lease: lease.to_string(),
+        lease: Some(lease.to_string()),
         tab_id,
         kinds: vec![
             AttachPayloadKind::from("sixel-mosaic-v9"),
@@ -431,6 +431,30 @@ async fn feed(client: &mut IpcClient, tab_id: i64, data: Vec<u8>) {
         )
         .await
         .expect("tab.feed_pty_bytes");
+}
+
+/// Drain what the tab's PTY writer was handed until every marker has
+/// shown up, returning everything read. Test-mode capture, so what this
+/// proves is that the bytes crossed the forwarder into the writer.
+async fn read_pty_input_until(client: &mut IpcClient, tab_id: i64, markers: &[&[u8]]) -> Vec<u8> {
+    let deadline = Instant::now() + BUDGET;
+    let mut captured = Vec::new();
+    while !markers.iter().all(|marker| contains(&captured, marker)) {
+        assert!(Instant::now() < deadline, "the INPUT bytes never arrived");
+        let batch: TabCapturePtyInputResult = client
+            .call(
+                ops::TAB_CAPTURE_PTY_INPUT,
+                TabCapturePtyInputParams {
+                    tab_id: WireTabRef::Local(tab_id),
+                    drain: true,
+                },
+            )
+            .await
+            .expect("tab.capture_pty_input");
+        captured.extend_from_slice(&batch.data);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    captured
 }
 
 async fn dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
@@ -836,14 +860,6 @@ async fn the_control_op_refuses_what_cannot_be_served() {
         "invalid-param"
     );
 
-    let mut no_lease = attach_params("", tab_id);
-    no_lease.tab_id = tab_id;
-    assert_eq!(
-        attach_with(&mut client, no_lease).await.unwrap_err(),
-        "connect-required",
-        "the lease is checked before anything else"
-    );
-
     let mut missing_tab = attach_params(&lease, tab_id + 9_999);
     missing_tab.kinds = vec![AttachPayloadKind::from("sixel-mosaic-v9")];
     assert_eq!(
@@ -889,94 +905,160 @@ async fn an_oversized_frame_ends_the_connection() {
     assert!(data.next().await.is_none());
 }
 
-/// A second admitted handshake for the same tab takes it over; the first
-/// forwarder is told why rather than just going quiet.
+/// A tab admits as many data connections as are dialed (plan 057, R15):
+/// both see the same PTY output and both can type into it. Nothing is
+/// superseded — a second attach used to close the first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_attach_supersedes_the_first() {
+async fn two_attaches_to_one_tab_both_stream_and_both_type() {
     let h = harness().await;
     let (mut client, lease, tab_id) = h.leased_tab().await;
+
     let first = attach(&mut client, &lease, tab_id).await;
-    let (_accepted, mut old) = dial(&h.socket, handshake(&first.attach_token))
+    let (a_accepted, mut a) = dial(&h.socket, handshake(&first.attach_token))
         .await
         .expect("accepted");
-    old.read_snapshot().await;
+    let (_snapshot, pty) = a.read_snapshot().await;
+    let a_at = pty.last().map_or(a_accepted.seq, |(seq, _)| *seq);
 
     let second = attach(&mut client, &lease, tab_id).await;
-    let (_accepted, mut new) = dial(&h.socket, handshake(&second.attach_token))
+    let (b_accepted, mut b) = dial(&h.socket, handshake(&second.attach_token))
         .await
-        .expect("accepted");
+        .expect("the first attach is untouched and a second is admitted");
+    let (_snapshot, pty) = b.read_snapshot().await;
+    let b_at = pty.last().map_or(b_accepted.seq, |(seq, _)| *seq);
 
-    assert_eq!(error_of(&old.frame().await).code, "superseded");
-    assert!(old.next().await.is_none());
-    // The replacement is untouched and still streaming.
-    new.read_snapshot().await;
+    // One tee, two receivers: the same bytes reach both.
+    feed(&mut client, tab_id, b"ROOST_BOTH_SEE_THIS\r\n".to_vec()).await;
+    a.read_pty_until(a_at, b"ROOST_BOTH_SEE_THIS").await;
+    b.read_pty_until(b_at, b"ROOST_BOTH_SEE_THIS").await;
+
+    // And both write: the input side is open to every admitted
+    // connection, not to one of them.
+    a.send(FRAME_INPUT, b"ROOST_FROM_A").await;
+    b.send(FRAME_INPUT, b"ROOST_FROM_B").await;
+    let typed =
+        read_pty_input_until(&mut client, tab_id, &[b"ROOST_FROM_A", b"ROOST_FROM_B"]).await;
+    assert!(contains(&typed, b"ROOST_FROM_A") && contains(&typed, b"ROOST_FROM_B"));
 }
 
-/// A supersede that lands mid-snapshot has to end the stream where it
-/// is. The close watch is checked at the top of every pump pass, so the
-/// displaced client stops receiving within one pass rather than riding
-/// the rest of a multi-megabyte catch-up to EXIT.
+/// Dropping one attach leaves the others alone: the registry keeps a
+/// list per tab, and a forwarder unwinding removes only its own entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_supersede_mid_snapshot_ends_the_stream_with_an_error() {
-    // Wide and full: the encoded snapshot's size follows the characters
-    // the terminal holds, and this one has to be too big to hand over
-    // before the supersede lands.
-    const COLS: u32 = 1_000;
+async fn dropping_one_of_several_data_connections_removes_only_its_entry() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab_sized(COLS, 24).await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
 
-    let mut history = Vec::new();
-    for row in 0..2_100u32 {
-        history.extend_from_slice(format!("{row:.<998}\r\n").as_bytes());
+    let leaving = attach(&mut client, &lease, tab_id).await;
+    let (_accepted, mut going) = dial(&h.socket, handshake(&leaving.attach_token))
+        .await
+        .expect("accepted");
+    going.read_snapshot().await;
+
+    let staying = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(&h.socket, handshake(&staying.attach_token))
+        .await
+        .expect("accepted");
+    let (_snapshot, pty) = data.read_snapshot().await;
+    let at = pty.last().map_or(accepted.seq, |(seq, _)| *seq);
+
+    drop(going);
+
+    // Still streaming, and a stop still reaches it — which is the half
+    // that would break if the departing connection had taken the tab's
+    // whole entry with it.
+    feed(&mut client, tab_id, b"ROOST_STILL_HERE\r\n".to_vec()).await;
+    data.read_pty_until(at, b"ROOST_STILL_HERE").await;
+
+    let _report: SessionStopResult = client
+        .call(ops::SESSION_STOP, SessionStopParams {})
+        .await
+        .expect("session.stop");
+    assert_eq!(error_of(&data.frame().await).code, "shutting-down");
+}
+
+/// An attach takes no lease, so a session can be serving a data
+/// connection having never minted one — and a stop owes that connection
+/// the same labeled close as any other. The registry's own walk is what
+/// pins this: the closer used to be reachable only through the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_labels_a_data_connection_on_a_session_that_never_minted_a_lease() {
+    let h = harness().await;
+    let mut client = h.control().await;
+    let project = h
+        .workspace
+        .create_project("p", "/tmp")
+        .expect("create a project");
+    let opened: TabOpenResult = client
+        .call(
+            ops::TAB_OPEN,
+            TabOpenParams {
+                project_id: project.id,
+                cwd: "/tmp".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "exec cat".into()],
+                cols: 0,
+                rows: 0,
+                title: String::new(),
+            },
+        )
+        .await
+        .expect("tab.open");
+
+    let ticket = attach_with(
+        &mut client,
+        TabAttachParams {
+            lease: None,
+            ..attach_params("", opened.tab.id)
+        },
+    )
+    .await
+    .expect("an attach on a session with no lease at all");
+    let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
+    data.read_snapshot().await;
+
+    let _report: SessionStopResult = client
+        .call(ops::SESSION_STOP, SessionStopParams {})
+        .await
+        .expect("session.stop");
+
+    assert_eq!(error_of(&data.frame().await).code, "shutting-down");
+    assert!(data.next().await.is_none());
+}
+
+/// The lease is accepted and ignored on an attach: absent, empty, and a
+/// token this session has already displaced all negotiate a ticket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tab_attach_accepts_no_lease_an_empty_lease_and_a_stale_one() {
+    let h = harness().await;
+    let (mut client, stale, tab_id) = h.leased_tab().await;
+    let mut taker = h.control().await;
+    let _taken: SessionConnectResult = taker
+        .call(
+            ops::SESSION_CONNECT,
+            SessionConnectParams {
+                takeover: true,
+                client_label: None,
+            },
+        )
+        .await
+        .expect("session.connect with takeover");
+
+    for lease in [None, Some(String::new()), Some(stale.clone())] {
+        let ticket = attach_with(
+            &mut client,
+            TabAttachParams {
+                lease: lease.clone(),
+                ..attach_params("", tab_id)
+            },
+        )
+        .await
+        .unwrap_or_else(|code| panic!("attach refused {code} for lease={lease:?}"));
+        let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+            .await
+            .expect("accepted");
+        data.read_snapshot().await;
     }
-    history.extend_from_slice(b"ROOST_HISTORY_DONE\r\n");
-    feed(&mut client, tab_id, history).await;
-    wait_for_dump(&mut client, tab_id, "the scrollback to land", |d| {
-        d.rows_text
-            .iter()
-            .any(|row| row.contains("ROOST_HISTORY_DONE"))
-    })
-    .await;
-
-    let mut wide = attach_params(&lease, tab_id);
-    wide.cols = u16::try_from(COLS).unwrap();
-    let first = attach_with(&mut client, wide.clone())
-        .await
-        .expect("tab.attach");
-    let (_accepted, mut old) = dial(&h.socket, handshake(&first.attach_token))
-        .await
-        .expect("accepted");
-    // One frame only: the snapshot is deliberately left unfinished.
-    let mut seen = Vec::new();
-    let frame = old.frame().await;
-    assert_eq!(frame.frame_type, FRAME_SNAP);
-    seen.extend_from_slice(&frame.payload);
-
-    let second = attach_with(&mut client, wide).await.expect("tab.attach");
-    let (_accepted, mut new) = dial(&h.socket, handshake(&second.attach_token))
-        .await
-        .expect("accepted");
-
-    // Drain the displaced connection to its end. Whatever was already
-    // in flight may still arrive; what must not is EXIT, which would
-    // mean the forwarder kept working for a client that lost the tab.
-    let error = loop {
-        let frame = old.frame().await;
-        match frame.frame_type {
-            FRAME_SNAP => seen.extend_from_slice(&frame.payload),
-            FRAME_PTY => continue,
-            FRAME_ERROR => break error_of(&frame),
-            other => panic!("a superseded stream must not carry frame {other:#04x}"),
-        }
-    };
-    assert_eq!(error.code, "superseded");
-    assert!(
-        !has_tag(&seen, TAG_FINISH),
-        "the close has to land mid-snapshot or this test proves nothing"
-    );
-    assert!(old.next().await.is_none(), "the connection closes after it");
-    // The replacement is untouched and still streaming.
-    new.read_snapshot().await;
 }
 
 /// A megabyte injected through the session's own test-mode arm has to
@@ -1046,33 +1128,21 @@ async fn a_session_stop_labels_a_live_data_connection() {
     assert!(data.next().await.is_none());
 }
 
-/// A takeover invalidates the displaced lease's tickets, so it has to
-/// drop them too: they are refused at admission anyway, and leaving them
-/// in the registry would let a dead client's full quota lock the new
-/// holder out for a whole TTL.
+/// A ticket belongs to the connection that minted it, not to a lease
+/// (plan 057, R15): a takeover leaves every outstanding one usable, and
+/// what reclaims the quota is the minting connection going away.
+///
+/// The quota is the registry's bound, so it has to be reclaimable
+/// without waiting out a TTL — a client that mints all 16 and vanishes
+/// must not lock everyone else out for a minute.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_purges_the_displaced_leases_attach_tokens() {
+async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
     let h = harness().await;
     let (mut old_client, old_lease, tab_id) = h.leased_tab().await;
-
-    let mut minted = Vec::new();
-    for _ in 0..MAX_OUTSTANDING_TOKENS {
-        minted.push(
-            attach(&mut old_client, &old_lease, tab_id)
-                .await
-                .attach_token,
-        );
-    }
-    assert_eq!(
-        attach_with(&mut old_client, attach_params(&old_lease, tab_id))
-            .await
-            .unwrap_err(),
-        "too-many-tokens",
-        "the quota is what bounds the registry"
-    );
+    let survivor = attach(&mut old_client, &old_lease, tab_id).await;
 
     let mut new_client = h.control().await;
-    let taken: SessionConnectResult = new_client
+    let _taken: SessionConnectResult = new_client
         .call(
             ops::SESSION_CONNECT,
             SessionConnectParams {
@@ -1083,21 +1153,49 @@ async fn a_takeover_purges_the_displaced_leases_attach_tokens() {
         .await
         .expect("session.connect with takeover");
 
-    // Immediately, with no expiry to wait out: the point of the purge.
-    let ticket = attach(&mut new_client, &taken.lease, tab_id).await;
+    // The takeover took the foreground and nothing else: a ticket minted
+    // under the displaced lease still admits a data connection.
+    let (_accepted, mut data) = dial(&h.socket, handshake(&survivor.attach_token))
+        .await
+        .expect("a ticket minted before the takeover is still admissible");
+    data.read_snapshot().await;
 
-    // The displaced lease itself still answers `taken-over` — the
-    // instruction its holder can act on.
-    let mut stale = h.control().await;
+    // The quota is per session, and the displaced client — still
+    // attaching on its stale lease, which is accepted and ignored — can
+    // fill the whole of it.
+    let mut minted = Vec::new();
+    for _ in 0..MAX_OUTSTANDING_TOKENS {
+        minted.push(
+            attach(&mut old_client, &old_lease, tab_id)
+                .await
+                .attach_token,
+        );
+    }
     assert_eq!(
-        attach_with(&mut stale, attach_params(&old_lease, tab_id))
+        attach_with(&mut new_client, attach_params("", tab_id))
             .await
             .unwrap_err(),
-        "taken-over"
+        "too-many-tokens",
+        "the quota is what bounds the registry"
     );
-    // Its tickets are gone rather than merely unusable, so the handshake
-    // no longer recognizes them: `invalid-token` sends the client back
-    // for a new one, which is where it learns it was taken over.
+
+    // The connection that minted them goes away, and its tickets go with
+    // it — immediately, with no expiry to wait out.
+    drop(old_client);
+    let deadline = Instant::now() + BUDGET;
+    let ticket = loop {
+        match attach_with(&mut new_client, attach_params("", tab_id)).await {
+            Ok(ticket) => break ticket,
+            Err(code) => {
+                assert_eq!(code, "too-many-tokens");
+                assert!(
+                    Instant::now() < deadline,
+                    "the minting connection's tickets were never reclaimed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
     let error = dial(&h.socket, handshake(&minted[0]))
         .await
         .expect_err("a purged ticket is not admissible");
@@ -1105,7 +1203,7 @@ async fn a_takeover_purges_the_displaced_leases_attach_tokens() {
 
     let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
         .await
-        .expect("the new lease's own ticket is accepted");
+        .expect("the freshly minted ticket is accepted");
     data.read_snapshot().await;
 }
 

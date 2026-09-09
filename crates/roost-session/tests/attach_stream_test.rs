@@ -221,7 +221,7 @@ impl Session {
             .call(
                 ops::TAB_ATTACH,
                 TabAttachParams {
-                    lease: self.lease.clone(),
+                    lease: Some(self.lease.clone()),
                     tab_id,
                     kinds: vec![AttachPayloadKind::from(kind)],
                     cols,

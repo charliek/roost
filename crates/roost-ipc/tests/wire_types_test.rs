@@ -155,7 +155,7 @@ fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
         r#"{"app_version":"0.0.18","session_protocol":4,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
-        r#""features":["put_file","events_resume","tab_dump_scrollback"],"#,
+        r#""features":["put_file","events_resume","tab_dump_scrollback","open_input"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
         r#""started_at":"2026-08-27T14:03:11Z"}"#,
@@ -415,7 +415,7 @@ const EPOCH: u64 = 6_032_428_321_756_423_947;
 
 fn sample_attach_params() -> TabAttachParams {
     TabAttachParams {
-        lease: LEASE.into(),
+        lease: Some(LEASE.into()),
         tab_id: 5,
         kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
         cols: 120,
@@ -558,6 +558,22 @@ fn tab_attach_params_default_the_pixel_geometry_only() {
         r#"{"lease":"l","tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b"}"#
     )
     .is_err());
+}
+
+/// The lease is accepted and ignored, so a client that holds none omits
+/// the key entirely — `null` is not what a pre-`open_input` session,
+/// which decodes it as a required `String`, can read.
+#[test]
+fn tab_attach_params_omit_an_absent_lease() {
+    let decoded: TabAttachParams = serde_json::from_str(
+        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b"}"#,
+    )
+    .expect("an attach with no lease at all decodes");
+    assert_eq!(decoded.lease, None);
+    assert_eq!(
+        serde_json::to_string(&decoded).unwrap(),
+        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"libghostty_build":"b"}"#
+    );
 }
 
 #[test]

@@ -14,6 +14,7 @@ use roost_engine::{PtyOutputEvent, PtySupervisor, Workspace};
 use roost_ipc::messages::{bytes_base64, ops, SessionIdentify, SessionStopResult, TabOpenResult};
 use roost_ipc::{ConnAction, ConnCtx, Handler, HandlerError, HandlerOutcome};
 use tempfile::TempDir;
+use tokio::sync::broadcast;
 
 const SESSION_ID: &str = "01K3S8TQ4F0Q9YB2K6WZ5D7XN";
 const STARTED_AT: &str = "2026-08-27T14:03:11Z";
@@ -526,79 +527,122 @@ async fn open_tab_reporting_size(
     (cols, rows)
 }
 
-/// A write is an interactive act, so on a session socket it is the
-/// lease holder's. The UI-socket half of this rule — a leaseless write
-/// still lands — is pinned in
-/// `a_ui_socket_does_not_know_the_session_ops`.
+/// Raw input is open to every same-UID client (plan 057, R15): a write
+/// on a session socket takes no lease, and a presented one is accepted
+/// and ignored the way a UI socket has always accepted it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_session_socket_refuses_an_unleased_tab_write() {
+async fn a_session_socket_accepts_an_unleased_tab_write() {
     let f = fixture(true);
-    let project = f.workspace.ensure_default_project("/tmp");
-    let opened: TabOpenResult = serde_json::from_value(reply(
+    let stale = connect(&f, &conn(1)).await;
+    // Displaced, so the third variant below is a lease this session
+    // actively remembers as dead rather than one it never issued.
+    connect_with(&f, &conn(2), true).await;
+
+    // Each variant gets its own tab and its own six-byte sink: `dd`
+    // exits after the first delivery, so one shared sink could only ever
+    // prove the first write landed.
+    for lease in [None, Some(""), Some(stale.as_str())] {
+        let (tab_id, mut output) = a_tab_reading_six_bytes(&f).await;
         call(
             &f.handler,
-            ops::TAB_OPEN,
-            tab_open_params(project, &["/bin/sh", "-c", "sleep 30"], None),
-        )
-        .await
-        .expect("tab.open"),
-    ))
-    .unwrap();
-
-    for lease in [None, Some("")] {
-        let err = call(
-            &f.handler,
             ops::TAB_WRITE,
-            tab_write_params(opened.tab.id, b"x", lease),
+            tab_write_params(tab_id, b"TYPED!", lease),
         )
         .await
-        .expect_err("an unleased session write must be refused");
-        assert_eq!(err.code, "connect-required", "lease={lease:?}");
+        .unwrap_or_else(|e| panic!("an unleased session write must land (lease={lease:?}): {e:?}"));
+        read_until(&mut output, b"TYPED!", &format!("lease={lease:?}")).await;
     }
 }
 
-/// Takeover is an **admission boundary**, not a write fence: the lease
-/// check linearizes before or after it, and a write admitted just
-/// before one may still enqueue afterwards. What is pinned is the gate
-/// — after the takeover the old lease buys nothing and the new one is
-/// the whole authority.
+/// The lease is the **foreground**, not a write fence: after a takeover
+/// both leases still write, and what tells them apart is a foreground
+/// op — `session.set_focus`, which only the live lease may state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_taken_over_lease_cannot_write_and_the_new_one_can() {
+async fn a_taken_over_lease_still_writes_and_only_the_new_one_is_the_foreground() {
     let f = fixture(true);
     let first = conn(1);
     let second = conn(2);
     let old = connect(&f, &first).await;
+
+    let new = connect_with(&f, &second, true).await;
+    assert_ne!(old, new);
+
+    for lease in [&old, &new] {
+        let (tab_id, mut output) = a_tab_reading_six_bytes(&f).await;
+        call(
+            &f.handler,
+            ops::TAB_WRITE,
+            tab_write_params(tab_id, b"TYPED!", Some(lease)),
+        )
+        .await
+        .expect("both leases write");
+        read_until(&mut output, b"TYPED!", "a write on either lease").await;
+    }
+
+    let err = f
+        .handler
+        .handle(
+            &first,
+            ops::SESSION_SET_FOCUS,
+            serde_json::json!({"lease": old, "focused_tab_id": null}),
+        )
+        .await
+        .expect_err("the displaced lease is not the foreground");
+    assert_eq!(err.code, "taken-over");
+    f.handler
+        .handle(
+            &second,
+            ops::SESSION_SET_FOCUS,
+            serde_json::json!({"lease": new, "focused_tab_id": null}),
+        )
+        .await
+        .expect("the live lease is");
+}
+
+/// A tab parked on `dd`, which copies exactly six bytes back out and
+/// exits — so what the assertion reads is what the PTY actually
+/// received, not what the workspace recorded.
+async fn a_tab_reading_six_bytes(f: &Fixture) -> (i64, broadcast::Receiver<PtyOutputEvent>) {
     let project = f.workspace.ensure_default_project("/tmp");
     let opened: TabOpenResult = serde_json::from_value(reply(
         call(
             &f.handler,
             ops::TAB_OPEN,
-            tab_open_params(project, &["/bin/sh", "-c", "sleep 30"], None),
+            tab_open_params(project, &["/bin/sh", "-c", "exec dd bs=6 count=1"], None),
         )
         .await
         .expect("tab.open"),
     ))
     .unwrap();
+    let output = f
+        .supervisor
+        .take_initial_receiver(opened.tab.id)
+        .expect("initial receiver");
+    (opened.tab.id, output)
+}
 
-    let new = connect_with(&f, &second, true).await;
-    assert_ne!(old, new);
-
-    let err = call(
-        &f.handler,
-        ops::TAB_WRITE,
-        tab_write_params(opened.tab.id, b"x", Some(&old)),
-    )
-    .await
-    .expect_err("the displaced lease must not write");
-    assert_eq!(err.code, "taken-over");
-
-    call(
-        &f.handler,
-        ops::TAB_WRITE,
-        tab_write_params(opened.tab.id, b"x", Some(&new)),
-    )
-    .await
-    .expect("the live lease writes");
+/// Read the tab's output until `marker` shows up, or fail `what`.
+async fn read_until(output: &mut broadcast::Receiver<PtyOutputEvent>, marker: &[u8], what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut collected = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "{what}: the bytes never came back");
+        match tokio::time::timeout(remaining, output.recv()).await {
+            Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => collected.extend_from_slice(&data),
+            Ok(Ok(PtyOutputEvent::Exit { .. })) => {
+                panic!("{what}: the tab exited before the bytes came back")
+            }
+            Ok(Err(e)) => panic!("{what}: output channel: {e}"),
+            Err(_) => panic!("{what}: the bytes never came back"),
+        }
+        if collected
+            .windows(marker.len())
+            .any(|window| window == marker)
+        {
+            return;
+        }
+    }
 }
 
 /// The latch is what gates; nothing else about the handler is stateful,

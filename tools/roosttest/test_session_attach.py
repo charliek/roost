@@ -304,28 +304,28 @@ def pty_payload(frames) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# 1. Leases: takeover closes everything the old client held
+# 1. Leases: a takeover moves the foreground and closes nothing
 # ---------------------------------------------------------------------------
 
 
-def test_a_takeover_closes_the_old_lease_but_demotes_its_stream(env):
-    """One takeover, four consequences — and one deliberate survivor.
+def test_a_takeover_moves_the_foreground_and_closes_nothing(env):
+    """One takeover, and the only thing it moves is the foreground.
 
-    The lease is what makes a host session single-driver, so the
-    interesting assertion is that the old client loses every foothold
-    that *writes*: its control connection and its live data connection.
-    A client left holding either would still believe it drives the
-    session.
+    Raw input is open to every same-UID client (plan 057, R15), so the
+    displaced client loses nothing it was using to work: its control
+    connection still answers, and its data connection still streams the
+    tab's output. What it loses is the foreground — the settings ops, the
+    focus, and its stream's driver classification.
 
-    Its **event stream is the exception** (plan 049 §3.8). Reading is
-    not authority, so the stream is demoted rather than cut: it gets one
+    The **stream is demoted, not cut** (plan 049 §3.8): it gets one
     non-terminal `session.driver_changed` naming whoever claimed the
     lease, and it keeps delivering after it. A deposed window that lost
     its stream would go blind about the session it is still showing.
 
-    The tombstone is the fourth: an op presenting the dead lease is told
-    `taken-over` (someone else has it) rather than `connect-required`
-    (you never connected), because those instruct differently.
+    The tombstone is the last: a *foreground* op presenting the dead
+    lease is told `taken-over` (someone else has it) rather than
+    `connect-required` (you never connected), because those instruct
+    differently.
     """
     started(env)
 
@@ -344,12 +344,18 @@ def test_a_takeover_closes_the_old_lease_but_demotes_its_stream(env):
     new_lease = connect_lease(new, takeover=True, label="  a phone\n  ")
     assert len(new_lease) == 32
 
-    # The data connection is told why it ended. EOF is the contract's
-    # fallback only where the peer had stopped reading; this one is
-    # draining, so the label is required.
-    ending = conn.drain_to_close(timeout=30.0)
-    assert ending.kind == "error", ending
-    assert ending.code == "taken-over", ending
+    # The data connection is untouched: it is still on the tab's tee, so
+    # output produced after the takeover reaches it.
+    marker = b"ROOST_AFTER_THE_TAKEOVER"
+    new.tab_feed_pty_bytes(tab, marker + b"\r\n")
+    seen = bytearray()
+
+    def landed(frame) -> bool:
+        if frame.frame_type == dataplane.FRAME_PTY:
+            seen.extend(frame.pty()[1])
+        return marker in bytes(seen)
+
+    conn.read_frames_until(landed, timeout=30.0, what="the post-takeover PTY bytes")
     conn.close()
 
     # The event stream is told, not cut — and the label the claimant
@@ -364,15 +370,19 @@ def test_a_takeover_closes_the_old_lease_but_demotes_its_stream(env):
     assert int(opened["data"]["tab"]["id"]) == watched
     stream.close()
 
-    # And the connection that ran the original `session.connect` is gone.
-    with pytest.raises((RoostError, OSError)):
-        old.call("tab.list")
+    # And the connection that ran the original `session.connect` is still
+    # there, still serving everything that is not the foreground.
+    assert old.call("tab.list")["projects"]
     old.close()
 
-    # The dead lease is tombstoned, not forgotten.
+    # The dead lease is tombstoned, not forgotten. Read through a
+    # foreground op: `tab.attach` takes no lease any more, so it is no
+    # longer the place a stale one is noticed.
     with env.client() as stale:
         with pytest.raises(RoostError) as refused:
-            attach_ticket(stale, old_lease, tab)
+            stale.call(
+                "session.set_focus", {"lease": old_lease, "focused_tab_id": None}
+            )
         assert refused.value.code == "taken-over", refused.value
 
     # A lease outlives its holder's connection: dropping `new` releases
@@ -1481,35 +1491,37 @@ def test_eight_concurrent_attaches_to_distinct_tabs_reach_ready(env):
 
         # Minted up front so the measured window is the data plane alone
         # and eight threads do not contend on one control connection.
+        # The connection stays open across the dials: a ticket is
+        # reclaimed when the connection that minted it closes.
         tickets = [attach_ticket(client, lease, tab) for tab in tabs]
 
-    elapsed: dict[int, float] = {}
-    failures: list[Exception] = []
-    barrier = threading.Barrier(len(tickets))
+        elapsed: dict[int, float] = {}
+        failures: list[Exception] = []
+        barrier = threading.Barrier(len(tickets))
 
-    def run(index: int, ticket: dict) -> None:
-        conn = DataPlane(env.socket)
-        try:
-            barrier.wait(timeout=scaled_timeout(30.0))
-            started_at = time.monotonic()
-            reply = conn.handshake(ticket["attach_token"])
-            assert reply.ok, (reply.code, reply.message)
-            conn.read_until_ready(timeout=60.0)
-            elapsed[index] = time.monotonic() - started_at
-        except Exception as error:  # noqa: BLE001 — re-raised on the main thread
-            failures.append(error)
-        finally:
-            conn.close()
+        def run(index: int, ticket: dict) -> None:
+            conn = DataPlane(env.socket)
+            try:
+                barrier.wait(timeout=scaled_timeout(30.0))
+                started_at = time.monotonic()
+                reply = conn.handshake(ticket["attach_token"])
+                assert reply.ok, (reply.code, reply.message)
+                conn.read_until_ready(timeout=60.0)
+                elapsed[index] = time.monotonic() - started_at
+            except Exception as error:  # noqa: BLE001 — re-raised on the main thread
+                failures.append(error)
+            finally:
+                conn.close()
 
-    threads = [
-        threading.Thread(target=run, args=(index, ticket))
-        for index, ticket in enumerate(tickets)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=scaled_timeout(120.0))
-        assert not thread.is_alive(), "a concurrent attach never finished"
+        threads = [
+            threading.Thread(target=run, args=(index, ticket))
+            for index, ticket in enumerate(tickets)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=scaled_timeout(120.0))
+            assert not thread.is_alive(), "a concurrent attach never finished"
 
     assert not failures, failures
     assert len(elapsed) == len(tickets), elapsed

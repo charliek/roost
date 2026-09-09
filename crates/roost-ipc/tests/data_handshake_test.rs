@@ -557,7 +557,7 @@ async fn closing_a_data_connection_ends_it_even_when_the_handler_ignores_the_wat
         serde_json::json!(true)
     );
 
-    served.closer().await.close(CloseReason::Superseded);
+    served.closer().await.close(CloseReason::TakenOver);
     let eof = tokio::time::timeout(TIMEOUT, reader.read_line())
         .await
         .expect("the server ends the connection within the close deadline")

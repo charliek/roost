@@ -1110,13 +1110,14 @@ fn is_layout_hostile(c: char) -> bool {
 
 /// One live `events.subscribe` stream.
 ///
-/// Streams are registered **here and never under [`Lease::conns`]**
-/// (plan 049 §3.7). The takeover closer loop walks that list, and a
-/// stream it closed is a stream it can no longer reclassify — so the two
-/// kinds of connection are kept apart structurally rather than by
-/// remembering to skip one. What a takeover does to a control or data
-/// connection is close it; what it does to a stream is demote it and
-/// tell it who took over.
+/// Streams are registered **here and never under [`ClientRegistry::controls`]**
+/// (plan 049 §3.7), because the two kinds are handled differently at
+/// both events that reach them: a stop closes a stream and only then
+/// aborts its relay, and a takeover demotes a stream and tells it who
+/// took over rather than touching it. Keeping them in separate lists is
+/// what makes that structural instead of a branch somebody has to
+/// remember. Since R15 (plan 057) a takeover touches no control or data
+/// connection either.
 struct Observer {
     conn_id: u64,
     closer: ConnCloser,
@@ -1160,10 +1161,20 @@ impl Observer {
     }
 }
 
-/// The lease registry. Bounded by construction: one live lease, one
-/// tombstone, one entry per live connection under the lease, one entry
-/// per live event stream, at most [`MAX_OUTSTANDING_TOKENS`] unconsumed
-/// tokens, and one live data connection per tab.
+/// The client registry: one live lease, one tombstone, one entry per
+/// live control connection, one entry per live event stream, at most
+/// [`MAX_OUTSTANDING_TOKENS`] unconsumed tokens, and **every** live data
+/// connection per tab.
+///
+/// Data connections are not bounded by construction any more (plan 057,
+/// R15): a tab admits as many as clients dial. What bounds them is the
+/// token quota — [`MAX_OUTSTANDING_TOKENS`] tickets per TTL window — and
+/// the tab task's `MAX_CONCURRENT_SNAPSHOTS` simultaneous fences (named
+/// rather than linked: that module is `server-vt`-gated and this one is
+/// not); over time the count is open. That is affordable because nothing is
+/// shared between forwarders: each takes its own broadcast receiver,
+/// fence and budgets, so a reader that falls behind is cut on its own
+/// lag and takes nobody with it.
 struct ClientRegistry {
     current: Option<Lease>,
     /// The most recently invalidated lease token, kept only so its
@@ -1175,10 +1186,19 @@ struct ClientRegistry {
     /// Attach tickets handed out but not yet presented on a data
     /// connection.
     tokens: Vec<AttachToken>,
-    /// The live data connection per tab id, so a second admitted
-    /// handshake for the same tab can supersede the first rather than
-    /// leaving two forwarders racing one tee.
-    data_conns: std::collections::HashMap<i64, (u64, ConnCloser)>,
+    /// Every live control connection, keyed by conn id.
+    ///
+    /// **The authority for closing**, held independently of any lease.
+    /// A takeover closes nothing, so the connections a displaced lease
+    /// was held on outlive it — and a stop must still be able to hand
+    /// each of them the labeled `shutting-down` close. [`Lease::conns`]
+    /// is membership for the focus bookkeeping and nothing else.
+    controls: std::collections::HashMap<u64, ConnCloser>,
+    /// Every live data connection, by tab id. Kept so a stop can close
+    /// them and so a forwarder unwinding can drop its own entry — no
+    /// supersede, no bound: a tab serves as many attaches as clients
+    /// dial.
+    data_conns: std::collections::HashMap<i64, Vec<(u64, ConnCloser)>>,
     /// Which connection's `session.set_focus` the workspace is currently
     /// holding, if any.
     ///
@@ -1206,6 +1226,7 @@ impl Default for ClientRegistry {
             current: None,
             tombstone: None,
             tokens: Vec::new(),
+            controls: std::collections::HashMap::new(),
             data_conns: std::collections::HashMap::new(),
             focus_conn: None,
             observers: Some(Vec::new()),
@@ -1213,9 +1234,10 @@ impl Default for ClientRegistry {
     }
 }
 
-/// One single-use attach ticket. Bound to the lease that minted it and
-/// to the exact tab pipeline it describes, so a takeover or a respawn
-/// between `tab.attach` and the handshake cannot be papered over.
+/// One single-use attach ticket. Bound to the exact tab pipeline it
+/// describes, so a respawn between `tab.attach` and the handshake cannot
+/// be papered over, and to the connection that minted it — which is what
+/// bounds the quota (see [`AttachToken::minted_by`]).
 ///
 /// Read only by the `server-vt` attach path; a default build (a UI
 /// binary built without `roost-session` in its graph) compiles the
@@ -1223,7 +1245,16 @@ impl Default for ClientRegistry {
 #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
 struct AttachToken {
     token: String,
-    lease: String,
+    /// The control connection that asked for this ticket.
+    ///
+    /// A ticket is authority, and authority nobody can revoke is a leak:
+    /// a client that mints the full [`MAX_OUTSTANDING_TOKENS`] quota and
+    /// vanishes would otherwise hold it against everyone else for a
+    /// whole TTL. `forget_connection` purges on this field, which is the
+    /// connection-scoped replacement for the lease-scoped purge a
+    /// takeover used to do — takeovers no longer invalidate tickets,
+    /// because an attach takes no lease.
+    minted_by: u64,
     tab_id: i64,
     tab_generation: u64,
     /// What `tab.attach` negotiated. Carried on the ticket because the
@@ -1246,7 +1277,11 @@ pub(crate) struct AdmittedAttach {
 
 struct Lease {
     token: String,
-    conns: Vec<(u64, ConnCloser)>,
+    /// Which connections have presented this lease — membership only.
+    /// The closers live in [`ClientRegistry::controls`], which outlives
+    /// the lease; this list exists so `forget_connection` can tell that
+    /// the holder has no connections left and retire its focus.
+    conns: Vec<u64>,
     /// What the claimant said it was, normalized. Never authenticated —
     /// it exists so a deposed client's banner can name whoever took the
     /// session, and it travels no further than
@@ -1269,16 +1304,17 @@ enum LeaseStatus {
 impl ClientRegistry {
     /// Mint a lease for `ctx`, or refuse.
     ///
-    /// `takeover` is what makes this destructive: the previous lease is
-    /// invalidated and every *control and data* connection it was held
-    /// on is closed — except the requester's, which is the one being
-    /// answered on.
+    /// `takeover` moves the **foreground** and nothing else (plan 057,
+    /// R15): the previous lease is invalidated and tombstoned, so its
+    /// holder's foreground ops answer `taken-over`, but no connection is
+    /// closed and no attach ticket is revoked. The displaced client
+    /// keeps typing, keeps attaching, keeps reading.
     ///
-    /// Event streams are the exception, and the whole of plan 049 §3.8:
-    /// they survive, and instead of a close they get one
-    /// `session.driver_changed` naming the claimant. The demotion and
-    /// the injection happen here, under the registry lock delivery also
-    /// classifies under — which is what makes "no `tab.effect` after
+    /// Event streams get the one thing a takeover does emit, which is
+    /// the whole of plan 049 §3.8: `session.driver_changed` naming the
+    /// claimant, plus a demotion of the displaced driver's stream. Both
+    /// happen here, under the registry lock delivery also classifies
+    /// under — which is what makes "no `tab.effect` after
     /// `session.driver_changed` on one stream" an invariant rather than
     /// a race.
     fn connect(
@@ -1299,18 +1335,6 @@ impl ClientRegistry {
         }
         let mut displaced = None;
         if let Some(previous) = self.current.take() {
-            for (conn_id, closer) in previous.conns {
-                if conn_id != ctx.conn_id {
-                    closer.close(CloseReason::TakenOver);
-                }
-            }
-            // Tickets minted under the displaced lease die with it —
-            // `admit_attach` would refuse them at the lease re-check
-            // anyway. Purged in the SAME critical section as the
-            // takeover, because leaving them would let a dead client's
-            // 16 outstanding tokens hold the whole quota against the new
-            // holder for a full TTL.
-            self.tokens.retain(|token| token.lease != previous.token);
             self.tombstone = Some(previous.token.clone());
             displaced = Some((previous.token, previous.label));
         }
@@ -1319,9 +1343,10 @@ impl ClientRegistry {
         self.focus_conn = None;
         let token = random_hex_128();
         let taken_by = label.clone().unwrap_or_else(|| UNKNOWN_CLIENT.to_string());
+        self.register_control(ctx);
         self.current = Some(Lease {
             token: token.clone(),
-            conns: vec![(ctx.conn_id, ctx.closer.clone())],
+            conns: vec![ctx.conn_id],
             label,
         });
         if let Some((displaced, from)) = displaced {
@@ -1465,22 +1490,46 @@ impl ClientRegistry {
     /// Resolve a presented lease, registering the presenting connection
     /// when it is the live one.
     fn present(&mut self, lease: &str, ctx: &ConnCtx) -> LeaseStatus {
-        if let Some(current) = self.current.as_mut() {
-            if !lease.is_empty() && current.token == lease {
-                // Pruned here, as in `forget_connection`: a client that
-                // reconnects repeatedly on the same lease would
-                // otherwise accumulate an entry per dead connection.
-                current.conns.retain(|(_, closer)| !closer.is_closed());
-                if !current.conns.iter().any(|(id, _)| *id == ctx.conn_id) {
-                    current.conns.push((ctx.conn_id, ctx.closer.clone()));
-                }
-                return LeaseStatus::Current;
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| !lease.is_empty() && current.token == lease)
+        {
+            self.register_control(ctx);
+            let controls = &self.controls;
+            let current = self
+                .current
+                .as_mut()
+                .expect("the live lease was just matched under this lock");
+            // Pruned here, as in `forget_connection`: a client that
+            // reconnects repeatedly on the same lease would otherwise
+            // accumulate a member id per dead connection.
+            current.conns.retain(|id| controls.contains_key(id));
+            if !current.conns.contains(&ctx.conn_id) {
+                current.conns.push(ctx.conn_id);
             }
+            return LeaseStatus::Current;
         }
         if !lease.is_empty() && self.tombstone.as_deref() == Some(lease) {
             return LeaseStatus::TakenOver;
         }
         LeaseStatus::Unknown
+    }
+
+    /// Track a control connection's closer, independently of whatever
+    /// authority it just presented.
+    ///
+    /// [`ClientRegistry::controls`] is the authority for closing and
+    /// [`Lease::conns`] is membership for the focus, which is why the
+    /// registration is here and not on the lease: a connection admitted
+    /// under a lease that is later taken over keeps being closable, and
+    /// a stop still owes it a labeled goodbye.
+    ///
+    /// Closed peers are pruned on the way in, the way this list is
+    /// walked: only on a registration, a close, and a stop.
+    fn register_control(&mut self, ctx: &ConnCtx) {
+        self.controls.retain(|_, closer| !closer.is_closed());
+        self.controls.insert(ctx.conn_id, ctx.closer.clone());
     }
 
     /// Record who the workspace's current focus belongs to. `false`
@@ -1489,8 +1538,8 @@ impl ClientRegistry {
         self.focus_conn = focused.then_some(conn_id);
     }
 
-    /// Drop one connection from the live lease, reporting whether the
-    /// focus the workspace holds went with it.
+    /// Forget one connection, reporting whether the focus the workspace
+    /// holds went with it.
     ///
     /// Either edge counts: the connection that *stated* the focus is
     /// gone, or the holder has no connections left at all. The first is
@@ -1501,21 +1550,30 @@ impl ClientRegistry {
     /// Closed peers are pruned on the way through, like [`Self::present`]
     /// does: a client that dropped two connections at once must not
     /// leave the second one standing in for a holder that is gone.
-    fn forget_connection(&mut self, conn_id: u64) -> bool {
-        // Ahead of the lease's own bookkeeping and outside it: a stream
-        // can exist on a session that never minted a lease at all, so
-        // pruning it must not sit under an early return that asks about
-        // one.
+    fn forget_connection(&mut self, conn_id: u64, reclaim_tokens: bool) -> bool {
+        // Ahead of the lease's own bookkeeping and outside it: a stream,
+        // a control connection or an attach ticket can exist on a
+        // session that never minted a lease at all, so none of these may
+        // sit under an early return that asks about one.
         if let Some(observers) = self.observers.as_mut() {
             observers.retain(|observer| observer.conn_id != conn_id && observer.is_live());
         }
+        self.controls.remove(&conn_id);
+        self.controls.retain(|_, closer| !closer.is_closed());
+        // See [`AttachToken::minted_by`]: a client that minted the whole
+        // quota and vanished must not hold it against everyone else
+        // until the tickets time out.
+        if reclaim_tokens {
+            self.tokens.retain(|token| token.minted_by != conn_id);
+        }
+        let controls = &self.controls;
         let Some(current) = self.current.as_mut() else {
             return false;
         };
         let held = !current.conns.is_empty();
         current
             .conns
-            .retain(|(id, closer)| *id != conn_id && !closer.is_closed());
+            .retain(|id| *id != conn_id && controls.contains_key(id));
         let lost = self.focus_conn == Some(conn_id) || (held && current.conns.is_empty());
         if lost {
             self.focus_conn = None;
@@ -1528,8 +1586,19 @@ impl ClientRegistry {
     /// keeping it means a late op is refused as `shutting-down` rather
     /// than as a lease problem it cannot fix.
     fn close_all(&mut self, reason: CloseReason) {
+        for (_, closer) in self.controls.drain() {
+            closer.close(reason);
+        }
         if let Some(current) = self.current.as_mut() {
-            for (_, closer) in current.conns.drain(..) {
+            // Membership only; the closers were in `controls` above.
+            current.conns.clear();
+        }
+        // Walked in its own right, not as a side effect of the lease's
+        // list: a data connection is admitted by a ticket, not by a
+        // lease, so a session that never minted one can still have
+        // several — and each is owed the same labeled close.
+        for (_, conns) in self.data_conns.drain() {
+            for (_, closer) in conns {
                 closer.close(reason);
             }
         }
@@ -1540,10 +1609,6 @@ impl ClientRegistry {
         for observer in self.observers.iter().flatten() {
             observer.closer.close(reason);
         }
-        // Their closers were in the list above, so this only drops the
-        // per-tab index — but leaving it would keep an entry alive per
-        // tab that ever attached.
-        self.data_conns.clear();
         // The tokens deliberately stay. `admit_attach`'s stop latch is
         // what refuses them, and it can only say `shutting-down` about a
         // ticket it can still recognize; dropping them here would send a
@@ -1560,7 +1625,7 @@ impl ClientRegistry {
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn mint_token(
         &mut self,
-        lease: &str,
+        minted_by: u64,
         tab_id: i64,
         tab_generation: u64,
         kind: AttachPayloadKind,
@@ -1568,19 +1633,6 @@ impl ClientRegistry {
     ) -> Result<String, HandlerError> {
         let now = std::time::Instant::now();
         self.tokens.retain(|t| t.expires_at > now);
-        // The lease is re-checked here because minting and the
-        // `require_lease` that preceded it are two acquisitions of this
-        // lock; a takeover in between must not leave a ticket behind
-        // that outlives the authority it was issued under.
-        match self.current.as_ref() {
-            Some(current) if !lease.is_empty() && current.token == lease => {}
-            _ => {
-                return Err(HandlerError::new(
-                    "taken-over",
-                    "this lease was taken over by another client",
-                ))
-            }
-        }
         if self.tokens.len() >= MAX_OUTSTANDING_TOKENS {
             return Err(HandlerError::new(
                 "too-many-tokens",
@@ -1593,7 +1645,7 @@ impl ClientRegistry {
         let token = random_hex_128();
         self.tokens.push(AttachToken {
             token: token.clone(),
-            lease: lease.to_string(),
+            minted_by,
             tab_id,
             tab_generation,
             kind,
@@ -1602,14 +1654,14 @@ impl ClientRegistry {
         Ok(token)
     }
 
-    /// Consume a token and register `ctx` as the tab's data connection.
+    /// Consume a token and register `ctx` among the tab's data
+    /// connections.
     ///
-    /// The whole admission is one step under one lock — consume, lease
-    /// re-check, stop latch, register, supersede — so two connections
-    /// presenting the same token produce exactly one forwarder, and a
-    /// takeover either wholly precedes this or wholly follows it.
+    /// The whole admission is one step under one lock — consume, stop
+    /// latch, register — so two connections presenting the same token
+    /// produce exactly one forwarder.
     ///
-    /// The order of the three refusals is the contract, not an accident:
+    /// The order of the two refusals is the contract, not an accident:
     /// each names a different thing for the client to fix, so a token
     /// this session never issued must answer `invalid-token` even during
     /// a stop — telling such a client `shutting-down` would send it
@@ -1620,7 +1672,7 @@ impl ClientRegistry {
         token: &str,
         ctx: &ConnCtx,
         stopping: bool,
-    ) -> Result<(AdmittedAttach, Option<ConnCloser>), HandlerError> {
+    ) -> Result<AdmittedAttach, HandlerError> {
         let now = std::time::Instant::now();
         self.tokens.retain(|t| t.expires_at > now);
         let Some(index) = self.tokens.iter().position(|t| t.token == token) else {
@@ -1630,16 +1682,6 @@ impl ClientRegistry {
             ));
         };
         let ticket = self.tokens.remove(index);
-        if !self
-            .current
-            .as_ref()
-            .is_some_and(|current| current.token == ticket.lease)
-        {
-            return Err(HandlerError::new(
-                "taken-over",
-                "the lease this attach token was minted under is no longer current",
-            ));
-        }
         // Checked only once the ticket is known good, and still under
         // this lock: the stop latches first and sweeps this registry
         // second, so a data connection admitted past the latch but
@@ -1647,40 +1689,28 @@ impl ClientRegistry {
         if stopping {
             return Err(shutting_down());
         }
-        let live = self
-            .current
-            .as_mut()
-            .expect("the lease was just confirmed current under this lock");
-        live.conns.retain(|(_, closer)| !closer.is_closed());
-        if !live.conns.iter().any(|(id, _)| *id == ctx.conn_id) {
-            live.conns.push((ctx.conn_id, ctx.closer.clone()));
-        }
-        let displaced = self
-            .data_conns
-            .insert(ticket.tab_id, (ctx.conn_id, ctx.closer.clone()))
-            .filter(|(conn_id, _)| *conn_id != ctx.conn_id)
-            .map(|(_, closer)| closer);
-        Ok((
-            AdmittedAttach {
-                tab_id: ticket.tab_id,
-                tab_generation: ticket.tab_generation,
-                kind: ticket.kind,
-            },
-            displaced,
-        ))
+        let conns = self.data_conns.entry(ticket.tab_id).or_default();
+        conns.retain(|(id, closer)| *id != ctx.conn_id && !closer.is_closed());
+        conns.push((ctx.conn_id, ctx.closer.clone()));
+        Ok(AdmittedAttach {
+            tab_id: ticket.tab_id,
+            tab_generation: ticket.tab_generation,
+            kind: ticket.kind,
+        })
     }
 
-    /// Drop a tab's data-connection entry, but only if it is still the
-    /// one this connection registered — a superseded forwarder unwinding
-    /// after its replacement registered must not evict it.
+    /// Drop this connection's entry from a tab's data connections, and
+    /// the tab's list with it once nothing is attached — the index must
+    /// not keep an entry alive per tab that ever attached.
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn release_data_conn(&mut self, tab_id: i64, conn_id: u64) {
-        if self
-            .data_conns
-            .get(&tab_id)
-            .is_some_and(|(id, _)| *id == conn_id)
-        {
-            self.data_conns.remove(&tab_id);
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.data_conns.entry(tab_id)
+        else {
+            return;
+        };
+        entry.get_mut().retain(|(id, _)| *id != conn_id);
+        if entry.get().is_empty() {
+            entry.remove();
         }
     }
 }
@@ -1784,7 +1814,13 @@ impl SessionState {
     /// One connection under the lease has ended. `true` when the focus
     /// the workspace is holding went away with it.
     fn forget_connection(&self, conn_id: u64) -> bool {
-        lock(&self.clients).forget_connection(conn_id)
+        // The quota is not reclaimed during a stop, which is also when
+        // every control connection is closed at once: `close_all` keeps
+        // the tokens deliberately so a client holding a good pre-stop
+        // ticket hears `shutting-down` instead of being sent hunting for
+        // a bad credential, and reclaiming here would undo exactly that.
+        let stopping = self.stopping.load(Ordering::Acquire);
+        lock(&self.clients).forget_connection(conn_id, !stopping)
     }
 
     /// Remember which connection the workspace's focus came from, so its
@@ -1798,14 +1834,14 @@ impl SessionState {
         lock(&self.clients).close_all(reason);
     }
 
-    /// Mint one attach ticket. The caller has already passed the lease
-    /// gate and the stop latch; both are re-checked under this lock,
-    /// because a ticket is authority and authority minted after a sweep
-    /// is authority nobody can revoke.
+    /// Mint one attach ticket. The caller has already passed the stop
+    /// latch; it is re-checked under this lock, because a ticket is
+    /// authority and authority minted after a sweep is authority nobody
+    /// can revoke.
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn mint_attach_token(
         &self,
-        lease: &str,
+        ctx: &ConnCtx,
         tab_id: i64,
         tab_generation: u64,
         kind: AttachPayloadKind,
@@ -1814,7 +1850,13 @@ impl SessionState {
         if self.stopping.load(Ordering::Acquire) {
             return Err(shutting_down());
         }
-        guard.mint_token(lease, tab_id, tab_generation, kind, self.attach_token_ttl())
+        guard.mint_token(
+            ctx.conn_id,
+            tab_id,
+            tab_generation,
+            kind,
+            self.attach_token_ttl(),
+        )
     }
 
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
@@ -1837,13 +1879,7 @@ impl SessionState {
     fn admit_attach(&self, token: &str, ctx: &ConnCtx) -> Result<AdmittedAttach, HandlerError> {
         let mut guard = lock(&self.clients);
         let stopping = self.stopping.load(Ordering::Acquire);
-        let (admitted, displaced) = guard.admit_attach(token, ctx, stopping)?;
-        // Fired under the lock so no third connection can slip between
-        // "this tab's data conn is now mine" and "the old one is told".
-        if let Some(closer) = displaced {
-            closer.close(CloseReason::Superseded);
-        }
-        Ok(admitted)
+        guard.admit_attach(token, ctx, stopping)
     }
 
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
@@ -2103,7 +2139,9 @@ impl Handler for IpcHandler {
     /// lease registry and does nothing here.
     ///
     /// Streams are pruned here too, and independently of the lease: an
-    /// observer can exist on a session where no lease was ever minted.
+    /// observer can exist on a session where no lease was ever minted —
+    /// as can a control connection holding attach tickets, which this is
+    /// also where the registry reclaims.
     fn connection_ended(&self, conn_id: u64) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -2659,8 +2697,9 @@ async fn dispatch_outcome(
             .map(HandlerOutcome::Reply);
     }
 
-    // Same reason as `session.connect`: the token is bound to the lease
-    // presented on *this* connection, which `dispatch` cannot see.
+    // Served here rather than in `dispatch` because the ticket it mints
+    // is bound to *this* connection — that is what lets the connection's
+    // close revoke the tickets it holds — and `dispatch` cannot see one.
     if op == ops::TAB_ATTACH {
         let p: TabAttachParams = decode(params)?;
         return tab_attach(h, session, ctx, p)
@@ -2668,18 +2707,12 @@ async fn dispatch_outcome(
             .map(HandlerOutcome::Reply);
     }
 
-    // A write is an interactive act, so on a session socket it belongs
-    // to whoever holds the lease — served here, and not in `dispatch`,
-    // because that is where the presenting connection is visible. UI
-    // sockets never reach this arm (they return at the head of this
-    // function), so there the key stays accepted-and-ignored.
-    //
-    // The gate is an admission boundary, not a write fence: a write that
-    // linearizes just before a takeover may still land after it. See
-    // `TabWriteParams::lease`.
+    // Raw input is open to every same-UID client (plan 057, R15): the
+    // presented lease is accepted and ignored here exactly as it is on a
+    // UI socket. What the lease still owns is the foreground — effects,
+    // focus, and the session-wide settings ops — never a keystroke.
     if op == ops::TAB_WRITE {
         let p: TabWriteParams = decode(params)?;
-        session.require_lease(p.lease.as_deref().unwrap_or(""), ctx)?;
         h.supervisor
             .write(p.tab_id, p.data)
             .await
@@ -2693,13 +2726,16 @@ async fn dispatch_outcome(
 /// `tab.attach`: negotiate a payload kind and hand back a single-use
 /// ticket for one data connection.
 ///
+/// An attach is raw input, so it takes no lease (plan 057, R15): any
+/// same-UID client may attach, and a tab serves as many data connections
+/// as are dialed. A presented `lease` is accepted and ignored.
+///
 /// The validation order is pinned (D5) and each earlier failure wins,
-/// because the codes instruct differently: `connect-required` means "go
-/// get a lease", `not-found` means "that tab is gone",
-/// `unsupported-kind` means "offer something else", `build-mismatch`
-/// means "the offer we could serve needs the same libghostty on both
-/// ends", and only then does geometry get looked at. Reordering would
-/// tell a client to fix the wrong thing.
+/// because the codes instruct differently: `not-found` means "that tab
+/// is gone", `unsupported-kind` means "offer something else",
+/// `build-mismatch` means "the offer we could serve needs the same
+/// libghostty on both ends", and only then does geometry get looked at.
+/// Reordering would tell a client to fix the wrong thing.
 #[cfg(feature = "server-vt")]
 async fn tab_attach(
     h: &IpcHandler,
@@ -2707,8 +2743,6 @@ async fn tab_attach(
     ctx: &ConnCtx,
     p: TabAttachParams,
 ) -> Result<serde_json::Value, HandlerError> {
-    session.require_lease(&p.lease, ctx)?;
-
     // One lookup, so the channel this resizes, the generation the token
     // is stamped with, and the task the forwarder will snapshot are the
     // same pipeline — two reads could straddle a respawn.
@@ -2829,8 +2863,7 @@ async fn tab_attach(
             ))
         })?;
 
-    let attach_token =
-        session.mint_attach_token(&p.lease, p.tab_id, tab_generation, kind.clone())?;
+    let attach_token = session.mint_attach_token(ctx, p.tab_id, tab_generation, kind.clone())?;
     encode(&TabAttachResult {
         attach_token,
         kind,
@@ -2845,11 +2878,10 @@ async fn tab_attach(
 #[allow(clippy::unused_async)]
 async fn tab_attach(
     _h: &IpcHandler,
-    session: &Arc<SessionState>,
-    ctx: &ConnCtx,
-    p: TabAttachParams,
+    _session: &Arc<SessionState>,
+    _ctx: &ConnCtx,
+    _p: TabAttachParams,
 ) -> Result<serde_json::Value, HandlerError> {
-    session.require_lease(&p.lease, ctx)?;
     Err(no_server_vt())
 }
 
