@@ -438,6 +438,17 @@ def collector_for(kind: str):
 # ---------------------------------------------------------------------------
 
 
+def _optional_int(raw: dict, key: str) -> int | None:
+    """A key the server sends only when it has something to say.
+
+    Absent is a legal answer, so a miss is `None` rather than a
+    `KeyError` — a client that treated the omission as malformed could
+    not talk to a session that had nothing to report.
+    """
+    value = raw.get(key)
+    return None if value is None else int(value)
+
+
 @dataclass
 class Reply:
     """The one JSON line a data connection gets before the wire turns
@@ -450,6 +461,13 @@ class Reply:
     seq: int = 0
     server_epoch: int = 0
     tab_generation: int = 0
+    #: The geometry the payload was encoded at, when the server said —
+    #: only an unfocused snapshot attach, which by definition did not
+    #: resize the tab to the client's own grid. `None` on a focused
+    #: attach and on a resume, so an absent pair is an answer rather
+    #: than a missing field.
+    snapshot_cols: int | None = None
+    snapshot_rows: int | None = None
     code: str = ""
     message: str = ""
 
@@ -589,6 +607,8 @@ class DataPlane:
                 seq=int(raw["seq"]),
                 server_epoch=int(raw["server_epoch"]),
                 tab_generation=int(raw["tab_generation"]),
+                snapshot_cols=_optional_int(raw, "snapshot_cols"),
+                snapshot_rows=_optional_int(raw, "snapshot_rows"),
             )
             assert reply.kind == self.kind, (
                 f"this connection was opened to read {self.kind!r} but the session "

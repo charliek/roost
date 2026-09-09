@@ -134,6 +134,7 @@ def attach_ticket(
     *,
     kinds: list[str] | None = None,
     libghostty_build: str | None = None,
+    focus: bool | None = None,
 ) -> dict:
     """`tab.attach` — a single-use ticket for one data connection.
 
@@ -141,22 +142,29 @@ def attach_ticket(
     the pin identity is the server's to state, and a literal here would
     have to be updated every time `third_party/ghostty` moves. The
     mismatch case mutates this value on purpose.
+
+    `focus` rides the wire **only when a caller asks for it**, so the
+    default here is the default on the wire: a focused attach sends no
+    `focus` key at all, which is the compatibility guarantee a session
+    predating `open_input` depends on (it decodes strictly and would
+    refuse the key). Every other case in this module goes on exercising
+    that shape by saying nothing.
     """
     if libghostty_build is None:
         libghostty_build = client.call("session.identify")["libghostty_build"]
-    return client.call(
-        "tab.attach",
-        {
-            "lease": lease,
-            "tab_id": str(tab_id),
-            "kinds": kinds if kinds is not None else [dataplane.GHOSTTY_SNAPSHOT],
-            "cols": cols,
-            "rows": rows,
-            "cell_w_px": 0,
-            "cell_h_px": 0,
-            "libghostty_build": libghostty_build,
-        },
-    )
+    params = {
+        "lease": lease,
+        "tab_id": str(tab_id),
+        "kinds": kinds if kinds is not None else [dataplane.GHOSTTY_SNAPSHOT],
+        "cols": cols,
+        "rows": rows,
+        "cell_w_px": 0,
+        "cell_h_px": 0,
+        "libghostty_build": libghostty_build,
+    }
+    if focus is not None:
+        params["focus"] = focus
+    return client.call("tab.attach", params)
 
 
 def dial(
@@ -186,13 +194,18 @@ def attached_as(
     tab_id: int,
     kind: str,
     cols: int = COLS,
+    rows: int = ROWS,
+    *,
+    focus: bool | None = None,
 ) -> tuple[DataPlane, dataplane.Reply, dict]:
     """The same prologue, offering exactly one kind.
 
     One kind on purpose: the negotiation then has nothing to choose
     between, so the stream under test is the one the case names.
     """
-    ticket = attach_ticket(client, lease, tab_id, cols=cols, kinds=[kind])
+    ticket = attach_ticket(
+        client, lease, tab_id, cols=cols, rows=rows, kinds=[kind], focus=focus
+    )
     assert ticket["kind"] == kind, ticket
     conn, reply = dial(env, ticket, kind=kind)
     assert reply.ok, (reply.code, reply.message)
@@ -215,6 +228,34 @@ def quiet_tab(client: Roost, project: int, cwd) -> int:
     the pid so the session's reap accounts for exactly one process, and
     `sleep` takes the default SIGHUP action."""
     return open_tab(client, project, cwd, ["/bin/sh", "-c", "exec sleep 300"])
+
+
+#: What [`echoing_tab`]'s child announces once it is copying input back.
+CHILD_UP = b"CHILD_UP"
+
+
+def echoing_tab(client: Roost, project: int, cwd) -> int:
+    """A tab whose child copies every byte it is given back out.
+
+    `stty raw -echo` first, so nothing that comes back can be the line
+    discipline's echo: a marker on the stream is a marker `cat` read and
+    wrote, which is the only way to tell "the child got it" from "the
+    tty saw it". The one-byte `dd` in front of the announcement is the
+    fence — [`CHILD_UP`] cannot be emitted before somebody types, and
+    nobody can type before they are attached, so no attach can open too
+    late to see it.
+    """
+    return open_tab(
+        client,
+        project,
+        cwd,
+        [
+            "/bin/sh",
+            "-c",
+            "stty raw -echo; dd bs=1 count=1 >/dev/null 2>&1; "
+            f"echo {CHILD_UP.decode()}; exec cat",
+        ],
+    )
 
 
 def flooding_tab(client: Roost, project: int, cwd) -> int:
@@ -300,6 +341,34 @@ def rss_mb(pid: int) -> float:
 def pty_payload(frames) -> bytes:
     return b"".join(
         frame.pty()[1] for frame in frames if frame.frame_type == dataplane.FRAME_PTY
+    )
+
+
+def wait_for_bytes(
+    conn: DataPlane, seen: bytearray, *markers: bytes, timeout: float = 30.0
+) -> None:
+    """Read `conn` until every marker has landed in `seen`.
+
+    The accumulator belongs to the caller so several waits on one
+    connection compose: bytes read while waiting for the first marker
+    are still there when the second is asked for, which is what makes
+    "both connections saw both markers" four ordinary waits instead of
+    one lucky interleaving. It also means a marker already in hand
+    returns without reading — [`DataPlane.read_frames_until`] always
+    consumes a frame first, and there may be no frame left to consume.
+    """
+
+    def landed(frame) -> bool:
+        if frame.frame_type == dataplane.FRAME_PTY:
+            seen.extend(frame.pty()[1])
+        return all(marker in seen for marker in markers)
+
+    if all(marker in seen for marker in markers):
+        return
+    conn.read_frames_until(
+        landed,
+        timeout=timeout,
+        what=" and ".join(marker.decode() for marker in markers),
     )
 
 
@@ -393,6 +462,168 @@ def test_a_takeover_moves_the_foreground_and_closes_nothing(env):
             connect_lease(polite, takeover=False)
         assert busy.value.code == "already-connected", busy.value
         assert len(connect_lease(polite, takeover=True)) == 32
+
+    env.stop_over_the_wire()
+
+
+# ---------------------------------------------------------------------------
+# 1b. Many clients on one tab, and the last one to interact sizes it
+# ---------------------------------------------------------------------------
+
+
+def test_two_clients_attached_to_one_tab_both_see_output_and_both_type(env):
+    """A tab serves every same-UID client that asks for it (plan 057, R15).
+
+    This is the shape the product is for — started on the desktop,
+    picked up on the phone, both left open — and before R15 it was the
+    one shape the protocol refused: a second admitted handshake
+    superseded the first, so the desktop's stream ended the moment the
+    phone attached.
+
+    Three things at once, because they are one behaviour: both
+    connections are still live after the second attach, output fans out
+    to both, and input from either reaches the child. The second client
+    presents an **empty** lease — it never ran `session.connect` at all,
+    which is the whole point of raw input being open.
+    """
+    started(env)
+
+    with env.client() as desktop, env.client() as phone:
+        lease = connect_lease(desktop)
+        project = first_project(desktop)
+        tab = echoing_tab(desktop, project, env.launch_cwd)
+
+        first, _reply, _ticket = attached(env, desktop, lease, tab)
+        first.read_until_ready()
+        second, _reply, _ticket = attached(env, phone, "", tab)
+        second.read_until_ready()
+
+        # One child, so one announcement — and it goes to both.
+        on_first, on_second = bytearray(), bytearray()
+        first.send_input(b"\n")
+        wait_for_bytes(first, on_first, CHILD_UP)
+        wait_for_bytes(second, on_second, CHILD_UP)
+
+        # Distinct markers: what comes back names which connection typed
+        # it, so "both typed" cannot be one write counted twice.
+        first.send_input(b"DESKTOP_TYPED\n")
+        second.send_input(b"PHONE_TYPED\n")
+        for conn, seen in ((first, on_first), (second, on_second)):
+            wait_for_bytes(conn, seen, b"DESKTOP_TYPED", b"PHONE_TYPED")
+
+        first.close()
+        second.close()
+
+    env.stop_over_the_wire()
+
+
+def test_geometry_follows_the_last_client_that_interacted(env):
+    """The tab is the size of whoever last did something with it.
+
+    Not smallest-wins: a phone glancing at a tab would shrink the
+    desktop that is working in it. Not first-wins either — the phone has
+    to be able to take the grid over by typing. So the rule is the last
+    *geometry-bearing* interaction, and the ladder below walks every
+    kind of event that is one and two that are not.
+
+    The watching attach is the interesting rung. It resizes nothing, so
+    its snapshot is encoded at somebody else's geometry — which the
+    reply has to say, or a `vt` client would replay 30 rows into the 20
+    it built and wrap every one of them.
+    """
+    started(env)
+
+    desktop_cols, desktop_rows = 100, 30
+    phone_cols, phone_rows = 60, 20
+    resized_cols, resized_rows = 70, 22
+
+    with env.client() as desktop, env.client() as phone:
+        lease = connect_lease(desktop)
+        project = first_project(desktop)
+        tab = quiet_tab(desktop, project, env.launch_cwd)
+
+        def geometry() -> tuple[int, int]:
+            dumped = desktop.dump(tab)
+            return dumped["cols"], dumped["rows"]
+
+        def settles_at(cols: int, rows: int) -> None:
+            sessionlib.wait_until(
+                lambda: geometry() == (cols, rows), 30.0, f"tab {tab} to reach {cols}x{rows}"
+            )
+
+        # 1. A focused attach claims the grid, as every attach used to.
+        # The resize is awaited inside `tab.attach`, so this is an
+        # assertion rather than a wait.
+        big, big_reply, _ticket = attached_as(
+            env,
+            desktop,
+            lease,
+            tab,
+            dataplane.GHOSTTY_SNAPSHOT,
+            cols=desktop_cols,
+            rows=desktop_rows,
+        )
+        assert geometry() == (desktop_cols, desktop_rows)
+        assert (big_reply.snapshot_cols, big_reply.snapshot_rows) == (None, None), (
+            "a focused attach was just resized to its own grid; there is no other "
+            "geometry to report"
+        )
+        big.read_until_ready()
+
+        # 2. A watching one claims nothing — and is told what it got.
+        small, small_reply, _ticket = attached_as(
+            env,
+            phone,
+            "",
+            tab,
+            dataplane.VT,
+            cols=phone_cols,
+            rows=phone_rows,
+            focus=False,
+        )
+        assert geometry() == (desktop_cols, desktop_rows)
+        assert (small_reply.snapshot_cols, small_reply.snapshot_rows) == (
+            desktop_cols,
+            desktop_rows,
+        )
+
+        # And the payload really is that size: the composition pads to
+        # the server's row count, so counting rows says which terminal
+        # it was encoded for. Same cross-check the row-for-every-row
+        # case below runs, asked of a geometry the client did not name.
+        small.read_until_finish()
+        dumped = desktop.dump(tab)
+        assert dumped["rows"] == desktop_rows, dumped
+        assert len(small.snap.plain_rows()) == dumped["scrollback_rows"] + dumped["rows"], (
+            f"the payload carried {len(small.snap.plain_rows())} rows for a "
+            f"{dumped['cols']}x{dumped['rows']} terminal; the phone asked for "
+            f"{phone_cols}x{phone_rows}"
+        )
+
+        # 3. Typing is an interaction, and it carries the typist's grid.
+        small.send_input(b"\n")
+        settles_at(phone_cols, phone_rows)
+
+        # 4. Including when it takes the grid back.
+        big.send_input(b"\n")
+        settles_at(desktop_cols, desktop_rows)
+
+        # 5. So is a bare resize, which is the same claim with no bytes.
+        small.send_resize(resized_cols, resized_rows)
+        settles_at(resized_cols, resized_rows)
+
+        # 6. Reading is not. Neither a dump nor a subscription states a
+        # geometry, and a client that only looks must leave the grid
+        # where the last typist put it.
+        with env.client() as bystander:
+            dumped = bystander.dump(tab)
+            assert (dumped["cols"], dumped["rows"]) == (resized_cols, resized_rows)
+            with EventStream(env.socket) as observer:
+                observer.subscribe()
+                assert geometry() == (resized_cols, resized_rows)
+
+        big.close()
+        small.close()
 
     env.stop_over_the_wire()
 

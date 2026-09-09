@@ -457,33 +457,51 @@ def test_set_theme_is_lease_gated_and_validates_its_palette(env):
 # 2b. tab.write is nobody's — raw input is open
 # ---------------------------------------------------------------------------
 
+#: The one marker every write case sends, and the number of bytes its
+#: sink copies before it stops. Six and then done, which is why a write
+#: that wants proof needs a tab and a sink of its own.
+TYPED = b"TYPED!"
+
+
+def a_tab_with_a_sink(env, client: Roost, name: str) -> tuple[int, Path]:
+    """A tab whose child copies [`TYPED`] into a file and moves on.
+
+    The file is what makes "the write reached the **child**" observable
+    from outside: `stty raw -echo` so the bytes arrive unlineated and
+    nothing the line discipline does can be mistaken for the child
+    reading them.
+    """
+    sink = env.launch_cwd / name
+    tab = client.open_tab(
+        first_project(client),
+        cwd=str(env.launch_cwd),
+        cols=COLS,
+        rows=ROWS,
+        argv=[
+            "/bin/sh",
+            "-c",
+            f"stty raw -echo; dd bs=1 count={len(TYPED)} of='{sink}' 2>/dev/null; "
+            "exec sleep 300",
+        ],
+    )
+    return tab, sink
+
+
+def wait_for_sink(sink: Path, what: str) -> None:
+    sessionlib.wait_until(
+        lambda: sink.is_file() and sink.stat().st_size == len(TYPED), 30.0, what
+    )
+
 
 def test_a_session_write_needs_no_lease(env):
     """Writing into a tab takes no lease (plan 057, R15): same-UID is the
     whole boundary, and the lease is the foreground, not a write fence.
 
     Each variant — no lease, an empty one, and one this session has
-    displaced — gets **its own tab and its own sink**. The child copies
-    exactly six bytes and moves on, so one shared sink could only ever
-    prove the first write landed. `stty raw -echo` so the six bytes
-    arrive unlineated and nothing is echoed back.
+    displaced — gets **its own tab and its own sink**, because one
+    shared sink could only ever prove the first write landed.
     """
     started(env)
-
-    def a_tab_with_a_sink(client, name: str) -> tuple[int, Path]:
-        sink = env.launch_cwd / name
-        tab = client.open_tab(
-            first_project(client),
-            cwd=str(env.launch_cwd),
-            cols=COLS,
-            rows=ROWS,
-            argv=[
-                "/bin/sh",
-                "-c",
-                f"stty raw -echo; dd bs=1 count=6 of='{sink}' 2>/dev/null; exec sleep 300",
-            ],
-        )
-        return tab, sink
 
     with env.client() as client:
         # Minted and then displaced, so the third variant presents a
@@ -497,14 +515,47 @@ def test_a_session_write_needs_no_lease(env):
                 ("empty", ""),
                 ("displaced", stale),
             ):
-                tab, sink = a_tab_with_a_sink(client, name)
-                client.send(tab, b"TYPED!", lease=presented)
-                sessionlib.wait_until(
-                    lambda sink=sink: sink.is_file() and sink.stat().st_size == 6,
-                    30.0,
-                    f"the child to receive the {name} write",
-                )
-                assert sink.read_bytes() == b"TYPED!", name
+                tab, sink = a_tab_with_a_sink(env, client, name)
+                client.send(tab, TYPED, lease=presented)
+                wait_for_sink(sink, f"the child to receive the {name} write")
+                assert sink.read_bytes() == TYPED, name
+
+    env.stop_over_the_wire()
+
+
+def test_roostctl_tab_send_into_a_session_needs_no_lease(env):
+    """The CLI half of the same rule, through the real binary.
+
+    `roostctl tab send` against a session socket used to be the driver's
+    act: with no `ROOST_LEASE` in the environment the session answered
+    `connect-required` and the CLI named the three lanes that could
+    write. Since R15 there is nothing to present — the write is admitted
+    on the socket's own same-UID boundary.
+
+    The unset variable is the fixture's guarantee, not the developer's
+    shell (`session.py`'s `_SANITIZE`); asserted here because it is the
+    precondition the whole case rests on.
+    """
+    started(env)
+
+    assert "ROOST_LEASE" not in env.command_env()
+
+    with env.client() as client:
+        tab, sink = a_tab_with_a_sink(env, client, "roostctl")
+
+        # `--socket` is roostctl's, not `tab send`'s, and `--bytes` is
+        # required — the escape-decoding form, which this marker passes
+        # through unchanged.
+        result = env.roostctl(
+            "--socket", str(env.socket),
+            "tab", "send",
+            "--tab", str(tab),
+            "--bytes", TYPED.decode(),
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+
+        wait_for_sink(sink, "the child to receive the CLI's write")
+        assert sink.read_bytes() == TYPED
 
     env.stop_over_the_wire()
 
