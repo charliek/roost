@@ -62,6 +62,21 @@
 //! that child's `parentID` as the root, so the child's later
 //! `permission.asked` is scoped to a session the tab's owner can match.
 //!
+//! # The session's own server
+//!
+//! A bare `opencode` binds no socket — the TUI talks to its server in
+//! process — so the plugin puts a loopback front end on that server and
+//! stamps its address as `server_url` on every forward (plan 054 R10).
+//! This module re-publishes it as `metadata["server_url"]`, and only
+//! when it parses as a loopback base URL, because the value is
+//! agent-supplied and a consumer reads it back verbatim.
+//!
+//! It rides the `Claim` on `session.created` and the `Preserve` upsert
+//! on everything after, which is also its limit: a plugin that loads
+//! mid-session (`opencode attach`, or an install while a session ran)
+//! emits no `session.created`, and a `Preserve` against an unowned tab
+//! creates nothing — so the key first lands at the *next* creation.
+//!
 //! # Known limits (plan §4, §9)
 //!
 //! **`dispose` may never fire.** It is declared in opencode's plugin
@@ -81,7 +96,7 @@ use roost_ipc::agent::{
 };
 use serde_json::Value;
 
-use crate::common::{field, field_alias, non_empty, parse_normalized};
+use crate::common::{field, field_alias, loopback_base_url, non_empty, parse_normalized};
 
 pub const SOURCE: &str = "opencode";
 
@@ -154,20 +169,37 @@ pub fn opencode_event_to_reports(
         ..TabAgentReportParams::sessionless(tab_id, SOURCE, OwnershipAction::Preserve, None)
     };
 
-    let report = match kind {
-        EventKind::SessionCreated => session_created(base, payload),
-        EventKind::ChatMessage => working_and_clear(base, "chat_message"),
-        EventKind::SessionStatus => return session_status(base, payload),
-        EventKind::PermissionAsked => permission_asked(base, payload),
-        EventKind::PermissionReplied => turn_progress(base, "permission_replied"),
-        EventKind::QuestionAsked => question_asked(base, payload),
-        EventKind::QuestionReplied => turn_progress(base, "question_replied"),
-        EventKind::SessionIdle => session_idle(base),
-        EventKind::SessionError => session_error(base, payload),
-        EventKind::Dispose => dispose(base),
+    let mut reports = match kind {
+        EventKind::SessionCreated => vec![session_created(base, payload)],
+        EventKind::ChatMessage => vec![working_and_clear(base, "chat_message")],
+        EventKind::SessionStatus => session_status(base, payload),
+        EventKind::PermissionAsked => vec![permission_asked(base, payload)],
+        EventKind::PermissionReplied => vec![turn_progress(base, "permission_replied")],
+        EventKind::QuestionAsked => vec![question_asked(base, payload)],
+        EventKind::QuestionReplied => vec![turn_progress(base, "question_replied")],
+        EventKind::SessionIdle => vec![session_idle(base)],
+        EventKind::SessionError => vec![session_error(base, payload)],
+        EventKind::Dispose => vec![dispose(base)],
     };
 
-    vec![report]
+    // The plugin stamps `server_url` onto *every* forward, not only the
+    // creation, because the address is what makes a session drivable and
+    // a `Claim` is the one report that can introduce a key onto a tab
+    // nobody owns yet — a plugin loaded mid-session never emits one, so
+    // the later kinds' `Preserve` upsert is the only other way in.
+    // Validated because it is agent-supplied and roost re-publishes it
+    // verbatim: an `--hostname 0.0.0.0` server announces an address no
+    // consumer may be handed, and is dropped to status-only.
+    if let Some(url) = non_empty(field(payload, "server_url")).filter(|url| loopback_base_url(url))
+    {
+        for report in &mut reports {
+            report
+                .metadata
+                .insert("server_url".to_string(), url.to_string());
+        }
+    }
+
+    reports
 }
 
 /// A session with a parent is a child (subagent) session. The probe only

@@ -447,3 +447,101 @@ fn every_report_carries_source_opencode_and_the_root_session_id() {
         assert_eq!(report.session_id, "ses_root", "{event}");
     }
 }
+
+// ---------------------------------------------------------------------
+// The session's own server (plan 054 R10)
+// ---------------------------------------------------------------------
+
+const SERVER_URL: &str = "http://127.0.0.1:41234";
+
+/// The creation is where the key normally enters a tab: it is the only
+/// report that claims one, and a `Claim` builds ownership's metadata
+/// from scratch.
+#[test]
+fn session_created_records_a_loopback_server_url() {
+    let report = only(
+        "session.created",
+        &json!({ "sessionID": SESSION, "server_url": SERVER_URL }),
+    );
+    assert_eq!(report.ownership_action, OwnershipAction::Claim);
+    assert_eq!(report.metadata["server_url"], SERVER_URL);
+}
+
+/// …and every later kind carries it too, because a plugin that loaded
+/// mid-session never emits a creation, and the upsert onto ownership
+/// that already exists is the only other way the key can land.
+#[test]
+fn every_later_kind_preserves_and_carries_the_server_url() {
+    let payload = json!({
+        "sessionID": SESSION,
+        "server_url": SERVER_URL,
+        "status": { "type": "busy" },
+        "permission": "external_directory",
+    });
+    for event in OPENCODE_HOOK_EVENTS {
+        let report = only(event, &payload);
+        assert_eq!(report.metadata["server_url"], SERVER_URL, "{event}");
+        if event != "session.created" {
+            assert_ne!(report.ownership_action, OwnershipAction::Claim, "{event}");
+        }
+    }
+}
+
+/// The value is agent-supplied and roost re-publishes it verbatim, so
+/// anything that is not a bare loopback base URL — an `--hostname
+/// 0.0.0.0` server's address most of all — is dropped and the session
+/// stays status-only.
+#[test]
+fn a_server_url_that_is_not_a_loopback_base_url_is_not_recorded() {
+    for value in [
+        json!(""),
+        json!("http://0.0.0.0:41234"),
+        json!("http://192.168.1.10:41234"),
+        json!("http://example.com:41234"),
+        json!("https://127.0.0.1:41234"),
+        json!("http://127.0.0.1"),
+        json!("http://127.0.0.1:41234/"),
+        json!("http://127.0.0.1:41234?token=x"),
+        json!("http://user@127.0.0.1:41234"),
+        json!("http://127.0.0.1:0"),
+        json!("http://127.0.0.1:99999"),
+        json!(41234),
+        json!(null),
+        json!({ "url": SERVER_URL }),
+    ] {
+        for event in ["session.created", "chat.message"] {
+            let report = only(
+                event,
+                &json!({ "sessionID": SESSION, "server_url": value.clone() }),
+            );
+            assert!(
+                !report.metadata.contains_key("server_url"),
+                "{event} recorded {value}"
+            );
+        }
+    }
+}
+
+/// The other loopback spellings a client can dial.
+#[test]
+fn the_loopback_spellings_are_all_recorded() {
+    for value in [
+        "http://127.0.0.1:1",
+        "http://localhost:41234",
+        "http://[::1]:65535",
+    ] {
+        let report = only(
+            "chat.message",
+            &json!({ "sessionID": SESSION, "server_url": value }),
+        );
+        assert_eq!(report.metadata["server_url"], value, "{value}");
+    }
+}
+
+/// The plugin only announces what it has: a session running without a
+/// front end reports exactly as it did before the listener existed.
+#[test]
+fn an_absent_server_url_leaves_the_metadata_untouched() {
+    let report = only("session.created", &json!({ "sessionID": SESSION }));
+    assert!(!report.metadata.contains_key("server_url"));
+}

@@ -45,12 +45,11 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 
 **Sequencing.** R6 went first, as the XS item that shook down the
 issue → PR → `Closes` → board chain; R2 and R1 followed, then R8, then
-R7 and R5, then R3 and R4 together. What is left is R10, independent of
-everything above, and **R9, the one not to rush** — it depends on R1
-(landed) and changes the default every session runs under, so it wants
-living with the pieces before it, not speed. The board carries the
-current state; this paragraph is only the order and the reasoning behind
-it.
+R7 and R5, then R3 and R4 together, then R10. What is left is
+**R9, the one not to rush** — it depends on R1 (landed) and changes the
+default every session runs under, so it wants living with the pieces
+before it, not speed. The board carries the current state; this
+paragraph is only the order and the reasoning behind it.
 
 **R11–R14 are follow-ups from shipped work, and they land before the
 autostart and mobile surfaces are announced.** R12 is one pass over what
@@ -103,6 +102,11 @@ needs it named in its own acceptance box.
   — that is where a consumer stamps its own data, by design.
 - **Roost stays local-only: UDS + SSH.** No network listener, no auth
   layer. Decided; not a roadmap item; not to be reopened inside this epic.
+  The rule governs **roost's own transport** — its sockets, and what
+  roost binds. An agent's own server, exposed on `127.0.0.1` by that
+  agent's plugin so a client can drive the session roost reports (R10's
+  opencode listener), is the agent's, not roost's: it stays on loopback,
+  it carries the agent's own auth, and roost's sockets are unchanged.
 - **Roost carries status, never conversation content.** "A banner is a
   label, not a transcript" stands. Transcripts come from the agent's own
   protocol, in shed's lane crates.
@@ -133,6 +137,9 @@ needs it named in its own acceptance box.
   adapter.
 - **R8 ↔ gx A3.** gx stamps the opt-in key once its remote lane exists;
   R8 documents the key and passes it through.
+- **R10 → shed A4.** R10 publishes `metadata["server_url"]`; shed's
+  opencode lane crate is what consumes it. The lane itself is shed's,
+  out of scope here.
 - **R9 is roost's own HS-5**, parked in `discovery/host-sessions-roadmap.md`
   as "a decision point, not scheduled." The decision is now made. Until R9
   merges, that roadmap row still reads "not scheduled" — stale by

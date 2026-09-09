@@ -80,7 +80,9 @@ use roost_ipc::agent::{
 };
 use serde_json::Value;
 
-use crate::common::{bool_field, field, field_alias, has_field, non_empty, parse_normalized};
+use crate::common::{
+    bool_field, field, field_alias, has_field, loopback_base_url, non_empty, parse_normalized,
+};
 
 pub const SOURCE: &str = "grok";
 
@@ -170,31 +172,6 @@ pub fn grok_event_to_reports(
     }
 
     vec![report]
-}
-
-/// `true` for a `http://` URL whose host is `127.0.0.1`, `localhost` or
-/// `[::1]`, followed by `:` and a decimal port in `1..=65535` and
-/// nothing else — no userinfo, path, query, or fragment. Anything else,
-/// including an absent/empty/non-string `gxRemote`, is handled by the
-/// caller via [`non_empty`]; this only judges the shape once a
-/// non-empty string is in hand.
-fn loopback_base_url(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("http://") else {
-        return false;
-    };
-    for host in ["127.0.0.1", "localhost", "[::1]"] {
-        let Some(after_host) = rest.strip_prefix(host) else {
-            continue;
-        };
-        let Some(port) = after_host.strip_prefix(':') else {
-            continue;
-        };
-        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        return matches!(port.parse::<u32>(), Ok(p) if (1..=65535).contains(&p));
-    }
-    false
 }
 
 fn session_start(mut report: TabAgentReportParams, payload: &Value) -> TabAgentReportParams {

@@ -64,6 +64,34 @@ release workflow asserts they agree).
   in `session.identify.features`. No protocol bump — but the request
   key is new, so a Roost or session predating it answers `unknown-field`
   to the flag rather than quietly ignoring it.
+- **`server_url` metadata key makes an opencode session drivable (#439)** —
+  a bare `opencode` binds no socket (its TUI talks to its server
+  in-process), so nothing could act on the session roost already
+  reported. Roost's opencode plugin runs inside that server process, so
+  it now puts a loopback listener (`127.0.0.1`, port 0) in front of the
+  in-process app and reports the address as `metadata["server_url"]` on
+  the owning tab; when opencode is already listening itself (`serve`,
+  `web`, `--port`, and the rest) it reports that address and serves
+  nothing — the two are told apart by whether the client opencode hands
+  the plugin carries an in-process `fetch`, which opencode supplies only
+  when there is no real listener, not by parsing the command line. The
+  value is recorded only when it parses as a
+  token-free loopback base URL, and the listener demands the same Basic
+  credentials opencode does when `OPENCODE_SERVER_PASSWORD` is set.
+  `ROOST_OPENCODE_NO_SERVER=1` opts out of the listener roost creates —
+  it does not suppress reporting a server you started yourself.
+  `roostctl doctor` prints the value rather than its length, because a
+  loopback URL is not a secret and printing it is what makes the
+  handshake debuggable. No protocol bump — `metadata` is the no-bump
+  extension channel. Note the widened surface (a bare
+  `opencode` in a roost tab is now reachable by any same-host process)
+  and the mid-session limitation (the key rides *every* forwarded event
+  and merges onto ownership the tab already has, so a plugin that loads
+  mid-session only has to wait when the tab is **unowned** — with no
+  claim to ride and nothing to merge onto, the key lands at the next
+  `session.created`); both are in the
+  [Agent Hooks](docs/guides/agents.md#opencode-keys) guide.
+
 - **`events.subscribe` can resume instead of re-snapshotting (#422)** — a
   phone dropping in and out of a flaky link used to pay a `tab.list`
   snapshot and a re-fence on every stall; a host session now keeps a

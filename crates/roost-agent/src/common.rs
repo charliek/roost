@@ -61,6 +61,36 @@ pub(crate) fn array_len(payload: &Value, key: &str) -> usize {
         .map_or(0, Vec::len)
 }
 
+/// `true` for a `http://` URL whose host is `127.0.0.1`, `localhost` or
+/// `[::1]`, followed by `:` and a decimal port in `1..=65535` and
+/// nothing else — no userinfo, path, query, or fragment.
+///
+/// Two adapters take a base URL from an agent that announces where its
+/// own control surface listens (grok's `gxRemote`, opencode's
+/// `server_url`), and neither may hand a consumer anything but a
+/// loopback address: the announcement is agent-supplied, and roost
+/// re-publishes it verbatim through `metadata`. Callers filter an
+/// absent/empty/non-string value with [`non_empty`] first; this only
+/// judges the shape once a non-empty string is in hand.
+pub fn loopback_base_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return false;
+    };
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        let Some(after_host) = rest.strip_prefix(host) else {
+            continue;
+        };
+        let Some(port) = after_host.strip_prefix(':') else {
+            continue;
+        };
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        return matches!(port.parse::<u32>(), Ok(p) if (1..=65535).contains(&p));
+    }
+    false
+}
+
 /// Resolve `name` against `table`, ignoring case and every
 /// non-alphanumeric character, so `SessionStart`, `session-start` and
 /// `SESSION_START` all reach the same entry.
