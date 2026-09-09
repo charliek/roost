@@ -1125,9 +1125,6 @@ impl HostConnSet {
     /// * the ask is a person's. An auto-reconnect that took the
     ///   foreground back would be exactly the steal-back
     ///   [`task::attempt`]'s probe exists to prevent;
-    /// * the ask is a person's. An auto-reconnect that took the
-    ///   foreground back would be exactly the steal-back [`task::attempt`]'s
-    ///   probe exists to prevent;
     /// * the host is `TakenOver` — every other state either drives
     ///   already or has no session to ask;
     /// * its task says it is serving in place, which only an

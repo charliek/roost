@@ -185,6 +185,17 @@ its control connection, its attach ends, keys stop routing, and "Take
 the foreground" falls back to a full reconnect because there is no
 surviving control leg to retake in place.
 
+**The in-place retake is `localhost`-only today.** `HostConnSet::connect`
+routes to it only when the request names the endpoint the deposed task
+is already on, and an ssh reconnect never does: `open_ssh` tears the
+tunnel down and binds a fresh per-attempt bridge socket before
+`connect` is reached, so the old task's control connection is on its
+way out however healthy its flag still reads. An ssh host therefore
+takes the full-reconnect path — correct, and one reattach more
+expensive than it needs to be. The deposed-but-*serving* half is
+transport-blind and works over ssh unchanged; it is only the retake
+that falls through.
+
 **The reconnect probe never authorizes a silent steal-back.** A client
 whose connection merely dropped — the wire, not a takeover — has to
 find out which happened before it reconnects as the foreground, because

@@ -206,8 +206,10 @@ serves — seeded with `"put_file"` (plan 049, R1) and joined by
 `"events_resume"` (plan 052) for `events.subscribe`'s
 `from_revision`/`session_id` pair, `"tab_dump_scrollback"` (plan
 053) for `tab.dump`'s `scrollback` count, and `"open_input"` (plan 057,
-R15) for the reopened `tab.write`/`tab.attach` gate and
-`tab.attach`'s `focus` parameter — the first three add a capability,
+R15) for three things a client may rely on together — the reopened
+`tab.write`/`tab.attach` gate, `tab.attach`'s `focus` parameter, and
+that a takeover **preserves every control and data connection** rather
+than closing them — the first three add a capability,
 the fourth *removes* a restriction the same generation had imposed, and
 `features` carries both kinds. It exists because the
 alternative, bumping `SESSION_PROTOCOL_VERSION` for every additive

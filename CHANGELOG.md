@@ -253,9 +253,10 @@ release workflow asserts they agree).
   not by the foreground alone, so two clients typing at different sizes
   will flip the grid between them by design. On the wire:
   `session.identify.features` gains `"open_input"`, `tab.attach` takes
-  an optional `focus` parameter, `taken-over`/`superseded` no longer
-  close a control or data connection, and `SESSION_PROTOCOL_VERSION`
-  stays `4`. **Skew note:** against a `roost-session` built before this
+  an optional `focus` parameter, a takeover no longer closes any
+  connection (so `taken-over` is no longer a close reason, and
+  `superseded` is gone entirely — nothing displaces a data connection
+  any more), and `SESSION_PROTOCOL_VERSION` stays `4`. **Skew note:** against a `roost-session` built before this
   change, the old behavior still applies — a takeover still closes the
   connection, and ↻ is a full reconnect rather than an in-place retake.
 - **`tab.reorder` / `project.reorder` narrow the ids they accept** — the

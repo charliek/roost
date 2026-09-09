@@ -249,7 +249,9 @@ So when another client connects to a host you have open, **nothing freezes**. Yo
 
 While another client has the foreground, an upload is refused with *"‹label› is driven by ‹taken_by›; take the foreground to upload"* rather than attempted, and effects for that host go to them instead of you.
 
-**"Take the foreground"** — the line's button, the sidebar's ↻ row, and the palette's Connect verb are all the same action — takes it back **in place**. No reconnect, no reattach, no fresh snapshot: the connection you already have claims the foreground again and the grid does not blink. It does not resize the tab either, so whatever size the other client left it at is the size it stays until somebody types.
+**"Take the foreground"** — the line's button, the sidebar's ↻ row, and the palette's Connect verb are all the same action — takes it back **in place** on a `localhost` host: no reconnect, no reattach, no fresh snapshot, the connection you already have claims the foreground again and the grid does not blink. It does not resize the tab either, so whatever size the other client left it at is the size it stays until somebody types.
+
+On a host reached **over SSH** the same button does a full reconnect instead. Reconnecting there rebuilds the tunnel and the bridge socket underneath, so there is no surviving connection to claim the foreground on — the tabs come back attached and focused, which does resize them to this window's grid. The outcome is the same, it just costs a reattach; tracked as future work.
 
 **Reading a session never needs the foreground at all** — and since this change, neither does typing into one. A client that dials a host and asks only to watch — a script, a monitoring tool, a future phone client — sees the same live tab list, titles and notifications with no risk of moving the foreground, because it never asks for it. Watching is not degraded driving; it is the normal way to look at a session you don't hold.
 

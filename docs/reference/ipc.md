@@ -1665,6 +1665,7 @@ A **live** host additionally carries `connect` and `tabs`:
 - `rollup` — the band's *output*, verbatim from the sidebar's reducer, capped at 60 characters with an ellipsis. For a **connected** host this is the agent count (`"3 agents"`), not state text; absent when the band shows no rollup at all. It is what the next frame draws — nothing here asserts a frame was painted.
 - `retry` — a `RetrySchedule`, absent unless an auto-reconnect is armed. `delay_ms` is the delay the timer was armed with (not what is left) and `armed_at` is when, so a caller can compute the remainder. `attempt` (1-based, the `3` in the band's `(3/10)`) and `budget` come with the **ssh** ladder only: a localhost retry is the connection task's own backoff whose counter never leaves the task, so it reports `delay_ms` alone.
 - `payload_kind` — what the last attach this client accepted on this host is being **decoded as**, one of [`payload_kinds`](#sessionidentify)' spellings. `"vt"` is the fallback a libghostty build skew lands on; such a host connects normally, the dot deliberately stays green, at that payload's [documented fidelity](#payload-kinds). Absent until a tab has actually attached over the *live* connection — it reports what is being decoded, never what could be — and it goes when that connection does, so a reconnect to a matching daemon cannot keep claiming a fallback it is no longer on.
+- `taken_by` — who holds this host's **foreground**, when it is not this client: present exactly while `state` is `taken-over`, carrying the claimant's own `session.connect{client_label}` as it reported itself — normalized, never authenticated, so render it as what the client *says* it is. Absent otherwise, including after this client takes the foreground back. This is the field the band's `taken over by ‹name›` and the terminal's foreground strip are built from; a poller watching for a takeover reads `state`, and reads this to say who.
 - `connect` — a `HostConnectStatus`, present only while the connection is live, naming what the prologue established **before any tab attaches** — this is what the sidebar's `reduced fidelity` indicator, the update/restart offers, and the CLI's fidelity line all key on, rather than `payload_kind`, which is lazy until an attach. `session_id` is the session's own id from `session.identify`. `reduced_fidelity` is `true` when this client and the session pin different libghostty builds and the connection fell back to `vt` — the same condition `payload_kind` will read `"vt"` for once something attaches. `resumed` says whether this connection's prologue replayed missed events (`events.subscribe {from_revision, session_id}`, R11/#442) instead of taking a fresh `tab.list`; `from_revision` is the revision it resumed from, as the session's subscribe ack attested it, present only when `resumed` is `true`. None of this bumped `SESSION_PROTOCOL_VERSION` — both fields are additive on the **UI** socket only.
 - `tabs` — how many tab rows this host's sidebar section is listing right now, always present (`0` included). The "5 tabs" a person reads, and the observable a poller uses to confirm a reconnect never blanked the section (R11: the client keeps drawing the carried mirror through `Connecting` rather than purging it before the fresh one lands).
 - `retry.reason` — **why** this rung is armed: the classified failure's own copy, in the same words the give-up line uses for it. It is a separate field from the `reason` above because that one is the band's input and `rollup` is derived from it — while a rung is armed the band has to read `reconnecting in 8s (3/10)`, so the family needs its own slot or it is unreadable until the attempt settles. ssh-only, like `attempt`/`budget`. **The rule for a caller is simply: read it when it is present.** Do not gate on `attempt` — the number is not a proxy in either direction. Absence is ordinary rather than a fault: the drop that *starts* an outage is usually the live connection dying, a bare bridge EOF with nothing to classify, and the classified copy arrives with the next dial's failure; a later rung armed by another connection coming up and dying reads absent again for the same reason. And presence is not confined to later rungs — a suspend/wake resets the ladder to `attempt: 1` while deliberately carrying the family it already had, because it is still the same outage.
@@ -1791,11 +1792,13 @@ stream:
 ```
 
 `reason` is `"stop"` (the session is shutting down) or `"taken-over"`
-(a takeover closed this connection). On an **event stream** only
-`"stop"` is reachable: a takeover no longer ends a surviving stream, it
-demotes it and says so with the non-terminal envelope below.
-`"taken-over"` remains the terminal reason on the **control and data**
-connections a takeover does close. It carries **no `revision`** and
+(a takeover closed this connection). Since plan 057 (R15) **only
+`"stop"` is reachable at all**: a takeover closes nothing — not the
+event stream, which it demotes and tells with the non-terminal envelope
+below, and not the control or data connections, which it leaves exactly
+where they were. `"taken-over"` stays in the schema because a session
+predating `open_input` still sends it, and a client that has to work
+against both must still decode it. It carries **no `revision`** and
 is exempt from the gap check below: it is not a commit, it is the
 stream saying why it is over, and it is always the last frame before
 the close.
@@ -2805,8 +2808,8 @@ the bytes after it are frames:
 | Code | Meaning |
 |---|---|
 | `protocol-mismatch` | wrong `protocol_version`. Checked **before** the token: the two ends disagree about what a token even is, and `invalid-token` would send the client hunting for the wrong bug. |
-| `invalid-token` | unknown, expired, already-used, or purged by a takeover. |
-| `taken-over` | the lease the token was minted under is no longer current. |
+| `invalid-token` | unknown, expired, already-used, or minted by a control connection that has since gone away (see [`tab.attach`](#tabattach)). A takeover purges no tokens. |
+| `taken-over` | **only from a session predating `open_input`**, where a ticket was bound to the lease that minted it. This session mints tickets against the connection instead, so a takeover leaves them valid and this code is never sent. Kept here because a client that talks to both has to decode it. |
 | `not-found` | the tab has no live terminal, or was respawned between `tab.attach` and this handshake. |
 | `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. For `vt` this also covers a terminal whose VT parser sits mid-sequence with no retained continuation for the whole attach budget: the encode is parked and retried after each further chunk rather than emitting a payload that would desync the client, and the budget is what bounds that wait. |
 | `shutting-down` | `session.stop` has latched. |

@@ -844,7 +844,8 @@ mutations (`tab.open`, `project.*`, `tab.agent_report`) stay lease-free,
 same-UID control-plane use exactly as before.
 
 **Takeover stopped being terminal for event streams.** A driver's
-control and data connections still close on takeover, same as always,
+control and data connections still close on takeover, same as always
+*(reversed by [DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08): a takeover now closes nothing)*,
 but its event stream now survives, reclassified to observer in place
 and told once via the new non-terminal `session.driver_changed{taken_by}`
 envelope — the sibling of the terminal `session.stopping`, not a
