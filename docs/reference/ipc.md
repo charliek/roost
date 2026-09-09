@@ -2646,22 +2646,24 @@ attach that carried the key rather than only to the ones that meant
 something by it. Send `focus: false` only to a session advertising
 `open_input` in [`session.identify`](#sessionidentify).
 
-**The accepted handshake reports the snapshot's own geometry.**
-`snapshot_cols` / `snapshot_rows` on the [data
-connection's](#the-handshake) accepted reply name the size the payload
-was encoded at, and are present for every snapshot attach — focused or
-not. A focused attach did resize the tab, but on the control connection
-and before this data connection was dialed; raw input is open, so
-another client's geometry-bearing frame can land in between and resize
-the tab again, and only the encode knows what it composed. A `vt` client
-needs the answer: that payload replays into a terminal *of the attach
-geometry*, and replaying it at another width wraps lines and misplaces
-absolute cursor moves, so such a client hydrates at this size and
-resizes its own terminal afterwards. When the size matches what was
-asked for the fields change nothing. A resume encodes no snapshot and
-carries neither. Both keys are additive — a client that has never heard
-of them ignores them, and one reading an older session's reply simply
-finds neither.
+**The accepted handshake reports the geometry its bytes were written
+for.** `snapshot_cols` / `snapshot_rows` on the [data
+connection's](#the-handshake) accepted reply name that size — the
+payload's encode geometry in snapshot mode, the tab's own grid at the
+handoff in resume mode — and are present on every accepted reply,
+focused or not, either mode. A focused attach did resize the tab, but on
+the control connection and before this data connection was dialed; raw
+input is open, so another client's geometry-bearing frame can land in
+between and resize the tab again, and only the server knows what the
+bytes ended up saying. A `vt` client needs the answer: that payload
+replays into a terminal *of the attach geometry*, and replaying it at
+another width wraps lines and misplaces absolute cursor moves, so such a
+client hydrates at this size and resizes its own terminal afterwards. A
+resuming client replays the ring into the terminal it kept, which has
+the same problem for the same reason. When the size matches what was
+asked for the fields change nothing. Both keys are additive — a client
+that has never heard of them ignores them, and one reading an older
+session's reply simply finds neither.
 
 `attach_token` is 32 hex characters, the same bearer credential the
 lease is and under the same no-logging rule. It is:
@@ -2828,14 +2830,17 @@ The control-plane `TabAttachResult.kind` must agree; a client that sees
 them disagree treats it as `protocol-error` and re-attaches rather than
 guessing which to believe.
 
-`snapshot_cols` and `snapshot_rows` name **the size the snapshot was
-actually encoded at**, and are present on every snapshot reply —
-`focus: true` included, because a focused attach resizes the tab from
-the control connection and any other client may resize it again before
-the encode runs. A `vt` client builds its terminal at that size before
-replaying, then resizes it to its own; see [`tab.attach`](#tabattach).
-Absent on a resume (there is no fresh snapshot), and absent from every
-reply a session predating `open_input` writes.
+`snapshot_cols` and `snapshot_rows` name **the size the bytes that
+follow were written for** — the snapshot's own encode geometry in
+`"snapshot"` mode, the tab's grid at the handoff in `"resume"` mode —
+and are present on every accepted reply, `focus: true` included, because
+a focused attach resizes the tab from the control connection and any
+other client may resize it again before the encode or the handoff runs.
+A `vt` client builds its terminal at that size before replaying, then
+resizes it to its own; a resuming client replays the ring into the
+terminal it kept, and the geometry it was away for may not be the one it
+left. See [`tab.attach`](#tabattach). Absent only from a reply a session
+predating `open_input` writes.
 
 #### Preamble and frames
 

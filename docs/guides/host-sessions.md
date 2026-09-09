@@ -232,7 +232,7 @@ This feature moved the session protocol version, which means a Roost with it **c
 
 ## Takeover
 
-**Two windows can type into the same tab at the same time.** A second Roost window, a script, a phone — any client on the same machine as the session may attach to a tab and put bytes in it. Nothing has to be taken from anybody first, and nothing is closed when somebody else joins.
+**Two windows can type into the same tab at the same time.** A second Roost window, a script, a phone over an SSH forward — any client that can open the session's socket **as the user running it** may attach to a tab and put bytes in it. Same-UID access to that socket is the whole boundary, and always was: another person logged into the same box cannot open it. What admits a client is not being on the machine, it is being you. Nothing has to be taken from anybody first, and nothing is closed when somebody else joins.
 
 What a session does hold one of is the **foreground**. Connecting to a host claims it, and connecting from somewhere else moves it. The foreground is a short list:
 
@@ -247,7 +247,7 @@ So when another client connects to a host you have open, **nothing freezes**. Yo
 
 (or, when the new connection gave no name: "‹label› is driven by another client.") "Reporting itself as" is deliberate wording, not a hedge you can ignore: the name is whatever the connecting client typed for itself — a hostname, an app name — and nothing here verifies it. Treat it as a hint, not an identity. The sidebar band says the same thing more briefly — *taken over by ‹taken_by›* — beside a dot that stays green, because the host really is connected.
 
-While another client has the foreground, an upload is refused with *"‹label› is driven by ‹taken_by›; take the foreground to upload"* rather than attempted, and effects for that host go to them instead of you.
+While another client has the foreground, an upload is refused with *"‹label› is driven by ‹taken_by›; take the foreground first"* rather than attempted, and effects for that host go to them instead of you.
 
 **"Take the foreground"** — the line's button, the sidebar's ↻ row, and the palette's Connect verb are all the same action — takes it back **in place** on a `localhost` host: no reconnect, no reattach, no fresh snapshot, the connection you already have claims the foreground again and the grid does not blink. It does not resize the tab either, so whatever size the other client left it at is the size it stays until somebody types.
 

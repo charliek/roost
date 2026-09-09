@@ -73,14 +73,18 @@ impl std::fmt::Display for HostOpError {
             HostOpError::Transport(error) => write!(f, "connection lost: {error}"),
             HostOpError::Unavailable => f.write_str("the host is not accepting operations"),
             HostOpError::Local(message) => f.write_str(message),
+            // The remedy names no verb: this variant answers every
+            // lease-required op — `session.set_focus`, `session.set_theme`
+            // and `session.set_agent_hooks` as well as `session.put_file`
+            // — and most of them have no reply channel, so the sentence
+            // is what the log says happened. A surface that wants "to
+            // upload" on the end can add it; the shared one must not
+            // claim an upload for a focus.
             HostOpError::NotForeground { label, taken_by } => match taken_by {
-                Some(taker) => write!(
-                    f,
-                    "{label} is driven by {taker}; take the foreground to upload"
-                ),
+                Some(taker) => write!(f, "{label} is driven by {taker}; take the foreground first"),
                 None => write!(
                     f,
-                    "{label} is driven by another client; take the foreground to upload"
+                    "{label} is driven by another client; take the foreground first"
                 ),
             },
         }
@@ -549,6 +553,39 @@ mod tests {
         // param, so omitting it would turn `taken-over` into
         // `invalid-param` and hide which side is at fault.
         assert_eq!(LeasePolicy::Required.present(""), Some(""));
+    }
+
+    /// The refusal reads for every op it answers, not just the one it
+    /// was written for.
+    ///
+    /// `NotForeground` is what `serve_deposed` hands back to *every*
+    /// `LeasePolicy::Required` intent — `session.set_focus`,
+    /// `session.set_theme` and `session.set_agent_hooks` as much as
+    /// `session.put_file` — and three of those four are
+    /// fire-and-forget, so this sentence is what the log records
+    /// happened. Naming the upload there would put an upload in the log
+    /// for a focus that was never one.
+    #[test]
+    fn the_not_foreground_sentence_names_no_operation() {
+        for taken_by in [Some("a phone".to_string()), None] {
+            let refusal = HostOpError::NotForeground {
+                label: "workbox".into(),
+                taken_by,
+            }
+            .to_string();
+            assert!(
+                refusal.starts_with("workbox is driven by "),
+                "the sentence still names who is driving: {refusal}"
+            );
+            assert!(
+                refusal.contains("take the foreground"),
+                "and still says what to do about it: {refusal}"
+            );
+            assert!(
+                !refusal.contains("upload"),
+                "but names no operation, because it answers all four: {refusal}"
+            );
+        }
     }
 
     #[test]

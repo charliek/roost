@@ -256,6 +256,13 @@ pub struct ResumeAt {
     pub last_assigned: u64,
     /// Set once the tab has exited, so a late resume still ends in EXIT.
     pub stored_exit: Option<(u64, i32)>,
+    /// The tab's grid at the handoff, read on the task in the same turn
+    /// the slice was cut. A resuming client replays these records into
+    /// the terminal it kept, and any other client may have resized the
+    /// tab while it was away — so the reply names the size the records
+    /// were written for rather than leaving it to guess.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// The child half of a resize, still in flight. See
@@ -935,7 +942,20 @@ impl TabTask {
 
     /// Queue the child's winsize, handing back the receiver when the
     /// caller wants to hear whether the `ioctl` landed.
+    ///
+    /// A writer that is already gone gets neither the command nor an
+    /// ack. [`Self::flush_writer`] is a no-op from the moment
+    /// `writer_gone` is set, and `pending` is cleared only at that same
+    /// instant — so a command queued afterwards would sit there forever
+    /// with its `oneshot::Sender` inside it, neither sent nor dropped,
+    /// which is the one shape [`await_winsize`] cannot answer promptly:
+    /// it would spend the whole budget and then report a failure. There
+    /// is no child left to tell, and no ack is exactly how the caller
+    /// spells the success [`await_winsize`] promises for that case.
     fn queue_resize(&mut self, size: PtySize, acked: bool) -> Option<WinsizeAck> {
+        if self.writer_gone {
+            return None;
+        }
         let (ack, rx) = if acked {
             let (tx, rx) = oneshot::channel();
             (Some(tx), Some(rx))
@@ -1103,8 +1123,11 @@ impl TabTask {
                                 let _ = ack.send(await_winsize(tab_id, winsize).await);
                             });
                         }
-                        // Nothing to wait for: the geometry was already
-                        // this one, so both halves are at it already.
+                        // Nothing to wait for: either the geometry was
+                        // already this one, so both halves are at it, or
+                        // the PTY writer is gone and there is no child
+                        // half left to tell. An exited tab still serves
+                        // attaches, so the second is a success too.
                         Ok(None) => {
                             let _ = ack.send(Ok(()));
                         }
@@ -1207,6 +1230,8 @@ impl TabTask {
             receiver: self.tee.subscribe(),
             last_assigned,
             stored_exit: self.stored_exit,
+            cols: self.vt.geometry.cols,
+            rows: self.vt.geometry.rows,
         })
     }
 

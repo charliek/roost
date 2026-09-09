@@ -2233,20 +2233,24 @@ pub enum AttachMode {
 /// at the snapshot's own encode point; resume mode fences at
 /// `resume_from_seq - 1`.
 ///
-/// `snapshot_cols`/`snapshot_rows` are the geometry the payload was
-/// actually encoded at. A `vt` client builds its terminal at the attach
-/// geometry, so replaying a payload encoded at another width there
-/// wraps lines and misplaces absolute cursor moves; it hydrates at this
-/// size and resizes afterwards.
+/// `snapshot_cols`/`snapshot_rows` are the geometry the bytes that
+/// follow were written for: in snapshot mode what the payload was
+/// actually encoded at, in resume mode the tab's own grid at the
+/// handoff. A `vt` client builds its terminal at the attach geometry, so
+/// replaying a payload encoded at another width there wraps lines and
+/// misplaces absolute cursor moves; it hydrates at this size and resizes
+/// afterwards. A resuming client replays the ring into the terminal it
+/// kept, which has the same problem for the same reason.
 ///
-/// Sent on **every** snapshot, focused or not. A focused attach did
-/// resize the tab to its own geometry — but on the control connection,
-/// before this data connection was dialed, and raw input is open (plan
-/// 057 R15): any other client's geometry-bearing frame can land in
-/// between and resize the tab again, so "the client asked for it" is not
-/// evidence the payload was composed at it. When the two agree the field
-/// is a no-op. Absent only on a resume (no fresh snapshot), and absent
-/// from every reply a session predating `open_input` writes.
+/// Sent on **every** accepted reply — both modes, focused or not. A
+/// focused attach did resize the tab to its own geometry, and a resuming
+/// client did leave one behind — but the resize ran on the control
+/// connection, before this data connection was dialed, and raw input is
+/// open (plan 057 R15): any other client's geometry-bearing frame can
+/// land in between and resize the tab again, so "the client asked for
+/// it" is not evidence of what the bytes say. When the two agree the
+/// fields are a no-op. Absent only from a reply a session predating
+/// `open_input` writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachAccepted {
     pub kind: AttachPayloadKind,

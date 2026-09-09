@@ -1707,6 +1707,70 @@ async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
     assert!(data.next().await.is_none());
 }
 
+/// A resume names the tab's geometry too, read at the handoff (review
+/// F1).
+///
+/// A resuming client replays the ring into the terminal it *kept*, and
+/// the shared grid can have moved while it was away — every client that
+/// types sizes the tab, and this one was not there to see it. Without
+/// the answer it lays those records out at the width it left, wrapping
+/// every line and misplacing every absolute cursor move until something
+/// resizes it locally.
+///
+/// The window is the same one the snapshot path has: the focused
+/// `tab.attach` sized the tab on the control connection, and the resize
+/// below lands before the ticket is presented. The reply must describe
+/// the tab as it is at the handoff, not as the attach asked for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    let ticket = attach_with(
+        &mut client,
+        sized_attach_params(&lease, tab_id, (100, 30), (8, 16), true),
+    )
+    .await
+    .expect("tab.attach");
+
+    // Somebody else keeps typing at their own size while this client is
+    // still dialing back in.
+    let mut other = h.control().await;
+    let _resized: serde_json::Value = other
+        .call(
+            ops::TAB_RESIZE,
+            TabResizeParams {
+                tab_id,
+                cols: 60,
+                rows: 20,
+            },
+        )
+        .await
+        .expect("tab.resize");
+    wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
+        (d.cols, d.rows) == (60, 20)
+    })
+    .await;
+
+    let (accepted, _data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+    )
+    .await
+    .expect("accepted");
+    assert_eq!(accepted.mode, AttachMode::Resume);
+    assert_eq!(
+        (accepted.snapshot_cols, accepted.snapshot_rows),
+        (Some(60), Some(20)),
+        "a resume names the grid its records were written at, not the one asked for"
+    );
+}
+
 /// `last_assigned + 1` is a hit, not a miss: the client missed nothing,
 /// and an empty slice is the honest answer. It must not be turned into a
 /// snapshot the client already has.

@@ -661,7 +661,7 @@ mod tests {
         );
         assert_eq!(
             refusal.to_string(),
-            "workbox is driven by a phone; take the foreground to upload"
+            "workbox is driven by a phone; take the foreground first"
         );
 
         // A takeover this client only inferred names nobody, and the
@@ -672,7 +672,7 @@ mod tests {
                 .enqueue("shot.png".into(), UploadSource::Bytes(vec![1]))
                 .expect_err("still no lane")
                 .to_string(),
-            "workbox is driven by another client; take the foreground to upload"
+            "workbox is driven by another client; take the foreground first"
         );
 
         // Opening a lane is what proves the foreground came back, so a

@@ -105,8 +105,15 @@ impl Shutdown {
 ///   arms must not be lost.
 ///
 /// The narrow race — the loop exits between the set's read and its raise
-/// — costs one click, and the loop clears both on the way out so no
-/// stale ask can fire against a later deposition.
+/// — costs one click, and never more than that: [`Self::serving`] clears
+/// the ask on **both** edges, so an ask raised against a round that has
+/// already ended cannot be consumed by the next one. Clearing only on
+/// the way down is not enough, because the raise can land after it: the
+/// set reads `in_place` true, the round lowers, and `request()` then
+/// stores a flag over a dead round that the next `serving(true)` would
+/// leave standing for [`serve_deposed`] to consume — a
+/// `session.connect { takeover: true }` nobody asked for, which is
+/// precisely the silent steal-back the probe policy exists to prevent.
 #[derive(Debug, Default)]
 pub(crate) struct Foreground {
     in_place: AtomicBool,
@@ -130,12 +137,11 @@ impl Foreground {
     }
 
     /// Arm or disarm the in-place route, and clear any ask that is no
-    /// longer answerable.
+    /// longer answerable — on either edge. See the struct doc for why
+    /// the raise has to clear one too.
     fn serving(&self, serving: bool) {
         self.in_place.store(serving, Ordering::Release);
-        if !serving {
-            self.requested.store(false, Ordering::Release);
-        }
+        self.requested.store(false, Ordering::Release);
     }
 
     /// Resolves once a takeback has been asked for, and consumes the ask.
@@ -4365,6 +4371,41 @@ mod tests {
             "the deposed connection must refile its facts behind the TakenOver it publishes"
         );
         assert_eq!(states.1[0], states.1[1], "same session, same fidelity");
+    }
+
+    /// An ask raised against a round that has already ended dies with
+    /// it (review F5).
+    ///
+    /// `HostConnSet::take_foreground_in_place` reads `in_place` and
+    /// calls `request()` as two separate steps, and nothing holds a lock
+    /// across them — the round can end in between, which is the "costs
+    /// one click" race the struct doc names. What it must not cost is a
+    /// takeover: a flag left standing over a dead round would be
+    /// consumed by the *next* deposition, and this client would issue
+    /// `session.connect { takeover: true }` that no user asked for.
+    #[test]
+    fn a_takeback_asked_of_a_finished_round_is_not_honoured_by_the_next_one() {
+        let foreground = Foreground::default();
+
+        // A round that ends, with the click landing just too late.
+        foreground.serving(true);
+        foreground.serving(false);
+        foreground.request();
+        assert!(
+            !foreground.in_place(),
+            "nothing is serving, so the set would not have asked"
+        );
+
+        // The next deposition arms the route again, and inherits nothing.
+        foreground.serving(true);
+        assert!(
+            !foreground.took_the_request_for_test(),
+            "a new round must not consume the previous round's ask"
+        );
+
+        // And the route still works when the ask is a live one.
+        foreground.request();
+        assert!(foreground.took_the_request_for_test());
     }
 
     /// Plan 057 §3.5's transport decision, both ways.

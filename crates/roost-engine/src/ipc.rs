@@ -2359,6 +2359,37 @@ fn tab_err(e: crate::tab_task::TabError) -> HandlerError {
     }
 }
 
+/// Why a focused [`tab_attach`] could not size the tab, told apart by
+/// whose problem it is.
+///
+/// A grid the server terminal refused is the caller's `cols`/`rows` to
+/// fix, and that is the only half of a resize that is. The child's half
+/// is not: [`TabError::WinsizeFailed`] covers a `TIOCSWINSZ` that
+/// failed and a child that did not take the size within the budget
+/// alike, and neither says anything about the parameters — calling
+/// those `invalid-param` would make a wedged shell look like a
+/// permanent client error and send every retry of a perfectly good
+/// attach off to fix a geometry that was never wrong. [`tab_err`] has
+/// always called that `internal`; the two paths answer for the same
+/// error and must not disagree about it.
+#[cfg(feature = "server-vt")]
+fn attach_resize_refusal(
+    tab_id: i64,
+    cols: u16,
+    rows: u16,
+    error: &crate::tab_task::TabError,
+) -> HandlerError {
+    use crate::tab_task::TabError;
+    let code = match error {
+        TabError::WinsizeFailed(_) => "internal",
+        _ => "invalid-param",
+    };
+    HandlerError::new(
+        code,
+        format!("tab {tab_id} could not be resized to {cols}x{rows}: {error}"),
+    )
+}
+
 /// Whether the session serving this op was started in test mode. A UI
 /// socket never reaches these arms (`dispatch` routes it to `ui_call`),
 /// so `false` here means a production daemon.
@@ -2949,14 +2980,7 @@ async fn tab_attach(
             // The task dropped the ack without answering, which only
             // happens when the task itself is going away.
             .map_err(|_| tab_gone(p.tab_id))?
-            // The terminal refused the geometry the client asked for,
-            // which is the client's parameter to fix.
-            .map_err(|error| {
-                HandlerError::invalid_param(format!(
-                    "tab {} could not be resized to {}x{}: {error}",
-                    p.tab_id, p.cols, p.rows
-                ))
-            })?;
+            .map_err(|error| attach_resize_refusal(p.tab_id, p.cols, p.rows, &error))?;
     }
 
     let attach_token = session.mint_attach_token(
@@ -4922,6 +4946,53 @@ mod tests {
         let landed = store.put("ok.bin", b"payload").expect("a short name lands");
         assert_eq!(std::fs::read(&landed).expect("read it back"), b"payload");
         assert_eq!(*lock(&store.0.used), 7);
+    }
+
+    /// A focused `tab.attach` that could not size the tab says whose
+    /// problem it was (review F2).
+    ///
+    /// The two halves fail for unrelated reasons and only one of them is
+    /// the caller's. `WinsizeFailed` is the child's — a `TIOCSWINSZ`
+    /// that failed, or a shell wedged past the ack budget — and a client
+    /// told `invalid-param` there would go hunting for a fault in a
+    /// `cols`/`rows` that was never wrong, then see every retry of the
+    /// same legitimate attach refused the same permanent-sounding way.
+    #[cfg(feature = "server-vt")]
+    #[test]
+    fn an_attach_resize_refusal_blames_the_geometry_only_when_the_terminal_refused_it() {
+        use crate::tab_task::TabError;
+
+        let child = attach_resize_refusal(
+            7,
+            80,
+            24,
+            &TabError::WinsizeFailed(
+                "the child did not take the new size within the budget".into(),
+            ),
+        );
+        assert_eq!(
+            child.code, "internal",
+            "a wedged child is not a parameter the caller can fix"
+        );
+        assert_eq!(
+            child.code,
+            tab_err(TabError::WinsizeFailed("ioctl".into())).code,
+            "and the two paths that answer for this error must agree"
+        );
+        assert!(
+            child
+                .message
+                .contains("tab 7 could not be resized to 80x24"),
+            "the message still names what was attempted: {}",
+            child.message
+        );
+
+        let refused = attach_resize_refusal(7, 0, 24, &TabError::Render("cols must be > 0".into()));
+        assert_eq!(
+            refused.code, "invalid-param",
+            "a grid the terminal itself refused is the caller's to fix"
+        );
+        assert!(refused.message.contains("cols must be > 0"));
     }
 
     /// The screen in front of the typed decode: coarse by construction

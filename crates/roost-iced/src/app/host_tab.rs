@@ -261,11 +261,12 @@ struct Hydration {
     /// Bounded stepping left pages behind; a `StepDecoder` self-wake is
     /// in flight.
     stepping: bool,
-    /// The cols/rows the terminal being built here is at — the attach
-    /// geometry, or the snapshot's own where the session reported one
-    /// (`AttachAccepted.snapshot_cols/rows`, an unfocused attach). What
-    /// [`HostAttach::finish_hydration`] resizes *from* once the payload
-    /// is whole; nothing else touches it while the hydration runs.
+    /// The cols/rows the terminal being built here is at — the
+    /// snapshot's own where the session reported one
+    /// (`AttachAccepted.snapshot_cols/rows`), this attach's otherwise.
+    /// What [`HostAttach::finish_hydration`] resizes *from* once the
+    /// payload is whole; nothing else touches it while the hydration
+    /// runs.
     built_at: (u16, u16),
 }
 
@@ -534,9 +535,11 @@ impl HostAttach {
                     }
                 } else {
                     // The payload's own geometry when the session named
-                    // one, this attach's otherwise. A session names one
-                    // only for an unfocused attach, which resized
-                    // nothing — and replaying a payload composed at
+                    // one, this attach's otherwise. A session names it
+                    // whenever it can — this attach's own request is no
+                    // evidence, because raw input is open and anything
+                    // else may have sized the tab between the resize and
+                    // the encode. Replaying a payload composed at
                     // another width into a terminal of this width wraps
                     // its lines and misplaces its absolute cursor moves,
                     // so the terminal is built at the payload's size and

@@ -232,7 +232,7 @@ async fn attach_tab(
         server_epoch,
         tab_generation: live_generation,
         snapshot,
-        snapshot_size,
+        reported_size,
         ready_end,
         terminator,
         snap_frame_bytes,
@@ -253,15 +253,15 @@ async fn attach_tab(
         return;
     }
 
-    // Reported for every snapshot, focused or not (a resume encodes none
-    // and carries nothing). A focused attach did resize the tab to its
-    // own geometry — but on the *control* connection, before this one
-    // was dialed, and a `vt` encode can defer and retry inside the
-    // attach budget. Any other client's geometry-bearing INPUT landing
-    // in that window resizes the tab again, and this is the only place
-    // that says what the payload was actually composed at. Sending it
-    // costs a client that already agrees nothing: it hydrates at a size
-    // it is already at.
+    // Reported on every accepted reply, snapshot or resume, focused or
+    // not. A focused attach did resize the tab to its own geometry — but
+    // on the *control* connection, before this one was dialed, and a
+    // `vt` encode can defer and retry inside the attach budget. Any
+    // other client's geometry-bearing INPUT landing in that window
+    // resizes the tab again, and this is the only place that says what
+    // the bytes to follow were actually written for. Sending it costs a
+    // client that already agrees nothing: it hydrates at a size it is
+    // already at.
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
         // What `tab.attach` negotiated, carried here on the ticket: the
         // data connection presents only a token, and a client that
@@ -271,8 +271,8 @@ async fn attach_tab(
         seq: fence,
         server_epoch,
         tab_generation: live_generation,
-        snapshot_cols: snapshot_size.map(|(cols, _)| cols),
-        snapshot_rows: snapshot_size.map(|(_, rows)| rows),
+        snapshot_cols: Some(reported_size.0),
+        snapshot_rows: Some(reported_size.1),
     });
     let Ok(body) = serde_json::to_vec(&accepted) else {
         return;
@@ -320,9 +320,12 @@ struct Attached {
     tab_generation: u64,
     /// Empty in resume mode — the client already has this history.
     snapshot: Vec<u8>,
-    /// The grid the snapshot was encoded at, read on the tab task at the
-    /// encode. `None` in resume mode, which encodes nothing.
-    snapshot_size: Option<(u16, u16)>,
+    /// The grid the bytes that follow were written for, read on the tab
+    /// task: the snapshot's encode geometry, or in resume mode the
+    /// tab's own at the handoff. Always known, which is why it is not an
+    /// `Option` the way the wire fields are — those are absent only from
+    /// a session that predates them.
+    reported_size: (u16, u16),
     ready_end: usize,
     /// Whether a zero-length `SNAP` frame ends the snapshot half.
     ///
@@ -419,7 +422,7 @@ async fn fence_tab(
         seq: snapshot.seq,
         server_epoch: snapshot.server_epoch,
         tab_generation: snapshot.tab_generation,
-        snapshot_size: Some((snapshot.cols, snapshot.rows)),
+        reported_size: (snapshot.cols, snapshot.rows),
         snapshot: snapshot.bytes,
         ready_end,
         terminator: is_vt,
@@ -501,7 +504,14 @@ async fn resume_tab(
         server_epoch,
         tab_generation: live_generation,
         snapshot: Vec::new(),
-        snapshot_size: None,
+        // The tab's size at the handoff, cut from the same turn of the
+        // task as the ring slice: a client that was away can have had
+        // the shared geometry changed under it by whoever kept typing,
+        // and replaying those records into the terminal it kept at the
+        // old width wraps every line and misplaces every absolute cursor
+        // move. Read here rather than after the await — a resize landing
+        // in between would describe records this reply does not carry.
+        reported_size: (resumed.cols, resumed.rows),
         ready_end: 0,
         terminator: false,
         snap_frame_bytes: MAX_DATA_FRAME_BYTES,

@@ -461,12 +461,12 @@ class Reply:
     seq: int = 0
     server_epoch: int = 0
     tab_generation: int = 0
-    #: The geometry the payload was encoded at, when the server said —
-    #: every snapshot attach, focused or not: a focused attach resizes
-    #: from the control connection, and anything else may resize the tab
-    #: again before the encode runs. `None` on a resume (no fresh
-    #: snapshot) and from a session predating `open_input`, so an absent
-    #: pair is an answer rather than a missing field.
+    #: The geometry the bytes that follow were written for, when the
+    #: server said — every accepted reply, either mode, focused or not:
+    #: a focused attach resizes from the control connection, and anything
+    #: else may resize the tab again before the encode or the resume
+    #: handoff runs. `None` only from a session predating `open_input`,
+    #: so an absent pair is an answer rather than a missing field.
     snapshot_cols: int | None = None
     snapshot_rows: int | None = None
     code: str = ""

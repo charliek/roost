@@ -1088,6 +1088,90 @@ async fn an_acked_resize_waits_for_the_childs_winsize() {
     sup.close(933);
 }
 
+/// A resize acked after the PTY writer is gone answers at once, and
+/// answers success (review F3).
+///
+/// `await_winsize` states the contract: a dropped ack is **not** a
+/// failure, because there is no child left to tell — the state an
+/// exited tab sits in while it still serves attaches. The queue broke
+/// that promise exactly when it was needed. `flush_writer` returns
+/// early once `writer_gone` is set and `pending` is cleared only at
+/// that instant, so a `WriterCmd::Resize` queued afterwards parked
+/// there forever with its `oneshot::Sender` inside it — neither sent
+/// nor dropped, the one shape the wait cannot resolve. It spent the
+/// whole `WINSIZE_ACK_BUDGET` and then reported the opposite of the
+/// truth, which a focused `tab.attach` turns into a refused attach five
+/// seconds late.
+///
+/// The *first* resize after the writer's death was never the bug: its
+/// own `try_send` is what discovers the closed channel, and clearing
+/// the queue drops the sender. Every one after it is, which is why this
+/// asks more than once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_acked_after_the_writer_is_gone_answers_at_once() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let mut output = sup
+        .spawn(934, "/tmp", &sh("exit 0"), 20, 6, &socket("writer-gone"))
+        .expect("spawn");
+    let commands = sup.tab_commands(934).expect("server-vt tab task");
+
+    loop {
+        match timeout(BUDGET, output.recv()).await {
+            Ok(Ok(PtyOutputEvent::Exit { .. })) => break,
+            Ok(Ok(_)) => continue,
+            other => panic!("expected an Exit event, got {other:?}"),
+        }
+    }
+    // The child took the slave with it, so this write to the master
+    // fails and the writer task ends — the only way a tab reaches
+    // `writer_gone` at all.
+    commands
+        .send(TabCmd::Input {
+            data: b"x\n".to_vec(),
+            geometry: None,
+        })
+        .await
+        .expect("the tab task outlives its child");
+
+    // Each geometry differs from the last, because an unchanged one
+    // short-circuits before the queue is reached and would prove
+    // nothing. A second below the ack budget: what is being asserted is
+    // that nothing here waits on it.
+    for (attempt, rows) in (7..=12u16).enumerate() {
+        let (tx, rx) = oneshot::channel();
+        commands
+            .send(TabCmd::Resize {
+                geometry: Geometry {
+                    cols: 40,
+                    rows,
+                    cell_w: 8,
+                    cell_h: 16,
+                },
+                ack: Some(tx),
+            })
+            .await
+            .expect("the tab task outlives its child");
+        timeout(Duration::from_secs(1), rx)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("resize {attempt} sat out the winsize budget with no writer to wait for")
+            })
+            .expect("the task answers rather than dropping the ack")
+            .unwrap_or_else(|error| {
+                panic!("resize {attempt} must succeed with no child left to tell: {error}")
+            });
+    }
+    let dump = quiesce(&commands).await;
+    assert_eq!(
+        (dump.cols, dump.rows),
+        (40, 12),
+        "and the server terminal half applied every one of them"
+    );
+
+    drop(commands);
+    sup.close(934);
+}
+
 /// OSC that carries workspace facts still reaches the workspace — the
 /// job `drain.rs` did in HS-1a, now done by the task that also owns the
 /// terminal. Client-local effects take the other seam (`tab_effect`),
