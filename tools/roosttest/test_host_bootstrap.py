@@ -1583,34 +1583,37 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
 
 
 # ---------------------------------------------------------------------------
-# 11. Issue #376 regression: refuse paste into a frozen host frame
+# 11. Issue #376 regression: the paste gate is the attach, not the host state
 # ---------------------------------------------------------------------------
 
 
-def test_paste_into_a_frozen_host_frame_is_refused(roost: Roost):
-    """The regression test for plan 039 C9 (§3.11), landing here per the
-    plan's own instruction ("whichever lands second wires it").
+def test_paste_into_a_taken_over_host_still_lands(roost: Roost):
+    """The other half of plan 039 C9 (§3.11), inverted by plan 057 §3.5,
+    and landing here per the plan's own instruction ("whichever lands
+    second wires it").
 
     `paste_into_active` (`crates/roost-iced/src/app/interactions.rs`)
-    now returns `Result<UiTask, String>` and refuses before the
-    clipboard is ever read when the active tab's host is frozen
-    (`TakenOver`/`Stopped`). `app.keybind_dispatch` is the test-mode IPC
-    op that drives `KeybindAction::Paste` through the same dispatcher a
-    real key event or native menu click reaches
-    (`crates/roost-iced/src/app.rs`), since the accelerator has no other
-    IPC back door.
+    refuses before the clipboard is ever read when nothing is attached to
+    read what would be pasted — which is #376's bug, and still the rule.
+    What changed is what "nothing is attached" means: a takeover closes no
+    data connection any more, so a taken-over host tab is streaming, owns
+    the keyboard, and takes a paste like any other. The gate is the
+    *attach phase*; the host's connection state is not consulted.
 
-    What this case can assert, and what it cannot. The refusal's own
-    sentence goes to the status banner and the log
-    (`dispatch_keybind_action`'s Err arm) and no op reports either, so
-    the copy is fenced where it is written — `host_notice.rs`'s
-    `paste_refusal_names_state_and_remedy_distinctly` — not from here.
-    What is op-visible is the state the refusal is a function of, held
-    across the dispatch: the host stays frozen at `taken-over`, the
-    keybind starts no attempt of its own (`generation` unmoved), and
-    nothing raises a card over the frozen frame. The dispatch answering
-    at all is the third claim — refused inside the dispatcher, which is
-    where the guard lives, rather than erroring at the op.
+    `app.keybind_dispatch` is the test-mode IPC op that drives
+    `KeybindAction::Paste` through the same dispatcher a real key event or
+    native menu click reaches (`crates/roost-iced/src/app.rs`), since the
+    accelerator has no other IPC back door.
+
+    What this case can assert, and what it cannot. Whether a paste was
+    refused is not op-visible — the sentence goes to the status banner
+    and the log — so the copy is fenced where it is written
+    (`host_notice.rs`) and the routing is pinned in `host_tab.rs`'s phase
+    table. What *is* op-visible is the keyboard route the paste follows
+    (`app.active_terminal_focused`, `false` for every frozen frame this
+    used to describe) and the state around the dispatch: the host stays
+    `taken-over`, the keybind starts no attempt of its own (`generation`
+    unmoved), and nothing raises a card over the live frame.
     """
     session_env = sessionlib.make_env()
     try:
@@ -1619,22 +1622,43 @@ def test_paste_into_a_frozen_host_frame_is_refused(roost: Roost):
             host.connect_and_wait()
             with host.client() as session:
                 tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
-                host_key(roost, tab)
+                key = host_key(roost, tab)
+                # Read the tab's size only once this window's attach has
+                # actually landed — `tab.attach` resizes the tab to the
+                # client's grid before it mints its ticket, so a size read
+                # before the first payload is still the open-time one.
+                line = marker("LIVE")
+                session.tab_feed_pty_bytes(tab, f"{line}\r\n".encode())
+                wait_dump_contains(roost, key, line)
+                sized = session.dump(tab)
 
             with host.client() as interloper:
                 lease = HostUnderTest.lease(interloper, takeover=True)
                 with EventStream(host.env.socket, lease=lease):
                     host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
 
-                    frozen = status(host)
-                    assert frozen["state"] == "taken-over", frozen
+                    deposed = status(host)
+                    assert deposed["state"] == "taken-over", deposed
+                    assert roost.app_active_terminal_focused() is True, (
+                        "a deposed host tab still owns the keyboard, so a paste "
+                        "has somewhere to go"
+                    )
+
+                    # The line that says who is driving is an overlay: it
+                    # must not take a row off the grid, because the grid
+                    # is what sizes the shared PTY.
+                    after = interloper.dump(tab)
+                    assert (after["cols"], after["rows"]) == (
+                        sized["cols"],
+                        sized["rows"],
+                    ), f"the takeover resized the tab: {sized} -> {after}"
 
                     roost.call("app.keybind_dispatch", {"action": "paste"})
 
                     def nothing_moved() -> None:
                         row = status(host)
                         assert row["state"] == "taken-over", row
-                        assert row["generation"] == frozen["generation"], row
+                        assert row["generation"] == deposed["generation"], row
                         dump = dialog_dump(roost)
                         assert dump.get("dialog") is None, dump
 

@@ -59,7 +59,7 @@ roostctl host connect --id <the id host add printed>
 
 A remote host never auto-connects at launch — Roost doesn't even reach for it, so it simply sits disconnected until you Connect. That's deliberate: connecting to a remote machine is an outbound decision that costs a handshake and can fail loudly, and when Roost has only just opened, nobody has asked for it. Once you've connected it, though, a remote host behaves like `localhost` again for a *mid-session* drop: close your laptop, let Wi-Fi hiccup, whatever kills the link — Roost notices and retries on its own, with a growing delay (up to 30 seconds) shown right in the sidebar band as `reconnecting in Ns (k/10)`. If ten attempts don't get it back it settles with `reconnect gave up after 10 tries`, and ↻ Reconnect — which was on screen the whole time — is exactly the button you'd have clicked anyway. Not every failure gets retried this way: a changed or unknown host key, a rejected login, and a session that's genuinely gone each settle immediately instead, because each of those needs a person to do something different — see [Troubleshooting](#troubleshooting) below for what a failed SSH connect looks like and how to recover.
 
-A rebooted remote machine is the one case that never grows a ladder: it comes back with no `roost-session` running at all, so the very first reconnect attempt classifies as "no session" and settles right away (see the [no-session row](#troubleshooting) below) rather than retrying. If you want a host to survive its own reboots without you having to reconnect by hand, run `roostctl session autostart install` on that machine to set up the `systemd --user` unit, then enable lingering for that user — `loginctl enable-linger <user>` — so the unit starts at boot instead of waiting for a login (the verb sets up the unit; it doesn't run `enable-linger` for you, since that's a system-wide `loginctl` grant, not something scoped to one artifact). With that in place the session is already up by the time Roost's client retries, and auto-reconnect covers the rest. See [Surviving reboots and logouts](#surviving-reboots-launchd) below for what the unit looks like and macOS's equivalent.
+A rebooted remote machine is the one case that never grows a ladder: it comes back with no `roost-session` running at all, so the very first reconnect attempt classifies as "no session" and settles right away (see the [no-session row](#troubleshooting) below) rather than retrying. Roost ships no supervisor for `roost-session` itself; if you want a host to survive its own reboots without reconnecting by hand, run `roost-session` under a unit you write yourself. See [Surviving reboots and logouts](#surviving-reboots-launchd) below for a unit that works and the reasoning behind it.
 
 ### Scripted / fallback forwarding with `ssh -N -L`
 
@@ -232,19 +232,32 @@ This feature moved the session protocol version, which means a Roost with it **c
 
 ## Takeover
 
-A session holds one interactive lease at a time — the authority to type into a tab. If you connect to the same host from a second window (a second machine, or the same machine after a crash left the first window's connection stale), the new connection **takes over**: it gets the lease, and the *displaced* window is told who took it.
+**Two windows can type into the same tab at the same time.** A second Roost window, a script, a phone over an SSH forward — any client that can open the session's socket **as the user running it** may attach to a tab and put bytes in it. Same-UID access to that socket is the whole boundary, and always was: another person logged into the same box cannot open it. What admits a client is not being on the machine, it is being you. Nothing has to be taken from anybody first, and nothing is closed when somebody else joins.
 
-The displaced window's banner now names the taker, whenever the connecting client stated one:
+What a session does hold one of is the **foreground**. Connecting to a host claims it, and connecting from somewhere else moves it. The foreground is a short list:
 
-> **‹label› was taken over by a client reporting itself as ‹taken_by›.** [Reconnect here]
+- **effects** — a bell, an OSC 52 clipboard write, an agent notification — go to the foreground client, so a copy from a shell lands on the machine you are sitting at rather than on all of them;
+- **focus** — which tab your window has open, and therefore which notifications are muted, is the foreground client's to declare;
+- **who sized the PTY last** — every client that types or resizes sets the tab's size, and taking the foreground does not by itself resize anything;
+- and the session-wide settings: the theme, the agent-hook mode, and file uploads (`tab.send_file`, drag-and-drop, a pasted image).
 
-(or, when the new connection gave no name: "‹label› was taken over by another client.") "Reporting itself as" is deliberate wording, not a hedge you can ignore: the name is whatever the connecting client typed for itself — a hostname, an app name — and nothing here verifies it. Treat it as a hint, not an identity.
+So when another client connects to a host you have open, **nothing freezes**. Your terminal keeps redrawing, your keystrokes keep landing, your tabs keep switching, your sidebar keeps listing. A line appears over the top of the grid saying who has the foreground:
 
-Only the **terminal frame** freezes. The tab list, titles, agent status, and notifications for that host keep updating live underneath the banner — you can still see what's running and get notified about it, you just can't type into it or watch the screen redraw until you take it back. That's a deliberate split: watching a session is not the same act as driving it, so losing the lease doesn't mean losing the picture.
+> **‹label› is driven by a client reporting itself as ‹taken_by›.** [Take the foreground]
 
-"Reconnect here" is an ordinary Connect: it takes the lease back, and the terminal frame comes back live with it. There's no data loss either way — the shells themselves don't care who's driving; only the interactive connection moves.
+(or, when the new connection gave no name: "‹label› is driven by another client.") "Reporting itself as" is deliberate wording, not a hedge you can ignore: the name is whatever the connecting client typed for itself — a hostname, an app name — and nothing here verifies it. Treat it as a hint, not an identity. The sidebar band says the same thing more briefly — *taken over by ‹taken_by›* — beside a dot that stays green, because the host really is connected.
 
-**Reading a session never needs the lease at all**, which is the same mechanism that keeps the displaced window's tab list and notifications live above. A second client that dials a host and asks only to watch — a script, a monitoring tool, a future phone client — sees the same live tab list, titles, and notifications, with no terminal frame and no risk of displacing whoever is actually driving, because it never asks for the lease in the first place. Watching is not degraded driving; it is the normal way to look at a session you don't hold.
+While another client has the foreground, an upload is refused with *"‹label› is driven by ‹taken_by›; take the foreground first"* rather than attempted, and effects for that host go to them instead of you.
+
+**"Take the foreground"** — the line's button, the sidebar's ↻ row, and the palette's Connect verb are all the same action — takes it back **in place** on a `localhost` host: no reconnect, no reattach, no fresh snapshot, the connection you already have claims the foreground again and the grid does not blink. It does not resize the tab either, so whatever size the other client left it at is the size it stays until somebody types.
+
+On a host reached **over SSH** the same button does a full reconnect instead. Reconnecting there rebuilds the tunnel and the bridge socket underneath, so there is no surviving connection to claim the foreground on — the tabs come back attached and focused, which does resize them to this window's grid. The outcome is the same, it just costs a reattach; tracked as future work.
+
+**Reading a session never needs the foreground at all** — and since this change, neither does typing into one. A client that dials a host and asks only to watch — a script, a monitoring tool, a future phone client — sees the same live tab list, titles and notifications with no risk of moving the foreground, because it never asks for it. Watching is not degraded driving; it is the normal way to look at a session you don't hold.
+
+### Against an older session
+
+A `roost-session` from before this change closes the displaced client's connections on a takeover, exactly as it always did. Against one of those you get the old behaviour: the terminal frame stops updating, the band reads *taken over*, and ↻ is a **full reconnect** — a new connection, a fresh attach, and a takeover of its own. Nothing is lost either way; you just watch it come back rather than never seeing it go. Update the session (see [the upgrade / restart flow](#the-upgrade-restart-flow)) and the in-place behaviour above is what you get.
 
 ## The upgrade / restart flow
 
@@ -311,28 +324,20 @@ This is a deliberate trade: connecting at reduced fidelity beats refusing to con
 
 ## Surviving reboots and logouts {: #surviving-reboots-launchd }
 
-The command *is* the recipe now, on either platform:
+Roost ships no supervisor artifact for `roost-session` — nothing installs
+a unit or a LaunchAgent for you, and nothing needs to: a session comes up
+on demand from whichever client connects first, whether that's the
+localhost launch ladder, the SSH bootstrap ladder, or `roostctl session
+start` run by hand. If you want a host to survive its own reboots
+anyway — so it's already up by the time your next reconnect attempt
+lands — write the unit yourself. Here's one that works.
 
-```bash
-roostctl session autostart install
-```
-
-This writes and loads one supervisor artifact for `roost-session` — a
-`systemd --user` unit on Linux, a `launchd` LaunchAgent on macOS — and
-confirms a session answers before it returns. It's **opt-in**: nothing
-calls this for you, and it never interrupts a session that's already
-running — see [`session autostart install` /
-`uninstall`](../reference/cli.md#session-autostart-install-uninstall)
-for the full verb reference, including `--force` and what `roostctl
-session status`'s new `autostart=` line reports.
-
-**Linux** writes `~/.config/systemd/user/roost-session.service`
-(honoring `XDG_CONFIG_HOME` if you've moved it):
+**Linux** — `~/.config/systemd/user/roost-session.service` (honoring
+`XDG_CONFIG_HOME` if you've moved it):
 
 ```ini
 [Unit]
-# Written by roostctl session autostart. Reinstalling replaces this file.
-Description=Roost host session (roost-session)
+Description=Roost host session
 
 [Service]
 Type=simple
@@ -345,13 +350,20 @@ KillMode=mixed
 WantedBy=default.target
 ```
 
-**macOS** writes `~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`:
+```bash
+systemctl --user enable --now roost-session
+loginctl enable-linger $USER
+```
+
+`enable-linger` is what makes the unit start at boot instead of waiting
+for a login.
+
+**macOS** — `~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- Written by roostctl session autostart. Reinstalling replaces this file. -->
 <dict>
     <key>Label</key>
     <string>ai.stridelabs.roost-session</string>
@@ -374,9 +386,13 @@ WantedBy=default.target
 </plist>
 ```
 
-Both carry an ownership-marker line as their first meaningful line —
-that's what makes a later re-`install` safe to overwrite without
-clobbering a unit that merely happens to look like ours.
+```bash
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.stridelabs.roost-session.plist
+```
+
+Substitute your own home directory in `WorkingDirectory` — launchd
+expands neither `~` nor `$HOME` in a plist, so the literal path is the
+only spelling that works.
 
 `KeepAlive` is deliberately `{SuccessfulExit: false}`, not bare `true`.
 A clean **Stop Session** (or `roostctl session stop`) exits `0` — under
@@ -398,23 +414,12 @@ always does, instead of every shell in the unit's cgroup getting
 `SIGTERM` at once and racing it; `WorkingDirectory` (`%h` on Linux, the
 literal home path in the plist) is what seeds the daemon's first
 project when it starts from an empty `state.json` — without it a
-supervisor-launched daemon would seed `/`.
+unit-launched daemon would seed `/`.
 
 **Stop Session** and `roostctl session stop` still work exactly as they
-always do under supervision: the daemon ends and, because of the rule
-above, stays ended — the supervisor starts a fresh session again only at
+always do under a unit like this: the daemon ends and, because of the
+rule above, stays ended — your unit starts a fresh session again only at
 your next login (macOS) or the unit's next trigger (Linux).
-
-To remove the artifact entirely — not just stop the current process,
-but stop it from coming back at your next login too:
-
-```bash
-roostctl session autostart uninstall
-```
-
-This unloads it (`systemctl --user disable --now` / `launchctl
-bootout`), **stopping the supervised session** if one is running — the
-command says so before it does it — then deletes the file.
 
 Say what this actually buys you, honestly: a macOS `gui/$UID`
 LaunchAgent starts at your **next login**, not at boot, and it stops at
@@ -423,17 +428,9 @@ LaunchAgent starts at your **next login**, not at boot, and it stops at
 remote host](#adding-a-remote-host-over-ssh) above for pairing the unit
 with it). A reboot brings your saved sidebar layout back either way, the
 next time Roost opens, but the *running shell processes* inside a
-session never survive a reboot, on any platform — what either
-supervisor buys you is not having to remember to start `roost-session`
-by hand after you log back in.
-
-The verb resolves the binary itself, the same way `session start` does,
-and prints what it picked (`autostart: <artifact path> → <binary>`) —
-the artifact's name is fixed regardless of build profile, so running
-this from a debug checkout will overwrite a release install's artifact
-(and vice versa); that printed line is how you'd notice. Point
-`ROOST_SESSION_BIN` at your real install first if you're running this
-from a dev checkout and want the release build supervised instead.
+session never survive a reboot, on any platform — what a unit like this
+buys you is not having to remember to start `roost-session` by hand
+after you log back in.
 
 ## Troubleshooting
 

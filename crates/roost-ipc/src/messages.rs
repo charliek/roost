@@ -331,11 +331,12 @@ pub struct TabWriteParams {
     pub data: Vec<u8>,
     /// The driver lease minted by [`ops::SESSION_CONNECT`].
     ///
-    /// **Required on a session socket** — a write is an interactive
-    /// act and belongs to whoever holds the lease. On a UI socket the
-    /// key is accepted and ignored: that socket mints no leases, and
-    /// rejecting it would make one `roostctl` build unable to talk to
-    /// both.
+    /// **Accepted and ignored on every socket.** Raw input is open to
+    /// every same-UID client (plan 057, R15): the lease is the session's
+    /// *foreground*, not a write fence. The key stays on the wire so a
+    /// client that holds a lease sends byte-identical bytes to what it
+    /// always has — and so a session that predates `open_input` still
+    /// accepts them.
     ///
     /// Omitted when unset so a lease-less client's request is
     /// byte-identical to what it has always sent — an older server
@@ -1821,6 +1822,14 @@ pub struct AgentReportChangedEvent {
 /// [`SessionConnectParams::client_label`] and
 /// [`SessionIdentify::features`] ride along additively.
 ///
+/// R15 (plan 057) re-opened the write half **within** this generation:
+/// [`ops::TAB_WRITE`] and [`ops::TAB_ATTACH`] take no lease again. That
+/// is additive — a gate that stops refusing breaks no client — so the
+/// number stays `4` and the reversal is advertised as `open_input` in
+/// [`SESSION_FEATURES`]. A `4` session without that entry still answers
+/// `connect-required` to a leaseless write, which is why a client
+/// feature-detects instead of reading this number.
+///
 /// `3` (plan 047) adds [`ops::SESSION_PUT_FILE`] under that rule.
 ///
 /// `2` (plan 036, HS-1b) was a **breaking** bump from HS-1a's `1`:
@@ -1847,7 +1856,19 @@ pub const SESSION_PROTOCOL_VERSION: u32 = 4;
 /// every generation already serves, listed so a client can
 /// feature-detect them instead of probing for the `unknown-field` an
 /// older server answers.
-pub const SESSION_FEATURES: &[&str] = &["put_file", "events_resume", "tab_dump_scrollback"];
+///
+/// `open_input` is the third kind — a *rule* this session serves that a
+/// same-generation session may not. It promises three things:
+/// [`ops::TAB_WRITE`] and [`ops::TAB_ATTACH`] take no lease; a takeover
+/// preserves every control and data connection, moving only the
+/// foreground; and [`ops::TAB_ATTACH`] accepts a `focus` parameter (a
+/// client sends `focus: false` only to a session advertising this).
+pub const SESSION_FEATURES: &[&str] = &[
+    "put_file",
+    "events_resume",
+    "tab_dump_scrollback",
+    "open_input",
+];
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -2045,10 +2066,27 @@ pub struct SessionConnectResult {
 /// — two libghostty builds that disagree cannot exchange a snapshot.
 /// The cell-pixel geometry is optional (a headless client has no cell
 /// metrics to report); `cols`/`rows` are not.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabAttachParams {
-    pub lease: String,
+    /// The driver lease minted by [`ops::SESSION_CONNECT`], accepted and
+    /// ignored — an attach is raw input and takes no lease (plan 057,
+    /// R15). It stays on the wire because a session that predates
+    /// `open_input` **requires** it, and a client that holds one has no
+    /// reason to strip it.
+    ///
+    /// Omitted when unset rather than sent as `null`, so that a client
+    /// which *does* hold a lease puts byte-identical bytes on the wire
+    /// to what it has always sent. That is the case compatibility turns
+    /// on. A client holding **no** lease cannot attach to a
+    /// pre-`open_input` session at all — that session decodes this key
+    /// as a required `String` and refuses both the missing key and a
+    /// `null` — which is correct, because such a session really does
+    /// gate attach on the lease. Present a lease whenever you have one:
+    /// it costs nothing here and is the difference between working and
+    /// not against an older peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
     #[serde(with = "string_int64")]
     pub tab_id: i64,
     pub kinds: Vec<AttachPayloadKind>,
@@ -2059,6 +2097,50 @@ pub struct TabAttachParams {
     #[serde(default)]
     pub cell_h_px: u16,
     pub libghostty_build: String,
+    /// Whether this attach claims the tab's geometry.
+    ///
+    /// `true` (the default) resizes the tab to `cols`/`rows` during
+    /// negotiation, which is what an attach has always done. `false`
+    /// attaches at whatever size the tab already is, so a client that is
+    /// only watching cannot shrink the one that is typing; its geometry
+    /// still applies the moment it sends an `INPUT` or `RESIZE` frame,
+    /// which is why the grid must be non-zero either way.
+    ///
+    /// **Omitted from the wire when true**, and that is not a size
+    /// optimization: this struct is `deny_unknown_fields`, so a session
+    /// that predates `open_input` would refuse *every* attach carrying
+    /// the key — not just the ones that meant something by it. A client
+    /// sends `focus: false` only to a session advertising `open_input`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub focus: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// Hand-written so the Rust default and the serde default agree: a
+/// derived `Default` would make `focus` false, and a caller filling the
+/// rest of the struct with `..Default::default()` would silently ask for
+/// an unfocused attach.
+impl Default for TabAttachParams {
+    fn default() -> Self {
+        TabAttachParams {
+            lease: None,
+            tab_id: 0,
+            kinds: Vec::new(),
+            cols: 0,
+            rows: 0,
+            cell_w_px: 0,
+            cell_h_px: 0,
+            libghostty_build: String::new(),
+            focus: true,
+        }
+    }
 }
 
 /// [`ops::TAB_ATTACH`] result — a single-use ticket for one data
@@ -2150,6 +2232,25 @@ pub enum AttachMode {
 /// it, and the next `PTY` frame carries `seq + 1`. Snapshot mode fences
 /// at the snapshot's own encode point; resume mode fences at
 /// `resume_from_seq - 1`.
+///
+/// `snapshot_cols`/`snapshot_rows` are the geometry the bytes that
+/// follow were written for: in snapshot mode what the payload was
+/// actually encoded at, in resume mode the tab's own grid at the
+/// handoff. A `vt` client builds its terminal at the attach geometry, so
+/// replaying a payload encoded at another width there wraps lines and
+/// misplaces absolute cursor moves; it hydrates at this size and resizes
+/// afterwards. A resuming client replays the ring into the terminal it
+/// kept, which has the same problem for the same reason.
+///
+/// Sent on **every** accepted reply — both modes, focused or not. A
+/// focused attach did resize the tab to its own geometry, and a resuming
+/// client did leave one behind — but the resize ran on the control
+/// connection, before this data connection was dialed, and raw input is
+/// open (plan 057 R15): any other client's geometry-bearing frame can
+/// land in between and resize the tab again, so "the client asked for
+/// it" is not evidence of what the bytes say. When the two agree the
+/// fields are a no-op. Absent only from a reply a session predating
+/// `open_input` writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachAccepted {
     pub kind: AttachPayloadKind,
@@ -2157,6 +2258,10 @@ pub struct AttachAccepted {
     pub seq: u64,
     pub server_epoch: u64,
     pub tab_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_rows: Option<u16>,
 }
 
 /// The one JSON line a data connection gets back before the wire turns
@@ -2202,6 +2307,10 @@ struct RawAttachHandshakeReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tab_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<ResponseError>,
 }
 
@@ -2224,6 +2333,8 @@ impl TryFrom<RawAttachHandshakeReply> for AttachHandshakeReply {
                 tab_generation: raw
                     .tab_generation
                     .ok_or("accepted handshake reply is missing `tab_generation`")?,
+                snapshot_cols: raw.snapshot_cols,
+                snapshot_rows: raw.snapshot_rows,
             }))
         } else {
             Ok(AttachHandshakeReply::Rejected(
@@ -2244,6 +2355,8 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
                 seq: Some(a.seq),
                 server_epoch: Some(a.server_epoch),
                 tab_generation: Some(a.tab_generation),
+                snapshot_cols: a.snapshot_cols,
+                snapshot_rows: a.snapshot_rows,
                 error: None,
             },
             AttachHandshakeReply::Rejected(error) => RawAttachHandshakeReply {
@@ -2388,6 +2501,16 @@ pub struct HostStatus {
     /// `host.connect` answers with, produced by the same classifier the
     /// band's dot reads.
     pub state: String,
+    /// Who this session says is driving it, when this client has been
+    /// told (plan 057 §3.5).
+    ///
+    /// Only a `taken-over` host carries it, and only when the
+    /// `session.driver_changed` envelope named the claimant — a takeover
+    /// this client merely *inferred* from a non-current lease probe knows
+    /// no name. Self-reported display metadata, never identity: the
+    /// session authenticates nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_by: Option<String>,
     /// The connection's own one-line reason, untruncated. This is the
     /// band's *input*; [`Self::rollup`] is what it renders.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2909,9 +3032,14 @@ pub mod ops {
     /// workspace, tear every PTY down, reply with the reap report, and
     /// only then run the process-level shutdown tail.
     pub const SESSION_STOP: &str = "session.stop";
-    /// Take the session's single interactive lease. Every lease-gated
-    /// op (`events.subscribe`, `tab.attach`) presents what this mints;
-    /// administrative ops stay lease-free. A lease lives until it is
+    /// Take the session's single interactive lease — the session's
+    /// *foreground*. Its holder is the one whose `session.set_focus`,
+    /// `session.set_theme`, `session.set_agent_hooks` and
+    /// `session.put_file` are accepted, and the one whose
+    /// `events.subscribe` stream is classified driver (so it receives
+    /// `tab.effect`) and named by `session.driver_changed`. Input is
+    /// not the lease's: `tab.write` and `tab.attach` take none. A lease
+    /// lives until it is
     /// replaced or the session stops — losing the connection does not
     /// release it, so a reconnecting client always arrives as a
     /// takeover.
@@ -4433,6 +4561,7 @@ mod tests {
             last_connected: Some("2026-09-01T17:40:02Z".into()),
             generation: 3,
             state: host_state::DISCONNECTED.into(),
+            taken_by: None,
             reason: Some("reconnecting in 8s (3/10)".into()),
             detail: None,
             rollup: Some("disconnected — reconnecting in 8s (3/10)".into()),
@@ -4524,6 +4653,27 @@ mod tests {
                 "from_revision": 4_312,
             })
         );
+
+        // `taken_by` rides beside the state and is additive: a host
+        // nobody took over omits the key, and one whose takeover this
+        // client only inferred omits it too — there is no name to give.
+        let deposed = HostStatus {
+            state: host_state::TAKEN_OVER.into(),
+            taken_by: Some("a phone".into()),
+            ..never.clone()
+        };
+        round_trip(&deposed);
+        assert_eq!(
+            serde_json::to_value(&deposed).unwrap()["taken_by"],
+            serde_json::json!("a phone")
+        );
+        assert!(serde_json::to_value(HostStatus {
+            state: host_state::TAKEN_OVER.into(),
+            ..never.clone()
+        })
+        .unwrap()
+        .get("taken_by")
+        .is_none());
 
         // A fresh snapshot resumed from nothing, so the fence is omitted
         // rather than reported as a revision the session never attested.

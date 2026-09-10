@@ -32,7 +32,7 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R4 | [#421](https://github.com/charliek/roost/issues/421) | RP/M5 | scrollback on `tab.dump` |
 | R5 | [#422](https://github.com/charliek/roost/issues/422) | RP/M4 | resume-from-revision for `events.subscribe` |
 | R6 | [#423](https://github.com/charliek/roost/issues/423) | RP/M2 | grok adapter: `Stop` re-fires per continuation → false idle; add `StopFailure` |
-| R7 | [#424](https://github.com/charliek/roost/issues/424) | RP/M6 | hygiene: lifecycle ops, autostart artifact, dead `pty_replaced` path |
+| R7 | [#424](https://github.com/charliek/roost/issues/424) | RP/M6 | hygiene: lifecycle ops, ~~autostart artifact~~ (removed by R16), dead `pty_replaced` path |
 | R8 | [#425](https://github.com/charliek/roost/issues/425) | RP/M2 | gx opt-in indicator via the `metadata` map — no new agent variant |
 | R9 | [#426](https://github.com/charliek/roost/issues/426) | RP/M5 | local default flip (HS-5): the UI connects to a local `roost-session` |
 | R10 | [#439](https://github.com/charliek/roost/issues/439) | RP/M3 | a bare `opencode` binds no server, so nothing can drive the session roost reports — the plugin serves a loopback proxy and names it |
@@ -42,6 +42,9 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R14 | [#447](https://github.com/charliek/roost/issues/447) | RP/M5 | a `vt` fallback is silent and unactionable: nothing in the UI says fidelity dropped, and a remote host has no in-app way to update its daemon |
 | R15 | [#453](https://github.com/charliek/roost/issues/453) | RP/M5 | open `tab.write` and `tab.attach` to every same-UID client, tmux/herdr style; the lease stays as the *foreground* (effects, focus, geometry), never as an input gate |
 | R16 | [#454](https://github.com/charliek/roost/issues/454) | RP/M6 | remove `roostctl session autostart`: sessions come up on demand from the connecting client; supersedes R12 |
+| R17 | [#462](https://github.com/charliek/roost/issues/462) | RP/M5 | R15's in-place foreground retake never runs over SSH — a reconnect rebuilds the bridge socket, so the remote case falls back to the reattach R15 exists to avoid |
+| R18 | [#463](https://github.com/charliek/roost/issues/463) | RP/M5 | `tab.resize` zeroes libghostty's cell metrics; R15's whole-tuple geometry compare made that reachable, so in-band size reports read `0x0` |
+| R19 | [#461](https://github.com/charliek/roost/issues/461) | — | CI/dev: `runtime_dir_test` fails 9/12 under umask 0002 — its own tempdir fixture is group-writable, and `roost-session start` refuses the same way |
 
 **Sequencing.** R6 went first, as the XS item that shook down the
 issue → PR → `Closes` → board chain; R2 and R1 followed, then R8, then
@@ -52,9 +55,10 @@ before it, not speed. The board carries the current state; this
 paragraph is only the order and the reasoning behind it.
 
 **R11–R14 are follow-ups from shipped work, and they land before the
-autostart and mobile surfaces are announced.** R12 is one pass over what
-R7 shipped — a defect plus the two things that first cut left unfinished
-— R11 is the client half R5 did not build, and R13 is a macOS CI flake
+mobile surface is announced** (the autostart one was removed by R16).
+R12 is one pass over what R7 shipped — a defect plus the two things that
+first cut left unfinished — R11 is the client half R5 did not build, and
+R13 is a macOS CI flake
 that fails unrelated pull requests, because a red job nobody reads is how
 a real regression gets waved through.
 
@@ -93,6 +97,34 @@ exists, a shed included: it gets a `roost-session` when a client joins
 it, like any machine. The supervisor artifact was costing a 2,500-line
 hardening pass with no consumer; it comes back only with a case that
 needs it named in its own acceptance box.
+
+**R17–R19 are R15's own follow-ups, and R17 is the one that matters for
+the flagship.** R15 made a takeover stop freezing the desktop and gave
+the deposed client its foreground back *in place* — no reconnect, no
+reattach, no blink. That holds on `localhost` and falls through on SSH:
+reconnecting there rebuilds the tunnel and the bridge socket underneath,
+so there is no surviving connection to claim the foreground on and the
+button does the full reattach R15 exists to avoid. The outcome is
+correct either way, which is why it is a follow-up and not a defect in
+R15 — but the product is *"start it on the desktop, pick it up on the
+phone, sit back down,"* and the phone reaches a real machine over SSH.
+Shipping the multi-device story with the desktop half polished and the
+remote half degraded is shipping it backwards. R18 is R15's own cost in
+the same sense R14 was R3's: zeroing the cell metrics on `tab.resize`
+predates it, and comparing geometry as a whole tuple is what made an
+already-attached client's size report go to `0x0`. R19 is hygiene of
+R13's kind — a gate that is red for an environmental reason on the box
+people develop on, which is how a real failure gets waved through — and
+it earns its row because the same check refuses a `roost-session start`,
+so it is not only a test.
+
+Two already on the board are worth reading beside these rather than
+below them: **#460** (no roosttest fixture for a daemon in the UI's own
+localhost profile) is named in its own body as work to do *before* R9,
+since R9 turns localhost from a minority case into the path every session
+takes; and **#458** (a subscribe's control and event legs can name
+different sessions) is a narrow race today whose odds R9 raises, for the
+same reason.
 
 ## Rules that apply in this repo
 

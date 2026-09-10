@@ -401,7 +401,7 @@ impl App {
         let wire_op = target.wire_op();
         self.engine_op(
             async move {
-                ops.call(wire_op, params, false)
+                ops.call(wire_op, params, crate::host_conn::LeasePolicy::None)
                     .await
                     .map(drop)
                     .map_err(|error| error.to_string())
@@ -858,7 +858,11 @@ pub(super) fn host_reorder_call(
     let ops = hosts.ops_for(host)?.clone();
     let params = host_reorder_params(target, ordered_ids);
     let wire_op = target.wire_op();
-    Some(async move { ops.call(wire_op, params, false).await.map(drop) })
+    Some(async move {
+        ops.call(wire_op, params, crate::host_conn::LeasePolicy::None)
+            .await
+            .map(drop)
+    })
 }
 
 /// The completion a reorder dispatch answers with, whichever axis and
@@ -2594,13 +2598,13 @@ impl App {
                 self.clipboard.start_next()
             }
             ClipboardReadCompletion::Paste { tab, target, value } => {
-                // The frame can freeze *during* the read: the guard in
+                // The attach can end *during* the read: the guard in
                 // `enqueue_tab_paste` ran before the clipboard was
-                // touched, and a takeover or a `session.stop` landing in
-                // that window would otherwise deliver these bytes into a
-                // frame nothing is reading — issue #376's bug, reached
-                // by a third door. Re-asked here, at the last moment
-                // before the write.
+                // touched, and a `session.stop` landing in that window
+                // would otherwise deliver these bytes into a frame
+                // nothing is reading — issue #376's bug, reached by a
+                // third door. Re-asked here, at the last moment before
+                // the write.
                 //
                 // Toasted rather than dropped silently: the read already
                 // happened, so the user's paste is spent either way, and
@@ -2609,9 +2613,8 @@ impl App {
                 // complaint #376 is about, and the frozen-frame banner
                 // says what the host is doing, not what became of the
                 // keystroke.
-                if let Some(frozen) = self.frozen_host_frame_for(tab) {
-                    let refusal = frozen.paste_refusal();
-                    tracing::info!(?tab, request_id, %refusal, "paste refused: the frame froze while the clipboard was being read");
+                if let Some(refusal) = self.paste_refusal_for(tab) {
+                    tracing::info!(?tab, request_id, %refusal, "paste refused: the attach ended while the clipboard was being read");
                     self.set_status(refusal.to_string());
                     return self.clipboard.start_next();
                 }
@@ -2724,20 +2727,20 @@ impl App {
     /// primary-selection middle-click route both funnel through this,
     /// so a future third caller can't forget the check.
     ///
-    /// Checked before the clipboard is touched at all: a frozen host
-    /// frame (taken over, or stopped) is still in `self.tabs` — that's
-    /// deliberate, it's what lets the last frame keep rendering — but
-    /// nothing on the other end will ever read what gets sent to it.
-    /// Reading the clipboard first and then discovering that would
-    /// consume the user's paste for nothing (issue #376); refusing here
-    /// means the clipboard is never touched.
+    /// Checked before the clipboard is touched at all: a host tab whose
+    /// attach ended is still in `self.tabs` — that's deliberate, it's
+    /// what lets the last frame keep rendering — but nothing on the
+    /// other end will ever read what gets sent to it. Reading the
+    /// clipboard first and then discovering that would consume the
+    /// user's paste for nothing (issue #376); refusing here means the
+    /// clipboard is never touched.
     pub(super) fn enqueue_tab_paste(
         &mut self,
         target: ClipboardOp,
         tab: TabKey,
     ) -> Result<(), String> {
-        if let Some(frozen) = self.frozen_host_frame_for(tab) {
-            return Err(frozen.paste_refusal().to_string());
+        if let Some(refusal) = self.paste_refusal_for(tab) {
+            return Err(refusal.to_string());
         }
         self.clipboard.enqueue_paste_read(target, tab);
         Ok(())

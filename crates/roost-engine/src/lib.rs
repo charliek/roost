@@ -45,7 +45,7 @@ pub use facade::{
     CommandResult, Engine, EngineCommand, EngineError, EngineEvent, EngineEventStream,
     EngineSnapshot,
 };
-pub use pty::{PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, SupervisorEvent};
+pub use pty::{Geometry, PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport, SupervisorEvent};
 #[cfg(feature = "server-vt")]
 pub use tab_task::{
     ResumeAt, ServerVtConfig, ServerVtWorkspace, SnapshotAt, TabCmd, TabError,

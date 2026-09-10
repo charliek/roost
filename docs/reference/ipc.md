@@ -123,11 +123,12 @@ terminal from. It shares the socket path but not the framing; see
   handshake: `connect-required`, `already-connected`, `taken-over`,
   `too-many-tokens`, `unsupported-kind`, `build-mismatch` — see
   [`session.connect`](#sessionconnect) and [`tab.attach`](#tabattach).
-  `connect-required` and `taken-over` are no longer `tab.attach`'s and
-  `events.subscribe`'s alone: [`tab.write`](#tabwrite) on a **session**
-  socket answers the same two codes now that the write itself is
-  lease-gated (plan 049, R1) — `events.subscribe` dropped the gate
-  instead (below).
+  `connect-required` and `taken-over` answer only the **foreground**
+  ops — `session.set_focus`, `session.set_theme`,
+  `session.set_agent_hooks`, `session.put_file`. Neither
+  [`tab.write`](#tabwrite) nor [`tab.attach`](#tabattach) answers them:
+  raw input takes no lease (plan 057, R15), and `events.subscribe`
+  classifies on one rather than gating (below).
 
 ## Shared types
 
@@ -323,30 +324,16 @@ Request:
 test suite round-trips `0x00..0xff`). Errors `not-found` if the tab
 has no live PTY.
 
-**On a UI socket, `lease` is accepted and ignored** — behavior here is
-byte-identical to before plan 049: that socket mints no leases, and
-rejecting the key would make one `roostctl` build unable to talk to
-both kinds of socket.
-
-**On a session socket, a write is an interactive act and belongs to
-whoever holds the driver lease** (plan 049, R1 — reads stay free, but
-writing is owned exactly like attach input). `lease` is then
-**required**: an absent or unrecognized one answers `connect-required`
-(go get a lease — `session.connect`, an attached client, or the agent
-API name the three lanes), and a lease that has since been displaced
-by a takeover answers `taken-over`. A client that holds no lease sends
-no `lease` key at all rather than an empty string, so an old
-`roostctl` talking to a new session degrades to the same
-`connect-required` a client that never connected gets.
-
-**The gate is an admission boundary, not a write fence.** `require_lease`
-runs and releases the registry lock *before* the bytes are handed to the
-supervisor to enqueue — so a write whose lease check linearizes just
-before a takeover wins admission, and its bytes may still land on the
-PTY after the takeover completes; one that linearizes after the takeover
-gets `taken-over`. A hard fence (holding a lock across the gate *and*
-the enqueue) was rejected: it would serialize every write against every
-lease op for a race the agent-API write path already makes irrelevant.
+**`lease` is accepted and ignored on every socket.** Raw input is open
+to every same-UID client (plan 057, R15): the socket's uid check is the
+whole boundary, and the lease is the session's *foreground* (see
+[`session.connect`](#sessionconnect)), never a write fence. A session
+socket answers neither `connect-required` nor `taken-over` to a write —
+no lease, an empty one, and one displaced by a takeover all deliver the
+same bytes. The key stays on the wire because a client that holds a
+lease has no reason to strip it, and because a session that predates
+`open_input` still requires it; a client holding none sends no `lease`
+key at all rather than an empty string.
 
 Response: `{}`.
 
@@ -414,10 +401,14 @@ host until it is swept.
 **Error precedence**, in order:
 
 1. `not-found` — the `tab` ref resolves to no live terminal.
-2. `host-unavailable` — the host is frozen (taken over, stopped), not
-   connected, or it disconnected, reconnected or was taken over
-   mid-gesture; also a tab closed under the gesture and an app
-   shutting down. The message names the file where there is one.
+2. `host-unavailable` — the host is stopped, not connected, or it
+   disconnected, reconnected or was taken over mid-gesture; also a tab
+   closed under the gesture and an app shutting down. A taken-over host
+   folds in here too, but for a narrower reason than the others: an
+   upload is one of the session's foreground-only ops (plan 057, R15),
+   so a client that is live but not the foreground gets `host-unavailable`
+   with a message naming who has it (`NotForeground`) rather than a
+   dead connection. The message names the file where there is one.
 3. `invalid-param` — an empty or relative `paths`, or a request where
    **every** path was skipped, in which case the message lists each
    path with its reason (`nothing to send: /tmp/build (directory)`).
@@ -470,6 +461,40 @@ Headless resize of a tab's PTY (issues `TIOCSWINSZ`, which fires
 
 Request: `{"params": {"tab_id": "3", "cols": 100, "rows": 24}}`.
 Response: `{}`.
+
+**A tab is sized by the last geometry-bearing interaction with it**
+(plan 057, R15) — the rule that lets two clients at different sizes
+share one tab without either permanently shrinking the other. Four
+things carry geometry, and each one sizes the tab:
+
+* this op;
+* [`tab.attach`](#tabattach) with `focus: true` (the default), which
+  resizes during negotiation;
+* a data-plane `INPUT` frame, which applies its connection's declared
+  geometry ahead of the bytes when it differs — typing is how a client
+  says which viewport it is looking at;
+* a data-plane `RESIZE` frame, which applies and becomes that
+  connection's declared geometry.
+
+Nothing else does. [`tab.dump`](#tabdump), an
+[`events.subscribe`](#eventssubscribe) stream, a
+[`tab.write`](#tabwrite) (a control-plane write has no viewport behind
+it) and an idle client that attached with `focus: false` all leave the
+size exactly where it was.
+
+Geometry is the four numbers `(cols, rows, cell_w_px, cell_h_px)`
+compared together, not just the grid: libghostty's mode-2048 in-band
+size reports quote the pixel dimensions, so the same grid at different
+cell metrics is a different viewport. Unchanged geometry is not
+re-applied, so two clients typing at the same size cost nothing.
+
+Simultaneous interactions **linearize in the order the tab receives
+them**, not in wall-clock order: every one of them is a command on the
+tab's single channel. The consequence is the rule working as intended —
+two clients alternating keystrokes at different sizes flip the PTY's
+size each time. The tab tells nobody it was resized under them (see
+[Data plane](#data-plane)); a client at another size sees wrapping
+until it interacts again.
 
 ### `tab.dump`
 
@@ -1640,6 +1665,7 @@ A **live** host additionally carries `connect` and `tabs`:
 - `rollup` — the band's *output*, verbatim from the sidebar's reducer, capped at 60 characters with an ellipsis. For a **connected** host this is the agent count (`"3 agents"`), not state text; absent when the band shows no rollup at all. It is what the next frame draws — nothing here asserts a frame was painted.
 - `retry` — a `RetrySchedule`, absent unless an auto-reconnect is armed. `delay_ms` is the delay the timer was armed with (not what is left) and `armed_at` is when, so a caller can compute the remainder. `attempt` (1-based, the `3` in the band's `(3/10)`) and `budget` come with the **ssh** ladder only: a localhost retry is the connection task's own backoff whose counter never leaves the task, so it reports `delay_ms` alone.
 - `payload_kind` — what the last attach this client accepted on this host is being **decoded as**, one of [`payload_kinds`](#sessionidentify)' spellings. `"vt"` is the fallback a libghostty build skew lands on; such a host connects normally, the dot deliberately stays green, at that payload's [documented fidelity](#payload-kinds). Absent until a tab has actually attached over the *live* connection — it reports what is being decoded, never what could be — and it goes when that connection does, so a reconnect to a matching daemon cannot keep claiming a fallback it is no longer on.
+- `taken_by` — who holds this host's **foreground**, when it is not this client: present exactly while `state` is `taken-over`, carrying the claimant's own `session.connect{client_label}` as it reported itself — normalized, never authenticated, so render it as what the client *says* it is. Absent otherwise, including after this client takes the foreground back. This is the field the band's `taken over by ‹name›` and the terminal's foreground strip are built from; a poller watching for a takeover reads `state`, and reads this to say who.
 - `connect` — a `HostConnectStatus`, present only while the connection is live, naming what the prologue established **before any tab attaches** — this is what the sidebar's `reduced fidelity` indicator, the update/restart offers, and the CLI's fidelity line all key on, rather than `payload_kind`, which is lazy until an attach. `session_id` is the session's own id from `session.identify`. `reduced_fidelity` is `true` when this client and the session pin different libghostty builds and the connection fell back to `vt` — the same condition `payload_kind` will read `"vt"` for once something attaches. `resumed` says whether this connection's prologue replayed missed events (`events.subscribe {from_revision, session_id}`, R11/#442) instead of taking a fresh `tab.list`; `from_revision` is the revision it resumed from, as the session's subscribe ack attested it, present only when `resumed` is `true`. None of this bumped `SESSION_PROTOCOL_VERSION` — both fields are additive on the **UI** socket only.
 - `tabs` — how many tab rows this host's sidebar section is listing right now, always present (`0` included). The "5 tabs" a person reads, and the observable a poller uses to confirm a reconnect never blanked the section (R11: the client keeps drawing the carried mirror through `Connecting` rather than purging it before the fresh one lands).
 - `retry.reason` — **why** this rung is armed: the classified failure's own copy, in the same words the give-up line uses for it. It is a separate field from the `reason` above because that one is the band's input and `rollup` is derived from it — while a rung is armed the band has to read `reconnecting in 8s (3/10)`, so the family needs its own slot or it is unreadable until the attempt settles. ssh-only, like `attempt`/`budget`. **The rule for a caller is simply: read it when it is present.** Do not gate on `attempt` — the number is not a proxy in either direction. Absence is ordinary rather than a fault: the drop that *starts* an outage is usually the live connection dying, a bare bridge EOF with nothing to classify, and the classified copy arrives with the next dial's failure; a later rung armed by another connection coming up and dying reads absent again for the same reason. And presence is not confined to later rungs — a suspend/wake resets the ladder to `attempt: 1` while deliberately carrying the family it already had, because it is still the same outage.
@@ -1766,11 +1792,13 @@ stream:
 ```
 
 `reason` is `"stop"` (the session is shutting down) or `"taken-over"`
-(a takeover closed this connection). On an **event stream** only
-`"stop"` is reachable: a takeover no longer ends a surviving stream, it
-demotes it and says so with the non-terminal envelope below.
-`"taken-over"` remains the terminal reason on the **control and data**
-connections a takeover does close. It carries **no `revision`** and
+(a takeover closed this connection). Since plan 057 (R15) **only
+`"stop"` is reachable at all**: a takeover closes nothing — not the
+event stream, which it demotes and tells with the non-terminal envelope
+below, and not the control or data connections, which it leaves exactly
+where they were. `"taken-over"` stays in the schema because a session
+predating `open_input` still sends it, and a client that has to work
+against both must still decode it. It carries **no `revision`** and
 is exempt from the gap check below: it is not a commit, it is the
 stream saying why it is over, and it is always the last frame before
 the close.
@@ -1969,9 +1997,8 @@ enumerate or select among. The seam for more than one session on a
 single host — a **named** session such as `workbox:agents` (HS-4e) — is
 one more path component in the profile resolver (`BundleProfile` →
 socket dir + state dir) plus a `--name` flag on `session start` / `stop`
-/ `status`, and on the autostart artifact's own name (see
-[`cli.md`](cli.md#session-autostart-install-uninstall)); it is not a
-registry op, and nothing on this wire needs to change to support it.
+/ `status`; it is not a registry op, and nothing on this wire needs to
+change to support it.
 `session.identify.session_id` distinguishes **process incarnations** of
 one session (it changes across a restart) — it names a run, not a
 session.
@@ -2009,7 +2036,8 @@ it belongs: `events.subscribe` was made
 [lease-gated](#eventssubscribe) (plan 049, R1 later re-cut this —
 subscribing is leaseless again, and the lease classifies the stream
 instead), `session.stop` and takeover
-[label what they close](#sessionstop), and terminal-generated queries
+[labeled what they closed](#sessionstop) (R15 later left a takeover
+closing nothing at all), and terminal-generated queries
 are answered by the tab's own server Terminal (below).
 
 Every tab a session spawns now has an authoritative **server Terminal**
@@ -2046,7 +2074,7 @@ Params: `{}`. Response:
   "app_version": "0.0.18",
   "session_protocol": 4,
   "payload_kinds": ["ghostty-snapshot", "vt"],
-  "features": ["put_file", "events_resume", "tab_dump_scrollback"],
+  "features": ["put_file", "events_resume", "tab_dump_scrollback", "open_input"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
   "started_at": "2026-08-27T14:03:11Z"
@@ -2062,8 +2090,13 @@ as of plan 049 (R1), which re-cut what the interactive lease owns —
 breaking in both directions:
 [`events.subscribe`](#eventssubscribe) no longer requires a lease (a
 `3` session refuses the leaseless subscribe a `4` client sends), and
-[`tab.write`](#tabwrite) on a session socket now does (a `3` client's
-leaseless write is refused by a `4` session). Takeover also stopped
+[`tab.write`](#tabwrite) on a session socket began requiring one (a `3`
+client's leaseless write is refused by a `4` session). That second half
+was **re-opened additively inside the same generation** by plan 057
+(R15) — a write and an attach take no lease again — which is why the
+number stayed at `4` and the reversal is advertised as `open_input` in
+`features` below: a `4` session without that entry still answers
+`connect-required`. Takeover also stopped
 being terminal for event streams — they survive it and receive
 [`session.driver_changed`](#events) instead of `session.stopping`,
 which a `3` client skips as an unknown envelope and then waits forever
@@ -2091,10 +2124,22 @@ with `"put_file"` — plan 047's op is the case that prompted this: had
 way, for the resume params documented under
 [`events.subscribe`](#eventssubscribe) above, with plan 053 adding
 `"tab_dump_scrollback"` for [`tab.dump`](#tabdump)'s history param
-right behind it. **What a generation bump
-itself covers is never listed here** — R1's own leaseless-subscribe /
-gated-write / `driver_changed` behaviors are what `4` covers, not
-`features` entries, because a client already knows its own generation.
+right behind it.
+
+`"open_input"` (plan 057, R15) is the entry that shows what the two
+channels are *for*. **A generation pins what a client may assume; a
+feature entry names what it may additionally rely on.** A `4` client
+assumes leaseless subscribe, `driver_changed`-on-takeover, and — until
+R15 — a lease-gated write. `open_input` names what it may rely on
+beyond that: [`tab.write`](#tabwrite) and [`tab.attach`](#tabattach)
+take no lease; a takeover preserves every control and data connection,
+moving only the foreground; and `tab.attach` takes a `focus` parameter,
+so a client can attach without claiming the tab's geometry. It is a
+feature entry rather than a generation bump because
+it takes nothing away — a `4` session *without* it still answers
+`connect-required` to a leaseless write, so the client feature-detects
+rather than sniffing the number.
+
 See [Versioning](#versioning) and
 [ipc-compatibility.md](ipc-compatibility.md#capability-negotiation-over-version-sniffing)
 for how this relates to the bump rule and to the monotonicity/subset
@@ -2187,21 +2232,35 @@ driver's and every observer's alike — as
 [`session.driver_changed`](#events)'s `taken_by`, falling back to
 `"unknown client"` when the claimant sent none.
 
-The lease is the interactive-authority boundary, and a self-declared
-client id (like the label above) would not be one: possession of the
-token is what proves a client is *the* driver. **Framing, restated for
-plan 049 (R1):** the lease is interactive-ownership *coordination*, not
-a security boundary — any same-UID client can
-`session.connect{takeover: true}` on purpose, same as always. What the
-lease gates changed, though: **reading is free**
-([`events.subscribe`](#eventssubscribe) takes no lease at all — it
-classifies its stream on one, it does not require one), and **writing
-is owned** — [`tab.attach`](#tabattach)'s attach input, and now
-[`tab.write`](#tabwrite) on a session socket too. Administrative
-mutations — `tab.open`, `tab.list`, `project.*`, `tab.agent_report`,
-`tab.resize`, the dumps — stay lease-free: they are same-UID
-control-plane use (`roostctl`, a Claude hook), not interactive
-ownership.
+**The lease holder is the session's foreground.** That is the whole of
+what a lease means (plan 057, R15), and it is exactly four things:
+
+1. its [`events.subscribe`](#eventssubscribe) stream is classified
+   *driver*, so it is the one that receives `tab.effect` (bells,
+   OSC 52 clipboard writes);
+2. its [`session.set_focus`](#sessionset_focus) is the focus the
+   session suppresses notifications against;
+3. [`session.driver_changed`](#events) names it;
+4. the session-wide settings and upload ops —
+   [`session.set_theme`](#sessionset_theme),
+   [`session.set_focus`](#sessionset_focus),
+   [`session.set_agent_hooks`](#sessionset_agent_hooks),
+   [`session.put_file`](#sessionput_file) — accept only its lease.
+
+**It never gates input.** [`tab.write`](#tabwrite) and
+[`tab.attach`](#tabattach) take no lease: any same-UID client may type
+into any tab and attach to any tab, as many at a time as it likes.
+Reading is free for the same reason — `events.subscribe` classifies its
+stream on a lease, it does not require one. Administrative mutations —
+`tab.open`, `tab.list`, `project.*`, `tab.agent_report`, `tab.resize`,
+the dumps — are lease-free as they always were: same-UID control-plane
+use (`roostctl`, a Claude hook), not the foreground.
+
+The lease is coordination, not a security boundary — any same-UID
+client can `session.connect{takeover: true}` on purpose, same as
+always. A self-declared client id (like the label above) would not be a
+boundary either: possession of the token is what proves a client is the
+foreground.
 
 **The lease outlives the connection it was minted on.** Dropping every
 socket releases nothing; a client that reconnects is a *new* client as
@@ -2222,42 +2281,43 @@ The third row is not an oversight. A client that lost track of its own
 lease is exactly the one that has to re-establish it deliberately.
 
 A takeover, under one lock, atomically: invalidates the old lease,
-closes **every control/data connection registered under it** except
-the requesting one, notifies every registered event stream, purges the
-old lease's outstanding attach tokens, and mints the new lease. What
-"closes" means depends on what the connection was doing — and, as of
-plan 049 (R1), an event stream is no longer in that "closes" set at
-all:
+tombstones it, drops the displaced client's focus, notifies every
+registered event stream, and mints the new lease. **It closes
+nothing** (plan 057, R15):
 
-* a plain control connection just closes — there is no stream its peer
-  is waiting on, only a reply it never asked for;
-* a data connection gets an `ERROR` frame with code `taken-over`, then
+* the displaced client's control connections stay open and keep
+  serving. Its foreground ops answer `taken-over` (the tombstone
+  below); everything else — reads, `tab.write`, `tab.attach`,
+  `tab.resize`, `tab.open` — keeps working;
+* its data connections stay open and keep streaming, and keep
+  accepting input. The desktop does not freeze because a phone typed
+  one line;
+* its outstanding attach tickets stay valid. A ticket was never bound
+  to a lease; it is reclaimed when the connection that minted it
   closes;
-* **an event stream survives.** It is registered separately from the
-  lease's own connection list precisely so a takeover cannot close the
-  stream it needs to reclassify. It gets one
+* **its event stream is demoted, not cut.** It is registered separately
+  from the lease's own membership list precisely so a takeover can
+  reclassify the stream it needs. It gets one
   `{"event": "session.driver_changed", "data": {"taken_by": "workbox"}}`
   envelope — non-terminal, injected into its existing push queue — and
   keeps delivering afterward, reclassified from driver to observer if
   it was the deposed lease's own stream (see
   [`events.subscribe`](#eventssubscribe) for what an observer stream
-  still gets). The tombstone rule below is unchanged by any of this.
+  still gets).
 
-Both the control/data close and the `driver_changed` injection are
-best-effort under a short deadline: a peer that stopped reading made
-the write impossible when its socket buffer filled, and for a control
-or data connection EOF is then the only signal it gets; for an event
-stream, a full queue ends the relay outright (bare EOF, the same
-resync semantics event backpressure has always had) rather than
-blocking the takeover on a slow reader.
+The `driver_changed` injection is best-effort under a short deadline: a
+full queue ends that relay outright (bare EOF, the same resync
+semantics event backpressure has always had) rather than blocking the
+takeover on a slow reader.
 
-Purging the displaced lease's attach tokens matters for a reason that
-is easy to miss: they would be refused at the handshake's lease
-re-check anyway, but leaving them would let a dead client's 16
-outstanding tokens hold the whole quota against the new holder for a
-full TTL. A ticket purged this way answers `invalid-token` — the
-session no longer recognizes it at all — while an op that presents the
-*lease* answers `taken-over`.
+**The displaced client's focus dies with its foreground.** Dropping the
+lease drops the session's focus flag, so notifications stop being
+suppressed until whoever holds the foreground states one again. The
+same release happens when the connection that *stated* the focus closes
+— which, since data connections are no longer counted as the holder's
+connections, can now un-mute notifications while the user is still
+typing on the data plane. Accepted: a client's control connection is
+long-lived and re-sends focus when it reconnects.
 
 **Exactly one tombstone.** The session remembers the most recently
 displaced lease so its holder is told `taken-over` (someone else has
@@ -2297,7 +2357,7 @@ Like `session.connect`, this answers `shutting-down` once `session.stop` has lat
 
 ### `session.set_focus`
 
-Tell the session which of its tabs the attached client is actually looking at. Lease-gated: focus is a property of the client driving the session, so a client that does not drive it does not get to state one.
+Tell the session which of its tabs the attached client is actually looking at. Lease-gated: a focus is the foreground's statement about its own window, so a client that is not the foreground does not get to state one — see [`session.connect`](#sessionconnect).
 
 Request:
 ```json
@@ -2524,15 +2584,29 @@ be masked by a later one:
 
 | # | Check | Error |
 |---|---|---|
-| 1 | lease is live | `connect-required` (unknown/absent) or `taken-over` (tombstoned) |
-| 2 | tab exists with a live terminal | `not-found` |
-| 3 | `kinds` contains something servable | `unsupported-kind` (message names both lists) |
-| 4 | the negotiated kind's own requirement holds | `build-mismatch` (message names both strings) |
-| 5 | `cols` and `rows` both non-zero | `invalid-param` |
-| 6 | the tab accepts the geometry | `invalid-param` |
-| 7 | token quota not exhausted | `too-many-tokens` |
+| 1 | tab exists with a live terminal | `not-found` |
+| 2 | `kinds` contains something servable | `unsupported-kind` (message names both lists) |
+| 3 | the negotiated kind's own requirement holds | `build-mismatch` (message names both strings) |
+| 4 | `cols` and `rows` both non-zero | `invalid-param` |
+| 5 | the tab accepts the geometry (a focused attach only — an unfocused one resizes nothing) | `invalid-param` |
+| 6 | token quota not exhausted | `too-many-tokens` |
 
-Checks 3 and 4 stay two separate walks over the offered list rather
+**An attach takes no lease** (plan 057, R15). `lease` is accepted and
+ignored, exactly as on [`tab.write`](#tabwrite): attaching is reading
+plus raw input, and both are open to every same-UID client.
+
+**Send a lease anyway whenever you hold one.** A session that predates
+`open_input` decodes the key as a *required* string and refuses both a
+missing one and a `null`, so a client that strips it would fail every
+attach against an older peer rather than only the attaches that peer
+really means to refuse. Holding a lease and presenting it costs nothing
+here and is the difference between working and not; holding none means
+you cannot attach to a pre-`open_input` session at all, which is that
+session's own rule and correct for it. A client that has no lease omits
+the key rather than sending `null` — against this session both are the
+same answer, and against an older one neither works.
+
+Checks 2 and 3 stay two separate walks over the offered list rather
 than one predicate, because a single pass cannot tell "nothing
 servable" from "nothing eligible" and those instruct the client
 differently: `unsupported-kind` means *offer something else*, while
@@ -2543,16 +2617,53 @@ when the client offers no kind but `ghostty-snapshot`, or is talking to
 a session too old to advertise `vt`.
 
 Zero `cell_w_px` / `cell_h_px` are legal — a headless client has no
-cell metrics to report — but a zero-sized grid is not a grid.
+cell metrics to report — but a zero-sized grid is not a grid. That
+holds for an unfocused attach too: `cols`/`rows` are this connection's
+**declared geometry** either way, and its first `INPUT` or `RESIZE`
+frame applies them.
 
-**Attach is when the server resizes.** Between checks 5 and 7 the
-session resizes the tab (server terminal *and* `TIOCSWINSZ`) to the
-requested geometry and waits for that to land, so the snapshot the
-data connection is about to encode is already at client size and needs
-no post-READY resize. Detach never resizes back — the PTY keeps the
-last attached size, so a TUI agent does not get a `SIGWINCH` because
-somebody closed a laptop. This does not contradict that rule: attach is
-exactly when an in-process Roost resizes too.
+**`focus` says whether this attach claims the tab's geometry.** It
+defaults to `true`, and a focused attach is when the server resizes:
+between checks 4 and 6 the session resizes the tab (server terminal
+*and* `TIOCSWINSZ`) to the requested geometry and waits for that to
+land, so the snapshot the data connection is about to encode is already
+at client size and needs no post-READY resize. Detach never resizes
+back — the PTY keeps the last attached size, so a TUI agent does not
+get a `SIGWINCH` because somebody closed a laptop. This does not
+contradict that rule: attach is exactly when an in-process Roost
+resizes too.
+
+`focus: false` resizes **nothing** — the point of it is a client that
+wants to watch a tab without shrinking the one that is typing (a phone
+glancing at a desktop's session). Its geometry still counts the moment
+it interacts; see the sizing rule beside [`tab.resize`](#tabresize).
+
+`true` is **omitted from the wire**, so a request from a client that
+does not care is byte-identical to what clients have always sent. That
+is not a size optimization: `TabAttachParams` is strict, so a session
+that predates `open_input` would answer `unknown-field` to *every*
+attach that carried the key rather than only to the ones that meant
+something by it. Send `focus: false` only to a session advertising
+`open_input` in [`session.identify`](#sessionidentify).
+
+**The accepted handshake reports the geometry its bytes were written
+for.** `snapshot_cols` / `snapshot_rows` on the [data
+connection's](#the-handshake) accepted reply name that size — the
+payload's encode geometry in snapshot mode, the tab's own grid at the
+handoff in resume mode — and are present on every accepted reply,
+focused or not, either mode. A focused attach did resize the tab, but on
+the control connection and before this data connection was dialed; raw
+input is open, so another client's geometry-bearing frame can land in
+between and resize the tab again, and only the server knows what the
+bytes ended up saying. A `vt` client needs the answer: that payload
+replays into a terminal *of the attach geometry*, and replaying it at
+another width wraps lines and misplaces absolute cursor moves, so such a
+client hydrates at this size and resizes its own terminal afterwards. A
+resuming client replays the ring into the terminal it kept, which has
+the same problem for the same reason. When the size matches what was
+asked for the fields change nothing. Both keys are additive — a client
+that has never heard of them ignores them, and one reading an older
+session's reply simply finds neither.
 
 `attach_token` is 32 hex characters, the same bearer credential the
 lease is and under the same no-logging rule. It is:
@@ -2565,13 +2676,20 @@ lease is and under the same no-logging rule. It is:
   shorten it, which is how the expiry case is tested in seconds; a
   production daemon ignores that variable entirely;
 * **quota-bounded** — at most 16 unconsumed tokens
-  (`MAX_OUTSTANDING_TOKENS`) exist at once. Past that, minting is
-  refused with `too-many-tokens` rather than evicting a token some
-  other connection is about to present. Reaching it means a client
-  minted 16 tickets inside one TTL and dialed none of them; a healthy
-  attach consumes its ticket within a round trip;
-* **lease-bound** — re-checked at the handshake, so a takeover between
-  this reply and the dial refuses the ticket with `taken-over`;
+  (`MAX_OUTSTANDING_TOKENS`) exist at once, and at most 8
+  (`MAX_TOKENS_PER_CONNECTION`) of them on any one control connection.
+  Past either bound, minting is refused with `too-many-tokens` rather
+  than evicting a token some other connection is about to present.
+  Reaching one means a client minted tickets inside one TTL and dialed
+  none of them; a healthy attach consumes its ticket within a round
+  trip. The per-connection share is what keeps a single looping client
+  from answering everybody else's attach with `too-many-tokens` — before
+  raw input was open, holding the lease was what stood in its way;
+* **connection-bound** — reclaimed when the connection that minted it
+  closes, which is what keeps the quota above from being held for a
+  whole TTL by a client that minted its share and vanished. A takeover
+  purges nothing: a ticket outlives the lease that happened to be live
+  when it was minted, because it was never bound to one;
 * **pipeline-bound** — stamped with the `tab_generation` below, so a
   respawn in the same window is a clean `not-found` rather than a
   stream from a different terminal under the old identity.
@@ -2603,7 +2721,10 @@ Params: `{}`. Response: the reap report,
 Stops the session. In order: the session latches *stopping* (every
 mutating op from that point answers `{"code": "shutting-down"}`, reads
 keep answering, and a second `session.stop` gets `shutting-down` too);
-it **labels and closes every connection the lease holder owns** — an
+it **labels and closes every connection the session ever admitted** —
+every control connection, every data connection on every tab, and every
+event stream, whether or not a lease was ever minted and whether or not
+the lease it presented is still the live one — an
 events connection gets the terminal
 `{"event": "session.stopping", "data": {"reason": "stop"}}` envelope, a
 data connection gets an `ERROR` frame with code `shutting-down`, a
@@ -2689,8 +2810,8 @@ the bytes after it are frames:
 | Code | Meaning |
 |---|---|
 | `protocol-mismatch` | wrong `protocol_version`. Checked **before** the token: the two ends disagree about what a token even is, and `invalid-token` would send the client hunting for the wrong bug. |
-| `invalid-token` | unknown, expired, already-used, or purged by a takeover. |
-| `taken-over` | the lease the token was minted under is no longer current. |
+| `invalid-token` | unknown, expired, already-used, or minted by a control connection that has since gone away (see [`tab.attach`](#tabattach)). A takeover purges no tokens. |
+| `taken-over` | **only from a session predating `open_input`**, where a ticket was bound to the lease that minted it. This session mints tickets against the connection instead, so a takeover leaves them valid and this code is never sent. Kept here because a client that talks to both has to decode it. |
 | `not-found` | the tab has no live terminal, or was respawned between `tab.attach` and this handshake. |
 | `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. For `vt` this also covers a terminal whose VT parser sits mid-sequence with no retained continuation for the whole attach budget: the encode is parked and retried after each further chunk rather than emitting a payload that would desync the client, and the budget is what bounds that wait. |
 | `shutting-down` | `session.stop` has latched. |
@@ -2708,6 +2829,18 @@ authoritative one**, and it is what a client selects its decoder from.
 The control-plane `TabAttachResult.kind` must agree; a client that sees
 them disagree treats it as `protocol-error` and re-attaches rather than
 guessing which to believe.
+
+`snapshot_cols` and `snapshot_rows` name **the size the bytes that
+follow were written for** — the snapshot's own encode geometry in
+`"snapshot"` mode, the tab's grid at the handoff in `"resume"` mode —
+and are present on every accepted reply, `focus: true` included, because
+a focused attach resizes the tab from the control connection and any
+other client may resize it again before the encode or the handoff runs.
+A `vt` client builds its terminal at that size before replaying, then
+resizes it to its own; a resuming client replays the ring into the
+terminal it kept, and the geometry it was away for may not be the one it
+left. See [`tab.attach`](#tabattach). Absent only from a reply a session
+predating `open_input` writes.
 
 #### Preamble and frames
 
@@ -2757,7 +2890,18 @@ what the server sends and vice versa:
 own, so a client that has applied `PTY` frame `final_seq - 1` knows it
 missed nothing. Pixel dimensions on `RESIZE` are load-bearing, not
 decoration: the server terminal's resize and mode-2048 size reports
-both need them.
+both need them, and they are part of the geometry the tab compares
+against (see [`tab.resize`](#tabresize)). A `RESIZE` naming zero cols
+or zero rows is **ignored**, not fatal and not applied —
+[`tab.attach`](#tabattach) refuses a zero-sized grid and the two state
+the same client's geometry, so they have to agree about what a grid is.
+
+Both `INPUT` and `RESIZE` size the tab: a `RESIZE` applies and becomes
+the connection's declared geometry, and an `INPUT` applies that
+geometry ahead of its bytes when the tab is at another one. Neither is
+answered, and the server never tells an attached client that somebody
+else resized the tab under it — a client at another size sees wrapping
+until it next interacts.
 
 Ordering, once the stream is running:
 
@@ -2786,8 +2930,7 @@ Ordering, once the stream is running:
 |---|---|
 | `desync` | the stream cannot be trusted: a gap or duplicate `seq`, a lagged tee, a snapshot that blew the attach budgets. Re-attach. |
 | `overflow` | the peer is not reading — 8 MiB queued for it, or a single write past its deadline. |
-| `superseded` | a newer data connection took this tab. |
-| `taken-over` | another client took the session lease. |
+| `taken-over` | another client took the session lease. Only a session that predates `open_input` sends it: a takeover closes no data connection now. |
 | `shutting-down` | `session.stop` latched. |
 | `protocol-error` | the client sent something the framing forbids. |
 
@@ -2909,20 +3052,37 @@ range, an identity mismatch, a tab task that went away — falls back to
 failure is never an error, and a client never has to handle one: it
 reads `mode` and does what it says.
 
-#### Supersede, and one connection per tab
+#### Many connections per tab
 
-A tab has at most one live data connection. A second *admitted*
-handshake for the same tab supersedes the first, which closes with
-`ERROR superseded` — two forwarders racing one tee is not a state worth
-supporting, and the client that just attached is by definition the
-current one. Admission (token consume, lease re-check, registration,
-supersede) happens as a single step under one lock, so a takeover
-either wholly precedes an attach or wholly follows it.
+A tab admits as many data connections as clients dial (plan 057, R15).
+Each gets its own receiver on the tab's output tee, its own fence, its
+own snapshot and its own [budgets](#budgets); nothing is shared, so a
+peer that stops reading is cut on its own lag and takes none of the
+others with it. Every admitted connection receives the same PTY bytes
+and every one of them may send `INPUT`. There is no supersede: a second
+attach used to close the first with `ERROR superseded`, and that code
+is now only what a session predating `open_input` emits.
 
-Client disconnect at any point simply aborts the forwarder; the tab
-keeps running and no partial state survives. That is the difference
-between detaching and stopping: dropping the socket leaves the session
-exactly as it was.
+**A takeover closes none of them.** It moves the foreground — see
+[`session.connect`](#sessionconnect) — and leaves every control and data
+connection exactly where it was.
+
+**The tab is sized by whichever of them interacted last**, per the rule
+beside [`tab.resize`](#tabresize): a client that only watches (attached
+with `focus: false`, never typing) never changes the size out from
+under the one that is working.
+
+What bounds the count is not a per-tab limit: it is the token quota (16
+unconsumed tickets per TTL window, 8 of them per control connection —
+see [`tab.attach`](#tabattach)) and the session's 4 concurrent snapshot
+encodes. Over time the number of
+admitted connections is open, which is the honest statement — the
+per-attach machinery is what keeps that affordable.
+
+Client disconnect at any point simply aborts that one forwarder; the
+tab keeps running, the other connections keep streaming, and no partial
+state survives. That is the difference between detaching and stopping:
+dropping the socket leaves the session exactly as it was.
 
 #### Budgets
 

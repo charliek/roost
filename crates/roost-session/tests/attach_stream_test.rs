@@ -221,7 +221,7 @@ impl Session {
             .call(
                 ops::TAB_ATTACH,
                 TabAttachParams {
-                    lease: self.lease.clone(),
+                    lease: Some(self.lease.clone()),
                     tab_id,
                     kinds: vec![AttachPayloadKind::from(kind)],
                     cols,
@@ -229,6 +229,7 @@ impl Session {
                     cell_w_px: 0,
                     cell_h_px: 0,
                     libghostty_build: roost_vt::libghostty_build(),
+                    focus: true,
                 },
             )
             .await

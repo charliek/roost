@@ -28,7 +28,6 @@
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install        (alias of `agent install claude`)
 //!   roostctl session {start,stop,status}
-//!   roostctl session autostart {install [--force],uninstall}
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
 //!
@@ -45,7 +44,6 @@
 //! reaches a session only through an explicit `--socket`.
 
 mod agent_install;
-mod autostart;
 mod doctor;
 mod host;
 mod session;
@@ -1837,16 +1835,18 @@ fn lease_from_env(raw: Option<String>) -> Option<String> {
     raw.filter(|lease| !lease.is_empty())
 }
 
-/// Name the write lanes when a session refuses an unleased write.
+/// Explain the one session that still refuses an unleased write.
 ///
-/// `connect-required` off a session socket means the caller reached a
-/// headless session with no authority to drive it, and the fix is a
-/// choice between three lanes rather than a retry.
+/// Since plan 057 (R15) a write takes no lease, so `connect-required`
+/// off a session socket no longer means "you have no authority" — it
+/// means the far side predates that change and is applying the older
+/// rule. Naming the version is the actionable half; a retry is not.
 fn write_lane_hint(e: roost_ipc::ClientError) -> anyhow::Error {
     match &e {
         roost_ipc::ClientError::Server { code, .. } if code == "connect-required" => anyhow!(
-            "tab send needs a session lease: use the agent API, attach to the tab, \
-             or export ROOST_LEASE with a driver lease"
+            "this session predates open input, so it still gates writes on a lease \
+             (no `open_input` in `session.identify.features`): update the \
+             roost-session on the far side, or export ROOST_LEASE with a driver lease"
         ),
         _ => e.into(),
     }
@@ -2014,18 +2014,21 @@ mod tests {
         );
     }
 
-    /// A session refusing an unleased write is not a retryable failure,
-    /// so the message names the three lanes that can write instead of
-    /// echoing the wire code.
+    /// Since R15 only a session predating `open_input` refuses an
+    /// unleased write, so this is a version report, not an authority
+    /// problem — and a retry cannot fix it. The message names what the
+    /// far side lacks instead of echoing the wire code.
     #[test]
-    fn an_unleased_session_write_names_the_write_lanes() {
+    fn an_unleased_session_write_names_the_stale_session() {
         let hinted = write_lane_hint(roost_ipc::ClientError::Server {
             code: "connect-required".into(),
             message: "run session.connect first: this op requires a session lease".into(),
         })
         .to_string();
-        for lane in ["agent API", "attach", "ROOST_LEASE"] {
-            assert!(hinted.contains(lane), "{lane} missing from {hinted:?}");
+        // The far side's age is the actionable fact, so the message has
+        // to name the capability it is missing and the two ways out.
+        for named in ["open_input", "update", "ROOST_LEASE"] {
+            assert!(hinted.contains(named), "{named} missing from {hinted:?}");
         }
         // Every other refusal is passed through untouched.
         let passed = write_lane_hint(roost_ipc::ClientError::Server {

@@ -167,7 +167,8 @@ pub(super) enum PasteGate {
     /// This tab's own incarnation, but nothing is serving it any more.
     Disconnected,
     Reconnected,
-    /// The frame is frozen; the payload is `FrozenFrame::paste_refusal`.
+    /// Nothing is attached to read it; the payload is
+    /// `App::paste_refusal_for`'s sentence.
     Frozen(&'static str),
 }
 
@@ -179,7 +180,8 @@ pub(super) struct TransferFacts {
     /// The origin tab is still one worth pasting into: it has a terminal,
     /// and — if it is local — the workspace still has it.
     tab_live: bool,
-    /// `FrozenFrame::paste_refusal` for the frame this tab is showing.
+    /// `App::paste_refusal_for`: why a paste into this tab is refused,
+    /// when it is.
     frozen: Option<&'static str>,
     connected: bool,
     /// The incarnation currently serving this tab's saved host, which
@@ -339,8 +341,8 @@ pub(super) fn paste_gate(facts: &TransferFacts) -> PasteGate {
 /// Answer a refusal: hand the outcome to whoever is waiting, and say
 /// what the status line should be (`None` = log it and stay quiet).
 ///
-/// `frozen` is `FrozenFrame::paste_refusal` for the frame that refused,
-/// which only the `App` can name.
+/// `frozen` is `App::paste_refusal_for`'s sentence for the tab that
+/// refused, which only the `App` can name.
 pub(super) fn refuse(
     refusal: Refusal,
     label: &str,
@@ -1111,9 +1113,7 @@ impl super::App {
 
     fn refuse_gesture(&mut self, tab: TabKey, refusal: Refusal, reply: Option<GestureReply>) {
         let label = self.transfer_host_label(tab.host);
-        let frozen = self
-            .frozen_host_frame_for(tab)
-            .map(|frame| frame.paste_refusal());
+        let frozen = self.paste_refusal_for(tab);
         tracing::debug!(?tab, ?refusal, "refused a file gesture");
         if let Some(line) = refuse(refusal, &label, frozen, reply) {
             self.set_status(line);
@@ -1162,23 +1162,48 @@ impl super::App {
         }
     }
 
+    /// Why a paste or a drop into `tab` is refused, if it is (issue
+    /// #376) — `None` when it lands.
+    ///
+    /// Gated on the **attach**, not on the host's connection state (plan
+    /// 057 §3.5): a takeover closes nothing, so a deposed host tab is
+    /// still streaming and still takes keys, and a paste belongs with
+    /// them. What has no reader is a host tab whose attach ended, and the
+    /// sentence names the state wherever the state names itself — a
+    /// session that *ended* says so, and everything else (a drop, a
+    /// build gate, a shell that exited) gets the sentence the rest of the
+    /// app gives a host that cannot take work.
+    pub(super) fn paste_refusal_for(&self, tab: TabKey) -> Option<&'static str> {
+        if self.attach_live(tab) {
+            return None;
+        }
+        Some(
+            self.frozen_host_frame_for(tab)
+                .map_or(HOST_UNAVAILABLE, |frame| frame.paste_refusal()),
+        )
+    }
+
     /// Every fact the pure rules need about one tab, read once.
     ///
     /// `connected` comes from the connection's own state rather than the
     /// reconciled view cache: the view is what the window is showing, and
-    /// a gesture is about what the wire can carry.
+    /// a gesture is about what the wire can carry. It asks
+    /// `reached_session` rather than `is_foreground` because a deposed
+    /// connection *can* carry one — the upload lane refuses it as
+    /// [`crate::host_conn::HostOpError::NotForeground`], with a sentence
+    /// naming who is driving and what to do about it, and answering
+    /// `Target::Unavailable` here would pre-empt that with "the host is
+    /// not accepting operations", which is not what happened.
     fn transfer_facts(&self, tab: TabKey) -> TransferFacts {
         let saved = self.host_view(tab.host).map(|view| view.saved_id.as_str());
         TransferFacts {
             is_local: tab.is_local(),
             tab_live: self.tab_live(tab),
-            frozen: self
-                .frozen_host_frame_for(tab)
-                .map(|frame| frame.paste_refusal()),
+            frozen: self.paste_refusal_for(tab),
             connected: saved.is_some_and(|saved| {
                 self.hosts
                     .state(saved)
-                    .is_some_and(crate::host_conn::HostConnState::is_connected)
+                    .is_some_and(crate::host_conn::HostConnState::reached_session)
             }),
             live: saved.and_then(|saved| self.hosts.incarnation(saved)),
             tab_host: tab.host,
@@ -1841,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_freezes_mid_upload_pastes_nothing_and_says_so() {
+    fn an_attach_that_ends_mid_upload_pastes_nothing_and_says_so() {
         let mut gestures = Gestures::default();
         let (id, _) = begun(
             &mut gestures,
@@ -1855,12 +1880,12 @@ mod tests {
             id,
             0,
             landed("/files/a.txt", 1),
-            PasteGate::Frozen("this session was taken over — reconnect to paste"),
+            PasteGate::Frozen("this session ended — start a new session to paste"),
         );
         assert!(pastes(&effects).is_empty());
         assert_eq!(
             statuses(&effects),
-            vec!["this session was taken over — reconnect to paste"]
+            vec!["this session ended — start a new session to paste"]
         );
     }
 
@@ -2147,13 +2172,13 @@ mod tests {
         );
     }
 
-    /// S14's pin: a frozen host's clipboard image never reaches an
-    /// upload. The planner refuses on the target alone, and `refuse`
-    /// answers with the same sentence the other two paste routes do
-    /// (#376) — so the deleted pre-check bought nothing.
+    /// S14's pin: a host tab with nothing attached never reaches an
+    /// upload with a clipboard image. The planner refuses on the target
+    /// alone, and `refuse` answers with the same sentence the other two
+    /// paste routes do (#376) — so the deleted pre-check bought nothing.
     #[test]
     fn a_frozen_host_refuses_a_clipboard_image_with_the_paste_refusal_line() {
-        const REFUSAL: &str = "this session was taken over — reconnect to paste";
+        const REFUSAL: &str = "this session ended — start a new session to paste";
         let frozen = facts(false, true, Some(REFUSAL), true, Some(host(3)), host(3));
         assert_eq!(target_of(&frozen), Target::Frozen);
 

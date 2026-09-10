@@ -35,7 +35,6 @@ roostctl [--socket <PATH>] <COMMAND>
 | `claude-hook` | Internal: invoked by Claude on each hook event (kept for settings files an earlier Roost wrote) |
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, agent hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
-| `session autostart install` / `uninstall` | Write or remove the supervisor artifact that brings a session back after login/reboot |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
 session is not a UI: `session start|stop|status` address the session profile's own socket
@@ -167,7 +166,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
-**`ROOST_LEASE` and `tab send`.** Against a UI socket (`--target mac|linux|iced`) a write needs no credential. Against a **host session's own socket** (reached with `--socket <path>`, e.g. one a `roostctl session start` daemon owns) a write is the driver's act: `tab send` presents the driver lease it reads from the `ROOST_LEASE` environment variable. With the variable unset or empty the session answers `connect-required` and roostctl names the three ways to write into a session tab — the agent API, an attached client, or a driver lease; a lease that has since been displaced by a takeover answers `taken-over`. There is deliberately no `--lease` flag (argv leaks through shell history and `ps`) and no auto-connect (a one-shot CLI minting a lease would silently depose the running app). The variable is stripped from every tab's child environment, so a session started from a shell that exported it never hands session-wide authority to the shells it spawns.
+**`ROOST_LEASE` and `tab send`.** A write needs no credential, on a UI socket (`--target mac|linux|iced`) or a **host session's own socket** (reached with `--socket <path>`, e.g. one a `roostctl session start` daemon owns) alike: since plan 057 (R15) raw input takes no lease, and same-UID access to the socket is the boundary. `tab send` still presents whatever `ROOST_LEASE` holds, because a session that predates that change requires it — such a session answers `connect-required` with the variable unset, and roostctl says so by name rather than sending you hunting for authority you no longer need. There is deliberately no `--lease` flag (argv leaks through shell history and `ps`) and no auto-connect (a one-shot CLI minting a lease would silently depose the running app). The variable is stripped from every tab's child environment, so a session started from a shell that exported it never hands the foreground to the shells it spawns.
 
 `tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
 
@@ -432,86 +431,6 @@ is a real fault and exits 1, not 3.
 | `session start` | a session confirmed serving (fresh or already-running) | spawn failed, or no session answered `session.identify` within the confirm window | — |
 | `session stop` | stopped, or already not running | a socket exists but never answered, or the reap timed out | — |
 | `session status` | a session answered; identity printed | a socket exists but would not answer | no session is running |
-
-### `session autostart install` / `uninstall`
-
-Write, or remove, the one supervisor artifact that brings `roost-session`
-back after a login or a reboot — a `systemd --user` unit on Linux, a
-launchd LaunchAgent on macOS. **Opt-in**: nothing calls this on your
-behalf. `install` never interrupts a session that's already running;
-`uninstall` stops the one the supervisor is running, and only that one
-(see below).
-
-```bash
-roostctl session autostart install
-roostctl session autostart install --force
-roostctl session autostart uninstall
-```
-
-**What it writes, and where.**
-
-| Platform | Path | Contents |
-|---|---|---|
-| Linux | `$XDG_CONFIG_HOME/systemd/user/roost-session.service` (default `~/.config/systemd/user/`), mode `0644` | `Type=simple`, `WorkingDirectory=%h`, `ExecStart="<resolved binary>" start --foreground`, `Restart=on-failure`, `KillMode=mixed` |
-| macOS | `~/Library/LaunchAgents/ai.stridelabs.roost-session.plist`, mode `0644` | `Label ai.stridelabs.roost-session`, `ProgramArguments [<resolved binary>, start, --foreground]`, `RunAtLoad true`, `KeepAlive {SuccessfulExit: false}`, `WorkingDirectory <home>` |
-
-Both files carry an explicit **ownership marker** as their first
-meaningful line — `# Written by roostctl session autostart. Reinstalling
-replaces this file.` (an XML comment of the same sentence in the plist) —
-which is what makes a re-`install` safe to overwrite: without it, a
-harmless-looking foreign file could be silently adopted. The binary is
-resolved with the same ladder `session start` uses
-(`ROOST_SESSION_BIN` → sibling of `roostctl` → `PATH`), made absolute
-but never resolved through a symlink (a packaged `/usr/bin/roost-session`
-is written as itself, not as the versioned build it happens to point
-at), and printed on every install: `autostart: <artifact path> →
-<binary>` — the artifact's name is fixed across build profiles, so this
-line is your only signal that a debug binary is about to take a release
-install's slot, or vice versa.
-
-**`--force` and "foreign file."** Before writing, `install` reads back
-whatever is already at the artifact path. A file is *ours* only if it
-carries the marker line, our `Description`/`Label`, and an `ExecStart`
-/ `ProgramArguments` ending in `start --foreground` — all three; a
-hand-edited copy of ours (an extra `Environment=` line, say) still reads
-as ours and is replaced, with the old bytes echoed to stderr first so
-nothing is silently lost. Anything else is **foreign** and is refused
-by name unless `--force` is given. This deliberately includes an
-artifact you or an earlier doc had you hand-write from the launchd/systemd
-recipe text this guide used to show — it carries no marker, so it reads
-as foreign and needs `--force` exactly once; after that install it's
-ours and every later re-`install` proceeds without the flag.
-
-**Uninstall stops the supervised session.** Removing the supervisor
-artifact stops whatever it's running, on both platforms — `uninstall`
-says so (`stopping the supervised session (…)`) before it does it. A
-session the supervisor isn't running (it may be running unsupervised, or
-not at all) is left untouched, and `uninstall` says that too. Running it
-when nothing is installed succeeds and says there was nothing to do.
-
-**`session status` and the `autostart=` line.** `session status` now
-prints an `autostart=` line in **both** of its branches — the running
-one and the not-running (exit 3) one — because whether the next login
-brings a session back is exactly what a stopped one raises. It reads
-straight off the artifact file on disk, never off the supervisor:
-
-```text
-autostart=installed (systemd --user roost-session.service → /usr/bin/roost-session)
-autostart=installed (launchd ai.stridelabs.roost-session → /Applications/Roost-Iced.app/Contents/MacOS/roost-session) (binary missing: /Applications/Roost-Iced.app/Contents/MacOS/roost-session)
-autostart=not installed
-autostart=not installed (foreign file: not written by roostctl: /home/charlie/.config/systemd/user/roost-session.service)
-autostart=unavailable
-```
-
-`(binary missing: <path>)` appears when the named binary is no longer an
-executable file; `(foreign file: …)` appears when something is at the
-path but isn't ours; `unavailable` is what a platform with no supervisor
-roost knows how to write reports. **`status` deliberately never queries
-the supervisor** — whether the unit is enabled, loaded, or active is not
-part of this line, on purpose: the artifact file is what roost owns and
-can answer for, and `systemctl --user status roost-session` / `launchctl
-print gui/<uid>/ai.stridelabs.roost-session` remain the authority on
-everything past that.
 
 ## `host` subcommands
 

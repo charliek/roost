@@ -646,6 +646,7 @@ mod tests {
                     },
                     reduced_fidelity: true,
                     supports_resume: true,
+                    supports_open_input: true,
                     resumed: None,
                 },
             ),

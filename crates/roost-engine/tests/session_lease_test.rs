@@ -266,16 +266,12 @@ async fn takeover_replaces_the_lease_and_tombstones_the_old_one() {
         .expect("the new lease works");
 }
 
-/// The takeover's whole job, and the one thing it deliberately does not
-/// do: every *writing* connection the previous holder had is closed with
-/// the reason that says why, its **stream survives** and is told instead,
-/// and the requester's own connection is untouched.
-///
-/// The survival is structural, not a skipped branch: streams live in the
-/// observer registry and never under the lease's connection list, so the
-/// closer loop cannot reach one (plan 049 §3.7).
+/// The takeover's whole job, and the whole of what it does *not* do: it
+/// moves the foreground — the displaced stream is demoted and every
+/// stream is told who took over — and it closes nothing (plan 057, R15).
+/// The displaced client keeps its control connection and keeps reading.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn takeover_closes_the_previous_holders_connections_but_demotes_its_stream() {
+async fn takeover_closes_nothing_and_demotes_the_stream() {
     let f = fixture();
     let control = conn(1);
     let lease = connect(&f, &control, false).await.expect("connect").lease;
@@ -289,7 +285,15 @@ async fn takeover_closes_the_previous_holders_connections_but_demotes_its_stream
         .await
         .expect("takeover");
 
-    assert_eq!(control.watch.reason(), Some(CloseReason::TakenOver));
+    assert_eq!(
+        control.watch.reason(),
+        None,
+        "a takeover moves the foreground; it closes no connection"
+    );
+    f.handler
+        .handle(&control.ctx, ops::TAB_LIST, serde_json::json!({}))
+        .await
+        .expect("the displaced holder's connection still serves reads");
     assert_eq!(
         stream.watch.reason(),
         None,
@@ -399,9 +403,10 @@ async fn a_client_label_is_normalized_before_it_is_announced() {
 }
 
 /// A client that already holds a connection under the lease and takes it
-/// over again (HS-2's reconnect shape) keeps that connection.
+/// over again (HS-2's reconnect shape) keeps that connection — as does
+/// everybody else's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_registered_connection_taking_over_does_not_close_itself() {
+async fn a_registered_connection_taking_over_closes_nothing() {
     let f = fixture();
     let first = conn(1);
     let lease = connect(&f, &first, false).await.expect("connect").lease;
@@ -411,7 +416,7 @@ async fn a_registered_connection_taking_over_does_not_close_itself() {
     connect(&f, &second, true).await.expect("takeover");
 
     assert_eq!(second.watch.reason(), None);
-    assert_eq!(first.watch.reason(), Some(CloseReason::TakenOver));
+    assert_eq!(first.watch.reason(), None);
 }
 
 /// Reading a session is not authority (plan 049 §3.7). Absent, empty,
@@ -630,6 +635,83 @@ async fn stop_closes_the_lease_holders_connections() {
 
     assert_eq!(control.watch.reason(), Some(CloseReason::ShuttingDown));
     assert_eq!(stream.watch.reason(), Some(CloseReason::ShuttingDown));
+}
+
+/// The consequence of a takeover closing nothing: three clients' control
+/// connections are all still live afterwards, and a stop owes every one
+/// of them the labeled goodbye.
+///
+/// Which is why the registry tracks control connections independently of
+/// the lease they presented — a displaced `Lease` no longer carries the
+/// closers, so dropping it at a takeover would strand two live sockets a
+/// stop could then only end with a bare EOF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_after_two_takeovers_labels_every_control_connection() {
+    let f = fixture();
+    let (a, b, c) = (conn(1), conn(2), conn(3));
+    connect(&f, &a, false).await.expect("connect");
+    connect(&f, &b, true).await.expect("the first takeover");
+    connect(&f, &c, true).await.expect("the second takeover");
+
+    f.handler
+        .handle(&conn(4).ctx, ops::SESSION_STOP, serde_json::json!({}))
+        .await
+        .expect("session.stop");
+
+    for (who, connection) in [("a", &a), ("b", &b), ("c", &c)] {
+        assert_eq!(
+            connection.watch.reason(),
+            Some(CloseReason::ShuttingDown),
+            "{who}'s control connection was never told the session stopped"
+        );
+    }
+}
+
+/// A control connection that never presented a lease is still owed the
+/// labeled goodbye (review F1).
+///
+/// R15 is what makes this the normal case: a client that only does
+/// `tab.attach` + `tab.write` + `tab.list` mints nothing, so a registry
+/// that tracked only leased connections would have no record of it — and
+/// a stop could give it a bare EOF, which is indistinguishable from the
+/// wire dying. A client that re-dials on that reading walks straight
+/// into a socket being unlinked.
+///
+/// The second half is the other edge: a connection that has already
+/// ended must be *gone*, not merely closed twice. A probe that dials,
+/// asks one question and hangs up would otherwise accumulate in the
+/// registry for the life of the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_labels_a_connection_that_never_presented_a_lease() {
+    let f = fixture();
+    let leaseless = conn(1);
+    f.handler
+        .handle(&leaseless.ctx, ops::SESSION_IDENTIFY, serde_json::json!({}))
+        .await
+        .expect("a leaseless op");
+
+    let probe = conn(2);
+    f.handler
+        .handle(&probe.ctx, ops::SESSION_IDENTIFY, serde_json::json!({}))
+        .await
+        .expect("a leaseless op");
+    f.handler.connection_ended(2);
+
+    f.handler
+        .handle(&conn(3).ctx, ops::SESSION_STOP, serde_json::json!({}))
+        .await
+        .expect("session.stop");
+
+    assert_eq!(
+        leaseless.watch.reason(),
+        Some(CloseReason::ShuttingDown),
+        "a client that never asked for the lease still gets told the session stopped"
+    );
+    assert_eq!(
+        probe.watch.reason(),
+        None,
+        "a connection that already ended was forgotten, not kept for the sweep"
+    );
 }
 
 /// A UI socket has no session, so it has no lease to hand out either.

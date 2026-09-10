@@ -239,10 +239,10 @@ class Roost:
     def send(self, tab_id: int, data: bytes | str, lease: str | None = None) -> None:
         """Write bytes into a tab's PTY input.
 
-        `lease` is required on a *session* socket, where a write is the
-        driver's act; a UI socket mints no leases and ignores the key.
-        Omitted rather than sent empty when absent — that is the shape a
-        lease-less client has always put on the wire.
+        `lease` is accepted and ignored on every socket (plan 057, R15):
+        raw input takes no lease. Omitted rather than sent empty when
+        absent — that is the shape a lease-less client has always put on
+        the wire, and the shape a pre-`open_input` session needs.
         """
         if isinstance(data, str):
             data = data.encode()

@@ -114,9 +114,13 @@ pub trait Handler: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
     /// Another client took the session's interactive lease.
+    ///
+    /// Nothing in this build closes a connection with it: since R15
+    /// (plan 057) a takeover moves the foreground and closes neither
+    /// control nor data connections. It stays as the published
+    /// vocabulary a pre-R15 session emitted and every client still
+    /// decodes.
     TakenOver,
-    /// A newer data connection replaced this one for the same tab.
-    Superseded,
     /// The session is stopping.
     ShuttingDown,
 }
@@ -124,14 +128,11 @@ pub enum CloseReason {
 impl CloseReason {
     /// The `reason` a push connection's [`SESSION_STOPPING_EVENT`]
     /// envelope carries. The published vocabulary is exactly
-    /// `"stop"` | `"taken-over"`; `Superseded` is a data-plane-only
-    /// reason that never reaches a push connection, and if it somehow
-    /// does, "stop" is the truthful half of it (the stream is over)
-    /// rather than a word no client knows.
+    /// `"stop"` | `"taken-over"`.
     pub fn stopping_reason(self) -> &'static str {
         match self {
             CloseReason::TakenOver => "taken-over",
-            CloseReason::Superseded | CloseReason::ShuttingDown => "stop",
+            CloseReason::ShuttingDown => "stop",
         }
     }
 
@@ -143,7 +144,6 @@ impl CloseReason {
     pub fn error_code(self) -> &'static str {
         match self {
             CloseReason::TakenOver => "taken-over",
-            CloseReason::Superseded => "superseded",
             CloseReason::ShuttingDown => "shutting-down",
         }
     }
@@ -160,10 +160,10 @@ pub const CLOSE_LABEL_DEADLINE: std::time::Duration = std::time::Duration::from_
 /// Identity of the connection a request arrived on, handed to every
 /// [`Handler::handle`] call.
 ///
-/// A session's lease registry keys on `conn_id` and stores `closer`, so
-/// a takeover can close every connection the previous lease holder
-/// owned — including ones parked in push or data mode, which no longer
-/// read requests and so can never be told anything by replying.
+/// A session's client registry keys on `conn_id` and stores `closer`, so
+/// a stop can close every connection it ever admitted — including ones
+/// parked in push or data mode, which no longer read requests and so can
+/// never be told anything by replying.
 pub struct ConnCtx {
     pub conn_id: u64,
     pub closer: ConnCloser,

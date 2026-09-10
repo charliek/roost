@@ -321,10 +321,12 @@ op right after every `session.connect`
   Reconciling disagreeing clients against one host is filed as future
   work, not solved here.
 
-No new remote command surface is added by this: a client that already
-holds a host's lease can run arbitrary commands there via `tab.open`, so
-wiring a hook command is not a new capability — it's the same one,
-applied to a dotfile instead of a shell.
+No new remote command surface is added by this: any same-UID client
+that can reach a host's socket can already run arbitrary commands there
+via `tab.open` — that op has always been lease-free, and as of plan 057
+(R15) `tab.write` is too, so wiring a hook command is not a new
+capability — it's the same one, applied to a dotfile instead of a
+shell.
 
 ## Security
 
@@ -360,10 +362,10 @@ Three things worth stating as a stance rather than leaving implicit:
   real widening of what a tab exposes, which is why
   `ROOST_OPENCODE_NO_SERVER=1` turns it off.
 
-The first two points introduce no capability a lease holder didn't
-already have: on a host, whoever holds the session's lease can already
-run arbitrary commands there via `tab.open`. The third does widen the
-surface, on purpose, and the opt-out is the answer to it.
+The first two points introduce no capability a same-UID client didn't
+already have: on a host, any client that can reach the socket can
+already run arbitrary commands there via `tab.open`. The third does
+widen the surface, on purpose, and the opt-out is the answer to it.
 
 ## gx
 

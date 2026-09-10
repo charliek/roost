@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle, MAX_OUTSTANDING_TOKENS};
+use roost_engine::ipc::{
+    IpcHandler, SessionInfo, StopHandle, MAX_OUTSTANDING_TOKENS, MAX_TOKENS_PER_CONNECTION,
+};
 use roost_engine::tab_task::{ServerVtConfig, ServerVtWorkspace};
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::dataframe::{
@@ -29,7 +31,7 @@ use roost_ipc::messages::{
     SessionConnectParams, SessionConnectResult, SessionStopParams, SessionStopResult,
     TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
     TabCloseParams, TabDumpParams, TabDumpResult, TabFeedPtyBytesParams, TabOpenParams,
-    TabOpenResult, WireTabRef, SESSION_PROTOCOL_VERSION,
+    TabOpenResult, TabResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -188,6 +190,31 @@ impl Harness {
         (client, tab_id, data)
     }
 
+    /// Attach at an explicit viewport and read the snapshot through, so
+    /// the next frame is one the test caused. The accepted reply comes
+    /// back with the connection because the geometry tests read it.
+    async fn attached_at(
+        &self,
+        client: &mut IpcClient,
+        lease: &str,
+        tab_id: i64,
+        grid: (u16, u16),
+        cell: (u16, u16),
+        focus: bool,
+    ) -> (AttachAccepted, DataClient) {
+        let ticket = attach_with(
+            client,
+            sized_attach_params(lease, tab_id, grid, cell, focus),
+        )
+        .await
+        .expect("tab.attach");
+        let (accepted, mut data) = dial(&self.socket, handshake(&ticket.attach_token))
+            .await
+            .expect("accepted");
+        data.read_snapshot().await;
+        (accepted, data)
+    }
+
     /// A tab that has been attached once and has gone quiet again, with
     /// the data connection dropped the way a client's would be. The seq
     /// is the last record that client applied — what it would carry into
@@ -218,7 +245,7 @@ async fn attach(client: &mut IpcClient, lease: &str, tab_id: i64) -> TabAttachRe
 
 fn attach_params(lease: &str, tab_id: i64) -> TabAttachParams {
     TabAttachParams {
-        lease: lease.to_string(),
+        lease: Some(lease.to_string()),
         tab_id,
         kinds: vec![
             AttachPayloadKind::from("sixel-mosaic-v9"),
@@ -229,6 +256,27 @@ fn attach_params(lease: &str, tab_id: i64) -> TabAttachParams {
         cell_w_px: 0,
         cell_h_px: 0,
         libghostty_build: roost_vt::libghostty_build(),
+        focus: true,
+    }
+}
+
+/// The same at an explicit viewport. `focus` is the attach-time
+/// geometry claim: `true` resizes the tab, `false` attaches at whatever
+/// size it already is.
+fn sized_attach_params(
+    lease: &str,
+    tab_id: i64,
+    (cols, rows): (u16, u16),
+    (cell_w_px, cell_h_px): (u16, u16),
+    focus: bool,
+) -> TabAttachParams {
+    TabAttachParams {
+        cols,
+        rows,
+        cell_w_px,
+        cell_h_px,
+        focus,
+        ..attach_params(lease, tab_id)
     }
 }
 
@@ -431,6 +479,30 @@ async fn feed(client: &mut IpcClient, tab_id: i64, data: Vec<u8>) {
         )
         .await
         .expect("tab.feed_pty_bytes");
+}
+
+/// Drain what the tab's PTY writer was handed until every marker has
+/// shown up, returning everything read. Test-mode capture, so what this
+/// proves is that the bytes crossed the forwarder into the writer.
+async fn read_pty_input_until(client: &mut IpcClient, tab_id: i64, markers: &[&[u8]]) -> Vec<u8> {
+    let deadline = Instant::now() + BUDGET;
+    let mut captured = Vec::new();
+    while !markers.iter().all(|marker| contains(&captured, marker)) {
+        assert!(Instant::now() < deadline, "the INPUT bytes never arrived");
+        let batch: TabCapturePtyInputResult = client
+            .call(
+                ops::TAB_CAPTURE_PTY_INPUT,
+                TabCapturePtyInputParams {
+                    tab_id: WireTabRef::Local(tab_id),
+                    drain: true,
+                },
+            )
+            .await
+            .expect("tab.capture_pty_input");
+        captured.extend_from_slice(&batch.data);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    captured
 }
 
 async fn dump(client: &mut IpcClient, tab_id: i64) -> TabDumpResult {
@@ -836,14 +908,6 @@ async fn the_control_op_refuses_what_cannot_be_served() {
         "invalid-param"
     );
 
-    let mut no_lease = attach_params("", tab_id);
-    no_lease.tab_id = tab_id;
-    assert_eq!(
-        attach_with(&mut client, no_lease).await.unwrap_err(),
-        "connect-required",
-        "the lease is checked before anything else"
-    );
-
     let mut missing_tab = attach_params(&lease, tab_id + 9_999);
     missing_tab.kinds = vec![AttachPayloadKind::from("sixel-mosaic-v9")];
     assert_eq!(
@@ -889,94 +953,457 @@ async fn an_oversized_frame_ends_the_connection() {
     assert!(data.next().await.is_none());
 }
 
-/// A second admitted handshake for the same tab takes it over; the first
-/// forwarder is told why rather than just going quiet.
+/// A tab admits as many data connections as are dialed (plan 057, R15):
+/// both see the same PTY output and both can type into it. Nothing is
+/// superseded — a second attach used to close the first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_attach_supersedes_the_first() {
+async fn two_attaches_to_one_tab_both_stream_and_both_type() {
     let h = harness().await;
     let (mut client, lease, tab_id) = h.leased_tab().await;
+
     let first = attach(&mut client, &lease, tab_id).await;
-    let (_accepted, mut old) = dial(&h.socket, handshake(&first.attach_token))
+    let (a_accepted, mut a) = dial(&h.socket, handshake(&first.attach_token))
         .await
         .expect("accepted");
-    old.read_snapshot().await;
+    let (_snapshot, pty) = a.read_snapshot().await;
+    let a_at = pty.last().map_or(a_accepted.seq, |(seq, _)| *seq);
 
     let second = attach(&mut client, &lease, tab_id).await;
-    let (_accepted, mut new) = dial(&h.socket, handshake(&second.attach_token))
+    let (b_accepted, mut b) = dial(&h.socket, handshake(&second.attach_token))
         .await
-        .expect("accepted");
+        .expect("the first attach is untouched and a second is admitted");
+    let (_snapshot, pty) = b.read_snapshot().await;
+    let b_at = pty.last().map_or(b_accepted.seq, |(seq, _)| *seq);
 
-    assert_eq!(error_of(&old.frame().await).code, "superseded");
-    assert!(old.next().await.is_none());
-    // The replacement is untouched and still streaming.
-    new.read_snapshot().await;
+    // One tee, two receivers: the same bytes reach both.
+    feed(&mut client, tab_id, b"ROOST_BOTH_SEE_THIS\r\n".to_vec()).await;
+    a.read_pty_until(a_at, b"ROOST_BOTH_SEE_THIS").await;
+    b.read_pty_until(b_at, b"ROOST_BOTH_SEE_THIS").await;
+
+    // And both write: the input side is open to every admitted
+    // connection, not to one of them.
+    a.send(FRAME_INPUT, b"ROOST_FROM_A").await;
+    b.send(FRAME_INPUT, b"ROOST_FROM_B").await;
+    let typed =
+        read_pty_input_until(&mut client, tab_id, &[b"ROOST_FROM_A", b"ROOST_FROM_B"]).await;
+    assert!(contains(&typed, b"ROOST_FROM_A") && contains(&typed, b"ROOST_FROM_B"));
 }
 
-/// A supersede that lands mid-snapshot has to end the stream where it
-/// is. The close watch is checked at the top of every pump pass, so the
-/// displaced client stops receiving within one pass rather than riding
-/// the rest of a multi-megabyte catch-up to EXIT.
+/// Dropping one attach leaves the others alone: the registry keeps a
+/// list per tab, and a forwarder unwinding removes only its own entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_supersede_mid_snapshot_ends_the_stream_with_an_error() {
-    // Wide and full: the encoded snapshot's size follows the characters
-    // the terminal holds, and this one has to be too big to hand over
-    // before the supersede lands.
-    const COLS: u32 = 1_000;
+async fn dropping_one_of_several_data_connections_removes_only_its_entry() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab_sized(COLS, 24).await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
 
-    let mut history = Vec::new();
-    for row in 0..2_100u32 {
-        history.extend_from_slice(format!("{row:.<998}\r\n").as_bytes());
+    let leaving = attach(&mut client, &lease, tab_id).await;
+    let (_accepted, mut going) = dial(&h.socket, handshake(&leaving.attach_token))
+        .await
+        .expect("accepted");
+    going.read_snapshot().await;
+
+    let staying = attach(&mut client, &lease, tab_id).await;
+    let (accepted, mut data) = dial(&h.socket, handshake(&staying.attach_token))
+        .await
+        .expect("accepted");
+    let (_snapshot, pty) = data.read_snapshot().await;
+    let at = pty.last().map_or(accepted.seq, |(seq, _)| *seq);
+
+    drop(going);
+
+    // Still streaming, and a stop still reaches it — which is the half
+    // that would break if the departing connection had taken the tab's
+    // whole entry with it.
+    feed(&mut client, tab_id, b"ROOST_STILL_HERE\r\n".to_vec()).await;
+    data.read_pty_until(at, b"ROOST_STILL_HERE").await;
+
+    let _report: SessionStopResult = client
+        .call(ops::SESSION_STOP, SessionStopParams {})
+        .await
+        .expect("session.stop");
+    assert_eq!(error_of(&data.frame().await).code, "shutting-down");
+}
+
+/// An attach takes no lease, so a session can be serving a data
+/// connection having never minted one — and a stop owes that connection
+/// the same labeled close as any other. The registry's own walk is what
+/// pins this: the closer used to be reachable only through the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_labels_a_data_connection_on_a_session_that_never_minted_a_lease() {
+    let h = harness().await;
+    let mut client = h.control().await;
+    let project = h
+        .workspace
+        .create_project("p", "/tmp")
+        .expect("create a project");
+    let opened: TabOpenResult = client
+        .call(
+            ops::TAB_OPEN,
+            TabOpenParams {
+                project_id: project.id,
+                cwd: "/tmp".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "exec cat".into()],
+                cols: 0,
+                rows: 0,
+                title: String::new(),
+            },
+        )
+        .await
+        .expect("tab.open");
+
+    let ticket = attach_with(
+        &mut client,
+        TabAttachParams {
+            lease: None,
+            ..attach_params("", opened.tab.id)
+        },
+    )
+    .await
+    .expect("an attach on a session with no lease at all");
+    let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
+    data.read_snapshot().await;
+
+    let _report: SessionStopResult = client
+        .call(ops::SESSION_STOP, SessionStopParams {})
+        .await
+        .expect("session.stop");
+
+    assert_eq!(error_of(&data.frame().await).code, "shutting-down");
+    assert!(data.next().await.is_none());
+}
+
+/// The lease is accepted and ignored on an attach: absent, empty, and a
+/// token this session has already displaced all negotiate a ticket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tab_attach_accepts_no_lease_an_empty_lease_and_a_stale_one() {
+    let h = harness().await;
+    let (mut client, stale, tab_id) = h.leased_tab().await;
+    let mut taker = h.control().await;
+    let _taken: SessionConnectResult = taker
+        .call(
+            ops::SESSION_CONNECT,
+            SessionConnectParams {
+                takeover: true,
+                client_label: None,
+            },
+        )
+        .await
+        .expect("session.connect with takeover");
+
+    for lease in [None, Some(String::new()), Some(stale.clone())] {
+        let ticket = attach_with(
+            &mut client,
+            TabAttachParams {
+                lease: lease.clone(),
+                ..attach_params("", tab_id)
+            },
+        )
+        .await
+        .unwrap_or_else(|code| panic!("attach refused {code} for lease={lease:?}"));
+        let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+            .await
+            .expect("accepted");
+        data.read_snapshot().await;
     }
-    history.extend_from_slice(b"ROOST_HISTORY_DONE\r\n");
-    feed(&mut client, tab_id, history).await;
-    wait_for_dump(&mut client, tab_id, "the scrollback to land", |d| {
-        d.rows_text
-            .iter()
-            .any(|row| row.contains("ROOST_HISTORY_DONE"))
+}
+
+// ---------------------------------------------------------------------
+// Geometry: the last geometry-bearing interaction sizes the PTY
+// ---------------------------------------------------------------------
+
+/// Enable libghostty's mode-2048 in-band size reports on a tab. Every
+/// resize then writes one report toward the child, on the very queue
+/// keystrokes ride — which is what makes the order between a resize and
+/// the input that caused it observable from outside.
+async fn watch_size_reports(client: &mut IpcClient, tab_id: i64) {
+    feed(client, tab_id, b"\x1b[?2048h".to_vec()).await;
+}
+
+/// How many size reports for `grid` a captured stream carries. The
+/// report is `CSI 48 ; rows ; cols ; …` — the grid half is all these
+/// tests read, so a change in the pixel half cannot break them.
+fn size_reports(captured: &[u8], (cols, rows): (u16, u16)) -> usize {
+    String::from_utf8_lossy(captured)
+        .matches(&format!("48;{rows};{cols}"))
+        .count()
+}
+
+fn index_of(captured: &[u8], needle: &[u8]) -> usize {
+    captured
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .unwrap_or_else(|| {
+            panic!(
+                "{:?} is not in {:?}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(captured)
+            )
+        })
+}
+
+/// Typing is a geometry-bearing interaction: an INPUT frame carries its
+/// connection's declared geometry, and the tab takes that size *before*
+/// the bytes are written. Both ride one command channel, so the order is
+/// the task's receive order and needs no fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_input_frame_applies_its_connections_geometry_first() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_desktop, _a) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_phone, mut b) = h
+        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .await;
+    wait_for_dump(&mut client, tab_id, "the focused attach's geometry", |d| {
+        (d.cols, d.rows) == (100, 30)
     })
     .await;
 
-    let mut wide = attach_params(&lease, tab_id);
-    wide.cols = u16::try_from(COLS).unwrap();
-    let first = attach_with(&mut client, wide.clone())
-        .await
-        .expect("tab.attach");
-    let (_accepted, mut old) = dial(&h.socket, handshake(&first.attach_token))
-        .await
-        .expect("accepted");
-    // One frame only: the snapshot is deliberately left unfinished.
-    let mut seen = Vec::new();
-    let frame = old.frame().await;
-    assert_eq!(frame.frame_type, FRAME_SNAP);
-    seen.extend_from_slice(&frame.payload);
+    watch_size_reports(&mut client, tab_id).await;
+    b.send(FRAME_INPUT, b"ROOST_TYPED").await;
 
-    let second = attach_with(&mut client, wide).await.expect("tab.attach");
-    let (_accepted, mut new) = dial(&h.socket, handshake(&second.attach_token))
-        .await
-        .expect("accepted");
-
-    // Drain the displaced connection to its end. Whatever was already
-    // in flight may still arrive; what must not is EXIT, which would
-    // mean the forwarder kept working for a client that lost the tab.
-    let error = loop {
-        let frame = old.frame().await;
-        match frame.frame_type {
-            FRAME_SNAP => seen.extend_from_slice(&frame.payload),
-            FRAME_PTY => continue,
-            FRAME_ERROR => break error_of(&frame),
-            other => panic!("a superseded stream must not carry frame {other:#04x}"),
-        }
-    };
-    assert_eq!(error.code, "superseded");
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_TYPED"]).await;
+    let resized = index_of(&captured, b"48;20;60");
+    let typed = index_of(&captured, b"ROOST_TYPED");
     assert!(
-        !has_tag(&seen, TAG_FINISH),
-        "the close has to land mid-snapshot or this test proves nothing"
+        resized < typed,
+        "the resize must precede the bytes it carried: {:?}",
+        String::from_utf8_lossy(&captured)
     );
-    assert!(old.next().await.is_none(), "the connection closes after it");
-    // The replacement is untouched and still streaming.
-    new.read_snapshot().await;
+    assert_eq!(
+        {
+            let d = dump(&mut client, tab_id).await;
+            (d.cols, d.rows)
+        },
+        (60, 20),
+        "the PTY follows whoever typed last"
+    );
+}
+
+/// Geometry is four numbers, not two. A connection at the tab's own grid
+/// but with different cell metrics is a different viewport — libghostty's
+/// size reports quote the pixel dimensions — so its input resizes the tab
+/// even though `tab.dump` cannot tell the difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_accepted, mut same) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_accepted, mut wider_cells) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (9, 16), false)
+        .await;
+
+    watch_size_reports(&mut client, tab_id).await;
+    same.send(FRAME_INPUT, b"ROOST_UNCHANGED").await;
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_UNCHANGED"]).await;
+    assert_eq!(
+        size_reports(&captured, (100, 30)),
+        0,
+        "geometry that has not changed is not re-applied ({:?})",
+        String::from_utf8_lossy(&captured)
+    );
+
+    wider_cells.send(FRAME_INPUT, b"ROOST_WIDER_CELLS").await;
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"ROOST_WIDER_CELLS"]).await;
+    assert_eq!(
+        size_reports(&captured, (100, 30)),
+        1,
+        "the same grid at other cell metrics is still a resize ({:?})",
+        String::from_utf8_lossy(&captured)
+    );
+}
+
+/// Two clients typing into one tab do not race for the PTY's size: each
+/// INPUT applies its own geometry, and the tab ends up wherever the last
+/// command the task *received* asked for — not the last one sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_senders_linearize_in_receive_order() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_accepted, mut desktop) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    let (_accepted, mut phone) = h
+        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .await;
+
+    // Sequenced, not raced: each marker is read back before the next
+    // sender types, so which command the task took first is a fact of
+    // the test rather than of the scheduler.
+    phone.send(FRAME_INPUT, b"ROOST_PHONE").await;
+    read_pty_input_until(&mut client, tab_id, &[b"ROOST_PHONE"]).await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (60, 20));
+
+    desktop.send(FRAME_INPUT, b"ROOST_DESKTOP").await;
+    read_pty_input_until(&mut client, tab_id, &[b"ROOST_DESKTOP"]).await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (100, 30));
+}
+
+/// `tab.attach` refuses a zero-sized grid, and a RESIZE frame states the
+/// same client's geometry, so the two agree: the frame is dropped rather
+/// than applied, and the connection carries on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_sized_resize_frame_is_ignored() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (_accepted, mut data) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+
+    let mut payload = Vec::new();
+    for value in [0u16, 20, 8, 16] {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    data.send(FRAME_RESIZE, &payload).await;
+
+    // Read a later frame back, so "nothing happened" is a fact about a
+    // tab that has processed the zero-sized one, not about timing.
+    data.send(FRAME_INPUT, b"ROOST_AFTER_ZERO").await;
+    read_pty_input_until(&mut client, tab_id, &[b"ROOST_AFTER_ZERO"]).await;
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!(
+        (d.cols, d.rows),
+        (100, 30),
+        "a zero-sized RESIZE leaves the tab alone"
+    );
+}
+
+/// An unfocused attach claims nothing: the tab keeps the size the
+/// focused client gave it, and the accepted handshake reports the
+/// geometry its snapshot was actually encoded at — which is what a `vt`
+/// client has to build its terminal at.
+///
+/// A focused attach hears it too. Its resize ran on the control
+/// connection before this one was dialed, and raw input is open, so
+/// "what I asked for" is not evidence of what the encode composed —
+/// `a_focused_attach_reports_the_size_it_was_actually_encoded_at` is the
+/// case where the two differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (desktop, _a) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+    assert_eq!(
+        (desktop.snapshot_cols, desktop.snapshot_rows),
+        (Some(100), Some(30)),
+        "the size the payload was encoded at, which here is what was asked for"
+    );
+
+    let (phone, _b) = h
+        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .await;
+    assert_eq!(
+        (phone.snapshot_cols, phone.snapshot_rows),
+        (Some(100), Some(30))
+    );
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!(
+        (d.cols, d.rows),
+        (100, 30),
+        "a client that is only watching cannot shrink the one that is typing"
+    );
+}
+
+/// A focused attach hears the snapshot's real geometry too, and it is
+/// the encode's answer rather than the request's (review F7).
+///
+/// The resize a focused `tab.attach` performs runs on the **control**
+/// connection and finishes before the data connection is even dialed.
+/// Raw input is open, so anything else may size the tab in that window —
+/// here a plain `tab.resize` from a second client, which is the same
+/// interaction a phone's first keystroke would be. The payload is then
+/// composed at the other client's size, and a `vt` client that hydrated
+/// at its own would wrap every line and misplace every absolute cursor
+/// move. Suppressing the field on `focus: true` — on the premise that a
+/// focused attacher already knows the size — is exactly what R15
+/// invalidated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_focused_attach_reports_the_size_it_was_actually_encoded_at() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    // The attach negotiates 100x30 and mints a ticket. Nothing has been
+    // dialed yet, so nothing has been encoded yet either.
+    let ticket = attach_with(
+        &mut client,
+        sized_attach_params(&lease, tab_id, (100, 30), (8, 16), true),
+    )
+    .await
+    .expect("tab.attach");
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (100, 30), "the focused attach sized it");
+
+    // Somebody else interacts before the ticket is presented.
+    let mut other = h.control().await;
+    let _resized: serde_json::Value = other
+        .call(
+            ops::TAB_RESIZE,
+            TabResizeParams {
+                tab_id,
+                cols: 60,
+                rows: 20,
+            },
+        )
+        .await
+        .expect("tab.resize");
+    wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
+        (d.cols, d.rows) == (60, 20)
+    })
+    .await;
+
+    let (accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
+    data.read_snapshot().await;
+    assert_eq!(
+        (accepted.snapshot_cols, accepted.snapshot_rows),
+        (Some(60), Some(20)),
+        "the reply names the geometry the encode used, not the one asked for"
+    );
+}
+
+/// Reading is not an interaction. `tab.dump` carries no geometry, so it
+/// leaves the tab's size alone however often it is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dump_never_resizes() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (_accepted, mut data) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .await;
+
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (100, 30));
+
+    let mut payload = Vec::new();
+    for value in [70u16, 22, 8, 16] {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    data.send(FRAME_RESIZE, &payload).await;
+    wait_for_dump(&mut client, tab_id, "the RESIZE frame to land", |d| {
+        (d.cols, d.rows) == (70, 22)
+    })
+    .await;
+
+    // A third client reading the tab changes nothing about it.
+    let mut reader = h.control().await;
+    let d = dump(&mut reader, tab_id).await;
+    assert_eq!((d.cols, d.rows), (70, 22));
+    let d = dump(&mut client, tab_id).await;
+    assert_eq!((d.cols, d.rows), (70, 22));
 }
 
 /// A megabyte injected through the session's own test-mode arm has to
@@ -1046,33 +1473,21 @@ async fn a_session_stop_labels_a_live_data_connection() {
     assert!(data.next().await.is_none());
 }
 
-/// A takeover invalidates the displaced lease's tickets, so it has to
-/// drop them too: they are refused at admission anyway, and leaving them
-/// in the registry would let a dead client's full quota lock the new
-/// holder out for a whole TTL.
+/// A ticket belongs to the connection that minted it, not to a lease
+/// (plan 057, R15): a takeover leaves every outstanding one usable, and
+/// what reclaims the quota is the minting connection going away.
+///
+/// The quota is the registry's bound, so it has to be reclaimable
+/// without waiting out a TTL — a client that mints its whole share and
+/// vanishes must not lock everyone else out for a minute.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_purges_the_displaced_leases_attach_tokens() {
+async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
     let h = harness().await;
     let (mut old_client, old_lease, tab_id) = h.leased_tab().await;
-
-    let mut minted = Vec::new();
-    for _ in 0..MAX_OUTSTANDING_TOKENS {
-        minted.push(
-            attach(&mut old_client, &old_lease, tab_id)
-                .await
-                .attach_token,
-        );
-    }
-    assert_eq!(
-        attach_with(&mut old_client, attach_params(&old_lease, tab_id))
-            .await
-            .unwrap_err(),
-        "too-many-tokens",
-        "the quota is what bounds the registry"
-    );
+    let survivor = attach(&mut old_client, &old_lease, tab_id).await;
 
     let mut new_client = h.control().await;
-    let taken: SessionConnectResult = new_client
+    let _taken: SessionConnectResult = new_client
         .call(
             ops::SESSION_CONNECT,
             SessionConnectParams {
@@ -1083,21 +1498,56 @@ async fn a_takeover_purges_the_displaced_leases_attach_tokens() {
         .await
         .expect("session.connect with takeover");
 
-    // Immediately, with no expiry to wait out: the point of the purge.
-    let ticket = attach(&mut new_client, &taken.lease, tab_id).await;
+    // The takeover took the foreground and nothing else: a ticket minted
+    // under the displaced lease still admits a data connection.
+    let (_accepted, mut data) = dial(&h.socket, handshake(&survivor.attach_token))
+        .await
+        .expect("a ticket minted before the takeover is still admissible");
+    data.read_snapshot().await;
 
-    // The displaced lease itself still answers `taken-over` — the
-    // instruction its holder can act on.
-    let mut stale = h.control().await;
+    // The quota is per session, and the displaced client — still
+    // attaching on its stale lease, which is accepted and ignored —
+    // takes its full share of it. Filling the rest takes a second
+    // connection, because no single one may hold the whole pool.
+    let mut minted = Vec::new();
+    for _ in 0..MAX_TOKENS_PER_CONNECTION {
+        minted.push(
+            attach(&mut old_client, &old_lease, tab_id)
+                .await
+                .attach_token,
+        );
+    }
+    let mut filler = h.control().await;
+    for _ in 0..(MAX_OUTSTANDING_TOKENS - MAX_TOKENS_PER_CONNECTION) {
+        attach_with(&mut filler, attach_params("", tab_id))
+            .await
+            .expect("a second connection fills the rest of the pool");
+    }
     assert_eq!(
-        attach_with(&mut stale, attach_params(&old_lease, tab_id))
+        attach_with(&mut new_client, attach_params("", tab_id))
             .await
             .unwrap_err(),
-        "taken-over"
+        "too-many-tokens",
+        "the quota is what bounds the registry"
     );
-    // Its tickets are gone rather than merely unusable, so the handshake
-    // no longer recognizes them: `invalid-token` sends the client back
-    // for a new one, which is where it learns it was taken over.
+
+    // The connection that minted them goes away, and its tickets go with
+    // it — immediately, with no expiry to wait out.
+    drop(old_client);
+    let deadline = Instant::now() + BUDGET;
+    let ticket = loop {
+        match attach_with(&mut new_client, attach_params("", tab_id)).await {
+            Ok(ticket) => break ticket,
+            Err(code) => {
+                assert_eq!(code, "too-many-tokens");
+                assert!(
+                    Instant::now() < deadline,
+                    "the minting connection's tickets were never reclaimed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
     let error = dial(&h.socket, handshake(&minted[0]))
         .await
         .expect_err("a purged ticket is not admissible");
@@ -1105,7 +1555,42 @@ async fn a_takeover_purges_the_displaced_leases_attach_tokens() {
 
     let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
         .await
-        .expect("the new lease's own ticket is accepted");
+        .expect("the freshly minted ticket is accepted");
+    data.read_snapshot().await;
+}
+
+/// One connection cannot hold the whole ticket pool (review F2).
+///
+/// Before R15 minting required the lease, so only the foreground could
+/// reach the session-wide quota at all. Raw input is open now: any
+/// same-UID process can loop `tab.attach` without ever dialing, and
+/// without a per-connection share one buggy script would answer the real
+/// UI's attach with `too-many-tokens` for a whole TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_connection_cannot_mint_away_everybody_elses_attach() {
+    let h = harness().await;
+    let (mut hog, lease, tab_id) = h.leased_tab().await;
+
+    for _ in 0..MAX_TOKENS_PER_CONNECTION {
+        attach(&mut hog, &lease, tab_id).await;
+    }
+    assert_eq!(
+        attach_with(&mut hog, attach_params(&lease, tab_id))
+            .await
+            .unwrap_err(),
+        "too-many-tokens",
+        "its own share is spent"
+    );
+
+    // And the session is not: another client — leaseless, as R15 allows
+    // — still gets a ticket, and a usable one.
+    let mut other = h.control().await;
+    let ticket = attach_with(&mut other, attach_params("", tab_id))
+        .await
+        .expect("a second connection still has room in the pool");
+    let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
+        .await
+        .expect("accepted");
     data.read_snapshot().await;
 }
 
@@ -1220,6 +1705,70 @@ async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
         }
     }
     assert!(data.next().await.is_none());
+}
+
+/// A resume names the tab's geometry too, read at the handoff (review
+/// F1).
+///
+/// A resuming client replays the ring into the terminal it *kept*, and
+/// the shared grid can have moved while it was away — every client that
+/// types sizes the tab, and this one was not there to see it. Without
+/// the answer it lays those records out at the width it left, wrapping
+/// every line and misplacing every absolute cursor move until something
+/// resizes it locally.
+///
+/// The window is the same one the snapshot path has: the focused
+/// `tab.attach` sized the tab on the control connection, and the resize
+/// below lands before the ticket is presented. The reply must describe
+/// the tab as it is at the handoff, not as the attach asked for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
+    let h = harness().await;
+    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+
+    let ticket = attach_with(
+        &mut client,
+        sized_attach_params(&lease, tab_id, (100, 30), (8, 16), true),
+    )
+    .await
+    .expect("tab.attach");
+
+    // Somebody else keeps typing at their own size while this client is
+    // still dialing back in.
+    let mut other = h.control().await;
+    let _resized: serde_json::Value = other
+        .call(
+            ops::TAB_RESIZE,
+            TabResizeParams {
+                tab_id,
+                cols: 60,
+                rows: 20,
+            },
+        )
+        .await
+        .expect("tab.resize");
+    wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
+        (d.cols, d.rows) == (60, 20)
+    })
+    .await;
+
+    let (accepted, _data) = dial(
+        &h.socket,
+        resume_handshake(
+            &ticket.attach_token,
+            applied + 1,
+            ticket.server_epoch,
+            ticket.tab_generation,
+        ),
+    )
+    .await
+    .expect("accepted");
+    assert_eq!(accepted.mode, AttachMode::Resume);
+    assert_eq!(
+        (accepted.snapshot_cols, accepted.snapshot_rows),
+        (Some(60), Some(20)),
+        "a resume names the grid its records were written at, not the one asked for"
+    );
 }
 
 /// `last_assigned + 1` is a hit, not a miss: the client missed nothing,
