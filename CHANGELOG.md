@@ -287,6 +287,52 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **Taking the foreground back on an SSH host no longer reconnects, and
+  no longer resizes the tab under whoever else is looking (#462)** —
+  a takeover moves the *foreground*, and the client it deposed keeps its
+  connection, its stream and its attach. Pressing ↻ or "Take the
+  foreground" on a `localhost` host claimed that foreground back on the
+  connection already there: no reconnect, no reattach, no blink. On a
+  host reached over SSH the same button did a full reconnect instead,
+  because reconnecting there tore down the tunnel — and the deposed
+  client's control leg with it — before anything could ask. The reattach
+  that followed was focused, so it also resized the shared tab to this
+  window's grid, which the phone or laptop still watching it saw happen.
+  The retake now runs on every transport, riding the tunnel that is
+  already open. The one case that still reconnects is a connection whose
+  tunnel has already been replaced, which is a genuinely different
+  connection. `roostctl host connect` takes the same path. Separately, a
+  retake that is granted and then fails part-way now leaves the
+  reconnect ladder holding the lease it actually won rather than the one
+  it superseded — that ladder used to probe with the stale lease, be
+  told it was not current, and quietly land the user as an observer of a
+  session they had just taken back.
+
+- **A `tab.resize` no longer blanks the terminal's cell metrics, so
+  in-band size reports stop reading `0x0` (#463)** — `tab.resize` states
+  a grid and nothing else, and the engine was filling the pixel half in
+  with zeros rather than leaving it alone, so the next mode-2048 size
+  report told the program running in the tab that its window was zero
+  pixels across. Programs that lay themselves out from that — image
+  viewers, anything sizing to the reported pixel box — got it wrong. The
+  metrics now stay where the last client that actually had a viewport
+  left them. A `tab.resize` naming the grid a client is already at is a
+  no-op again, which is what the IPC reference always promised.
+
+- **Two SSH tunnels to one host in the same process no longer destroy
+  each other (#449)** — opening a tunnel swept away this process's older
+  scratch directories for that host id with no liveness check, on the
+  reasoning that one process holds one tunnel per host at a time. A
+  caller that opened two therefore lost the first: its socket and its
+  control master went out from under it. The sweep now skips a directory
+  this process is still holding, and keeps probing another process's
+  leftovers exactly as before. A probe was deliberately not used for the
+  same-process case: a directory is created before its socket is bound,
+  so a probe would read "not bound yet" as "dead" and reclaim a tunnel
+  its owner was about to bind into — and probing a live tunnel is not
+  free, since every accepted connection spawns an `ssh` and bumps the
+  tunnel's failure generation.
+
 - **grok/gx: a continued turn's `stopHookActive: true` Stop fires keep the
   tab `working`, and a failed turn's banner carries the reason (#423)** —
   gx's `Stop` hook is a gate: when a blocking Stop hook continues the
