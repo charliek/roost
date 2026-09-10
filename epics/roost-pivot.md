@@ -12,6 +12,28 @@ Sections that matter here: §03 (the layering rule), §04 Q7 (local-only,
 SSH is the transport) and Q12 (where a session lives; the three kinds of
 write), §06 Track R.
 
+**The artifact is a dated record and is not being amended — this file is
+the current truth.** It was written on 6 September and carries its own
+amendments only as far as §10 and §11. Two of its answers have since
+been overtaken, so read them against the rules below rather than as they
+stand:
+
+* **§04 Q12's "write is three things"** is half wrong now. "Semantic
+  writes go through the agent's API" stands. "**Attach** is one client at
+  a time, switched by takeover" and "**raw `tab.write`** follows attach"
+  were both reversed by R15 (#453, landed): a tab admits as many data
+  connections as clients dial, `tab.write` and `tab.attach` take no lease
+  at all, and a takeover closes neither — it moves the *foreground*. See
+  the "Write is two things" rule below, and `vision.md` DL-25.
+* **§04 Q7's "no network listener"** is narrower than it reads. It
+  governs roost's own transport; an agent's own server on `127.0.0.1`,
+  exposed by that agent's plugin, is the agent's lane (R10, landed). See
+  the local-only rule below.
+
+Everything else in §04 still reads true. Where the artifact and this file
+disagree, this file wins; where this file is silent, the artifact is
+still the reasoning.
+
 **Tracking:** https://github.com/users/charliek/projects/4 —
 `Epic: Roost Pivot`. Your PR body must contain `Closes charliek/roost#<n>`.
 Status moves by itself when that merges. Never edit board status by hand.
