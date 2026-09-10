@@ -988,18 +988,24 @@ impl SshTunnel {
             .expect("pick_socket_dir joins a leaf name onto a candidate");
         sweep_scratch_dirs(&options.ssh_bin, &target.raw, parent, host_id).await?;
 
+        // Claimed *before* it exists, which is what makes the claim
+        // airtight rather than merely early: from `create_private_dir`
+        // on, this directory is visible to a concurrent `open`'s sweep
+        // running on another thread, and an unheld one is exactly what
+        // that sweep reclaims — this bug again, through a window of two
+        // statements. Registering a path that is not there yet costs
+        // nothing, because the sweep only ever asks about directories
+        // `read_dir` handed it.
+        claim_scratch_dir(&dir);
+
         // `create_new` semantics: the name carries a pid and a sequence,
         // so a collision is a real error rather than something to reclaim.
-        create_private_dir(&dir)
-            .with_context(|| format!("create the scratch directory {}", dir.display()))?;
-
-        // The instant it exists, not after the write below: from
-        // `create_private_dir` on, this directory is visible to a
-        // concurrent `open`'s sweep, and an unheld one is exactly what
-        // that sweep reclaims — which would be this bug again, through a
-        // narrower window. Nothing before this line has anything to
-        // release, since the directory it names does not exist yet.
-        claim_scratch_dir(&dir);
+        if let Err(error) = create_private_dir(&dir) {
+            release_scratch_dir(&dir);
+            return Err(SshTunnelError::Local(anyhow::Error::from(error).context(
+                format!("create the scratch directory {}", dir.display()),
+            )));
+        }
 
         if let Err(error) =
             write_private_file(&config_path, options.config_paths.render().as_bytes())
