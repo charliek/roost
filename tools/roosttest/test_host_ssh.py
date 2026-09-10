@@ -104,6 +104,7 @@ from test_host_client import (
     marker,
     quiet_tab,
     start_session,
+    takeback_in_place,
     wait_dump_contains,
     wait_live_connect,
     wait_until,
@@ -838,6 +839,42 @@ def test_a_send_file_opens_one_extra_bridge_connection_and_moves_no_generation(
 
     assert count(is_exec) - execs_before == 1, invocations()
     assert status(ssh_host)["generation"] == generation_before, status(ssh_host)
+
+
+# ---------------------------------------------------------------------------
+# Plan 057 R15 / plan 058 R17: the takeback rides the tunnel already there
+# ---------------------------------------------------------------------------
+
+
+def test_a_takeover_on_an_ssh_host_is_taken_back_in_place(ssh_host, roost):
+    """R15's sequence, on the transport it was never run on.
+
+    Called rather than restated: `takeback_in_place` is the same
+    foreground round trip the Unix-socket and localhost lanes drive, so
+    all three transports pin one behaviour instead of three descriptions
+    of it. It goes through `host.connect` — the op, not a UI-only path —
+    which is why proving it here also proves `roostctl host connect` on a
+    deposed ssh host.
+
+    What only this lane can see is the transport underneath, and it is
+    the half R17 changed. Over ssh a reconnect is an OS fact: a mux
+    warm-up builds a tunnel and an `-O exit` shuts down the one it
+    replaced. `open_ssh` used to run that teardown before anything could
+    ask for the foreground — killing the very control leg the deposed
+    task's retake needs — so a takeback could only ever come back as a
+    reconnect, and both counts below would have moved.
+
+    One establish, and it belongs to the opening connect: the takeover,
+    the phone's attach and the takeback all ride the tunnel that connect
+    built, and nothing tears one down until the fixture removes the host.
+    """
+    establishes = count(is_establish)
+    teardowns = count(is_teardown)
+
+    takeback_in_place(ssh_host, roost)
+
+    assert count(is_establish) == establishes + 1, invocations()
+    assert count(is_teardown) == teardowns, invocations()
 
 
 # ---------------------------------------------------------------------------
