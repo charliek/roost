@@ -153,17 +153,19 @@ PR pays only for what it touches.
 | `themes-parity` | The Rust + Mac bundled-theme copies are byte-identical | ✅ |
 | `rust-build` | `cargo build`/`test` on Linux + macOS, plus the `roost-vt` ffi and `roost-engine/facade` passes | ✅ |
 | `swift-mac` | `swift build` / `swift test`, release bundle, embedded `roostctl`, entitlements + link guards | ✅ |
-| `iced-build-e2e` | 2×2 matrix (ubuntu, macOS) × (wgpu, tiny-skia): build + unit + toolkit-boundary check, then functional E2E — Linux under **both** X11 (xvfb) and **Wayland** (headless weston), plus the exit-on-empty, menu-quit, real-input clipboard, the five host-session client lanes (below), and (macOS) bundle-identity + smoke lanes | ✅ |
+| `iced-build-e2e` | 2×2 matrix (ubuntu, macOS) × (wgpu, tiny-skia): build + unit + toolkit-boundary check, then functional E2E — Linux under **both** X11 (xvfb) and **Wayland** (headless weston), plus the exit-on-empty, menu-quit, real-input clipboard, the six host-session client lanes (below), and (macOS) bundle-identity + smoke lanes | ✅ |
 | `iced-release` | Release-profile build, the real `.deb`, a release-binary E2E subset, packaged-profile assertion, artifact smoke, dependency-closure check | ✅ |
 | `e2e-mac` | The full `tools/roosttest` directory against a bundled `Roost.app` on a GUI-session runner | ✅ |
 | `session-e2e` | The headless host-session lanes — `roost-session` driven with no UI and no display (`SESSION_E2E_TESTS`, marker-based rather than an enumerated CI list) | ✅ |
 | `e2e-iced-wayland-drag` | `roost-iced` fullscreen under `cage` with a real `/dev/uinput` seat — the pointer-drag + system-clipboard guard the IPC-driven Wayland lane cannot cover | ❌ soft (`continue-on-error`, absent from `ci-success`) |
 
-**The five host-session client lanes inside `iced-build-e2e`.** They
+**The six host-session client lanes inside `iced-build-e2e`.** They
 need a UI *and* a `roost-session` daemon, so they are in neither
 `ICED_E2E_TESTS` nor `SESSION_E2E_TESTS` and run as their own steps —
 `e2e-host-client`, `e2e-host-ssh`, `e2e-host-missing-daemon`,
-`e2e-host-local-spawn` (added by plan 044 for #397) and
+`e2e-host-local-spawn` (added by plan 044 for #397),
+`e2e-host-localhost` (added by plan 058 for #460: the literal
+`localhost` target, its ↻ Restart verb, and the restart behind it) and
 `e2e-host-bootstrap`, each with an X11 and a Wayland twin. They run
 **serialized, never beside one another**: they share the client's
 incarnation counter and the default session socket, so two at once bind

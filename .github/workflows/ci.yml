@@ -866,6 +866,29 @@ jobs:
           tools/roosttest/test_host_local_spawn.py
           --roost-target iced --roost-fresh -v
 
+      # Plan 058 §3.2's sentinel lane (#460): the only host lane whose
+      # target is the literal string `localhost`, and so the only cover
+      # for the ↻ Restart verb and the restart behind it. AFTER the
+      # local-spawn step and never beside any other host step — it points
+      # `XDG_RUNTIME_DIR` at a private root at import, which moves the UI
+      # this step launches along with the sentinel it dials, and it shares
+      # the incarnation probe that cannot tell two connected hosts' tabs
+      # apart (`make e2e-host-localhost` carries the same warning).
+      - name: Run localhost E2E (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-localhost-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-host-localhost-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_host_localhost.py
+          --roost-target iced --roost-fresh -v
+
       # HS-3 slice 2's bootstrap lane (plan 039 C6): the same fake-`ssh`
       # fixture in `run-remote` mode, so the generated probe/install/start
       # scripts really run. AFTER the SSH-transport step and never beside
@@ -1048,6 +1071,24 @@ jobs:
           tools/wayland/weston-run.sh
           uv run --group test pytest
           tools/roosttest/test_host_local_spawn.py
+          --roost-target iced --roost-fresh -v
+
+      # The Wayland twin of the X11 localhost step. Same ordering rule,
+      # and the lane the module's private `XDG_RUNTIME_DIR` is riskiest
+      # in — `agent_jail.make_private_runtime_dir` says why.
+      - name: Run localhost E2E (Linux Wayland)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-localhost-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-host-localhost-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_host_localhost.py
           --roost-target iced --roost-fresh -v
 
       # The Wayland twin of the X11 bootstrap step. Same ordering rule:
