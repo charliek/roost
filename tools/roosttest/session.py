@@ -44,6 +44,12 @@ The runtime directory's *parent* is pre-created here rather than left to
 the daemon: `validate_runtime_dir` creates only the leaf (non-recursive,
 `0700`), which is right for a real machine where `$XDG_RUNTIME_DIR` and
 `~/Library/Caches` are provided by the OS. The fixture plays the OS.
+On Linux that means `make_env` also chmods `$XDG_RUNTIME_DIR` itself to
+`0700` after creating it, since `Path.mkdir` inherits the process umask
+and a permissive one (e.g. 0002) would otherwise leave it group-writable
+and fail the same validation a real runtime dir would; `data`/`state`/
+`cache` are left as `mkdir` makes them since the daemon never validates
+those.
 
 # Why `SHELL=/bin/sh`
 
@@ -753,6 +759,11 @@ def make_env(*, launch_cwd_name: str = "launch") -> SessionEnv:
         cache = root / "cache"
         for directory in (runtime, data, state, cache):
             directory.mkdir(parents=True, exist_ok=True)
+        # `Path.mkdir` inherits the umask, so under umask 0002 `runtime`
+        # would land group-writable and fail `validate_runtime_dir` the
+        # same way a real `$XDG_RUNTIME_DIR` would. Only `runtime` needs
+        # hardening: it is the one directory the daemon validates.
+        runtime.chmod(0o700)
         env["XDG_RUNTIME_DIR"] = str(runtime)
         env["XDG_DATA_HOME"] = str(data)
         env["XDG_STATE_HOME"] = str(state)
