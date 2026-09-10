@@ -554,19 +554,70 @@ async fn a_live_bridge_socket_refuses_a_second_tunnel() {
     drop(live);
 }
 
-/// The same-process rule, and the guard against a rapid double Connect:
-/// this app opens one tunnel per saved host at a time, so a directory
-/// *this pid* left behind is superseded by construction. It is reclaimed
-/// with no probe at all — probing it would find the previous attempt's
-/// own live bridge socket and refuse the replacement, which is exactly
-/// the deadlock a second Connect must not hit.
+/// A directory this pid minted that a tunnel of this process still
+/// holds. The register says so, and nothing else is asked: the sweep
+/// neither probes it nor exits its master, and the second tunnel takes a
+/// directory of its own.
 #[tokio::test]
-async fn a_leftover_directory_from_this_process_is_superseded_not_refused() {
+async fn a_held_leftover_from_this_process_is_left_alone_not_refused_not_reclaimed() {
     let harness = Harness::new("ok", "cat");
     let host_id = "0000000a";
-    let superseded = harness.leftover_dir(host_id, std::process::id(), u64::MAX);
-    let live = tokio::net::UnixListener::bind(superseded.join("bridge.sock")).expect("bind");
-    std::fs::write(superseded.join("ctl"), b"").expect("pre-create the control socket");
+
+    // Opened and not established — the state a rapid double Connect's
+    // second open finds its sibling in.
+    let held = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
+        .await
+        .expect("the first open");
+    let held_dir = held.bridge_socket().parent().expect("a dir").to_path_buf();
+    // The control socket this tunnel's establish is about to create. It
+    // is what a reclaim would run `-O exit` against, so writing it is
+    // what makes "no exit ran" evidence rather than a vacuous count.
+    std::fs::write(held_dir.join("ctl"), b"").expect("pre-create the control socket");
+
+    let tunnel = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
+        .await
+        .expect("this process's own tunnels must never refuse each other");
+
+    assert_eq!(
+        harness.count(is_master_exit),
+        0,
+        "a held directory's master is never exited: {:?}",
+        harness.invocations()
+    );
+    assert!(held_dir.exists(), "the held directory is left standing");
+
+    let second_dir = tunnel
+        .bridge_socket()
+        .parent()
+        .expect("a dir")
+        .to_path_buf();
+    assert_ne!(held_dir, second_dir);
+    let mut both = vec![held_dir, second_dir];
+    both.sort();
+    assert_eq!(
+        harness.scratch_dirs(host_id),
+        both,
+        "each tunnel owns a directory of its own"
+    );
+
+    tunnel
+        .establish()
+        .await
+        .expect("establish beside a sibling");
+    drop(echo_through(tunnel.bridge_socket(), b"fresh\n").await);
+}
+
+/// A directory this pid minted that no tunnel holds any more — an
+/// attempt that died between creating it and returning one. The register
+/// is what says so; the live bridge socket left in it would refuse the
+/// reclaim if the sweep asked the socket instead.
+#[tokio::test]
+async fn an_unheld_leftover_from_this_process_is_reclaimed() {
+    let harness = Harness::new("ok", "cat");
+    let host_id = "0000000c";
+    let forgotten = harness.leftover_dir(host_id, std::process::id(), u64::MAX);
+    let live = tokio::net::UnixListener::bind(forgotten.join("bridge.sock")).expect("bind");
+    std::fs::write(forgotten.join("ctl"), b"").expect("pre-create the control socket");
 
     let tunnel = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
         .await
@@ -577,13 +628,10 @@ async fn a_leftover_directory_from_this_process_is_superseded_not_refused() {
     assert!(is_master_exit(&invocations[0]), "{:?}", invocations[0]);
     assert!(
         invocations[0].contains(&"ctl-exists=1".to_string()),
-        "a superseded master is exited before its socket goes: {:?}",
+        "a forgotten master is exited before its socket goes: {:?}",
         invocations[0]
     );
-    assert!(
-        !superseded.exists(),
-        "the superseded directory is reclaimed"
-    );
+    assert!(!forgotten.exists(), "the forgotten directory is reclaimed");
     assert_eq!(
         harness.scratch_dirs(host_id),
         vec![tunnel
@@ -591,22 +639,20 @@ async fn a_leftover_directory_from_this_process_is_superseded_not_refused() {
             .parent()
             .expect("a scratch dir")
             .to_path_buf()],
-        "the replacement owns a directory of its own"
+        "and the only one left is this attempt's own"
     );
 
-    tunnel
-        .establish()
-        .await
-        .expect("establish after superseding");
+    tunnel.establish().await.expect("establish after a reclaim");
     drop(echo_through(tunnel.bridge_socket(), b"fresh\n").await);
     drop(live);
 }
 
-/// Two overlapping opens for one host — a rapid double Connect, whose
-/// establishes are in flight at the same time — never share a directory,
-/// so neither one's teardown can delete the other's files.
+/// Two tunnels to one host in one process — a reconnect overlapping the
+/// connection it replaces, opened before either establishes — both work,
+/// and each teardown takes only its own files. This is shed's
+/// `faked_bridge` scenario in roost's own words.
 #[tokio::test]
-async fn two_overlapping_tunnels_for_one_host_never_share_a_directory() {
+async fn two_tunnels_for_one_host_in_one_process_coexist() {
     let harness = Harness::new("ok", "cat");
     let host_id = "0000000b";
 
@@ -614,10 +660,6 @@ async fn two_overlapping_tunnels_for_one_host_never_share_a_directory() {
         .await
         .expect("first open");
     let first_dir = first.bridge_socket().parent().expect("a dir").to_path_buf();
-    first.establish().await.expect("first establish");
-
-    // The second open sweeps the first away (same pid, superseded) and
-    // takes a directory of its own.
     let second = SshTunnel::open(host_id, &ssh_target("workbox"), harness.options())
         .await
         .expect("second open");
@@ -627,15 +669,24 @@ async fn two_overlapping_tunnels_for_one_host_never_share_a_directory() {
         .expect("a dir")
         .to_path_buf();
     assert_ne!(first_dir, second_dir);
-    second.establish().await.expect("second establish");
-    drop(echo_through(second.bridge_socket(), b"live\n").await);
 
-    // The loser's teardown lands late, and must take nothing of the
-    // winner's with it.
+    first.establish().await.expect("first establish");
+    second.establish().await.expect("second establish");
+    drop(echo_through(first.bridge_socket(), b"first\n").await);
+    drop(echo_through(second.bridge_socket(), b"second\n").await);
+
     first.shutdown().await;
+    assert!(!first_dir.exists(), "the first takes its own directory");
+    assert_eq!(harness.scratch_dirs(host_id), vec![second_dir]);
     assert!(second.bridge_socket().exists(), "the live bridge survives");
     drop(echo_through(second.bridge_socket(), b"still here\n").await);
-    assert_eq!(harness.scratch_dirs(host_id), vec![second_dir]);
+
+    second.shutdown().await;
+    assert!(
+        harness.scratch_dirs(host_id).is_empty(),
+        "{:?}",
+        harness.scratch_dirs(host_id)
+    );
 }
 
 #[tokio::test]

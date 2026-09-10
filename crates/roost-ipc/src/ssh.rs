@@ -17,10 +17,11 @@
 //! `tests/ssh_transport_test.rs`, driven by a fake `ssh` — the only way
 //! to pin process choreography without a real host on the other end.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -958,18 +959,12 @@ impl SshTunnel {
     /// the *sweep*: every `roost-ssh-<this host id>-*` directory under the
     /// chosen parent is examined before the new one is created.
     ///
-    /// Two rules, by whose leftovers they are:
+    /// What becomes of each is [`reclaim_decision`]'s rule; the
+    /// directory this attempt goes on to create is registered with
+    /// [`claim_scratch_dir`], which is what tells that rule a sibling
+    /// tunnel is still using its own.
     ///
-    /// * **This process's** — superseded by construction, since the
-    ///   caller above opens one tunnel per saved host at a time — are
-    ///   reclaimed with no probe at all.
-    /// * **Another process's** are fail-safe in exactly the way
-    ///   [`crate::socket_state`] is: a `bridge.sock` that answers, or
-    ///   that cannot be classified at all, means another Roost owns this
-    ///   target and this one refuses. Only a socket that is provably dead
-    ///   — or absent — authorizes a reclaim.
-    ///
-    /// Either reclaim runs `-O exit` against the *old* control socket
+    /// A reclaim runs `-O exit` against the *old* control socket
     /// before removing anything. That client is gone but its `ssh` master
     /// is not: `ControlPersist` keeps it alive for its own timeout, and
     /// removing the control socket out from under it would strand a
@@ -998,8 +993,26 @@ impl SshTunnel {
         create_private_dir(&dir)
             .with_context(|| format!("create the scratch directory {}", dir.display()))?;
 
-        write_private_file(&config_path, options.config_paths.render().as_bytes())
-            .with_context(|| format!("write {}", config_path.display()))?;
+        // The instant it exists, not after the write below: from
+        // `create_private_dir` on, this directory is visible to a
+        // concurrent `open`'s sweep, and an unheld one is exactly what
+        // that sweep reclaims — which would be this bug again, through a
+        // narrower window. Nothing before this line has anything to
+        // release, since the directory it names does not exist yet.
+        claim_scratch_dir(&dir);
+
+        if let Err(error) =
+            write_private_file(&config_path, options.config_paths.render().as_bytes())
+        {
+            // No `Drop` will ever come for a tunnel that was never
+            // built, so the claim has to go back by hand or the next
+            // sweep skips this directory forever instead of reclaiming
+            // it.
+            release_scratch_dir(&dir);
+            return Err(SshTunnelError::Local(
+                error.context(format!("write {}", config_path.display())),
+            ));
+        }
 
         Ok(Self {
             state: Arc::new(TunnelState {
@@ -1179,13 +1192,14 @@ impl SshTunnel {
         )
         .await;
         if let Err(error) = tokio::fs::remove_dir_all(&self.dir).await {
-            // Already gone is ordinary, not a fault: a superseded
-            // tunnel's shutdown lands after its replacement's sweep has
-            // reclaimed this directory (same pid, no probe).
+            // Already gone is not a fault, only a surprise: this tunnel
+            // holds the directory until the release below, so no sibling
+            // sweep can have taken it and something outside this process
+            // must have.
             if error.kind() == std::io::ErrorKind::NotFound {
                 tracing::debug!(
                     dir = %self.dir.display(),
-                    "ssh tunnel: the scratch directory was already reclaimed"
+                    "ssh tunnel: the scratch directory was already gone"
                 );
             } else {
                 tracing::warn!(
@@ -1195,6 +1209,7 @@ impl SshTunnel {
                 );
             }
         }
+        release_scratch_dir(&self.dir);
     }
 
     fn stop_accepting(&self) {
@@ -1230,9 +1245,12 @@ impl Drop for SshTunnel {
             &self.state.target,
         );
         // Ignored rather than reported: this directory is this tunnel's
-        // alone, and the only way it is already gone is a replacement's
-        // sweep having reclaimed it.
+        // alone and `Drop` has nowhere to report to. The release below
+        // is the half a dropped-without-`shutdown` handle still owes —
+        // the register would otherwise grow an entry per tunnel for the
+        // life of the process.
         let _ = std::fs::remove_dir_all(&self.dir);
+        release_scratch_dir(&self.dir);
     }
 }
 
@@ -1622,9 +1640,101 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Every scratch directory a live [`SshTunnel`] in this process holds.
+/// [`SshTunnel::open`] adds one, `shutdown` and `Drop` take it back out,
+/// and [`reclaim_decision`] is the only reader.
+static CLAIMED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+
+const CLAIMED_MUTEX: &str = "ssh tunnel claimed scratch directory mutex";
+
+fn claim_scratch_dir(dir: &Path) {
+    CLAIMED
+        .lock()
+        .expect(CLAIMED_MUTEX)
+        .insert(dir.to_path_buf());
+}
+
+fn release_scratch_dir(dir: &Path) {
+    CLAIMED.lock().expect(CLAIMED_MUTEX).remove(dir);
+}
+
+fn holds_scratch_dir(dir: &Path) -> bool {
+    CLAIMED.lock().expect(CLAIMED_MUTEX).contains(dir)
+}
+
+/// What the sweep does with one leftover scratch directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sweep {
+    /// Leave the directory, its socket and its master exactly as they
+    /// are.
+    Skip,
+    /// Exit the old master, then remove the directory.
+    Reclaim,
+    /// Another Roost owns this target; this attempt does not open.
+    Refuse,
+    /// Something is at `bridge.sock` that no sweep may remove.
+    Error,
+}
+
+/// The sweep's whole rule, over everything knowable about one leftover:
+/// whether this process minted it, whether a tunnel of this process
+/// still holds it ([`CLAIMED`]), and — for another process's only — what
+/// its `bridge.sock` answered.
+///
+/// **Another process's** are fail-safe in exactly the way
+/// [`crate::socket_state`] is: a socket that answers, or that cannot be
+/// classified at all, means another Roost owns this target and this one
+/// refuses. Only a socket that is provably dead — or absent —
+/// authorizes a reclaim.
+///
+/// **This process's** are settled by the register instead, and are never
+/// probed. Two tunnels to one host in one process are ordinary — a
+/// reconnect overlapping the connection it replaces — and per-attempt
+/// naming ([`scratch_dir_name`]) already gives the new one a directory
+/// of its own, so a held sibling collides with nothing and is left
+/// alone; its own `shutdown` removes it. A directory this pid minted
+/// that is *not* on the register is a forgotten one — an attempt that
+/// failed after creating it — and is reclaimed.
+///
+/// Probing a same-pid directory rather than asking the register would be
+/// wrong twice over. `bridge.sock` is bound in [`SshTunnel::establish`]
+/// and not in [`SshTunnel::open`], so a sibling caught between the two
+/// probes `Missing` — and a rapid double Connect, the likeliest way two
+/// tunnels for one host overlap, would reclaim a directory its owner is
+/// about to bind into. And a probe is not free: [`TunnelState::serve`]
+/// spawns a real `ssh` exec and bumps the generation for every accepted
+/// connection, a probe's included, so a failing exec would record a
+/// failure against the *live* tunnel.
+fn reclaim_decision(same_pid: bool, held: bool, socket: Option<&SocketState>) -> Sweep {
+    if same_pid {
+        return if held { Sweep::Skip } else { Sweep::Reclaim };
+    }
+    match socket {
+        Some(state) if state.safe_to_unlink() => Sweep::Reclaim,
+        Some(SocketState::NotASocket(_)) => Sweep::Error,
+        _ => Sweep::Refuse,
+    }
+}
+
+/// The copy behind a [`Sweep::Refuse`] or a [`Sweep::Error`].
+fn refusal(target: &str, dir: &Path, socket: SocketState) -> SshTunnelError {
+    SshTunnelError::Local(match socket {
+        SocketState::NotASocket(kind) => anyhow!(
+            "{} is a {kind}, not a socket; remove {} by hand",
+            dir.join(BRIDGE_FILE).display(),
+            dir.display()
+        ),
+        state => anyhow!(
+            "another Roost is connected to {target} (its bridge socket is {state:?} at {})",
+            dir.display()
+        ),
+    })
+}
+
 /// The reclaim half of [`SshTunnel::open`]: every scratch directory
 /// `parent` still holds for `host_id`, examined and dealt with before a
-/// fresh one is claimed. See [`SshTunnel::open`] for the two rules.
+/// fresh one is claimed. [`reclaim_decision`] is the rule; this only
+/// carries it out.
 async fn sweep_scratch_dirs(
     ssh_bin: &Path,
     target: &str,
@@ -1660,27 +1770,29 @@ async fn sweep_scratch_dirs(
     leftovers.sort();
 
     for (dir, pid) in leftovers {
-        if pid != ours {
-            let bridge_path = dir.join(BRIDGE_FILE);
-            match socket_state::probe(&bridge_path, PROBE_TIMEOUT).await {
-                SocketState::Missing | SocketState::Stale => {}
-                SocketState::NotASocket(kind) => {
-                    return Err(SshTunnelError::Local(anyhow!(
-                        "{} is a {kind}, not a socket; remove {} by hand",
-                        bridge_path.display(),
-                        dir.display()
-                    )))
-                }
-                // Live, and anything that cannot be classified: fail-safe,
-                // the same rule `socket_state` unlinks under.
-                state => {
-                    return Err(SshTunnelError::Local(anyhow!(
-                        "another Roost is connected to {target} (its bridge socket is \
-                         {state:?} at {})",
-                        dir.display()
-                    )))
-                }
+        let same_pid = pid == ours;
+        let socket = if same_pid {
+            None
+        } else {
+            Some(socket_state::probe(&dir.join(BRIDGE_FILE), PROBE_TIMEOUT).await)
+        };
+
+        match reclaim_decision(same_pid, holds_scratch_dir(&dir), socket.as_ref()) {
+            Sweep::Skip => {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    "ssh tunnel: leaving a scratch directory this process still holds"
+                );
+                continue;
             }
+            Sweep::Refuse | Sweep::Error => {
+                return Err(refusal(
+                    target,
+                    &dir,
+                    socket.expect("only a probed leftover refuses"),
+                ))
+            }
+            Sweep::Reclaim => {}
         }
 
         exit_master(ssh_bin, &dir.join(CONFIG_FILE), &dir.join(CTL_FILE), target).await;
@@ -2610,6 +2722,94 @@ mod tests {
             assert!(
                 parse_scratch_dir_name(name).is_none(),
                 "{name:?} must not read as a host's scratch directory"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // the reclaim rule
+    // ------------------------------------------------------------------
+
+    /// An open puts its directory on the register and a shutdown takes
+    /// it off — the round trip the whole rule rests on.
+    ///
+    /// **What this does not pin** is *when* within `open` the claim
+    /// happens. That matters: the claim sits immediately after
+    /// `create_private_dir` rather than after the config write, because
+    /// from creation onward the directory is visible to a concurrent
+    /// `open`'s sweep, and an unheld one is what that sweep reclaims —
+    /// #449 again through a narrower window. Both orderings leave the
+    /// register in the same state by the time `open` returns, which is
+    /// all a test can see from out here, so the placement is argued at
+    /// its definition rather than asserted.
+    #[tokio::test]
+    async fn an_open_claims_its_directory_and_a_shutdown_hands_it_back() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let tunnel = SshTunnel::open(
+            "claimwindow",
+            &SshTarget::new("workbox"),
+            SshTunnelOptions {
+                config_paths: SshConfigPaths {
+                    user: None,
+                    system: None,
+                },
+                // A macOS `$TMPDIR` can be too deep for a `sun_path`;
+                // the fallback is what `from_env` would pick anyway.
+                scratch_parents: vec![parent.path().to_path_buf(), PathBuf::from("/tmp")],
+                ssh_bin: PathBuf::from("/nonexistent/ssh"),
+                jail_fs_root: false,
+            },
+        )
+        .await
+        .expect("claim a scratch directory");
+
+        assert!(
+            holds_scratch_dir(&tunnel.dir),
+            "an open holds the directory it made"
+        );
+        tunnel.shutdown().await;
+        assert!(
+            !holds_scratch_dir(&tunnel.dir),
+            "shutdown hands the directory back"
+        );
+    }
+
+    /// `held` is a same-pid question — no directory another process
+    /// minted is ever on this process's register — so the cross-process
+    /// rows carry both answers, to pin that it is ignored there.
+    #[test]
+    fn the_reclaim_rule_decides_every_kind_of_leftover() {
+        let backlogged = SocketState::Indeterminate("connect timed out".into());
+        let cases = [
+            (true, true, None, Sweep::Skip),
+            (true, false, None, Sweep::Reclaim),
+            (false, false, Some(SocketState::Missing), Sweep::Reclaim),
+            (false, true, Some(SocketState::Missing), Sweep::Reclaim),
+            (false, false, Some(SocketState::Stale), Sweep::Reclaim),
+            (false, true, Some(SocketState::Stale), Sweep::Reclaim),
+            (false, false, Some(SocketState::Live), Sweep::Refuse),
+            (false, true, Some(SocketState::Live), Sweep::Refuse),
+            (false, false, Some(backlogged.clone()), Sweep::Refuse),
+            (false, true, Some(backlogged), Sweep::Refuse),
+            (
+                false,
+                false,
+                Some(SocketState::NotASocket("regular file")),
+                Sweep::Error,
+            ),
+            (
+                false,
+                true,
+                Some(SocketState::NotASocket("regular file")),
+                Sweep::Error,
+            ),
+        ];
+
+        for (same_pid, held, socket, want) in cases {
+            assert_eq!(
+                reclaim_decision(same_pid, held, socket.as_ref()),
+                want,
+                "same_pid={same_pid} held={held} socket={socket:?}"
             );
         }
     }
