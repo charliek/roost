@@ -347,6 +347,19 @@ pub enum TabCmd {
         geometry: Geometry,
         ack: Option<oneshot::Sender<Result<(), TabError>>>,
     },
+    /// `tab.resize` — a grid with no cell metrics behind it, which the
+    /// task fills in from the ones the tab already has.
+    ///
+    /// Zeroing them instead would spell "unknown" as "zero", and
+    /// libghostty would quote `0x0` pixels in every mode-2048 size
+    /// report the tab sent afterwards (R18). No caller of
+    /// `PtySupervisor::resize` — the only construction site — holds a
+    /// viewport to wait on, so unlike `TabCmd::Resize` this carries no
+    /// `ack`; add one back if a waiting grid-only caller shows up.
+    ResizeGrid {
+        cols: u16,
+        rows: u16,
+    },
     /// `session.set_theme` — re-seed this tab's terminal (and its color
     /// tracker) with the attached client's palette. Fire-and-forget:
     /// the op's reply reports how many tabs it was sent to, and a tab
@@ -988,7 +1001,26 @@ impl TabTask {
         acked: bool,
     ) -> Result<Option<WinsizeAck>, TabError> {
         if geometry == self.vt.geometry {
-            return Ok(None);
+            // Both halves are at this tuple — but the child's may not
+            // have *landed*: a grid-only resize queues its winsize with
+            // no ack, so a waiter arriving at the same tuple a moment
+            // later would be told "done" while that write is still in
+            // the writer's FIFO. Re-queueing at the same size fences on
+            // it, since the FIFO is ordered, and costs the child
+            // nothing: `TIOCSWINSZ` signals it only on a real change.
+            return Ok(acked
+                .then(|| {
+                    self.queue_resize(
+                        PtySize {
+                            rows: geometry.rows,
+                            cols: geometry.cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        },
+                        true,
+                    )
+                })
+                .flatten());
         }
         let Geometry {
             cols,
@@ -1033,6 +1065,36 @@ impl TabTask {
         self.take_replies();
         applied?;
         Ok(queued)
+    }
+
+    /// Apply a resize command's geometry and answer its `ack`.
+    fn resize(&mut self, geometry: Geometry, ack: Option<oneshot::Sender<Result<(), TabError>>>) {
+        let applied = self.apply_geometry(geometry, ack.is_some());
+        // Answered only once BOTH halves are applied: a waiter that
+        // resumed at the terminal resize alone could still snapshot a
+        // tab whose child had not been told.
+        let Some(ack) = ack else { return };
+        match applied {
+            // Off the task, because the child half is another task's
+            // FIFO: a tab that blocked here would stop rendering its own
+            // output behind a child that stopped reading its input.
+            Ok(Some(winsize)) => {
+                let tab_id = self.tab_id;
+                tokio::spawn(async move {
+                    let _ = ack.send(await_winsize(tab_id, winsize).await);
+                });
+            }
+            // Nothing to wait for: either the geometry was already this
+            // one, so both halves are at it, or the PTY writer is gone
+            // and there is no child half left to tell. An exited tab
+            // still serves attaches, so the second is a success too.
+            Ok(None) => {
+                let _ = ack.send(Ok(()));
+            }
+            Err(error) => {
+                let _ = ack.send(Err(error));
+            }
+        }
     }
 
     fn flush_writer(&mut self) {
@@ -1106,36 +1168,14 @@ impl TabTask {
                 }
                 self.queue_input(data);
             }
-            TabCmd::Resize { geometry, ack } => {
-                let applied = self.apply_geometry(geometry, ack.is_some());
-                // Answered only once BOTH halves are applied: a waiter
-                // that resumed at the terminal resize alone could still
-                // snapshot a tab whose child had not been told.
-                if let Some(ack) = ack {
-                    match applied {
-                        // Off the task, because the child half is
-                        // another task's FIFO: a tab that blocked here
-                        // would stop rendering its own output behind a
-                        // child that stopped reading its input.
-                        Ok(Some(winsize)) => {
-                            let tab_id = self.tab_id;
-                            tokio::spawn(async move {
-                                let _ = ack.send(await_winsize(tab_id, winsize).await);
-                            });
-                        }
-                        // Nothing to wait for: either the geometry was
-                        // already this one, so both halves are at it, or
-                        // the PTY writer is gone and there is no child
-                        // half left to tell. An exited tab still serves
-                        // attaches, so the second is a success too.
-                        Ok(None) => {
-                            let _ = ack.send(Ok(()));
-                        }
-                        Err(error) => {
-                            let _ = ack.send(Err(error));
-                        }
-                    }
-                }
+            TabCmd::Resize { geometry, ack } => self.resize(geometry, ack),
+            TabCmd::ResizeGrid { cols, rows } => {
+                let geometry = Geometry {
+                    cols,
+                    rows,
+                    ..self.vt.geometry
+                };
+                self.resize(geometry, None);
             }
             TabCmd::SetTheme(seed, generation) => {
                 // Monotonic: a stale fan-out racing a fresh one (or the

@@ -892,6 +892,124 @@ async fn a_resize_drains_the_in_band_size_report() {
     sup.close(921);
 }
 
+/// An acked resize that finds the geometry already applied is still
+/// answered, and answered successfully.
+///
+/// That path now queues a redundant winsize so the ack fences on the
+/// writer's FIFO: a grid-only resize queues its own winsize with no ack,
+/// so a waiter arriving at the same tuple would otherwise be told the
+/// child was sized while that `ioctl` was still queued, and a focused
+/// `tab.attach` is exactly such a waiter. **What this pins is that the
+/// extra write cannot strand the waiter** — the ordering it buys is not
+/// observable from here, because forcing the writer to lag needs a child
+/// that has stopped reading and an assertion on an ack that does *not*
+/// fire. Stated rather than tested, deliberately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acked_resize_at_the_grid_already_applied_is_still_answered() {
+    let (sup, _workspace) = enabled_supervisor(true);
+    let _output = sup
+        .spawn(931, "/tmp", &sh("exec sleep 30"), 20, 6, &socket("fence"))
+        .expect("spawn");
+    let commands = sup.tab_commands(931).expect("server-vt tab task");
+
+    // A client declares the metrics, then a grid-only resize moves the
+    // grid under them without waiting for the child.
+    commands
+        .send(TabCmd::Resize {
+            geometry: Geometry {
+                cols: 100,
+                rows: 30,
+                cell_w: 9,
+                cell_h: 18,
+            },
+            ack: None,
+        })
+        .await
+        .expect("tab task is alive");
+    commands
+        .send(TabCmd::ResizeGrid { cols: 80, rows: 24 })
+        .await
+        .expect("tab task is alive");
+
+    // The same tuple the grid-only resize just recorded. The task must
+    // not answer off the record alone.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    commands
+        .send(TabCmd::Resize {
+            geometry: Geometry {
+                cols: 80,
+                rows: 24,
+                cell_w: 9,
+                cell_h: 18,
+            },
+            ack: Some(tx),
+        })
+        .await
+        .expect("tab task is alive");
+    rx.await
+        .expect("the ack is answered")
+        .expect("the child was sized");
+
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), (80, 24), "the grid stands");
+
+    drop(commands);
+    sup.close(931);
+}
+
+/// `TabCmd::ResizeGrid` states the grid and lets the task fill the cell
+/// metrics in from the ones the tab already holds, so the report the
+/// resize drains quotes the pixels the last client declared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
+    let (sup, _workspace) = enabled_supervisor(true);
+    let _output = sup
+        .spawn(
+            922,
+            "/tmp",
+            &sh("exec sleep 30"),
+            20,
+            6,
+            &socket("resize-grid"),
+        )
+        .expect("spawn");
+    let commands = sup.tab_commands(922).expect("server-vt tab task");
+
+    // One client states all four numbers; only the grid moves after it.
+    ask(&commands, |ack| TabCmd::Resize {
+        geometry: Geometry {
+            cols: 100,
+            rows: 30,
+            cell_w: 9,
+            cell_h: 18,
+        },
+        ack: Some(ack),
+    })
+    .await
+    .expect("the client's geometry applies");
+
+    feed(&commands, b"\x1b[?2048h").await;
+    quiesce(&commands).await;
+    let _ = capture(&commands, true).await;
+
+    commands
+        .send(TabCmd::ResizeGrid { cols: 80, rows: 24 })
+        .await
+        .expect("tab task is alive");
+    let dump = quiesce(&commands).await;
+    assert_eq!((dump.cols, dump.rows), (80, 24), "the server VT resized");
+
+    let captured = capture(&commands, true).await;
+    let text = String::from_utf8_lossy(&captured).into_owned();
+    assert!(
+        text.contains("48;24;80;432;720"),
+        "expected the report to quote 24x18 by 80x9 pixels, got {text:?}"
+    );
+
+    drop(commands);
+    sup.close(922);
+}
+
 /// A resize the terminal refuses records nothing, so the next attempt at
 /// the same size is a real attempt (review F6).
 ///

@@ -1000,6 +1000,10 @@ impl PtySupervisor {
     /// Same authority rule as [`Self::write`]: a server-VT tab's resize
     /// must move the authoritative Terminal (and drain its mode-2048
     /// report) before `TIOCSWINSZ`, which only the tab task can order.
+    ///
+    /// It sends [`TabCmd::ResizeGrid`](crate::tab_task::TabCmd::ResizeGrid)
+    /// rather than a full geometry: `tab.resize` states two numbers, and
+    /// there is no viewport at this layer to take the cell metrics from.
     pub async fn resize(&self, tab_id: i64, cols: u16, rows: u16) -> Result<(), PtyError> {
         #[cfg(feature = "server-vt")]
         let task_tx = {
@@ -1010,15 +1014,7 @@ impl PtySupervisor {
         #[cfg(feature = "server-vt")]
         if let Some(tx) = task_tx {
             return tx
-                .send(crate::tab_task::TabCmd::Resize {
-                    geometry: Geometry {
-                        cols,
-                        rows,
-                        cell_w: 0,
-                        cell_h: 0,
-                    },
-                    ack: None,
-                })
+                .send(crate::tab_task::TabCmd::ResizeGrid { cols, rows })
                 .await
                 .map_err(|_| PtyError::Closed(tab_id));
         }

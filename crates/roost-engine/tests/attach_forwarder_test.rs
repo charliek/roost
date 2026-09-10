@@ -481,6 +481,13 @@ async fn feed(client: &mut IpcClient, tab_id: i64, data: Vec<u8>) {
         .expect("tab.feed_pty_bytes");
 }
 
+async fn resize(client: &mut IpcClient, tab_id: i64, cols: u32, rows: u32) {
+    client
+        .call::<_, serde_json::Value>(ops::TAB_RESIZE, TabResizeParams { tab_id, cols, rows })
+        .await
+        .expect("tab.resize");
+}
+
 /// Drain what the tab's PTY writer was handed until every marker has
 /// shown up, returning everything read. Test-mode capture, so what this
 /// proves is that the bytes crossed the forwarder into the writer.
@@ -1130,6 +1137,23 @@ fn size_reports(captured: &[u8], (cols, rows): (u16, u16)) -> usize {
         .count()
 }
 
+/// The pixel half of every size report for `grid` a captured stream
+/// carries, as `(width_px, height_px)`. The whole report is
+/// `CSI 48 ; rows ; cols ; height_px ; width_px t`, so a test that cares
+/// what libghostty holds for the cell metrics has to read past where
+/// [`size_reports`] stops.
+fn size_report_pixels(captured: &[u8], (cols, rows): (u16, u16)) -> Vec<(u32, u32)> {
+    let text = String::from_utf8_lossy(captured).into_owned();
+    let head = format!("\x1b[48;{rows};{cols};");
+    text.match_indices(&head)
+        .filter_map(|(at, _)| {
+            let (params, _) = text[at + head.len()..].split_once('t')?;
+            let (height, width) = params.split_once(';')?;
+            Some((width.parse().ok()?, height.parse().ok()?))
+        })
+        .collect()
+}
+
 fn index_of(captured: &[u8], needle: &[u8]) -> usize {
     captured
         .windows(needle.len())
@@ -1216,6 +1240,61 @@ async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
         size_reports(&captured, (100, 30)),
         1,
         "the same grid at other cell metrics is still a resize ({:?})",
+        String::from_utf8_lossy(&captured)
+    );
+}
+
+/// `tab.resize` states two of the four numbers, so the tab keeps the
+/// cell metrics its last geometry-bearing client declared — and the
+/// report it emits quotes the child real pixels rather than `0x0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grid_resize_keeps_the_cell_metrics_a_client_declared() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_accepted, _data) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (9, 18), true)
+        .await;
+    watch_size_reports(&mut client, tab_id).await;
+
+    let mut other = h.control().await;
+    resize(&mut other, tab_id, 80, 24).await;
+
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"48;24;80"]).await;
+    assert_eq!(
+        size_report_pixels(&captured, (80, 24)),
+        vec![(720, 432)],
+        "the report quotes 80x9 by 24x18 pixels ({:?})",
+        String::from_utf8_lossy(&captured)
+    );
+}
+
+/// And because the metrics are kept, naming the grid an attached client
+/// is already at is the no-op `ipc.md` promises: the whole-tuple
+/// compare sees the same four numbers rather than two of them against a
+/// pair of zeros.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grid_resize_to_the_size_the_tab_already_has_reports_nothing() {
+    let h = harness().await;
+    let (mut client, lease, tab_id) = h.leased_tab().await;
+
+    let (_accepted, _data) = h
+        .attached_at(&mut client, &lease, tab_id, (100, 30), (9, 18), true)
+        .await;
+    watch_size_reports(&mut client, tab_id).await;
+
+    // The second resize is the fence: both ride the tab's one command
+    // channel, so its report cannot arrive ahead of one the first would
+    // have emitted.
+    let mut other = h.control().await;
+    resize(&mut other, tab_id, 100, 30).await;
+    resize(&mut other, tab_id, 60, 20).await;
+
+    let captured = read_pty_input_until(&mut client, tab_id, &[b"48;20;60"]).await;
+    assert_eq!(
+        size_reports(&captured, (100, 30)),
+        0,
+        "the grid it is already at is not re-applied ({:?})",
         String::from_utf8_lossy(&captured)
     );
 }
@@ -1348,17 +1427,7 @@ async fn a_focused_attach_reports_the_size_it_was_actually_encoded_at() {
 
     // Somebody else interacts before the ticket is presented.
     let mut other = h.control().await;
-    let _resized: serde_json::Value = other
-        .call(
-            ops::TAB_RESIZE,
-            TabResizeParams {
-                tab_id,
-                cols: 60,
-                rows: 20,
-            },
-        )
-        .await
-        .expect("tab.resize");
+    resize(&mut other, tab_id, 60, 20).await;
     wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
         (d.cols, d.rows) == (60, 20)
     })
@@ -1736,17 +1805,7 @@ async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
     // Somebody else keeps typing at their own size while this client is
     // still dialing back in.
     let mut other = h.control().await;
-    let _resized: serde_json::Value = other
-        .call(
-            ops::TAB_RESIZE,
-            TabResizeParams {
-                tab_id,
-                cols: 60,
-                rows: 20,
-            },
-        )
-        .await
-        .expect("tab.resize");
+    resize(&mut other, tab_id, 60, 20).await;
     wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
         (d.cols, d.rows) == (60, 20)
     })
