@@ -185,16 +185,20 @@ its control connection, its attach ends, keys stop routing, and "Take
 the foreground" falls back to a full reconnect because there is no
 surviving control leg to retake in place.
 
-**The in-place retake is `localhost`-only today.** `HostConnSet::connect`
-routes to it only when the request names the endpoint the deposed task
-is already on, and an ssh reconnect never does: `open_ssh` tears the
-tunnel down and binds a fresh per-attempt bridge socket before
-`connect` is reached, so the old task's control connection is on its
-way out however healthy its flag still reads. An ssh host therefore
-takes the full-reconnect path — correct, and one reattach more
-expensive than it needs to be. The deposed-but-*serving* half is
-transport-blind and works over ssh unchanged; it is only the retake
-that falls through.
+**The in-place retake runs on every transport.** Both doors raise the
+ask through `HostConnSet::request_foreground_in_place`, which is why
+they cannot drift: `connect` when the request names the endpoint the
+deposed task is already on, and over ssh `open_ssh` against the
+**live** tunnel's `bridge.sock` *before* it tears anything down. So a
+takeback over ssh reuses the tunnel, its mux, its per-connection execs
+and the deposed task's control leg: no second handshake, no new request
+number, no new generation, no fresh `SshState` — and therefore
+`reached_connected` still standing, which is what makes the ladder
+eligible if the takeback itself fails. The exception over ssh is a host
+with no live tunnel to ask on: one whose tunnel has already been
+replaced under the task — its endpoint is not the live tunnel's, and a
+reconnect is the only endpoint it could come back on — and one whose
+establish is still in flight. Both take the full reconnect.
 
 **The reconnect probe never authorizes a silent steal-back.** A client
 whose connection merely dropped — the wire, not a takeover — has to
