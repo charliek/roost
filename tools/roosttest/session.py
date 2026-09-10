@@ -303,6 +303,11 @@ class SessionEnv:
     log_dir: Path
     launch_cwd: Path
     binary: Path
+    #: `roost-session[-dev]` — the profile directory name the socket,
+    #: state and log paths above all end in.
+    namespace: str
+    #: False when the caller lent this env its root. See `make_env`.
+    owns_root: bool = True
     _pids: list[int] = field(default_factory=list)
     _procs: list[subprocess.Popen] = field(default_factory=list)
     #: Installed by `jail_agents()`; once set, every launch asserts on it.
@@ -504,7 +509,7 @@ class SessionEnv:
     # -- teardown ---------------------------------------------------------
     def teardown(self) -> None:
         """Ask any surviving session to stop, then prove every process
-        this test started is gone, then delete the root.
+        this test started is gone, then delete what this env made.
 
         Signals before deletion, never the other way round: both instance
         locks are inodes, and removing them out from under a live daemon
@@ -523,7 +528,34 @@ class SessionEnv:
             try:
                 self._kill_everything()
             finally:
-                shutil.rmtree(self.root, ignore_errors=True)
+                self._remove_what_it_made()
+
+    def _remove_what_it_made(self) -> None:
+        """The whole root when this env minted one; only the daemon's own
+        subtrees when it borrowed the caller's.
+
+        A borrowed root belongs to a running process — its socket
+        directory and its single-instance lock live under it — so
+        removing the root would take that process down for whatever runs
+        next.
+
+        `home` and the launch cwd are named per *root*, not per env, so
+        this list is only sound while a borrowed root hosts one
+        `SessionEnv` at a time — which is what a function-scoped fixture
+        against a module-scoped root gives. Two live envs sharing a root
+        would have the first teardown take the second's `HOME`.
+        """
+        if self.owns_root:
+            shutil.rmtree(self.root, ignore_errors=True)
+            return
+        for made in (
+            self.root / "home",
+            self.launch_cwd,
+            self.root / "run" / self.namespace,
+            self.root / "data" / self.namespace,
+            self.root / "state" / self.namespace,
+        ):
+            shutil.rmtree(made, ignore_errors=True)
 
     def _polite_stop(self) -> None:
         """Give a still-serving session the chance to flush and reap.
@@ -719,21 +751,45 @@ def roostctl_binary() -> str:
 # ---------------------------------------------------------------------------
 
 
-def make_env(*, launch_cwd_name: str = "launch") -> SessionEnv:
-    """Build a fresh, isolated session profile rooted in a temp dir."""
+def make_env(
+    *,
+    launch_cwd_name: str = "launch",
+    root: Path | None = None,
+    state_dir: Path | None = None,
+) -> SessionEnv:
+    """Build an isolated session profile, in a fresh temp root or in one
+    the caller lends.
+
+    A lent `root` is one the caller has already pointed
+    `XDG_RUNTIME_DIR` at, so this profile's socket lands exactly where
+    that process resolves it — which is how a lane puts the daemon on
+    the sentinel path a UI dials for `localhost`. This env then owns only
+    the directories it makes under that root, and its teardown removes
+    only those. Lend a **canonical** path: it is resolved here either
+    way, and a lender that exported an unresolved one would have its
+    process resolving a different string than this daemon.
+
+    `state_dir` redirects where the daemon keeps `state.json`, through
+    the same `ROOST_STATE_DIR` seam `spawn_session` hands a UI-spawned
+    child: aim both at one directory and a UI-driven restart hydrates the
+    layout this env's daemon wrote.
+    """
     binary = session_binary()
     label, namespace = _dir_names(_is_debug_build(binary))
-    # `/tmp`, not `$TMPDIR`: a Unix socket path is capped at ~104 bytes
-    # (`SUN_LEN`), and macOS's per-user `$TMPDIR`
-    # (`/var/folders/xx/yyy…/T/`) spends most of that before the profile's
-    # own `home/Library/Caches/<label>/roost.sock` is appended. `/tmp` is
-    # sticky on both platforms, which is what keeps it legal as a
-    # runtime-dir ancestor.
-    #
-    # Canonicalized: `validate_runtime_dir` refuses a socket directory
-    # with a symlinked component, and `/tmp` reaches `/private/tmp`
-    # through one on macOS.
-    root = Path(tempfile.mkdtemp(prefix="roost-hs-", dir="/tmp")).resolve()
+    owns_root = root is None
+    if owns_root:
+        # `/tmp`, not `$TMPDIR`: a Unix socket path is capped at ~104
+        # bytes (`SUN_LEN`), and macOS's per-user `$TMPDIR`
+        # (`/var/folders/xx/yyy…/T/`) spends most of that before the
+        # profile's own `home/Library/Caches/<label>/roost.sock` is
+        # appended. `/tmp` is sticky on both platforms, which is what
+        # keeps it legal as a runtime-dir ancestor.
+        root = Path(tempfile.mkdtemp(prefix="roost-hs-", dir="/tmp"))
+    # Canonicalized either way: `validate_runtime_dir` refuses a socket
+    # directory with a symlinked component, and a lent root can reach one
+    # the same way `/tmp` reaches `/private/tmp` through a symlink on
+    # macOS.
+    root = root.resolve()
 
     home = root / "home"
     launch_cwd = root / launch_cwd_name
@@ -747,7 +803,7 @@ def make_env(*, launch_cwd_name: str = "launch") -> SessionEnv:
 
     if platform.system() == "Darwin":
         socket = home / "Library/Caches" / label / "roost.sock"
-        state_dir = home / "Library/Application Support" / label
+        default_state_dir = home / "Library/Application Support" / label
         log_dir = home / "Library/Logs" / label
         # The OS provides `~/Library/Caches`; `validate_runtime_dir`
         # creates only the leaf.
@@ -769,8 +825,13 @@ def make_env(*, launch_cwd_name: str = "launch") -> SessionEnv:
         env["XDG_STATE_HOME"] = str(state)
         env["XDG_CACHE_HOME"] = str(cache)
         socket = runtime / namespace / "roost.sock"
-        state_dir = data / namespace
+        default_state_dir = data / namespace
         log_dir = state / namespace
+
+    if state_dir is None:
+        state_dir = default_state_dir
+    else:
+        env["ROOST_STATE_DIR"] = str(state_dir)
 
     home.mkdir(parents=True, exist_ok=True)
     launch_cwd.mkdir(parents=True, exist_ok=True)
@@ -783,4 +844,6 @@ def make_env(*, launch_cwd_name: str = "launch") -> SessionEnv:
         log_dir=log_dir,
         launch_cwd=launch_cwd,
         binary=binary,
+        namespace=namespace,
+        owns_root=owns_root,
     )

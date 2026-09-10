@@ -1051,6 +1051,16 @@ def test_a_takeover_keeps_the_frame_live_and_connect_takes_the_foreground_back(h
     it; the size standing still is what proves the takeback happened in
     place, with no reattach and no snapshot.
     """
+    takeback_in_place(host, roost)
+
+
+def takeback_in_place(host, roost) -> None:
+    """A takeover moves only the foreground, and `host.connect` takes it
+    back on the connection already there.
+
+    Driven against whichever `host` the lane hands it, so every transport
+    asserts the same sequence rather than a copy of it.
+    """
     host.connect_and_wait()
     with host.client() as session:
         tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
