@@ -1953,11 +1953,11 @@ async fn deposed_rounds(
                 ended = end;
             }
             DeposedEnd::Retaken { live, lease } => {
-                // `held_lease` and `observing` were written the moment
-                // the lease moved on the wire — see [`retake_foreground`].
+                // `held_lease`, `observing` and the lease's publication
+                // all happened the moment the lease moved on the wire —
+                // see [`retake_foreground`].
                 let facts = live.facts.clone();
-                if !publish_lease(feed, incarnation, lease.clone())
-                    || !publish_state(feed, incarnation, machine.connected())
+                if !publish_state(feed, incarnation, machine.connected())
                     || !publish_facts(feed, incarnation, facts)
                 {
                     return ConnEnd::FeedClosed;
@@ -2023,13 +2023,21 @@ async fn serve_deposed(
             biased;
             () = shutdown.requested() => return DeposedEnd::Ended(ConnEnd::Shutdown),
             () = config.foreground.requested() => {
-                return match retake_foreground(config, &mut live, held_lease, observing).await {
+                let retaken = retake_foreground(
+                    config,
+                    &mut live,
+                    held_lease,
+                    observing,
+                    feed,
+                    incarnation,
+                )
+                .await;
+                return match retaken {
                     Ok(lease) => DeposedEnd::Retaken { live: Box::new(live), lease },
                     // A takeback that cannot finish leaves this
-                    // connection with no stream and a lease nobody
-                    // published: the round ends, and the ladder (or the
-                    // user) starts a clean one.
-                    Err(error) => DeposedEnd::Ended(error.into()),
+                    // connection with no stream: the round ends, and the
+                    // ladder (or the user) starts a clean one.
+                    Err(end) => DeposedEnd::Ended(end),
                 };
             }
             frame = live.events.recv() => {
@@ -2161,12 +2169,18 @@ async fn serve_deposed(
 ///
 /// The control connection and every data connection are untouched, which
 /// is the whole point: the grid never blinks.
+///
+/// The error is a [`ConnEnd`] rather than an [`AttemptError`] because a
+/// closed feed is one of the ways this ends and is not an attempt
+/// failure.
 async fn retake_foreground(
     config: &ConnectionConfig,
     live: &mut Live,
     held_lease: &mut Option<String>,
     observing: &mut Option<Option<String>>,
-) -> Result<String, AttemptError> {
+    feed: &EngineFeedSender,
+    incarnation: HostId,
+) -> Result<String, ConnEnd> {
     let raw = call(
         &mut live.control,
         ops::SESSION_CONNECT,
@@ -2178,15 +2192,21 @@ async fn retake_foreground(
     .await?;
     let connected: SessionConnectResult =
         serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_CONNECT, &error))?;
-    // All three written before the steps below can fail, for the same
+    // All four written before the steps below can fail, for the same
     // reason [`connect`] writes its lease at step 2: ownership moved on
     // the wire, so from this line this client *is* the driver. A
     // takeback that fell over at step 2 and left the latch armed would
     // leave the task watching a session it actually holds, with no
-    // `driver_changed` ever coming to explain it.
+    // `driver_changed` ever coming to explain it — and one that left
+    // the *set* holding the superseded lease would hand it to the
+    // ladder the failure lands on, whose probe answers "not current"
+    // and turns the user's takeback into a watch.
     live.lease = connected.lease;
     *held_lease = Some(live.lease.clone());
     *observing = None;
+    if !publish_lease(feed, incarnation, live.lease.clone()) {
+        return Err(ConnEnd::FeedClosed);
+    }
 
     let theme = config
         .theme
@@ -3697,6 +3717,17 @@ mod tests {
         Close,
     }
 
+    /// Count one send of a scripted op down, and say whether the script
+    /// arms on this one: the counter runs out when `checked_sub` returns
+    /// `None`, which is the `Err` this reads.
+    fn armed(skips: &AtomicUsize) -> bool {
+        skips
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |skips| {
+                skips.checked_sub(1)
+            })
+            .is_err()
+    }
+
     /// A session that serves the whole prologue, scripts
     /// `session.put_file`, and can hold one control op unanswered or cut
     /// its event stream on cue.
@@ -3764,6 +3795,10 @@ mod tests {
         /// name an op the prologue never sends, so a connection can be
         /// established and *then* refused.
         refuse_op: Option<(&'static str, &'static str)>,
+        /// How many times [`Self::refuse_op`]'s op is answered normally
+        /// before the refusal arms, so an op the prologue *does* send
+        /// can still be refused on the round after it.
+        refuse_skips: Arc<AtomicUsize>,
         /// Whether `session.set_theme` refuses the lease — the probe's
         /// non-current verdict, and the only thing a session says that
         /// may put this client into observer mode without an envelope.
@@ -3806,6 +3841,7 @@ mod tests {
                 emit: Arc::new(tokio::sync::Semaphore::new(0)),
                 next_emit: Arc::new(AtomicU64::new(SESSION_REVISION + 1)),
                 refuse_op: None,
+                refuse_skips: Arc::new(AtomicUsize::new(0)),
                 theme_refusal: None,
                 puts: Arc::new(AtomicUsize::new(0)),
                 dials: Arc::new(AtomicUsize::new(0)),
@@ -3885,6 +3921,13 @@ mod tests {
         fn refusing(mut self, op: &'static str, code: &'static str) -> Fake {
             self.refuse_op = Some((op, code));
             self
+        }
+
+        /// Refuse `op`, but only from the `skips + 1`th time it is sent.
+        fn refusing_after(self, op: &'static str, code: &'static str, skips: usize) -> Fake {
+            let fake = self.refusing(op, code);
+            fake.refuse_skips.store(skips, Ordering::Release);
+            fake
         }
 
         /// Write one more `event.batch` onto whichever connection is
@@ -3981,20 +4024,13 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&line).expect("a request");
                 let id = request["id"].clone();
                 let op = request["op"].as_str().unwrap_or_default().to_string();
-                if self.stall == Some(op.as_str())
-                    && self
-                        .stall_skips
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |skips| {
-                            skips.checked_sub(1)
-                        })
-                        .is_err()
-                {
+                if self.stall == Some(op.as_str()) && armed(&self.stall_skips) {
                     self.stalled.request();
                     self.release.requested().await;
                 }
                 let refused = self
                     .refuse_op
-                    .filter(|(refused, _)| *refused == op.as_str())
+                    .filter(|(refused, _)| *refused == op.as_str() && armed(&self.refuse_skips))
                     .map(|(_, code)| {
                         serde_json::json!({
                             "id": id,
@@ -4013,11 +4049,19 @@ mod tests {
                         })
                     }
                     ops::SESSION_CONNECT => {
-                        self.connects.fetch_add(1, Ordering::AcqRel);
+                        // A lease per grant, not one constant: a test that
+                        // only counts publications cannot tell the lease
+                        // this client just won from the one it superseded,
+                        // and which of the two reaches the set is the whole
+                        // of what a takeback's failure path turns on.
+                        let nth = self.connects.fetch_add(1, Ordering::AcqRel) + 1;
                         serde_json::json!({
                             "id": id,
                             "ok": true,
-                            "result": { "lease": "the-lease", "revision": SESSION_REVISION },
+                            "result": {
+                                "lease": format!("the-lease-{nth}"),
+                                "revision": SESSION_REVISION,
+                            },
                         })
                     }
                     ops::TAB_LIST => {
@@ -4111,7 +4155,11 @@ mod tests {
         ) -> Option<serde_json::Value> {
             let params: SessionPutFileParams =
                 serde_json::from_value(request["params"].clone()).expect("put_file params");
-            assert_eq!(params.lease, "the-lease", "an upload presents the lease");
+            assert!(
+                params.lease.starts_with("the-lease-"),
+                "an upload presents the lease, got {:?}",
+                params.lease
+            );
             let nth = self.puts.fetch_add(1, Ordering::AcqRel);
             self.uploading.request();
             let result = match &self.put_file {
@@ -4143,6 +4191,17 @@ mod tests {
     }
 
     /// Wait for a fake session's cue, or fail the test rather than hang.
+    /// One budget went by and not two, measured in paused virtual time.
+    /// The window absorbs the timer's millisecond granularity and the
+    /// real time between arming the budget and pausing the clock; it is
+    /// nowhere near wide enough to admit a second one.
+    fn spent_one_budget(spent: Duration, budget: Duration, what: &str) {
+        assert!(
+            spent + Duration::from_secs(5) >= budget && spent <= budget + Duration::from_secs(1),
+            "{what}: {spent:?} of {budget:?}"
+        );
+    }
+
     async fn cued(signal: &Shutdown, what: &str) {
         tokio::time::timeout(Duration::from_secs(10), signal.requested())
             .await
@@ -4150,9 +4209,10 @@ mod tests {
     }
 
     /// Every host state the task has published, drained as it goes,
-    /// with the connect facts that rode behind them.
+    /// with the connect facts, applied revisions and granted leases that
+    /// rode behind them.
     #[derive(Default)]
-    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>);
+    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>, Vec<String>);
 
     impl States {
         fn drain(&mut self, rx: &mut crate::engine_feed::EngineFeedReceiver) {
@@ -4163,6 +4223,7 @@ mod tests {
                     EngineFeed::HostWorkspace(_, HostWorkspaceEvent::Applied { revision, .. }) => {
                         self.2.push(revision)
                     }
+                    EngineFeed::HostLease(_, lease) => self.3.push(lease),
                     _ => {}
                 }
             }
@@ -4295,7 +4356,19 @@ mod tests {
         what: &str,
         want: impl Fn(&HostConnState) -> bool,
     ) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        until_state_within(connected, Duration::from_secs(10), what, want).await
+    }
+
+    /// [`until_state`] on a stated budget, for a case whose wait is a
+    /// production timeout rather than the suite's own patience — the
+    /// default is [`leg`] exactly, so such a case would be racing it.
+    async fn until_state_within(
+        connected: &mut Connected,
+        budget: Duration,
+        what: &str,
+        want: impl Fn(&HostConnState) -> bool,
+    ) {
+        tokio::time::timeout(budget, async {
             loop {
                 connected.states.drain(&mut connected.feed);
                 if connected.states.0.last().is_some_and(&want) {
@@ -4742,6 +4815,113 @@ mod tests {
         );
     }
 
+    /// A takeback that falls over **after** the grant still hands the
+    /// set the lease it won (R17), from either step that can fail.
+    ///
+    /// Both rows are one defect — see [`retake_foreground`]'s lease
+    /// write.
+    #[tokio::test]
+    async fn a_takeback_that_fails_after_the_grant_publishes_the_lease_it_won() {
+        for (case, fake) in [
+            (
+                "set_theme",
+                Fake::new(PutFile::Land).deposing(1).refusing_after(
+                    ops::SESSION_SET_THEME,
+                    "not-supported",
+                    1,
+                ),
+            ),
+            (
+                "the re-subscribe",
+                Fake::new(PutFile::Land).deposing(1).dropping_resumes(1),
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let socket = dir.path().join("takeback-failing.sock");
+            fake.serve(&socket);
+            let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+            fake.depose.request();
+            until_state(&mut host, "the client to be deposed", |state| {
+                taken_by(state) == Some(Some("a phone"))
+            })
+            .await;
+
+            host.foreground.request();
+            until_state(&mut host, "the takeback to fall over", |state| {
+                matches!(state, HostConnState::Disconnected(_))
+            })
+            .await;
+
+            let states = host.stop().await;
+            assert_eq!(
+                fake.connects.load(Ordering::Acquire),
+                2,
+                "{case}: the takeover was granted before the step that failed"
+            );
+            assert_eq!(
+                states.3,
+                vec!["the-lease-1".to_string(), "the-lease-2".to_string()],
+                "{case}: the set must be holding the lease this takeback WON, not \
+                 the one it superseded — the ladder the failure lands on carries \
+                 whatever is here, and a stale one probes as not-current and \
+                 lands the user as an observer"
+            );
+        }
+    }
+
+    /// A takeback the session reads and never answers ends the round on
+    /// `call`'s own leg budget — the deposed round adds no timeout of
+    /// its own, and one round of three ops must not have to fit in one.
+    #[tokio::test]
+    async fn a_takeback_the_session_never_answers_ends_on_the_control_legs_budget() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("takeback-silent.sock");
+        // Skip the prologue's `session.connect` and hold the takeback's.
+        let fake = Fake::new(PutFile::Land)
+            .deposing(1)
+            .stalling_after(ops::SESSION_CONNECT, 1);
+        fake.serve(&socket);
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        fake.depose.request();
+        until_state(&mut host, "the client to be deposed", |state| {
+            taken_by(state) == Some(Some("a phone"))
+        })
+        .await;
+
+        host.foreground.request();
+        cued(&fake.stalled, "the takeback's session.connect to be read").await;
+
+        // Spent in virtual time, and measured: what tells one leg from
+        // a budget wrapped round the whole round is how much of it goes.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        until_state_within(
+            &mut host,
+            leg() * 3,
+            "an unanswered takeback to end its round",
+            |state| matches!(state, HostConnState::Disconnected(_)),
+        )
+        .await;
+        let spent = started.elapsed();
+
+        spent_one_budget(spent, leg(), "one control leg, not a budget of its own");
+        assert_eq!(
+            reason(host.states.last()),
+            format!("{} timed out", ops::SESSION_CONNECT),
+            "and it ends on the op that hung, by name"
+        );
+
+        let states = host.stop().await;
+        assert_eq!(
+            states.3.len(),
+            1,
+            "a takeback nobody granted publishes no lease: {:?}",
+            states.3
+        );
+    }
+
     /// Live observer → reconnecting observer → live observer, and never
     /// driver. The stream is cut under a deposed client; the ladder
     /// re-runs the **observer** prologue, which claims nothing.
@@ -4887,8 +5067,11 @@ mod tests {
         let socket = dir.path().join("probe-ok.sock");
         Fake::new(PutFile::Land).serve(&socket);
 
-        let mut host =
-            Connected::spawn(socket, HostTransport::UnixSocket, Some("the-lease".into()));
+        let mut host = Connected::spawn(
+            socket,
+            HostTransport::UnixSocket,
+            Some("the-lease-1".into()),
+        );
         host.states.until_connected(&mut host.feed, 1).await;
 
         assert!(
@@ -5293,12 +5476,10 @@ mod tests {
                 if reason.contains(ops::SESSION_PUT_FILE) && reason.contains("timed out")),
             "{answered:?}"
         );
-        // The window absorbs the timer's millisecond granularity and the
-        // real time between arming the budget and pausing the clock; it
-        // is nowhere near wide enough to admit the 10 s control leg.
-        assert!(
-            spent + Duration::from_secs(5) >= budget && spent <= budget + Duration::from_secs(1),
-            "the upload's own budget, not the control leg's: {spent:?} of {budget:?}"
+        spent_one_budget(
+            spent,
+            budget,
+            "the upload's own budget, not the control leg's",
         );
 
         host.states.drain(&mut host.feed);
@@ -5423,7 +5604,7 @@ mod tests {
         fake.serve(&socket);
 
         let uploads = Uploads::default();
-        let lane = uploads.open(socket, "the-lease".into());
+        let lane = uploads.open(socket, "the-lease-1".into());
         // Two more than run at once, so half of these are still on the
         // channel when the lane closes.
         let waiting: Vec<_> = (0..4)
@@ -5526,7 +5707,7 @@ mod tests {
         .expect("write an over-cap file");
 
         let uploads = Uploads::default();
-        let _lane = uploads.open(socket, "the-lease".into());
+        let _lane = uploads.open(socket, "the-lease-1".into());
         let refused = uploads
             .enqueue("grown.png".into(), UploadSource::Path(grown))
             .expect("the lane admits it; the read is what refuses");

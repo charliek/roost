@@ -36,6 +36,26 @@ INSTALLABLE_AGENTS = ("claude", "codex", "grok", "cursor", "opencode")
 JAIL_ENV_KEYS = ("HOME", "XDG_CONFIG_HOME", *AGENT_CONFIG_DIR_ENV.values())
 
 
+def make_private_runtime_dir(path: Path) -> None:
+    """A private `XDG_RUNTIME_DIR` for a redirected UI, so its socket and
+    single-instance locks cannot collide with the session UI's.
+
+    On the Wayland lane that also moves the compositor out of reach —
+    `WAYLAND_DISPLAY` is a socket *name*, resolved against
+    `XDG_RUNTIME_DIR` — so the real one is linked back in. Without this
+    the redirected UI would fail to open a window on the weston lane, and
+    only there."""
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+    display = os.environ.get("WAYLAND_DISPLAY", "")
+    if not display or os.path.isabs(display):
+        return
+    real = Path(os.environ.get("XDG_RUNTIME_DIR", "")) / display
+    link = path / display
+    if real.exists() and not link.exists():
+        link.symlink_to(real)
+
+
 class Jail:
     """A throwaway home with its own `config.conf`, its own agent config
     directories, and the environment that points every relevant tool at
@@ -63,7 +83,7 @@ class Jail:
         for name in present:
             self.agent_dirs[name].mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self._make_runtime_dir()
+        make_private_runtime_dir(self.runtime_dir)
         self.write_config(agent_hooks=agent_hooks, skip=skip)
 
         self.env = {
@@ -74,25 +94,6 @@ class Jail:
                 for name, path in self.agent_dirs.items()
             },
         }
-
-    def _make_runtime_dir(self) -> None:
-        """A private `XDG_RUNTIME_DIR` for a jailed UI, so its socket and
-        single-instance locks cannot collide with the session UI's.
-
-        On the Wayland lane that also moves the compositor out of reach —
-        `WAYLAND_DISPLAY` is a socket *name*, resolved against
-        `XDG_RUNTIME_DIR` — so the real one is linked back in. Without
-        this the jailed UI would fail to open a window on the weston
-        lane, and only there."""
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        self.runtime_dir.chmod(0o700)
-        display = os.environ.get("WAYLAND_DISPLAY", "")
-        if not display or os.path.isabs(display):
-            return
-        real = Path(os.environ.get("XDG_RUNTIME_DIR", "")) / display
-        link = self.runtime_dir / display
-        if real.exists() and not link.exists():
-            link.symlink_to(real)
 
     def write_config(self, *, agent_hooks: str, skip: str | None = None) -> None:
         self.config.parent.mkdir(parents=True, exist_ok=True)

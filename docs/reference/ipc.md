@@ -486,7 +486,10 @@ Geometry is the four numbers `(cols, rows, cell_w_px, cell_h_px)`
 compared together, not just the grid: libghostty's mode-2048 in-band
 size reports quote the pixel dimensions, so the same grid at different
 cell metrics is a different viewport. Unchanged geometry is not
-re-applied, so two clients typing at the same size cost nothing.
+re-applied, so two clients typing at the same size cost nothing. This
+op states the grid only and leaves the cell metrics where the last
+geometry-bearing client left them; before any client has declared them
+they are unset, and the size report quotes `0x0` pixels.
 
 Simultaneous interactions **linearize in the order the tab receives
 them**, not in wall-clock order: every one of them is a command on the

@@ -1007,7 +1007,7 @@ impl HostConnSet {
         mode: ConnectMode,
         cause: AttemptCause,
     ) {
-        if self.take_foreground_in_place(host, &socket, transport, cause) {
+        if self.request_foreground_in_place(host, &socket, transport, cause) {
             return;
         }
         // The incarnation this reconnect displaces, threaded into the
@@ -1117,10 +1117,10 @@ impl HostConnSet {
         });
     }
 
-    /// Ask a deposed-but-serving task for the foreground back, and say
-    /// whether it took the request (plan 057 §3.5).
+    /// Whether Connect on this host is a takeback the deposed task can
+    /// perform on the connection it still holds (plan 057 §3.5).
     ///
-    /// Three conditions, and each rules out a way this could be wrong:
+    /// Four conditions, and each rules out a way this could be wrong:
     ///
     /// * the ask is a person's. An auto-reconnect that took the
     ///   foreground back would be exactly the steal-back
@@ -1129,12 +1129,14 @@ impl HostConnSet {
     ///   already or has no session to ask;
     /// * its task says it is serving in place, which only an
     ///   `open_input` session's takeover produces;
-    /// * and the endpoint is the one that task is already on. An ssh
-    ///   reconnect tears the tunnel down and comes back with a *new*
-    ///   bridge socket, so the old task's control connection is on its
-    ///   way out however healthy its flag still looks.
-    fn take_foreground_in_place(
-        &mut self,
+    /// * and the endpoint is the one that task is already on. Over ssh
+    ///   that endpoint is the **live** tunnel's bridge socket, which
+    ///   [`Self::open_ssh`] offers before it tears anything down — so
+    ///   what this rules out there is a task left over from a tunnel
+    ///   the host no longer has, whose control connection is on its way
+    ///   out however healthy its flag still looks.
+    fn can_take_foreground_in_place(
+        &self,
         host: &str,
         socket: &std::path::Path,
         transport: HostTransport,
@@ -1143,20 +1145,36 @@ impl HostConnSet {
         if cause != AttemptCause::Explicit {
             return false;
         }
-        let Some(conn) = self
+        let Some(conn) = self.entries.get(host).and_then(|entry| entry.conn.as_ref()) else {
+            return false;
+        };
+        matches!(conn.state, HostConnState::TakenOver { .. })
+            && conn.socket == socket
+            && conn.transport == transport
+            && conn.foreground.in_place()
+    }
+
+    /// [`Self::can_take_foreground_in_place`], and when it holds, ask —
+    /// answering whether the task took the request.
+    ///
+    /// The predicate is split out only so neither door has to spell the
+    /// conditions out; raising the ask is what *makes* the takeback, so
+    /// nothing may consult it and act on it alone.
+    fn request_foreground_in_place(
+        &mut self,
+        host: &str,
+        socket: &std::path::Path,
+        transport: HostTransport,
+        cause: AttemptCause,
+    ) -> bool {
+        if !self.can_take_foreground_in_place(host, socket, transport, cause) {
+            return false;
+        }
+        let conn = self
             .entries
             .get_mut(host)
             .and_then(|entry| entry.conn.as_mut())
-        else {
-            return false;
-        };
-        if !matches!(conn.state, HostConnState::TakenOver { .. })
-            || conn.socket != socket
-            || conn.transport != transport
-            || !conn.foreground.in_place()
-        {
-            return false;
-        }
+            .expect("the connection the predicate just read");
         tracing::info!(%host, "taking this host session's foreground back in place");
         conn.foreground.request();
         conn.taking_foreground = true;
@@ -1194,7 +1212,10 @@ impl HostConnSet {
     /// Any tunnel this host already had is torn down first: a Connect is
     /// an unconditional reconnect on this wire, and reusing a mux whose
     /// master may already be wedged is exactly how a reconnect fails to
-    /// be one.
+    /// be one. The one exception is the takeback
+    /// [`Self::request_foreground_in_place`] answers for — there is no
+    /// reconnect to be had there, only a session to ask for back, and
+    /// the connection that asks is the one riding this very tunnel.
     ///
     /// The teardown is *awaited by the replacement*, in the same task, so
     /// one host never has two `ssh` masters at once. That is hygiene
@@ -1240,6 +1261,19 @@ impl HostConnSet {
         // the ladder must still be a takeback when a socket finally
         // exists. The verdict itself is read again there.
         self.observer_mode(host, cause);
+        // Before the teardown below: a deposed task's control leg runs
+        // over the very tunnel a reconnect would shut down, so the ask
+        // has to come first.
+        let bridge = self
+            .entries
+            .get(host)
+            .and_then(|entry| entry.ssh.as_ref()?.tunnel.as_ref())
+            .map(|tunnel| tunnel.bridge_socket().to_path_buf());
+        if let Some(bridge) = bridge {
+            if self.request_foreground_in_place(host, &bridge, HostTransport::Ssh, cause) {
+                return;
+            }
+        }
         let previous = self.take_tunnel(host);
         self.next_ssh_request += 1;
         let request = self.next_ssh_request;
@@ -3281,6 +3315,36 @@ pub(crate) mod fixtures {
         incarnation
     }
 
+    /// An ssh host taken over by somebody else whose task is still
+    /// serving in place, reached on `socket` and carrying `tunnel`.
+    /// Where every takeback case starts.
+    ///
+    /// The foreground seam comes back with the incarnation because
+    /// `open_ssh` borrows the set, and the ask has to be read after it.
+    pub(crate) fn a_deposed_serving_ssh_host(
+        set: &mut HostConnSet,
+        socket: &str,
+        tunnel: Option<Arc<SshTunnel>>,
+        taken_by: Option<&str>,
+    ) -> (HostId, Arc<Foreground>) {
+        let incarnation = a_connected_ssh_host(set, socket);
+        abort_establishes(set);
+        set.entry_mut("h1")
+            .ssh
+            .as_mut()
+            .expect("an ssh entry")
+            .tunnel = tunnel;
+        set.apply_state(
+            incarnation,
+            HostConnState::TakenOver {
+                taken_by: taken_by.map(Into::into),
+            },
+        );
+        let foreground = Arc::clone(&set.conn("h1").foreground);
+        foreground.serving_for_test(true);
+        (incarnation, foreground)
+    }
+
     /// A transport failure, which is the retryable establish shape.
     pub(crate) fn unreachable() -> SshFailure {
         SshFailure::Transport(Some("no route to host".into()))
@@ -4044,12 +4108,18 @@ mod tests {
     /// ssh takeback starts at the tunnel: a handshake that fails and
     /// lands on the ladder must not turn the user's claim back into a
     /// watch by the time a socket finally exists.
+    ///
+    /// This host has no tunnel, so the attempt is the full one — the
+    /// half where a claim can go missing across an establish, and the
+    /// half the in-place takeback never reaches.
     #[tokio::test]
     async fn an_explicit_ssh_attempt_clears_the_deposed_fact_at_the_tunnel() {
         let (mut set, _feed) = a_set();
         let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-takeback.sock");
         set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
         assert!(set.observes_only("h1"));
+        assert!(set.ssh("h1").tunnel.is_none());
+        let generation = set.ssh("h1").generation;
 
         set.open_ssh(
             "h1",
@@ -4062,6 +4132,11 @@ mod tests {
         assert!(
             !set.observes_only("h1"),
             "the takeback is stated at the tunnel, not at the socket"
+        );
+        assert_ne!(
+            set.ssh("h1").generation,
+            generation,
+            "the full path numbers a fresh attempt"
         );
     }
     #[tokio::test]
@@ -5684,8 +5759,7 @@ mod tests {
         );
 
         // A different endpoint is a different connection, however healthy
-        // the old task's flag still looks — an ssh reconnect rebuilds the
-        // bridge socket under it.
+        // the old task's flag still looks.
         let generation = set.conn("h1").generation;
         set.apply_state(
             set.mint_for("h1"),
@@ -5706,6 +5780,151 @@ mod tests {
             generation,
             "a new endpoint is a full reconnect"
         );
+    }
+
+    /// The same takeback over **ssh**, which is the transport the
+    /// product's own story runs on (R17).
+    #[tokio::test]
+    async fn an_explicit_ssh_connect_takes_the_foreground_back_on_the_tunnel_it_is_already_on() {
+        let (mut set, _feed) = a_set();
+        let parent = tempfile::Builder::new()
+            .prefix("roost-set-ssh-takeback")
+            .tempdir()
+            .expect("a scratch parent");
+        let tunnel = an_unestablished_tunnel(parent.path().to_path_buf()).await;
+        let bridge = tunnel.bridge_socket().to_path_buf();
+
+        let (incarnation, foreground) = a_deposed_serving_ssh_host(
+            &mut set,
+            &bridge.to_string_lossy(),
+            Some(tunnel),
+            Some("a phone"),
+        );
+        // A residual outage, so the clear an explicit cause performs is
+        // observable at all.
+        set.begin_outage("h1");
+        let generation = set.ssh("h1").generation;
+        let request = set.ssh("h1").request;
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+
+        assert!(
+            foreground.took_the_request_for_test(),
+            "the task on this tunnel is the one that performs it, and it heard the ask"
+        );
+        assert!(
+            set.taking_foreground("h1"),
+            "an attempt is in flight, which is what `host.connect` answers with"
+        );
+        assert_eq!(
+            set.ssh("h1").generation,
+            generation,
+            "a takeback in place numbers no new attempt"
+        );
+        assert_eq!(
+            set.ssh("h1").request,
+            request,
+            "and starts no second handshake"
+        );
+        assert!(
+            set.ssh("h1").tunnel.is_some(),
+            "the tunnel the deposed control leg runs over is left standing"
+        );
+        assert!(
+            set.ssh_reached_connected("h1"),
+            "so a takeback that fails still lands on an eligible ladder"
+        );
+        assert!(
+            !set.has_outage("h1"),
+            "the clear an explicit cause performs is above the short-circuit"
+        );
+        assert!(
+            !set.observes_only("h1"),
+            "and so is the claim: a takeback is not a watch"
+        );
+
+        // The lease the retake publishes the moment it is granted has to
+        // land on this entry — [`Self::apply_lease`] gates on the
+        // generation, and the short-circuit minted none to gate it out.
+        set.apply_lease(incarnation, "lease-2".into());
+        assert_eq!(
+            set.ssh("h1").lease.as_deref(),
+            Some("lease-2"),
+            "the granted lease reaches the entry the ladder would carry it from"
+        );
+    }
+
+    /// The three ssh shapes that are **not** a takeback in place, each
+    /// taking the full reconnect.
+    #[tokio::test]
+    async fn an_ssh_connect_that_is_not_a_takeback_in_place_rebuilds_the_tunnel() {
+        let parent = tempfile::Builder::new()
+            .prefix("roost-set-ssh-full")
+            .tempdir()
+            .expect("a scratch parent");
+        let tunnel = an_unestablished_tunnel(parent.path().to_path_buf()).await;
+        let bridge = tunnel.bridge_socket().to_string_lossy().into_owned();
+        let elsewhere = "/nonexistent/roost-set-ssh-elsewhere.sock";
+
+        // Everything below runs without awaiting, so no `open_ssh`'s
+        // handshake is ever polled; the tunnel above is the suite's
+        // last await.
+        for (case, cause, carried, socket) in [
+            (
+                "a scheduled attempt",
+                AttemptCause::AutoReconnect,
+                Some(&tunnel),
+                bridge.as_str(),
+            ),
+            (
+                "a task on an endpoint this host no longer has",
+                AttemptCause::Explicit,
+                Some(&tunnel),
+                elsewhere,
+            ),
+            (
+                "an establish still in flight",
+                AttemptCause::Explicit,
+                None,
+                elsewhere,
+            ),
+        ] {
+            let (mut set, _feed) = a_set();
+            let (_, foreground) =
+                a_deposed_serving_ssh_host(&mut set, socket, carried.map(Arc::clone), None);
+            let generation = set.ssh("h1").generation;
+
+            set.open_ssh(
+                "h1",
+                "one",
+                ssh_target("workbox"),
+                ConnectMode::Dial,
+                RequestOrigin::User,
+                cause,
+            );
+            abort_establishes(&mut set);
+
+            assert!(
+                !foreground.took_the_request_for_test(),
+                "{case} must never ask a task for the foreground"
+            );
+            assert_ne!(
+                set.ssh("h1").generation,
+                generation,
+                "{case} numbers a fresh attempt"
+            );
+            assert!(
+                set.ssh("h1").tunnel.is_none(),
+                "{case} takes the tunnel down ahead of its replacement"
+            );
+        }
     }
 
     /// A theme change goes to the foreground and nobody else (review

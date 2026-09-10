@@ -13,6 +13,15 @@ use tempfile::{tempdir, TempDir};
 
 fn root() -> (TempDir, PathBuf) {
     let dir = tempdir().expect("tempdir");
+    // `tempdir()` inherits the umask, so on a box running umask 0002 the
+    // root itself lands group-writable (0775) and `validate_runtime_dir`
+    // correctly refuses it as an ancestor. Harden it to 0700 so the root
+    // is never itself the thing under test; cases that want a permissive
+    // ancestor build one explicitly as a subdirectory via `mkdir` below.
+    // This assumes the tempdir's own ancestors (`/tmp`, sticky; or a
+    // `$TMPDIR` that is 0700) are acceptable — a group-writable `$TMPDIR`
+    // still fails one level up, by the validator's design.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod tempdir");
     let path = dir.path().canonicalize().expect("canonicalize tempdir");
     (dir, path)
 }
@@ -46,6 +55,7 @@ fn a_missing_leaf_is_created_0700_and_owned_by_us() {
 #[test]
 fn an_existing_0700_leaf_validates_and_is_idempotent() {
     let (_guard, root) = root();
+    assert_eq!(mode_of(&root), 0o700, "test root must be hardened to 0700");
     let leaf = root.join("session");
     mkdir(&leaf, 0o700);
 
