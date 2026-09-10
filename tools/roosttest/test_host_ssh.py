@@ -314,6 +314,28 @@ def count(predicate) -> int:
     return sum(1 for fields in invocations() if predicate(fields[1:]))
 
 
+def settled_teardowns() -> int:
+    """`count(is_teardown)` once it has stopped moving.
+
+    An `-O exit` is spawned rather than awaited, so a teardown the
+    *previous* case's fixture ordered can still be in flight when this
+    one takes its baseline — and a baseline one exit short reads a
+    neighbour's teardown as this test's own.
+    """
+    deadline = time.monotonic() + scaled_timeout(10.0)
+    quiet_for = scaled_timeout(0.5)
+    last = count(is_teardown)
+    since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        now = count(is_teardown)
+        if now != last:
+            last, since = now, time.monotonic()
+        elif time.monotonic() - since >= quiet_for:
+            break
+    return last
+
+
 def _descendants(pid: int) -> list[int]:
     """The pid's live descendants, deepest last, via `pgrep -P`."""
     out = subprocess.run(
@@ -868,8 +890,8 @@ def test_a_takeover_on_an_ssh_host_is_taken_back_in_place(ssh_host, roost):
     the phone's attach and the takeback all ride the tunnel that connect
     built, and nothing tears one down until the fixture removes the host.
     """
+    teardowns = settled_teardowns()
     establishes = count(is_establish)
-    teardowns = count(is_teardown)
 
     takeback_in_place(ssh_host, roost)
 
