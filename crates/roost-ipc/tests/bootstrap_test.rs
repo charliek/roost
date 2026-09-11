@@ -57,7 +57,7 @@ use std::time::Duration;
 use roost_ipc::bootstrap::{
     asset_name, checksum_name, shell_quote, sniff_binary, BootstrapError, BootstrapJob,
     BootstrapOptions, IdentityGate, InstallPhase, InstallSource, ProbeOutcome, RemoteArch,
-    ResolvedSource, Sniff, SourceOrigin,
+    ResolvedSource, Sniff, SourceOrigin, PROBE_BUDGET,
 };
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 use roost_ipc::session_launch::Verdict;
@@ -449,15 +449,13 @@ impl Harness {
     }
 
     fn write_uname(&self, script: &str) {
-        write_executable(&self.stub_bin.join("uname"), script.as_bytes());
+        link_stub(&self.stub_bin.join("uname"), script);
     }
 
     /// Replace one tool with a script of the test's own — how a `tee`
     /// that dies part-way is arranged.
     fn override_tool(&self, tool: &str, script: &str) {
-        let path = self.stub_bin.join(tool);
-        let _ = std::fs::remove_file(&path);
-        write_executable(&path, script.as_bytes());
+        link_stub(&self.stub_bin.join(tool), script);
     }
 
     /// A `chmod` that blocks until [`Harness::release_chmod`], then does
@@ -568,7 +566,7 @@ impl Harness {
             ),
         )
         .expect("write the fake ssh config");
-        std::os::unix::fs::symlink(fixture_path(), &path).expect("link the ssh wrapper");
+        std::os::unix::fs::symlink(fixture("fake-ssh.sh"), &path).expect("link the ssh wrapper");
         path
     }
 
@@ -648,16 +646,24 @@ impl Harness {
         self.local(remote).display().to_string()
     }
 
+    /// [`Harness::local`], with the rung's directory created.
+    fn local_rung(&self, remote: &str) -> PathBuf {
+        let path = self.local(remote);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create the rung's dir");
+        path
+    }
+
     /// Put a fake `roost-session` at a remote path.
     fn plant(&self, remote: &str, stub: &Stub) -> PathBuf {
-        self.plant_bytes(remote, stub.script(&self.state).as_bytes())
+        let path = self.local_rung(remote);
+        link_stub(&path, &stub.script(&self.state));
+        path
     }
 
     /// The same, for bytes that are not a [`Stub`] — an incumbent
     /// install a failing job must leave byte for byte.
     fn plant_bytes(&self, remote: &str, contents: &[u8]) -> PathBuf {
-        let path = self.local(remote);
-        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create the rung's dir");
+        let path = self.local_rung(remote);
         write_executable(&path, contents);
         path
     }
@@ -777,17 +783,39 @@ fn real_tool(tool: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("this machine has no {tool} in {TOOL_DIRS:?}"))
 }
 
+/// Everything the far side execs: a symlink to the committed
+/// `fake-remote-tool.sh` plus a `<path>.conf` holding `body`, which the
+/// fixture sources. The same trade [`Harness::write_ssh_wrapper`] makes
+/// for `ssh`, for the ETXTBSY reason its doc and the fixture's header
+/// give.
+fn link_stub(path: &Path, body: &str) {
+    let _ = std::fs::remove_file(path);
+    std::fs::write(format!("{}.conf", path.display()), body).expect("write a stub's conf");
+    std::os::unix::fs::symlink(fixture("fake-remote-tool.sh"), path).expect("link a stub");
+}
+
+/// The one raw write left, and it stays one: its callers
+/// ([`Harness::plant_bytes`], [`Harness::source_bytes`]) hand over bytes
+/// nothing on the far side ever execs, and their tests read the path
+/// back byte for byte — a symlink would silently turn that into "read
+/// the fixture". Anything exec'd goes through [`link_stub`].
 fn write_executable(path: &Path, contents: &[u8]) {
+    // Unlink first: `fs::write` FOLLOWS a symlink, and a rung that
+    // [`link_stub`] already pointed at the committed fixture would be
+    // written straight through — clobbering a tracked file in the repo
+    // rather than replacing the rung.
+    let _ = std::fs::remove_file(path);
     std::fs::write(path, contents).expect("write a fixture file");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod a fixture file");
 }
 
-fn fixture_path() -> PathBuf {
+fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/roosttest/fixtures/fake-ssh.sh")
+        .join("../../tools/roosttest/fixtures")
+        .join(name)
         .canonicalize()
-        .expect("the fake-ssh fixture must exist")
+        .unwrap_or_else(|error| panic!("the {name} fixture must exist: {error}"))
 }
 
 fn ssh_target(raw: &str) -> SshTarget {
@@ -1182,6 +1210,38 @@ async fn an_install_streams_verifies_and_commits_the_binary() {
 /// left open, in which the old bytes were already gone and the new ones
 /// had not answered.
 ///
+/// Two ways to occupy a rung coexist: [`Harness::plant`] symlinks the
+/// committed fixture, [`Harness::plant_bytes`] writes raw bytes. Writing
+/// raw bytes over a symlinked rung must replace the rung — `fs::write`
+/// follows a symlink, so without the unlink in `write_executable` this
+/// would write through the link and overwrite the fixture in the source
+/// tree, breaking every later stub in the run and dirtying the checkout.
+#[test]
+fn raw_bytes_over_a_symlinked_rung_replace_the_rung_not_the_fixture() {
+    let harness = Harness::new();
+    let fixture_before = std::fs::read(fixture("fake-remote-tool.sh")).expect("read the fixture");
+
+    harness.plant("$HOME/.local/bin/roost-session", &Stub::matching("linked"));
+    let dest = harness.plant_bytes("$HOME/.local/bin/roost-session", b"#!/bin/sh\nexit 7\n");
+
+    assert!(
+        std::fs::symlink_metadata(&dest)
+            .expect("stat the rung")
+            .file_type()
+            .is_file(),
+        "the rung must be a regular file again, not a link"
+    );
+    assert_eq!(
+        std::fs::read(&dest).expect("read the rung"),
+        b"#!/bin/sh\nexit 7\n"
+    );
+    assert_eq!(
+        std::fs::read(fixture("fake-remote-tool.sh")).expect("re-read the fixture"),
+        fixture_before,
+        "the committed fixture was written through the symlink"
+    );
+}
+
 /// The stub identifies from the staging path and nowhere else, so it
 /// passes the pre-commit gate, gets renamed into place, and then goes
 /// silent: exactly the shape a dropped leg or a timeout after the `mv`
@@ -2481,9 +2541,16 @@ async fn dropping_a_job_still_exits_the_master_and_removes_the_directory() {
 #[tokio::test]
 async fn a_remote_step_that_never_answers_is_killed_reaped_and_classified() {
     let harness = Harness::new();
-    // Longer than the probe's own budget, and bounded so the orphan the
-    // kill leaves behind cannot outlive the test run by much.
-    harness.hang_uname(45);
+    // Longer than the probe's own (scaled) budget, and bounded so the
+    // orphan the kill leaves behind cannot outlive the test run by much.
+    // Derived from PROBE_BUDGET rather than a copied literal: a fixed
+    // duration chosen against the unscaled 30s budget stops being safely
+    // longer than it once ROOST_TEST_TIMEOUT_SCALE widens that budget —
+    // this ties the hang to the same knob the product's own deadline
+    // reads.
+    let scale = roost_ipc::session_launch::timeout_scale().max(1.0);
+    let hang_secs = (PROBE_BUDGET.as_secs_f64() * scale + 15.0).ceil() as u32;
+    harness.hang_uname(hang_secs);
     let job = harness.job(harness.options()).await;
 
     let error = job.probe().await.expect_err("nothing answered");

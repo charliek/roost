@@ -95,6 +95,21 @@ DOCKER_TIMEOUT="${ROOST_CLOSURE_DOCKER_TIMEOUT:-900}"
 COMPOSITOR_TIMEOUT="${ROOST_CLOSURE_COMPOSITOR_TIMEOUT:-300}"
 IMAGE="${ROOST_CLOSURE_IMAGE:-ubuntu:24.04}"
 
+# apt's default inactivity timeout is 120s per connection, and it walks every
+# address the mirror resolves to (nine for archive.ubuntu.com) before it gives
+# up on a file. A mirror that accepts connections and then stalls therefore
+# keeps `apt-get update -qq` completely silent for longer than
+# COMPOSITOR_TIMEOUT — measured: still nothing after 560s with the defaults,
+# simulated by dropping post-handshake packets in the container. That is the
+# exact shape of the 2026-09-11 CI failure (three runs, empty compositor log,
+# same image digest and runner image as the green run the day before; the
+# unchanged job passed again eight hours later). Bounded, the same stall ends
+# with apt's own "Connection failed" / "Unable to locate package" inside the
+# budget (measured: update gives up after 122s, install then fails at once), and
+# the container's exit puts those lines in the printed log. Every container in
+# this script sources this.
+APT_CONF='Acquire::http::Timeout "10"; Acquire::Retries "1";'
+
 # How long the app must still be alive and answering AFTER its first successful
 # identify. `App::bootstrap` binds the IPC socket before iced creates the
 # window, so a renderer or EGL failure that kills the process a moment later can
@@ -150,8 +165,45 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# What the compositor container prints, and when. The log is only ever shown on
+# failure, and then it has to say where the container got stuck: apt-get with
+# -qq prints nothing until dpkg starts configuring, so a mirror hang used to
+# leave the log completely empty. The phase markers make "which step never
+# finished" readable from the last line, and the version line pins what was
+# actually under test.
+#
+# shellcheck disable=SC2016  # every $VAR here is expanded INSIDE the container.
+COMPOSITOR_PRELUDE='
+  printf "%s\n" "${APT_CONF}" > /etc/apt/apt.conf.d/99roost-closure
+  echo "compositor: apt-get update"
+  apt-get update -qq
+  echo "compositor: apt-get install ${COMPOSITOR_PKG}"
+  apt-get install -y -qq --no-install-recommends "${COMPOSITOR_PKG}"
+  echo "compositor: ${COMPOSITOR_PKG} $(dpkg-query -W -f "\${Version}" "${COMPOSITOR_PKG}") installed"
+'
+
+# Dump everything knowable about a compositor container that did not deliver a
+# socket: its log, and — when it is still running — its process table, which
+# tells a wedged apt-get (an `http` acquire method sitting on a connect) apart
+# from a display server that started but put its socket somewhere else.
+compositor_diagnostics() {
+  local leg="$1"
+  echo "--- ${leg} compositor container log ---" >&2
+  docker logs "${compositor_cid}" 2>&1 | tail -40 >&2 || true
+  if docker inspect -f '{{.State.Running}}' "${compositor_cid}" 2>/dev/null | grep -q true; then
+    echo "--- ${leg} compositor container processes (still running) ---" >&2
+    docker top "${compositor_cid}" -o pid,etime,args >&2 || true
+  else
+    echo "--- ${leg} compositor container exit status: $(docker inspect -f '{{.State.ExitCode}}' "${compositor_cid}" 2>/dev/null || echo unknown) ---" >&2
+  fi
+}
+
 # Start the display server in its own container and wait for its socket to show
 # up in the shared directory. `$1` is the leg name; sets `compositor_cid`.
+#
+# No `--rm` on this container: a display server that fails to start exits at
+# once, and with `--rm` docker would have deleted the container — log included —
+# before the readiness loop below got to read it. `cleanup` removes it by id.
 start_compositor() {
   local leg="$1" name sock
   name="${run_id}-${leg}-compositor"
@@ -161,13 +213,14 @@ start_compositor() {
       # weston's headless backend needs no GPU and no seat. `--idle-time=0` so
       # it never suspends the output under a long apt-get in the other
       # container.
-      compositor_cid="$(timeout "${COMPOSITOR_TIMEOUT}" docker run -d --rm --name "${name}" \
+      compositor_cid="$(timeout "${COMPOSITOR_TIMEOUT}" docker run -d --name "${name}" \
         -v "${share_dir}:/share" \
         -e XDG_RUNTIME_DIR=/share \
-        "${IMAGE}" bash -eu -c '
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends weston
+        -e "APT_CONF=${APT_CONF}" \
+        -e COMPOSITOR_PKG=weston \
+        "${IMAGE}" bash -eu -c "${COMPOSITOR_PRELUDE}"'
           chmod 700 /share
+          echo "compositor: starting weston"
           exec weston --backend=headless-backend.so --socket=wayland-closure \
             --width=1280 --height=800 --idle-time=0
         ')"
@@ -177,11 +230,12 @@ start_compositor() {
       # `-ac` disables access control so the package container needs no xauth —
       # xauth is an X client library dependency we must not install beside the
       # package under test.
-      compositor_cid="$(timeout "${COMPOSITOR_TIMEOUT}" docker run -d --rm --name "${name}" \
+      compositor_cid="$(timeout "${COMPOSITOR_TIMEOUT}" docker run -d --name "${name}" \
         -v "${share_dir}:/tmp/.X11-unix" \
-        "${IMAGE}" bash -eu -c '
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends xvfb
+        -e "APT_CONF=${APT_CONF}" \
+        -e COMPOSITOR_PKG=xvfb \
+        "${IMAGE}" bash -eu -c "${COMPOSITOR_PRELUDE}"'
+          echo "compositor: starting Xvfb"
           exec Xvfb :99 -screen 0 1280x800x24 -ac -nolisten tcp
         ')"
       sock="${share_dir}/X99"
@@ -197,16 +251,14 @@ start_compositor() {
   while [ "${waited}" -lt "${COMPOSITOR_TIMEOUT}" ]; do
     [ -S "${sock}" ] && return 0
     if ! docker inspect -f '{{.State.Running}}' "${compositor_cid}" 2>/dev/null | grep -q true; then
-      echo "--- ${leg} compositor container log ---" >&2
-      docker logs "${compositor_cid}" 2>&1 | tail -40 >&2 || true
-      die "the ${leg} compositor container exited before its socket appeared"
+      compositor_diagnostics "${leg}"
+      die "the ${leg} compositor container exited before its socket appeared — the last log line above names the step that failed (an apt-get error here is the mirror or the network, not the package under test)"
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  echo "--- ${leg} compositor container log ---" >&2
-  docker logs "${compositor_cid}" 2>&1 | tail -40 >&2 || true
-  die "the ${leg} compositor socket never appeared within ${COMPOSITOR_TIMEOUT}s"
+  compositor_diagnostics "${leg}"
+  die "the ${leg} compositor socket never appeared within ${COMPOSITOR_TIMEOUT}s — the last log line above names the step it was still on"
 }
 
 # The body that runs inside the package container. Identical for both legs; the
@@ -219,6 +271,7 @@ start_compositor() {
 #
 # shellcheck disable=SC2016  # every $VAR here is expanded INSIDE the container.
 INSTALL_SCRIPT='
+  printf "%s\n" "${APT_CONF}" > /etc/apt/apt.conf.d/99roost-closure
   apt-get update -qq
   # --no-install-recommends is the strict case: only what Depends actually
   # names gets installed.
@@ -356,6 +409,7 @@ run_leg() {
     "${display_env[@]}" \
     -e "ROOST_LEG=${leg}" \
     -e "LIVENESS_SECONDS=${LIVENESS_SECONDS}" \
+    -e "APT_CONF=${APT_CONF}" \
     -v "${deb}:/tmp/roost.deb:ro" \
     "${IMAGE}" bash -eu -c "
       export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/tmp/rt}
@@ -391,6 +445,9 @@ run_leg() {
       ;;
     4)
       die "[${leg}] the package installed and answered roostctl identify, then failed the liveness re-check. The IPC socket is bound before the window exists, so this is the shape a renderer/EGL failure takes: bootstrap succeeds, the window does not."
+      ;;
+    100)
+      die "[${leg}] apt-get failed inside the package container (exit 100). Its E: lines above say which: a mirror or network failure is a harness problem, NOT evidence about the Depends: list; a dependency apt cannot satisfy IS the Depends: list."
       ;;
     122)
       die "[${leg}] the installed package did not come up within ${LAUNCH_TIMEOUT}s and the launch was killed. Distinct from the ${DOCKER_TIMEOUT}s budget below: the package DID install and its dlopen closure DID resolve, so this points at the app, not at docker or apt."

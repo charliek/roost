@@ -1768,8 +1768,10 @@ impl BootstrapOptions {
 
 /// Per-exec budget for the read-only probe steps. Each is one `ssh`
 /// exec over a master that is already up (or is being opened by this
-/// very exec, which is why it is not tighter).
-const PROBE_BUDGET: Duration = Duration::from_secs(30);
+/// very exec, which is why it is not tighter). `pub` so a test fixture
+/// that must outlast the scaled budget (`ROOST_TEST_TIMEOUT_SCALE`) can
+/// derive its duration from this constant instead of copying it.
+pub const PROBE_BUDGET: Duration = Duration::from_secs(30);
 
 /// The install's remote steps that only *think* — prepare, verify the
 /// staged file, commit. No bytes cross the wire on any of them.
