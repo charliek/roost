@@ -267,6 +267,16 @@ fn status_lines(h: &HostStatus) -> Vec<String> {
             lines.push(format!("    {line}"));
         }
     }
+    // While a rung is armed, `reason` above *is* the countdown text and
+    // the `rollup.contains(reason)` filter usually suppresses it, so
+    // this is the only place in the human form the classified failure
+    // family (plan 044 §3.3) appears. A bare bridge EOF — the usual
+    // shape of an outage's first rung — carries no family, so an armed
+    // retry with no reason is ordinary and prints nothing (plan 060
+    // §3.1, #401).
+    if let Some(reason) = h.retry.as_ref().and_then(|r| r.reason.as_deref()) {
+        lines.push(format!("    armed because: {reason}"));
+    }
     if h.connect.as_ref().is_some_and(|c| c.reduced_fidelity) {
         lines.push(REDUCED_FIDELITY_LINE.to_string());
     }
@@ -334,7 +344,7 @@ async fn connection(client: &mut IpcClient, op: &str, id: &str) -> Result<i32> {
 mod tests {
     use super::*;
     use clap::Parser;
-    use roost_ipc::messages::HostConnectStatus;
+    use roost_ipc::messages::{HostConnectStatus, RetrySchedule};
 
     /// A throwaway root so `clap` parses the subcommand exactly as
     /// `roostctl host …` does, without dragging the real `Cli` (and its
@@ -530,6 +540,88 @@ mod tests {
         assert_eq!(
             status_lines(&host),
             vec!["abc  workbox  disconnected".to_string()],
+        );
+    }
+
+    /// An armed retry that carries a classified failure family prints
+    /// `armed because:` after the reason/detail lines and before the
+    /// reduced-fidelity line — the ordering plan 060 §3.1 (#401) pins.
+    #[test]
+    fn status_lines_print_armed_because_after_detail_before_reduced_fidelity() {
+        let host = HostStatus {
+            id: "abc".to_string(),
+            label: "workbox".to_string(),
+            state: "reconnecting".to_string(),
+            reason: Some("reconnecting in 8s (3/10)".to_string()),
+            detail: Some("rung 1: timed out\nrung 2: connection refused".to_string()),
+            retry: Some(RetrySchedule {
+                delay_ms: 8000,
+                attempt: Some(3),
+                budget: Some(10),
+                reason: Some("host key changed".to_string()),
+                ..Default::default()
+            }),
+            connect: Some(HostConnectStatus {
+                session_id: "s1".to_string(),
+                reduced_fidelity: true,
+                resumed: false,
+                from_revision: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&host),
+            vec![
+                "abc  workbox  reconnecting".to_string(),
+                "    reconnecting in 8s (3/10)".to_string(),
+                "    rung 1: timed out".to_string(),
+                "    rung 2: connection refused".to_string(),
+                "    armed because: host key changed".to_string(),
+                REDUCED_FIDELITY_LINE.to_string(),
+            ],
+        );
+    }
+
+    /// An armed retry with no classified family (a bare bridge EOF, the
+    /// usual first rung of an outage) prints no `armed because` line.
+    #[test]
+    fn status_lines_omit_armed_because_when_retry_has_no_reason() {
+        let host = HostStatus {
+            id: "abc".to_string(),
+            label: "workbox".to_string(),
+            state: "reconnecting".to_string(),
+            retry: Some(RetrySchedule {
+                delay_ms: 2000,
+                reason: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&host),
+            vec!["abc  workbox  reconnecting".to_string()],
+        );
+    }
+
+    /// An unrelated `HostStatus::reason` (no `retry` at all) never
+    /// leaks into the `armed because` line — it reads `retry.reason`
+    /// only, never `HostStatus::reason`.
+    #[test]
+    fn status_lines_omit_armed_because_when_not_armed() {
+        let host = HostStatus {
+            id: "abc".to_string(),
+            label: "workbox".to_string(),
+            state: "disconnected".to_string(),
+            reason: Some("some unrelated reason".to_string()),
+            retry: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&host),
+            vec![
+                "abc  workbox  disconnected".to_string(),
+                "    some unrelated reason".to_string(),
+            ],
         );
     }
 }
