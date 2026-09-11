@@ -303,6 +303,16 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **The app in `/Applications` now carries its own notarization ticket
+  (#405)** — the release pipeline stapled only the DMG, so a user who
+  dragged `Roost.app` (or `Roost-Iced.app`) out of the image and first
+  launched it offline, or behind a firewall that can't reach Apple, got
+  the "cannot check it for malicious software" dialog on an app that
+  was properly notarized. `notarize.sh` now also notarizes + staples
+  the app bundle itself before it's packaged into the DMG, so the ticket
+  travels with the app regardless of where it's launched from. This is
+  a release-pipeline change and takes effect starting with the next
+  release.
 - **A tab closed while it was still being opened no longer leaves a
   shell running with no tab (#417)** — `tab.open` put the row in the
   workspace and published it before the PTY supervisor reserved the

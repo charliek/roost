@@ -29,6 +29,7 @@ jobs:
       macbundle: ${{ steps.filter.outputs.macbundle }}
       docnav: ${{ steps.filter.outputs.docnav }}
       examples: ${{ steps.filter.outputs.examples }}
+      scripts: ${{ steps.filter.outputs.scripts }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -162,6 +163,14 @@ jobs:
               # to either one would re-run nothing that packages a DMG.
               - 'mac/scripts/make-dmg.sh'
               - 'mac/scripts/update-appcast.py'
+            # Gates the `scripts` job below (make test-linux-scripts +
+            # test-mac-scripts) — the only lane that runs either shell
+            # test suite; without this filter a script-only fix runs no
+            # CI job at all.
+            scripts:
+              - 'mac/scripts/notarize*.sh'
+              - 'linux/scripts/**'
+              - 'Makefile'
 
   rust-lint:
     needs: changes
@@ -237,6 +246,18 @@ jobs:
           persist-credentials: false
       - name: Functional harness target contract
         run: python3 -m unittest discover -s tools/roosttest_unit -v
+
+  scripts:
+    needs: changes
+    if: needs.changes.outputs.scripts == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Shell tests for linux/scripts + mac/scripts release helpers
+        run: make test-linux-scripts test-mac-scripts
 
   themes-parity:
     needs: changes
@@ -2267,7 +2288,7 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, iced-build-e2e, iced-release, e2e-mac, session-e2e]
+    needs: [changes, rust-lint, harness-unit, scripts, themes-parity, rust-build, swift-mac, iced-build-e2e, iced-release, e2e-mac, session-e2e]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2302,7 +2323,10 @@ jobs:
           # non-blocking signal lane (see its job comment).
           # 9 -> 10 in plan 035: `session-e2e` gates the headless
           # host-session daemon lane.
-          required_jobs=10
+          # 10 -> 11 in plan 060: `scripts` gates the shell tests for
+          # linux/scripts + mac/scripts (notarize.sh), previously run by
+          # no workflow at all.
+          required_jobs=11
           count="$(echo "${NEEDS}" | jq -r 'length')"
           if [ "${count}" -lt "${required_jobs}" ]; then
             echo "::error::ci-success is gating ${count} jobs but expects at least ${required_jobs} — a job was removed from its needs list. If that was deliberate, lower required_jobs in the same commit."

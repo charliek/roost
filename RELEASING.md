@@ -31,15 +31,20 @@ That's it. Everything else is automatic.
      standalone `roost-session-X.Y.Z-linux-<arch>` binary and its
      `.sha256` checksum sidecar — the host-sessions bootstrap install rung
      fetches these directly (`crates/roost-ipc/src/bootstrap.rs`)
-   - `mac` — build + sign + notarize + upload `Roost-X.Y.Z.dmg`, then
-     EdDSA-sign it and hand `sign.txt` forward as a build artifact. The
-     "Append macOS first-launch note" step keeps the Gatekeeper bypass
-     instructions on the Release body while the DMG is not notarized.
+   - `mac` — build + sign `Roost.app`, notarize + staple the app itself,
+     then package + notarize `Roost-X.Y.Z.dmg` and upload it, then
+     EdDSA-sign it and hand `sign.txt` forward as a build artifact. A
+     verify step mounts the DMG and confirms the app inside carries its
+     own ticket. The "Append macOS first-launch note" step keeps the
+     Gatekeeper bypass instructions on the Release body while the DMG is
+     not notarized.
    - `mac-iced` — the **experimental** Rust + iced mac build's twin of
      `mac`: fails fast if the iced Sparkle key material isn't installed,
-     then builds + bundles `Roost-Iced.app`, notarizes + uploads
-     `Roost-Iced-X.Y.Z.dmg`, and EdDSA-signs it (its own keypair, never
-     the Swift key), handing `sign-iced.txt` forward as a build artifact.
+     then builds + bundles `Roost-Iced.app`, notarizes + staples the app
+     itself, packages + notarizes `Roost-Iced-X.Y.Z.dmg` (verified the
+     same way) and uploads it, and EdDSA-signs it (its own keypair,
+     never the Swift key), handing `sign-iced.txt` forward as a build
+     artifact.
    - **`publish-release`** — asserts the artifact set (both `.deb`s, the
      Swift DMG, the iced DMG, both `roost-session` standalone binaries and
      both of their `.sha256` sidecars — eight assets, one each, correctly
