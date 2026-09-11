@@ -2833,7 +2833,7 @@ async fn dispatch_outcome(
         h.supervisor
             .write(p.tab_id, p.data)
             .await
-            .map_err(pty_err)?;
+            .map_err(|e| pty_err(&e))?;
         return Ok(HandlerOutcome::Reply(serde_json::json!({})));
     }
 
@@ -3591,27 +3591,19 @@ async fn dispatch(
                 u16::try_from(p.rows)
                     .map_err(|_| HandlerError::invalid_param("rows out of u16 range"))?
             };
-            if let Err(err) =
-                h.supervisor
-                    .spawn(tab.id, &tab.cwd, &p.argv, cols, rows, &h.socket_path)
-            {
-                // PTY spawn failed — roll back the tab so the
-                // workspace doesn't carry a phantom.
-                let _ = h.workspace.close_tab(tab.id);
-                // A `Cancelled` here means the user (or another
-                // caller) closed the same tab id between our
-                // workspace insert and the supervisor's promote.
-                // Surface that as `not-found` so the client sees
-                // the same code as any other "tab gone" path
-                // rather than misclassifying it as a server fault.
-                if let Some(PtyError::Cancelled(_)) = err.downcast_ref::<PtyError>() {
-                    return Err(HandlerError::not_found(err.to_string()));
-                }
-                return Err(HandlerError::new(
-                    "internal",
-                    format!("pty spawn failed: {err}"),
-                ));
-            }
+            crate::application::spawn_for_row(
+                &h.workspace,
+                &h.supervisor,
+                &tab,
+                &p.argv,
+                cols,
+                rows,
+                &h.socket_path,
+            )
+            .map_err(|err| match err.downcast_ref::<PtyError>() {
+                Some(pty) => pty_err(pty),
+                None => HandlerError::new("internal", format!("pty spawn failed: {err}")),
+            })?;
             encode(&TabOpenResult { tab })
         }
         ops::TAB_CLOSE => {
@@ -3636,7 +3628,7 @@ async fn dispatch(
             h.supervisor
                 .write(p.tab_id, p.data)
                 .await
-                .map_err(pty_err)?;
+                .map_err(|e| pty_err(&e))?;
             Ok(serde_json::json!({}))
         }
         ops::TAB_RESIZE => {
@@ -3648,7 +3640,7 @@ async fn dispatch(
             h.supervisor
                 .resize(p.tab_id, cols, rows)
                 .await
-                .map_err(pty_err)?;
+                .map_err(|e| pty_err(&e))?;
             Ok(serde_json::json!({}))
         }
         ops::TAB_DUMP => {
@@ -4635,8 +4627,7 @@ fn dump_err(e: DumpError) -> HandlerError {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)] // `Result::map_err` adapter owns its error.
-fn pty_err(e: PtyError) -> HandlerError {
+fn pty_err(e: &PtyError) -> HandlerError {
     match e {
         PtyError::NotFound(_) | PtyError::Closed(_) | PtyError::Cancelled(_) => {
             HandlerError::not_found(e.to_string())
@@ -5015,5 +5006,12 @@ mod tests {
         put_file_size_guard(&serde_json::json!({})).expect("a missing `data` is decode's to name");
         put_file_size_guard(&serde_json::json!({"data": 7}))
             .expect("and so is one of the wrong type");
+    }
+
+    /// `tab.open`'s lost-row answer, pinned here because the race it
+    /// reports cannot be interposed over a socket.
+    #[test]
+    fn a_cancelled_spawn_is_not_found_on_the_wire() {
+        assert_eq!(pty_err(&PtyError::Cancelled(7)).code, "not-found");
     }
 }

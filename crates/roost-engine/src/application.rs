@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use roost_ipc::messages::{Project, Tab};
 
-use crate::{AttentionSource, PtySupervisor, Workspace, WorkspaceError};
+use crate::{AttentionSource, PtyError, PtySupervisor, Workspace, WorkspaceError};
 
 /// The one `tab.close` sequence, shared by the served handler, the
 /// in-process client and the facade.
@@ -36,6 +36,56 @@ pub fn close_tab(
     let removed = workspace.close_tab(tab_id);
     supervisor.close(tab_id);
     removed
+}
+
+/// The one `tab.open` spawn sequence, shared by the served handler and
+/// the in-process client.
+///
+/// The row is in the workspace — and published — before `spawn` reserves
+/// the id in `pending`. A `tab.close` landing in that window removes the
+/// row and finds neither a live session nor a pending slot, so the
+/// teardown is a no-op and this spawn promotes a live PTY for a row
+/// nobody can see (#417). Closing that window is the caller's job and
+/// not `spawn`'s: `spawn` holds no workspace handle, and the window lies
+/// entirely between `open_tab` returning and the reservation. So re-read
+/// the row after the promotion and hang the child up if it went away.
+///
+/// The rollback is `let _ =` because the row may already be gone — that
+/// is exactly the race. And a close landing between the promotion and
+/// the re-check makes the re-check's `supervisor.close` a second close:
+/// once the waiter has taken the entry it finds nothing, but under a
+/// latched `shutting_down` the entry stays until the reap, so the
+/// hang-up is re-sent. That second SIGHUP is as narrow as every other
+/// double close in the tree and no narrower — `terminate_child` gates
+/// its watchdog on `reaped` but not its immediate `kill()` (#470).
+///
+/// `pub` for the same reason [`close_tab`] is: the race test lives in
+/// `tests/` with a real PTY and a multi-thread runtime.
+pub fn spawn_for_row(
+    workspace: &Workspace,
+    supervisor: &PtySupervisor,
+    tab: &Tab,
+    argv: &[String],
+    cols: u16,
+    rows: u16,
+    socket_path: &std::path::Path,
+) -> Result<()> {
+    match supervisor.spawn(tab.id, &tab.cwd, argv, cols, rows, socket_path) {
+        // The pre-subscribed receiver `spawn` returns is dropped; the
+        // supervisor's stashed twin (`take_initial_receiver`) is what an
+        // attach consumes, so early output survives however late that
+        // attach runs.
+        Ok(_rx) => {}
+        Err(err) => {
+            let _ = workspace.close_tab(tab.id);
+            return Err(err);
+        }
+    }
+    if let Err(WorkspaceError::TabNotFound(_)) = workspace.tab(tab.id) {
+        supervisor.close(tab.id);
+        return Err(PtyError::Cancelled(tab.id).into());
+    }
+    Ok(())
 }
 
 /// In-process workspace + PTY supervisor handle.
@@ -126,20 +176,17 @@ impl LocalClient {
         // returned — not the `cwd` parameter above, which may still
         // be empty. Spawning the parameter regresses this path back
         // to the UI's own cwd (#266).
-        match self
-            .supervisor
-            .spawn(tab.id, &tab.cwd, argv, cols, rows, &self.socket_path)
-        {
-            // The pre-subscribed receiver spawn returns is dropped;
-            // the supervisor's stashed twin (`take_initial_receiver`)
-            // is what the UI's attach consumes, so early output
-            // survives however late that attach runs.
-            Ok(_rx) => Ok(tab),
-            Err(err) => {
-                let _ = self.workspace.close_tab(tab.id);
-                Err(err.context("pty spawn failed"))
-            }
-        }
+        spawn_for_row(
+            &self.workspace,
+            &self.supervisor,
+            &tab,
+            argv,
+            cols,
+            rows,
+            &self.socket_path,
+        )
+        .context("pty spawn failed")?;
+        Ok(tab)
     }
 
     pub async fn close_tab(&self, tab_id: i64) -> Result<()> {
