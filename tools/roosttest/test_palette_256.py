@@ -18,7 +18,7 @@ import time
 import pytest
 
 from client import scaled_timeout
-from util import wait_tab_attached
+from util import BARE_SHELL_ARGV, wait_tab_quiet
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -42,8 +42,10 @@ CHARS = "ABCDEFGH"
 )
 class TestPalette256:
     def test_cube_and_grayscale_resolve_to_correct_rgb(self, roost, project):
-        tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        # Quiet, not just attached: feed_pty_bytes doesn't serialize with
+        # shell startup output still in flight (see test_osc_pipeline.py).
+        wait_tab_quiet(roost, tab)
         # Clear + home to row 10, then one marker char per index, each
         # with that 256-color background.
         seq = b"\x1b[2J\x1b[10;1H"

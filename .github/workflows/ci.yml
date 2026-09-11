@@ -732,6 +732,7 @@ jobs:
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
           tools/roosttest/test_osc_pipeline.py
+          tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
           tools/roosttest/test_ime.py
@@ -968,6 +969,7 @@ jobs:
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
           tools/roosttest/test_osc_pipeline.py
+          tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
           tools/roosttest/test_ime.py
@@ -1154,6 +1156,7 @@ jobs:
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
           tools/roosttest/test_osc_pipeline.py
+          tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
           tools/roosttest/test_ime.py
