@@ -1,8 +1,6 @@
-//! The one `tab.open` spawn sequence
-//! (`roost_engine::application::spawn_for_row`): a `tab.close` that
-//! lands before the supervisor reserves the id leaves no session and no
-//! pending slot to cancel, so the opener's own re-check has to hang the
-//! freshly-promoted child up (#417).
+//! `roost_engine::application::spawn_for_row` against a close that beats
+//! the supervisor's reservation (#417). The window and why the re-check
+//! closes it are stated on the helper.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -50,9 +48,9 @@ async fn exited(lifecycle: &mut broadcast::Receiver<SupervisorEvent>, tab_id: i6
     false
 }
 
-/// Driven by end state rather than by timing: `PtySupervisor::close`
-/// reads the session and pending maps, so running the close first is
-/// exactly the interleaving where it finds both empty.
+/// Ordering by end state is exact here: `PtySupervisor::close` branches on
+/// its map contents, not on when it ran, so calling the close first *is*
+/// the interleaving under test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_that_beats_the_reservation_still_tears_the_child_down() {
     let (workspace, supervisor, socket, tab) = fixture();
