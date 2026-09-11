@@ -14,6 +14,10 @@
 //! task parked in `poll()`, and dropping the tokio runtime waits on
 //! in-flight blocking tasks — the test would hang instead of failing.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::io::Read as _;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use roost_engine::{PtyError, PtyOutputEvent, PtySupervisor, ShutdownReport};
@@ -35,11 +39,432 @@ fn socket() -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp/roost-pty-shutdown.sock")
 }
 
-fn spawn_tab(
+/// Every live tab holds four master-side descriptors in this process —
+/// the master, a reader dup, a writer dup and the EOF-on-drop writer — so
+/// the 70 simultaneous tabs of the heaviest test plus the racers and a
+/// baseline need ~350. A macOS login session's default soft limit is 256.
+const FD_BUDGET_NEEDED: libc::rlim_t = 350;
+/// Comfortably past what the tests need and far below every platform's
+/// per-process ceiling (`kern.maxfilesperproc` on macOS, 10240 there).
+const FD_BUDGET_TARGET: libc::rlim_t = 1024;
+
+/// The two PTY-heavy tests must not overlap: run together they ask for
+/// ~140 pty pairs at once, against a system-wide macOS pool
+/// (`kern.tty.ptmx_max`, 511 on a CI runner) shared with everything else
+/// on the box. Serialised, this binary peaks at ~75 pairs.
+///
+/// Each `#[tokio::test]` builds its own runtime, and one static tokio
+/// mutex shared across those runtimes is sound because its wakers are
+/// `Send`: whichever runtime releases the guard may wake a waiter parked
+/// on another.
+///
+/// The guard bounds concurrent *spawning*, not every descriptor: a torn
+/// down tab's blocking reader can still hold its master dup until the
+/// runtime drains it, so a brief tail of closing dups outlives the guard
+/// and the peak is ~75 pairs plus that tail rather than a hard 75.
+/// Bounding it exactly would mean gating on this process's fd or pty
+/// count, which the binary's other tests move concurrently — a flaky gate
+/// rather than a precise one, so both heavy tests settle the tail
+/// best-effort (`settle_open_fds`) instead.
+static PTY_HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Best effort after a teardown: wait for this process's descriptor count
+/// to stop falling, so most of the closing master dups land before the
+/// `PTY_HEAVY` guard is released. Never an assertion and never fatal —
+/// the binary's other tests open descriptors of their own while this runs,
+/// which is exactly why the count cannot be a bound.
+async fn settle_open_fds() {
+    let open_fds = || count_dir_entries("/dev/fd", |_| true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let Ok(mut previous) = open_fds() else {
+        return;
+    };
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(25)).await;
+        let Ok(current) = open_fds() else {
+            return;
+        };
+        if current >= previous {
+            return;
+        }
+        previous = current;
+    }
+}
+
+fn rlimit_nofile() -> Result<libc::rlimit, String> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes one `rlimit`, which is what it is given.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if rc == 0 {
+        Ok(limit)
+    } else {
+        Err(format!("getrlimit: {}", std::io::Error::last_os_error()))
+    }
+}
+
+/// Raise this process's `RLIMIT_NOFILE` soft limit to what the PTY-heavy
+/// tests need, rather than shrink the tests: 65+ simultaneous live tabs
+/// is the property under test. Raise-only and idempotent — two tests
+/// calling it concurrently settle on the same value, so it needs no lock.
+fn ensure_fd_budget() {
+    let current = rlimit_nofile().unwrap_or_else(|err| panic!("{err}"));
+    assert!(
+        current.rlim_max >= FD_BUDGET_NEEDED,
+        "RLIMIT_NOFILE hard limit is {} (soft {}), below the {FD_BUDGET_NEEDED} \
+         descriptors this test needs",
+        current.rlim_max,
+        current.rlim_cur
+    );
+    let target = FD_BUDGET_TARGET.min(current.rlim_max);
+    if current.rlim_cur >= target {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: current.rlim_max,
+    };
+    // SAFETY: `setrlimit` reads one `rlimit`, which is what it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        let err = std::io::Error::last_os_error();
+        assert!(
+            current.rlim_cur >= FD_BUDGET_NEEDED,
+            "raising the RLIMIT_NOFILE soft limit from {} to {target} failed: {err} \
+             (hard {})",
+            current.rlim_cur,
+            current.rlim_max
+        );
+    }
+}
+
+/// What the box could say about its pty supply at the moment a spawn
+/// failed. Every field is fallible *into the message*: a panic raised
+/// while collecting would replace the `openpty` errno — the one thing
+/// that pins which ceiling was hit — with its own.
+struct PtyCensus {
+    /// Tabs the calling test already had live, `None` where the caller
+    /// does not track it.
+    tabs_live: Option<usize>,
+    fd_limit: Result<String, String>,
+    open_fds: Result<String, String>,
+    /// What this platform can say about its pty pool, each row labelled
+    /// for exactly what it counts.
+    pool: Vec<(&'static str, Result<String, String>)>,
+    holders: Result<String, String>,
+}
+
+impl PtyCensus {
+    fn render(&self) -> String {
+        let mut out = String::from("pty census:\n");
+        let tabs = self
+            .tabs_live
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string());
+        let _ = writeln!(out, "  tabs live in this test: {tabs}");
+        let _ = writeln!(out, "  RLIMIT_NOFILE: {}", shown(&self.fd_limit));
+        let _ = writeln!(
+            out,
+            "  open fds (/dev/fd entries): {}",
+            shown(&self.open_fds)
+        );
+        for (label, value) in &self.pool {
+            let _ = writeln!(out, "  {label}: {}", shown(value));
+        }
+        let _ = writeln!(out, "  candidate holders (lsof): {}", shown(&self.holders));
+        out
+    }
+}
+
+fn shown(value: &Result<String, String>) -> String {
+    match value {
+        Ok(value) => value.clone(),
+        Err(why) => format!("unavailable: {why}"),
+    }
+}
+
+fn pty_census(tabs_live: Option<usize>) -> PtyCensus {
+    PtyCensus {
+        tabs_live,
+        fd_limit: rlimit_nofile()
+            .map(|limit| format!("soft {} hard {}", limit.rlim_cur, limit.rlim_max)),
+        open_fds: count_dir_entries("/dev/fd", |_| true).map(|count| count.to_string()),
+        pool: pty_pool(),
+        holders: pty_holders(),
+    }
+}
+
+fn count_dir_entries(path: &str, keep: impl Fn(&str) -> bool) -> Result<usize, String> {
+    std::fs::read_dir(path)
+        .map_err(|err| format!("{path}: {err}"))?
+        .try_fold(0usize, |count, entry| {
+            let name = entry.map_err(|err| format!("{path}: {err}"))?.file_name();
+            Ok(count + usize::from(keep(&name.to_string_lossy())))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn pty_pool() -> Vec<(&'static str, Result<String, String>)> {
+    // The node count tracks allocations on a Mac but is not the same
+    // thing, so the label says nodes and the message never claims more.
+    vec![
+        (
+            "/dev/ttys* device nodes",
+            count_dir_entries("/dev", |name| name.starts_with("ttys"))
+                .map(|count| count.to_string()),
+        ),
+        (
+            "kern.tty.ptmx_max",
+            sysctl_int("kern.tty.ptmx_max").map(|max| max.to_string()),
+        ),
+    ]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pty_pool() -> Vec<(&'static str, Result<String, String>)> {
+    vec![
+        (
+            "/proc/sys/kernel/pty/nr",
+            read_trimmed("/proc/sys/kernel/pty/nr"),
+        ),
+        (
+            "/proc/sys/kernel/pty/max",
+            read_trimmed("/proc/sys/kernel/pty/max"),
+        ),
+        (
+            "/dev/pts entries",
+            count_dir_entries("/dev/pts", |_| true).map(|count| count.to_string()),
+        ),
+    ]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_trimmed(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map(|text| text.trim().to_string())
+        .map_err(|err| format!("{path}: {err}"))
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_int(name: &str) -> Result<libc::c_int, String> {
+    let cname = std::ffi::CString::new(name).map_err(|err| err.to_string())?;
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: `sysctlbyname` writes at most `size` bytes into `value`,
+    // and `size` is exactly one `c_int`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            std::ptr::from_mut(&mut value).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(value)
+    } else {
+        Err(format!("{name}: {}", std::io::Error::last_os_error()))
+    }
+}
+
+/// macOS keeps `lsof` in `/usr/sbin`, which is not always on a test
+/// process's `PATH`.
+#[cfg(target_os = "macos")]
+const LSOF: &str = "/usr/sbin/lsof";
+#[cfg(not(target_os = "macos"))]
+const LSOF: &str = "lsof";
+/// Short on purpose: this runs on the failure path, after a 5s teardown,
+/// and the whole point of that teardown is that an exhausted pool reports
+/// in seconds rather than after the `sleep 100` children die. A truncated
+/// holder list beats a census that costs more than the failure it explains.
+const LSOF_BUDGET: Duration = Duration::from_secs(5);
+const HOLDER_CAP: usize = 40;
+/// The devices a pty holder is named by. The parser filters `lsof`'s name
+/// records on these, and the happy-path test reads the same raw output to
+/// decide whether there was anything for the parser to find.
+const PTY_DEVICES: [&str; 3] = ["/dev/ttys", "/dev/ptmx", "/dev/pts"];
+
+#[cfg(target_os = "macos")]
+fn lsof_target_paths() -> Vec<String> {
+    let mut paths = vec!["/dev/ptmx".to_string()];
+    // `+d /dev` matches nothing on macOS, so the pty device nodes have
+    // to be named explicitly.
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        paths.extend(entries.flatten().filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("ttys").then(|| format!("/dev/{name}"))
+        }));
+    }
+    paths
+}
+
+#[cfg(target_os = "macos")]
+fn lsof_command() -> Command {
+    let mut cmd = Command::new(LSOF);
+    cmd.args(["-n", "-w", "-F", "pcfn"])
+        .args(lsof_target_paths());
+    cmd
+}
+
+#[cfg(not(target_os = "macos"))]
+fn lsof_command() -> Command {
+    let mut cmd = Command::new(LSOF);
+    cmd.args(["-n", "-w", "-F", "pcfn", "+d", "/dev/pts", "/dev/ptmx"]);
+    cmd
+}
+
+/// Who else holds a pty descriptor, best effort. `lsof` is the only tool
+/// that enumerates descriptor holders — `ps`'s controlling-tty column
+/// names processes attached to a tty, which is a different set and not
+/// the one that keeps a macOS pty slot alive. It is not installed
+/// everywhere and can be slow on a busy box, so it is bounded and its
+/// absence is just another unavailable line.
+fn pty_holders() -> Result<String, String> {
+    lsof_field_output().map(|bytes| render_holders(&bytes))
+}
+
+/// `lsof -F pcfn` over this platform's pty devices, bounded by
+/// `LSOF_BUDGET`. Kept separate from the parsing so the happy-path test can
+/// read what the tool actually said without going through the parser it is
+/// there to check.
+fn lsof_field_output() -> Result<Vec<u8>, String> {
+    let mut child = lsof_command()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("{LSOF}: {err}"))?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{LSOF}: stdout was not piped"));
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    // `lsof`'s output outgrows a pipe buffer, so it has to be drained
+    // while it runs or it would block forever on a full pipe and only
+    // ever be killed at the budget. `Builder::spawn` rather than
+    // `thread::spawn`, whose panic when the OS refuses a thread would
+    // replace the errno this census exists to report.
+    let drain = std::thread::Builder::new()
+        .name("pty-census-lsof".to_string())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = tx.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
+        });
+    let drain = match drain {
+        Ok(drain) => drain,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{LSOF} drain thread: {err}"));
+        }
+    };
+    let outcome = match rx.recv_timeout(LSOF_BUDGET) {
+        // stdout is at EOF, so the child is done writing and `wait`
+        // returns promptly.
+        Ok(Ok(bytes)) => child
+            .wait()
+            .map(|_| bytes)
+            .map_err(|err| format!("{LSOF}: {err}")),
+        Ok(Err(err)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("{LSOF}: {err}"))
+        }
+        // `Child::kill` signals through the handle, so — unlike a saved
+        // raw pid — it cannot reach a pid the child was already reaped out
+        // of and the OS recycled.
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("{LSOF} did not answer within {LSOF_BUDGET:?}"))
+        }
+    };
+    // The drain ends when stdout EOFs, which the kill above guarantees. A
+    // join error is one more thing the census must not panic on.
+    let _ = drain.join();
+    outcome
+}
+
+/// Field mode (`-F pcfn`) is parsed instead of columns: Linux lsof
+/// inserts a TASKCMD column for threaded processes that shifts FD out of a
+/// fixed position, but tagged records (`p`/`c`/`f`/`n`) are immune to
+/// that. A many-threaded process can still repeat the same descriptor once
+/// per thread, so tally each holder's distinct fds, not lines.
+fn render_holders(bytes: &[u8]) -> String {
+    let mut by_holder: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let stdout = String::from_utf8_lossy(bytes);
+    let mut pid: Option<&str> = None;
+    let mut command: Option<&str> = None;
+    let mut fd: Option<&str> = None;
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let rest = &line[1..];
+        match line.as_bytes()[0] {
+            // A process record starts over: carrying the previous one's
+            // command or descriptor into it would attribute this pid's
+            // ptys to the last process seen.
+            b'p' => {
+                pid = Some(rest);
+                command = None;
+                fd = None;
+            }
+            b'c' => command = Some(rest),
+            b'f' => fd = Some(rest),
+            // One name per descriptor: consume the fd so a second name
+            // line cannot record the same descriptor again.
+            b'n' => {
+                let (Some(pid), Some(command), Some(fd)) = (pid, command, fd.take()) else {
+                    continue;
+                };
+                if PTY_DEVICES.iter().any(|device| rest.contains(device)) {
+                    by_holder
+                        .entry(format!("{command}({pid})"))
+                        .or_default()
+                        .insert(fd.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if by_holder.is_empty() {
+        return "none".to_string();
+    }
+    let total = by_holder.len();
+    // Biggest first: a box that ran out of ptys ran out because of
+    // whoever is at the top, and the cap must not spend its lines on an
+    // alphabetically lucky tail.
+    let mut holders: Vec<(String, usize)> = by_holder
+        .into_iter()
+        .map(|(holder, fds)| (holder, fds.len()))
+        .collect();
+    holders.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut lines: Vec<String> = holders
+        .into_iter()
+        .take(HOLDER_CAP)
+        .map(|(holder, fds)| format!("{holder}: {fds} fds"))
+        .collect();
+    if total > HOLDER_CAP {
+        lines.push(format!("(+{} more)", total - HOLDER_CAP));
+    }
+    lines.join("\n    ")
+}
+
+/// A spawn failure carries the errno *and* the census, so a PTY that
+/// cannot be allocated names the ceiling it hit and who else was holding
+/// one.
+fn try_spawn_tab(
     sup: &PtySupervisor,
     tab_id: i64,
     script: &str,
-) -> broadcast::Receiver<PtyOutputEvent> {
+    tabs_live: Option<usize>,
+) -> Result<broadcast::Receiver<PtyOutputEvent>, String> {
     sup.spawn(
         tab_id,
         "/tmp",
@@ -48,7 +473,22 @@ fn spawn_tab(
         24,
         &socket(),
     )
-    .expect("spawn")
+    .map_err(|err| {
+        // `{err:#}` walks the anyhow chain: the errno is the whole point
+        // of the message, and the outermost context alone drops it.
+        format!(
+            "spawn of tab {tab_id} failed: {err:#}\n{}",
+            pty_census(tabs_live).render()
+        )
+    })
+}
+
+fn spawn_tab(
+    sup: &PtySupervisor,
+    tab_id: i64,
+    script: &str,
+) -> broadcast::Receiver<PtyOutputEvent> {
+    try_spawn_tab(sup, tab_id, script, None).unwrap_or_else(|err| panic!("{err}"))
 }
 
 /// Wait for the child's readiness byte, so the shutdown that follows
@@ -212,12 +652,25 @@ async fn a_generous_deadline_lets_the_per_tab_watchdog_do_the_killing() {
 /// one derived from the map cannot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_tab_is_accounted_for_past_the_lifecycle_channel_capacity() {
+    ensure_fd_budget();
+    let _serialised = PTY_HEAVY.lock().await;
     let sup = PtySupervisor::new();
     let targets: Vec<i64> = (400..470).collect();
-    let _rx: Vec<_> = targets
-        .iter()
-        .map(|id| spawn_tab(&sup, *id, COOPERATIVE))
-        .collect();
+    let mut _rx = Vec::with_capacity(targets.len());
+    for (live, id) in targets.iter().enumerate() {
+        match try_spawn_tab(&sup, *id, COOPERATIVE, Some(live)) {
+            Ok(receiver) => _rx.push(receiver),
+            Err(failure) => {
+                // Tear down before reporting: every tab already spawned
+                // parks a blocking reader task on a master dup, and
+                // dropping the runtime waits on those tasks while the
+                // `exec sleep 100` children live — panicking here
+                // directly would deliver the message ~100s later.
+                sup.shutdown_all(Duration::from_secs(5)).await;
+                panic!("{failure}");
+            }
+        }
+    }
 
     let report = sup.shutdown_all(Duration::from_secs(30)).await;
 
@@ -231,6 +684,7 @@ async fn every_tab_is_accounted_for_past_the_lifecycle_channel_capacity() {
     for id in &targets {
         assert!(!sup.has(*id), "tab {id} outlived shutdown");
     }
+    settle_open_fds().await;
 }
 
 /// The no-more-spawns latch is permanent: once shutdown has walked the
@@ -317,12 +771,14 @@ async fn close_during_shutdown_leaves_the_entry_for_the_waiter() {
 /// path when the drain is allowed to succeed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spawns_racing_the_sweep_never_leak_a_session() {
+    ensure_fd_budget();
+    let _serialised = PTY_HEAVY.lock().await;
     for round in 0..6i64 {
         let sup = std::sync::Arc::new(PtySupervisor::new());
         let base = 600 + round * 100;
         // A few tabs already live, so the sweep has real work to do and
         // shutdown does not finish before the racers get moving.
-        let _rx: Vec<_> = (base..base + 3)
+        let baseline: Vec<_> = (base..base + 3)
             .map(|id| spawn_tab(&sup, id, COOPERATIVE))
             .collect();
 
@@ -355,7 +811,8 @@ async fn spawns_racing_the_sweep_never_leak_a_session() {
             match err {
                 Some(err) => assert!(
                     err.contains("shutting down"),
-                    "racer {id} failed for the wrong reason: {err}"
+                    "racer {id} failed for the wrong reason: {err}\n{}",
+                    pty_census(Some(baseline.len())).render()
                 ),
                 None => {
                     let buckets = [&report.reaped, &report.killed, &report.abandoned]
@@ -376,5 +833,122 @@ async fn spawns_racing_the_sweep_never_leak_a_session() {
                 "round {round}: tab {id} outlived shutdown unreported: {report:?}"
             );
         }
+        settle_open_fds().await;
+    }
+}
+
+/// The census only ever prints when a spawn has already failed, so it is
+/// read on the happy path too — cross-platform collection that runs only
+/// on the failure path rots silently until the one moment it matters.
+#[test]
+fn the_census_reads_this_platform() {
+    let census = pty_census(Some(7));
+
+    let fd_limit = census.fd_limit.expect("RLIMIT_NOFILE");
+    assert!(fd_limit.contains("soft "), "{fd_limit}");
+    let open_fds: usize = census
+        .open_fds
+        .expect("open fds")
+        .parse()
+        .expect("open fds is a count");
+    assert!(open_fds > 0, "this process has descriptors open");
+    assert!(!census.pool.is_empty(), "no pty pool reading on this OS");
+    for (label, value) in &census.pool {
+        assert!(value.is_ok(), "pool field {label}: {value:?}");
+    }
+    // Every way the holders reading can fail renders as "unavailable: …",
+    // so whether `lsof` runs at all here — the one legitimate reason for
+    // that line — has to be established outside the census.
+    match lsof_field_output() {
+        Ok(raw) => {
+            let holders = census.holders.unwrap_or_else(|why| {
+                panic!("{LSOF} runs here, so the census must produce a holder list: {why}")
+            });
+            // One-directional on purpose: the two runs are separate
+            // samples, so "the tool saw none and the census listed some"
+            // is a race, not a defect. The shape check below is what
+            // covers a parser that renders something unusable.
+            let raw = String::from_utf8_lossy(&raw);
+            if PTY_DEVICES.iter().any(|device| raw.contains(device)) {
+                assert_ne!(
+                    holders, "none",
+                    "{LSOF} named pty devices on this box, yet the census \
+                     found no holder:\n{raw:.400}"
+                );
+            }
+            if holders != "none" {
+                for line in holders.lines() {
+                    assert!(
+                        holder_line_is_shaped(line),
+                        "not a holder line: {line:?} in {holders:?}"
+                    );
+                }
+            }
+        }
+        Err(absent) => {
+            // `lsof` ships with macOS but is not installed on every Linux
+            // box; a tool that cannot be run is the one reading allowed to
+            // be missing, and nothing else is.
+            if cfg!(target_os = "macos") {
+                panic!("macOS ships lsof at {LSOF}, so it must run here: {absent}");
+            }
+            let why = census
+                .holders
+                .expect_err("holders were rendered without a runnable lsof");
+            assert!(
+                why.contains("lsof"),
+                "{LSOF} cannot be run here ({absent}), which is the one reason \
+                 holders may be missing — but not with this failure: {why}"
+            );
+        }
+    }
+}
+
+/// `render_holders`' own output shape: `command(pid): N fds`, or the
+/// over-cap tail. Anything else means the parser produced something the
+/// reader of a failed spawn cannot act on.
+fn holder_line_is_shaped(line: &str) -> bool {
+    let line = line.trim();
+    if line.starts_with("(+") && line.ends_with(" more)") {
+        return true;
+    }
+    let Some((holder, fds)) = line.rsplit_once(": ") else {
+        return false;
+    };
+    holder.contains('(')
+        && holder.ends_with(')')
+        && fds
+            .strip_suffix(" fds")
+            .and_then(|count| count.parse::<usize>().ok())
+            .is_some_and(|count| count > 0)
+}
+
+#[test]
+fn the_rendered_census_labels_every_field() {
+    let census = PtyCensus {
+        tabs_live: Some(12),
+        fd_limit: Ok("soft 1024 hard 1048576".to_string()),
+        open_fds: Err("/dev/fd: nope".to_string()),
+        pool: vec![
+            ("/dev/ttys* device nodes", Ok("21".to_string())),
+            ("kern.tty.ptmx_max", Ok("511".to_string())),
+        ],
+        holders: Ok("sh(4242): 2 fds".to_string()),
+    };
+
+    let rendered = census.render();
+
+    for expected in [
+        "tabs live in this test: 12",
+        "RLIMIT_NOFILE: soft 1024 hard 1048576",
+        "open fds (/dev/fd entries): unavailable: /dev/fd: nope",
+        "/dev/ttys* device nodes: 21",
+        "kern.tty.ptmx_max: 511",
+        "candidate holders (lsof): sh(4242): 2 fds",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "census render is missing {expected:?}:\n{rendered}"
+        );
     }
 }
