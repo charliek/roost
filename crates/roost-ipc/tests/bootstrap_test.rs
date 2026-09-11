@@ -57,7 +57,7 @@ use std::time::Duration;
 use roost_ipc::bootstrap::{
     asset_name, checksum_name, shell_quote, sniff_binary, BootstrapError, BootstrapJob,
     BootstrapOptions, IdentityGate, InstallPhase, InstallSource, ProbeOutcome, RemoteArch,
-    ResolvedSource, Sniff, SourceOrigin,
+    ResolvedSource, Sniff, SourceOrigin, PROBE_BUDGET,
 };
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 use roost_ipc::session_launch::Verdict;
@@ -2481,9 +2481,16 @@ async fn dropping_a_job_still_exits_the_master_and_removes_the_directory() {
 #[tokio::test]
 async fn a_remote_step_that_never_answers_is_killed_reaped_and_classified() {
     let harness = Harness::new();
-    // Longer than the probe's own budget, and bounded so the orphan the
-    // kill leaves behind cannot outlive the test run by much.
-    harness.hang_uname(45);
+    // Longer than the probe's own (scaled) budget, and bounded so the
+    // orphan the kill leaves behind cannot outlive the test run by much.
+    // Derived from PROBE_BUDGET rather than a copied literal: a fixed
+    // duration chosen against the unscaled 30s budget stops being safely
+    // longer than it once ROOST_TEST_TIMEOUT_SCALE widens that budget —
+    // this ties the hang to the same knob the product's own deadline
+    // reads.
+    let scale = roost_ipc::session_launch::timeout_scale().max(1.0);
+    let hang_secs = (PROBE_BUDGET.as_secs_f64() * scale + 15.0).ceil() as u32;
+    harness.hang_uname(hang_secs);
     let job = harness.job(harness.options()).await;
 
     let error = job.probe().await.expect_err("nothing answered");

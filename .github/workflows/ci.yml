@@ -260,6 +260,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      # Both matrix legs (ubuntu-latest and macos-latest) are shared runners
+      # whose CPU is slower/variable than the budgets were tuned against.
+      ROOST_TEST_TIMEOUT_SCALE: "3"
     steps:
       - uses: actions/checkout@v6
         with:
