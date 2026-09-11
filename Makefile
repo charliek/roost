@@ -198,7 +198,7 @@ DAEMON_E2E_DESELECT := -m 'not session_daemon and not host_client'
 # resolve means a stray launch of this bundle can't reach anything.
 SPARKLE_TEST_PUBLIC_KEY := tools/roosttest/fixtures/sparkle/TEST-ONLY-public-ed-key.txt
 SPARKLE_TEST_PLACEHOLDER_FEED := http://127.0.0.1:1/placeholder
-test: test-rust test-mac test-harness test-linux-scripts  ## All unit/integration tests (Rust + Swift + harness)
+test: test-rust test-mac test-harness test-linux-scripts test-mac-scripts  ## All unit/integration tests (Rust + Swift + harness)
 
 # roost-vt's tests/*.rs all start with `#![cfg(feature = "ffi")]`, so the
 # `--workspace` run compiles and then silently skips every one of them. The
@@ -220,6 +220,9 @@ test-harness:  ## Fast unit tests for target/path/capability harness wiring
 
 test-linux-scripts:  ## Shell tests for linux/scripts/*.sh release-artifact helpers (no cargo/deb build needed)
 	./linux/scripts/stage-session-artifact_test.sh
+
+test-mac-scripts:  ## Shell tests for mac/scripts/notarize.sh against fake ditto/xcrun shims (no macOS needed)
+	./mac/scripts/notarize_test.sh
 
 # `e2e` dispatches rather than running a bare full-dir suite: the full
 # `tools/roosttest` dir includes `test_exit_on_empty.py` / `test_menu_quit.py`,

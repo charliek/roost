@@ -348,7 +348,8 @@ jobs:
   mac:
     needs: create-release
     runs-on: macos-26   # arm64 — pinned; ships Xcode 26 by default, which
-    timeout-minutes: 90
+    timeout-minutes: 120 # 90 -> 120 in plan 060 (#405): a second notarytool
+                        # --wait (app, then DMG) can double the Apple queue time.
                         # actool needs to compile mac/AppIcon.icon (the Tahoe
                         # glass icon). On older Xcode, bundle.sh still builds but
                         # falls back to the flat (framed) .icns. See
@@ -577,6 +578,22 @@ jobs:
           -m 'not session_daemon and not host_client'
           --roost-target mac --roost-fresh -v
 
+      # After E2E, before the DMG (#405): after so a bad build doesn't spend
+      # an Apple submission on a bundle E2E is about to reject; before Make
+      # DMG so make-dmg.sh's `cp -R` carries an already-stapled bundle (the
+      # ticket lives in Contents/CodeResources) into the image. Without
+      # this, only the DMG ever carried a ticket — a user who dragged
+      # Roost.app out of the image and launched it with no path to Apple
+      # got the "cannot check it for malicious software" dialog on an app
+      # that was properly notarized.
+      - name: Notarize + staple the app (skipped without credentials)
+        if: env.CAN_NOTARIZE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./mac/scripts/notarize.sh --app mac/build/Roost.app
+
       - name: Make DMG
         env:
           ROOST_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.ROOST_DEVELOPER_ID_IDENTITY || '' }}
@@ -589,6 +606,25 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: ./mac/scripts/notarize.sh "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg"
+
+      # Proves the app INSIDE the DMG carries its own ticket, not just the
+      # image (#405) — mounts the just-notarized DMG read-only and validates
+      # the bundle itself, never the /Applications symlink beside it.
+      - name: Verify the app inside the DMG carries a ticket
+        if: env.CAN_NOTARIZE == 'true'
+        run: |
+          set -euo pipefail
+          MNT="$RUNNER_TEMP/roost-dmg"
+          mkdir -p "$MNT"
+          trap '
+            for attempt in 1 2 3 4 5; do
+              hdiutil detach "$MNT" >/dev/null 2>&1 && break
+              [ "$attempt" = 5 ] && { hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; break; }
+              sleep 2
+            done
+          ' EXIT
+          hdiutil attach "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" -readonly -nobrowse -noautoopen -noverify -mountpoint "$MNT"
+          xcrun stapler validate "$MNT/Roost.app"
 
       # What governs Gatekeeper on a downloaded DMG is whether it's *notarized*
       # (a stapled ticket) — not whether a signing cert exists. A Developer-ID-
@@ -710,7 +746,9 @@ jobs:
   mac-iced:
     needs: create-release
     runs-on: macos-26   # Same pin as `mac`: bundle-iced.sh shares that job's
-    timeout-minutes: 90 # icon pipeline (bundle-lib.sh), which wants Xcode 26.
+    timeout-minutes: 120 # icon pipeline (bundle-lib.sh), which wants Xcode 26.
+                        # 90 -> 120 in plan 060 (#405): see `mac`'s comment —
+                        # a second notarytool --wait (app, then DMG).
     permissions:
       contents: write
     env:
@@ -899,6 +937,16 @@ jobs:
           tools/roosttest/test_sparkle.py
           --roost-target iced --roost-fresh -v
 
+      # See the `mac` job's twin step (#405): same reasoning, same position
+      # (after E2E, before the DMG).
+      - name: Notarize + staple the app (skipped without credentials)
+        if: env.CAN_NOTARIZE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./mac/scripts/notarize.sh --app mac/build/Roost-Iced.app
+
       # The overrides are what keep this DMG's contents named Roost-Iced.app:
       # with defaults make-dmg.sh packages the Swift bundle, and an iced DMG
       # containing a "Roost.app" would drag-install OVER the Swift app.
@@ -918,6 +966,25 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: ./mac/scripts/notarize.sh "mac/build/Roost-Iced-${GITHUB_REF_NAME#v}.dmg"
+
+      # See the `mac` job's twin step (#405): same reasoning, same relative
+      # slot (immediately after the DMG's own notarize step). This job has
+      # no detect/note steps, so the verify sits directly before Upload.
+      - name: Verify the app inside the DMG carries a ticket
+        if: env.CAN_NOTARIZE == 'true'
+        run: |
+          set -euo pipefail
+          MNT="$RUNNER_TEMP/roost-dmg"
+          mkdir -p "$MNT"
+          trap '
+            for attempt in 1 2 3 4 5; do
+              hdiutil detach "$MNT" >/dev/null 2>&1 && break
+              [ "$attempt" = 5 ] && { hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; break; }
+              sleep 2
+            done
+          ' EXIT
+          hdiutil attach "mac/build/Roost-Iced-${GITHUB_REF_NAME#v}.dmg" -readonly -nobrowse -noautoopen -noverify -mountpoint "$MNT"
+          xcrun stapler validate "$MNT/Roost-Iced.app"
 
       # A distinct label, because the two DMG rows sit next to each other on
       # the Release page and only the label says which one is the experiment.

@@ -1829,6 +1829,11 @@ pub enum PtyError {
     Closed(i64),
     #[error("tab {0} already has a live pty session")]
     DuplicateTab(i64),
+    /// The spawn lost its tab. Either a `close()` took the reservation
+    /// back between the `pending` insert and the promotion, or the
+    /// workspace row vanished *before* the reservation and the opener's
+    /// re-check ([`crate::application::spawn_for_row`]) caught it after
+    /// the fact. Both mean the same thing to a caller: the tab is gone.
     #[error("spawn for tab {0} cancelled by close()")]
     Cancelled(i64),
     #[error("supervisor is shutting down; refused to spawn tab {0}")]
