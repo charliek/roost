@@ -38,6 +38,7 @@ use roost_ipc::agent::{
     effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, ShellState,
 };
 use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
+use roost_ipc::session_launch::timeout_scale;
 use roost_ipc::socket_state::{self, describe_file_type, SocketState};
 use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
 use roost_ipc::{ClientError, IpcClient};
@@ -50,6 +51,21 @@ const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long `collect_agent_status` waits on its detached thread — see
 /// that function for why the read happens off-thread at all.
 const AGENT_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `send_file_budget`'s shape (`main.rs`): a pure function of the scale,
+/// so it is unit-testable without mutating process-global env.
+fn subprocess_budget(scale: f64) -> Duration {
+    SUBPROCESS_TIMEOUT.mul_f64(scale)
+}
+
+fn ipc_budget(scale: f64) -> Duration {
+    IPC_TIMEOUT.mul_f64(scale)
+}
+
+fn agent_status_budget(scale: f64) -> Duration {
+    AGENT_STATUS_TIMEOUT.mul_f64(scale)
+}
+
 /// A timeout bounds time, not memory. Version banners are one line.
 const OUTPUT_CAP: u64 = 8 * 1024;
 /// `claude-settings.json` is a handful of hook entries; anything past this
@@ -727,16 +743,25 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
     let shell_usable = shell_path.as_deref().is_some_and(executable_regular_file);
     let parent_pid = std::os::unix::process::parent_id();
 
+    // Read once, and thread the result down as plain `Duration`s: the
+    // budget functions are pure and unit-tested on their own, and the
+    // arithmetic here has no test of its own that `capture_version`
+    // actually receives a scaled value — `ROOST_TEST_TIMEOUT_SCALE` is
+    // process-global, and `session.rs`'s tests in this same binary read
+    // it live, so setting it from a doctor test would race them.
+    let scale = timeout_scale();
+    let subprocess_budget = subprocess_budget(scale);
+
     // Two independent I/O phases, concurrently: the three bounded
     // subprocesses (§3.8) and the target → socket → IPC chain, which is
     // ordered internally but depends on none of them. Doctor is reached
     // for precisely when something is hung, so the wall clock must be
     // the slower of the two, not their sum.
     let (shell_version, parent_comm, claude_version, ui) = tokio::join!(
-        shell_version(shell_path.as_deref(), shell_usable),
-        parent_comm(parent_pid),
-        capture_version("claude"),
-        probe_ui(selector),
+        shell_version(shell_path.as_deref(), shell_usable, subprocess_budget),
+        parent_comm(parent_pid, subprocess_budget),
+        capture_version("claude", subprocess_budget),
+        probe_ui(selector, ipc_budget(scale)),
     );
 
     let claude_settings_path = crate::claude_settings_path().ok();
@@ -744,7 +769,7 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
         read_claude_settings(claude_settings_path.as_deref());
 
     let (agent_status, agent_status_error, agent_codex_trust, agent_codex_trust_error) =
-        collect_agent_status().await;
+        collect_agent_status(agent_status_budget(scale)).await;
     let legacy_claude_settings_present = crate::legacy_claude_settings_path()
         .map(|p| p.is_file())
         .unwrap_or(false);
@@ -829,16 +854,16 @@ type AgentStatusResult = (
 /// but a `#[tokio::test]`'s runtime does not — a thread nothing ever
 /// joins cannot hang either one. The timeout gives up on the channel,
 /// never on the thread.
-async fn collect_agent_status() -> AgentStatusResult {
+async fn collect_agent_status(budget: Duration) -> AgentStatusResult {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let _ = tx.send(collect_agent_status_blocking());
     });
-    match tokio::time::timeout(AGENT_STATUS_TIMEOUT, rx).await {
+    match tokio::time::timeout(budget, rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) | Err(_) => {
             let msg = format!(
-                "agent status probe did not answer within {AGENT_STATUS_TIMEOUT:?} — a config \
+                "agent status probe did not answer within {budget:?} — a config \
                  file may be a FIFO or otherwise non-regular"
             );
             (Vec::new(), Some(msg.clone()), Vec::new(), Some(msg))
@@ -955,7 +980,7 @@ struct UiProbe {
     tab_list: Result<serde_json::Value, String>,
 }
 
-async fn probe_ui(selector: &TargetSelector) -> UiProbe {
+async fn probe_ui(selector: &TargetSelector, budget: Duration) -> UiProbe {
     let diagnosis = selector.diagnose().await;
     let target = match diagnosis.resolved {
         Ok(t) => Ok(t.socket_path),
@@ -976,7 +1001,7 @@ async fn probe_ui(selector: &TargetSelector) -> UiProbe {
         Ok(path) => vec![SocketProbe {
             path: path.clone(),
             profile: None,
-            outcome: classify_socket(path).await,
+            outcome: classify_socket(path, budget).await,
         }],
         Err(TargetFailure::NoLiveTarget(_)) | Err(TargetFailure::Ambiguous(_)) => {
             let mut probes = Vec::with_capacity(diagnosis.candidates.len());
@@ -984,7 +1009,7 @@ async fn probe_ui(selector: &TargetSelector) -> UiProbe {
                 probes.push(SocketProbe {
                     path: path.clone(),
                     profile: Some(kind.as_str()),
-                    outcome: classify_socket(path).await,
+                    outcome: classify_socket(path, budget).await,
                 });
             }
             probes
@@ -993,7 +1018,7 @@ async fn probe_ui(selector: &TargetSelector) -> UiProbe {
     };
 
     let (identify, tab_list) = match &target {
-        Ok(path) => dial(path).await,
+        Ok(path) => dial(path, budget).await,
         Err(_) => (
             Err(IdentifyFailure::NoConnection(NO_SOCKET.into())),
             Err(NO_SOCKET.to_string()),
@@ -1081,10 +1106,10 @@ fn read_regular_file_capped(path: &Path, cap: u64) -> FileRead {
     }
 }
 
-async fn shell_version(shell: Option<&str>, usable: bool) -> SubprocessOutcome {
+async fn shell_version(shell: Option<&str>, usable: bool, budget: Duration) -> SubprocessOutcome {
     match (shell, usable) {
         (None, _) | (Some(_), false) => SubprocessOutcome::Skipped,
-        (Some(path), true) => capture(Command::new(path), ["--version"]).await,
+        (Some(path), true) => capture_within(Command::new(path), ["--version"], budget).await,
     }
 }
 
@@ -1093,16 +1118,17 @@ async fn shell_version(shell: Option<&str>, usable: bool) -> SubprocessOutcome {
 /// `PATH` choose the binary. (`claude` stays PATH-resolved — reporting
 /// what the user would actually run is the point — and `$SHELL` is
 /// guarded by [`executable_regular_file`].)
-async fn parent_comm(ppid: u32) -> SubprocessOutcome {
-    capture(
+async fn parent_comm(ppid: u32, budget: Duration) -> SubprocessOutcome {
+    capture_within(
         Command::new("/bin/ps"),
         ["-o", "comm=", "-p", &ppid.to_string()],
+        budget,
     )
     .await
 }
 
-async fn capture_version(program: &str) -> SubprocessOutcome {
-    capture(Command::new(program), ["--version"]).await
+async fn capture_version(program: &str, budget: Duration) -> SubprocessOutcome {
+    capture_within(Command::new(program), ["--version"], budget).await
 }
 
 /// Run a read-only command under every bound plan §3.8 pins: stdin from
@@ -1114,7 +1140,7 @@ async fn capture_version(program: &str) -> SubprocessOutcome {
 /// that leaves a process behind is not read-only in any sense the user
 /// cares about. Forked *grand*children still escape; killing the process
 /// group is out of scope (plan §9).
-async fn capture<I, S>(mut cmd: Command, args: I) -> SubprocessOutcome
+async fn capture_within<I, S>(mut cmd: Command, args: I, budget: Duration) -> SubprocessOutcome
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -1138,7 +1164,7 @@ where
         Err(e) => return SubprocessOutcome::Failed(e.to_string()),
     };
 
-    match tokio::time::timeout(SUBPROCESS_TIMEOUT, drain_capped(&mut child)).await {
+    match tokio::time::timeout(budget, drain_capped(&mut child)).await {
         Ok(Ok(text)) => SubprocessOutcome::Output(text),
         Ok(Err(e)) => SubprocessOutcome::Failed(e.to_string()),
         Err(_) => {
@@ -1181,8 +1207,8 @@ async fn drain_capped(child: &mut tokio::process::Child) -> std::io::Result<Stri
 /// including the rule that only `ECONNREFUSED` and an absent path mean
 /// stale — lives in `roost_ipc::socket_state`, shared with the UI's
 /// bind path so the two can't drift.
-async fn classify_socket(path: &Path) -> SocketOutcome {
-    match socket_state::probe(path, IPC_TIMEOUT).await {
+async fn classify_socket(path: &Path, budget: Duration) -> SocketOutcome {
+    match socket_state::probe(path, budget).await {
         SocketState::Missing => SocketOutcome::Missing,
         SocketState::NotASocket(kind) => SocketOutcome::NotASocket(kind.to_string()),
         SocketState::Live => SocketOutcome::Connected,
@@ -1198,8 +1224,8 @@ type Dialed = (
 
 /// The only two ops doctor sends, both read-only, each under its own
 /// deadline.
-async fn dial(path: &Path) -> Dialed {
-    let mut client = match tokio::time::timeout(IPC_TIMEOUT, IpcClient::connect(path)).await {
+async fn dial(path: &Path, budget: Duration) -> Dialed {
+    let mut client = match tokio::time::timeout(budget, IpcClient::connect(path)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             let msg = e.to_string();
@@ -1217,7 +1243,7 @@ async fn dial(path: &Path) -> Dialed {
     };
 
     let identify = match tokio::time::timeout(
-        IPC_TIMEOUT,
+        budget,
         client.identify(IdentifyParams {
             client_name: crate::CLIENT_NAME.into(),
             client_version: env!("CARGO_PKG_VERSION").into(),
@@ -1237,7 +1263,7 @@ async fn dial(path: &Path) -> Dialed {
     // section for a failure that never happened. Dial again rather than
     // inherit a desynchronized stream.
     if matches!(identify, Err(IdentifyFailure::Timeout)) {
-        client = match tokio::time::timeout(IPC_TIMEOUT, IpcClient::connect(path)).await {
+        client = match tokio::time::timeout(budget, IpcClient::connect(path)).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => return (identify, Err(format!("no connection: {e}"))),
             Err(_) => return (identify, Err("connect timed out".to_string())),
@@ -1245,7 +1271,7 @@ async fn dial(path: &Path) -> Dialed {
     }
 
     let tab_list = match tokio::time::timeout(
-        IPC_TIMEOUT,
+        budget,
         client.call::<_, serde_json::Value>(ops::TAB_LIST, serde_json::json!({})),
     )
     .await
@@ -7485,6 +7511,33 @@ mod tests {
         assert_eq!(shipped_script_path(None, ShellFamily::Bash), None);
     }
 
+    // -- scaled budgets ------------------------------------------------
+
+    #[test]
+    fn the_three_doctor_budgets_scale_like_every_other_roost_cli_budget() {
+        assert_eq!(subprocess_budget(1.0), Duration::from_secs(2));
+        assert_eq!(subprocess_budget(3.0), Duration::from_secs(6));
+        assert_eq!(ipc_budget(1.0), Duration::from_secs(2));
+        assert_eq!(ipc_budget(3.0), Duration::from_secs(6));
+        assert_eq!(agent_status_budget(1.0), Duration::from_secs(2));
+        assert_eq!(agent_status_budget(3.0), Duration::from_secs(6));
+    }
+
+    /// The negative control for the wiring, not the arithmetic: proves a
+    /// budget passed into `capture_within` actually reaches `timeout`,
+    /// without env and without writing a script.
+    #[tokio::test]
+    async fn capture_within_is_bounded_by_the_budget_it_is_given() {
+        assert_eq!(
+            capture_within(Command::new("/bin/sleep"), ["1"], Duration::from_millis(50)).await,
+            SubprocessOutcome::TimedOut
+        );
+        assert_eq!(
+            capture_within(Command::new("/bin/echo"), ["hi"], Duration::from_secs(2)).await,
+            SubprocessOutcome::Output("hi\n".to_string())
+        );
+    }
+
     // -- collect, for real -------------------------------------------------
     //
     // The rest of the suite drives `evaluate` over synthetic `Inputs`,
@@ -7599,10 +7652,18 @@ mod tests {
             socket_override: Some(sock),
             kind_override: None,
         };
+        // `dial` makes two IPC round trips against a silent server —
+        // `identify`, then a reconnect + `tab_list` once `identify` is
+        // seen as cancelled — each waiting out the full budget.
+        let scale = timeout_scale();
+        let ipc_round_trips: u32 = 2;
         let started = std::time::Instant::now();
-        let inputs = tokio::time::timeout(Duration::from_secs(30), collect(&selector, None))
-            .await
-            .expect("doctor must not hang on a silent UI");
+        let inputs = tokio::time::timeout(
+            ipc_budget(scale) * ipc_round_trips + Duration::from_secs(26),
+            collect(&selector, None),
+        )
+        .await
+        .expect("doctor must not hang on a silent UI");
         let elapsed = started.elapsed();
         server.abort();
 
@@ -7612,7 +7673,10 @@ mod tests {
             inputs.identify
         );
         assert!(inputs.tab_list.is_err());
-        assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+        assert!(
+            elapsed < ipc_budget(scale) * ipc_round_trips + Duration::from_secs(16),
+            "{elapsed:?}"
+        );
 
         let report = evaluate(&inputs);
         assert_status(&report, "ui.socket", Status::Ok);
@@ -7640,6 +7704,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let _env = ENV.lock().await;
+        let scale = timeout_scale();
         let dir = TmpDir::new("slow-ui");
         let sock = dir.join("roost.sock");
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
@@ -7653,9 +7718,10 @@ mod tests {
                             .ok()
                             .and_then(|v| v.get("id").and_then(serde_json::Value::as_i64))
                             .unwrap_or(0);
-                        // Well past IPC_TIMEOUT, so every request is
-                        // cancelled with its answer still coming.
-                        tokio::time::sleep(IPC_TIMEOUT + Duration::from_secs(1)).await;
+                        // Well past the client's actual ipc_budget, so
+                        // every request is cancelled with its answer
+                        // still coming.
+                        tokio::time::sleep(ipc_budget(scale) + Duration::from_secs(1)).await;
                         let frame = format!("{{\"id\":{id},\"ok\":true,\"result\":{{}}}}\n");
                         if w.write_all(frame.as_bytes()).await.is_err() {
                             return;
@@ -7669,9 +7735,15 @@ mod tests {
             socket_override: Some(sock),
             kind_override: None,
         };
-        let inputs = tokio::time::timeout(Duration::from_secs(30), collect(&selector, None))
-            .await
-            .expect("doctor must not hang on a slow UI");
+        // Two IPC round trips, same shape as the silent-UI test above:
+        // `identify` times out, `dial` reconnects, `tab_list` times out.
+        let ipc_round_trips: u32 = 2;
+        let inputs = tokio::time::timeout(
+            ipc_budget(scale) * ipc_round_trips + Duration::from_secs(26),
+            collect(&selector, None),
+        )
+        .await
+        .expect("doctor must not hang on a slow UI");
         server.abort();
 
         assert!(
@@ -7738,7 +7810,13 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(inputs.shell_version, SubprocessOutcome::TimedOut);
-        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        // One subprocess round trip dominates: `shell_version` hangs to
+        // the budget while `parent_comm` and `capture_version` finish
+        // fast alongside it (`collect`'s `tokio::join!`).
+        assert!(
+            elapsed < subprocess_budget(timeout_scale()) + Duration::from_secs(8),
+            "{elapsed:?}"
+        );
 
         let pid = std::fs::read_to_string(&pidfile).expect("script must have run");
         let alive = std::process::Command::new("/bin/ps")
