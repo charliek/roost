@@ -2752,16 +2752,15 @@ pub struct SessionSetThemeResult {
     pub tabs: u32,
 }
 
-/// [`ops::SESSION_SET_FOCUS`] params: what the attached client is
+/// [`ops::SESSION_SET_FOCUS`] params: what the connected client is
 /// actually looking at.
 ///
-/// A session's own workspace has no window, so its `window_focused`
-/// defaults to true and its active tab is whatever its restored layout
-/// selected — which makes the notification-suppression predicate
-/// (`window focused AND this is the active tab`) permanently true for
-/// one tab per session, muting exactly the tab an agent is most likely
-/// to be working in. This op is how the client that *does* have a window
-/// states the truth.
+/// A session's own workspace has no window, so nothing it can see tells
+/// it which tab a user has on screen and every agent would raise into a
+/// surface nobody is reading. This op is how a client that *does* have a
+/// window states it. Per connection and unioned: a tab is muted while
+/// any client says it is looking at it, and the statement moves nothing
+/// else — not the session's selection, which only `tab.focus` moves.
 ///
 /// Lease-gated, like every other interactive session op: focus is a
 /// property of the client driving the session, so a client that does not

@@ -2754,12 +2754,12 @@ impl HostConnSet {
     /// focused window, if any, so at most one host hears a tab and every
     /// other hears null.
     ///
-    /// Null is not silence: a session defaults to believing itself
-    /// focused on its own restored tab, so a host that is never told
-    /// keeps muting that tab's notifications. The dedup below is
-    /// therefore only about the *repeat* — the first statement to each
-    /// incarnation always goes out (`focus_sent` starts empty and is
-    /// cleared with the incarnation).
+    /// Null is not silence: it *withdraws* this connection's claim, so
+    /// the host that just lost the selection has to hear it or it keeps
+    /// muting that tab. The dedup below is therefore only about the
+    /// *repeat* — the first statement to each incarnation always goes
+    /// out (`focus_sent` starts empty and is cleared with the
+    /// incarnation).
     ///
     /// Fire-and-forget and quiet: a session one release older answers
     /// `unknown-op`, which the connection tolerates, and the task logs
@@ -2795,27 +2795,6 @@ impl HostConnSet {
             if sent.is_ok() {
                 conn.focus_sent = Some(focused);
             }
-        }
-    }
-
-    /// Whether the session's active row moved away from what this client
-    /// claimed. A lease-less third party (`tab.focus`, `tab.open`) can
-    /// park the selection on a tab nobody watches — with the claim's
-    /// `window_focused` still standing, that tab would be muted at the
-    /// source until this client's next natural edge. A disagreement
-    /// clears the dedup so the caller's re-push actually goes out; the
-    /// echo of this client's own `set_focus` matches the claim and
-    /// changes nothing.
-    pub(crate) fn focus_claim_disagrees(&mut self, incarnation: HostId, tab_id: i64) -> bool {
-        let Some(conn) = self.conn_at_mut(incarnation) else {
-            return false;
-        };
-        match conn.focus_sent {
-            Some(claim) if claim != Some(tab_id) => {
-                conn.focus_sent = None;
-                true
-            }
-            _ => false,
         }
     }
 
@@ -5564,42 +5543,6 @@ mod tests {
         );
         set.disconnect("h1");
         assert!(!set.establishing("h1"));
-    }
-
-    /// A third party moving the session's active row must clear the
-    /// focus dedup — and only a genuine disagreement does; the echo of
-    /// this client's own claim changes nothing.
-    #[tokio::test]
-    async fn an_active_move_away_from_the_claim_clears_the_dedup() {
-        let (mut set, _feed) = a_set();
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from("/nonexistent/roost-set-focus.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h1");
-        set.apply_state(incarnation, HostConnState::Connected);
-        set.conn_mut("h1").focus_sent = Some(Some(5));
-
-        assert!(
-            !set.focus_claim_disagrees(incarnation, 5),
-            "the claim's own echo is not a disagreement"
-        );
-        assert_eq!(set.conn("h1").focus_sent, Some(Some(5)));
-
-        assert!(set.focus_claim_disagrees(incarnation, 9));
-        assert_eq!(
-            set.conn("h1").focus_sent,
-            None,
-            "a disagreement clears the dedup so the re-push goes out"
-        );
-        assert!(
-            !set.focus_claim_disagrees(incarnation, 9),
-            "nothing claimed, nothing to disagree with"
-        );
     }
 
     /// The takeover edge, field by field (plan 057 §3.5).

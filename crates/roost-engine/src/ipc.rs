@@ -1210,7 +1210,7 @@ struct ClientRegistry {
     /// A takeover closes nothing, so the connections a displaced lease
     /// was held on outlive it — and a stop must still be able to hand
     /// each of them the labeled `shutting-down` close. [`Lease::conns`]
-    /// is membership for the focus bookkeeping and nothing else.
+    /// is membership and nothing else.
     ///
     /// Every connection that sends a single op on this socket is in
     /// here, not only the ones that present a lease: since R15 a client
@@ -1222,16 +1222,6 @@ struct ClientRegistry {
     /// supersede, no bound: a tab serves as many attaches as clients
     /// dial.
     data_conns: std::collections::HashMap<i64, Vec<(u64, ConnCloser)>>,
-    /// Which connection's `session.set_focus` the workspace is currently
-    /// holding, if any.
-    ///
-    /// A focus is a statement about a window, and it is only true while
-    /// the connection that made it is still there. Tracking the *author*
-    /// rather than only counting live connections is what makes the
-    /// reset independent of the order two closes and a new registration
-    /// happen to be noticed in — a client that re-dials on the same
-    /// lease must not accidentally keep the departed one's focus alive.
-    focus_conn: Option<u64>,
     /// Every live event stream. `None` once a stop has swept them: a
     /// subscribe that raced the sweep is refused rather than registered
     /// into a list nobody will read again.
@@ -1251,7 +1241,6 @@ impl Default for ClientRegistry {
             tokens: Vec::new(),
             controls: std::collections::HashMap::new(),
             data_conns: std::collections::HashMap::new(),
-            focus_conn: None,
             observers: Some(Vec::new()),
         }
     }
@@ -1316,8 +1305,7 @@ struct Lease {
     token: String,
     /// Which connections have presented this lease — membership only.
     /// The closers live in [`ClientRegistry::controls`], which outlives
-    /// the lease; this list exists so `forget_connection` can tell that
-    /// the holder has no connections left and retire its focus.
+    /// the lease.
     conns: Vec<u64>,
     /// What the claimant said it was, normalized. Never authenticated —
     /// it exists so a deposed client's banner can name whoever took the
@@ -1375,9 +1363,6 @@ impl ClientRegistry {
             self.tombstone = Some(previous.token.clone());
             displaced = Some((previous.token, previous.label));
         }
-        // The displaced client's focus dies with its authority; the
-        // caller drops the workspace flag to match.
-        self.focus_conn = None;
         let token = random_hex_128();
         let taken_by = label.clone().unwrap_or_else(|| UNKNOWN_CLIENT.to_string());
         self.register_control(ctx);
@@ -1557,10 +1542,10 @@ impl ClientRegistry {
     /// authority it just presented — or never presented at all.
     ///
     /// [`ClientRegistry::controls`] is the authority for closing and
-    /// [`Lease::conns`] is membership for the focus, which is why the
-    /// registration is here and not on the lease: a connection admitted
-    /// under a lease that is later taken over keeps being closable, and
-    /// a stop still owes it a labeled goodbye.
+    /// [`Lease::conns`] is membership, which is why the registration is
+    /// here and not on the lease: a connection admitted under a lease
+    /// that is later taken over keeps being closable, and a stop still
+    /// owes it a labeled goodbye.
     ///
     /// Closed peers are pruned on the way in, the way this list is
     /// walked: only on a registration, a close, and a stop.
@@ -1569,25 +1554,12 @@ impl ClientRegistry {
         self.controls.insert(ctx.conn_id, ctx.closer.clone());
     }
 
-    /// Record who the workspace's current focus belongs to. `false`
-    /// clears it: a null focus is nobody's claim to lose.
-    fn claim_focus(&mut self, conn_id: u64, focused: bool) {
-        self.focus_conn = focused.then_some(conn_id);
-    }
-
-    /// Forget one connection, reporting whether the focus the workspace
-    /// holds went with it.
-    ///
-    /// Either edge counts: the connection that *stated* the focus is
-    /// gone, or the holder has no connections left at all. The first is
-    /// what makes this independent of ordering; the second covers a
-    /// client that stated a focus and then went away on some other
-    /// connection.
+    /// Forget one connection.
     ///
     /// Closed peers are pruned on the way through, like [`Self::present`]
     /// does: a client that dropped two connections at once must not
     /// leave the second one standing in for a holder that is gone.
-    fn forget_connection(&mut self, conn_id: u64, reclaim_tokens: bool) -> bool {
+    fn forget_connection(&mut self, conn_id: u64, reclaim_tokens: bool) {
         // Ahead of the lease's own bookkeeping and outside it: a stream,
         // a control connection or an attach ticket can exist on a
         // session that never minted a lease at all, so none of these may
@@ -1604,18 +1576,11 @@ impl ClientRegistry {
             self.tokens.retain(|token| token.minted_by != conn_id);
         }
         let controls = &self.controls;
-        let Some(current) = self.current.as_mut() else {
-            return false;
-        };
-        let held = !current.conns.is_empty();
-        current
-            .conns
-            .retain(|id| *id != conn_id && controls.contains_key(id));
-        let lost = self.focus_conn == Some(conn_id) || (held && current.conns.is_empty());
-        if lost {
-            self.focus_conn = None;
+        if let Some(current) = self.current.as_mut() {
+            current
+                .conns
+                .retain(|id| *id != conn_id && controls.contains_key(id));
         }
-        lost
     }
 
     /// Close every registered connection, and stop tracking them. The
@@ -1888,22 +1853,15 @@ impl SessionState {
             .is_some_and(|current| current.token == lease)
     }
 
-    /// One connection under the lease has ended. `true` when the focus
-    /// the workspace is holding went away with it.
-    fn forget_connection(&self, conn_id: u64) -> bool {
+    /// One connection has ended.
+    fn forget_connection(&self, conn_id: u64) {
         // The quota is not reclaimed during a stop, which is also when
         // every control connection is closed at once: `close_all` keeps
         // the tokens deliberately so a client holding a good pre-stop
         // ticket hears `shutting-down` instead of being sent hunting for
         // a bad credential, and reclaiming here would undo exactly that.
         let stopping = self.stopping.load(Ordering::Acquire);
-        lock(&self.clients).forget_connection(conn_id, !stopping)
-    }
-
-    /// Remember which connection the workspace's focus came from, so its
-    /// close can retire it.
-    fn claim_focus(&self, ctx: &ConnCtx, focused: bool) {
-        lock(&self.clients).claim_focus(ctx.conn_id, focused);
+        lock(&self.clients).forget_connection(conn_id, !stopping);
     }
 
     /// Tell every connection the lease holder owns why it is going away.
@@ -2216,13 +2174,9 @@ impl Handler for IpcHandler {
 
     /// The other half of `session.set_focus`'s lifetime rule: a focus a
     /// client reported is only true while that client is still there.
-    ///
-    /// The lease deliberately outlives its connections (a reconnect is a
-    /// takeover), so this cannot release the lease — but when the last
-    /// connection under it goes, nobody is looking at this session any
-    /// more, and leaving the flag set would mute one tab until some
-    /// future client happens to move the selection. A UI socket has no
-    /// lease registry and does nothing here.
+    /// Only this connection's statement is retired — everyone else is
+    /// still looking at whatever they said they were. A UI socket has no
+    /// session registry and does nothing here.
     ///
     /// Streams are pruned here too, and independently of the lease: an
     /// observer can exist on a session where no lease was ever minted —
@@ -2232,9 +2186,8 @@ impl Handler for IpcHandler {
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        if session.forget_connection(conn_id) {
-            self.workspace.release_client_focus();
-        }
+        session.forget_connection(conn_id);
+        self.workspace.forget_client_focus(conn_id);
     }
 
     /// A data connection is a session's business only. Without a
@@ -2758,13 +2711,6 @@ async fn dispatch_outcome(
     if op == ops::SESSION_CONNECT {
         let p: SessionConnectParams = decode(params)?;
         let lease = session.connect(p.takeover, normalize_client_label(p.client_label), ctx)?;
-        // A new lease means a new client, and the focus the previous one
-        // reported was a statement about *its* window. Carried over, it
-        // would mute one tab for a client that never said anything — the
-        // headless-default bug `session.set_focus` exists to fix,
-        // rebuilt out of stale state. The fresh holder states its own
-        // focus right after connecting.
-        h.workspace.release_client_focus();
         // `snapshot_with_revision` rather than `revision`: one lock
         // acquisition means the number a client fences its first
         // `tab.list` against is a state-consistent read, not one that
@@ -3061,21 +3007,17 @@ async fn session_set_theme(
     Err(no_server_vt())
 }
 
-/// `session.set_focus`: take the attached client's real focus (plan 038
+/// `session.set_focus`: take one connected client's real focus (plan 038
 /// §C6).
 ///
-/// A session's workspace has no window of its own, so it defaults to
-/// focused and its active tab is whatever its restored layout selected —
-/// leaving `attention_suppressed_by_focus` permanently true for one tab
-/// per session and muting that tab's agent entirely. The client that
-/// *does* have a window is the only thing that can say otherwise, and
-/// this is where it says it.
+/// A session's workspace has no window of its own, so the only thing
+/// that can say a tab is being looked at is a client that does — and
+/// several may be, each at a different tab, which is why the statement
+/// is keyed by connection ([`Workspace::set_client_focus`]).
 ///
 /// Unlike its two neighbours there is no `server-vt` twin: nothing here
 /// touches a server terminal, and a featureless build's notification
-/// routing is the same routing. The whole apply is one workspace
-/// transaction — see [`Workspace::set_client_focus`] for why the
-/// validation has to happen inside it.
+/// routing is the same routing.
 fn session_set_focus(
     h: &IpcHandler,
     session: &Arc<SessionState>,
@@ -3084,12 +3026,8 @@ fn session_set_focus(
 ) -> Result<serde_json::Value, HandlerError> {
     session.require_lease(&p.lease, ctx)?;
     h.workspace
-        .set_client_focus(p.focused_tab_id)
+        .set_client_focus(ctx.conn_id, p.focused_tab_id)
         .map_err(ws_err)?;
-    // Only once it applied: a refused focus is not a claim, and
-    // recording one would let a close retire a focus this connection
-    // never established.
-    session.claim_focus(ctx, p.focused_tab_id.is_some());
     Ok(serde_json::json!({}))
 }
 
@@ -4780,7 +4718,7 @@ mod tests {
         assert!(state.register_stream("", &ctx, tx.downgrade(), parked.abort_handle()));
         assert!(lock(&state.clients).current.is_none());
 
-        assert!(!state.forget_connection(7), "no focus was ever claimed");
+        state.forget_connection(7);
         assert_eq!(live_streams(&state), 0);
         parked.abort();
     }

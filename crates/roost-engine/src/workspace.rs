@@ -22,7 +22,7 @@
 //!   bootstrap drains via `take_restore_layout`; it is kept out of the
 //!   live `tabs` map (those are the re-opened fresh shells).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -144,6 +144,11 @@ struct Inner {
     /// UI via [`Workspace::set_window_focused`]. Never persisted — focus
     /// is a property of the running session, not of the layout.
     window_focused: bool,
+    /// The tab each connected client says it is looking at, by
+    /// connection id — the other half of the suppression predicate, and
+    /// the half a session has (its own window flag is nobody's).
+    /// Never persisted, like [`Inner::window_focused`].
+    focused: HashMap<u64, i64>,
     /// Monotonic commit counter, bumped each time a persistable
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
@@ -173,12 +178,11 @@ impl Default for Inner {
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             hosts: Vec::new(),
-            // Focused until a UI says otherwise: a headless or IPC-only
-            // workspace never reports focus, and the alternative default
-            // would leave the active tab permanently "unseen" — silently
-            // routing every notification the opposite way from what a
-            // real window would.
+            // The safe default for a workspace nobody reports focus to:
+            // unfocused would route every notification the opposite way
+            // from a real window. [`Workspace::open`] overrides it.
             window_focused: true,
+            focused: HashMap::new(),
             persist_seq: 0,
             revision: 0,
             replay: VecDeque::new(),
@@ -670,6 +674,14 @@ impl Workspace {
 
     /// Construct a workspace backed by `state_path`. Loads the file
     /// if present; corrupt or absent → empty workspace (warn-log).
+    ///
+    /// Starts **unfocused**, unlike [`Workspace::new`]: a `roost-session`
+    /// has no window of its own, so a default-focused one would leave
+    /// `attention_suppressed_by_focus` permanently true for whichever tab
+    /// its restored layout selected and mute that tab's agent with nobody
+    /// watching. A workspace that does have a window says so through
+    /// [`Workspace::set_window_focused`], which the local UI calls at
+    /// construction and on every focus edge.
     pub fn open(state_path: PathBuf) -> Self {
         let mut snapshot = match read_state(&state_path) {
             Ok(Some(s)) => s,
@@ -694,6 +706,7 @@ impl Workspace {
             sidebar_width: normalize_sidebar_width(snapshot.sidebar_width)
                 .unwrap_or(SIDEBAR_DEFAULT_WIDTH),
             hosts: std::mem::take(&mut snapshot.hosts),
+            window_focused: false,
             ..Inner::default()
         };
 
@@ -1270,6 +1283,7 @@ impl Workspace {
             .remove(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         let project_id = row.project_id;
+        inner.focused.retain(|_, viewed| *viewed != tab_id);
 
         // Last tab in the project? Cascade-close the project. Inlined
         // rather than calling `delete_project` so the event order is
@@ -1736,67 +1750,46 @@ impl Workspace {
         Ok(prev)
     }
 
-    /// An attached client stating what it is looking at (host sessions,
-    /// HS-3's `session.set_focus`).
+    /// One connection stating what it is looking at (host sessions,
+    /// HS-3's `session.set_focus`). `Some(tab)` records that statement,
+    /// `None` withdraws it.
     ///
-    /// `Some(tab)` means "my window is focused and this session's tab is
-    /// the one on screen": the session takes both halves of the
-    /// suppression predicate from the client — the window flag *and* the
-    /// selection, which moves through the same `select_tab` the
-    /// ordinary focus path uses so the session's own active tab and its
-    /// persisted selection agree with what the user is actually looking
-    /// at. It deliberately stops short of the rest of [`Self::focus_tab`]:
-    /// saying what you are looking at does not acknowledge the tab's
-    /// notification — the attached client sends `tab.clear_notification`
-    /// for that. `None` means nothing here is
-    /// being looked at (the window lost focus, or the selection moved
-    /// elsewhere) and moves only the flag: the selection is where the
-    /// client left it, and forgetting it would re-open the tab that the
-    /// next reconnect restores to.
+    /// It records the statement and **nothing else** — no selection, no
+    /// event, no write. Connections are symmetric, so a `set_focus` that
+    /// moved the persisted selection would fan an `ActiveChanged` to
+    /// every other subscriber, each of which would then find the session
+    /// disagreeing with its own claim and re-state it: two clients on
+    /// two tabs ping-pong forever, a workspace write per round. The
+    /// selection moves only through `tab.focus`. It also stops short of
+    /// the rest of [`Self::focus_tab`] for the older reason: saying what
+    /// you are looking at does not acknowledge the tab's notification —
+    /// the attached client sends `tab.clear_notification` for that.
     ///
     /// Atomic in the sense the caller needs: an unknown tab is refused
     /// with **nothing** applied, so a client that names a tab which just
-    /// closed does not silently flip the session to "focused" against
-    /// whatever tab happened to be active.
-    pub fn set_client_focus(&self, focused_tab_id: Option<i64>) -> Result<(), WorkspaceError> {
+    /// closed does not silently mute some other one.
+    pub fn set_client_focus(
+        &self,
+        conn_id: u64,
+        focused_tab_id: Option<i64>,
+    ) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let Some(tab_id) = focused_tab_id else {
-            inner.window_focused = false;
+            inner.focused.remove(&conn_id);
             return Ok(());
         };
-        // Before the flag moves: a refusal must leave the session
-        // exactly as it was.
-        let (prev, now) = inner.select_tab(tab_id)?;
-        inner.window_focused = true;
-        if prev == now {
-            // The selection did not move, so there is nothing to
-            // announce and nothing to write — and announcing anyway
-            // would make every window-focus change a workspace commit
-            // that every attached client re-renders on. The flag itself
-            // is never persisted and no event carries it.
-            return Ok(());
+        if !inner.tabs.contains_key(&tab_id) {
+            return Err(WorkspaceError::TabNotFound(tab_id));
         }
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::ActiveChanged {
-                project_id: now.0,
-                tab_id: now.1,
-            }],
-            Persist::Write,
-        );
+        inner.focused.insert(conn_id, tab_id);
         Ok(())
     }
 
-    /// The attached client is gone: nobody is looking at this session.
-    ///
-    /// Called when the interactive lease turns over and when the last
-    /// connection holding it closes. Only the flag moves — the selection
-    /// stays where the departed client left it, so a reconnect restores
-    /// the same tab. Without this, one `session.set_focus` would outlive
-    /// the client that sent it and mute a tab for whoever comes next,
-    /// which is the exact bug the op exists to fix.
-    pub fn release_client_focus(&self) {
-        self.inner.lock().unwrap().window_focused = false;
+    /// One connection is gone: drop its statement, like
+    /// [`Self::set_client_focus`] with `None`. Idempotent, so a close
+    /// need not know whether there was one.
+    pub fn forget_client_focus(&self, conn_id: u64) {
+        self.inner.lock().unwrap().focused.remove(&conn_id);
     }
 
     pub fn reorder_tabs(&self, project_id: i64, tab_ids: &[i64]) -> Result<(), WorkspaceError> {
@@ -2056,10 +2049,7 @@ type Selection = (i64, i64);
 
 impl Inner {
     /// Move the active selection onto one tab, reporting where it was
-    /// and where it landed. The mutation half of [`Workspace::focus_tab`],
-    /// split out so [`Workspace::set_client_focus`] applies the same
-    /// selection move inside its own transaction rather than taking the
-    /// lock twice around it.
+    /// and where it landed. The mutation half of [`Workspace::focus_tab`].
     ///
     /// Validation comes first and mutates nothing on the way out: an
     /// unknown tab leaves the selection exactly as it was.
@@ -2079,8 +2069,16 @@ impl Inner {
     /// Plan §3.5's suppression predicate: a notification for the tab the
     /// user is actively looking at is considered seen, so it raises no
     /// banner, no badge, and no inbox row.
+    ///
+    /// A **union**, not an election — this workspace's own window plus
+    /// every connection's stated tab — so a tab is muted while *anyone*
+    /// is looking at it and a second client can never un-mute the
+    /// first's. Only attention runs through here; `publish_tab_effect`
+    /// deliberately does not, so effects still reach every subscriber
+    /// whatever is muted.
     fn attention_suppressed_by_focus(&self, tab_id: i64) -> bool {
-        self.window_focused && self.active_tab_id == tab_id
+        (self.window_focused && self.active_tab_id == tab_id)
+            || self.focused.values().any(|t| *t == tab_id)
     }
 
     fn alloc_id(&mut self) -> i64 {
@@ -2970,11 +2968,11 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A two-tab workspace standing in for a session's: no window of its
-    /// own, so it starts on the headless default (focused, on the tab
-    /// its layout selected) — which is exactly the state
-    /// `set_client_focus` exists to correct.
+    /// own, so its own focus flag is down and everything it mutes comes
+    /// from what a connection said.
     fn session_like_ws() -> (Workspace, i64, i64) {
         let ws = Workspace::new();
+        ws.set_window_focused(false);
         let pid = ws.create_project("p", "").unwrap().id;
         let first = ws.open_tab(pid, "/", "").unwrap().id;
         let second = ws.open_tab(pid, "/", "").unwrap().id;
@@ -2982,91 +2980,92 @@ mod tests {
         (ws, first, second)
     }
 
-    /// The whole point of the op: the client says what it is looking at,
-    /// and the session suppresses that tab and only that tab.
-    #[test]
-    fn client_focus_moves_the_suppressed_tab_with_the_selection() {
-        let (ws, first, second) = session_like_ws();
-
-        ws.set_client_focus(Some(second)).unwrap();
-        assert_eq!(ws.active(), (ws.tab(second).unwrap().project_id, second));
-        assert!(!ws
-            .raise_attention(second, "Roost", "", AttentionSource::Structured)
-            .unwrap());
-        assert!(ws
-            .raise_attention(first, "Roost", "", AttentionSource::Structured)
-            .unwrap());
+    fn raises(ws: &Workspace, tab: i64) -> bool {
+        ws.raise_attention(tab, "Roost", "", AttentionSource::Structured)
+            .unwrap()
     }
 
-    /// A null focus moves the flag and nothing else: the selection is
-    /// where the client left it, so a reconnect restores the same tab.
+    /// A workspace a session opens has no window, so it mutes nothing
+    /// until a connection says it is looking.
+    #[test]
+    fn an_opened_workspace_starts_unfocused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().join("state.json"));
+        let pid = ws.create_project("p", "").unwrap().id;
+        let tab = ws.open_tab(pid, "/", "").unwrap().id;
+
+        assert_eq!(ws.active().1, tab, "the new tab took the selection");
+        assert!(raises(&ws, tab));
+    }
+
+    /// The whole point of the op: the connection says what it is looking
+    /// at, that tab and only that tab is muted, and the selection does
+    /// not budge.
+    #[test]
+    fn client_focus_mutes_its_tab_and_leaves_the_selection_alone() {
+        let (ws, first, second) = session_like_ws();
+
+        ws.set_client_focus(7, Some(second)).unwrap();
+        assert_eq!(ws.active().1, first, "the selection must not move");
+        assert!(!raises(&ws, second));
+        assert!(raises(&ws, first));
+    }
+
+    /// A null focus withdraws the statement and nothing else: the
+    /// selection is where the client left it, so a reconnect restores the
+    /// same tab.
     #[test]
     fn a_null_client_focus_unmutes_without_moving_the_selection() {
         let (ws, first, _second) = session_like_ws();
-        ws.set_client_focus(Some(first)).unwrap();
+        ws.set_client_focus(7, Some(first)).unwrap();
 
-        ws.set_client_focus(None).unwrap();
+        ws.set_client_focus(7, None).unwrap();
         assert_eq!(ws.active().1, first, "the selection must not move");
-        assert!(ws
-            .raise_attention(first, "Roost", "", AttentionSource::Structured)
-            .unwrap());
+        assert!(raises(&ws, first));
     }
 
     /// Atomic: an unknown tab is refused with nothing applied. A partial
-    /// apply here would flip the session to "focused" against whatever
-    /// tab happened to be active and mute it.
+    /// apply here would leave this connection muting some other tab.
     #[test]
     fn an_unknown_tab_leaves_the_reported_focus_untouched() {
-        let (ws, first, _second) = session_like_ws();
-        ws.set_client_focus(None).unwrap();
+        let (ws, first, second) = session_like_ws();
+        ws.set_client_focus(7, Some(second)).unwrap();
 
-        let refused = ws.set_client_focus(Some(9_999)).unwrap_err();
+        let refused = ws.set_client_focus(7, Some(9_999)).unwrap_err();
         assert!(matches!(refused, WorkspaceError::TabNotFound(9_999)));
         assert_eq!(ws.active().1, first, "the selection must not have moved");
-        assert!(
-            ws.raise_attention(first, "Roost", "", AttentionSource::Structured)
-                .unwrap(),
-            "the window flag must not have moved either"
-        );
+        assert!(!raises(&ws, second), "the standing claim still holds");
     }
 
-    /// Re-stating the same focus is a no-op on the event stream: a
-    /// client that re-asserts on reconnect must not make every attached
-    /// client re-render, and `ActiveChanged` is what they re-render on.
+    /// A focus statement never commits: it is not persisted state and no
+    /// event carries it, so re-stating one — which every reconnect does —
+    /// cannot make every attached client re-render.
     #[test]
-    fn re_stating_the_same_client_focus_emits_nothing() {
+    fn a_client_focus_never_commits() {
         let (ws, first, second) = session_like_ws();
-        ws.set_client_focus(Some(second)).unwrap();
         let mut rx = ws.subscribe();
 
-        ws.set_client_focus(Some(second)).unwrap();
+        ws.set_client_focus(7, Some(second)).unwrap();
+        ws.set_client_focus(7, Some(second)).unwrap();
+        ws.set_client_focus(7, None).unwrap();
+        ws.set_client_focus(7, Some(first)).unwrap();
         assert!(drain(&mut rx).is_empty());
-
-        // Including the flag-only edge: unfocus, then re-state the same
-        // tab. The selection never moved, so still nothing.
-        ws.set_client_focus(None).unwrap();
-        ws.set_client_focus(Some(second)).unwrap();
-        assert!(drain(&mut rx).is_empty());
-
-        // …but a move still announces itself, exactly like `tab.focus`.
-        ws.set_client_focus(Some(first)).unwrap();
-        assert!(drain(&mut rx).iter().any(
-            |e| matches!(e, WorkspaceEvent::ActiveChanged { tab_id, .. } if *tab_id == first)
-        ));
     }
 
-    /// `release_client_focus` is the lease-loss reset: the flag drops,
-    /// the selection stays.
+    /// Two connections on the *same* tab: it stays muted until the last
+    /// of them stops looking, so one client's close cannot un-mute a tab
+    /// another is still showing.
     #[test]
-    fn releasing_client_focus_unmutes_and_keeps_the_selection() {
-        let (ws, _first, second) = session_like_ws();
-        ws.set_client_focus(Some(second)).unwrap();
+    fn a_tab_two_connections_view_is_muted_until_both_leave() {
+        let (ws, first, _second) = session_like_ws();
+        ws.set_client_focus(1, Some(first)).unwrap();
+        ws.set_client_focus(2, Some(first)).unwrap();
 
-        ws.release_client_focus();
-        assert_eq!(ws.active().1, second);
-        assert!(ws
-            .raise_attention(second, "Roost", "", AttentionSource::Structured)
-            .unwrap());
+        ws.set_client_focus(1, None).unwrap();
+        assert!(!raises(&ws, first));
+
+        ws.forget_client_focus(2);
+        assert!(raises(&ws, first));
     }
 
     /// Structured attention is NEVER gated on agent ownership (plan
@@ -3117,10 +3116,10 @@ mod tests {
         ));
     }
 
-    /// Focus defaults to *focused* before any UI reports it, so a
-    /// headless / IPC-only workspace routes exactly as a real window
-    /// would. The active tab is therefore suppressed, and — the half
-    /// that keeps the default safe — an inactive tab still delivers.
+    /// An in-memory workspace starts focused, so it routes exactly as a
+    /// real window would before the UI reports its first focus edge. The
+    /// active tab is therefore suppressed, and — the half that keeps the
+    /// default safe — an inactive tab still delivers.
     #[test]
     fn window_focus_defaults_to_focused() {
         let ws = Workspace::new();
@@ -3129,12 +3128,8 @@ mod tests {
         let background = ws.open_tab(pid, "/", "b").unwrap().id;
         ws.focus_tab(active).unwrap();
 
-        assert!(!ws
-            .raise_attention(active, "t", "b", AttentionSource::Structured)
-            .unwrap());
-        assert!(ws
-            .raise_attention(background, "t", "b", AttentionSource::Structured)
-            .unwrap());
+        assert!(!raises(&ws, active));
+        assert!(raises(&ws, background));
         assert!(ws.tab(background).unwrap().has_notification);
     }
 

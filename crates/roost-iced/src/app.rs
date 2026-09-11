@@ -2332,6 +2332,7 @@ impl App {
             .build()
             .context("build Iced engine runtime")?;
         let workspace = Arc::new(Workspace::open(profile.state_json_path()));
+        workspace.set_window_focused(true);
         let supervisor = Arc::new(PtySupervisor::new());
         let client = LocalClient::new(
             Arc::clone(&workspace),
@@ -5525,10 +5526,10 @@ impl App {
     /// assembled at each edge.
     ///
     /// Called at the three edges that can move it: a host reaching
-    /// `Connected` (a fresh session believes its own headless default
-    /// until told), the selection moving, and the window gaining or
-    /// losing focus. The set dedups, so calling it on a change that
-    /// turns out not to move anything costs nothing.
+    /// `Connected` (this connection has stated nothing yet), the
+    /// selection moving, and the window gaining or losing focus. The set
+    /// dedups, so calling it on a change that turns out not to move
+    /// anything costs nothing.
     fn push_host_focus(&mut self) {
         self.hosts
             .set_focus(host_focus_claim(self.window_focused, self.host_selection));

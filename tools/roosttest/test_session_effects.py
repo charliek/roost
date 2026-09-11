@@ -14,12 +14,13 @@ terminal without owning the terminal:
   terminal answers itself carry the colors the user is actually looking
   at. It applies to the tabs that exist and is remembered for the ones
   opened next.
-* **`session.set_focus`** — the attached client's real focus, so the
-  session suppresses notifications for the tab the user is actually
-  looking at instead of for whichever tab its headless workspace
-  defaulted to. Forgotten when the lease turns over, and when the
-  connection that reported it (or the lease's last one) closes: a focus
-  is a statement about a window that may no longer exist.
+* **`session.set_focus`** — one connected client's real focus, so the
+  session suppresses notifications for a tab somebody is actually
+  looking at rather than for whichever tab its windowless workspace
+  happens to have selected. Per connection and unioned: several clients
+  may be looking at several tabs, and each statement is forgotten when
+  the connection that made it closes, because a focus is a statement
+  about a window that may no longer exist.
 * **`ROOST_SESSION_FAKE_BUILD`** — the test seam that makes
   `tab.attach`'s build-mismatch refusal reproducible without building a
   second binary against a second Ghostty pin. Strictly test-mode.
@@ -296,11 +297,6 @@ def test_a_notification_reaches_an_observer(env):
         connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
-        # A second tab takes the selection: a focused, *active* tab
-        # suppresses its own notification, so leaving `tab` selected
-        # would make this pass or fail on the selection rather than on
-        # routing.
-        quiet_tab(client, project, env.launch_cwd)
 
         with EventStream(env.socket) as watcher:
             fence = watcher.subscribe()
@@ -694,11 +690,10 @@ def assert_muted(stream: EventStream, client: Roost, muted: int, heard: int) -> 
 def test_set_focus_moves_which_tab_a_session_mutes(env):
     """The gap HS-2 recorded, closed.
 
-    A session's workspace has no window: it defaults to focused, on
-    whichever tab its layout selected, so its suppression predicate reads
-    as permanently satisfied for that one tab and its agent can never
-    raise anything. The attached client is the only thing that knows
-    better, and this is how it says so.
+    A session's workspace has no window, so nothing it can see tells it
+    which tab a user is looking at and its agents would raise into a
+    surface nobody is reading. The connected client is the only thing
+    that knows better, and this is how it says so.
     """
     started(env)
 
@@ -715,13 +710,13 @@ def test_set_focus_moves_which_tab_a_session_mutes(env):
             assert_muted(stream, client, muted=watched, heard=other)
 
             # Null is the other half of the statement: the window lost
-            # focus, or the selection moved off this session, and the tab
+            # focus, or its selection moved off this session, and the tab
             # that was muted goes back to raising.
             set_focus(client, lease, None)
             client.notify(watched, "unmuted")
             assert next_fired(stream)["tab_id"] == str(watched)
 
-            # The focus follows the selection, tab for tab.
+            # And the mute follows the client's eye, tab for tab.
             set_focus(client, lease, other)
             assert_muted(stream, client, muted=other, heard=watched)
 
@@ -729,14 +724,13 @@ def test_set_focus_moves_which_tab_a_session_mutes(env):
 
 
 def test_a_reported_focus_does_not_outlive_the_client_that_reported_it(env):
-    """The load-bearing half: focus is forgotten when the lease's last
-    connection goes.
+    """The load-bearing half: a focus is forgotten with the connection
+    that stated it.
 
-    A lease deliberately outlives its connections (reconnecting is a
-    takeover), but a *focus* must not — it was a statement about a window
-    that no longer exists. Left standing, one `set_focus` would mute a
-    tab for every client that comes after, which is exactly the bug this
-    op exists to fix, rebuilt out of stale state.
+    It was a statement about a window that no longer exists. Left
+    standing, one `set_focus` would mute a tab for every client that
+    comes after, which is exactly the bug this op exists to fix, rebuilt
+    out of stale state.
     """
     started(env)
 
@@ -751,9 +745,9 @@ def test_a_reported_focus_does_not_outlive_the_client_that_reported_it(env):
             set_focus(client, lease, watched)
             assert_muted(stream, client, muted=watched, heard=other)
 
-    # Both connections registered under the lease are closed now: the
-    # control one (it presented the lease at `set_focus`) and the
-    # subscriber. Nobody is looking at this session any more.
+    # Both of that client's connections are closed now: the control one
+    # (which sent the `set_focus`) and the subscriber. Nobody is looking
+    # at this session any more.
     with env.client() as client:
         with EventStream(env.socket, lease=lease) as stream:
             stream.subscribe()
@@ -763,12 +757,58 @@ def test_a_reported_focus_does_not_outlive_the_client_that_reported_it(env):
             # hence the condition wait rather than one raise and a hope.
             wait_until_fires(stream, client, watched)
 
-            # The lease itself survived, and re-asserting on it is what a
+            # And a client coming back re-states it, which is what a
             # reconnecting UI does the moment it reaches Connected.
             set_focus(client, lease, watched)
             assert_muted(stream, client, muted=watched, heard=other)
 
         client.call("session.stop")
+
+
+def test_two_clients_settle_with_no_focus_churn(env):
+    """Two clients on two tabs mute both tabs and then go quiet.
+
+    The mute is a union, so neither statement displaces the other, and
+    neither moves the session's selection (`Workspace::set_client_focus`
+    says why that would not settle).
+
+    Counted rather than timed: the sentinel notification is committed
+    after both statements, so every batch up to it is every batch they
+    produced.
+    """
+    started(env)
+
+    with env.client() as a, env.client() as b:
+        lease = connect_lease(a)
+        project = first_project(a)
+        watched_a = quiet_tab(a, project, env.launch_cwd)
+        watched_b = quiet_tab(a, project, env.launch_cwd)
+        loud = quiet_tab(a, project, env.launch_cwd)
+
+        with EventStream(env.socket, lease=lease) as stream:
+            fence = stream.subscribe()
+
+            set_focus(a, lease, watched_a)
+            set_focus(b, lease, watched_b)
+
+            a.notify(watched_a, "muted")
+            b.notify(watched_b, "muted")
+            a.notify(loud, "heard")
+            batches, envelope = stream.recv_until("notification.fired", timeout=30.0)
+            assert envelope["data"]["tab_id"] == str(loud), (
+                f"both viewed tabs must be suppressed, but {envelope} arrived first"
+            )
+            stream.expect_contiguous(batches, fence)
+
+            moved = [
+                event
+                for batch in batches
+                for event in batch.get("events", [])
+                if event.get("event") == "active.changed"
+            ]
+            assert moved == [], f"a focus statement moved the session's selection: {moved}"
+
+        a.call("session.stop")
 
 
 def test_set_focus_is_lease_gated_and_needs_a_tab_that_exists(env):
