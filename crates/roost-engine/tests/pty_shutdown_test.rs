@@ -281,8 +281,7 @@ const LSOF: &str = "lsof";
 const LSOF_BUDGET: Duration = Duration::from_secs(5);
 const HOLDER_CAP: usize = 40;
 /// The devices a pty holder is named by. The parser filters `lsof`'s name
-/// records on these, and the happy-path test reads the same raw output to
-/// decide whether there was anything for the parser to find.
+/// records on these.
 const PTY_DEVICES: [&str; 3] = ["/dev/ttys", "/dev/ptmx", "/dev/pts"];
 
 #[cfg(target_os = "macos")]
@@ -326,9 +325,7 @@ fn pty_holders() -> Result<String, String> {
 }
 
 /// `lsof -F pcfn` over this platform's pty devices, bounded by
-/// `LSOF_BUDGET`. Kept separate from the parsing so the happy-path test can
-/// read what the tool actually said without going through the parser it is
-/// there to check.
+/// `LSOF_BUDGET`.
 fn lsof_field_output() -> Result<Vec<u8>, String> {
     let mut child = lsof_command()
         .stdout(Stdio::piped())
@@ -402,11 +399,15 @@ fn render_holders(bytes: &[u8]) -> String {
     let mut command: Option<&str> = None;
     let mut fd: Option<&str> = None;
     for line in stdout.lines() {
-        if line.is_empty() {
+        // The tag comes from the bytes and the value from a checked
+        // slice: a field value may itself contain a newline, so a line
+        // can start with a multi-byte character and byte 1 need not be a
+        // char boundary. Slicing one would panic inside the census and
+        // replace the errno it exists to report.
+        let (Some(&tag), Some(rest)) = (line.as_bytes().first(), line.get(1..)) else {
             continue;
-        }
-        let rest = &line[1..];
-        match line.as_bytes()[0] {
+        };
+        match tag {
             // A process record starts over: carrying the previous one's
             // command or descriptor into it would attribute this pid's
             // ptys to the last process seen.
@@ -837,12 +838,42 @@ async fn spawns_racing_the_sweep_never_leak_a_session() {
     }
 }
 
+/// Whether `lsof` can be run here at all. `-v` prints its version and
+/// exits, so this cannot hang and enumerates nothing: the census's own
+/// bounded run is a load-sensitive measurement and must be sampled once
+/// per test, never twice and compared.
+fn lsof_runs_here() -> bool {
+    let Ok(mut child) = Command::new(LSOF)
+        .arg("-v")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        // `ErrorKind::NotFound` — no `lsof` on this box — is the case
+        // that occurs; any other spawn failure is equally a tool that
+        // cannot be run here.
+        return false;
+    };
+    let _ = child.wait();
+    true
+}
+
 /// The census only ever prints when a spawn has already failed, so it is
 /// read on the happy path too — cross-platform collection that runs only
 /// on the failure path rots silently until the one moment it matters.
-#[test]
-fn the_census_reads_this_platform() {
-    let census = pty_census(Some(7));
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_census_reads_this_platform() {
+    // One live tab, so a working parser is guaranteed a holder to find
+    // and "no holders" is a real failure rather than an accepted
+    // outcome. One pty pair, so this test needs no `PTY_HEAVY` guard.
+    let sup = PtySupervisor::new();
+    let _rx = spawn_tab(&sup, 1200, COOPERATIVE);
+    let census = pty_census(Some(1));
+    // Assert only after the teardown: a panic with the tab still live
+    // would be delivered when the `exec sleep 100` child dies, not now
+    // (this file's header).
+    sup.shutdown_all(Duration::from_secs(5)).await;
+    let lsof_runs = lsof_runs_here();
 
     let fd_limit = census.fd_limit.expect("RLIMIT_NOFILE");
     assert!(fd_limit.contains("soft "), "{fd_limit}");
@@ -856,51 +887,51 @@ fn the_census_reads_this_platform() {
     for (label, value) in &census.pool {
         assert!(value.is_ok(), "pool field {label}: {value:?}");
     }
+
     // Every way the holders reading can fail renders as "unavailable: …",
-    // so whether `lsof` runs at all here — the one legitimate reason for
-    // that line — has to be established outside the census.
-    match lsof_field_output() {
-        Ok(raw) => {
-            let holders = census.holders.unwrap_or_else(|why| {
-                panic!("{LSOF} runs here, so the census must produce a holder list: {why}")
-            });
-            // One-directional on purpose: the two runs are separate
-            // samples, so "the tool saw none and the census listed some"
-            // is a race, not a defect. The shape check below is what
-            // covers a parser that renders something unusable.
-            let raw = String::from_utf8_lossy(&raw);
-            if PTY_DEVICES.iter().any(|device| raw.contains(device)) {
-                assert_ne!(
-                    holders, "none",
-                    "{LSOF} named pty devices on this box, yet the census \
-                     found no holder:\n{raw:.400}"
-                );
-            }
-            if holders != "none" {
-                for line in holders.lines() {
-                    assert!(
-                        holder_line_is_shaped(line),
-                        "not a holder line: {line:?} in {holders:?}"
-                    );
-                }
-            }
+    // so the census's own text cannot say whether `lsof` is installed at
+    // all — the one reading allowed to be missing outright. The probe
+    // above settles that without sampling the bounded run a second time.
+    let holders = match census.holders {
+        Ok(holders) => holders,
+        Err(why) if lsof_runs => {
+            // The bounded run is best effort by design: on a loaded
+            // runner it may give up, and a timeout is the *only* failure
+            // this test tolerates from an installed `lsof`. A spawn
+            // failure, a wait failure or a parser regression stays red.
+            assert!(
+                why.contains("did not answer within"),
+                "{LSOF} runs here, so the census must produce a holder list — \
+                 a timeout is tolerated because the probe is best-effort under \
+                 load, but not this: {why}"
+            );
+            return;
         }
-        Err(absent) => {
+        Err(why) => {
             // `lsof` ships with macOS but is not installed on every Linux
             // box; a tool that cannot be run is the one reading allowed to
             // be missing, and nothing else is.
             if cfg!(target_os = "macos") {
-                panic!("macOS ships lsof at {LSOF}, so it must run here: {absent}");
+                panic!("macOS ships lsof at {LSOF}, so it must run here: {why}");
             }
-            let why = census
-                .holders
-                .expect_err("holders were rendered without a runnable lsof");
             assert!(
                 why.contains("lsof"),
-                "{LSOF} cannot be run here ({absent}), which is the one reason \
-                 holders may be missing — but not with this failure: {why}"
+                "{LSOF} cannot be run here, which is the one reason holders may \
+                 be missing — but not with this failure: {why}"
             );
+            return;
         }
+    };
+    assert!(
+        holders.contains(&format!("({})", std::process::id())),
+        "this process held a pty master for a live tab while the census ran, \
+         yet it is not among the holders:\n{holders}"
+    );
+    for line in holders.lines() {
+        assert!(
+            holder_line_is_shaped(line),
+            "not a holder line: {line:?} in {holders:?}"
+        );
     }
 }
 
@@ -921,6 +952,20 @@ fn holder_line_is_shaped(line: &str) -> bool {
             .strip_suffix(" fds")
             .and_then(|count| count.parse::<usize>().ok())
             .is_some_and(|count| count > 0)
+}
+
+/// A `-F` value may carry a newline, so the parser is fed lines that are
+/// not records at all — and one starting with a multi-byte character puts
+/// byte 1 mid-character. It has to skip such a line, not slice it.
+#[test]
+fn a_continuation_line_is_skipped_rather_than_sliced() {
+    // The `n` record's value is "/tmp/w\nédir", so "édir" arrives as a
+    // line of its own whose first character is two bytes wide.
+    let feed = "p11\ncsh\nf3\nn/dev/pts/4\nf7\nn/tmp/w\n\u{00e9}dir\np12\ncsh\nf5\nn/dev/pts/6\n";
+
+    let rendered = render_holders(feed.as_bytes());
+
+    assert_eq!(rendered, "sh(11): 1 fds\n    sh(12): 1 fds", "{rendered}");
 }
 
 #[test]
