@@ -13,6 +13,22 @@ release workflow asserts they agree).
 
 ### Added
 
+- **`roostctl host status` prints why a reconnect rung is armed (#401)**
+  — while a rung is armed, the band's own line (and so the human form's
+  rollup) *is* the countdown, `reconnecting in 8s (3/10)`, which is
+  exactly the stretch where the cause was otherwise unreadable: the
+  classified failure has been on the wire as `retry.reason` since #399,
+  but `--json` was the only way to see it. An indented `armed because:
+  <reason>` line now follows the `reason`/`detail` lines and precedes
+  the reduced-fidelity line. It prints nothing when the rung carries no
+  classified family — ordinary rather than a gap, since the first rung
+  of an outage is usually a bare connection drop with nothing to
+  classify, so its absence means "not known yet", not "no reason". It's
+  ssh-only in origin: a `localhost` retry is the connection task's own
+  backoff and carries no family. See
+  [`docs/reference/cli.md`](docs/reference/cli.md#host-subcommands) and
+  the [host sessions
+  guide](docs/guides/host-sessions.md#checking-a-host-from-the-command-line).
 - **A libghostty build skew connects instead of demanding a restart
   (#420)** — a host session and the Roost connecting to it used to have
   to pin the *same* libghostty build, because the only attach payload
@@ -286,6 +302,21 @@ release workflow asserts they agree).
   guide.
 
 ### Fixed
+
+- **A tab closed while it was still being opened no longer leaves a
+  shell running with no tab (#417)** — `tab.open` put the row in the
+  workspace and published it before the PTY supervisor reserved the
+  tab id, so a `tab.close` arriving in that window removed the row and
+  found nothing to tear down — no live session, no pending reservation
+  — and the opener then went on to promote a live PTY for a row nobody
+  could see. The orphaned shell survived until the app's shutdown
+  sweep, or under a `roost-session` daemon until someone stopped the
+  session. Both openers now go through one spawn sequence that
+  re-reads the row after the PTY is promoted and hangs the child up
+  when it has gone, reporting the same `not-found` any other "tab is
+  gone" path does. Hitting it needs two things acting on one tab at
+  once — the UI and `roostctl`, or two clients on one host session —
+  so it was rare but silent, which is the bad combination.
 
 - **Taking the foreground back on an SSH host no longer reconnects, and
   no longer resizes the tab under whoever else is looking (#462)** —
