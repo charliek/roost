@@ -981,7 +981,7 @@ struct SessionState {
     /// Every connection this session is tracking, and the attach
     /// tickets it has handed out. One lock, so a stop's sweep and a
     /// registration that raced it cannot both win.
-    clients: std::sync::Mutex<ClientRegistry>,
+    conns: std::sync::Mutex<Connections>,
 }
 
 /// How long an attach token minted by `tab.attach` stays usable.
@@ -1022,32 +1022,33 @@ pub const MAX_OUTSTANDING_TOKENS: usize = 16;
 /// room, and a low cap would start refusing legitimate bursts.
 pub const MAX_TOKENS_PER_CONNECTION: usize = MAX_OUTSTANDING_TOKENS / 2;
 
-/// One live `events.subscribe` stream.
+/// One live `events.subscribe` subscriber.
 ///
-/// Streams are registered **here and never under [`ClientRegistry::controls`]**
+/// Subscribers are registered **here and never under [`Connections::controls`]**
 /// (plan 049 §3.7), because a stop treats the two kinds differently: it
-/// closes a stream and only then aborts its relay. Keeping them in
+/// closes a subscriber and only then aborts its relay. Keeping them in
 /// separate lists is what makes that structural instead of a branch
 /// somebody has to remember.
-struct Stream {
+struct Subscriber {
     conn_id: u64,
     closer: ConnCloser,
     /// Ends the relay; its dropped sender is what EOFs the peer.
     relay: tokio::task::AbortHandle,
 }
 
-impl Stream {
+impl Subscriber {
     /// Still worth keeping a record for: the relay is running and the
-    /// connection it writes to is open. A stream that ended on its own
+    /// connection it writes to is open. A subscriber that ended on its own
     /// satisfies neither, which is what the prunes retain on.
     fn is_live(&self) -> bool {
         !self.relay.is_finished() && !self.closer.is_closed()
     }
 }
 
-/// The client registry: one entry per live control connection, one per
-/// live event stream, at most [`MAX_OUTSTANDING_TOKENS`] unconsumed
-/// tokens, and **every** live data connection per tab.
+/// Every connection this session is tracking: one entry per live
+/// control connection, one per live event subscriber, at most
+/// [`MAX_OUTSTANDING_TOKENS`] unconsumed tokens, and **every** live
+/// data connection per tab.
 ///
 /// Data connections are not bounded by construction any more (plan 057,
 /// R15): a tab admits as many as clients dial. What bounds them is the
@@ -1059,7 +1060,7 @@ impl Stream {
 /// shared between forwarders: each takes its own broadcast receiver,
 /// fence and budgets, so a reader that falls behind is cut on its own
 /// lag and takes nobody with it.
-struct ClientRegistry {
+struct Connections {
     /// Attach tickets handed out but not yet presented on a data
     /// connection.
     tokens: Vec<AttachToken>,
@@ -1073,7 +1074,7 @@ struct ClientRegistry {
     /// supersede, no bound: a tab serves as many attaches as clients
     /// dial.
     data_conns: std::collections::HashMap<i64, Vec<(u64, ConnCloser)>>,
-    /// Every live event stream. `None` once a stop has swept them: a
+    /// Every live event subscriber. `None` once a stop has swept them: a
     /// subscribe that raced the sweep is refused rather than registered
     /// into a list nobody will read again.
     ///
@@ -1081,16 +1082,16 @@ struct ClientRegistry {
     /// — nothing on it is request-shaped any more — so a stop has to
     /// reach in, close it (which writes the terminal envelope) and only
     /// then abort its relay.
-    streams: Option<Vec<Stream>>,
+    subscribers: Option<Vec<Subscriber>>,
 }
 
-impl Default for ClientRegistry {
+impl Default for Connections {
     fn default() -> Self {
         Self {
             tokens: Vec::new(),
             controls: std::collections::HashMap::new(),
             data_conns: std::collections::HashMap::new(),
-            streams: Some(Vec::new()),
+            subscribers: Some(Vec::new()),
         }
     }
 }
@@ -1148,18 +1149,18 @@ pub(crate) struct AdmittedAttach {
     pub(crate) terms: AttachTerms,
 }
 
-impl ClientRegistry {
-    /// Register one event stream. `false` once a stop has swept.
-    fn register_stream(&mut self, ctx: &ConnCtx, relay: tokio::task::AbortHandle) -> bool {
-        let Some(streams) = self.streams.as_mut() else {
+impl Connections {
+    /// Register one event subscriber. `false` once a stop has swept.
+    fn register_subscriber(&mut self, ctx: &ConnCtx, relay: tokio::task::AbortHandle) -> bool {
+        let Some(subscribers) = self.subscribers.as_mut() else {
             return false;
         };
         // Pruned here, as `forget_connection` prunes the controls: this
         // list is only ever walked here and at a stop, so a subscriber
         // that finished on its own goes away on somebody else's
         // subscribe.
-        streams.retain(Stream::is_live);
-        streams.push(Stream {
+        subscribers.retain(Subscriber::is_live);
+        subscribers.push(Subscriber {
             conn_id: ctx.conn_id,
             closer: ctx.closer.clone(),
             relay,
@@ -1171,9 +1172,9 @@ impl ClientRegistry {
     /// [`Self::close_all`], never before: a relay aborted first would
     /// drop its sender, the push loop's source would end, and the peer
     /// would get an unlabeled EOF instead of `session.stopping`.
-    fn abort_streams(&mut self) {
-        for stream in self.streams.take().into_iter().flatten() {
-            stream.relay.abort();
+    fn abort_subscribers(&mut self) {
+        for subscriber in self.subscribers.take().into_iter().flatten() {
+            subscriber.relay.abort();
         }
     }
 
@@ -1191,8 +1192,8 @@ impl ClientRegistry {
     /// Closed peers are pruned on the way through: a client that dropped
     /// two connections at once must not leave the second one standing.
     fn forget_connection(&mut self, conn_id: u64, reclaim_tokens: bool) {
-        if let Some(streams) = self.streams.as_mut() {
-            streams.retain(|stream| stream.conn_id != conn_id && stream.is_live());
+        if let Some(subscribers) = self.subscribers.as_mut() {
+            subscribers.retain(|subscriber| subscriber.conn_id != conn_id && subscriber.is_live());
         }
         self.controls.remove(&conn_id);
         self.controls.retain(|_, closer| !closer.is_closed());
@@ -1216,10 +1217,10 @@ impl ClientRegistry {
                 closer.close(reason);
             }
         }
-        // The records stay — [`Self::abort_streams`] takes them, after
+        // The records stay — [`Self::abort_subscribers`] takes them, after
         // every closer above has fired.
-        for stream in self.streams.iter().flatten() {
-            stream.closer.close(reason);
+        for subscriber in self.subscribers.iter().flatten() {
+            subscriber.closer.close(reason);
         }
         // The tokens deliberately stay. `admit_attach`'s stop latch is
         // what refuses them, and it can only say `shutting-down` about a
@@ -1356,24 +1357,24 @@ fn random_hex_128() -> String {
 }
 
 impl SessionState {
-    /// Register a live event stream, or report that the session is
+    /// Register a live event subscriber, or report that the session is
     /// already stopping.
     ///
     /// The check and the registration share the registry lock the stop
-    /// sweep takes, which is what makes them atomic: a stream handed out
+    /// sweep takes, which is what makes them atomic: a subscriber handed out
     /// after the sweep would be one no closer can reach and no abort can
     /// end.
-    fn register_stream(&self, ctx: &ConnCtx, relay: tokio::task::AbortHandle) -> bool {
-        let mut guard = lock(&self.clients);
+    fn register_subscriber(&self, ctx: &ConnCtx, relay: tokio::task::AbortHandle) -> bool {
+        let mut guard = lock(&self.conns);
         if self.stopping.load(Ordering::Acquire) {
             return false;
         }
-        guard.register_stream(ctx, relay)
+        guard.register_subscriber(ctx, relay)
     }
 
     /// End every live relay and refuse further ones.
-    fn abort_streams(&self) {
-        lock(&self.clients).abort_streams();
+    fn abort_subscribers(&self) {
+        lock(&self.conns).abort_subscribers();
     }
 
     /// Note this connection as a live control connection, whatever it is
@@ -1382,7 +1383,7 @@ impl SessionState {
     /// The one choke point, called from [`Handler::handle`] before any
     /// dispatch: a client that only attaches, writes and lists would
     /// otherwise appear in none of `controls`, `data_conns` or
-    /// `streams` — so a stop could only give it a bare EOF, and a client
+    /// `subscribers` — so a stop could only give it a bare EOF, and a client
     /// that distinguishes "the session stopped" from "the wire died"
     /// would re-dial a socket being unlinked.
     ///
@@ -1392,7 +1393,7 @@ impl SessionState {
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
-        lock(&self.clients).register_control(ctx);
+        lock(&self.conns).register_control(ctx);
     }
 
     /// One connection has ended.
@@ -1403,12 +1404,12 @@ impl SessionState {
         // ticket hears `shutting-down` instead of being sent hunting for
         // a bad credential, and reclaiming here would undo exactly that.
         let stopping = self.stopping.load(Ordering::Acquire);
-        lock(&self.clients).forget_connection(conn_id, !stopping);
+        lock(&self.conns).forget_connection(conn_id, !stopping);
     }
 
     /// Tell every registered connection why it is going away.
     fn close_clients(&self, reason: CloseReason) {
-        lock(&self.clients).close_all(reason);
+        lock(&self.conns).close_all(reason);
     }
 
     /// Mint one attach ticket. The caller has already passed the stop
@@ -1423,7 +1424,7 @@ impl SessionState {
         tab_generation: u64,
         terms: AttachTerms,
     ) -> Result<String, HandlerError> {
-        let mut guard = lock(&self.clients);
+        let mut guard = lock(&self.conns);
         if self.stopping.load(Ordering::Acquire) {
             return Err(shutting_down());
         }
@@ -1449,19 +1450,19 @@ impl SessionState {
     }
 
     /// The data plane's single admission point. See
-    /// [`ClientRegistry::admit_attach`], which takes the latch's value
+    /// [`Connections::admit_attach`], which takes the latch's value
     /// rather than reading it first, so the refusals stay in the order
     /// the client can act on.
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn admit_attach(&self, token: &str, ctx: &ConnCtx) -> Result<AdmittedAttach, HandlerError> {
-        let mut guard = lock(&self.clients);
+        let mut guard = lock(&self.conns);
         let stopping = self.stopping.load(Ordering::Acquire);
         guard.admit_attach(token, ctx, stopping)
     }
 
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn release_data_conn(&self, tab_id: i64, conn_id: u64) {
-        lock(&self.clients).release_data_conn(tab_id, conn_id);
+        lock(&self.conns).release_data_conn(tab_id, conn_id);
     }
 }
 
@@ -1638,7 +1639,7 @@ impl IpcHandler {
             stop,
             stopping: AtomicBool::new(false),
             barrier: tokio::sync::RwLock::new(()),
-            clients: std::sync::Mutex::new(ClientRegistry::default()),
+            conns: std::sync::Mutex::new(Connections::default()),
         }));
         self
     }
@@ -1718,14 +1719,14 @@ impl Handler for IpcHandler {
     /// still looking at whatever they said they were. A UI socket has no
     /// session registry and does nothing here.
     ///
-    /// Streams are pruned here too, and so are the attach tickets this
+    /// Subscribers are pruned here too, and so are the attach tickets this
     /// connection minted.
     fn connection_ended(&self, conn_id: u64) {
         let Some(session) = self.session.as_ref() else {
             return;
         };
         session.forget_connection(conn_id);
-        self.workspace.forget_client_focus(conn_id);
+        self.workspace.forget_viewer(conn_id);
     }
 
     /// A data connection is a session's business only. Without a
@@ -2501,7 +2502,7 @@ async fn session_set_theme(
 /// A session's workspace has no window of its own, so the only thing
 /// that can say a tab is being looked at is a client that does — and
 /// several may be, each at a different tab, which is why the statement
-/// is keyed by connection ([`Workspace::set_client_focus`]).
+/// is keyed by connection ([`Workspace::set_viewed_tab`]).
 ///
 /// Unlike its two neighbours there is no `server-vt` twin: nothing here
 /// touches a server terminal, and a featureless build's notification
@@ -2512,7 +2513,7 @@ fn session_set_focus(
     p: &SessionSetFocusParams,
 ) -> Result<serde_json::Value, HandlerError> {
     h.workspace
-        .set_client_focus(ctx.conn_id, p.focused_tab_id)
+        .set_viewed_tab(ctx.conn_id, p.focused_tab_id)
         .map_err(ws_err)?;
     Ok(serde_json::json!({}))
 }
@@ -2779,8 +2780,8 @@ fn resume_cut(
 ///
 /// Not a mutating op — it changes no workspace state — but it does
 /// establish a resource, so it is refused once the session has latched:
-/// a stream handed out after the stop swept the registry would be one
-/// nobody can end. [`SessionState::register_stream`] closes the race by
+/// a subscriber handed out after the stop swept the registry would be one
+/// nobody can end. [`SessionState::register_subscriber`] closes the race by
 /// making the registration itself the check.
 fn events_subscribe(
     h: &IpcHandler,
@@ -2801,7 +2802,7 @@ fn events_subscribe(
     // subscribe again on it.
     let cut = resume_cut(h, session, params)?;
     let subscription = event_push::spawn(cut, h.push_limits);
-    if !session.register_stream(ctx, subscription.abort.clone()) {
+    if !session.register_subscriber(ctx, subscription.abort.clone()) {
         // Lost the race with the stop's sweep. Abort what we just
         // started rather than leaking a relay the stop will never see.
         subscription.abort.abort();
@@ -2844,7 +2845,7 @@ async fn session_stop(
     // no registered connection — or one whose peer stopped reading — ends
     // regardless.
     session.close_clients(CloseReason::ShuttingDown);
-    session.abort_streams();
+    session.abort_subscribers();
 
     // Waits out exactly the mutations that got past the latch.
     let _drained = session.barrier.write().await;
@@ -4006,19 +4007,19 @@ mod tests {
             stop: StopHandle::new(|| async {}),
             stopping: AtomicBool::new(false),
             barrier: tokio::sync::RwLock::new(()),
-            clients: std::sync::Mutex::new(ClientRegistry::default()),
+            conns: std::sync::Mutex::new(Connections::default()),
         }
     }
 
-    fn live_streams(state: &SessionState) -> usize {
-        lock(&state.clients).streams.as_ref().map_or(0, Vec::len)
+    fn live_subscribers(state: &SessionState) -> usize {
+        lock(&state.conns).subscribers.as_ref().map_or(0, Vec::len)
     }
 
-    /// A stream registration with a throwaway relay: what these cases
+    /// A subscriber registration with a throwaway relay: what these cases
     /// are about is the *registry*, not delivery.
     fn register(state: &SessionState, conn_id: u64, relay: tokio::task::AbortHandle) -> bool {
         let (ctx, _watch) = ConnCtx::new(conn_id);
-        state.register_stream(&ctx, relay)
+        state.register_subscriber(&ctx, relay)
     }
 
     /// A relay that ended on its own — the normal close — must not stay
@@ -4036,7 +4037,7 @@ mod tests {
         let parked = tokio::spawn(std::future::pending::<()>());
         assert!(register(&state, 2, parked.abort_handle()));
         assert_eq!(
-            live_streams(&state),
+            live_subscribers(&state),
             1,
             "the finished relay must be swept, leaving only the live one"
         );
@@ -4052,7 +4053,7 @@ mod tests {
         let parked = tokio::spawn(std::future::pending::<()>());
         assert!(register(&state, 1, parked.abort_handle()));
 
-        state.abort_streams();
+        state.abort_subscribers();
         assert!(
             parked.await.expect_err("aborted").is_cancelled(),
             "the sweep must actually end the relay"
@@ -4069,7 +4070,7 @@ mod tests {
     /// The other half of the same race, and the one that only the
     /// registry lock can settle: the latch is set before the sweep
     /// runs, so a subscribe admitted past the latch must still be
-    /// refused — a stream registered after the sweep is one no closer
+    /// refused — a subscriber registered after the sweep is one no closer
     /// can reach.
     #[tokio::test]
     async fn a_subscribe_that_raced_the_stop_latch_is_refused() {
@@ -4081,21 +4082,21 @@ mod tests {
             !register(&state, 1, late.abort_handle()),
             "the latch is checked under the sweep's own lock"
         );
-        assert_eq!(live_streams(&state), 0);
+        assert_eq!(live_subscribers(&state), 0);
         late.abort();
     }
 
-    /// A connection that ends takes its stream record with it, so a
+    /// A connection that ends takes its subscriber record with it, so a
     /// subscriber that went away leaves nothing for the stop sweep to
     /// walk.
     #[tokio::test]
-    async fn a_stream_is_pruned_when_its_connection_ends() {
+    async fn a_subscriber_is_pruned_when_its_connection_ends() {
         let state = session_state();
         let parked = tokio::spawn(std::future::pending::<()>());
         assert!(register(&state, 7, parked.abort_handle()));
 
         state.forget_connection(7);
-        assert_eq!(live_streams(&state), 0);
+        assert_eq!(live_subscribers(&state), 0);
         parked.abort();
     }
 

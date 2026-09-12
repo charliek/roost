@@ -983,9 +983,30 @@ kept narrowing what the interactive lease gated until what was left —
 whose focus muted notifications, who `session.driver_changed` named,
 and which connection the session-wide settings ops would accept.
 Measured against the two substrates roost keeps comparing itself to,
-that residue bought nothing: tmux sends bells and OSC 52 to every
-attached client and sizes by the latest one, gating none of it on an
-owner; herdr's multi-client attach has no owner concept at all. What
+that residue bought nothing *for roost's requirement* — though the
+measurement deserves stating precisely, because an earlier draft of this
+entry overstated it. **tmux** is the clean case: bells and OSC 52 go to
+every attached client, sizing follows the latest, and none of it is
+gated on an owner. **herdr is not an owner-free design**, and citing it
+as one was wrong. It keeps a `foreground_client_id` — "the client
+currently driving session-wide host presentation and side effects"
+(`src/server/headless.rs:210`) — and its bells, window title and PTY
+sizing (`effective_size`) all key off that one client. Its *direct*
+terminal attach goes further still, with a single writable owner per
+terminal (`terminal_attach_owners`) that a second client must pass
+`--takeover` to seize.
+
+Two things distinguish it from what roost retired, and they are the
+whole of the argument. herdr's foreground is **derived, not claimed**:
+`latest_shell_client` is simply the connection with the newest activity
+stamp, promoted automatically, never a token a client holds and another
+must take. And its ordinary multi-pane client mode gates **no input** on
+any of it — the owner exists only for the raw single-terminal attach.
+Roost's lease was the other shape: an explicitly minted token, held
+across reconnects, seized by an announced takeover. Roost also goes
+further than herdr rather than copying it — effects reach every
+subscriber and the viewing client decides what to apply, and muting is a
+union rather than one elected client's property. What
 the residue *cost* was most of the host-session client's complexity —
 the reconnect probe, observer mode, deposed-but-serving, the in-place
 retake, the carried lease through an outage, the takeover banner — for

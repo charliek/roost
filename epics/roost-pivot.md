@@ -107,9 +107,13 @@ moved and the protocol did not.
 **R15 reverses one of R1's two halves, on purpose.** R1 made reads free
 and writes owned. Measured against tmux and herdr (2026-09-08), owned
 input is stricter than either substrate for no product gain: tmux lets
-every attached client type, herdr's multi-client attach has no owner at
-all, and both put bells, clipboard and sizing on one foreground client
-without ever gating input on it. Roost follows. Every same-UID client
+every attached client type, and herdr's ordinary multi-pane client mode
+gates no input either — its foreground client is derived from the newest
+activity stamp rather than claimed, and carries bells, title and sizing
+without ever deciding who may type. (herdr does keep a single writable
+owner with an explicit `--takeover`, but only for a raw direct attach to
+one terminal; see DL-26, which corrects an earlier overstatement that
+herdr had no owner at all.) Roost follows. Every same-UID client
 may type into and attach to any tab; the lease survives as the
 foreground. The wire change is additive at protocol 4 — shed pins one
 identify vector per generation and must not need a re-pin. Geometry is

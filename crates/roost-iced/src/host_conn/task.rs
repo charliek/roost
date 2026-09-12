@@ -984,7 +984,7 @@ async fn subscribe(
 /// revisions and rows are a different history, and this client would fold
 /// one onto the other (#458). Checked before the pump is spawned: a pump
 /// that has started is already folding.
-fn one_incarnation(stream: &EventStream, identified: &str) -> Result<(), AttemptError> {
+fn require_same_incarnation(stream: &EventStream, identified: &str) -> Result<(), AttemptError> {
     let answered = stream.session_id();
     if answered != identified {
         return Err(AttemptError::Transport(format!(
@@ -1044,7 +1044,7 @@ async fn resume_stream(
         }
     };
 
-    one_incarnation(&stream, identified)?;
+    require_same_incarnation(&stream, identified)?;
     let ack = stream.revision();
     if ack != from_revision {
         // The ack echoes the fence by contract. A different one with no
@@ -1076,7 +1076,7 @@ async fn subscribe_and_snapshot(
     let stream = tokio::time::timeout(leg(), EventStream::connect(socket))
         .await
         .map_err(|_| AttemptError::Transport(format!("{} timed out", ops::EVENTS_SUBSCRIBE)))??;
-    one_incarnation(&stream, identified)?;
+    require_same_incarnation(&stream, identified)?;
     let ack = stream.revision();
     let (events, pump) = spawn_event_pump(stream);
 

@@ -144,11 +144,11 @@ struct Inner {
     /// UI via [`Workspace::set_window_focused`]. Never persisted — focus
     /// is a property of the running session, not of the layout.
     window_focused: bool,
-    /// The tab each connected client says it is looking at, by
-    /// connection id — the other half of the suppression predicate, and
-    /// the half a session has (its own window flag is nobody's).
-    /// Never persisted, like [`Inner::window_focused`].
-    focused: HashMap<u64, i64>,
+    /// The tab each connected client says it is viewing, by connection
+    /// id — the other half of the suppression predicate, and the half a
+    /// session has (its own window flag is nobody's). Never persisted,
+    /// like [`Inner::window_focused`].
+    viewing: HashMap<u64, i64>,
     /// Monotonic commit counter, bumped each time a persistable
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
@@ -182,7 +182,7 @@ impl Default for Inner {
             // unfocused would route every notification the opposite way
             // from a real window. [`Workspace::open`] overrides it.
             window_focused: true,
-            focused: HashMap::new(),
+            viewing: HashMap::new(),
             persist_seq: 0,
             revision: 0,
             replay: VecDeque::new(),
@@ -677,7 +677,7 @@ impl Workspace {
     ///
     /// Starts **unfocused**, unlike [`Workspace::new`]: a `roost-session`
     /// has no window of its own, so a default-focused one would leave
-    /// `attention_suppressed_by_focus` permanently true for whichever tab
+    /// `tab_is_being_watched` permanently true for whichever tab
     /// its restored layout selected and mute that tab's agent with nobody
     /// watching. A workspace that does have a window says so through
     /// [`Workspace::set_window_focused`], which the local UI calls at
@@ -1283,7 +1283,7 @@ impl Workspace {
             .remove(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         let project_id = row.project_id;
-        inner.focused.retain(|_, viewed| *viewed != tab_id);
+        inner.viewing.retain(|_, viewed| *viewed != tab_id);
 
         // Last tab in the project? Cascade-close the project. Inlined
         // rather than calling `delete_project` so the event order is
@@ -1454,7 +1454,7 @@ impl Workspace {
         source: AttentionSource,
     ) -> Result<bool, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
-        let focus_suppressed = inner.attention_suppressed_by_focus(tab_id);
+        let watched = inner.tab_is_being_watched(tab_id);
         // A 'lookup' error rather than a silent drop: hook tools racing
         // a tab close need to tell "gone" from "suppressed".
         let row = inner
@@ -1469,7 +1469,7 @@ impl Workspace {
             tracing::debug!(tab_id, "raw OSC notification suppressed (agent owns tab)");
             return Ok(false);
         }
-        if focus_suppressed {
+        if watched {
             return Ok(false);
         }
         row.has_notification = true;
@@ -1627,7 +1627,7 @@ impl Workspace {
         let now = unix_now();
         let mut inner = self.inner.lock().unwrap();
         let is_active = inner.active_tab_id == tab_id;
-        let focus_suppressed = inner.attention_suppressed_by_focus(tab_id);
+        let watched = inner.tab_is_being_watched(tab_id);
         let row = inner
             .tabs
             .get_mut(&tab_id)
@@ -1650,14 +1650,14 @@ impl Workspace {
 
         let mut events = replace_agent(row, next);
         match attention {
-            // Same focus predicate as `raise_attention`, applied here
+            // Same watched predicate as `raise_attention`, applied here
             // rather than by delegating because the report's own
             // mutation must stay in this transaction: a Claude
             // notification for the tab you are looking at is suppressed
             // exactly like any other, but its lifecycle change is not.
             //
             // `severity` stops here in v1 by design: policy B (plan
-            // §3.5) suppresses on focus alone, and "failed overrides
+            // §3.5) suppresses while watched, and "failed overrides
             // suppression" is a later slice. It stays readable on the
             // report itself rather than being plumbed through an event
             // nobody reads yet.
@@ -1665,7 +1665,7 @@ impl Workspace {
                 title,
                 body,
                 severity: _,
-            } if !focus_suppressed => {
+            } if !watched => {
                 row.has_notification = true;
                 events.push(WorkspaceEvent::TabNotification {
                     tab_id,
@@ -1768,28 +1768,28 @@ impl Workspace {
     /// Atomic in the sense the caller needs: an unknown tab is refused
     /// with **nothing** applied, so a client that names a tab which just
     /// closed does not silently mute some other one.
-    pub fn set_client_focus(
+    pub fn set_viewed_tab(
         &self,
         conn_id: u64,
         focused_tab_id: Option<i64>,
     ) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let Some(tab_id) = focused_tab_id else {
-            inner.focused.remove(&conn_id);
+            inner.viewing.remove(&conn_id);
             return Ok(());
         };
         if !inner.tabs.contains_key(&tab_id) {
             return Err(WorkspaceError::TabNotFound(tab_id));
         }
-        inner.focused.insert(conn_id, tab_id);
+        inner.viewing.insert(conn_id, tab_id);
         Ok(())
     }
 
     /// One connection is gone: drop its statement, like
-    /// [`Self::set_client_focus`] with `None`. Idempotent, so a close
+    /// [`Self::set_viewed_tab`] with `None`. Idempotent, so a close
     /// need not know whether there was one.
-    pub fn forget_client_focus(&self, conn_id: u64) {
-        self.inner.lock().unwrap().focused.remove(&conn_id);
+    pub fn forget_viewer(&self, conn_id: u64) {
+        self.inner.lock().unwrap().viewing.remove(&conn_id);
     }
 
     pub fn reorder_tabs(&self, project_id: i64, tab_ids: &[i64]) -> Result<(), WorkspaceError> {
@@ -2076,9 +2076,9 @@ impl Inner {
     /// first's. Only attention runs through here; `publish_tab_effect`
     /// deliberately does not, so effects still reach every subscriber
     /// whatever is muted.
-    fn attention_suppressed_by_focus(&self, tab_id: i64) -> bool {
+    fn tab_is_being_watched(&self, tab_id: i64) -> bool {
         (self.window_focused && self.active_tab_id == tab_id)
-            || self.focused.values().any(|t| *t == tab_id)
+            || self.viewing.values().any(|t| *t == tab_id)
     }
 
     fn alloc_id(&mut self) -> i64 {
@@ -3005,7 +3005,7 @@ mod tests {
     fn client_focus_mutes_its_tab_and_leaves_the_selection_alone() {
         let (ws, first, second) = session_like_ws();
 
-        ws.set_client_focus(7, Some(second)).unwrap();
+        ws.set_viewed_tab(7, Some(second)).unwrap();
         assert_eq!(ws.active().1, first, "the selection must not move");
         assert!(!raises(&ws, second));
         assert!(raises(&ws, first));
@@ -3017,9 +3017,9 @@ mod tests {
     #[test]
     fn a_null_client_focus_unmutes_without_moving_the_selection() {
         let (ws, first, _second) = session_like_ws();
-        ws.set_client_focus(7, Some(first)).unwrap();
+        ws.set_viewed_tab(7, Some(first)).unwrap();
 
-        ws.set_client_focus(7, None).unwrap();
+        ws.set_viewed_tab(7, None).unwrap();
         assert_eq!(ws.active().1, first, "the selection must not move");
         assert!(raises(&ws, first));
     }
@@ -3029,9 +3029,9 @@ mod tests {
     #[test]
     fn an_unknown_tab_leaves_the_reported_focus_untouched() {
         let (ws, first, second) = session_like_ws();
-        ws.set_client_focus(7, Some(second)).unwrap();
+        ws.set_viewed_tab(7, Some(second)).unwrap();
 
-        let refused = ws.set_client_focus(7, Some(9_999)).unwrap_err();
+        let refused = ws.set_viewed_tab(7, Some(9_999)).unwrap_err();
         assert!(matches!(refused, WorkspaceError::TabNotFound(9_999)));
         assert_eq!(ws.active().1, first, "the selection must not have moved");
         assert!(!raises(&ws, second), "the standing claim still holds");
@@ -3045,10 +3045,10 @@ mod tests {
         let (ws, first, second) = session_like_ws();
         let mut rx = ws.subscribe();
 
-        ws.set_client_focus(7, Some(second)).unwrap();
-        ws.set_client_focus(7, Some(second)).unwrap();
-        ws.set_client_focus(7, None).unwrap();
-        ws.set_client_focus(7, Some(first)).unwrap();
+        ws.set_viewed_tab(7, Some(second)).unwrap();
+        ws.set_viewed_tab(7, Some(second)).unwrap();
+        ws.set_viewed_tab(7, None).unwrap();
+        ws.set_viewed_tab(7, Some(first)).unwrap();
         assert!(drain(&mut rx).is_empty());
     }
 
@@ -3058,13 +3058,13 @@ mod tests {
     #[test]
     fn a_tab_two_connections_view_is_muted_until_both_leave() {
         let (ws, first, _second) = session_like_ws();
-        ws.set_client_focus(1, Some(first)).unwrap();
-        ws.set_client_focus(2, Some(first)).unwrap();
+        ws.set_viewed_tab(1, Some(first)).unwrap();
+        ws.set_viewed_tab(2, Some(first)).unwrap();
 
-        ws.set_client_focus(1, None).unwrap();
+        ws.set_viewed_tab(1, None).unwrap();
         assert!(!raises(&ws, first));
 
-        ws.forget_client_focus(2);
+        ws.forget_viewer(2);
         assert!(raises(&ws, first));
     }
 

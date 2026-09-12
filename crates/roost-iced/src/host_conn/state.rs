@@ -435,7 +435,7 @@ impl Backoff {
     }
 
     #[cfg(test)]
-    pub(crate) fn attempt(&self) -> u32 {
+    pub(crate) fn attempt_number(&self) -> u32 {
         self.attempt
     }
 }
@@ -951,9 +951,9 @@ mod tests {
         for _ in 0..5 {
             machine.dropped("eof", 1.0);
         }
-        assert!(machine.backoff.attempt() > 0);
+        assert!(machine.backoff.attempt_number() > 0);
         machine.connected();
-        assert_eq!(machine.backoff.attempt(), 0);
+        assert_eq!(machine.backoff.attempt_number(), 0);
         assert_eq!(
             machine.dropped("eof", 1.0).retry_in(),
             Some(BACKOFF_BASE),
