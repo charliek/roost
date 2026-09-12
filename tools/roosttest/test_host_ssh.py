@@ -261,8 +261,8 @@ def _install_wrapper() -> None:
     #
     # Shipped, the ladder is ten attempts on a 1s base, and a give-up
     # against a black-holed route costs six to eight minutes (plan 040
-    # §3.5): every attempt pays an establish, a teardown and a lease
-    # probe on top of its sleep. A lane whose whole subject is *settling*
+    # §3.5): every attempt pays an establish, a teardown and an identify
+    # on top of its sleep. A lane whose whole subject is *settling*
     # cannot spend that, so it shortens the ladder rather than the
     # assertions. 400ms keeps the rungs long enough that a case which has
     # to get an op onto the wire inside an armed window (the disconnect,

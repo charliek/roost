@@ -1,7 +1,6 @@
-//! Host-session wire types (plan 033 §D4, plan 036 §D11):
-//! `SessionIdentify`, `EventBatch`, `AttachPayloadKind`, the
-//! `session.connect` / `tab.attach` shapes, the attach handshake and
-//! its reply, and `SESSION_PROTOCOL_VERSION`.
+//! Host-session wire types: `SessionIdentify`, `EventBatch`,
+//! `AttachPayloadKind`, the `tab.attach` shapes, the attach handshake
+//! and its reply, and `SESSION_PROTOCOL_VERSION`.
 //!
 //! What pins their shape is this file plus the golden vectors under
 //! `tests/ipc-vectors/` (the identify vector per generation, see
@@ -10,26 +9,24 @@
 //! assertions are deliberately byte-exact against literal JSON:
 //! a field rename or a reordering that a `round_trip` would happily
 //! accept is a cross-language break. These fixtures are a
-//! compatibility contract — never edit an existing vector to bless a
-//! wire change (additive changes add new vectors); see
-//! `docs/reference/ipc-compatibility.md`.
+//! compatibility contract — an existing vector is edited only by a
+//! breaking `SESSION_PROTOCOL_VERSION` bump, in the same commit;
+//! see `docs/reference/ipc-compatibility.md`.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
 use roost_ipc::messages::{
     ops, AgentHooksMode, AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode,
     AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope,
-    EventsSubscribeParams, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
-    SessionBinaryIdentity, SessionConnectParams, SessionConnectResult, SessionDriverChangedEvent,
-    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
-    SessionSetAgentHooksParams, SessionSetAgentHooksResult, SessionSetFocusParams,
-    SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
-    SessionStoppingEvent, SkippedFile, TabAttachParams, TabAttachResult, TabDumpCursor,
-    TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
-    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
-    SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES, SESSION_PROTOCOL_VERSION,
+    EventsSubscribeParams, EventsSubscribeResult, ProjectReorderParams, ResponseError,
+    RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
+    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams,
+    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
+    TabAttachParams, TabAttachResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
+    TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
+    WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
     SESSION_STOPPING_EVENT,
 };
 
@@ -56,7 +53,6 @@ fn sample_identify() -> SessionIdentify {
             AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
             AttachPayloadKind::VT.into(),
         ],
-        features: SESSION_FEATURES.iter().map(|f| (*f).to_string()).collect(),
         libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
         session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
         started_at: "2026-08-27T14:03:11Z".into(),
@@ -88,20 +84,117 @@ where
     assert_eq!(
         value, &back,
         "round-trip mismatch via {json} — these vectors are a compatibility \
-         contract, never edit an existing one to bless a wire change (additive \
-         changes add new vectors); see docs/reference/ipc-compatibility.md"
+         contract; see docs/reference/ipc-compatibility.md"
     );
 }
 
-/// Plan 049 R1's bump: the lease changed axis (leaseless classified
-/// `events.subscribe`, lease-gated session-socket `tab.write`,
-/// non-terminal `session.driver_changed`), which no `3` peer can be
-/// served. The request/response wire version did not move with it — the
-/// two version different things.
+/// `5` retires the lease: no `session.connect`, no `lease` on any op, no
+/// `session.driver_changed`, no `features` — breaking in both
+/// directions. The request/response wire version did not move with it —
+/// the two version different things.
 #[test]
-fn session_protocol_version_is_four() {
-    assert_eq!(SESSION_PROTOCOL_VERSION, 4);
+fn session_protocol_version_is_five() {
+    assert_eq!(SESSION_PROTOCOL_VERSION, 5);
     assert_eq!(roost_ipc::PROTOCOL_VERSION, 1);
+}
+
+/// The break, from the far side: every op a `4` client put a `lease` on
+/// refuses the key outright, because each of those params is
+/// `deny_unknown_fields` — which is what the engine answers
+/// `invalid-param` to. Together with `ops`' having no `session.connect`
+/// (a compile-time fact, and `unknown-op` on the wire) this is the whole
+/// of what a pre-bump client hits.
+#[test]
+fn a_request_carrying_a_lease_is_refused_by_every_op_that_took_one() {
+    let refused = |what: &str, result: Result<(), serde_json::Error>| {
+        let error = result.expect_err(&format!("{what} must refuse a `lease` key"));
+        assert!(
+            error.to_string().contains("unknown field `lease`"),
+            "{what}: {error}"
+        );
+    };
+
+    refused(
+        ops::TAB_WRITE,
+        serde_json::from_str::<TabWriteParams>(r#"{"tab_id":"5","data":"bHMK","lease":"l"}"#)
+            .map(drop),
+    );
+    refused(
+        ops::EVENTS_SUBSCRIBE,
+        serde_json::from_str::<EventsSubscribeParams>(r#"{"tab_id_filter":"0","lease":"l"}"#)
+            .map(drop),
+    );
+    refused(
+        ops::TAB_ATTACH,
+        serde_json::from_str::<TabAttachParams>(
+            r#"{"lease":"l","tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
+                "libghostty_build":"b"}"#,
+        )
+        .map(drop),
+    );
+    refused(
+        ops::SESSION_SET_THEME,
+        serde_json::from_value::<SessionSetThemeParams>(serde_json::json!({
+            "lease": "l",
+            "osc_colors": {
+                "foreground": "#ffffff",
+                "background": "#000000",
+                "cursor": "#ffffff",
+                "palette": vec!["#000000"; 256],
+            },
+        }))
+        .map(drop),
+    );
+    refused(
+        ops::SESSION_SET_FOCUS,
+        serde_json::from_value::<SessionSetFocusParams>(
+            serde_json::json!({"lease": "l", "focused_tab_id": "5"}),
+        )
+        .map(drop),
+    );
+    refused(
+        ops::SESSION_SET_AGENT_HOOKS,
+        serde_json::from_value::<SessionSetAgentHooksParams>(
+            serde_json::json!({"lease": "l", "mode": "auto", "client": "c"}),
+        )
+        .map(drop),
+    );
+    refused(
+        ops::SESSION_PUT_FILE,
+        serde_json::from_str::<SessionPutFileParams>(
+            r#"{"lease":"l","name":"a.png","data":"aGVsbG8="}"#,
+        )
+        .map(drop),
+    );
+}
+
+/// The ack names the incarnation, and `session_id` is **required**: a
+/// subscribe's two legs can be two dials, so a client that cannot read
+/// which session answered cannot refuse a pair that disagree.
+#[test]
+fn the_subscribe_ack_names_its_incarnation_and_cannot_omit_it() {
+    const GOLDEN: &str = r#"{"revision":42,"session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN"}"#;
+
+    let ack = EventsSubscribeResult {
+        revision: 42,
+        session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
+    };
+    round_trip(&ack);
+    assert_eq!(serde_json::to_string(&ack).unwrap(), GOLDEN);
+    assert_eq!(
+        serde_json::from_str::<EventsSubscribeResult>(GOLDEN).unwrap(),
+        ack
+    );
+
+    let missing = serde_json::from_str::<EventsSubscribeResult>(r#"{"revision":42}"#)
+        .expect_err("an ack without a session_id must not decode");
+    assert!(
+        missing.to_string().contains("missing field `session_id`"),
+        "{missing}"
+    );
+
+    // A counter, not an id: the string-int64 convention does not apply.
+    assert!(serde_json::to_value(&ack).unwrap()["revision"].is_u64());
 }
 
 #[test]
@@ -153,9 +246,8 @@ fn unknown_attach_payload_kind_survives_a_round_trip() {
 #[test]
 fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.18","session_protocol":4,"#,
+        r#"{"app_version":"0.0.18","session_protocol":5,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
-        r#""features":["put_file","events_resume","tab_dump_scrollback","open_input"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
         r#""started_at":"2026-08-27T14:03:11Z"}"#,
@@ -175,7 +267,7 @@ fn session_identify_matches_its_golden_json() {
 #[test]
 fn session_binary_identity_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.19","session_protocol":4,"#,
+        r#"{"app_version":"0.0.19","session_protocol":5,"#,
         r#""libghostty_build":"ghostty-abcdef0123456789+snapshot.v1"}"#,
     );
 
@@ -292,58 +384,24 @@ fn decode_identify_vector(name: &str) -> SessionIdentify {
         .unwrap_or_else(|e| panic!("{name}: decode session identify: {e}"))
 }
 
-/// A duplicate-free view of a feature list, or `None` if it repeats
-/// itself — a list compared as a set has to *be* one.
-fn feature_set<'a>(features: impl IntoIterator<Item = &'a str>) -> Option<BTreeSet<&'a str>> {
-    let mut set = BTreeSet::new();
-    for feature in features {
-        if !set.insert(feature) {
-            return None;
-        }
-    }
-    Some(set)
-}
-
-/// The vector is frozen, so this proves it is a **valid** view of this
-/// generation, not the *current* one: every field matches except
-/// `features`, which is only asserted to be a subset of what this build
-/// advertises.
-///
-/// That is the executable form of the policy in
-/// `docs/reference/ipc-compatibility.md` — features are additive and
-/// monotonic within a generation, so the generation's vector pins the
-/// floor and a build that has grown one since is still serving exactly
-/// this shape. A capability that *disappeared* would fail here, which is
-/// the half that matters: removing one takes a
-/// `SESSION_PROTOCOL_VERSION` bump and a new vector.
+/// The current generation's vector is this build's identity, field for
+/// field: the integer is the whole negotiation at `5`, so there is
+/// nothing a session may differ on and still be served.
 #[test]
 fn session_identify_vector_decodes_into_its_typed_result() {
     let result = decode_identify_vector(&identify_vector_name(SESSION_PROTOCOL_VERSION));
     assert_eq!(result.session_protocol, SESSION_PROTOCOL_VERSION);
-    assert_eq!(
-        result,
-        SessionIdentify {
-            features: result.features.clone(),
-            ..sample_identify()
-        },
-        "only `features` may differ from this build's identity"
-    );
-
-    let vector = feature_set(result.features.iter().map(String::as_str))
-        .expect("the vector's features repeat");
-    let current = feature_set(SESSION_FEATURES.iter().copied()).expect("SESSION_FEATURES repeats");
-    assert!(
-        vector.is_subset(&current),
-        "the v{SESSION_PROTOCOL_VERSION} vector advertises {:?}, which this build no longer \
-         does — removing a feature is a generation bump, not an edit",
-        vector.difference(&current).collect::<Vec<_>>()
-    );
+    assert_eq!(result, sample_identify());
 }
 
 /// Every prior generation's vector stays on disk and keeps decoding —
-/// the compatibility policy's "an old client's view still parses",
-/// as a test rather than a claim. `2` is the first versioned
-/// generation (the corpus was backfilled at the `2` → `3` bump).
+/// the compatibility policy's "an old client's view still parses", as a
+/// test rather than a claim, and what the compat gate relies on to
+/// refuse an old session *by name* rather than on a decode failure. The
+/// frozen files carry keys this generation no longer declares
+/// (`features`), which `SessionIdentify` tolerates by design. `2` is the
+/// first versioned generation (the corpus was backfilled at the `2` →
+/// `3` bump).
 #[test]
 fn every_prior_session_identify_generation_still_decodes() {
     const FIRST_VERSIONED: u32 = 2;
@@ -406,16 +464,14 @@ fn session_stop_vector_decodes_into_its_typed_result() {
 }
 
 // ============================================================================
-// Leases + attach (plan 036 §D4/D5/D6)
+// Attach
 // ============================================================================
 
-const LEASE: &str = "9f2c1d7a4b6e08315c0d9a72e4f16b83";
 const TOKEN: &str = "1a0be5c37d924f68b1c05e3a7f2d8496";
 const EPOCH: u64 = 6_032_428_321_756_423_947;
 
 fn sample_attach_params() -> TabAttachParams {
     TabAttachParams {
-        lease: Some(LEASE.into()),
         tab_id: 5,
         kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
         cols: 120,
@@ -437,102 +493,11 @@ fn sample_attach_result() -> TabAttachResult {
 }
 
 #[test]
-fn session_connect_params_default_to_no_takeover() {
-    assert_eq!(
-        serde_json::to_string(&SessionConnectParams::default()).unwrap(),
-        r#"{"takeover":false}"#
-    );
-    // Absent is false: the safe answer, since a takeover kicks whoever
-    // is connected.
-    let decoded: SessionConnectParams = serde_json::from_str("{}").unwrap();
-    assert!(!decoded.takeover);
-    let decoded: SessionConnectParams = serde_json::from_str(r#"{"takeover":true}"#).unwrap();
-    assert!(decoded.takeover);
-    round_trip(&decoded);
-    // Params are strict, like every other op's.
-    assert!(serde_json::from_str::<SessionConnectParams>(r#"{"force":true}"#).is_err());
-}
-
-/// The label rides `session.connect`, not `identify`, and is omitted
-/// unless the client actually states one — an older session
-/// `deny_unknown_fields`-rejects a key it has never heard of, so an
-/// unlabeled connect must stay byte-identical to what it always sent.
-#[test]
-fn session_connect_params_omit_an_unset_client_label() {
-    let bare = SessionConnectParams {
-        takeover: true,
-        client_label: None,
-    };
-    assert_eq!(
-        serde_json::to_string(&bare).unwrap(),
-        r#"{"takeover":true}"#
-    );
-
-    let labeled = SessionConnectParams {
-        takeover: true,
-        client_label: Some("kestrel.local".into()),
-    };
-    assert_eq!(
-        serde_json::to_string(&labeled).unwrap(),
-        r#"{"takeover":true,"client_label":"kestrel.local"}"#
-    );
-    round_trip(&labeled);
-
-    let decoded: SessionConnectParams = serde_json::from_str(r#"{"takeover":false}"#).unwrap();
-    assert_eq!(decoded.client_label, None);
-}
-
-/// Same omit-when-unset contract on the write path, and the reason is
-/// the sharper one: a lease-less `roostctl` must keep talking to a UI
-/// socket that predates the key entirely.
-#[test]
-fn tab_write_params_omit_an_unset_lease() {
-    let bare = TabWriteParams {
-        tab_id: 5,
-        data: b"ls\n".to_vec(),
-        lease: None,
-    };
-    assert_eq!(
-        serde_json::to_string(&bare).unwrap(),
-        r#"{"tab_id":"5","data":"bHMK"}"#
-    );
-
-    let leased = TabWriteParams {
-        tab_id: 5,
-        data: b"ls\n".to_vec(),
-        lease: Some(LEASE.into()),
-    };
-    assert_eq!(
-        serde_json::to_string(&leased).unwrap(),
-        format!(r#"{{"tab_id":"5","data":"bHMK","lease":"{LEASE}"}}"#)
-    );
-    round_trip(&leased);
-
-    let decoded: TabWriteParams = serde_json::from_str(r#"{"tab_id":"5","data":"bHMK"}"#).unwrap();
-    assert_eq!(decoded.lease, None);
-}
-
-#[test]
-fn session_connect_result_matches_its_golden_json() {
-    const GOLDEN: &str = r#"{"lease":"9f2c1d7a4b6e08315c0d9a72e4f16b83","revision":42}"#;
-
-    let value = SessionConnectResult {
-        lease: LEASE.into(),
-        revision: 42,
-    };
-    round_trip(&value);
-    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
-    let decoded: SessionConnectResult = serde_json::from_str(GOLDEN).unwrap();
-    assert_eq!(decoded, value);
-}
-
-#[test]
 fn tab_attach_params_match_their_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"lease":"9f2c1d7a4b6e08315c0d9a72e4f16b83","tab_id":"5","#,
-        r#""kinds":["ghostty-snapshot"],"cols":120,"rows":40,"#,
+        r#"{"tab_id":"5","kinds":["ghostty-snapshot"],"cols":120,"rows":40,"#,
         r#""cell_w_px":9,"cell_h_px":18,"#,
-        r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1"}"#,
+        r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","focus":true}"#,
     );
 
     let value = sample_attach_params();
@@ -548,7 +513,7 @@ fn tab_attach_params_match_their_golden_json() {
 #[test]
 fn tab_attach_params_default_the_pixel_geometry_only() {
     let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"lease":"l","tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
+        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
             "libghostty_build":"b"}"#,
     )
     .unwrap();
@@ -556,44 +521,27 @@ fn tab_attach_params_default_the_pixel_geometry_only() {
     assert_eq!(decoded.tab_id, 7);
 
     assert!(serde_json::from_str::<TabAttachParams>(
-        r#"{"lease":"l","tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b"}"#
+        r#"{"tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b"}"#
     )
     .is_err());
 }
 
-/// The lease is accepted and ignored, so a client that holds none omits
-/// the key entirely — `null` is not what a pre-`open_input` session,
-/// which decodes it as a required `String`, can read.
+/// `focus` is a plain always-serialized bool, and an absent key is a
+/// focused attach — the one default a watcher has to override to avoid
+/// resizing the tab someone else is typing in.
 #[test]
-fn tab_attach_params_omit_an_absent_lease() {
-    let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b"}"#,
-    )
-    .expect("an attach with no lease at all decodes");
-    assert_eq!(decoded.lease, None);
-    assert_eq!(
-        serde_json::to_string(&decoded).unwrap(),
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"libghostty_build":"b"}"#
-    );
-}
-
-/// The compatibility guarantee `focus` is built around: a focused
-/// attach — the default, and what every client sends today — serializes
-/// to **no key at all**, so a new client's request stays byte-identical
-/// against a session that predates `open_input` and
-/// `deny_unknown_fields`-refuses anything it has not heard of. Only
-/// `false`, which a client sends only to a session advertising the
-/// feature, appears on the wire.
-#[test]
-fn tab_attach_params_omit_a_focused_attach_and_spell_out_an_unfocused_one() {
+fn tab_attach_params_default_a_focused_attach_and_always_spell_it_out() {
     const NO_FOCUS_KEY: &str =
         r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b"}"#;
 
     let decoded: TabAttachParams = serde_json::from_str(NO_FOCUS_KEY).expect("a missing key");
     assert!(decoded.focus, "an absent `focus` is a focused attach");
-    assert!(
-        !serde_json::to_string(&decoded).unwrap().contains("focus"),
-        "a focused attach carries no `focus` key"
+    assert_eq!(
+        serde_json::to_string(&decoded).unwrap(),
+        concat!(
+            r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"#,
+            r#""libghostty_build":"b","focus":true}"#
+        )
     );
 
     let decoded: TabAttachParams = serde_json::from_str(
@@ -637,9 +585,9 @@ fn tab_attach_result_matches_its_golden_json() {
 
 #[test]
 fn attach_handshake_matches_its_golden_json() {
-    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":4}"#;
+    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":5}"#;
     const RESUME: &str = concat!(
-        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":4,"#,
+        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":5,"#,
         r#""resume_from_seq":901,"server_epoch":6032428321756423947,"#,
         r#""tab_generation":3}"#,
     );
@@ -788,26 +736,6 @@ fn attach_mode_is_a_lowercase_string() {
         AttachMode::Resume
     );
     assert!(serde_json::from_str::<AttachMode>(r#""Snapshot""#).is_err());
-}
-
-#[test]
-fn session_connect_vectors_decode_into_their_typed_shapes() {
-    let raw = read_vector("session.connect.request.json");
-    let request: roost_ipc::messages::RawRequest =
-        serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_CONNECT);
-    let params: SessionConnectParams =
-        serde_json::from_value(request.params).expect("decode connect params");
-    assert!(params.takeover);
-
-    let raw = read_vector("session.connect.response.json");
-    let resp: roost_ipc::messages::Response =
-        serde_json::from_str(&raw).expect("decode response envelope");
-    assert!(resp.ok);
-    let result: SessionConnectResult =
-        serde_json::from_value(resp.result.expect("result body")).expect("decode connect result");
-    assert_eq!(result.lease, LEASE);
-    assert_eq!(result.revision, 42);
 }
 
 #[test]
@@ -967,74 +895,7 @@ fn session_stopping_vector_decodes_into_its_typed_shape() {
     let data: SessionStoppingEvent =
         serde_json::from_value(envelope.data).expect("decode stopping data");
     assert_eq!(data.reason, "stop");
-
-    // The other half of the published vocabulary. Both are terminal;
-    // only the retry advice differs.
-    let taken_over: SessionStoppingEvent =
-        serde_json::from_str(r#"{"reason":"taken-over"}"#).unwrap();
-    assert_eq!(taken_over.reason, "taken-over");
-    round_trip(&taken_over);
-}
-
-/// Non-terminal by construction: it carries no revision (so the gap
-/// check skips it) and the stream is defined to continue after it —
-/// the whole point of the R1 re-cut.
-#[test]
-fn session_driver_changed_vector_decodes_into_its_typed_shape() {
-    let raw = read_vector("session.driver_changed.event.json");
-    let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
-    assert_eq!(envelope.event, SESSION_DRIVER_CHANGED_EVENT);
-    let data: SessionDriverChangedEvent =
-        serde_json::from_value(envelope.data).expect("decode driver-changed data");
-    assert_eq!(data.taken_by, "kestrel.local");
     round_trip(&data);
-    assert_eq!(
-        serde_json::to_string(&data).unwrap(),
-        r#"{"taken_by":"kestrel.local"}"#
-    );
-
-    // A claimant that stated no label still produces an envelope; the
-    // server substitutes the fallback rather than omitting the key.
-    let unlabeled: SessionDriverChangedEvent =
-        serde_json::from_str(r#"{"taken_by":"unknown client"}"#).unwrap();
-    assert_eq!(unlabeled.taken_by, "unknown client");
-}
-
-/// The labeled variant of the connect request — an additive vector
-/// beside the unlabeled one rather than an edit of it, which is what
-/// "never edit an existing vector" means in practice.
-#[test]
-fn labeled_session_connect_vector_decodes_into_its_typed_shape() {
-    let raw = read_vector("session.connect.labeled.request.json");
-    let request: roost_ipc::messages::RawRequest =
-        serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_CONNECT);
-    let params: SessionConnectParams =
-        serde_json::from_value(request.params).expect("decode connect params");
-    assert!(params.takeover);
-    assert_eq!(params.client_label.as_deref(), Some("kestrel.local"));
-}
-
-/// `features` is an open list with a client-side default: a `3`
-/// session sends no such key and must still decode, and a newer
-/// session's unrecognized entries survive rather than becoming a
-/// decode error (the `payload_kinds` contract, applied to ops).
-#[test]
-fn session_identify_features_default_when_absent_and_preserve_unknowns() {
-    let v3 = decode_identify_vector(&identify_vector_name(SESSION_PROTOCOL_VERSION - 1));
-    assert!(
-        v3.features.is_empty(),
-        "a pre-features generation must decode, not fail"
-    );
-
-    let newer: SessionIdentify = serde_json::from_str(
-        r#"{"app_version":"0.0.99","session_protocol":9,"payload_kinds":["vt"],
-            "features":["put_file","teleport"],"libghostty_build":"b",
-            "session_id":"s","started_at":"t"}"#,
-    )
-    .unwrap();
-    assert_eq!(newer.features, vec!["put_file", "teleport"]);
-    round_trip(&newer);
 }
 
 #[test]
@@ -1136,7 +997,6 @@ fn session_set_theme_vectors_decode_into_their_typed_shapes() {
     assert_eq!(request.op, roost_ipc::messages::ops::SESSION_SET_THEME);
     let params: SessionSetThemeParams =
         serde_json::from_value(request.params).expect("decode set_theme params");
-    assert_eq!(params.lease, LEASE);
     assert_eq!(params.osc_colors.foreground, "#ffffff");
     assert_eq!(params.osc_colors.background, "#1c1c1c");
     assert_eq!(params.osc_colors.cursor, "#98989d");
@@ -1168,14 +1028,12 @@ fn session_set_theme_params_reject_unknown_fields() {
     });
     assert!(
         serde_json::from_value::<SessionSetThemeParams>(serde_json::json!({
-            "lease": LEASE,
             "osc_colors": colors.clone(),
         }))
         .is_ok()
     );
     assert!(
         serde_json::from_value::<SessionSetThemeParams>(serde_json::json!({
-            "lease": LEASE,
             "osc_colors": colors,
             "tab_id": "5",
         }))
@@ -1195,7 +1053,6 @@ fn session_set_focus_vectors_decode_into_their_typed_shapes() {
     assert_eq!(request.op, roost_ipc::messages::ops::SESSION_SET_FOCUS);
     let params: SessionSetFocusParams =
         serde_json::from_value(request.params).expect("decode set_focus params");
-    assert_eq!(params.lease, LEASE);
     // The wire spelling is `string_int64`, like every other tab id.
     assert_eq!(params.focused_tab_id, Some(5));
     round_trip(&params);
@@ -1225,16 +1082,13 @@ fn session_set_focus_vectors_decode_into_their_typed_shapes() {
 #[test]
 fn session_set_focus_requires_the_field_it_lets_be_null() {
     let null: SessionSetFocusParams = serde_json::from_value(serde_json::json!({
-        "lease": LEASE,
         "focused_tab_id": null,
     }))
     .expect("an explicit null is a statement");
     assert_eq!(null.focused_tab_id, None);
 
-    let missing = serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-        "lease": LEASE,
-    }))
-    .expect_err("an omitted focused_tab_id must not decode");
+    let missing = serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({}))
+        .expect_err("an omitted focused_tab_id must not decode");
     assert!(
         missing.to_string().contains("missing field"),
         "the refusal has to name the missing field so the server answers \
@@ -1245,15 +1099,14 @@ fn session_set_focus_requires_the_field_it_lets_be_null() {
     // built from this type cannot emit the omission either.
     assert_eq!(
         serde_json::to_value(&null).expect("serialize"),
-        serde_json::json!({"lease": LEASE, "focused_tab_id": null}),
+        serde_json::json!({"focused_tab_id": null}),
     );
     let some = SessionSetFocusParams {
-        lease: LEASE.into(),
         focused_tab_id: Some(7),
     };
     assert_eq!(
         serde_json::to_value(&some).expect("serialize"),
-        serde_json::json!({"lease": LEASE, "focused_tab_id": "7"}),
+        serde_json::json!({"focused_tab_id": "7"}),
     );
 }
 
@@ -1263,7 +1116,6 @@ fn session_set_focus_requires_the_field_it_lets_be_null() {
 fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
     assert!(
         serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "lease": LEASE,
             "focused_tab_id": "5",
             "project_id": "1",
         }))
@@ -1271,14 +1123,12 @@ fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
     );
     assert!(
         serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "lease": LEASE,
             "focused_tab_id": "h3.7",
         }))
         .is_err()
     );
     assert!(
         serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "lease": LEASE,
             "focused_tab_id": 5,
         }))
         .is_err()
@@ -1300,7 +1150,6 @@ fn session_set_agent_hooks_vectors_decode_into_their_typed_shapes() {
     );
     let params: SessionSetAgentHooksParams =
         serde_json::from_value(request.params).expect("decode set_agent_hooks params");
-    assert_eq!(params.lease, LEASE);
     assert_eq!(params.mode, AgentHooksMode::Auto);
     assert_eq!(params.skip, vec!["cursor".to_string()]);
     assert_eq!(params.client, "charlie-mbp");
@@ -1350,7 +1199,6 @@ fn session_set_agent_hooks_vectors_decode_into_their_typed_shapes() {
 #[test]
 fn session_set_agent_hooks_params_are_strict_about_mode_and_shape() {
     let ok = serde_json::json!({
-        "lease": LEASE,
         "mode": "off",
         "skip": [],
         "client": "charlie-mbp",
@@ -1358,9 +1206,9 @@ fn session_set_agent_hooks_params_are_strict_about_mode_and_shape() {
     assert!(serde_json::from_value::<SessionSetAgentHooksParams>(ok).is_ok());
 
     for bad in [
-        serde_json::json!({"lease": LEASE, "mode": "Auto", "client": "c"}),
-        serde_json::json!({"lease": LEASE, "mode": "on", "client": "c"}),
-        serde_json::json!({"lease": LEASE, "mode": true, "client": "c"}),
+        serde_json::json!({"mode": "Auto", "client": "c"}),
+        serde_json::json!({"mode": "on", "client": "c"}),
+        serde_json::json!({"mode": true, "client": "c"}),
     ] {
         assert!(
             serde_json::from_value::<SessionSetAgentHooksParams>(bad.clone()).is_err(),
@@ -1370,7 +1218,6 @@ fn session_set_agent_hooks_params_are_strict_about_mode_and_shape() {
 
     // `client` is required — the host's record has to name who asked.
     let missing = serde_json::from_value::<SessionSetAgentHooksParams>(serde_json::json!({
-        "lease": LEASE,
         "mode": "auto",
     }))
     .expect_err("an omitted client must not decode");
@@ -1380,7 +1227,6 @@ fn session_set_agent_hooks_params_are_strict_about_mode_and_shape() {
     // ordinary case, and demanding an empty array would break nothing
     // except hand-written requests.
     let bare: SessionSetAgentHooksParams = serde_json::from_value(serde_json::json!({
-        "lease": LEASE,
         "mode": "auto",
         "client": "charlie-mbp",
     }))
@@ -1389,7 +1235,6 @@ fn session_set_agent_hooks_params_are_strict_about_mode_and_shape() {
 
     assert!(
         serde_json::from_value::<SessionSetAgentHooksParams>(serde_json::json!({
-            "lease": LEASE,
             "mode": "auto",
             "client": "charlie-mbp",
             "tab_id": "5",
@@ -1663,12 +1508,8 @@ fn the_put_file_cap_base64s_inside_one_frame() {
 
 #[test]
 fn session_put_file_shapes_match_their_golden_json() {
-    const PARAMS: &str = concat!(
-        r#"{"lease":"9f2c1d7a4b6e08315c0d9a72e4f16b83","#,
-        r#""name":"shot.png","data":"aGVsbG8="}"#,
-    );
+    const PARAMS: &str = r#"{"name":"shot.png","data":"aGVsbG8="}"#;
     let params = SessionPutFileParams {
-        lease: LEASE.into(),
         name: "shot.png".into(),
         data: b"hello".to_vec(),
     };
@@ -1682,15 +1523,12 @@ fn session_put_file_shapes_match_their_golden_json() {
     // Strict like every other request type: a caller that misspells a
     // field is refused, not served with the field ignored.
     assert!(serde_json::from_str::<SessionPutFileParams>(
-        r#"{"lease":"l","name":"a.png","data":"aGVsbG8=","mode":"0600"}"#
+        r#"{"name":"a.png","data":"aGVsbG8=","mode":"0600"}"#
     )
     .is_err());
     // Malformed base64 is a decode failure, so the engine never sees a
     // half-decoded payload.
-    assert!(serde_json::from_str::<SessionPutFileParams>(
-        r#"{"lease":"l","name":"a","data":"!!"}"#
-    )
-    .is_err());
+    assert!(serde_json::from_str::<SessionPutFileParams>(r#"{"name":"a","data":"!!"}"#).is_err());
 
     const RESULT: &str =
         r#"{"path":"/home/c/.cache/roost-session/files/4b9d1e7f0a3c5e21/shot.png","bytes":482113}"#;
@@ -1856,10 +1694,9 @@ fn decode_request_vector(name: &str) -> serde_json::Value {
 /// server's `deny_unknown_fields` would refuse the whole request.
 #[test]
 fn events_subscribe_omits_the_resume_keys_when_they_are_unset() {
-    const GOLDEN: &str = r#"{"lease":"9f2c1d7a","tab_id_filter":"0"}"#;
+    const GOLDEN: &str = r#"{"tab_id_filter":"0"}"#;
 
     let plain = EventsSubscribeParams {
-        lease: "9f2c1d7a".into(),
         tab_id_filter: 0,
         from_revision: None,
         session_id: None,
@@ -1876,10 +1713,9 @@ fn events_subscribe_omits_the_resume_keys_when_they_are_unset() {
 
     // Still strict: additive optional fields are not a licence for
     // arbitrary keys.
-    let error = serde_json::from_str::<EventsSubscribeParams>(
-        r#"{"lease":"a","tab_id_filter":"0","from_rev":9}"#,
-    )
-    .expect_err("an unknown key must be refused");
+    let error =
+        serde_json::from_str::<EventsSubscribeParams>(r#"{"tab_id_filter":"0","from_rev":9}"#)
+            .expect_err("an unknown key must be refused");
     assert!(
         error.to_string().contains("unknown field"),
         "unexpected error: {error}"
@@ -1892,7 +1728,6 @@ fn events_subscribe_omits_the_resume_keys_when_they_are_unset() {
 #[test]
 fn events_subscribe_resume_matches_its_vector() {
     let resume = EventsSubscribeParams {
-        lease: "9f2c1d7a4b6e08315c0d9a72e4f16b83".into(),
         tab_id_filter: 0,
         from_revision: Some(1180),
         session_id: Some("01K3S8TQ4F0Q9YB2K6WZ5D7XN".into()),

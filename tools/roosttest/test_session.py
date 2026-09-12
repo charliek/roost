@@ -44,7 +44,6 @@ from eventstream import EventStream
 # of `osc52` here.
 from test_session_effects import (
     batches_through,
-    connect_lease,
     next_effect,
     osc52,
     quiet_tab,
@@ -1011,11 +1010,10 @@ def test_a_resume_never_re_lives_the_effects_in_its_gap(env):
 
     with env.client() as client:
         session_id = client.call("session.identify")["session_id"]
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
-        with EventStream(env.socket, lease=lease) as stream:
+        with EventStream(env.socket) as stream:
             fence = stream.subscribe()
             client.tab_feed_pty_bytes(tab, osc52(b"live, before the gap"))
             data, fence = next_effect(stream, fence)
@@ -1030,7 +1028,7 @@ def test_a_resume_never_re_lives_the_effects_in_its_gap(env):
         client.set_title(tab, "renamed-in-the-gap")
         gap_end = revision_beyond(client, effect_revision, "the gap's title change to commit")
 
-        with EventStream(env.socket, lease=lease) as resumed:
+        with EventStream(env.socket) as resumed:
             assert resumed.subscribe(from_revision=fence, session_id=session_id) == fence
 
             replayed = batches_through(resumed, gap_end)

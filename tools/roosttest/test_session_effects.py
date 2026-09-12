@@ -92,17 +92,6 @@ def first_project(client: Roost) -> int:
     return int(client.list()[0]["id"])
 
 
-def connect_lease(client: Roost, takeover: bool = False, label: str | None = None) -> str:
-    """`session.connect`, which gates nothing and displaces nobody.
-
-    The op is inert and retired at protocol 5; the token it answers with
-    is returned only because the `lease` field is still on the wire."""
-    params: dict = {"takeover": takeover}
-    if label is not None:
-        params["client_label"] = label
-    return client.call("session.connect", params)["lease"]
-
-
 def quiet_tab(client: Roost, project: int, cwd) -> int:
     """A tab parked on a child that never writes anything, so every byte
     in its stream is one this test put there."""
@@ -152,11 +141,10 @@ def test_a_bell_and_a_clipboard_write_arrive_as_tab_effect_events(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
-        with EventStream(env.socket, lease=lease) as stream:
+        with EventStream(env.socket) as stream:
             fence = stream.subscribe()
 
             # A bare BEL rings. The OSC that follows it ends with a BEL
@@ -218,9 +206,7 @@ def test_two_streams_receive_the_same_effect(env):
     A session has no view of its own, so it cannot decide whose bell a
     bell is or whose clipboard an OSC 52 write is for: it publishes the
     fact in commit order and each client applies it to the tab it is
-    showing (the viewed-tab rule, unit-tested client-side). The second
-    stream here presents nothing at all — under the retired lease that
-    made it an "observer" and the effect reached it as an empty batch.
+    showing (the viewed-tab rule, unit-tested client-side).
 
     Asserted on the *payload*, not just the event name: a fan-out that
     delivered a different revision, or a different tab, would be a
@@ -358,14 +344,13 @@ def test_set_theme_changes_what_a_color_query_is_answered_with(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
         # The headless default is white on black.
         expect_background(client, tab, "0000/0000/0000")
 
-        result = client.call("session.set_theme", {"lease": lease, "osc_colors": theme()})
+        result = client.call("session.set_theme", {"osc_colors": theme()})
         # Every live tab, not just the one this test opened — the
         # hydrated layout brought its own, and a theme that reached only
         # the newest tab would leave the rest on the headless default.
@@ -382,7 +367,7 @@ def test_set_theme_changes_what_a_color_query_is_answered_with(env):
         # Last writer wins, and it is a whole theme each time.
         client.call(
             "session.set_theme",
-            {"lease": lease, "osc_colors": theme(background="#0a0b0c")},
+            {"osc_colors": theme(background="#0a0b0c")},
         )
         expect_background(client, tab, "0a0a/0b0b/0c0c")
 
@@ -394,9 +379,7 @@ def test_set_theme_validates_its_palette(env):
     applied halfway.
 
     No authority is asked for: `set_theme` is same-UID and
-    last-writer-wins, so a client that never announced itself may state
-    the palette too — the first call below is made on a plain connection
-    for exactly that reason.
+    last-writer-wins.
     """
     started(env)
 
@@ -404,12 +387,12 @@ def test_set_theme_validates_its_palette(env):
         short = theme()
         short["palette"] = short["palette"][:8]
         with pytest.raises(RoostError) as bad:
-            client.call("session.set_theme", {"lease": "", "osc_colors": short})
+            client.call("session.set_theme", {"osc_colors": short})
         assert bad.value.code == "invalid-param", bad.value
 
         malformed = theme(background="rgb:1c/2b/3a")
         with pytest.raises(RoostError) as unparsed:
-            client.call("session.set_theme", {"lease": "", "osc_colors": malformed})
+            client.call("session.set_theme", {"osc_colors": malformed})
         assert unparsed.value.code == "invalid-param", unparsed.value
 
         client.call("session.stop")
@@ -455,68 +438,38 @@ def wait_for_sink(sink: Path, what: str) -> None:
     )
 
 
-def test_a_session_write_needs_no_lease(env):
-    """Writing into a tab takes no lease (plan 057, R15): same-UID is the
-    whole boundary.
+def test_a_session_socket_write_reaches_the_child(env):
+    """A session socket serves `tab.write`, over IPC and through the real
+    `roostctl`, and the bytes land in the child.
 
-    Each variant — no field, an empty one, and one this session never
-    issued — gets **its own tab and its own sink**, because one shared
-    sink could only ever prove the first write landed.
+    Two writers because they are two code paths: the harness client
+    builds the frame itself, the CLI builds it from argv. Each gets its
+    own tab and its own sink — one sink copies [`TYPED`] once and stops,
+    so a shared one could only ever prove the first write landed.
     """
     started(env)
 
     with env.client() as client:
-        for name, presented in (
-            ("unleased", None),
-            ("empty", ""),
-            ("unknown", "0" * 32),
-        ):
-            tab, sink = a_tab_with_a_sink(env, client, name)
-            client.send(tab, TYPED, lease=presented)
-            wait_for_sink(sink, f"the child to receive the {name} write")
-            assert sink.read_bytes() == TYPED, name
+        tab, sink = a_tab_with_a_sink(env, client, "ipc")
+        client.send(tab, TYPED)
+        wait_for_sink(sink, "the child to receive the IPC write")
+        assert sink.read_bytes() == TYPED
 
-    env.stop_over_the_wire()
-
-
-def test_roostctl_tab_send_into_a_session_needs_no_lease(env):
-    """The CLI half of the same rule, through the real binary.
-
-    `roostctl tab send` against a session socket used to need a
-    credential in `ROOST_LEASE`. There is nothing to present now — the
-    write is admitted on the socket's own same-UID boundary.
-
-    The unset variable is the fixture's guarantee, not the developer's
-    shell (`session.py`'s `_SANITIZE`); asserted here because it is the
-    precondition the whole case rests on.
-    """
-    started(env)
-
-    assert "ROOST_LEASE" not in env.command_env()
-
-    with env.client() as client:
-        tab, sink = a_tab_with_a_sink(env, client, "roostctl")
-
+        cli_tab, cli_sink = a_tab_with_a_sink(env, client, "roostctl")
         # `--socket` is roostctl's, not `tab send`'s, and `--bytes` is
         # required — the escape-decoding form, which this marker passes
         # through unchanged.
         result = env.roostctl(
             "--socket", str(env.socket),
             "tab", "send",
-            "--tab", str(tab),
+            "--tab", str(cli_tab),
             "--bytes", TYPED.decode(),
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
-
-        wait_for_sink(sink, "the child to receive the CLI's write")
-        assert sink.read_bytes() == TYPED
+        wait_for_sink(cli_sink, "the child to receive the CLI's write")
+        assert cli_sink.read_bytes() == TYPED
 
     env.stop_over_the_wire()
-
-
-# ---------------------------------------------------------------------------
-# 3. The build-mismatch seam
-# ---------------------------------------------------------------------------
 
 
 def test_a_fake_build_is_reported_and_enforced_at_attach(env):
@@ -536,7 +489,6 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
         identity = client.call("session.identify")
         assert identity["libghostty_build"] == FAKE_BUILD, identity
 
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
@@ -544,7 +496,6 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
             return client.call(
                 "tab.attach",
                 {
-                    "lease": lease,
                     "tab_id": str(tab),
                     "kinds": ["ghostty-snapshot"],
                     "cols": COLS,
@@ -589,13 +540,13 @@ def test_the_fake_build_override_is_ignored_outside_test_mode(env):
 # ---------------------------------------------------------------------------
 
 
-def set_focus(client: Roost, lease: str, tab: int | None) -> None:
+def set_focus(client: Roost, tab: int | None) -> None:
     """State what the attached client is looking at. `None` is an
     explicit JSON null — the field is required, and null is a statement
     ("nothing here") rather than an omission."""
     result = client.call(
         "session.set_focus",
-        {"lease": lease, "focused_tab_id": None if tab is None else str(tab)},
+        {"focused_tab_id": None if tab is None else str(tab)},
     )
     assert result == {}, result
 
@@ -656,26 +607,25 @@ def test_set_focus_moves_which_tab_a_session_mutes(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         watched = quiet_tab(client, project, env.launch_cwd)
         other = quiet_tab(client, project, env.launch_cwd)
 
-        with EventStream(env.socket, lease=lease) as stream:
+        with EventStream(env.socket) as stream:
             stream.subscribe()
 
-            set_focus(client, lease, watched)
+            set_focus(client, watched)
             assert_muted(stream, client, muted=watched, heard=other)
 
             # Null is the other half of the statement: the window lost
             # focus, or its selection moved off this session, and the tab
             # that was muted goes back to raising.
-            set_focus(client, lease, None)
+            set_focus(client, None)
             client.notify(watched, "unmuted")
             assert next_fired(stream)["tab_id"] == str(watched)
 
             # And the mute follows the client's eye, tab for tab.
-            set_focus(client, lease, other)
+            set_focus(client, other)
             assert_muted(stream, client, muted=other, heard=watched)
 
         client.call("session.stop")
@@ -693,21 +643,20 @@ def test_a_reported_focus_does_not_outlive_the_client_that_reported_it(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         watched = quiet_tab(client, project, env.launch_cwd)
         other = quiet_tab(client, project, env.launch_cwd)
 
-        with EventStream(env.socket, lease=lease) as stream:
+        with EventStream(env.socket) as stream:
             stream.subscribe()
-            set_focus(client, lease, watched)
+            set_focus(client, watched)
             assert_muted(stream, client, muted=watched, heard=other)
 
     # Both of that client's connections are closed now: the control one
     # (which sent the `set_focus`) and the subscriber. Nobody is looking
     # at this session any more.
     with env.client() as client:
-        with EventStream(env.socket, lease=lease) as stream:
+        with EventStream(env.socket) as stream:
             stream.subscribe()
 
             # The reset lands when the server notices the closed sockets,
@@ -717,7 +666,7 @@ def test_a_reported_focus_does_not_outlive_the_client_that_reported_it(env):
 
             # And a client coming back re-states it, which is what a
             # reconnecting UI does the moment it reaches Connected.
-            set_focus(client, lease, watched)
+            set_focus(client, watched)
             assert_muted(stream, client, muted=watched, heard=other)
 
         client.call("session.stop")
@@ -737,17 +686,16 @@ def test_two_clients_settle_with_no_focus_churn(env):
     started(env)
 
     with env.client() as a, env.client() as b:
-        lease = connect_lease(a)
         project = first_project(a)
         watched_a = quiet_tab(a, project, env.launch_cwd)
         watched_b = quiet_tab(a, project, env.launch_cwd)
         loud = quiet_tab(a, project, env.launch_cwd)
 
-        with EventStream(env.socket, lease=lease) as stream:
+        with EventStream(env.socket) as stream:
             fence = stream.subscribe()
 
-            set_focus(a, lease, watched_a)
-            set_focus(b, lease, watched_b)
+            set_focus(a, watched_a)
+            set_focus(b, watched_b)
 
             a.notify(watched_a, "muted")
             b.notify(watched_b, "muted")
@@ -784,12 +732,12 @@ def test_set_focus_needs_a_tab_that_exists_and_a_field_that_is_present(env):
         tab = quiet_tab(client, project, env.launch_cwd)
 
         with pytest.raises(RoostError) as missing:
-            client.call("session.set_focus", {"lease": ""})
+            client.call("session.set_focus", {})
         assert missing.value.code == "missing-param", missing.value
 
         with pytest.raises(RoostError) as gone:
             client.call(
-                "session.set_focus", {"lease": "", "focused_tab_id": str(tab + 9999)}
+                "session.set_focus", {"focused_tab_id": str(tab + 9999)}
             )
         assert gone.value.code == "not-found", gone.value
 

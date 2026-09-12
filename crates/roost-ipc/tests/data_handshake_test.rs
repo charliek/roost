@@ -470,10 +470,10 @@ async fn closing_a_push_connection_writes_one_labeled_envelope() {
     );
 
     let closer = served.closer().await;
-    assert!(closer.close(CloseReason::TakenOver));
+    assert!(closer.close(CloseReason::ShuttingDown));
     // One-shot: the first reason wins and a later one is a no-op.
     assert!(!closer.close(CloseReason::ShuttingDown));
-    assert_eq!(closer.reason(), Some(CloseReason::TakenOver));
+    assert_eq!(closer.reason(), Some(CloseReason::ShuttingDown));
 
     let stopping = read_json_line(&mut reader).await;
     assert_eq!(
@@ -481,7 +481,7 @@ async fn closing_a_push_connection_writes_one_labeled_envelope() {
         serde_json::json!(SESSION_STOPPING_EVENT),
         "the last frame names why the stream ended"
     );
-    assert_eq!(stopping["data"]["reason"], serde_json::json!("taken-over"));
+    assert_eq!(stopping["data"]["reason"], serde_json::json!("stop"));
     assert!(
         stopping.get("revision").is_none(),
         "the control envelope carries no revision — it is exempt from the gap check"
@@ -557,7 +557,7 @@ async fn closing_a_data_connection_ends_it_even_when_the_handler_ignores_the_wat
         serde_json::json!(true)
     );
 
-    served.closer().await.close(CloseReason::TakenOver);
+    served.closer().await.close(CloseReason::ShuttingDown);
     let eof = tokio::time::timeout(TIMEOUT, reader.read_line())
         .await
         .expect("the server ends the connection within the close deadline")

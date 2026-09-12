@@ -20,11 +20,10 @@ use std::time::{Duration, Instant};
 
 use roost_engine::single_instance::{self, InstanceLocks};
 use roost_ipc::messages::{
-    ops, IdentifyParams, IdentifyResult, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionStopParams, SessionStopResult, Tab,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabFeedPtyBytesParams, TabListResult, TabOpenParams, TabOpenResult, TabResizeParams,
-    TabSetTitleParams, WireTabRef,
+    ops, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams, SessionStopParams,
+    SessionStopResult, Tab, TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult,
+    TabDumpResult, TabFeedPtyBytesParams, TabListResult, TabOpenParams, TabOpenResult,
+    TabResizeParams, TabSetTitleParams, WireTabRef,
 };
 use roost_ipc::IpcClient;
 use roost_session::{Readiness, SessionConfig};
@@ -216,22 +215,6 @@ pub async fn session_identify(client: &mut IpcClient) -> SessionIdentify {
         .call(ops::SESSION_IDENTIFY, SessionIdentifyParams {})
         .await
         .expect("session.identify")
-}
-
-/// Run `session.connect`. It gates nothing and displaces nobody — the
-/// op is inert and retired at protocol 5; the token it answers with is
-/// echoed back only because the field is still on the wire.
-pub async fn session_connect(client: &mut IpcClient) -> SessionConnectResult {
-    client
-        .call(
-            ops::SESSION_CONNECT,
-            SessionConnectParams {
-                takeover: true,
-                client_label: None,
-            },
-        )
-        .await
-        .expect("session.connect")
 }
 
 pub async fn session_stop(client: &mut IpcClient) -> SessionStopResult {

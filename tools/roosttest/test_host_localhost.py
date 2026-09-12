@@ -493,12 +493,8 @@ def test_a_killed_session_started_again_comes_back_connected(ground: Ground):
     dies with no envelope at all — and nothing here asks the UI to
     reconnect, so what lands the host is the schedule.
 
-    The failure this pins is the one the lease left behind: a scheduled
-    attempt used to present the lease its predecessor held, and a session
-    that had never issued it refused — so the host settled as somebody
-    else's and watched a session nobody was driving. A restarted session
-    is simply a different session now, and the band says so by naming its
-    id.
+    A restarted session is simply a different session, and the band says
+    so by naming its id.
     """
     first = ground.start_daemon()
     ground.host.connect_and_wait()

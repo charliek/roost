@@ -493,13 +493,9 @@ async fn three_concurrent_streams_are_each_delivered_in_full() {
 /// **Every subscriber receives every effect.** One bell, two streams,
 /// the same envelope on both — same tab, same revision, same commit.
 ///
-/// The two streams are deliberately asymmetric in the one way that used
-/// to decide this: the first presents the token `session.connect` mints
-/// and the second presents nothing at all. Under the retired lease that
-/// made the second an *observer* and stripped `tab.effect` out of its
-/// batch; a session has no view of its own, so which client a bell or an
-/// OSC 52 write is for is now the viewing client's question, answered
-/// where the tab is on screen.
+/// A session has no view of its own, so which client a bell or an OSC 52
+/// write is for is the viewing client's question, answered where the tab
+/// is on screen — not the wire's, which fans every effect out.
 #[cfg(feature = "server-vt")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_stream_receives_the_same_effect() {
@@ -509,20 +505,8 @@ async fn every_stream_receives_the_same_effect() {
     let project = h.workspace.create_project("p", "/tmp").unwrap();
     let tab = h.workspace.open_tab(project.id, "/tmp", "sh").unwrap();
 
-    let mut client = IpcClient::connect(&h.socket).await.expect("connect");
-    let connected: roost_ipc::messages::SessionConnectResult = client
-        .call(ops::SESSION_CONNECT, serde_json::json!({"takeover": true}))
-        .await
-        .expect("session.connect");
-
     let (mut holder, mut hw) = h.dial().await;
-    request(
-        &mut hw,
-        1,
-        ops::EVENTS_SUBSCRIBE,
-        serde_json::json!({"lease": connected.lease}),
-    )
-    .await;
+    request(&mut hw, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
     let ack = read_frame(&mut holder).await;
     assert_eq!(ack["ok"], serde_json::json!(true), "ack: {ack}");
 
@@ -537,7 +521,7 @@ async fn every_stream_receives_the_same_effect() {
     assert_eq!(
         names(&second),
         vec![ops::EVENT_TAB_EFFECT],
-        "a subscriber that presented nothing gets the bell too: {second:?}"
+        "the second subscriber gets the bell too: {second:?}"
     );
     assert_eq!(first.revision, second.revision);
     assert_eq!(

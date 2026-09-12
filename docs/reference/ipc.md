@@ -2075,9 +2075,8 @@ Params: `{}`. Response:
 ```json
 {
   "app_version": "0.0.18",
-  "session_protocol": 4,
+  "session_protocol": 5,
   "payload_kinds": ["ghostty-snapshot", "vt"],
-  "features": ["put_file", "events_resume", "tab_dump_scrollback", "open_input"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
   "started_at": "2026-08-27T14:03:11Z"
@@ -3221,7 +3220,7 @@ is the UI socket's schema version — currently **`1`**
 (`roost_ipc::PROTOCOL_VERSION`); it is reported by
 [`identify`](#identify) but nothing compares it, so the UI socket has no
 handshake gate. `session.identify.session_protocol` is the session
-sockets' — currently **`4`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
+sockets' — currently **`5`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
 covering both the session JSON ops and the binary [data
 plane](#data-plane); conforming clients check it for equality before
 anything else and the [attach handshake](#tabattach) refuses a mismatch.

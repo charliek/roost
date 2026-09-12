@@ -36,13 +36,11 @@ STOPPING_EVENT = "session.stopping"
 
 
 class EventStream:
-    """One subscribed connection. Open it with the lease a
-    `session.connect` handed out, [`subscribe`], then [`recv_frame`]
-    until the test has what it needs."""
+    """One subscribed connection. Open it, [`subscribe`], then
+    [`recv_frame`] until the test has what it needs."""
 
-    def __init__(self, socket_path, lease: str = "", timeout: float = 15.0):
+    def __init__(self, socket_path, timeout: float = 15.0):
         self.path = str(socket_path)
-        self.lease = lease
         self._buf = b""
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.settimeout(scaled_timeout(timeout))
@@ -69,7 +67,6 @@ class EventStream:
     def subscribe(
         self,
         tab_id_filter: int = 0,
-        lease: str | None = None,
         from_revision: int | None = None,
         session_id: str | None = None,
     ) -> int:
@@ -98,15 +95,12 @@ class EventStream:
         pre-052 session answer a plain subscribe instead of
         `unknown-field`.
 
-        Never refused for want of a lease: every subscriber receives
+        Never refused for want of authority: every subscriber receives
         every event. What still refuses is `tab_id_filter`
         (unimplemented) and a session that has already latched its stop
         (`shutting-down`).
         """
-        params: dict = {
-            "lease": self.lease if lease is None else lease,
-            "tab_id_filter": str(tab_id_filter),
-        }
+        params: dict = {"tab_id_filter": str(tab_id_filter)}
         if from_revision is not None:
             # A plain JSON number: a revision is an in-process counter,
             # not an id, so the string-int convention above does not

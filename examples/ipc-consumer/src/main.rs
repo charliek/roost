@@ -1,11 +1,10 @@
 //! Reference external consumer of `roost-ipc`.
 //!
 //! Dials a Roost UI socket, `identify`s, and polls `tab.list` once a
-//! second until Ctrl-C. Deliberately confined to leaseless UI-socket
-//! ops (`identify`, `tab.list`) — no lease, no `events.subscribe`, no
-//! session-socket ops — so this program keeps working across the lease
-//! and observer changes elsewhere in the protocol. See
-//! `docs/reference/ipc-compatibility.md`.
+//! second until Ctrl-C. Deliberately confined to UI-socket ops
+//! (`identify`, `tab.list`) — no `events.subscribe`, no session-socket
+//! ops — so this program keeps working across host-session protocol
+//! changes. See `docs/reference/ipc-compatibility.md`.
 
 use std::env;
 use std::path::PathBuf;

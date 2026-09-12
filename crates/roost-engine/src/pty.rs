@@ -1557,11 +1557,6 @@ fn build_command(
     // xterm-256color entry), so strict $TERMINFO readers would find no
     // entry for the TERM Roost advertises.
     cmd.env_remove("TERMINFO");
-    // A driver lease is authority over the whole session, and a daemon
-    // launched from a shell that exported one would hand that authority
-    // to every tab it spawns. Nothing in a child needs it: `roostctl`
-    // inside a tab drives the UI through ROOST_SOCKET.
-    cmd.env_remove("ROOST_LEASE");
     // Advertise OSC 8 hyperlink support. Roost renders + opens OSC 8
     // links (Ctrl-click), but the `supports-hyperlinks` library many CLIs
     // gate on — Claude Code, anything on chalk/terminal-link — only

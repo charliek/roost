@@ -51,13 +51,12 @@ from dataplane import DataPlane
 from eventstream import EventStream
 
 # The prologue is the session lane's, unchanged: same daemon, same test
-# mode, same lease + ticket vocabulary. Only the socket a client dials
-# is different here, which is the whole point of the module.
+# mode, same ticket vocabulary. Only the socket a client dials is
+# different here, which is the whole point of the module.
 from test_session_attach import (
     COLS,
     ROWS,
     attach_ticket,
-    connect_lease,
     first_project,
     pty_payload,
     quiet_tab,
@@ -344,8 +343,7 @@ def test_the_bridge_answers_exactly_what_the_socket_does(env, bridge):
     with bridge.client() as client:
         assert client.call("session.identify") == direct
 
-        lease = connect_lease(client)
-        with EventStream(bridge.path, lease=lease) as stream:
+        with EventStream(bridge.path) as stream:
             fence = stream.subscribe()
             project = first_project(client)
             tab = client.open_tab(project, cwd=str(env.launch_cwd), title="through-the-bridge")
@@ -376,7 +374,6 @@ def test_a_full_attach_streams_and_echoes_through_the_bridge(env, bridge):
     """
     started(env)
     with bridge.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         line = marker("BRIDGED")
         tab = client.open_tab(
@@ -387,7 +384,7 @@ def test_a_full_attach_streams_and_echoes_through_the_bridge(env, bridge):
             argv=["/bin/sh", "-c", 'read line; printf "ECHO:%s\\r\\n" "$line"; exit 0'],
         )
 
-        ticket = attach_ticket(client, lease, tab)
+        ticket = attach_ticket(client, tab)
         with DataPlane(bridge.path) as conn:
             reply = conn.handshake(ticket["attach_token"])
             assert reply.ok, (reply.code, reply.message)
@@ -416,17 +413,15 @@ def test_a_killed_bridge_child_leaves_no_wedged_state(env, bridge):
 
     This is the transport failing in the one way a graceful close cannot
     cover: no half-close, no final frame, just a dead pipe. What must
-    survive it is the *server* — the lease it had handed out, the attach
-    it was serving and the tab behind them — so the proof is a second
-    connection that connects, takes the lease back and attaches to the
+    survive it is the *server* — the attach it was serving and the tab
+    behind it — so the proof is a second connection that attaches to the
     same tab.
     """
     started(env)
     with bridge.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
-        ticket = attach_ticket(client, lease, tab)
+        ticket = attach_ticket(client, tab)
         conn = DataPlane(bridge.path)
         assert conn.handshake(ticket["attach_token"]).ok
         conn.read_until_ready()
@@ -437,14 +432,12 @@ def test_a_killed_bridge_child_leaves_no_wedged_state(env, bridge):
         assert conn.drain_to_close(timeout=30.0).kind == "eof"
         conn.close()
 
-    # A fresh connection over a fresh child. `takeover` because the old
-    # lease outlives the transport that carried it — the session cannot
-    # tell a killed bridge from a client that walked away, which is
-    # exactly why the lease is reclaimed rather than assumed free.
+    # A fresh connection over a fresh child. The session cannot tell a
+    # killed bridge from a client that walked away, and at protocol 5 it
+    # does not have to: the next connection is just another connection.
     with bridge.client() as revived:
-        again = connect_lease(revived, takeover=True)
         assert tab in {int(row["id"]) for row in revived.tabs()}
-        ticket = attach_ticket(revived, again, tab)
+        ticket = attach_ticket(revived, tab)
         with DataPlane(bridge.path) as conn:
             assert conn.handshake(ticket["attach_token"]).ok
             conn.read_until_ready()
@@ -484,13 +477,12 @@ def test_each_half_close_ends_the_chain_cleanly(env, bridge):
     # And the session is untouched by one client leaving: the next
     # connection is ordinary.
     with bridge.client() as after:
-        lease = connect_lease(after)
         project = first_project(after)
         tab = quiet_tab(after, project, env.launch_cwd)
 
         # (b) the far end goes away: `session.stop` while a data
         #     connection is attached through the bridge.
-        ticket = attach_ticket(after, lease, tab)
+        ticket = attach_ticket(after, tab)
         conn = DataPlane(bridge.path)
         assert conn.handshake(ticket["attach_token"]).ok
         conn.read_until_ready()

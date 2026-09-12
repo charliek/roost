@@ -190,7 +190,7 @@ class HostUnderTest:
     def connect_and_wait(self, timeout: float = 30.0) -> None:
         result = self.connect()
         # The op reports what was asked for, never the far end's verdict:
-        # waiting for a dial, an identify and a lease before replying
+        # waiting for a dial, an identify and a subscribe before replying
         # would block the caller on a round trip it can watch instead.
         assert result["state"] in ("connecting", "connected"), result
         self.wait_connected(timeout)
@@ -1943,7 +1943,6 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
         reply = scripted.call(
             "session.set_agent_hooks",
             {
-                "lease": "",
                 "mode": "auto",
                 "skip": ["cursor", "gemini"],
                 "client": "roosttest",
@@ -1979,7 +1978,6 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
         again = second.call(
             "session.set_agent_hooks",
             {
-                "lease": "",
                 "mode": "auto",
                 "skip": ["cursor"],
                 "client": "roosttest",
@@ -1989,8 +1987,8 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
     assert again["removed"] == [], again
 
     # Now the real client. Nothing below asks for an unwiring — the UI
-    # reads `agent-hooks = off` out of the harness config and sends it
-    # after its own `session.connect`.
+    # reads `agent-hooks = off` out of the harness config and sends it on
+    # connecting.
     host.connect_and_wait()
     wait_until(
         lambda: wired_agents(jail) == set(),

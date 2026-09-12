@@ -40,20 +40,19 @@ use roost_ipc::messages::{
     PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
-    SessionSetAgentHooksParams, SessionSetAgentHooksResult, SessionSetFocusParams,
-    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
-    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
-    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
-    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
-    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_FEATURES,
-    SESSION_PROTOCOL_VERSION,
+    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
+    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams, SessionStopParams,
+    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams,
+    TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
+    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -1509,10 +1508,6 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::PROJECT_DELETE
             | ops::PROJECT_REORDER
             | ops::NOTIFICATION_CREATE
-            // Inert, and listed anyway: a session that has flushed and
-            // reaped must answer `shutting-down` rather than hand back a
-            // fence for a socket it is about to unlink.
-            | ops::SESSION_CONNECT
             | ops::SESSION_SET_THEME
             | ops::SESSION_SET_FOCUS
             // Not workspace state, but authority-bearing all the same:
@@ -2203,7 +2198,6 @@ async fn dispatch_outcome(
                 app_version: session.info.app_version.clone(),
                 session_protocol: SESSION_PROTOCOL_VERSION,
                 payload_kinds: session.info.payload_kinds.clone(),
-                features: SESSION_FEATURES.iter().map(|f| (*f).to_string()).collect(),
                 libghostty_build: session.info.libghostty_build.clone(),
                 session_id: session.info.session_id.clone(),
                 started_at: session.info.started_at.clone(),
@@ -2246,19 +2240,6 @@ async fn dispatch_outcome(
     // mutate a session that has already flushed and reaped.
     if session.stopping.load(Ordering::Acquire) {
         return Err(shutting_down());
-    }
-
-    // Retained, and inert: the token it answers with grants nothing,
-    // registers nothing and displaces nobody. Every same-UID connection
-    // is already symmetric — the op itself is retired at protocol 5.
-    if op == ops::SESSION_CONNECT {
-        let _p: SessionConnectParams = decode(params)?;
-        let revision = h.workspace.revision();
-        return encode(&SessionConnectResult {
-            lease: random_hex_128(),
-            revision,
-        })
-        .map(HandlerOutcome::Reply);
     }
 
     if op == ops::SESSION_SET_THEME {
@@ -2829,6 +2810,7 @@ fn events_subscribe(
     Ok(HandlerOutcome::ReplyThen {
         reply: encode(&EventsSubscribeResult {
             revision: subscription.revision,
+            session_id: session.info.session_id.clone(),
         })?,
         then: ConnAction::StartPush(subscription.source),
     })

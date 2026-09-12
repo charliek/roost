@@ -27,7 +27,7 @@ type Writer = tokio::net::unix::OwnedWriteHalf;
 /// The write half comes back with it and must be held: the server reads
 /// the push connection only to notice a peer that went away, so dropping
 /// it is indistinguishable from hanging up.
-async fn subscribe(socket_path: &Path, lease: &str) -> (Reader, Writer, u64) {
+async fn subscribe(socket_path: &Path) -> (Reader, Writer, u64) {
     let stream = UnixStream::connect(socket_path)
         .await
         .expect("dial the session socket");
@@ -36,7 +36,7 @@ async fn subscribe(socket_path: &Path, lease: &str) -> (Reader, Writer, u64) {
     let body = serde_json::to_vec(&serde_json::json!({
         "id": "1",
         "op": ops::EVENTS_SUBSCRIBE,
-        "params": {"lease": lease},
+        "params": {},
     }))
     .unwrap();
     write_frame(&mut w, &body).await.expect("write subscribe");
@@ -73,12 +73,11 @@ async fn a_session_pushes_its_commits_and_cuts_the_stream_on_stop() {
     let seeded = support::tabs(&mut client).await;
     let project_id = seeded[0].project_id;
 
-    // A client that never ran `session.connect` still gets a stream,
-    // and the same one every other subscriber gets.
-    let (mut watching, _watch_w, watch_fence) = subscribe(&socket_path, "").await;
-    let lease = support::session_connect(&mut client).await.lease;
+    // Two subscribers, and they get the same stream: the daemon serves
+    // every connection, it does not merely tolerate a second one.
+    let (mut watching, _watch_w, watch_fence) = subscribe(&socket_path).await;
 
-    let (mut reader, _w, fence) = subscribe(&socket_path, &lease).await;
+    let (mut reader, _w, fence) = subscribe(&socket_path).await;
     assert!(fence > 0, "hydration alone commits");
 
     // A real op, on another connection, through the whole daemon.
@@ -110,9 +109,8 @@ async fn a_session_pushes_its_commits_and_cuts_the_stream_on_stop() {
     assert_eq!(opened.data["tab"]["id"], tab.id.to_string());
     assert_eq!(opened.data["tab"]["title"], "watched");
 
-    // The leaseless stream saw the same open, on the same contiguous
-    // sequence — the daemon serves an observer, it does not merely
-    // tolerate one.
+    // The second stream saw the same open, on the same contiguous
+    // sequence.
     let mut expected_watch = watch_fence + 1;
     loop {
         let batch = next_batch(&mut watching).await;

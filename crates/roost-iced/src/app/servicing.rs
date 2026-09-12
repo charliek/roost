@@ -3090,9 +3090,6 @@ impl App {
                 last_connected: host.last_connected,
                 generation: self.hosts.generation(&host.id),
                 state: band.state.wire().to_string(),
-                // Nothing drives a session any more, so nothing names a
-                // driver. The field goes at protocol 5.
-                taken_by: None,
                 // The band's input, untruncated — the ssh failure
                 // families are written as sentences and the rollup
                 // beside them is capped at 60 characters.
@@ -3310,9 +3307,8 @@ mod tests {
 
         for code in [
             "shutting-down",
-            "connect-required",
-            "taken-over",
-            "already-connected",
+            "replay-expired",
+            "session-mismatch",
             "too-many-tokens",
             "a-code-from-a-newer-session",
         ] {

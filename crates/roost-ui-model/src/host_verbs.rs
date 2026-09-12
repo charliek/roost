@@ -170,8 +170,8 @@ impl VerbItem {
 }
 
 /// Whether a host is attached right now. `Connecting` is deliberately
-/// not connected: an attempt in flight holds no lease, so Stop and
-/// Disconnect have nothing to act on yet.
+/// not connected: an attempt in flight has reached no session yet, so
+/// Stop and Disconnect have nothing to act on.
 fn is_connected(state: SectionState) -> bool {
     matches!(state, SectionState::Connected)
 }
@@ -395,7 +395,7 @@ mod tests {
     /// Stop is connected-only and Remove is not-connected-only, stated
     /// as the invariant rather than as a row list: the two must never be
     /// offered together, or the palette would let a user remove the
-    /// registry entry for a session it is holding a lease on.
+    /// registry entry for a session it is still connected to.
     #[test]
     fn stop_and_remove_are_never_offered_at_the_same_time() {
         for state in [

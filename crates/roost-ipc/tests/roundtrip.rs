@@ -51,7 +51,6 @@ fn tab_write_data_round_trips_as_base64() {
     let p = TabWriteParams {
         tab_id: 5,
         data: b"ls -la\n".to_vec(),
-        lease: None,
     };
     let json = round_trip_to_value(&p);
     assert_eq!(

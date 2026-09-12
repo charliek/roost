@@ -32,8 +32,8 @@ use std::time::Duration;
 
 use roost_ipc::client::{ClientError, EventFrame, EventStream, IpcClient, ServerCode};
 use roost_ipc::messages::{
-    ops, EventBatch, OscColorsParams, SessionConnectParams, SessionConnectResult, SessionIdentify,
-    SessionIdentifyParams, SessionSetThemeParams, TabListResult,
+    ops, EventBatch, OscColorsParams, SessionIdentify, SessionIdentifyParams,
+    SessionSetThemeParams, TabListResult,
 };
 use roost_ipc::session_launch;
 use roost_ui_model::keys::HostId;
@@ -391,14 +391,6 @@ fn dial_failure(mode: ConnectMode, socket: &Path, error: &roost_ipc::Error) -> A
 /// A live, subscribed connection.
 struct Live {
     control: IpcClient,
-    /// The token `session.connect` answered with, for the ops whose
-    /// protocol-4 params still declare a required `lease: String`.
-    ///
-    /// Connection-local and inert: the session stopped reading the value
-    /// when every connection became symmetric, nothing here compares it
-    /// and no attempt carries it to the next one. Protocol 5 drops the
-    /// field and this with it.
-    lease: String,
     events: EventRx,
     pump: tokio::task::AbortHandle,
     /// Shared with the UI: written here, read there. Never copied onto
@@ -434,15 +426,6 @@ impl Live {
             "connected to host session"
         );
     }
-}
-
-/// How this client names itself, and the same name
-/// `session.set_agent_hooks` reports — a host's agent record and a
-/// connection's own label are answering the same question ("which of my
-/// machines was that?"), so they must not answer it differently.
-/// Display metadata, never identity: the session authenticates nothing.
-fn host_client_label() -> String {
-    crate::app::agent_hooks::client_label()
 }
 
 /// The ops an older session answers `unknown-op` to, and whether this
@@ -626,9 +609,7 @@ async fn connect_loop(
                     // future being dropped by [`run`]'s grace timer —
                     // that last one runs no code, which is why this is a
                     // `Drop` and not a line after the `await`.
-                    let _lane = config
-                        .uploads
-                        .open(config.socket.clone(), live.lease.clone());
+                    let _lane = config.uploads.open(config.socket.clone());
                     serve(
                         config,
                         incarnation,
@@ -819,23 +800,7 @@ async fn attempt(
     // 1. Identify, and gate on it.
     let (mut control, mut facts) = open_control(config, mode).await?;
 
-    // 2. Take this connection's token. It grants nothing and displaces
-    //    nobody; it exists because the ops below still declare the field
-    //    — see [`Live::lease`].
-    let raw = call(
-        &mut control,
-        ops::SESSION_CONNECT,
-        serde_json::json!(SessionConnectParams {
-            takeover: true,
-            client_label: Some(host_client_label()),
-        }),
-    )
-    .await?;
-    let connected: SessionConnectResult =
-        serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_CONNECT, &error))?;
-    let lease = connected.lease;
-
-    // 3. Seed the session's palette before anything is attached, so a
+    // 2. Seed the session's palette before anything is attached, so a
     //    query answered while hydrating already carries our colors.
     let theme = config
         .theme
@@ -845,14 +810,11 @@ async fn attempt(
     call(
         &mut control,
         ops::SESSION_SET_THEME,
-        serde_json::json!(SessionSetThemeParams {
-            lease: lease.clone(),
-            osc_colors: theme,
-        }),
+        serde_json::json!(SessionSetThemeParams { osc_colors: theme }),
     )
     .await?;
 
-    // 4. Subscribe — resuming from the carried fence where there is one,
+    // 3. Subscribe — resuming from the carried fence where there is one,
     //    else subscribe then snapshot. That order is what makes the
     //    fresh fence sound: the ack names a commit the snapshot is
     //    guaranteed to be at or past.
@@ -861,7 +823,6 @@ async fn attempt(
 
     let live = Live {
         control,
-        lease,
         events,
         pump,
         mirror,
@@ -995,13 +956,6 @@ enum Subscribed {
     Fresh(HostMirror),
 }
 
-/// What a subscription presents where protocol 4 still declares a
-/// `lease` on `events.subscribe`.
-///
-/// Nothing about a stream depends on it any more — every connection
-/// receives every event — and the field goes at protocol 5.
-const RETIRED_LEASE: &str = "";
-
 /// Subscribe, resuming from the checkpoint when the session can serve
 /// one and taking a fresh snapshot when it cannot.
 ///
@@ -1042,7 +996,7 @@ async fn resume_stream(
     let dialed = tokio::time::timeout(leg(), async {
         IpcClient::connect(socket)
             .await?
-            .resume_events(RETIRED_LEASE, from_revision, &resume.session_id)
+            .resume_events(from_revision, &resume.session_id)
             .await
     })
     .await
@@ -1097,7 +1051,7 @@ async fn subscribe_and_snapshot(
 ) -> Result<(EventRx, tokio::task::AbortHandle, HostMirror), AttemptError> {
     // Bounded: this dials and handshakes, and a peer that accepts
     // without answering must not hold the connection in `Connecting`.
-    let stream = tokio::time::timeout(leg(), EventStream::connect(socket, RETIRED_LEASE))
+    let stream = tokio::time::timeout(leg(), EventStream::connect(socket))
         .await
         .map_err(|_| AttemptError::Transport(format!("{} timed out", ops::EVENTS_SUBSCRIBE)))??;
     let ack = stream.revision();
@@ -1211,9 +1165,6 @@ async fn serve(
                     Some(Ok(EventFrame::Stopping(stopping))) => {
                         return ConnEnd::Stopping(stopping.reason);
                     }
-                    // Nothing announces a driver any more: no session
-                    // has an owner to move. The frame goes at protocol 5.
-                    Some(Ok(EventFrame::DriverChanged(_))) => {}
                     Some(Err(error)) => {
                         // A revision gap is loss and nothing else, and
                         // the contract's answer to loss is a resync —
@@ -1304,17 +1255,6 @@ enum IntentOutcome {
     Ends(ConnEnd),
 }
 
-/// The queued ops whose protocol-4 params declare a required
-/// `lease: String`, which the session decodes and no longer reads. Every
-/// other op either has no such field or defaults it, and a
-/// `deny_unknown_fields` struct refuses a key it does not declare — so
-/// the list is exactly this long. It goes with the field at protocol 5.
-const LEASE_BEARING_OPS: [&str; 3] = [
-    ops::SESSION_SET_THEME,
-    ops::SESSION_SET_FOCUS,
-    ops::SESSION_SET_AGENT_HOOKS,
-];
-
 /// Send one queued op through the control client and answer its caller.
 ///
 /// `unsupported` is the task's, not this connection's: see
@@ -1326,20 +1266,7 @@ async fn run_intent(
 ) -> IntentOutcome {
     // Taken rather than cloned: the params are this intent's alone, and
     // `answer` never reads them.
-    let mut params = std::mem::take(&mut intent.params);
-    if LEASE_BEARING_OPS.contains(&intent.op.as_ref()) {
-        let Some(object) = params.as_object_mut() else {
-            intent.answer(Err(HostOpError::Rejected {
-                code: ServerCode::InvalidParam,
-                message: "a session op needs an object for params".into(),
-            }));
-            return IntentOutcome::Live;
-        };
-        object.insert(
-            "lease".into(),
-            serde_json::Value::String(live.lease.clone()),
-        );
-    }
+    let params = std::mem::take(&mut intent.params);
 
     let op = intent.op.clone();
     let sent = tokio::time::timeout(op_budget(&op), live.control.call_raw(&op, params)).await;
@@ -1485,26 +1412,18 @@ mod tests {
     /// answers with — the one shape that clears the compatibility gate
     /// against the build [`config`] claims.
     fn identify_result() -> serde_json::Value {
-        identify_advertising(roost_ipc::messages::SESSION_FEATURES)
-    }
-
-    /// The same, from a session that lists exactly these features. `[]`
-    /// is a session from before they existed, which refuses the fields
-    /// they name outright.
-    fn identify_advertising(features: &[&str]) -> serde_json::Value {
         serde_json::json!({
             "app_version": "test",
             "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
             "payload_kinds": super::super::state::CLIENT_PAYLOAD_KINDS,
-            "features": features,
             "libghostty_build": "gb",
             "session_id": SESSION_ID,
             "started_at": "2026-01-01T00:00:00Z",
         })
     }
 
-    /// The session id [`identify_advertising`] answers with, and the one
-    /// a checkpoint has to name to be offered.
+    /// The session id [`identify_result`] answers with, and the one a
+    /// checkpoint has to name to be offered.
     const SESSION_ID: &str = "s1";
 
     /// The revision every fake session's `tab.list` and fresh subscribe
@@ -2119,11 +2038,6 @@ mod tests {
                                 "ok": true,
                                 "result": identify_result(),
                             }),
-                            ops::SESSION_CONNECT => serde_json::json!({
-                                "id": id,
-                                "ok": true,
-                                "result": { "lease": "the-lease", "revision": 1 },
-                            }),
                             ops::SESSION_SET_THEME => {
                                 serde_json::json!({"id": id, "ok": true, "result": {}})
                             }
@@ -2170,7 +2084,7 @@ mod tests {
                                     _ => serde_json::json!({
                                         "id": id,
                                         "ok": true,
-                                        "result": { "revision": 1 },
+                                        "result": { "revision": 1, "session_id": SESSION_ID },
                                     }),
                                 }
                             }
@@ -2219,8 +2133,8 @@ mod tests {
     /// **An old session costs one line for the life of the connection
     /// task, not one per reconnect.**
     ///
-    /// `session.set_agent_hooks` is re-sent after every `session.connect`
-    /// and a dropped localhost session reconnects on a 250 ms ladder, so
+    /// `session.set_agent_hooks` is re-sent on every connect and a
+    /// dropped localhost session reconnects on a 250 ms ladder, so
     /// a latch rebuilt per connection would repeat the same sentence
     /// about the same unchanging session forever. Driven through the real
     /// [`run`] against a session that refuses the op, across two
@@ -2389,9 +2303,8 @@ mod tests {
         /// [`Self::release`] is signalled.
         stall: Option<&'static str>,
         /// How many times [`Self::stall`]'s op is answered normally
-        /// before the stall arms. `0` stalls the first one; a takeback's
-        /// `session.connect` is the prologue's op said a second time, so
-        /// its test skips one.
+        /// before the stall arms. `0` stalls the first one; a test whose
+        /// subject is a *reconnect* skips the first connection's.
         stall_skips: Arc<AtomicUsize>,
         release: Arc<Shutdown>,
         /// Raised once the stalled op has been read.
@@ -2403,8 +2316,6 @@ mod tests {
         /// must not be cut by the same one.
         cut: Arc<Shutdown>,
         cuts: Arc<AtomicUsize>,
-        /// Every `session.connect` this session has been asked for.
-        connects: Arc<AtomicUsize>,
         /// Every `session.identify` — the op a *reconnect* re-runs.
         identifies: Arc<AtomicUsize>,
         /// Every `session.set_theme`, so a re-seeded palette is
@@ -2450,7 +2361,6 @@ mod tests {
                 uploading: Arc::new(Shutdown::default()),
                 cut: Arc::new(Shutdown::default()),
                 cuts: Arc::new(AtomicUsize::new(0)),
-                connects: Arc::new(AtomicUsize::new(0)),
                 identifies: Arc::new(AtomicUsize::new(0)),
                 themes: Arc::new(AtomicUsize::new(0)),
                 emit: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -2606,17 +2516,6 @@ mod tests {
                             "result": identify_result(),
                         })
                     }
-                    ops::SESSION_CONNECT => {
-                        let nth = self.connects.fetch_add(1, Ordering::AcqRel) + 1;
-                        serde_json::json!({
-                            "id": id,
-                            "ok": true,
-                            "result": {
-                                "lease": format!("the-lease-{nth}"),
-                                "revision": SESSION_REVISION,
-                            },
-                        })
-                    }
                     ops::TAB_LIST => {
                         self.tab_lists.fetch_add(1, Ordering::AcqRel);
                         serde_json::json!({
@@ -2670,7 +2569,13 @@ mod tests {
             from_revision: Option<u64>,
             id: &serde_json::Value,
         ) -> Option<serde_json::Value> {
-            let ack = |revision: u64| serde_json::json!({"id": id, "ok": true, "result": {"revision": revision}});
+            let ack = |revision: u64| {
+                serde_json::json!({
+                    "id": id,
+                    "ok": true,
+                    "result": {"revision": revision, "session_id": SESSION_ID},
+                })
+            };
             let Some(from) = from_revision else {
                 return Some(ack(SESSION_REVISION));
             };
@@ -2698,11 +2603,6 @@ mod tests {
         ) -> Option<serde_json::Value> {
             let params: SessionPutFileParams =
                 serde_json::from_value(request["params"].clone()).expect("put_file params");
-            assert!(
-                params.lease.starts_with("the-lease-"),
-                "an upload presents the lease, got {:?}",
-                params.lease
-            );
             let nth = self.puts.fetch_add(1, Ordering::AcqRel);
             self.uploading.request();
             let result = match &self.put_file {
@@ -3339,7 +3239,7 @@ mod tests {
         fake.serve(&socket);
 
         let uploads = Uploads::default();
-        let lane = uploads.open(socket, "the-lease-1".into());
+        let lane = uploads.open(socket);
         // Two more than run at once, so half of these are still on the
         // channel when the lane closes.
         let waiting: Vec<_> = (0..4)
@@ -3409,7 +3309,7 @@ mod tests {
         .expect("write an over-cap file");
 
         let uploads = Uploads::default();
-        let _lane = uploads.open(socket, "the-lease-1".into());
+        let _lane = uploads.open(socket);
         let refused = uploads
             .enqueue("grown.png".into(), UploadSource::Path(grown))
             .expect("the lane admits it; the read is what refuses");

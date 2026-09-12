@@ -137,7 +137,7 @@ impl Uploads {
     ///
     /// The returned guard is the incarnation's lifetime: dropping it
     /// empties the slot and cancels every upload, in flight or queued.
-    pub(crate) fn open(&self, socket: PathBuf, lease: String) -> Lane {
+    pub(crate) fn open(&self, socket: PathBuf) -> Lane {
         let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
         let cancel = Arc::new(Shutdown::default());
         *self.locked() = Some(tx.clone());
@@ -145,7 +145,6 @@ impl Uploads {
             rx,
             Wire {
                 socket,
-                lease,
                 budget: self.budget,
             },
             Arc::clone(&cancel),
@@ -236,7 +235,6 @@ impl Drop for Lane {
 #[derive(Clone)]
 struct Wire {
     socket: PathBuf,
-    lease: String,
     budget: Budget,
 }
 
@@ -312,8 +310,8 @@ async fn put_file(wire: Wire, name: String, source: UploadSource) -> UploadResul
     // 10 MiB file on an NFS `$HOME` must not park a runtime worker, and
     // neither may ever run where the winit thread could see it.
     let encoding = {
-        let (name, lease) = (name.clone(), wire.lease.clone());
-        tokio::task::spawn_blocking(move || encode(lease, name, source))
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || encode(name, source))
     };
     let (bytes, params) = encoding
         .await
@@ -351,11 +349,7 @@ async fn send(socket: &Path, params: serde_json::Value) -> Result<serde_json::Va
 }
 
 /// Read the source and build the frame's params. Blocking.
-fn encode(
-    lease: String,
-    name: String,
-    source: UploadSource,
-) -> Result<(u64, serde_json::Value), HostOpError> {
+fn encode(name: String, source: UploadSource) -> Result<(u64, serde_json::Value), HostOpError> {
     let data = match source {
         UploadSource::Path(path) => read_capped(&path, &name)?,
         UploadSource::Bytes(bytes) => bytes,
@@ -364,7 +358,7 @@ fn encode(
     if bytes > MAX_PUT_FILE_BYTES {
         return Err(too_large(&name, bytes));
     }
-    let params = serde_json::to_value(SessionPutFileParams { lease, name, data })
+    let params = serde_json::to_value(SessionPutFileParams { name, data })
         .map_err(|error| HostOpError::Local(format!("encoding the upload failed: {error}")))?;
     Ok((bytes, params))
 }

@@ -14,7 +14,6 @@ fn full_byte_range_round_trips_through_base64() {
     let p = TabWriteParams {
         tab_id: 1,
         data: data.clone(),
-        lease: None,
     };
     let json = serde_json::to_string(&p).expect("serialize");
     let back: TabWriteParams = serde_json::from_str(&json).expect("deserialize");
@@ -24,11 +23,7 @@ fn full_byte_range_round_trips_through_base64() {
 #[test]
 fn nul_bytes_round_trip() {
     let data = vec![0u8; 1024];
-    let p = TabWriteParams {
-        tab_id: 1,
-        data,
-        lease: None,
-    };
+    let p = TabWriteParams { tab_id: 1, data };
     let json = serde_json::to_string(&p).unwrap();
     let back: TabWriteParams = serde_json::from_str(&json).unwrap();
     assert_eq!(back.data.len(), 1024);
@@ -41,7 +36,6 @@ fn high_bit_bytes_round_trip() {
     let p = TabWriteParams {
         tab_id: 1,
         data: data.clone(),
-        lease: None,
     };
     let json = serde_json::to_string(&p).unwrap();
     let back: TabWriteParams = serde_json::from_str(&json).unwrap();

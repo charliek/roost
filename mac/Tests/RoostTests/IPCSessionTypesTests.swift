@@ -1,5 +1,5 @@
 // IPCSessionTypesTests — the Swift half of the host-session wire
-// types (plan 033 §D4). Loads the same
+// types. Loads the same
 // `tests/ipc-vectors/session.identify.response.v<N>.json` (N built from
 // `ipcSessionProtocolVersion` — the current-generation lookup rule in
 // docs/reference/ipc-compatibility.md) and
@@ -18,9 +18,9 @@ import XCTest
 
 final class IPCSessionTypesTests: XCTestCase {
     func testSessionProtocolVersionIsSeparateFromTheWireVersion() {
-        // Plan 049 R1's lease re-cut bumped the session protocol to 4;
-        // the request/response wire version did not move with it.
-        XCTAssertEqual(ipcSessionProtocolVersion, 4)
+        // Retiring the lease bumped the session protocol to 5; the
+        // request/response wire version did not move with it.
+        XCTAssertEqual(ipcSessionProtocolVersion, 5)
         XCTAssertEqual(ipcProtocolVersion, 1)
     }
 
@@ -55,7 +55,6 @@ final class IPCSessionTypesTests: XCTestCase {
         XCTAssertEqual(identify.sessionProtocol, ipcSessionProtocolVersion)
         XCTAssertEqual(
             identify.payloadKinds, [IPCAttachPayloadKind.ghosttySnapshot, IPCAttachPayloadKind.vt])
-        XCTAssertEqual(identify.features, ["put_file"])
         XCTAssertEqual(identify.libghosttyBuild, "ghostty-3f6b1c9a4d2e5f80+snapshot.v1")
         XCTAssertEqual(identify.sessionID, "01K3S8TQ4F0Q9YB2K6WZ5D7XN")
         XCTAssertEqual(identify.startedAt, "2026-08-27T14:03:11Z")
@@ -64,12 +63,12 @@ final class IPCSessionTypesTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(IPCSessionIdentify.self, from: reencoded), identify)
     }
 
-    // `features` arrived with generation 4. The generation before it
-    // sends no such key, and its vector is still on disk — so this is
-    // the decode-when-absent contract as a test rather than a claim.
-    // An `[String]` with a default would throw here; the Optional is
-    // what makes it decode.
-    func testSessionIdentifyDecodesAGenerationWithoutFeatures() throws {
+    // The previous generation's vector is frozen and still on disk, and
+    // the compatibility gate decodes it to refuse an old session *by
+    // name* rather than on a decode failure. It carries a `features`
+    // key this generation no longer declares, which is exactly the
+    // tolerance being pinned.
+    func testSessionIdentifyDecodesThePreviousGeneration() throws {
         let raw = try Data(
             contentsOf: vectorURL(
                 "session.identify.response.v\(ipcSessionProtocolVersion - 1).json"))
@@ -80,25 +79,12 @@ final class IPCSessionTypesTests: XCTestCase {
         let identify = try JSONDecoder().decode(IPCSessionIdentify.self, from: body)
 
         XCTAssertEqual(identify.sessionProtocol, ipcSessionProtocolVersion - 1)
-        XCTAssertNil(identify.features)
 
-        // And it stays off the wire on the way back out.
+        // And the retired key stays off the wire on the way back out.
         let reencoded = try JSONEncoder().encode(identify)
         let fields = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: reencoded) as? [String: Any])
         XCTAssertNil(fields["features"])
-    }
-
-    // Unknown feature strings survive rather than becoming a decode
-    // error — the `payload_kinds` contract, applied to ops.
-    func testSessionIdentifyPreservesUnknownFeatureStrings() throws {
-        let json = """
-            {"app_version":"0.0.99","session_protocol":9,"payload_kinds":["vt"],
-             "features":["put_file","teleport"],"libghostty_build":"b",
-             "session_id":"s","started_at":"t"}
-            """
-        let identify = try JSONDecoder().decode(IPCSessionIdentify.self, from: Data(json.utf8))
-        XCTAssertEqual(identify.features, ["put_file", "teleport"])
     }
 
     func testSessionIdentifyToleratesUnknownFields() throws {
@@ -134,16 +120,18 @@ final class IPCSessionTypesTests: XCTestCase {
     // so they get field-level coverage of the shared vectors rather than
     // Swift twins. What matters across languages here is that `revision`
     // is a JSON *number* (revisions are counters, not ids, so the
-    // string-int64 convention does not apply to them) and that a UI
-    // socket's `tab.list` omits the key rather than sending null.
-    func testEventsSubscribeAckCarriesANumericRevision() throws {
+    // string-int64 convention does not apply to them), that a UI
+    // socket's `tab.list` omits the key rather than sending null, and
+    // that the ack names the incarnation answering it as a string.
+    func testEventsSubscribeAckCarriesANumericRevisionAndASessionID() throws {
         let raw = try Data(contentsOf: vectorURL("events.subscribe.response.json"))
         let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
         XCTAssertTrue(response.ok)
         let result = try XCTUnwrap(try XCTUnwrap(response.result).value as? [String: Any])
-        XCTAssertEqual(Set(result.keys), ["revision"])
+        XCTAssertEqual(Set(result.keys), ["revision", "session_id"])
         XCTAssertEqual(result["revision"] as? Int64, 42)
         XCTAssertNil(result["revision"] as? String, "revision is a number, not an id string")
+        XCTAssertEqual(result["session_id"] as? String, "01K3S8TQ4F0Q9YB2K6WZ5D7XN")
     }
 
     func testTabListFenceIsPresentOnlyOnTheSessionVector() throws {
@@ -215,34 +203,7 @@ final class IPCSessionTypesTests: XCTestCase {
         XCTAssertTrue(fence.events.isEmpty)
     }
 
-    // MARK: - Leases + attach (plan 036 §D11)
-
-    func testSessionConnectVectorDecodes() throws {
-        let raw = try Data(contentsOf: vectorURL("session.connect.response.json"))
-        let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
-        XCTAssertTrue(response.ok)
-        let body = try JSONSerialization.data(
-            withJSONObject: try XCTUnwrap(response.result).value)
-        let result = try JSONDecoder().decode(IPCSessionConnectResult.self, from: body)
-
-        XCTAssertEqual(result.lease, "9f2c1d7a4b6e08315c0d9a72e4f16b83")
-        // A counter, not an id: a bare JSON number, like the events
-        // fence.
-        XCTAssertEqual(result.revision, 42)
-
-        let reencoded = try JSONEncoder().encode(result)
-        XCTAssertEqual(
-            try JSONDecoder().decode(IPCSessionConnectResult.self, from: reencoded), result)
-    }
-
-    func testSessionConnectRequestVectorDefaultsTakeoverToAnExplicitBool() throws {
-        let raw = try Data(contentsOf: vectorURL("session.connect.request.json"))
-        let request = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: raw) as? [String: Any])
-        XCTAssertEqual(request["op"] as? String, "session.connect")
-        let params = try XCTUnwrap(request["params"] as? [String: Any])
-        XCTAssertEqual(params["takeover"] as? Bool, true)
-    }
+    // MARK: - Attach
 
     func testTabAttachVectorsDecode() throws {
         let requestRaw = try Data(contentsOf: vectorURL("tab.attach.request.json"))
@@ -290,47 +251,6 @@ final class IPCSessionTypesTests: XCTestCase {
         let fields = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: raw) as? [String: Any])
         XCTAssertEqual(Set(fields.keys), ["event", "data"])
-    }
-
-    // The counterexample to the stopping envelope: same non-batch
-    // shape, but the stream continues after it — the subscriber is now
-    // an observer, not gone.
-    func testSessionDriverChangedVectorDecodesAsAnEventEnvelope() throws {
-        let raw = try Data(contentsOf: vectorURL("session.driver_changed.event.json"))
-        let envelope = try JSONDecoder().decode(IPCEventEnvelope.self, from: raw)
-        XCTAssertEqual(envelope.event, ipcSessionDriverChangedEvent)
-
-        let body = try JSONSerialization.data(withJSONObject: envelope.data.value)
-        let changed = try JSONDecoder().decode(IPCSessionDriverChangedEvent.self, from: body)
-        XCTAssertEqual(changed.takenBy, "kestrel.local")
-
-        // No revision, like the stopping envelope: it is exempt from
-        // the gap check.
-        let fields = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: raw) as? [String: Any])
-        XCTAssertEqual(Set(fields.keys), ["event", "data"])
-    }
-
-    // The labeled connect is an additive vector beside the unlabeled
-    // one, never an edit of it. The label is display metadata, so what
-    // matters across languages is only that the key round-trips and
-    // that an unlabeled connect keeps it off the wire.
-    func testLabeledSessionConnectVectorDecodes() throws {
-        let raw = try Data(contentsOf: vectorURL("session.connect.labeled.request.json"))
-        let request = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: raw) as? [String: Any])
-        XCTAssertEqual(request["op"] as? String, "session.connect")
-        let paramsJSON = try JSONSerialization.data(
-            withJSONObject: try XCTUnwrap(request["params"]))
-        let params = try JSONDecoder().decode(IPCSessionConnectParams.self, from: paramsJSON)
-        XCTAssertTrue(params.takeover)
-        XCTAssertEqual(params.clientLabel, "kestrel.local")
-
-        let bare = IPCSessionConnectParams(takeover: true, clientLabel: nil)
-        let encoded = try JSONEncoder().encode(bare)
-        let fields = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
-        XCTAssertEqual(Set(fields.keys), ["takeover"])
     }
 
     private func vectorURL(_ name: String) throws -> URL {

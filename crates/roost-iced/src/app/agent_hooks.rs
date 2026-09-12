@@ -192,9 +192,9 @@ pub(crate) struct HostAgentHooks {
 
 /// What this client asks a host to do, read fresh from its config.
 ///
-/// Sent after **every** `session.connect`, values and all: the op is
-/// idempotent, and a config edit made since the last connect has no
-/// other way to reach the host.
+/// Sent on **every** connect, values and all: the op is idempotent, and
+/// a config edit made since the last connect has no other way to reach
+/// the host.
 ///
 /// **`off` is not silence here.** Locally it means "wire nothing" and
 /// the UI never opens an agent's file; remotely it means "unwire", and

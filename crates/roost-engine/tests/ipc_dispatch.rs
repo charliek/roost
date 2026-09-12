@@ -768,7 +768,6 @@ async fn put_file(
         .call(
             ops::SESSION_PUT_FILE,
             SessionPutFileParams {
-                lease: String::new(),
                 name: name.to_string(),
                 data,
             },
@@ -893,11 +892,9 @@ async fn malformed_base64_is_invalid_param() {
         .await
         .expect_err("malformed base64 must be refused");
     assert_eq!(code(&error), "invalid-param");
-    // `invalid-param` is also what a frame missing a required field answers,
-    // and this payload omits the (still-required) `lease`. The code alone
-    // would therefore pass without the base64 check ever running; serde
-    // happens to reach `data` first, so it does. Assert on the text as well
-    // so a future field reordering cannot quietly make this vacuous.
+    // `invalid-param` is also what a frame missing a required field
+    // answers, so assert on the text as well: the code alone could pass
+    // without the base64 check ever running.
     assert!(
         message(&error).contains("base64"),
         "the refusal must be the malformed payload, not a missing field: {error:?}"
@@ -924,12 +921,10 @@ async fn put_file_is_open_to_every_connection() {
         .await
         .expect("a second connection may upload too");
 
-    // And an unrelated one, which under the retired lease answered
-    // `connect-required` here.
     let mut stranger = f.client().await;
     put_file(&mut stranger, "after.png", b"x".to_vec())
         .await
-        .expect("a connection that never connected may upload");
+        .expect("an unrelated connection may upload");
 
     assert_eq!(f.uploads().len(), 3, "each upload got its own directory");
 }

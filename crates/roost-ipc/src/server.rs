@@ -67,9 +67,8 @@ pub trait Handler: Send + Sync + 'static {
     /// task: whatever a handler does here must not block.
     ///
     /// The default does nothing. A host session overrides it because
-    /// "the last connection under the lease went away" is a fact about
-    /// authority that no request can report — the client that would have
-    /// sent it is the one that vanished.
+    /// "this connection went away" is a fact no request can report — the
+    /// client that would have sent it is the one that vanished.
     fn connection_ended(&self, conn_id: u64) {
         let _ = conn_id;
     }
@@ -108,30 +107,19 @@ pub trait Handler: Send + Sync + 'static {
 /// Why the server is closing a connection out from under its own read
 /// loop.
 ///
-/// The reason exists so the peer learns *why*: a client that was taken
-/// over should not retry the way one whose session is shutting down
-/// should.
+/// The reason exists so the peer learns *why* rather than reading a bare
+/// EOF and guessing whether to retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
-    /// Another client took the session's interactive lease.
-    ///
-    /// Nothing in this build closes a connection with it: since R15
-    /// (plan 057) a takeover moves the foreground and closes neither
-    /// control nor data connections. It stays as the published
-    /// vocabulary a pre-R15 session emitted and every client still
-    /// decodes.
-    TakenOver,
     /// The session is stopping.
     ShuttingDown,
 }
 
 impl CloseReason {
     /// The `reason` a push connection's [`SESSION_STOPPING_EVENT`]
-    /// envelope carries. The published vocabulary is exactly
-    /// `"stop"` | `"taken-over"`.
+    /// envelope carries. The published vocabulary is exactly `"stop"`.
     pub fn stopping_reason(self) -> &'static str {
         match self {
-            CloseReason::TakenOver => "taken-over",
             CloseReason::ShuttingDown => "stop",
         }
     }
@@ -139,11 +127,10 @@ impl CloseReason {
     /// The stable code a data connection's `ERROR` frame carries.
     ///
     /// No caller in this crate: the frame is written by whatever
-    /// overrides [`Handler::handle_data`] (the engine, at HS-1b), and
-    /// the vocabulary lives here so both ends read it from one place.
+    /// overrides [`Handler::handle_data`] (the engine), and the
+    /// vocabulary lives here so both ends read it from one place.
     pub fn error_code(self) -> &'static str {
         match self {
-            CloseReason::TakenOver => "taken-over",
             CloseReason::ShuttingDown => "shutting-down",
         }
     }
@@ -183,8 +170,7 @@ impl ConnCtx {
 ///
 /// Cloneable because a registry keeps one per connection while the
 /// connection task keeps its own; one-shot because the first reason
-/// wins — a connection being torn down for a takeover that then gets
-/// caught by a shutdown should still report the takeover.
+/// wins, so a connection reports what actually closed it.
 #[derive(Clone)]
 pub struct ConnCloser {
     tx: Arc<tokio::sync::watch::Sender<Option<CloseReason>>>,
@@ -932,8 +918,8 @@ async fn serve_data<H: Handler>(
 /// with it; a write failure, a stalled write, or an exhausted source
 /// aborts the reader.
 ///
-/// The third way it ends is the server closing it (a takeover, a stop):
-/// the peer gets one final labeled control envelope, best-effort under
+/// The third way it ends is the server closing it (a stop): the peer
+/// gets one final labeled control envelope, best-effort under
 /// [`CLOSE_LABEL_DEADLINE`], and then the connection goes away.
 async fn serve_push(
     mut reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
@@ -946,7 +932,7 @@ async fn serve_push(
     let result = loop {
         // Sticky check before the select: the closer must win over any
         // other arm that happens to be ready in the same pass (a queued
-        // event, a simultaneous EOF), or a taken-over client could keep
+        // event, a simultaneous EOF), or a closing client could keep
         // receiving batches — or lose its label — on a coin flip.
         if let Some(reason) = close_watch.reason() {
             write_stopping_envelope(&mut w, reason).await;

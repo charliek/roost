@@ -11,9 +11,7 @@ use std::sync::Arc;
 
 use roost_engine::ipc::{AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle};
 use roost_engine::{PtySupervisor, Workspace};
-use roost_ipc::messages::{
-    ops, AgentHooksMode, AgentHooksSkipped, SessionConnectResult, SessionSetAgentHooksResult,
-};
+use roost_ipc::messages::{ops, AgentHooksMode, AgentHooksSkipped, SessionSetAgentHooksResult};
 use roost_ipc::{
     CloseReason, ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome, PushSource,
 };
@@ -80,17 +78,6 @@ fn reply(outcome: HandlerOutcome) -> serde_json::Value {
     }
 }
 
-async fn connect(f: &Fixture, c: &Conn) -> Result<SessionConnectResult, String> {
-    match f
-        .handler
-        .handle(&c.ctx, ops::SESSION_CONNECT, serde_json::json!({}))
-        .await
-    {
-        Ok(outcome) => Ok(serde_json::from_value(reply(outcome)).expect("typed connect result")),
-        Err(e) => Err(e.code),
-    }
-}
-
 /// Subscribe and keep the push source alive: dropping it would end the
 /// relay, and a dead connection is pruned out of the registry — which is
 /// the opposite of what most of these cases are checking.
@@ -124,7 +111,7 @@ const RETIRED_AUTHORITY_CODES: [&str; 3] = ["connect-required", "taken-over", "a
 
 /// **Nothing deposes anybody.** A second client arriving takes no
 /// authority away from the first: every op the first can run before the
-/// second connects, it can still run afterwards, and its stream keeps
+/// second arrives, it can still run afterwards, and its stream keeps
 /// delivering.
 ///
 /// The list is the whole of what used to be gated — theme, focus, agent
@@ -135,19 +122,19 @@ const RETIRED_AUTHORITY_CODES: [&str; 3] = ["connect-required", "taken-over", "a
 /// of the two wiring refusals they give depends on the build's features
 /// — what must never come back is an authority refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_connect_gates_nothing_and_deposes_nobody() {
+async fn a_second_client_gates_nothing_and_deposes_nobody() {
     let (handle, _seen) = recording_backend();
     let f = fixture_with(Some(handle));
     let project = f.workspace.create_project("p", "/tmp").unwrap();
     let tab = f.workspace.open_tab(project.id, "/tmp", "sh").unwrap().id;
 
     let first = conn(1);
-    connect(&f, &first).await.expect("the first connect");
     let stream = conn(2);
     let mut push = subscribe(&f, &stream).await.expect("subscribe");
 
     // The second client. Under the lease this was a takeover.
-    connect(&f, &conn(3)).await.expect("a second connect");
+    let second = conn(3);
+    subscribe(&f, &second).await.expect("a second subscribe");
 
     assert_eq!(
         first.watch.reason(),
@@ -160,9 +147,7 @@ async fn a_second_connect_gates_nothing_and_deposes_nobody() {
         .handle(
             &first.ctx,
             ops::SESSION_SET_FOCUS,
-            // `lease` is still a required field on the wire; it is read
-            // by nothing and retired at protocol 5.
-            serde_json::json!({"lease": "", "focused_tab_id": tab.to_string()}),
+            serde_json::json!({"focused_tab_id": tab.to_string()}),
         )
         .await
         .expect("session.set_focus");
@@ -170,18 +155,18 @@ async fn a_second_connect_gates_nothing_and_deposes_nobody() {
         .handle(
             &first.ctx,
             ops::SESSION_SET_AGENT_HOOKS,
-            serde_json::json!({"lease": "", "mode": "auto", "skip": [], "client": "charlie-mbp"}),
+            serde_json::json!({"mode": "auto", "skip": [], "client": "charlie-mbp"}),
         )
         .await
         .expect("session.set_agent_hooks");
     for (op, params) in [
         (
             ops::SESSION_SET_THEME,
-            serde_json::json!({"lease": "", "osc_colors": {"palette": vec!["#000000"; 256], "foreground": "#ffffff", "background": "#000000", "cursor": "#ffffff"}}),
+            serde_json::json!({"osc_colors": {"palette": vec!["#000000"; 256], "foreground": "#ffffff", "background": "#000000", "cursor": "#ffffff"}}),
         ),
         (
             ops::SESSION_PUT_FILE,
-            serde_json::json!({"lease": "", "name": "note.txt", "data": ""}),
+            serde_json::json!({"name": "note.txt", "data": ""}),
         ),
     ] {
         let refusal = f
@@ -319,22 +304,85 @@ async fn a_stop_labels_every_control_connection_and_forgets_the_ended_one() {
     );
 }
 
-/// A UI socket has no session, so it does not serve `session.connect`.
+/// The protocol-5 break, from the far side. A pre-bump client does two
+/// things this session refuses by name rather than half-serving: it runs
+/// `session.connect`, which no socket knows any more, and it puts a
+/// `lease` on ops whose params are `deny_unknown_fields`.
+///
+/// Both refusals are loud on purpose — the alternative to `unknown-op`
+/// and `unknown-field` is a shim, and the whole point of the bump is
+/// that there is none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_ui_socket_does_not_know_session_connect() {
+async fn session_connect_and_a_lease_bearing_request_are_both_refused() {
+    let f = fixture();
+    let c = conn(1);
+    let project = f.workspace.create_project("p", "/tmp").unwrap();
+    let tab = f.workspace.open_tab(project.id, "/tmp", "sh").unwrap().id;
+
+    let err = f
+        .handler
+        .handle(&c.ctx, "session.connect", serde_json::json!({}))
+        .await
+        .expect_err("session.connect is retired");
+    assert_eq!(err.code, "unknown-op");
+
+    // A UI socket never served it either, and still does not.
     let dir = tempfile::tempdir().unwrap();
-    let handler = IpcHandler::new(
+    let ui = IpcHandler::new(
         Arc::new(Workspace::open(dir.path().join("state.json"))),
         Arc::new(PtySupervisor::new()),
         dir.path().join("roost.sock"),
         "Roost-test",
         "ai.stridelabs.Roost.test",
     );
-    let err = handler
-        .handle(&conn(1).ctx, ops::SESSION_CONNECT, serde_json::json!({}))
+    let err = ui
+        .handle(&conn(1).ctx, "session.connect", serde_json::json!({}))
         .await
         .expect_err("a UI socket must not serve session.connect");
     assert_eq!(err.code, "unknown-op");
+
+    for (op, params) in [
+        (
+            ops::TAB_WRITE,
+            serde_json::json!({"tab_id": tab.to_string(), "data": "", "lease": "l"}),
+        ),
+        (
+            ops::EVENTS_SUBSCRIBE,
+            serde_json::json!({"tab_id_filter": "0", "lease": "l"}),
+        ),
+        (
+            ops::TAB_ATTACH,
+            serde_json::json!({"lease": "l", "tab_id": tab.to_string(), "kinds": ["vt"],
+                               "cols": 80, "rows": 24, "libghostty_build": "b"}),
+        ),
+        (
+            ops::SESSION_SET_THEME,
+            serde_json::json!({"lease": "l", "osc_colors": {"palette": vec!["#000000"; 256], "foreground": "#ffffff", "background": "#000000", "cursor": "#ffffff"}}),
+        ),
+        (
+            ops::SESSION_SET_FOCUS,
+            serde_json::json!({"lease": "l", "focused_tab_id": tab.to_string()}),
+        ),
+        (
+            ops::SESSION_SET_AGENT_HOOKS,
+            serde_json::json!({"lease": "l", "mode": "auto", "skip": [], "client": "c"}),
+        ),
+        (
+            ops::SESSION_PUT_FILE,
+            serde_json::json!({"lease": "l", "name": "note.txt", "data": ""}),
+        ),
+    ] {
+        let err = f
+            .handler
+            .handle(&c.ctx, op, params)
+            .await
+            .expect_err("a lease-bearing request is refused");
+        assert_eq!(err.code, "unknown-field", "{op}: {err:?}");
+        assert!(
+            err.message.contains("unknown field `lease`"),
+            "{op} must name the field it refused: {err:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +420,6 @@ async fn set_agent_hooks(
     mode: &str,
 ) -> Result<SessionSetAgentHooksResult, String> {
     let params = serde_json::json!({
-        "lease": "",
         "mode": mode,
         "skip": ["cursor"],
         "client": "charlie-mbp",

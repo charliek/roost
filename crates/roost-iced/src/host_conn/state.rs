@@ -556,7 +556,6 @@ mod tests {
                 .iter()
                 .map(|k| AttachPayloadKind((*k).to_string()))
                 .collect(),
-            features: vec![],
             libghostty_build: build.into(),
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),
@@ -621,8 +620,8 @@ mod tests {
         );
     }
 
-    /// One question, since the lease went: a connection either reached
-    /// the session and is on it, or it is not.
+    /// One question: a connection either reached the session and is on
+    /// it, or it is not.
     #[test]
     fn only_a_connected_state_is_connected() {
         assert!(HostConnState::Connected.is_connected());

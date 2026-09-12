@@ -105,17 +105,11 @@ fn tab_open_params(project_id: i64, argv: &[&str], size: Option<(u32, u32)>) -> 
     })
 }
 
-/// A `tab.write` request. `lease` is omitted rather than empty when
-/// absent — that is exactly the shape a client holding no lease sends.
-fn tab_write_params(tab_id: i64, data: &[u8], lease: Option<&str>) -> serde_json::Value {
-    let mut params = serde_json::json!({
+fn tab_write_params(tab_id: i64, data: &[u8]) -> serde_json::Value {
+    serde_json::json!({
         "tab_id": tab_id.to_string(),
         "data": bytes_base64::encode(data),
-    });
-    if let Some(lease) = lease {
-        params["lease"] = serde_json::json!(lease);
-    }
-    params
+    })
 }
 
 /// One client's connection. Two distinct identities are what a
@@ -156,9 +150,8 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
     }
 
     // And nothing about the UI socket's other answers moved: the size
-    // fallback is still 80x24 — reached through a leaseless `tab.write`,
-    // which this socket must keep serving (it mints no leases).
-    assert_eq!(open_tab_reporting_size(&f, None, None).await, (80, 24));
+    // fallback is still 80x24.
+    assert_eq!(open_tab_reporting_size(&f, None).await, (80, 24));
 }
 
 /// The mirror of the UI-socket rule: the host registry is client-side
@@ -265,12 +258,9 @@ async fn session_identify_reports_the_installed_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tab_open_without_a_size_uses_the_session_default() {
     let f = fixture(true);
-    assert_eq!(open_tab_reporting_size(&f, None, None).await, (120, 40));
+    assert_eq!(open_tab_reporting_size(&f, None).await, (120, 40));
     // An explicit size still wins.
-    assert_eq!(
-        open_tab_reporting_size(&f, Some((72, 19)), None).await,
-        (72, 19)
-    );
+    assert_eq!(open_tab_reporting_size(&f, Some((72, 19))).await, (72, 19));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -325,7 +315,7 @@ async fn session_stop_reaps_latches_and_finalizes() {
     let err = call(
         &f.handler,
         ops::SESSION_SET_FOCUS,
-        serde_json::json!({"lease": "0".repeat(32), "focused_tab_id": null}),
+        serde_json::json!({"focused_tab_id": null}),
     )
     .await
     .expect_err("session.set_focus after stop");
@@ -339,7 +329,6 @@ async fn session_stop_reaps_latches_and_finalizes() {
         &f.handler,
         ops::SESSION_SET_AGENT_HOOKS,
         serde_json::json!({
-            "lease": "0".repeat(32),
             "mode": "auto",
             "client": "charlie-mbp",
         }),
@@ -356,7 +345,6 @@ async fn session_stop_reaps_latches_and_finalizes() {
         &f.handler,
         ops::SESSION_PUT_FILE,
         serde_json::json!({
-            "lease": "0".repeat(32),
             "name": "shot.png",
             "data": "aGVsbG8=",
         }),
@@ -437,15 +425,7 @@ async fn a_mutation_racing_stop_is_refused_or_reaped() {
 /// PTY. This is the only honest check that the default reached the
 /// terminal rather than just the workspace record.
 ///
-/// `lease` rides the `tab.write` that releases the shell: a session
-/// socket refuses an unleased write, and the size the shell reports is
-/// what proves a leased one reached the terminal rather than just being
-/// admitted.
-async fn open_tab_reporting_size(
-    f: &Fixture,
-    size: Option<(u32, u32)>,
-    lease: Option<&str>,
-) -> (u16, u16) {
+async fn open_tab_reporting_size(f: &Fixture, size: Option<(u32, u32)>) -> (u16, u16) {
     let project = f.workspace.ensure_default_project("/tmp");
     let value = reply(
         call(
@@ -470,7 +450,7 @@ async fn open_tab_reporting_size(
     call(
         &f.handler,
         ops::TAB_WRITE,
-        tab_write_params(opened.tab.id, b"\n", lease),
+        tab_write_params(opened.tab.id, b"\n"),
     )
     .await
     .expect("tab.write");
@@ -501,29 +481,21 @@ async fn open_tab_reporting_size(
     (cols, rows)
 }
 
-/// Raw input is open to every same-UID client (plan 057, R15): a write
-/// on a session socket takes no lease, and the field is accepted and
-/// ignored whatever it carries — the way a UI socket has always
-/// accepted it.
+/// Raw input is open to every same-UID client: a write on a session
+/// socket is exactly the tab and the bytes, the way a UI socket's has
+/// always been.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_session_socket_accepts_an_unleased_tab_write() {
+async fn a_session_socket_serves_a_plain_tab_write() {
     let f = fixture(true);
-
-    // Each variant gets its own tab and its own six-byte sink: `dd`
-    // exits after the first delivery, so one shared sink could only ever
-    // prove the first write landed.
-    let unknown = "0".repeat(32);
-    for lease in [None, Some(""), Some(unknown.as_str())] {
-        let (tab_id, mut output) = a_tab_reading_six_bytes(&f).await;
-        call(
-            &f.handler,
-            ops::TAB_WRITE,
-            tab_write_params(tab_id, b"TYPED!", lease),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("an unleased session write must land (lease={lease:?}): {e:?}"));
-        read_until(&mut output, b"TYPED!", &format!("lease={lease:?}")).await;
-    }
+    let (tab_id, mut output) = a_tab_reading_six_bytes(&f).await;
+    call(
+        &f.handler,
+        ops::TAB_WRITE,
+        tab_write_params(tab_id, b"TYPED!"),
+    )
+    .await
+    .expect("a session write must land");
+    read_until(&mut output, b"TYPED!", "a session socket write").await;
 }
 
 /// Two connections, and neither one is privileged: both write, and both
@@ -538,11 +510,7 @@ async fn two_connections_both_write_and_both_report_a_focus() {
     for ctx in [&first, &second] {
         let (tab_id, mut output) = a_tab_reading_six_bytes(&f).await;
         f.handler
-            .handle(
-                ctx,
-                ops::TAB_WRITE,
-                tab_write_params(tab_id, b"TYPED!", None),
-            )
+            .handle(ctx, ops::TAB_WRITE, tab_write_params(tab_id, b"TYPED!"))
             .await
             .expect("every connection writes");
         read_until(&mut output, b"TYPED!", "a write on either connection").await;
@@ -551,7 +519,7 @@ async fn two_connections_both_write_and_both_report_a_focus() {
             .handle(
                 ctx,
                 ops::SESSION_SET_FOCUS,
-                serde_json::json!({"lease": "", "focused_tab_id": null}),
+                serde_json::json!({"focused_tab_id": null}),
             )
             .await
             .expect("either connection may report what it is viewing");

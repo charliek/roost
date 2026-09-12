@@ -109,10 +109,7 @@ fn sibling_tab(f: &Fixture, tab: i64) -> i64 {
 }
 
 async fn set_focus(f: &Fixture, c: &Conn, tab: Option<i64>) -> Result<(), String> {
-    // `lease` is still a required field on the wire; it is read by
-    // nothing and retired at protocol 5.
     let params = serde_json::json!({
-        "lease": "",
         "focused_tab_id": tab.map(|id| id.to_string()),
     });
     match f
@@ -326,7 +323,6 @@ async fn set_agent_hooks(
     mode: &str,
 ) -> Result<SessionSetAgentHooksResult, String> {
     let params = serde_json::json!({
-        "lease": "",
         "mode": mode,
         "skip": ["cursor"],
         "client": "charlie-mbp",

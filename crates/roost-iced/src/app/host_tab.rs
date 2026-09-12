@@ -614,12 +614,7 @@ impl HostAttach {
             HostTabFrame::Error { code, message, .. } => {
                 let mapped = ServerCode::from_wire(&code);
                 match mapped {
-                    ServerCode::Superseded => {
-                        // Another window took the tab: this one lets go.
-                        self.phase = Phase::Ended;
-                        AttachStep::Detach
-                    }
-                    ServerCode::TakenOver | ServerCode::ShuttingDown => {
+                    ServerCode::ShuttingDown => {
                         // Host-level: the events connection sees the
                         // same fate and the connection state machine
                         // owns the banner. The tab detaches passively.
@@ -1024,9 +1019,7 @@ fn negotiated_kind(
 fn reason_for(code: Option<&ServerCode>, message: String) -> FailReason {
     match code {
         Some(ServerCode::BuildMismatch) => FailReason::BuildMismatch(message),
-        Some(ServerCode::TakenOver | ServerCode::ConnectRequired | ServerCode::ShuttingDown) => {
-            FailReason::HostGone(message)
-        }
+        Some(ServerCode::ShuttingDown) => FailReason::HostGone(message),
         _ => FailReason::Retryable(message),
     }
 }
@@ -1520,13 +1513,11 @@ mod tests {
         assert!(matches!(attach.phase, Phase::Requesting));
     }
 
-    /// The ERROR-code table: `superseded` and `taken-over` detach
-    /// passively (someone else drives now), `overflow`/`desync` rebuild.
+    /// The ERROR-code table: `shutting-down` detaches passively (the
+    /// host connection owns the recovery), `overflow`/`desync` rebuild.
     #[tokio::test]
     async fn error_codes_map_to_their_recoveries() {
         for (code, detaches) in [
-            ("superseded", true),
-            ("taken-over", true),
             ("shutting-down", true),
             ("overflow", false),
             ("desync", false),

@@ -2264,7 +2264,7 @@ fn unix_now() -> i64 {
 }
 
 /// A saved host's stable id: 64 bits of OS entropy as 16 lowercase hex
-/// characters. Not a credential (unlike a session lease) — it only has
+/// characters. Not a credential (unlike an attach token) — it only has
 /// to not collide with another saved host — so half the width
 /// `roost-session`'s bearer tokens use is plenty. Far past birthday risk
 /// for a hand-curated list, but a collision would be silent and
