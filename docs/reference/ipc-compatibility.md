@@ -260,17 +260,17 @@ bump anything, with one deliberate exception, now **re-qualified twice**
 since it was first written:
 
 **An additive *session-socket* op bumps the session integer when a
-pre-bump peer could not refuse it meaningfully — and only as a
-fallback, now that `features` exists.** Two qualifiers, both learned
+pre-bump peer could not refuse it meaningfully.** Two qualifiers, both learned
 after the fact. First, *session-socket only*: a UI-socket op like
 `tab.send_file` correctly does not move `PROTOCOL_VERSION` — that wire
 has no handshake gate for a bump to protect, so the exception never
 applied there in the first place; `tab.send_file` shipped as a pure
-addition, no bump, exactly as the matrix predicts. Second, *fallback,
-not first resort*: [`session.identify.features`](#capability-negotiation-over-version-sniffing)
-(plan 049, R1) is now the preferred channel for "this build also does
-one more optional thing" — a client feature-detects an entry instead of
-a whole generation being spent on one op.
+addition, no bump, exactly as the matrix predicts. Second, at protocol 5 this is again the
+*only* route: `session.identify.features` was the preferred channel for
+"this build also does one more optional thing" through generation 4, and
+5 deleted it — the integer now carries the whole contract, so an
+additive session-socket op spends a generation rather than a feature
+entry. A capability channel returns only with a second real consumer.
 
 Plan 047's `session.put_file` is the case that set the rule in the
 first place (documented on `SESSION_PROTOCOL_VERSION` and in [ipc.md's

@@ -2330,8 +2330,8 @@ holds for an unfocused attach too: `cols`/`rows` are this connection's
 **declared geometry** either way, and its first `INPUT` or `RESIZE`
 frame applies them.
 
-**`focus` says whether this attach claims the tab's geometry.** It
-defaults to `true`, and a focused attach is when the server resizes:
+**`focus` says whether this attach claims the tab's geometry.** A
+focused attach is when the server resizes:
 between checks 4 and 6 the session resizes the tab (server terminal
 *and* `TIOCSWINSZ`) to the requested geometry and waits for that to
 land, so the snapshot the data connection is about to encode is already

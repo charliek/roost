@@ -238,12 +238,11 @@ fn the_attach_request_vectors_decode_into_their_typed_params() {
                 .is_some_and(serde_json::Value::is_boolean),
             "{name}: `focus` must be present on the wire, spelled as a bool",
         );
-        assert!(
-            params
-                .kinds
-                .iter()
-                .any(|kind| kind.as_str() == AttachPayloadKind::GHOSTTY_SNAPSHOT),
-            "{name}: the snapshot kind stays first in every preference list",
+        assert_eq!(
+            params.kinds.first().map(AttachPayloadKind::as_str),
+            Some(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+            "{name}: the snapshot kind stays first in every preference list, got {:?}",
+            params.kinds,
         );
         assert!(
             params.cols > 0 && params.rows > 0,

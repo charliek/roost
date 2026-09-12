@@ -1175,7 +1175,7 @@ def test_resume_replays_the_ring_with_no_snapshot(env):
         seed(client, tab, seed_bytes(100))
         wait_dump_contains(client, tab, "seed-0099")
 
-        first, reply, ticket = attached(env, client, tab)
+        first, _reply, ticket = attached(env, client, tab)
         first.read_until_finish()
         resume_from = first.next_seq
         first.close()
@@ -1263,7 +1263,7 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         assert restored, client.tabs()
         tab = int(restored[0]["id"])
 
-        first, reply, fresh_ticket = attached(env, client, tab)
+        first, _reply, fresh_ticket = attached(env, client, tab)
         first.read_until_finish()
         assert fresh_ticket["server_epoch"] != old_ticket["server_epoch"], (
             "a restarted session reused its predecessor's epoch"
@@ -1331,7 +1331,7 @@ def test_exit_is_the_final_frame_on_a_natural_child_exit(env):
             ["/bin/sh", "-c", "read line; echo done; exit 0"],
         )
 
-        conn, reply, _ticket = attached(env, client, tab)
+        conn, _reply, _ticket = attached(env, client, tab)
         conn.read_until_finish()
 
         conn.send_input(b"go\n")

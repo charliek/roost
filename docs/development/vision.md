@@ -1035,8 +1035,9 @@ connections, not a claim.
    ping-pong between them.
 
 Session protocol `5` retires `session.connect`, the `lease` field on
-every op, `session.driver_changed`, and the three retired refusal codes
-(`connect-required`, `already-connected`, `taken-over`) — a hard,
+every op, `session.driver_changed`, and the four retired refusal codes
+(`connect-required`, `already-connected`, `taken-over`, `superseded`) —
+a hard,
 breaking bump with no compatibility shim in either direction, because
 nothing built on this wire had shipped past v0.0.19's protocol `2`
 (see CHANGELOG). Geometry stays last-interactor
