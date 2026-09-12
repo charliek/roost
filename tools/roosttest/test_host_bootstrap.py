@@ -132,16 +132,12 @@ import session as sessionlib
 import ui
 from client import Roost, RoostError, scaled_timeout
 
-from eventstream import EventStream
 from test_host_client import (
     SUBTITLE_NEEDS_RESTART,
-    SUBTITLE_TAKEN_OVER,
-    HostUnderTest,
     first_project,
     host_row,
     host_row_ids,
     marker,
-    quiet_tab,
     saved_host,
     start_session,
     wait_dump_contains,
@@ -153,7 +149,6 @@ from test_host_ssh import (
     NOT_FOUND_COPY,
     _harness_owned_ui,  # noqa: F401  (autouse: this lane needs a harness-owned UI too)
     configure_fake_ssh,
-    hold,
     host_key,
     invocations,
     session_env,  # noqa: F401  (ssh_host's own dependency; pytest resolves it in *this* module)
@@ -1131,13 +1126,6 @@ def test_running_mismatch_offers_remote_update_and_reconnects(
 # ---------------------------------------------------------------------------
 
 
-#: `host_state::TAKEN_OVER` on the wire. Restated rather than derived,
-#: like this lane's other wire constants: the phantom takeover below is
-#: the whole point of the case, and a renamed state that silently stopped
-#: matching would turn the assertion green forever.
-TAKEN_OVER = "taken-over"
-
-
 @functools.cache
 def client_libghostty_build() -> str:
     """The libghostty build *this* client pins, as a string.
@@ -1241,18 +1229,11 @@ def test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_who
     * no state outside `connected`/`disconnected`/`connecting` for the
       whole job. `stopped` is the tell — that is what the far side's
       `session.stopping` looks like to a client still listening, and it
-      is exactly what a build without the disconnect samples here.
-    * never `taken-over`, which is the harm §3.6 names: with a stream
-      still up when the job stops the session, the bridge can EOF before
-      `session.stopping` lands, `serve` returns `Dropped`, the ssh ladder
-      dials the session the job has just started, the `held_lease` probe
-      answers `NotCurrent` against a lease that session never issued, the
-      observing latch flips, and the band reads "taken over" by nobody.
-      That is a race, and this harness — every hop local, the whole job
-      inside a second — loses it politely rather than winning it, so this
-      assertion is the criterion rather than the detector. It is sampled
-      throughout the job rather than read once at the end because the
-      phantom heals itself at the job's own reconnect.
+      is exactly what a build without the disconnect samples here. It is
+      sampled throughout the job rather than read once at the end,
+      because a client that heard the stop reconnects and heals itself.
+    * the sample really covered the job's own window, or the assertion
+      above was checking nothing.
     """
     binary = bootstrap_host.jail.plant("$HOME/.local/bin/roost-session", sessionlib.session_binary())
     # No `ROOST_SESSION_LEGACY_KINDS` — the premise here is a daemon that
@@ -1301,11 +1282,6 @@ def test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_who
 
     row, states = watch_the_update_job(bootstrap_host)
 
-    assert TAKEN_OVER not in states, (
-        f"the host read {TAKEN_OVER!r} during the update job (states "
-        f"{sorted(set(states))} over {len(states)} samples) — confirming has to "
-        "disconnect before the job owns the session (§3.6)"
-    )
     # Everything a *let-go* host can be while a job runs, and nothing
     # else. `stopped` is the tell: it is what the far side's
     # `session.stopping` looks like to a client that was still listening,
@@ -1319,7 +1295,7 @@ def test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_who
     )
     # The sample is only worth its assertions if it covered the window.
     assert {"disconnected", "connecting"} & set(states), (
-        f"never sampled the job's own window, so the {TAKEN_OVER!r} claim went "
+        f"never sampled the job's own window, so the claim above went "
         f"unchecked: {sorted(set(states))}"
     )
     assert row["connect"]["reduced_fidelity"] is False, row
@@ -1580,88 +1556,3 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
     finally:
         with contextlib.suppress(Exception):
             roost.call("host.remove", {"id": saved_id})
-
-
-# ---------------------------------------------------------------------------
-# 11. Issue #376 regression: the paste gate is the attach, not the host state
-# ---------------------------------------------------------------------------
-
-
-def test_paste_into_a_taken_over_host_still_lands(roost: Roost):
-    """The other half of plan 039 C9 (§3.11), inverted by plan 057 §3.5,
-    and landing here per the plan's own instruction ("whichever lands
-    second wires it").
-
-    `paste_into_active` (`crates/roost-iced/src/app/interactions.rs`)
-    refuses before the clipboard is ever read when nothing is attached to
-    read what would be pasted — which is #376's bug, and still the rule.
-    What changed is what "nothing is attached" means: a takeover closes no
-    data connection any more, so a taken-over host tab is streaming, owns
-    the keyboard, and takes a paste like any other. The gate is the
-    *attach phase*; the host's connection state is not consulted.
-
-    `app.keybind_dispatch` is the test-mode IPC op that drives
-    `KeybindAction::Paste` through the same dispatcher a real key event or
-    native menu click reaches (`crates/roost-iced/src/app.rs`), since the
-    accelerator has no other IPC back door.
-
-    What this case can assert, and what it cannot. Whether a paste was
-    refused is not op-visible — the sentence goes to the status banner
-    and the log — so the copy is fenced where it is written
-    (`host_notice.rs`) and the routing is pinned in `host_tab.rs`'s phase
-    table. What *is* op-visible is the keyboard route the paste follows
-    (`app.active_terminal_focused`, `false` for every frozen frame this
-    used to describe) and the state around the dispatch: the host stays
-    `taken-over`, the keybind starts no attempt of its own (`generation`
-    unmoved), and nothing raises a card over the live frame.
-    """
-    session_env = sessionlib.make_env()
-    try:
-        start_session(session_env)
-        with saved_host(roost, session_env) as host:
-            host.connect_and_wait()
-            with host.client() as session:
-                tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
-                key = host_key(roost, tab)
-                # Read the tab's size only once this window's attach has
-                # actually landed — `tab.attach` resizes the tab to the
-                # client's grid before it mints its ticket, so a size read
-                # before the first payload is still the open-time one.
-                line = marker("LIVE")
-                session.tab_feed_pty_bytes(tab, f"{line}\r\n".encode())
-                wait_dump_contains(roost, key, line)
-                sized = session.dump(tab)
-
-            with host.client() as interloper:
-                lease = HostUnderTest.lease(interloper, takeover=True)
-                with EventStream(host.env.socket, lease=lease):
-                    host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
-
-                    deposed = status(host)
-                    assert deposed["state"] == "taken-over", deposed
-                    assert roost.app_active_terminal_focused() is True, (
-                        "a deposed host tab still owns the keyboard, so a paste "
-                        "has somewhere to go"
-                    )
-
-                    # The line that says who is driving is an overlay: it
-                    # must not take a row off the grid, because the grid
-                    # is what sizes the shared PTY.
-                    after = interloper.dump(tab)
-                    assert (after["cols"], after["rows"]) == (
-                        sized["cols"],
-                        sized["rows"],
-                    ), f"the takeover resized the tab: {sized} -> {after}"
-
-                    roost.call("app.keybind_dispatch", {"action": "paste"})
-
-                    def nothing_moved() -> None:
-                        row = status(host)
-                        assert row["state"] == "taken-over", row
-                        assert row["generation"] == deposed["generation"], row
-                        dump = dialog_dump(roost)
-                        assert dump.get("dialog") is None, dump
-
-                    hold(nothing_moved)
-    finally:
-        session_env.teardown()

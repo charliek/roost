@@ -166,7 +166,7 @@ pub const HOST_FIDELITY_TEXT: Color = HOST_DOT_PENDING;
 pub const HOST_SECTION_DIM: f32 = 0.45;
 /// The inline "↻ Reconnect" row (mockup `.reconnect`).
 pub const HOST_RECONNECT_TEXT: Color = Color::from_rgb8(0x7f, 0xa8, 0xe8);
-/// The takeover / session-ended banner over a host tab's last frame
+/// The session-ended banner over a host tab's last frame
 /// (plan 037 §3.1). Sampled from the approved mockup's `.banner` rules —
 /// a warm amber band that is deliberately nothing like the terminal
 /// palette underneath it, because the whole point is that it is not part

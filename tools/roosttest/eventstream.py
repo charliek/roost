@@ -14,21 +14,13 @@ client half of that contract.
 
 Two things every subscriber has to know about:
 
-* the stream is **leaseless and lease-classified** (plan 049 §3.7).
-  Anyone who can reach the socket may subscribe; the lease decides what
-  arrives. Present the live one and this is the *driver* stream, with
-  `tab.effect` included. Present none, a stale one, or one this session
-  never issued and it is an *observer* stream: every workspace batch
-  plus `notification.fired`, with `tab.effect` filtered out and its
-  revision still delivered as an empty batch.
-* every frame is a batch EXCEPT two, both carrying no `revision` and
-  both exempt from the gap check:
-  `{"event": "session.stopping", "data": {"reason": ...}}`, which is
-  terminal and names why the stream is ending, and
-  `{"event": "session.driver_changed", "data": {"taken_by": ...}}`,
-  which is **not** — the stream keeps delivering after it, demoted to
-  an observer. [`recv_stopping`] still means "the stream really ended";
-  [`recv_driver_changed`] reads the other one.
+* the stream is **symmetric**: anyone who can reach the socket may
+  subscribe, and every subscriber receives every event — workspace
+  batches, `notification.fired` and `tab.effect` alike.
+* every frame is a batch EXCEPT one, which carries no `revision` and is
+  exempt from the gap check:
+  `{"event": "session.stopping", "data": {"reason": ...}}`, terminal and
+  naming why the stream is ending. [`recv_stopping`] reads it.
 """
 
 from __future__ import annotations
@@ -41,7 +33,6 @@ from client import RoostError, scaled_timeout
 
 
 STOPPING_EVENT = "session.stopping"
-DRIVER_CHANGED_EVENT = "session.driver_changed"
 
 
 class EventStream:
@@ -60,11 +51,6 @@ class EventStream:
         # Set when the terminal control envelope arrives; a close after
         # it is the session saying goodbye, not a dropped stream.
         self.stopping_reason: str | None = None
-        # Every `session.driver_changed` this stream has seen, oldest
-        # first. A list rather than a latch: consecutive takeovers each
-        # produce one, in order, and "exactly one per takeover" is a
-        # thing tests assert on.
-        self.driver_changes: list[str] = []
 
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:
@@ -112,10 +98,10 @@ class EventStream:
         pre-052 session answer a plain subscribe instead of
         `unknown-field`.
 
-        Never refused for want of a lease: an absent or stale one opens
-        an observer stream instead (plan 049 §3.7). What still refuses is
-        `tab_id_filter` (unimplemented) and a session that has already
-        latched its stop (`shutting-down`).
+        Never refused for want of a lease: every subscriber receives
+        every event. What still refuses is `tab_id_filter`
+        (unimplemented) and a session that has already latched its stop
+        (`shutting-down`).
         """
         params: dict = {
             "lease": self.lease if lease is None else lease,
@@ -172,34 +158,6 @@ class EventStream:
                     ) from error
                 return self.stopping_reason
 
-    def recv_driver_changed(self, timeout: float = 10.0) -> str:
-        """Read to the next `session.driver_changed` and return `taken_by`.
-
-        NOT terminal: the stream is still open afterwards and still
-        delivering, which is the property most callers are here to
-        check. Batches read on the way are discarded — a caller that
-        needs them reads frames itself.
-
-        A `session.stopping` arriving first is a failure, not a result:
-        it means the stream ended instead of surviving the takeover.
-        """
-        deadline = time.monotonic() + scaled_timeout(timeout)
-        seen = len(self.driver_changes)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"no {DRIVER_CHANGED_EVENT} on {self.path} within its budget"
-                )
-            self._recv_within(remaining)
-            if self.stopping_reason is not None:
-                raise AssertionError(
-                    f"the stream at {self.path} ended ({self.stopping_reason}) instead "
-                    f"of surviving the takeover"
-                )
-            if len(self.driver_changes) > seen:
-                return self.driver_changes[seen]
-
     def recv_until(
         self, event: str, timeout: float = 10.0, max_batches: int = 512
     ) -> tuple[list[dict], dict]:
@@ -227,11 +185,7 @@ class EventStream:
                 )
             frame = self._recv_within(remaining)
             if "revision" not in frame:
-                if frame.get("event") == DRIVER_CHANGED_EVENT:
-                    # Non-terminal: the stream keeps delivering, so keep
-                    # reading. `driver_changes` recorded it.
-                    continue
-                # The other non-batch frame is the terminal envelope, and
+                # The only non-batch frame is the terminal envelope, and
                 # it means `event` is never coming.
                 raise RoostError(
                     "disconnected",
@@ -277,8 +231,6 @@ class EventStream:
         frame = json.loads(self._readline())
         if frame.get("event") == STOPPING_EVENT:
             self.stopping_reason = (frame.get("data") or {}).get("reason", "")
-        elif frame.get("event") == DRIVER_CHANGED_EVENT:
-            self.driver_changes.append((frame.get("data") or {}).get("taken_by", ""))
         return frame
 
     def _readline(self) -> str:

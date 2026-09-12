@@ -34,7 +34,7 @@
 //! The attach data plane. A host tab's bytes and snapshot payloads are
 //! C5's, because the decoder and the hydrated `Terminal` are
 //! main-thread-only; C4 stops at handing C5 a live control client with
-//! the lease, an ordered queue to mint `tab.attach` tokens on, and a
+//! an ordered queue to mint `tab.attach` tokens on, and a
 //! mirror that already knows which tabs exist.
 //!
 //! # How C5/C6/C7 consume this
@@ -86,10 +86,10 @@ pub(crate) mod task;
 pub(crate) mod upload;
 
 pub(crate) use mirror::SharedMirror;
-pub(crate) use queue::{HostIntent, HostOpError, HostOps, LeasePolicy};
+pub(crate) use queue::{HostIntent, HostOpError, HostOps};
 pub(crate) use reconnect::{Decision, DropInput};
 pub(crate) use state::{ConnectFacts, HostConnState, HostTransport};
-pub(crate) use task::{ConnectMode, Foreground, Resume, Shutdown};
+pub(crate) use task::{ConnectMode, Resume, Shutdown};
 pub(crate) use upload::{UploadResult, UploadSource};
 
 /// How far wall-clock time may run past an armed delay before the
@@ -147,8 +147,7 @@ pub(crate) enum AttemptCause {
     /// a schedule had in mind, so it clears the outage entry outright.
     Explicit,
     /// The schedule asked. It leaves the outage alone — the attempt
-    /// counter, and the lease [`Outage`] carries, are what bound the
-    /// ladder and keep it from stealing a session back.
+    /// counter [`Outage`] carries is what bounds the ladder.
     AutoReconnect,
 }
 
@@ -449,13 +448,6 @@ struct HostConn {
     generation: u64,
     ops: HostOps,
     shutdown: Arc<Shutdown>,
-    /// The in-place takeback seam this connection's task is watching.
-    /// `in_place()` is the task's own answer to whether ↻ is a takeback
-    /// or a full reconnect — see [`task::Foreground`].
-    foreground: Arc<Foreground>,
-    /// A takeback asked of that seam and not yet answered. See
-    /// [`HostConnSet::taking_foreground`].
-    taking_foreground: bool,
     /// The incarnation currently being served, once its `Connecting`
     /// has been drained off the feed.
     incarnation: Option<HostId>,
@@ -563,16 +555,6 @@ pub(crate) struct HostSectionView<'a> {
     pub(crate) state: &'a HostConnState,
     pub(crate) incarnation: Option<HostId>,
     pub(crate) mirror: Option<&'a Arc<SharedMirror>>,
-    /// Whether this host's task is deposed but still serving on the
-    /// control connection it holds — the task's own answer, read off
-    /// [`task::Foreground::in_place`].
-    ///
-    /// It rides the section because a `TakenOver` state alone cannot say
-    /// it: the same state covers a session too old to keep the
-    /// connections open and an observer-only connection, and both of
-    /// those leave a frame nothing is feeding. See
-    /// [`crate::app::host_notice::frozen_frame`].
-    pub(crate) serving_in_place: bool,
 }
 
 /// Every connected host, and the mirrors their tasks publish.
@@ -660,23 +642,6 @@ struct HostEntry {
     /// What an ssh host's retry ladder must carry across its own
     /// attempts. See [`Outage`].
     outage: Option<Outage>,
-    /// Whether somebody else drives this session (plan 049 §3.11).
-    ///
-    /// The connection task latches the same fact for its *own* retries,
-    /// but that latch dies with the task — and an ssh host's ladder
-    /// re-enters at [`HostConnSet::open_ssh`] with a fresh one every
-    /// time. Without a copy here, an observer whose stream drops would
-    /// come back as a driver: no held lease, no latch, so
-    /// `attempt` skips the probe and dials
-    /// `session.connect{takeover:true}` — the silent retake the whole
-    /// probe policy exists to prevent.
-    ///
-    /// Set when a `TakenOver` settlement is applied, and cleared by
-    /// exactly one thing: an explicit attempt
-    /// ([`AttemptCause::Explicit`], which is the palette's "take the
-    /// session back" and nothing else). An auto-reconnect never clears
-    /// it, which is the point.
-    observer_only: bool,
     /// Where this host's last connection left the event stream, so the
     /// next one can replay the gap instead of re-listing the workspace
     /// (plan 056 §3.2).
@@ -689,8 +654,8 @@ struct HostEntry {
     ///
     /// It is a fact about the *session*, so the wire going away does not
     /// touch it: [`Self::conn`] being gone, a `Disconnected`, a
-    /// `Connecting`, a takeover, an explicit disconnect and the `forget`
-    /// a reconnect runs all leave it. Only the session being gone or
+    /// `Connecting`, an explicit disconnect and the `forget` a reconnect
+    /// runs all leave it. Only the session being gone or
     /// unreachable clears it — see [`HostConnState::session_is_gone`] —
     /// because a new one has a new id the server would refuse anyway.
     ///
@@ -717,18 +682,14 @@ struct HostEntry {
 /// call that needs them. [`HostConnSet::open_ssh`] inserts a *fresh*
 /// [`SshState`] on every attempt, and [`HostConnSet::connect`] calls
 /// `forget` before it builds the config, destroying the old
-/// [`HostConn`]. So the ladder's depth and the lease it must present
-/// live here, in a store neither of them touches.
+/// [`HostConn`]. So the ladder's depth lives here, in a store neither of
+/// them touches.
 ///
 /// Created at the first drop of an outage and destroyed by anything
 /// that ends one: a successful connect, an explicit attempt, a
 /// disconnect, a remove, a give-up, a terminal settle.
 pub(crate) struct Outage {
     ladder: reconnect::ReconnectLadder,
-    /// The lease the connection that just died held, copied off
-    /// [`SshState::lease`] on every drop that has one (§3.7). What the
-    /// next attempt presents before taking the session back.
-    lease: Option<String>,
     /// The retry waiting to fire, if one is. Deliberately without a
     /// request stamp beside it — see [`HostConnSet::arm_reconnect`].
     armed: Option<Armed>,
@@ -853,29 +814,14 @@ struct SshState {
     origin: RequestOrigin,
     /// Whether anybody asked for *this* attempt, as opposed to who
     /// would hear about it. It is what an explicit connect clears an
-    /// outage off, and what decides whether the next dial carries
-    /// [`Outage::lease`].
+    /// outage off.
     cause: AttemptCause,
     /// This attempt's connection generation, minted by
     /// [`HostConnSet::open_ssh`] when the handshake started and reused
     /// verbatim by the [`HostConnSet::connect`] a working tunnel
     /// reaches — so the two are the same number and an establish that
     /// never answers still has one.
-    ///
-    /// It is what makes [`Self::lease`] attributable: a feed item is
-    /// tagged with an incarnation, and the connection an incarnation
-    /// belongs to is only half the question here.
     generation: Option<u64>,
-    /// The lease the connection under this attempt was granted, once it
-    /// reached `Connected`.
-    ///
-    /// It lands here rather than on the [`Outage`] because of when it
-    /// arrives (§3.7): at `Connected` no outage exists yet — one is
-    /// created at the first drop — and a successful auto-reconnect
-    /// *clears* the outage at exactly the moment the new lease is
-    /// published. This entry, by contrast, is created at `open_ssh`,
-    /// stamped here, and still untouched at the drop that copies it out.
-    lease: Option<String>,
     /// `None` until the establish answers, and again once the tunnel is
     /// torn down.
     tunnel: Option<Arc<SshTunnel>>,
@@ -985,19 +931,7 @@ impl HostConnSet {
     ///
     /// An existing connection for the same saved host is dropped first —
     /// its task is aborted and its incarnation forgotten — so "Connect"
-    /// on an already-connected host is a deliberate reconnect, which on
-    /// this wire is a takeover.
-    ///
-    /// `cause` decides one thing here: whether the task starts holding
-    /// the previous connection's lease — see [`Self::carried_lease`].
-    ///
-    /// **The one exception is a host somebody else took over on a
-    /// session that closed nothing** (plan 057 §3.5): its task is still
-    /// serving on a live control connection, so Connect asks *that* task
-    /// for the foreground instead of replacing it. No new incarnation, no
-    /// reattach, no snapshot — and deliberately no new incarnation
-    /// especially, because [`Self::apply_state`] clears a connection's
-    /// facts, payload kind and focus the moment one appears.
+    /// on an already-connected host is a deliberate reconnect.
     pub(crate) fn connect(
         &mut self,
         host: &str,
@@ -1005,11 +939,7 @@ impl HostConnSet {
         socket: PathBuf,
         transport: HostTransport,
         mode: ConnectMode,
-        cause: AttemptCause,
     ) {
-        if self.request_foreground_in_place(host, &socket, transport, cause) {
-            return;
-        }
         // The incarnation this reconnect displaces, threaded into the
         // replacement task so its FIRST `Connecting` carries it — that
         // is the one message consumers purge dead-incarnation state off,
@@ -1020,8 +950,6 @@ impl HostConnSet {
             .entries
             .get(host)
             .and_then(|entry| entry.conn.as_ref()?.incarnation);
-        let held_lease = self.carried_lease(host, cause);
-        let observer_only = self.observer_mode(host, cause);
         // Every cause, deliberately: what the checkpoint describes is
         // the session, not who asked to dial it, so an explicit Connect
         // resumes exactly as an auto-reconnect does.
@@ -1065,7 +993,6 @@ impl HostConnSet {
 
         let (ops, ops_rx) = HostOps::channel();
         let shutdown = Arc::new(Shutdown::default());
-        let foreground = Arc::new(Foreground::default());
         let config = task::ConnectionConfig {
             host: host.to_string(),
             label: label.to_string(),
@@ -1074,13 +1001,10 @@ impl HostConnSet {
             generation,
             supersedes,
             mode,
-            held_lease,
-            observer_only,
             resume,
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
-            foreground: Arc::clone(&foreground),
         };
         // Detached on purpose: the task owns its own shutdown, bounds it
         // (`task::SHUTDOWN_GRACE`), and answers its queue on the way
@@ -1101,8 +1025,6 @@ impl HostConnSet {
             generation,
             ops,
             shutdown,
-            foreground,
-            taking_foreground: false,
             incarnation: None,
             payload_kind: None,
             fidelity_announced: false,
@@ -1115,86 +1037,6 @@ impl HostConnSet {
             // state the machine cannot produce.
             state: HostConnState::Connecting { previous: None },
         });
-    }
-
-    /// Whether Connect on this host is a takeback the deposed task can
-    /// perform on the connection it still holds (plan 057 §3.5).
-    ///
-    /// Four conditions, and each rules out a way this could be wrong:
-    ///
-    /// * the ask is a person's. An auto-reconnect that took the
-    ///   foreground back would be exactly the steal-back
-    ///   [`task::attempt`]'s probe exists to prevent;
-    /// * the host is `TakenOver` — every other state either drives
-    ///   already or has no session to ask;
-    /// * its task says it is serving in place, which only an
-    ///   `open_input` session's takeover produces;
-    /// * and the endpoint is the one that task is already on. Over ssh
-    ///   that endpoint is the **live** tunnel's bridge socket, which
-    ///   [`Self::open_ssh`] offers before it tears anything down — so
-    ///   what this rules out there is a task left over from a tunnel
-    ///   the host no longer has, whose control connection is on its way
-    ///   out however healthy its flag still looks.
-    fn can_take_foreground_in_place(
-        &self,
-        host: &str,
-        socket: &std::path::Path,
-        transport: HostTransport,
-        cause: AttemptCause,
-    ) -> bool {
-        if cause != AttemptCause::Explicit {
-            return false;
-        }
-        let Some(conn) = self.entries.get(host).and_then(|entry| entry.conn.as_ref()) else {
-            return false;
-        };
-        matches!(conn.state, HostConnState::TakenOver { .. })
-            && conn.socket == socket
-            && conn.transport == transport
-            && conn.foreground.in_place()
-    }
-
-    /// [`Self::can_take_foreground_in_place`], and when it holds, ask —
-    /// answering whether the task took the request.
-    ///
-    /// The predicate is split out only so neither door has to spell the
-    /// conditions out; raising the ask is what *makes* the takeback, so
-    /// nothing may consult it and act on it alone.
-    fn request_foreground_in_place(
-        &mut self,
-        host: &str,
-        socket: &std::path::Path,
-        transport: HostTransport,
-        cause: AttemptCause,
-    ) -> bool {
-        if !self.can_take_foreground_in_place(host, socket, transport, cause) {
-            return false;
-        }
-        let conn = self
-            .entries
-            .get_mut(host)
-            .and_then(|entry| entry.conn.as_mut())
-            .expect("the connection the predicate just read");
-        tracing::info!(%host, "taking this host session's foreground back in place");
-        conn.foreground.request();
-        conn.taking_foreground = true;
-        true
-    }
-
-    /// Whether a takeback asked of a deposed-but-serving task has not
-    /// been answered yet.
-    ///
-    /// Deliberately **not** a state: the band, the facts and the grid all
-    /// stay exactly as they were, because none of them changed. What it
-    /// serves is `host.connect`'s own contract — that op answers what was
-    /// asked for, and from the ask until the task's next publication an
-    /// attempt is genuinely in flight. A caller that wants the settled
-    /// answer polls `host.status`, as it always did.
-    pub(crate) fn taking_foreground(&self, host: &str) -> bool {
-        self.entries
-            .get(host)
-            .and_then(|entry| entry.conn.as_ref())
-            .is_some_and(|conn| conn.taking_foreground)
     }
 
     /// Start an ssh-reached host's connection: open its tunnel, warm the
@@ -1212,10 +1054,7 @@ impl HostConnSet {
     /// Any tunnel this host already had is torn down first: a Connect is
     /// an unconditional reconnect on this wire, and reusing a mux whose
     /// master may already be wedged is exactly how a reconnect fails to
-    /// be one. The one exception is the takeback
-    /// [`Self::request_foreground_in_place`] answers for — there is no
-    /// reconnect to be had there, only a session to ask for back, and
-    /// the connection that asks is the one riding this very tunnel.
+    /// be one.
     ///
     /// The teardown is *awaited by the replacement*, in the same task, so
     /// one host never has two `ssh` masters at once. That is hygiene
@@ -1255,25 +1094,6 @@ impl HostConnSet {
         if cause == AttemptCause::Explicit {
             self.clear_outage(host);
         }
-        // For the clear an explicit cause performs, and for it to
-        // happen before the tunnel rather than at the connect a working
-        // tunnel reaches: a takeback whose establish fails and lands on
-        // the ladder must still be a takeback when a socket finally
-        // exists. The verdict itself is read again there.
-        self.observer_mode(host, cause);
-        // Before the teardown below: a deposed task's control leg runs
-        // over the very tunnel a reconnect would shut down, so the ask
-        // has to come first.
-        let bridge = self
-            .entries
-            .get(host)
-            .and_then(|entry| entry.ssh.as_ref()?.tunnel.as_ref())
-            .map(|tunnel| tunnel.bridge_socket().to_path_buf());
-        if let Some(bridge) = bridge {
-            if self.request_foreground_in_place(host, &bridge, HostTransport::Ssh, cause) {
-                return;
-            }
-        }
         let previous = self.take_tunnel(host);
         self.next_ssh_request += 1;
         let request = self.next_ssh_request;
@@ -1311,7 +1131,6 @@ impl HostConnSet {
             origin,
             cause,
             generation: Some(generation),
-            lease: None,
             tunnel: None,
             establish: Some(establish.abort_handle()),
             seen: 0,
@@ -1385,9 +1204,9 @@ impl HostConnSet {
                 entry.failure = None;
                 entry.tunnel = Some(tunnel);
                 entry.establish = None;
-                let (label, mode, cause) = (entry.label.clone(), entry.mode, entry.cause);
+                let (label, mode) = (entry.label.clone(), entry.mode);
                 tracing::info!(%host, socket = %socket.display(), "ssh tunnel established");
-                self.connect(&host, &label, socket, HostTransport::Ssh, mode, cause);
+                self.connect(&host, &label, socket, HostTransport::Ssh, mode);
                 None
             }
             Err(failure) => {
@@ -1441,24 +1260,6 @@ impl HostConnSet {
             return Some(failure.message.as_str());
         }
         disconnected_reason(&entry.retained.as_ref()?.state)
-    }
-
-    /// [`Self::section_reason`] as the **sidebar band** wants it: the
-    /// same ladder, except that a taken-over host's reason is *who* took
-    /// it, which `SectionState::status_text_with_reason` renders as
-    /// "taken over by ‹taker›".
-    ///
-    /// Separate from `section_reason` on purpose. That one is
-    /// `host.status`'s `reason` field, which reports why a connection is
-    /// in trouble; who holds the foreground is not trouble and rides its
-    /// own `taken_by` field there.
-    pub(crate) fn band_reason(&self, host: &str) -> Option<&str> {
-        if let Some(conn) = self.entries.get(host).and_then(|entry| entry.conn.as_ref()) {
-            if matches!(conn.state, HostConnState::TakenOver { .. }) {
-                return conn.state.taken_by();
-            }
-        }
-        self.section_reason(host)
     }
 
     /// The long form behind [`Self::section_reason`], when the reason is
@@ -1562,117 +1363,13 @@ impl HostConnSet {
     }
 
     /// This host's outage, created if this is the drop that starts one.
-    ///
-    /// This is where the lease moves house: [`SshState::lease`] is still
-    /// the one the connection that just died held — `open_ssh` has not
-    /// run again yet — so this is the last moment it can be copied
-    /// somewhere the next attempt's `open_ssh` will not wipe (§3.7).
     pub(crate) fn begin_outage(&mut self, host: &str) -> &mut Outage {
-        // Cloned before the entry is borrowed mutably, which is also
-        // the order today's two maps forced.
-        let lease = self
-            .entries
-            .get(host)
-            .and_then(|entry| entry.ssh.as_ref()?.lease.clone());
-        let outage = self.entry_mut(host).outage.get_or_insert_with(|| Outage {
+        self.entry_mut(host).outage.get_or_insert_with(|| Outage {
             ladder: reconnect::ReconnectLadder::default(),
-            lease: None,
             armed: None,
             family: None,
             dead_tunnel: None,
-        });
-        // Every drop, not only the first: an entry holding a lease is by
-        // construction the connection that just died, so it supersedes
-        // whatever the outage carries. `None` does not clear, because
-        // that is what a retry which never reached `Connected` leaves
-        // behind — and the outage's own lease is still the one to
-        // present.
-        if lease.is_some() {
-            outage.lease = lease;
-        }
-        outage
-    }
-
-    /// The lease one attempt starts holding, which is the whole takeover
-    /// guard (§3.7).
-    ///
-    /// A fresh task's `held_lease` is `None`, so an auto-reconnect that
-    /// carried nothing would reconnect with `takeover: true` and no
-    /// probe — silently taking the session back from another client
-    /// whenever the drop *was* a takeover whose `session.stopping`
-    /// envelope was lost. An explicit Connect carries nothing on
-    /// purpose: taking the session back is exactly what that button
-    /// means.
-    fn carried_lease(&self, host: &str, cause: AttemptCause) -> Option<String> {
-        match cause {
-            AttemptCause::Explicit => None,
-            AttemptCause::AutoReconnect => self.entries.get(host)?.outage.as_ref()?.lease.clone(),
-        }
-    }
-
-    /// Whether the attempt starting now may claim the lease, and the
-    /// only place [`HostEntry::observer_only`] is cleared.
-    ///
-    /// The takeback is a *user* act by construction — the palette's
-    /// `host:connect:<id>` row is the one door that reaches here with
-    /// [`AttemptCause::Explicit`] — so clearing it on that cause and
-    /// nothing else is the whole rule. Called from [`Self::connect`] and
-    /// [`Self::open_ssh`], because an ssh attempt starts at the tunnel
-    /// and only reaches the connect if one comes up.
-    fn observer_mode(&mut self, host: &str, cause: AttemptCause) -> bool {
-        match cause {
-            AttemptCause::Explicit => {
-                if let Some(entry) = self.entries.get_mut(host) {
-                    entry.observer_only = false;
-                }
-                false
-            }
-            AttemptCause::AutoReconnect => self.observes_only(host),
-        }
-    }
-
-    /// Whether this host has learned it is not the driver.
-    fn observes_only(&self, host: &str) -> bool {
-        self.entries
-            .get(host)
-            .is_some_and(|entry| entry.observer_only)
-    }
-
-    /// Drain one `EngineFeed::HostLease`: the lease a connection was
-    /// granted, on its way to the entry that outlives the connection.
-    ///
-    /// Attributed through [`Self::owner_of`] like every other feed item
-    /// — a lease minted by a connection this set has since replaced
-    /// would otherwise become the one the *next* outage presents, which
-    /// is a lease two connections old. Hosts not reached over ssh keep
-    /// nothing: their task holds its own lease across its own retries,
-    /// which is the case this entry exists to cover for ssh.
-    ///
-    /// The stamped generation is a *second* question, and the ssh path
-    /// is where the two come apart: [`Self::open_ssh`] installs a fresh
-    /// [`SshState`] while the old [`HostConn`] is still on the entry — an
-    /// ssh connect does not reach [`Self::connect`], and so does not
-    /// `forget`, until its tunnel is up an establish later. So "is this
-    /// connection still current?" can be yes while "is this the attempt
-    /// that opened it?" is no, and only the second keeps a lease from
-    /// landing on the attempt an explicit connect just installed.
-    pub(crate) fn apply_lease(&mut self, incarnation: HostId, lease: String) {
-        let Some(host) = self.owner_of(incarnation) else {
-            return;
-        };
-        let Some(minted) = self.minter.registration(incarnation) else {
-            return;
-        };
-        let Some(entry) = self
-            .entries
-            .get_mut(&host)
-            .and_then(|entry| entry.ssh.as_mut())
-        else {
-            return;
-        };
-        if entry.generation == Some(minted.generation) {
-            entry.lease = Some(lease);
-        }
+        })
     }
 
     /// Say what a bootstrap is doing to this host, or stop saying it.
@@ -1789,14 +1486,6 @@ impl HostConnSet {
                 return;
             }
         }
-        // Outside the gate, not inside it: this creates the entry on the
-        // drop that starts an outage *and* refreshes the lease it carries
-        // on every later one. Called only under the gate the refresh is
-        // dead code, and the case it exists for is real — an attempt
-        // whose `session.connect` was granted a lease and whose prologue
-        // then failed publishes that lease without ever reaching
-        // `Connected`, so nothing clears the outage and its lease is a
-        // tombstone from that moment on (§3.7).
         self.begin_outage(host);
         // `HostConn::drop` publishes its own `disconnect_requested()`,
         // and a late `Dropped` can still arrive under the *same*
@@ -1866,8 +1555,7 @@ impl HostConnSet {
                 disconnected.reason = gave_up_copy(attempts, family_copy.as_deref());
                 disconnected.retry_in = None;
                 // Nothing is armed in this state, so nothing else would
-                // ever clean the entry — and the lease it holds belongs
-                // to an outage that is over (§3.7).
+                // ever clean the entry (§3.4).
                 self.clear_outage(host);
             }
             // The band keeps the family's own copy: "must not be tried"
@@ -2104,8 +1792,8 @@ impl HostConnSet {
         }
     }
 
-    /// End this host's outage: the ladder, the lease, the dead tunnel
-    /// and any armed timer go together.
+    /// End this host's outage: the ladder, the dead tunnel and any armed
+    /// timer go together.
     fn clear_outage(&mut self, host: &str) {
         // `get_mut`, never `entry_mut`: ending an outage a host does
         // not have must not conjure an entry for it.
@@ -2258,8 +1946,7 @@ impl HostConnSet {
             .and_then(|entry| entry.ssh.take());
         self.park_displaced(removed);
         // Being reconnected eight seconds after asking to disconnect is
-        // the one outcome nobody wants, and the lease the entry holds
-        // has no owner left either.
+        // the one outcome nobody wants.
         self.clear_outage(host);
         let Some(mut conn) = self
             .entries
@@ -2460,14 +2147,9 @@ impl HostConnSet {
     /// attempt's `Connecting` purges the incarnation) — and a kind
     /// nothing is decoding is exactly the misinformation this field
     /// exists to prevent.
-    ///
-    /// `reached_session` rather than `is_foreground`: since plan 057 a
-    /// takeover closes no data connection, so a deposed client's attach
-    /// is still decoding this very kind. Reporting nothing there would be
-    /// the same misinformation with the sign flipped.
     pub(crate) fn payload_kind(&self, host: &str) -> Option<&'static str> {
         let conn = self.entries.get(host)?.conn.as_ref()?;
-        conn.payload_kind.filter(|_| conn.state.reached_session())
+        conn.payload_kind.filter(|_| conn.state.is_connected())
     }
 
     /// File what one incarnation's prologue learned, and check the
@@ -2506,23 +2188,14 @@ impl HostConnSet {
     }
 
     /// What this host's live connection learned about its session.
-    ///
-    /// Filtered on [`HostConnState::reached_session`] rather than on
-    /// driving it: an observer's facts describe something just as real —
-    /// it resumes on the same checkpoint and it is at the same fidelity.
     pub(crate) fn facts(&self, host: &str) -> Option<&ConnectFacts> {
         let conn = self.entries.get(host)?.conn.as_ref()?;
-        conn.facts.as_ref().filter(|_| conn.state.reached_session())
+        conn.facts.as_ref().filter(|_| conn.state.is_connected())
     }
 
     /// Whether this host is attached across a libghostty build skew.
-    ///
-    /// `Connected` only, unlike [`Self::facts`]: everything this answers
-    /// offers to *do* something about the skew — update, restart — and
-    /// none of that is a deposed client's to offer.
     pub(crate) fn reduced_fidelity(&self, host: &str) -> bool {
         self.facts(host).is_some_and(|facts| facts.reduced_fidelity)
-            && self.state(host).is_some_and(HostConnState::is_foreground)
     }
 
     /// How many tab rows this host's section is currently listing.
@@ -2615,7 +2288,6 @@ impl HostConnSet {
                     .incarnation
                     .or_else(|| carried.map(|carried| carried.incarnation)),
                 mirror: live.or(carried.map(|carried| &carried.mirror)),
-                serving_in_place: conn.foreground.in_place(),
             });
         }
         let retained = entry.retained.as_ref()?;
@@ -2624,9 +2296,6 @@ impl HostConnSet {
             state: &retained.state,
             incarnation: Some(retained.incarnation),
             mirror: Some(&retained.mirror),
-            // A retained section has no task at all, so nothing is
-            // serving it by definition.
-            serving_in_place: false,
         })
     }
 
@@ -2638,7 +2307,7 @@ impl HostConnSet {
     ) -> impl Iterator<Item = (&str, &str, HostId, &Arc<SharedMirror>)> {
         self.entries.iter().filter_map(|(host, entry)| {
             let conn = entry.conn.as_ref()?;
-            let incarnation = conn.incarnation.filter(|_| conn.state.is_foreground())?;
+            let incarnation = conn.incarnation.filter(|_| conn.state.is_connected())?;
             let mirror = self.mirrors.get(&incarnation)?;
             Some((host.as_str(), conn.label.as_str(), incarnation, mirror))
         })
@@ -2676,23 +2345,14 @@ impl HostConnSet {
             .entries
             .values()
             .filter_map(|entry| entry.conn.as_ref())
-            // The foreground only. A deposed connection refuses a
-            // lease-required intent before the wire, and this one has no
-            // reply channel — so sending it would buy nothing but a
-            // warning per deposed host on an ordinary theme change. The
-            // takeback re-seeds from the shared slot above, which is
-            // where a deposed host's colors come from anyway.
-            .filter(|conn| conn.state.is_foreground())
+            .filter(|conn| conn.state.is_connected())
         {
-            // Lease-gated, and it rides the same queue as everything
-            // else so it cannot interleave with an attach.
-            let _ = conn.ops.send(
-                queue::HostIntent::new(
-                    ops::SESSION_SET_THEME,
-                    serde_json::json!({ "osc_colors": colors }),
-                )
-                .requires_lease(),
-            );
+            // It rides the same queue as everything else so it cannot
+            // interleave with an attach.
+            let _ = conn.ops.send(queue::HostIntent::new(
+                ops::SESSION_SET_THEME,
+                serde_json::json!({ "osc_colors": colors }),
+            ));
         }
     }
 
@@ -2725,7 +2385,6 @@ impl HostConnSet {
         let reply = conn.ops.call(
             ops::SESSION_SET_AGENT_HOOKS,
             serde_json::json!({ "mode": mode, "skip": skip, "client": client }),
-            LeasePolicy::Required,
         );
         let feed = self.feed.clone();
         self.runtime.spawn(async move {
@@ -2770,7 +2429,7 @@ impl HostConnSet {
             .values_mut()
             .filter_map(|entry| entry.conn.as_mut())
         {
-            let Some(incarnation) = conn.incarnation.filter(|_| conn.state.is_foreground()) else {
+            let Some(incarnation) = conn.incarnation.filter(|_| conn.state.is_connected()) else {
                 continue;
             };
             let focused = claim
@@ -2786,7 +2445,6 @@ impl HostConnSet {
                     // on the wire, so an absent one would be refused.
                     serde_json::json!({ "focused_tab_id": focused.map(|id| id.to_string()) }),
                 )
-                .requires_lease()
                 .quiet(),
             );
             // Recorded only once it is actually on the queue: an intent
@@ -2814,7 +2472,7 @@ impl HostConnSet {
         // here on, every drop for this attempt is a *session going away*
         // rather than a connect that never worked, and the bootstrap
         // offer turns on exactly that difference.
-        if next.reached_session() {
+        if next.is_connected() {
             if let Some(ssh) = self
                 .entries
                 .get_mut(&host)
@@ -2830,30 +2488,13 @@ impl HostConnSet {
                 entry.resume = None;
             }
         }
-        // Task-independent by design: the arm below ends this host's
-        // outage, so every later auto-reconnect starts from a clean
-        // ladder with no lease to probe. This is what stops one of them
-        // dialing as a driver — see [`HostEntry::observer_only`].
-        if matches!(next, HostConnState::TakenOver { .. }) {
-            self.entry_mut(&host).observer_only = true;
-        }
-        if next.is_foreground() {
-            self.entry_mut(&host).observer_only = false;
-        }
         match &next {
             // The outage is over, so the next one starts at the base
-            // delay — and the lease this one carried has been superseded
-            // by the one the fresh connection is about to publish.
-            //
-            // It is also the one edge that *proves* this client drives
-            // again, which an in-place takeback reaches without ever
-            // passing through [`Self::connect`] — the other place the
-            // latch is cleared.
+            // delay.
             HostConnState::Connected
             // Terminal in the machine, and nothing is armed in any of
             // them: if the entry did not go here, nothing would ever
             // clean it up (§3.4).
-            | HostConnState::TakenOver { .. }
             | HostConnState::Stopped
             | HostConnState::NeedsRestart(_) => self.clear_outage(&host),
             HostConnState::Connecting { .. } | HostConnState::Disconnected(_) => {}
@@ -2901,26 +2542,13 @@ impl HostConnSet {
         // A different incarnation, or one that never reached a session,
         // knows nothing about what this connection established: the kind
         // an attach negotiated with the *old* incarnation must not be
-        // reported for the one that replaced it. A takeover retires none
-        // of it — the session is the same session, at the same fidelity,
-        // still being read (plan 057 §3.5).
-        if conn.incarnation != Some(incarnation) || !next.reached_session() {
+        // reported for the one that replaced it.
+        if conn.incarnation != Some(incarnation) || !next.is_connected() {
             conn.payload_kind = None;
             conn.fidelity_announced = false;
             conn.facts = None;
-        }
-        // Focus is the exception, and it is cleared on the **takeover
-        // edge too**: the session drops the displaced client's focus
-        // claim when it deposes it, so a client that came back to the
-        // foreground with this dedup intact would leave that host's
-        // notifications unmuted forever.
-        if conn.incarnation != Some(incarnation) || !next.is_foreground() {
             conn.focus_sent = None;
         }
-        // Whatever the task published, it published it after hearing the
-        // ask — so the takeback is no longer in flight, whether it worked
-        // or the connection went instead.
-        conn.taking_foreground = false;
         conn.incarnation = Some(incarnation);
         conn.state = next;
         Some(host)
@@ -3222,9 +2850,9 @@ pub(crate) mod fixtures {
         })
     }
 
-    /// An ssh host walked to `Connected` by an explicit connect — the
-    /// only state that mints a lease, and where each case below starts.
-    /// The cause a case turns on is the one it passes *after* this.
+    /// An ssh host walked to `Connected` by an explicit connect, where
+    /// each case below starts. The cause a case turns on is the one it
+    /// passes *after* this.
     pub(crate) fn a_connected_ssh_host(set: &mut HostConnSet, socket: &str) -> HostId {
         set.open_ssh(
             "h1",
@@ -3240,7 +2868,6 @@ pub(crate) mod fixtures {
             PathBuf::from(socket),
             HostTransport::Ssh,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -3292,36 +2919,6 @@ pub(crate) mod fixtures {
         let incarnation = a_connected_ssh_host(set, socket);
         set.apply_state(incarnation, dropped("the connection closed"));
         incarnation
-    }
-
-    /// An ssh host taken over by somebody else whose task is still
-    /// serving in place, reached on `socket` and carrying `tunnel`.
-    /// Where every takeback case starts.
-    ///
-    /// The foreground seam comes back with the incarnation because
-    /// `open_ssh` borrows the set, and the ask has to be read after it.
-    pub(crate) fn a_deposed_serving_ssh_host(
-        set: &mut HostConnSet,
-        socket: &str,
-        tunnel: Option<Arc<SshTunnel>>,
-        taken_by: Option<&str>,
-    ) -> (HostId, Arc<Foreground>) {
-        let incarnation = a_connected_ssh_host(set, socket);
-        abort_establishes(set);
-        set.entry_mut("h1")
-            .ssh
-            .as_mut()
-            .expect("an ssh entry")
-            .tunnel = tunnel;
-        set.apply_state(
-            incarnation,
-            HostConnState::TakenOver {
-                taken_by: taken_by.map(Into::into),
-            },
-        );
-        let foreground = Arc::clone(&set.conn("h1").foreground);
-        foreground.serving_for_test(true);
-        (incarnation, foreground)
     }
 
     /// A transport failure, which is the retryable establish shape.
@@ -3423,7 +3020,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-one.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         set.connect(
             "h2",
@@ -3431,7 +3027,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-two.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
 
         let first = set.mint_for("h1");
@@ -3441,14 +3036,10 @@ mod tests {
             Some("h2")
         );
         assert_eq!(
-            set.apply_state(first, HostConnState::TakenOver { taken_by: None })
-                .as_deref(),
+            set.apply_state(first, HostConnState::Stopped).as_deref(),
             Some("h1")
         );
-        assert_eq!(
-            set.state("h1"),
-            Some(&HostConnState::TakenOver { taken_by: None })
-        );
+        assert_eq!(set.state("h1"), Some(&HostConnState::Stopped));
         assert_eq!(set.state("h2"), Some(&HostConnState::Connected));
         assert_eq!(set.incarnation("h2"), Some(second));
     }
@@ -3465,7 +3056,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-purge.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
 
         let old = set.mint_for("h1");
@@ -3516,7 +3106,6 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let outgoing = set.conn("h1").generation;
 
@@ -3528,7 +3117,6 @@ mod tests {
             socket,
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -3576,7 +3164,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-send-at.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -3858,42 +3445,6 @@ mod tests {
         assert_eq!(set.section_reason("h1"), None);
     }
 
-    /// The band and `host.status` ask different questions of a
-    /// taken-over host (plan 057 §3.5). The band wants *who* has the
-    /// foreground, because `SectionState::status_text_with_reason` is
-    /// what renders "taken over by ‹taker›"; `host.status`'s `reason`
-    /// reports why a connection is in trouble, and holding the
-    /// foreground is not trouble — it rides `taken_by` there.
-    #[tokio::test]
-    async fn the_band_names_the_taker_and_host_status_reason_does_not() {
-        let (mut set, _feed) = a_set();
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from("/nonexistent/roost-set-band-reason.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h1");
-        set.apply_state(incarnation, HostConnState::Connected);
-        assert_eq!(set.band_reason("h1"), None);
-
-        set.apply_state(
-            incarnation,
-            HostConnState::TakenOver {
-                taken_by: Some("a phone".into()),
-            },
-        );
-        assert_eq!(set.band_reason("h1"), Some("a phone"));
-        assert_eq!(set.section_reason("h1"), None);
-
-        // A takeover this client only inferred names nobody, and the
-        // band falls back to the bare word.
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-        assert_eq!(set.band_reason("h1"), None);
-    }
-
     /// The band prefers the live connection's own reason. An ssh failure
     /// recorded before this connection existed must not outrank what the
     /// connection is saying now.
@@ -3917,7 +3468,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-ssh.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(
@@ -3958,7 +3508,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-reached.sock"),
             HostTransport::Ssh,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
 
@@ -4004,247 +3553,15 @@ mod tests {
         assert!(!set.ssh_reached_connected("h1"));
     }
 
-    /// An observer settlement answers the same question: the session
-    /// was reached and refused the lease, which is not "never worked".
-    /// Without this, a client deposed on a fresh tunnel whose observer
-    /// stream later drops would be treated as a connect that never
-    /// happened, and the ladder would give up on it.
-    #[tokio::test]
-    async fn an_observer_settlement_counts_as_having_reached_the_session() {
-        let (mut set, _feed) = a_set();
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::User,
-            AttemptCause::Explicit,
-        );
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from("/nonexistent/roost-set-observer.sock"),
-            HostTransport::Ssh,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h1");
-        assert!(!set.ssh_reached_connected("h1"));
-
-        set.apply_state(
-            incarnation,
-            HostConnState::TakenOver {
-                taken_by: Some("kestrel.local".into()),
-            },
-        );
-        assert!(
-            set.ssh_reached_connected("h1"),
-            "settling as an observer reached the session"
-        );
-    }
-
-    /// The other half of "only the explicit takeback promotes an
-    /// observer" (plan 049 §3.11), and the hole it closes.
-    ///
-    /// A `TakenOver` settlement ends the outage, so the auto-reconnect
-    /// that follows an observer's dropped stream carries no lease to
-    /// probe. Without a fact on the *set*, that attempt would spawn a
-    /// task with nothing to stop it dialing
-    /// `session.connect{takeover: true}` — the ladder taking the session
-    /// back on nobody's behalf.
-    #[tokio::test]
-    async fn an_auto_reconnect_after_a_takeover_dials_as_an_observer() {
-        let (mut set, _feed) = a_set();
-        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-deposed.sock");
-        assert!(!set.observes_only("h1"), "a driver claims its lease");
-
-        set.apply_state(
-            incarnation,
-            HostConnState::TakenOver {
-                taken_by: Some("a phone".into()),
-            },
-        );
-        assert!(set.observes_only("h1"), "the set carries the deposed fact");
-
-        // The observer's own stream drops and the ladder re-enters.
-        set.apply_state(incarnation, dropped("the event stream closed"));
-        assert!(
-            set.observes_only("h1"),
-            "an auto-reconnect must not clear it"
-        );
-        assert!(
-            set.observer_mode("h1", AttemptCause::AutoReconnect),
-            "so the task it spawns runs the observer prologue"
-        );
-
-        // Only the palette's "take the session back" clears it, and
-        // clearing it is what makes the next attempt a driver.
-        assert!(!set.observer_mode("h1", AttemptCause::Explicit));
-        assert!(!set.observes_only("h1"), "an explicit connect is a claim");
-    }
-
-    /// The clear happens at [`HostConnSet::open_ssh`] too, because an
-    /// ssh takeback starts at the tunnel: a handshake that fails and
-    /// lands on the ladder must not turn the user's claim back into a
-    /// watch by the time a socket finally exists.
-    ///
-    /// This host has no tunnel, so the attempt is the full one — the
-    /// half where a claim can go missing across an establish, and the
-    /// half the in-place takeback never reaches.
-    #[tokio::test]
-    async fn an_explicit_ssh_attempt_clears_the_deposed_fact_at_the_tunnel() {
-        let (mut set, _feed) = a_set();
-        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-takeback.sock");
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-        assert!(set.observes_only("h1"));
-        assert!(set.ssh("h1").tunnel.is_none());
-        let generation = set.ssh("h1").generation;
-
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::User,
-            AttemptCause::Explicit,
-        );
-        assert!(
-            !set.observes_only("h1"),
-            "the takeback is stated at the tunnel, not at the socket"
-        );
-        assert_ne!(
-            set.ssh("h1").generation,
-            generation,
-            "the full path numbers a fresh attempt"
-        );
-    }
-    #[tokio::test]
-    async fn a_lease_published_at_connected_reaches_the_attempt_after_the_drop() {
-        let (mut set, _feed) = a_set();
-        let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease.sock");
-        set.apply_lease(incarnation, "lease-1".into());
-        assert_eq!(
-            set.ssh("h1").lease.as_deref(),
-            Some("lease-1"),
-            "the lease lands on the entry the connection was opened under"
-        );
-        assert!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .is_none(),
-            "and nowhere else yet — there is no outage to hold it"
-        );
-
-        set.apply_state(incarnation, dropped("the connection closed"));
-        set.begin_outage("h1");
-        assert_eq!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .as_deref(),
-            Some("lease-1"),
-            "the outage copies it out of the entry that is about to go"
-        );
-
-        // The re-entry: a fresh entry, and the lease still reaches the
-        // dial it authorizes.
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::Ipc,
-            AttemptCause::AutoReconnect,
-        );
-        assert_eq!(
-            set.ssh("h1").lease,
-            None,
-            "the fresh entry knows nothing about the connection that died"
-        );
-        assert_eq!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .as_deref(),
-            Some("lease-1"),
-            "but the outage does, which is the whole reason it exists"
-        );
-    }
-
-    /// A second drop inside one outage carries the *second* attempt's
-    /// lease.
-    ///
-    /// The shape is the one `connect_loop` publishes a lease for without
-    /// ever reaching `Connected`: `session.connect` granted a lease — so
-    /// ownership moved on the wire and everything older is a tombstone —
-    /// and the prologue then failed. Nothing clears the outage on that
-    /// path (`Connected` is what does), so the entry survives to the next
-    /// drop and [`HostConnSet::begin_outage`] has to refresh what it
-    /// carries. Called from inside the entry-creation gate it never runs
-    /// for that drop, and the ladder goes on presenting a lease the far
-    /// side has already tombstoned: `taken-over`, terminal, with no other
-    /// client involved (plan 040 §3.7).
-    /// The lease's whole life, walked rather than seeded.
-    ///
-    /// Every step of it is somewhere the previous store would have been
-    /// wiped, which is why none of them may be short-circuited: it is
-    /// published at `Connected`, when **no outage exists yet**; the
-    /// outage that copies it out is not created until the drop; and the
-    /// entry it was stamped on is replaced wholesale by the very
-    /// `open_ssh` the ladder re-enters through. A test that seeded any
-    /// one of those by hand would stay green while the guard was dead.
-    #[tokio::test]
-    async fn a_second_drop_refreshes_the_lease_the_outage_carries() {
-        let (mut set, _feed) = a_set();
-        let socket = "/nonexistent/roost-set-refresh.sock";
-        let first = a_connected_ssh_host(&mut set, socket);
-        set.apply_lease(first, "lease-1".into());
-        set.apply_state(first, dropped("the connection closed"));
-        assert_eq!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .as_deref(),
-            Some("lease-1"),
-            "the drop that started the outage copied the lease out"
-        );
-
-        // The retry's tunnel comes up and its prologue is granted a lease
-        // before failing — no `Connected`, so the outage is still the
-        // same one.
-        assert!(retry_once(&mut set));
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from(socket),
-            HostTransport::Ssh,
-            ConnectMode::Dial,
-            AttemptCause::AutoReconnect,
-        );
-        let second = set.mint_for("h1");
-        set.apply_lease(second, "lease-2".into());
-        set.apply_state(second, dropped("and the prologue failed"));
-
-        assert!(
-            set.has_outage("h1"),
-            "the ladder is still walking the outage it started"
-        );
-        assert_eq!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .as_deref(),
-            Some("lease-2"),
-            "and the next attempt presents the lease the last one was granted"
-        );
-    }
-
     /// What an attempt's cause decides, at both ends of the two-step ssh
-    /// connect: `open_ssh` records it on the entry `tunnel_ready` reads
-    /// to build the dial, and `connect` turns it into the lease the task
-    /// starts holding.
-    ///
     /// An explicit attempt clears the outage outright — the user's
-    /// attempt supersedes the schedule, and a lease minted two
-    /// connections ago must not be presented by the next ladder. A
-    /// scheduled one leaves it alone: without that, every retry would
-    /// zero its own attempt counter and the ladder would never end.
+    /// attempt supersedes the schedule. A scheduled one leaves it alone:
+    /// without that, every retry would zero its own attempt counter and
+    /// the ladder would never end.
     #[tokio::test]
-    async fn an_attempts_cause_decides_the_outage_and_the_lease_it_carries() {
+    async fn an_attempts_cause_decides_the_outage() {
         let (mut set, _feed) = a_set();
         let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-cause.sock");
-        set.apply_lease(incarnation, "lease-1".into());
         set.apply_state(incarnation, dropped("the connection closed"));
         set.begin_outage("h1");
 
@@ -4261,10 +3578,6 @@ mod tests {
             set.has_outage("h1"),
             "a scheduled attempt leaves the ladder it belongs to alone"
         );
-        assert_eq!(
-            set.carried_lease("h1", set.ssh("h1").cause).as_deref(),
-            Some("lease-1")
-        );
 
         // The user clicks ↻ mid-ladder.
         set.open_ssh(
@@ -4279,165 +3592,6 @@ mod tests {
         assert!(
             !set.has_outage("h1"),
             "an explicit attempt supersedes the schedule outright"
-        );
-        assert_eq!(
-            set.carried_lease("h1", set.ssh("h1").cause),
-            None,
-            "cleared, not merely not-passed: the lease went with the outage"
-        );
-        assert!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .is_none(),
-            "so a ladder started after it cannot present the old lease either"
-        );
-    }
-
-    /// A lease publication is attributed like every other feed item. One
-    /// from a connection this set has since replaced must land nowhere:
-    /// stored, it would become the lease the *next* outage presents —
-    /// a lease two connections old, offered to a session that never
-    /// issued it.
-    #[tokio::test]
-    async fn a_lease_from_a_replaced_connection_is_dropped() {
-        let (mut set, _feed) = a_set();
-        let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-stale.sock");
-        set.apply_lease(live, "lease-live".into());
-
-        let replaced = set.minter.mint("h1", set.conn("h1").generation - 1);
-        set.apply_lease(replaced, "lease-from-the-connection-before".into());
-        assert_eq!(
-            set.ssh("h1").lease.as_deref(),
-            Some("lease-live"),
-            "a replaced connection cannot overwrite the live one's lease"
-        );
-
-        // And an incarnation this set never minted at all.
-        set.apply_lease(HostId::new(9_999), "invented".into());
-        assert_eq!(set.ssh("h1").lease.as_deref(), Some("lease-live"));
-
-        // A disconnect ends the outage the lease would have been kept
-        // for, so nothing survives to be presented.
-        set.begin_outage("h1");
-        set.disconnect("h1");
-        assert!(set
-            .carried_lease("h1", AttemptCause::AutoReconnect)
-            .is_none());
-    }
-
-    /// A lease still in flight when an explicit connect installs a fresh
-    /// attempt must not land on that attempt.
-    ///
-    /// The window is the ssh path's alone, and it is why "is this
-    /// connection current?" cannot answer this on its own: `open_ssh`
-    /// replaces [`SshState`] immediately, while the [`HostConn`] the
-    /// lease was minted under stays in `conns` until the *next* tunnel
-    /// comes up — so [`HostConnSet::owner_of`] accepts an item the
-    /// explicit connect was supposed to have cleared. Stored, it would
-    /// be copied onto the first outage of a connection that never
-    /// issued it, undoing §3.7's "cleared, not merely not-passed".
-    #[tokio::test]
-    async fn a_lease_does_not_land_on_the_attempt_that_superseded_it() {
-        let (mut set, _feed) = a_set();
-        let live = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-superseded.sock");
-
-        // The user clicks Connect. A fresh entry is in place at once;
-        // the old connection is not forgotten until its replacement's
-        // tunnel answers.
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::User,
-            AttemptCause::Explicit,
-        );
-        assert!(
-            set.owner_of(live).is_some(),
-            "the connection the lease belongs to is still held — that is the window"
-        );
-
-        set.apply_lease(live, "lease-1".into());
-        assert_eq!(
-            set.ssh("h1").lease,
-            None,
-            "but the attempt that replaced it never held that lease"
-        );
-        set.begin_outage("h1");
-        assert!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .is_none(),
-            "so no ladder off this attempt can present it"
-        );
-    }
-
-    /// An outage carries the *freshest* lease, not the first one it ever
-    /// saw.
-    ///
-    /// A reconnect that reaches `Connected` mints a new lease and
-    /// tombstones the old one, so an outage still holding the old one
-    /// would present a tombstone on the next drop — the far side answers
-    /// `taken-over` and the host settles as somebody else's with nobody
-    /// else involved. A retry that only failed its establish holds no
-    /// lease at all, and there the outage's own is still the one to
-    /// present.
-    #[tokio::test]
-    async fn an_outage_carries_the_lease_of_the_connection_that_just_died() {
-        let (mut set, _feed) = a_set();
-        let first = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-lease-refresh.sock");
-        set.apply_lease(first, "lease-1".into());
-        set.apply_state(first, dropped("the connection closed"));
-        set.begin_outage("h1");
-        assert_eq!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .as_deref(),
-            Some("lease-1")
-        );
-
-        // A retry that gets all the way to `Connected` again.
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::Ipc,
-            AttemptCause::AutoReconnect,
-        );
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from("/nonexistent/roost-set-lease-refresh.sock"),
-            HostTransport::Ssh,
-            ConnectMode::Dial,
-            AttemptCause::AutoReconnect,
-        );
-        let second = set.mint_for("h1");
-        set.apply_state(second, HostConnState::Connected);
-        set.apply_lease(second, "lease-2".into());
-        set.apply_state(second, dropped("and it dropped again"));
-        set.begin_outage("h1");
-        assert_eq!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .as_deref(),
-            Some("lease-2"),
-            "the second drop presents the second connection's lease"
-        );
-
-        // A retry that never gets a connection at all: its entry has no
-        // lease, and the outage keeps the one it has.
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::Ipc,
-            AttemptCause::AutoReconnect,
-        );
-        set.begin_outage("h1");
-        assert_eq!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .as_deref(),
-            Some("lease-2"),
-            "a failed establish has no lease of its own to supersede it with"
         );
     }
 
@@ -4604,7 +3758,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-why.sock"),
             HostTransport::Ssh,
             ConnectMode::Dial,
-            AttemptCause::AutoReconnect,
         );
         let third = set.mint_for("h1");
         set.apply_state(third, dropped("and it dropped again"));
@@ -4691,7 +3844,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-local.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         assert_eq!(
@@ -4735,7 +3887,6 @@ mod tests {
                 PathBuf::from("/nonexistent/roost-set-gen.sock"),
                 HostTransport::UnixSocket,
                 ConnectMode::Dial,
-                AttemptCause::Explicit,
             );
         };
         connect(&mut set);
@@ -4781,7 +3932,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-sshgen.sock"),
             HostTransport::Ssh,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         assert_eq!(set.generation("h1"), 1, "one attempt is one generation");
         let incarnation = set.mint_for("h1");
@@ -4895,7 +4045,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-survive.sock"),
             HostTransport::Ssh,
             ConnectMode::Dial,
-            AttemptCause::AutoReconnect,
         );
         let second = set.mint_for("h1");
         set.apply_state(second, dropped("and it dropped again"));
@@ -4915,14 +4064,13 @@ mod tests {
     /// like the first. A ladder that stalls there never reaches its
     /// budget, and the give-up copy never renders.
     ///
-    /// It also pins the two things that end an outage: the entry goes at
-    /// `Exhausted`, lease included, since no timer is armed in that
-    /// state and nothing else would ever clean it.
+    /// It also pins what ends an outage: the entry goes at `Exhausted`,
+    /// since no timer is armed in that state and nothing else would ever
+    /// clean it.
     #[tokio::test]
     async fn repeated_establish_failures_run_the_ladder_to_its_budget() {
         let (mut set, _feed) = a_set();
         let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-budget.sock");
-        set.apply_lease(incarnation, "lease-1".into());
         set.apply_state(incarnation, dropped("the connection closed"));
         let budget = budget(&set);
 
@@ -4964,11 +4112,6 @@ mod tests {
             set.retry_schedule("h1"),
             None,
             "the rung's own reason went with the outage — nothing is armed to explain"
-        );
-        assert!(
-            set.carried_lease("h1", AttemptCause::AutoReconnect)
-                .is_none(),
-            "the lease went with the outage it belonged to"
         );
     }
 
@@ -5210,23 +4353,17 @@ mod tests {
         );
     }
 
-    /// A terminal settle ends the outage, lease and all. Nothing is
-    /// armed in `TakenOver`, so if the entry did not go here nothing
-    /// would ever clean it — and the lease it holds belongs to a
-    /// connection somebody else now owns.
+    /// A terminal settle ends the outage. Nothing is armed in `Stopped`,
+    /// so if the entry did not go here nothing would ever clean it.
     #[tokio::test]
     async fn a_terminal_settle_takes_the_outage_with_it() {
         let (mut set, _feed) = a_set();
         let incarnation = a_connected_ssh_host(&mut set, "/nonexistent/roost-set-terminal.sock");
-        set.apply_lease(incarnation, "lease-1".into());
         set.apply_state(incarnation, dropped("the connection closed"));
         assert!(set.has_outage("h1"));
 
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
+        set.apply_state(incarnation, HostConnState::Stopped);
         assert!(!set.has_outage("h1"));
-        assert!(set
-            .carried_lease("h1", AttemptCause::AutoReconnect)
-            .is_none());
     }
 
     /// The exit teardown, both windows (§3.4). An armed timer firing
@@ -5545,342 +4682,16 @@ mod tests {
         assert!(!set.establishing("h1"));
     }
 
-    /// The takeover edge, field by field (plan 057 §3.5).
+    /// A theme change goes to the connected hosts and nobody else
+    /// (review F5).
     ///
-    /// A takeover is a loss of the *foreground*, not of the session, so
-    /// the facts, the negotiated payload kind and the fidelity latch all
-    /// stand — the same session is still being read at the same
-    /// fidelity. **Focus is the exception**: the session drops the
-    /// displaced client's claim when it deposes it, so a dedup that
-    /// survived would leave that host's notifications unmuted for as
-    /// long as the window stayed on the same tab after taking the
-    /// foreground back.
+    /// `session.set_theme` has no reply channel, so a host that is not
+    /// connected would land its refusal on `HostIntent::answer`'s
+    /// nobody-listening arm — a `warn!` per dropped host every time the
+    /// user changes theme. Nothing is lost by skipping it: the next
+    /// connect re-seeds from the shared slot above.
     #[tokio::test]
-    async fn a_takeover_clears_the_focus_dedup_and_keeps_everything_else() {
-        let (mut set, _feed) = a_set();
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from("/nonexistent/roost-set-takeover-edge.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h1");
-        set.apply_state(incarnation, HostConnState::Connected);
-        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
-        assert!(set.note_payload_kind(incarnation, AttachPayloadKind::VT));
-        set.conn_mut("h1").fidelity_announced = true;
-        set.conn_mut("h1").focus_sent = Some(Some(5));
-
-        set.apply_state(
-            incarnation,
-            HostConnState::TakenOver {
-                taken_by: Some("a phone".into()),
-            },
-        );
-
-        assert_eq!(
-            set.conn("h1").focus_sent,
-            None,
-            "the session dropped the claim, so the dedup must not suppress the re-send"
-        );
-        assert_eq!(
-            set.facts("h1").map(|facts| facts.session_id.as_str()),
-            Some("sess-1"),
-            "same session"
-        );
-        assert_eq!(
-            set.conn("h1").payload_kind,
-            Some(AttachPayloadKind::VT),
-            "same attach, still decoding"
-        );
-        assert_eq!(
-            set.payload_kind("h1"),
-            Some(AttachPayloadKind::VT),
-            "and `host.status` says so: the attach the takeover did not close is decoding this"
-        );
-        assert!(
-            set.conn("h1").fidelity_announced,
-            "and the sentence was already said about this very connection"
-        );
-    }
-
-    /// Connect on a taken-over host whose task is still serving is a
-    /// takeback **in place**: no new incarnation, no reattach, and the
-    /// task hears the ask on its own seam (plan 057 §3.5).
-    #[tokio::test]
-    async fn connect_on_a_deposed_but_serving_host_asks_for_the_foreground_in_place() {
-        let (mut set, _feed) = a_set();
-        let socket = PathBuf::from("/nonexistent/roost-set-takeback.sock");
-        let connect = |set: &mut HostConnSet| {
-            set.connect(
-                "h1",
-                "one",
-                socket.clone(),
-                HostTransport::UnixSocket,
-                ConnectMode::Dial,
-                AttemptCause::Explicit,
-            )
-        };
-        connect(&mut set);
-        let incarnation = set.mint_for("h1");
-        set.apply_state(incarnation, HostConnState::Connected);
-        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-        let generation = set.conn("h1").generation;
-
-        // The task has not said it is serving in place, so this is the
-        // ordinary reconnect it has always been.
-        connect(&mut set);
-        assert_ne!(
-            set.conn("h1").generation,
-            generation,
-            "a full reconnect numbers a new attempt"
-        );
-
-        // Now with the task's own answer. Rebuilt from scratch because
-        // the reconnect above replaced the connection.
-        let (mut set, _feed) = a_set();
-        connect(&mut set);
-        let incarnation = set.mint_for("h1");
-        set.apply_state(incarnation, HostConnState::Connected);
-        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-        let generation = set.conn("h1").generation;
-        let foreground = Arc::clone(&set.conn("h1").foreground);
-        foreground.serving_for_test(true);
-
-        connect(&mut set);
-        assert_eq!(
-            set.conn("h1").generation,
-            generation,
-            "a takeback in place mints no new incarnation: `apply_state` would \
-             clear the facts and the payload kind under it"
-        );
-        assert_eq!(
-            set.facts("h1").map(|facts| facts.session_id.as_str()),
-            Some("sess-1"),
-            "and nothing this connection established was retired"
-        );
-        assert!(
-            foreground.took_the_request_for_test(),
-            "the task is the one that performs it, and it heard the ask"
-        );
-        assert!(
-            set.taking_foreground("h1"),
-            "an attempt is in flight, which is what `host.connect` answers with"
-        );
-        assert!(
-            matches!(set.state("h1"), Some(HostConnState::TakenOver { .. })),
-            "and nothing about the band, the grid or the facts moved for it"
-        );
-
-        // The task's own verdict replaces the optimistic write, and
-        // reaching the foreground clears the steal-back latch that a
-        // takeback never passing through `connect` would otherwise leave
-        // armed.
-        set.apply_state(incarnation, HostConnState::Connected);
-        assert!(!set.taking_foreground("h1"), "answered by the task");
-        assert!(!set.observes_only("h1"));
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-
-        // An auto-reconnect never takes the foreground back: retaking is
-        // a takeover, and only a person asks for one.
-        foreground.serving_for_test(true);
-        set.connect(
-            "h1",
-            "one",
-            socket.clone(),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::AutoReconnect,
-        );
-        assert!(
-            !foreground.took_the_request_for_test(),
-            "a scheduled attempt must never ask for the foreground"
-        );
-
-        // A different endpoint is a different connection, however healthy
-        // the old task's flag still looks.
-        let generation = set.conn("h1").generation;
-        set.apply_state(
-            set.mint_for("h1"),
-            HostConnState::TakenOver { taken_by: None },
-        );
-        let foreground = Arc::clone(&set.conn("h1").foreground);
-        foreground.serving_for_test(true);
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from("/nonexistent/roost-set-takeback-other.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        assert_ne!(
-            set.conn("h1").generation,
-            generation,
-            "a new endpoint is a full reconnect"
-        );
-    }
-
-    /// The same takeback over **ssh**, which is the transport the
-    /// product's own story runs on (R17).
-    #[tokio::test]
-    async fn an_explicit_ssh_connect_takes_the_foreground_back_on_the_tunnel_it_is_already_on() {
-        let (mut set, _feed) = a_set();
-        let parent = tempfile::Builder::new()
-            .prefix("roost-set-ssh-takeback")
-            .tempdir()
-            .expect("a scratch parent");
-        let tunnel = an_unestablished_tunnel(parent.path().to_path_buf()).await;
-        let bridge = tunnel.bridge_socket().to_path_buf();
-
-        let (incarnation, foreground) = a_deposed_serving_ssh_host(
-            &mut set,
-            &bridge.to_string_lossy(),
-            Some(tunnel),
-            Some("a phone"),
-        );
-        // A residual outage, so the clear an explicit cause performs is
-        // observable at all.
-        set.begin_outage("h1");
-        let generation = set.ssh("h1").generation;
-        let request = set.ssh("h1").request;
-
-        set.open_ssh(
-            "h1",
-            "one",
-            ssh_target("workbox"),
-            ConnectMode::Dial,
-            RequestOrigin::User,
-            AttemptCause::Explicit,
-        );
-
-        assert!(
-            foreground.took_the_request_for_test(),
-            "the task on this tunnel is the one that performs it, and it heard the ask"
-        );
-        assert!(
-            set.taking_foreground("h1"),
-            "an attempt is in flight, which is what `host.connect` answers with"
-        );
-        assert_eq!(
-            set.ssh("h1").generation,
-            generation,
-            "a takeback in place numbers no new attempt"
-        );
-        assert_eq!(
-            set.ssh("h1").request,
-            request,
-            "and starts no second handshake"
-        );
-        assert!(
-            set.ssh("h1").tunnel.is_some(),
-            "the tunnel the deposed control leg runs over is left standing"
-        );
-        assert!(
-            set.ssh_reached_connected("h1"),
-            "so a takeback that fails still lands on an eligible ladder"
-        );
-        assert!(
-            !set.has_outage("h1"),
-            "the clear an explicit cause performs is above the short-circuit"
-        );
-        assert!(
-            !set.observes_only("h1"),
-            "and so is the claim: a takeback is not a watch"
-        );
-
-        // The lease the retake publishes the moment it is granted has to
-        // land on this entry — [`Self::apply_lease`] gates on the
-        // generation, and the short-circuit minted none to gate it out.
-        set.apply_lease(incarnation, "lease-2".into());
-        assert_eq!(
-            set.ssh("h1").lease.as_deref(),
-            Some("lease-2"),
-            "the granted lease reaches the entry the ladder would carry it from"
-        );
-    }
-
-    /// The three ssh shapes that are **not** a takeback in place, each
-    /// taking the full reconnect.
-    #[tokio::test]
-    async fn an_ssh_connect_that_is_not_a_takeback_in_place_rebuilds_the_tunnel() {
-        let parent = tempfile::Builder::new()
-            .prefix("roost-set-ssh-full")
-            .tempdir()
-            .expect("a scratch parent");
-        let tunnel = an_unestablished_tunnel(parent.path().to_path_buf()).await;
-        let bridge = tunnel.bridge_socket().to_string_lossy().into_owned();
-        let elsewhere = "/nonexistent/roost-set-ssh-elsewhere.sock";
-
-        // Everything below runs without awaiting, so no `open_ssh`'s
-        // handshake is ever polled; the tunnel above is the suite's
-        // last await.
-        for (case, cause, carried, socket) in [
-            (
-                "a scheduled attempt",
-                AttemptCause::AutoReconnect,
-                Some(&tunnel),
-                bridge.as_str(),
-            ),
-            (
-                "a task on an endpoint this host no longer has",
-                AttemptCause::Explicit,
-                Some(&tunnel),
-                elsewhere,
-            ),
-            (
-                "an establish still in flight",
-                AttemptCause::Explicit,
-                None,
-                elsewhere,
-            ),
-        ] {
-            let (mut set, _feed) = a_set();
-            let (_, foreground) =
-                a_deposed_serving_ssh_host(&mut set, socket, carried.map(Arc::clone), None);
-            let generation = set.ssh("h1").generation;
-
-            set.open_ssh(
-                "h1",
-                "one",
-                ssh_target("workbox"),
-                ConnectMode::Dial,
-                RequestOrigin::User,
-                cause,
-            );
-            abort_establishes(&mut set);
-
-            assert!(
-                !foreground.took_the_request_for_test(),
-                "{case} must never ask a task for the foreground"
-            );
-            assert_ne!(
-                set.ssh("h1").generation,
-                generation,
-                "{case} numbers a fresh attempt"
-            );
-            assert!(
-                set.ssh("h1").tunnel.is_none(),
-                "{case} takes the tunnel down ahead of its replacement"
-            );
-        }
-    }
-
-    /// A theme change goes to the foreground and nobody else (review
-    /// F5).
-    ///
-    /// `session.set_theme` is a lease-required intent with no reply
-    /// channel, so a deposed connection would refuse it locally and the
-    /// refusal would land on `HostIntent::answer`'s nobody-listening arm
-    /// — a `warn!` per deposed host every time the user changes theme.
-    /// Nothing is lost by skipping it: the shared slot above is what a
-    /// takeback re-seeds from.
-    #[tokio::test]
-    async fn a_theme_change_is_only_sent_to_hosts_this_client_still_drives() {
+    async fn a_theme_change_is_only_sent_to_connected_hosts() {
         let (mut set, _feed) = a_set();
         for host in ["h1", "h2"] {
             set.connect(
@@ -5889,18 +4700,12 @@ mod tests {
                 PathBuf::from(format!("/nonexistent/roost-set-theme-{host}.sock")),
                 HostTransport::UnixSocket,
                 ConnectMode::Dial,
-                AttemptCause::Explicit,
             );
         }
-        let driven = set.mint_for("h1");
-        set.apply_state(driven, HostConnState::Connected);
-        let deposed = set.mint_for("h2");
-        set.apply_state(
-            deposed,
-            HostConnState::TakenOver {
-                taken_by: Some("a phone".into()),
-            },
-        );
+        let connected = set.mint_for("h1");
+        set.apply_state(connected, HostConnState::Connected);
+        let dropped_host = set.mint_for("h2");
+        set.apply_state(dropped_host, dropped("the connection closed"));
 
         // Nothing has awaited since the spawns, so no worker has run and
         // whatever is in these queues is what was enqueued.
@@ -5912,57 +4717,12 @@ mod tests {
         assert_eq!(
             set.conn("h1").ops.queued_for_test(),
             before.0 + 1,
-            "the foreground is told"
+            "a connected host is told"
         );
         assert_eq!(
             set.conn("h2").ops.queued_for_test(),
             before.1,
-            "a deposed host is not: it would refuse the intent and warn about it"
-        );
-    }
-
-    /// The section carries the task's in-place answer, which is the
-    /// only honest way to tell the two deposed worlds apart (review F3).
-    ///
-    /// `TakenOver` alone covers a session that kept the connections
-    /// open, a session too old to, and a connection that was only ever
-    /// an observer. The last two leave a frame nothing is feeding, and
-    /// the terminal area decides which of the two lines to draw off this
-    /// flag — so it has to survive the trip from the task's seam to the
-    /// section the draw reads.
-    #[tokio::test]
-    async fn a_deposed_section_reports_whether_its_task_is_still_serving() {
-        let (mut set, _feed) = a_set();
-        set.connect(
-            "h1",
-            "one",
-            PathBuf::from("/nonexistent/roost-set-serving.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h1");
-        set.apply_state(incarnation, HostConnState::Connected);
-        assert!(
-            !set.section("h1").expect("a section").serving_in_place,
-            "a foreground connection is not deposed at all"
-        );
-
-        set.apply_state(
-            incarnation,
-            HostConnState::TakenOver {
-                taken_by: Some("a phone".into()),
-            },
-        );
-        assert!(
-            !set.section("h1").expect("a section").serving_in_place,
-            "deposed with nothing serving: the frame is frozen"
-        );
-
-        Arc::clone(&set.conn("h1").foreground).serving_for_test(true);
-        assert!(
-            set.section("h1").expect("a section").serving_in_place,
-            "deposed but serving: the frame is live and takes keys"
+            "a host that is not connected is not: the intent would only warn"
         );
     }
 
@@ -5977,7 +4737,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-drop.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -6007,7 +4766,6 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let live = set.mint_for("h1");
         set.apply_state(live, HostConnState::Connected);
@@ -6054,7 +4812,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-section.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -6070,7 +4827,7 @@ mod tests {
         );
         let section = set.section("h1").expect("a saved host keeps its section");
         assert_eq!(section.label, "pop-os");
-        assert!(!section.state.is_foreground());
+        assert!(!section.state.is_connected());
         assert_eq!(section.incarnation, Some(incarnation));
         assert!(
             section.mirror.is_some(),
@@ -6125,7 +4882,6 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -6162,7 +4918,6 @@ mod tests {
             socket.clone(),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         assert!(set.mirror(incarnation).is_none());
         let section = set.section("h1").expect("connecting hosts have sections");
@@ -6269,7 +5024,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-payload-kind.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         assert_eq!(
             set.payload_kind("h1"),
@@ -6313,7 +5067,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-reconnect-kind.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let old = set.mint_for("h1");
         set.apply_state(old, HostConnState::Connected);
@@ -6360,7 +5113,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-fidelity-latch.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
 
         let stale = set.minter.mint("h1", set.conn("h1").generation - 1);
@@ -6402,7 +5154,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-fidelity-relatch.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let old = set.mint_for("h1");
         set.apply_state(old, HostConnState::Connected);
@@ -6435,8 +5186,6 @@ mod tests {
                 client_build: "gb-new".into(),
             },
             reduced_fidelity: true,
-            supports_resume: true,
-            supports_open_input: true,
             resumed: None,
         }
     }
@@ -6454,7 +5203,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-connect-facts.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         assert_eq!(set.facts("h1"), None, "no prologue has finished yet");
 
@@ -6502,70 +5250,6 @@ mod tests {
         );
     }
 
-    /// An observer reached the session and answered its identify just as
-    /// a driver did, so its facts are real — it is at the same fidelity
-    /// and it resumes on the same checkpoint. What it must not do is
-    /// *offer* anything about the skew: updating or restarting a session
-    /// somebody else is driving is not a deposed client's call.
-    #[tokio::test]
-    async fn an_observer_reports_its_facts_but_offers_nothing_about_them() {
-        let (mut set, _feed) = a_set();
-        set.connect(
-            "h1",
-            "pop-os",
-            PathBuf::from("/nonexistent/roost-set-observer-facts.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h1");
-
-        // The order a *deposed driver* takes: it was connected and had
-        // filed its facts, and a takeover retires **none** of them (plan
-        // 057 §3.5) — same session, same fidelity, same fence, still
-        // being read. The task refiles them behind the `TakenOver` it
-        // publishes anyway, and that refiling is now a no-op rather than
-        // the only reason the answer below is not `None`.
-        set.apply_state(incarnation, HostConnState::Connected);
-        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-        assert_eq!(
-            set.facts("h1").map(|facts| facts.session_id.as_str()),
-            Some("sess-1"),
-            "a takeover is a loss of the foreground, not of the session"
-        );
-        set.note_connect_facts(incarnation, skewed_facts("sess-1"));
-
-        assert_eq!(
-            set.facts("h1").map(|facts| facts.session_id.as_str()),
-            Some("sess-1")
-        );
-        assert!(
-            !set.reduced_fidelity("h1"),
-            "a deposed client must not be offered the update"
-        );
-
-        // The other order, which an observer prologue takes: it never
-        // drove, so `TakenOver` is the first state it ever publishes
-        // and the facts land behind it exactly as a driver's do.
-        let (mut set, _feed) = a_set();
-        set.connect(
-            "h2",
-            "pop-os",
-            PathBuf::from("/nonexistent/roost-set-observer-prologue.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::Explicit,
-        );
-        let incarnation = set.mint_for("h2");
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-        set.note_connect_facts(incarnation, skewed_facts("sess-2"));
-        assert_eq!(
-            set.facts("h2").map(|facts| facts.session_id.as_str()),
-            Some("sess-2")
-        );
-    }
-
     /// `host.status.tabs` is the section's own row count, so a caller
     /// polling it across a reconnect sees exactly what the sidebar draws
     /// — including whatever the section falls back to.
@@ -6580,7 +5264,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-tab-count.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -6617,7 +5300,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-resume.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         let mirror = Arc::new(SharedMirror::new(a_mirror(&[1])));
@@ -6659,7 +5341,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-resume-seed.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         set.apply_state(incarnation, HostConnState::Connected);
@@ -6729,7 +5410,6 @@ mod tests {
         for kept in [
             HostConnState::Connecting { previous: None },
             dropped("the stream closed"),
-            HostConnState::TakenOver { taken_by: None },
         ] {
             let (mut set, _feed, incarnation, _) = a_host_with_a_checkpoint();
             set.apply_state(incarnation, kept.clone());
@@ -6757,39 +5437,23 @@ mod tests {
         }
     }
 
-    /// Explicit, automatic and observer-only attempts all start from the
-    /// checkpoint — what it describes is the session, not who asked to
-    /// dial it — and the `forget` every reconnect runs, which drops the
-    /// connection and every key on it, leaves it alone.
+    /// Every reconnect starts from the checkpoint — what it describes is
+    /// the session, not who asked to dial it — and the `forget` every
+    /// reconnect runs, which drops the connection and every key on it,
+    /// leaves it alone.
     #[tokio::test]
-    async fn every_cause_reconnects_from_the_checkpoint() {
-        for cause in [AttemptCause::Explicit, AttemptCause::AutoReconnect] {
+    async fn every_reconnect_starts_from_the_checkpoint() {
+        for socket in ["roost-set-resume-first.sock", "roost-set-resume-again.sock"] {
             let (mut set, _feed, _, _) = a_host_with_a_checkpoint();
             set.connect(
                 "h1",
                 "pop-os",
-                PathBuf::from("/nonexistent/roost-set-resume-cause.sock"),
+                PathBuf::from(format!("/nonexistent/{socket}")),
                 HostTransport::UnixSocket,
                 ConnectMode::Dial,
-                cause,
             );
-            assert!(set.checkpoint_for("h1").is_some(), "{cause:?}");
+            assert!(set.checkpoint_for("h1").is_some(), "{socket}");
         }
-
-        // Observer-only is an auto-reconnect after a takeover: a deposed
-        // client watches the same session and resumes on the same fence.
-        let (mut set, _feed, incarnation, _) = a_host_with_a_checkpoint();
-        set.apply_state(incarnation, HostConnState::TakenOver { taken_by: None });
-        set.connect(
-            "h1",
-            "pop-os",
-            PathBuf::from("/nonexistent/roost-set-resume-observer.sock"),
-            HostTransport::UnixSocket,
-            ConnectMode::Dial,
-            AttemptCause::AutoReconnect,
-        );
-        assert!(set.observes_only("h1"), "the attempt is an observer's");
-        assert!(set.checkpoint_for("h1").is_some());
     }
 
     /// An explicit disconnect drops the wire and keeps the rows; it
@@ -6818,7 +5482,6 @@ mod tests {
             PathBuf::from(socket),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         let incarnation = set.mint_for("h1");
         let mirror = Arc::new(SharedMirror::new(a_mirror(&[2, 1])));
@@ -6847,7 +5510,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-carried-frozen.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         assert_eq!(
             set.tabs("h1"),
@@ -6952,7 +5614,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-carried-explicit.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::Explicit,
         );
         assert!(
             set.mirror(live).is_none(),
@@ -6991,7 +5652,6 @@ mod tests {
             PathBuf::from("/nonexistent/roost-set-carried-frozen.sock"),
             HostTransport::UnixSocket,
             ConnectMode::Dial,
-            AttemptCause::AutoReconnect,
         );
         let drawn = set
             .section("h1")

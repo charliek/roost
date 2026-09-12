@@ -278,7 +278,6 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
 fn connect_subtitle(state: SectionState) -> &'static str {
     match state {
         SectionState::NeedsRestart => "build mismatch — offers a restart",
-        SectionState::TakenOver => "take the session back",
         SectionState::Stopped => "starts a fresh session",
         _ => "starts it if needed",
     }
@@ -376,10 +375,6 @@ mod tests {
                 vec![ADD_ID, "host:connect:h", "host:remove:h"],
             ),
             (
-                SectionState::TakenOver,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
-            ),
-            (
                 SectionState::Stopped,
                 vec![ADD_ID, "host:connect:h", "host:remove:h"],
             ),
@@ -408,7 +403,6 @@ mod tests {
             SectionState::Connecting,
             SectionState::Disconnected,
             SectionState::NeedsRestart,
-            SectionState::TakenOver,
             SectionState::Stopped,
         ] {
             let items = verbs(&[host("h", state)], FULL);
@@ -552,12 +546,6 @@ mod tests {
                 vec![ADD_ID, "host:connect:h", "host:remove:h"],
             ),
             (
-                Localhost,
-                SectionState::TakenOver,
-                true,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
-            ),
-            (
                 Socket,
                 SectionState::Connecting,
                 true,
@@ -588,7 +576,6 @@ mod tests {
             SectionState::Connecting,
             SectionState::Disconnected,
             SectionState::NeedsRestart,
-            SectionState::TakenOver,
             SectionState::Stopped,
         ] {
             for action in [

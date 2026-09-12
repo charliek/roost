@@ -23,41 +23,25 @@ use crate::host_conn::state::{
 };
 use roost_ui_model::host_sidebar::FidelityAction;
 
-/// A line the window owes a host tab, over the pixels it is drawing.
-///
-/// Two producers, one shape: [`frozen_frame`]'s banner over a frame
-/// nothing will update again, and [`foreground_strip`]'s status line over
-/// a frame that is still live but is no longer this window's to drive.
-/// Both are a sentence and one button, and the button is a Connect
-/// underneath either way — only the wording changes, because "start a
-/// new session" and "take the foreground" are very different promises
-/// about what comes back.
+/// A line the window owes a host tab, over the pixels it is drawing: a
+/// sentence and one button, the button being a Connect underneath.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HostBanner {
     pub(super) message: String,
     pub(super) action: &'static str,
 }
 
-/// The status strip's action, named once: the widget's label and the
-/// tests that pin it read the same string.
-pub(super) const TAKE_FOREGROUND: &str = "Take the foreground";
-
 /// A frame nothing will ever update again, and why.
 ///
-/// One variant since plan 057 — a takeover no longer freezes anything,
-/// because the session closes nothing and the attach goes on streaming —
-/// and still an enum, because the click check below is a question about
-/// *which* frame was drawn and a second one may yet exist.
+/// One variant, and still an enum, because the click check below is a
+/// question about *which* frame was drawn and a second one may yet
+/// exist.
 ///
 /// `pub(crate)` because the banner's button carries it: the click has to
 /// name the frame it was drawn on, so the app can refuse one that landed
 /// after the host moved on (see [`click_still_lands`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrozenFrame {
-    /// Another client holds the session, and this one has nothing left
-    /// reading it — a session too old to keep the connections open on a
-    /// takeover, or a connection that was only ever an observer.
-    TakenOver,
     /// The session ended; its shells are gone with it.
     Stopped,
 }
@@ -69,72 +53,20 @@ pub(crate) enum FrozenFrame {
 /// disconnected or reconnecting one is saying so in its section band
 /// with a ↻ beside it.
 ///
-/// **`TakenOver` is two worlds, and `serving_in_place` is which one**
-/// (plan 057 §3.5). Against a session advertising `open_input` the
-/// takeover moved the foreground and closed nothing: that frame is live,
-/// takes keys, and gets [`foreground_strip`]'s line rather than a scrim.
-/// Against a session that predates it — and for a connection that was
-/// only ever an observer — the data connections really are gone, the
-/// frame stops updating, and it needs the scrim and the full-reconnect
-/// button it has always had. The flag is the *task's* answer, not an
-/// inference from the state, because only the task knows whether it is
-/// still serving on the control connection it holds.
-///
 /// The kind is separate from its wording because two very different
 /// readers ask: the terminal area wants the sentence, and the selection
 /// reconcile wants only whether there is a frame worth keeping — which
 /// is a question about the state, not about the copy over it. One table
 /// answers both, so a state added later cannot mean "frozen" to one and
 /// not the other.
-pub(super) fn frozen_frame(state: &HostConnState, serving_in_place: bool) -> Option<FrozenFrame> {
+pub(super) fn frozen_frame(state: &HostConnState) -> Option<FrozenFrame> {
     match state {
         HostConnState::Stopped => Some(FrozenFrame::Stopped),
-        HostConnState::TakenOver { .. } => (!serving_in_place).then_some(FrozenFrame::TakenOver),
         HostConnState::Disconnected(_)
         | HostConnState::Connecting { .. }
         | HostConnState::Connected
         | HostConnState::NeedsRestart(_) => None,
     }
-}
-
-/// The one-line status strip over a host tab's **live** grid when
-/// another client holds the foreground (plan 057 §3.5).
-///
-/// Not a banner over a corpse and deliberately not shaped like one: the
-/// attach is still streaming, the keyboard still reaches it, and the
-/// only thing this window lost is the foreground — effects, the focus
-/// that mutes notifications, and the settings ops. So the sentence is in
-/// the present tense and names who has it, and the button takes it back
-/// in place rather than reconnecting.
-///
-/// `taken_by` is the claimant's *self-reported* label (plan 049 §3.9)
-/// and the copy says so: nothing authenticates it, so the sentence
-/// attributes the name to the client rather than asserting it. `None` —
-/// a takeover this client inferred from a probe rather than being told
-/// about — says only that somebody has it.
-///
-/// `serving_in_place` is [`frozen_frame`]'s flag and answers the same
-/// fork from the other side, so the two are mutually exclusive by
-/// construction: a deposed host that is *not* serving gets the scrim,
-/// never this line over a grid nothing is feeding.
-pub(super) fn foreground_strip(
-    state: &HostConnState,
-    label: &str,
-    serving_in_place: bool,
-) -> Option<HostBanner> {
-    let HostConnState::TakenOver { taken_by } = state else {
-        return None;
-    };
-    if !serving_in_place {
-        return None;
-    }
-    Some(HostBanner {
-        message: match taken_by.as_deref() {
-            Some(taker) => format!("{label} is driven by a client reporting itself as {taker}."),
-            None => format!("{label} is driven by another client."),
-        },
-        action: TAKE_FOREGROUND,
-    })
 }
 
 /// Whether a banner click still names the frame it was drawn on.
@@ -154,25 +86,8 @@ pub(super) fn click_still_lands(rendered: FrozenFrame, current: Option<FrozenFra
 
 impl FrozenFrame {
     /// What this frame says to the user, over the pixels it froze.
-    ///
-    /// `taken_by` is the claimant's *self-reported* label (plan 049
-    /// §3.9) and the copy says so; `None` — a takeover this client
-    /// inferred from a probe rather than being told about — says only
-    /// that somebody did.
-    pub(super) fn banner(self, label: &str, taken_by: Option<&str>) -> HostBanner {
+    pub(super) fn banner(self, label: &str) -> HostBanner {
         match self {
-            Self::TakenOver => HostBanner {
-                message: match taken_by {
-                    Some(taker) => {
-                        format!("{label} was taken over by a client reporting itself as {taker}.")
-                    }
-                    None => format!("{label} was taken over by another client."),
-                },
-                // A full reconnect, deliberately: this frame is frozen
-                // because nothing is serving it any more, so there is no
-                // foreground to take back in place.
-                action: "Reconnect here",
-            },
             Self::Stopped => HostBanner {
                 // Deliberately not "reconnect": the shells are gone, and
                 // the button starts a fresh session rather than finding
@@ -187,7 +102,6 @@ impl FrozenFrame {
     /// the remedy the banner beside it offers.
     pub(super) fn paste_refusal(self) -> &'static str {
         match self {
-            Self::TakenOver => "this session was taken over — reconnect to paste",
             Self::Stopped => "this session ended — start a new session to paste",
         }
     }
@@ -483,10 +397,9 @@ mod tests {
     }
 
     /// The two production halves composed exactly as the terminal area
-    /// composes them. `serving` is the task's in-place answer; a state
-    /// that is not a takeover ignores it.
-    fn banner(label: &str, state: &HostConnState, serving: bool) -> Option<HostBanner> {
-        Some(frozen_frame(state, serving)?.banner(label, state.taken_by()))
+    /// composes them.
+    fn banner(label: &str, state: &HostConnState) -> Option<HostBanner> {
+        Some(frozen_frame(state)?.banner(label))
     }
 
     fn every_state() -> Vec<HostConnState> {
@@ -498,7 +411,6 @@ mod tests {
             }),
             HostConnState::Connecting { previous: None },
             HostConnState::Connected,
-            HostConnState::TakenOver { taken_by: None },
             HostConnState::Stopped,
             HostConnState::NeedsRestart(mismatch(MismatchKind::Build, RestartAction::RestartLocal)),
         ]
@@ -511,144 +423,22 @@ mod tests {
     fn only_a_session_that_ended_puts_a_banner_over_the_frame() {
         let banners: Vec<Option<HostBanner>> = every_state()
             .iter()
-            .map(|state| banner("pop-os", state, true))
+            .map(|state| banner("pop-os", state))
             .collect();
         assert_eq!(banners[0], None, "disconnected explains itself in the band");
         assert_eq!(banners[1], None, "connecting is not a failure yet");
         assert_eq!(banners[2], None, "a connected host says nothing");
         assert_eq!(
-            banners[3], None,
-            "a takeover that closed nothing leaves a live frame: a strip, not a scrim"
-        );
-        assert_eq!(
-            banners[4],
+            banners[3],
             Some(HostBanner {
                 message: "The session on pop-os ended.".into(),
                 action: "Start a new session",
             })
         );
         assert_eq!(
-            banners[5], None,
+            banners[4], None,
             "a build mismatch is answered by its dialog, not a banner"
         );
-    }
-
-    /// The three worlds `TakenOver` covers, and the one signal that
-    /// separates them (plan 057 §3.5, review F3).
-    ///
-    /// Deposed-but-serving is the `open_input` world: the connections
-    /// stayed open, so the frame is live and the strip offers the
-    /// in-place takeback. The other two — a session too old to keep them
-    /// open, and a connection that was only ever an observer — have
-    /// nothing feeding that frame, so they get the scrim and a button
-    /// that promises a reconnect, which is what it actually performs.
-    #[test]
-    fn a_deposed_host_with_nothing_serving_it_is_frozen_not_stripped() {
-        let taken = HostConnState::TakenOver {
-            taken_by: Some("a phone".into()),
-        };
-
-        assert_eq!(
-            frozen_frame(&taken, true),
-            None,
-            "a deposed-but-serving host still has a live grid"
-        );
-        assert_eq!(
-            foreground_strip(&taken, "pop-os", true),
-            Some(HostBanner {
-                message: "pop-os is driven by a client reporting itself as a phone.".into(),
-                action: TAKE_FOREGROUND,
-            })
-        );
-
-        assert_eq!(
-            frozen_frame(&taken, false),
-            Some(FrozenFrame::TakenOver),
-            "nothing is serving that frame: it is frozen"
-        );
-        assert_eq!(
-            banner("pop-os", &taken, false),
-            Some(HostBanner {
-                message: "pop-os was taken over by a client reporting itself as a phone.".into(),
-                action: "Reconnect here",
-            }),
-            "the button promises the reconnect it will actually do"
-        );
-        assert_eq!(
-            foreground_strip(&taken, "pop-os", false),
-            None,
-            "no present-tense strip over a frame nothing is feeding"
-        );
-
-        // The inferred takeover — an observer-only settlement, which is
-        // never in-place — still names the state without a taker.
-        assert_eq!(
-            banner(
-                "pop-os",
-                &HostConnState::TakenOver { taken_by: None },
-                false
-            ),
-            Some(HostBanner {
-                message: "pop-os was taken over by another client.".into(),
-                action: "Reconnect here",
-            })
-        );
-        assert_eq!(
-            FrozenFrame::TakenOver.paste_refusal(),
-            "this session was taken over — reconnect to paste"
-        );
-    }
-
-    /// The strip's own table: it is the takeover's, and nothing else's.
-    /// A stopped session must not get one — its frame is a corpse and
-    /// the banner above says so — and the copy names the taker where the
-    /// session named one, attributed rather than asserted.
-    #[test]
-    fn only_a_takeover_puts_a_status_strip_over_a_live_grid() {
-        let strips: Vec<Option<HostBanner>> = every_state()
-            .iter()
-            .map(|state| foreground_strip(state, "pop-os", true))
-            .collect();
-        assert_eq!(
-            strips,
-            vec![
-                None,
-                None,
-                None,
-                Some(HostBanner {
-                    message: "pop-os is driven by another client.".into(),
-                    action: TAKE_FOREGROUND,
-                }),
-                None,
-                None,
-            ]
-        );
-        assert_eq!(
-            foreground_strip(
-                &HostConnState::TakenOver {
-                    taken_by: Some("a phone".into())
-                },
-                "pop-os",
-                true
-            ),
-            Some(HostBanner {
-                message: "pop-os is driven by a client reporting itself as a phone.".into(),
-                action: TAKE_FOREGROUND,
-            })
-        );
-    }
-
-    /// The one thing the two lines must not share: a stopped session's
-    /// shells are gone, so its button may not promise the foreground —
-    /// there is nothing left to drive.
-    #[test]
-    fn the_strip_and_the_banner_promise_different_things() {
-        let taken = foreground_strip(&HostConnState::TakenOver { taken_by: None }, "pop-os", true)
-            .expect("takeover strip");
-        let stopped = banner("pop-os", &HostConnState::Stopped, true).expect("stopped banner");
-        assert_ne!(taken.action, stopped.action);
-        assert!(taken.message.contains("is driven by"));
-        assert!(stopped.message.contains("ended"));
     }
 
     /// A banner click is a promise about the frame it was drawn on, and
@@ -660,14 +450,12 @@ mod tests {
     #[test]
     fn a_banner_click_lands_only_on_the_frame_it_was_drawn_on() {
         for state in every_state() {
-            for serving in [false, true] {
-                let current = frozen_frame(&state, serving);
-                assert_eq!(
-                    click_still_lands(FrozenFrame::Stopped, current),
-                    current == Some(FrozenFrame::Stopped),
-                    "against {state:?} (serving: {serving})"
-                );
-            }
+            let current = frozen_frame(&state);
+            assert_eq!(
+                click_still_lands(FrozenFrame::Stopped, current),
+                current == Some(FrozenFrame::Stopped),
+                "against {state:?}"
+            );
         }
         assert!(click_still_lands(
             FrozenFrame::Stopped,

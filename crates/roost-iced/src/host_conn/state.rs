@@ -4,8 +4,8 @@
 //! Pure: no sockets, no clock, no randomness. The retry delay takes its
 //! jitter as an argument and the transitions are ordinary method calls,
 //! so every rule below — a build skew a session cannot serve `vt` for
-//! is terminal, a takeover is terminal, only localhost auto-retries,
-//! the backoff caps — is a unit test rather than a timing experiment.
+//! is terminal, only localhost auto-retries, the backoff caps — is a
+//! unit test rather than a timing experiment.
 
 use std::time::Duration;
 
@@ -194,21 +194,6 @@ pub(crate) fn check_compatibility(
     Ok(Compatibility::Exact)
 }
 
-/// The `session.identify` feature that says a session can replay events
-/// from a revision (`events.subscribe {from_revision}`, plan 052 R5).
-/// A session that does not list it rejects the field outright, so the
-/// client has to ask before it offers.
-const EVENTS_RESUME: &str = "events_resume";
-
-/// The `session.identify` feature that says raw input is open to every
-/// same-UID client and the lease is only the foreground (plan 057 §3.2).
-///
-/// What this client relies on it for is narrower than the whole feature:
-/// a takeover on such a session closes **no** control and no data
-/// connection, so a deposed task can keep serving on the connection it
-/// already holds instead of dropping to a bare observer.
-const OPEN_INPUT: &str = "open_input";
-
 /// What one connect attempt learned about the session it reached.
 ///
 /// Facts, not state: they are established during the prologue, published
@@ -238,12 +223,6 @@ pub(crate) struct ConnectFacts {
     /// that one is `None` until a tab attaches, so a skewed host nobody
     /// has clicked into would show nothing.
     pub(crate) reduced_fidelity: bool,
-    /// The session advertises [`EVENTS_RESUME`].
-    pub(crate) supports_resume: bool,
-    /// The session advertises [`OPEN_INPUT`], so a takeover leaves this
-    /// client's control and data connections open. The task's transport
-    /// decision on the deposition edge is the only reader.
-    pub(crate) supports_open_input: bool,
     /// How this attempt's prologue actually subscribed: `Some` when it
     /// replayed from a carried fence, `None` when it took a fresh
     /// snapshot.
@@ -286,8 +265,6 @@ impl ConnectFacts {
                 client_build: client_build.to_string(),
             },
             reduced_fidelity: compatibility == Compatibility::BuildSkew,
-            supports_resume: identity.features.iter().any(|f| f == EVENTS_RESUME),
-            supports_open_input: identity.features.iter().any(|f| f == OPEN_INPUT),
             resumed: None,
         }
     }
@@ -316,7 +293,7 @@ pub(crate) struct Disconnected {
 }
 
 /// Per-host connection lifecycle: `Disconnected → Connecting →
-/// Connected → {TakenOver, Stopped, NeedsRestart, Disconnected}`.
+/// Connected → {Stopped, NeedsRestart, Disconnected}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HostConnState {
     Disconnected(Disconnected),
@@ -328,25 +305,6 @@ pub(crate) enum HostConnState {
         previous: Option<HostId>,
     },
     Connected,
-    /// Another client holds the **foreground**. Since plan 057 §3.5 that
-    /// is all it holds: the session closes nothing on a takeover, so this
-    /// client keeps its control connection, its event stream and every
-    /// attach — the grid stays live, keys still route, tabs still switch.
-    /// What it loses is what the lease now means — `tab.effect`, the
-    /// focus that mutes notifications, and the session-wide settings ops,
-    /// which are refused locally as
-    /// [`crate::host_conn::HostOpError::NotForeground`].
-    ///
-    /// No auto-retry ever takes the session back, because retrying is
-    /// taking it back and that is a decision only the user makes.
-    ///
-    /// `taken_by` is the claimant's self-reported label from the
-    /// `session.driver_changed` envelope — display metadata, never
-    /// identity, and `None` when this client inferred the takeover from
-    /// a probe rather than being told.
-    TakenOver {
-        taken_by: Option<String>,
-    },
     /// The session said it is shutting down. Terminal for the same
     /// reason — an explicit Connect starts a fresh one.
     Stopped,
@@ -356,28 +314,10 @@ pub(crate) enum HostConnState {
 }
 
 impl HostConnState {
-    /// Whether this client holds the **foreground**: the lease, and with
-    /// it `tab.effect`, the focus that mutes notifications, and the
-    /// session-wide settings ops (plan 057 §3.2).
-    ///
-    /// Spelled for what it decides rather than for the connection's
-    /// health, because since plan 057 those are two questions: a
-    /// `TakenOver` connection is live, typing and resizing — it simply is
-    /// not the one driving. Every caller picks one of this and
-    /// [`Self::reached_session`] deliberately.
-    pub(crate) fn is_foreground(&self) -> bool {
+    /// Whether this connection reached a session and is still on it:
+    /// everything a connected host can do is open.
+    pub(crate) fn is_connected(&self) -> bool {
         matches!(self, HostConnState::Connected)
-    }
-
-    /// Whether this connection's prologue got all the way to a session.
-    ///
-    /// An observer settlement reached one just as surely — it answered
-    /// the same identify and holds the same stream — even though
-    /// `TakenOver` is not the foreground (plan 049 §3.11). Readers that
-    /// care about *having reached* the session ask this; readers that
-    /// care about *driving* it ask [`Self::is_foreground`].
-    pub(crate) fn reached_session(&self) -> bool {
-        self.is_foreground() || matches!(self, HostConnState::TakenOver { .. })
     }
 
     /// Whether this state says the *session* is gone or cannot be talked
@@ -394,9 +334,7 @@ impl HostConnState {
         match self {
             HostConnState::Stopped | HostConnState::NeedsRestart(_) => true,
             HostConnState::Disconnected(disconnected) => disconnected.detail.is_some(),
-            HostConnState::Connecting { .. }
-            | HostConnState::Connected
-            | HostConnState::TakenOver { .. } => false,
+            HostConnState::Connecting { .. } | HostConnState::Connected => false,
         }
     }
 
@@ -410,7 +348,6 @@ impl HostConnState {
             Self::Disconnected(_) => SectionState::Disconnected,
             Self::Connecting { .. } => SectionState::Connecting,
             Self::Connected => SectionState::Connected,
-            Self::TakenOver { .. } => SectionState::TakenOver,
             Self::Stopped => SectionState::Stopped,
             Self::NeedsRestart(_) => SectionState::NeedsRestart,
         }
@@ -420,17 +357,6 @@ impl HostConnState {
     pub(crate) fn retry_in(&self) -> Option<Duration> {
         match self {
             HostConnState::Disconnected(d) => d.retry_in,
-            _ => None,
-        }
-    }
-
-    /// Who the session says is driving it now, when this client has
-    /// been told. `None` everywhere else — including a takeover this
-    /// client only *inferred*, from a probe that came back
-    /// non-current.
-    pub(crate) fn taken_by(&self) -> Option<&str> {
-        match self {
-            HostConnState::TakenOver { taken_by } => taken_by.as_deref(),
             _ => None,
         }
     }
@@ -550,7 +476,7 @@ impl HostStateMachine {
         self.transition(HostConnState::Connecting { previous })
     }
 
-    /// The lease is held, the theme is seeded, the mirror is built.
+    /// The theme is seeded, the stream is subscribed, the mirror is built.
     pub(crate) fn connected(&mut self) -> HostConnState {
         self.backoff.reset();
         self.transition(HostConnState::Connected)
@@ -563,30 +489,10 @@ impl HostStateMachine {
     }
 
     /// A `session.stopping` envelope, or the equivalent op refusal.
-    /// `"taken-over"` and `"stop"` are the two the wire defines; an
-    /// unrecognized reason is read as a stop, which is the safe half —
-    /// it stops driving rather than silently retrying into a session
-    /// that told us it was going away.
-    pub(crate) fn stopping(&mut self, reason: &str) -> HostConnState {
-        let next = if reason == "taken-over" {
-            HostConnState::TakenOver { taken_by: None }
-        } else {
-            HostConnState::Stopped
-        };
-        self.transition(next)
-    }
-
-    /// This client is no longer the driver: the stream said so
-    /// (`session.driver_changed`, `taken_by` named) or a reconnect
-    /// probe came back non-current (`taken_by` unknown).
-    ///
-    /// Not terminal any more. The connection task stays up as an
-    /// observer — tab list, titles, agent status and notifications keep
-    /// arriving — and the backoff is reset because watching is a
-    /// working connection, not a failed one.
-    pub(crate) fn taken_over(&mut self, taken_by: Option<String>) -> HostConnState {
-        self.backoff.reset();
-        self.transition(HostConnState::TakenOver { taken_by })
+    /// Whatever reason the session gave, the answer is the same: stop
+    /// driving it rather than retry into something that said goodbye.
+    pub(crate) fn stopping(&mut self) -> HostConnState {
+        self.transition(HostConnState::Stopped)
     }
 
     /// The connection dropped for a transport reason (EOF, refused, an
@@ -660,11 +566,9 @@ mod tests {
     /// The sidebar's three-dot vocabulary, pinned against every
     /// connection state: green while the session is reached, amber while
     /// something is in flight or waiting on the user, grey once the
-    /// connection is gone. A taken-over host is green and interactive
-    /// (plan 057 §3.5) — it is connected, and only the foreground moved —
-    /// so `reached_session` is the predicate the section reads, and it is
-    /// what makes a dimmed section's rows unclickable everywhere at once
-    /// (plan 037 §3.1).
+    /// connection is gone. `is_connected` is the predicate the section
+    /// reads, and it is what makes a dimmed section's rows unclickable
+    /// everywhere at once (plan 037 §3.1).
     #[test]
     fn every_connection_state_maps_to_a_section_state() {
         use roost_ui_model::host_sidebar::{HostDot, SectionState};
@@ -690,10 +594,6 @@ mod tests {
                 SectionState::Connecting,
             ),
             (dropped, SectionState::Disconnected),
-            (
-                HostConnState::TakenOver { taken_by: None },
-                SectionState::TakenOver,
-            ),
             (HostConnState::Stopped, SectionState::Stopped),
             (mismatch, SectionState::NeedsRestart),
         ];
@@ -701,7 +601,7 @@ mod tests {
             assert_eq!(state.section_state(), expected, "{state:?}");
             assert_eq!(
                 state.section_state().interactive(),
-                state.reached_session(),
+                state.is_connected(),
                 "a host whose session is reached has responsive rows ({state:?})"
             );
         }
@@ -716,40 +616,20 @@ mod tests {
             HostDot::Pending
         );
         assert_eq!(
-            HostConnState::TakenOver { taken_by: None }
-                .section_state()
-                .dot(),
-            HostDot::Connected,
-            "the host is live; the band's word is where the takeover is said"
-        );
-        assert_eq!(
             HostConnState::Stopped.section_state().dot(),
             HostDot::Offline
         );
     }
 
-    /// Two questions, not one (plan 057 §3.5): a deposed connection is
-    /// live and reading the session — it simply is not the one driving
-    /// it. Every caller picks the predicate it means.
+    /// One question, since the lease went: a connection either reached
+    /// the session and is on it, or it is not.
     #[test]
-    fn driving_and_having_reached_the_session_are_different_questions() {
-        let taken_over = HostConnState::TakenOver {
-            taken_by: Some("a phone".into()),
-        };
-        assert!(!taken_over.is_foreground());
-        assert!(taken_over.reached_session());
-        assert!(
-            !taken_over.session_is_gone(),
-            "and the checkpoint a resume rides on survives it"
-        );
-        assert_eq!(taken_over.taken_by(), Some("a phone"));
+    fn only_a_connected_state_is_connected() {
+        assert!(HostConnState::Connected.is_connected());
+        assert!(!HostConnState::Connected.session_is_gone());
 
-        assert!(HostConnState::Connected.is_foreground());
-        assert!(HostConnState::Connected.reached_session());
-        assert_eq!(HostConnState::Connected.taken_by(), None);
-
-        assert!(!HostConnState::Stopped.reached_session());
-        assert!(!HostConnState::Connecting { previous: None }.reached_session());
+        assert!(!HostConnState::Stopped.is_connected());
+        assert!(!HostConnState::Connecting { previous: None }.is_connected());
     }
 
     #[test]
@@ -797,34 +677,16 @@ mod tests {
         );
     }
 
-    /// The three facts a connection is judged on later: whether it is at
-    /// reduced fidelity, whether it can be resumed, and whether a
-    /// takeover on it would leave this client's connections open. All
-    /// three are read off the identify reply the gate already has, and
-    /// the build pair is kept whether or not the builds disagree — the
-    /// reason lines that print it cannot go back and ask.
+    /// What a connection is judged on later: whether it is at reduced
+    /// fidelity, and which session it reached. Both are read off the
+    /// identify reply the gate already has, and the build pair is kept
+    /// whether or not the builds disagree — the reason lines that print
+    /// it cannot go back and ask.
     #[test]
     fn the_prologues_facts_come_off_the_identify_reply() {
-        for feature in [EVENTS_RESUME, OPEN_INPUT] {
-            assert!(
-                roost_ipc::messages::SESSION_FEATURES.contains(&feature),
-                "the client is gating on {feature}, which no session advertises"
-            );
-        }
-
-        let mut matched = identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-1");
-        matched.features = vec!["put_file".into(), EVENTS_RESUME.into(), OPEN_INPUT.into()];
+        let matched = identity(SESSION_PROTOCOL_VERSION, &["ghostty-snapshot"], "gb-1");
         let exact = ConnectFacts::new(&matched, "gb-1", Compatibility::Exact);
         assert!(!exact.reduced_fidelity);
-        assert!(exact.supports_resume);
-        assert!(exact.supports_open_input);
-
-        // Each feature is read on its own: a session that resumes but
-        // still closes everything at a takeover is a real generation.
-        matched.features = vec![EVENTS_RESUME.into()];
-        let resume_only = ConnectFacts::new(&matched, "gb-1", Compatibility::Exact);
-        assert!(resume_only.supports_resume);
-        assert!(!resume_only.supports_open_input);
         assert_eq!(exact.session_id, "sess-1");
         assert_eq!(
             exact.skew,
@@ -836,13 +698,9 @@ mod tests {
         );
         assert_eq!(exact.resumed, None, "nothing has subscribed yet");
 
-        // A pre-R5 session lists no features at all, and offering it a
-        // `from_revision` would be an error outside the three refusals.
         let skewed = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-old");
         let reduced = ConnectFacts::new(&skewed, "gb-new", Compatibility::BuildSkew);
         assert!(reduced.reduced_fidelity);
-        assert!(!reduced.supports_resume);
-        assert!(!reduced.supports_open_input);
         assert_eq!(reduced.skew.session_build, "gb-old");
         assert_eq!(reduced.skew.client_build, "gb-new");
     }
@@ -915,7 +773,7 @@ mod tests {
             HostConnState::Connecting { previous: None }
         );
         assert_eq!(machine.connected(), HostConnState::Connected);
-        assert!(machine.state().is_foreground());
+        assert!(machine.state().is_connected());
     }
 
     /// The reconnect contract: the transition into `Connecting` is what
@@ -955,29 +813,15 @@ mod tests {
         assert!(state.retry_in().is_none(), "a mismatch never auto-retries");
     }
 
+    /// A client that keeps driving a session that said goodbye is the
+    /// failure this transition exists to prevent, whatever the session
+    /// gave as its reason.
     #[test]
-    fn a_taken_over_stop_reason_is_its_own_state() {
+    fn a_stopping_session_stops_this_connection() {
         let mut machine = HostStateMachine::new(true);
         machine.begin_attempt(None);
         machine.connected();
-        assert_eq!(
-            machine.stopping("taken-over"),
-            HostConnState::TakenOver { taken_by: None }
-        );
-
-        let mut machine = HostStateMachine::new(true);
-        machine.begin_attempt(None);
-        machine.connected();
-        assert_eq!(machine.stopping("stop"), HostConnState::Stopped);
-    }
-
-    /// An unrecognized reason must not be read as a takeover — a client
-    /// that keeps driving a session that said goodbye is the failure
-    /// this arm exists to prevent.
-    #[test]
-    fn an_unknown_stop_reason_reads_as_a_stop() {
-        let mut machine = HostStateMachine::new(true);
-        assert_eq!(machine.stopping("something-new"), HostConnState::Stopped);
+        assert_eq!(machine.stopping(), HostConnState::Stopped);
     }
 
     #[test]

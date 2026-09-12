@@ -54,6 +54,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
 import uuid
@@ -124,7 +125,6 @@ from test_host_client import (  # noqa: E402
     quiet_tab,
     require_test_mode,
     start_session,
-    takeback_in_place,
     wait_live_connect,
     wait_until,
 )
@@ -141,11 +141,6 @@ pytestmark = pytest.mark.host_client
 # What `roostctl session status` exits when nothing is listening
 # (`STATUS_NOT_RUNNING_EXIT`, `crates/roost-cli/src/session.rs`).
 NOT_RUNNING_EXIT = 3
-
-# `host_state::TAKEN_OVER` on the wire, restated like this lane's other
-# wire constants.
-TAKEN_OVER = "taken-over"
-
 
 @functools.cache
 def client_libghostty_build() -> str:
@@ -181,6 +176,9 @@ class Ground:
 
     host: HostUnderTest
     caused: set[str] = field(default_factory=set)
+    #: The pid the launcher reported for the daemon now on the sentinel
+    #: socket, for the one case that kills it outright.
+    pid: int | None = None
 
     def start_daemon(self, **overrides: str) -> str:
         """Daemonize this lane's session and claim what it turned out to
@@ -191,7 +189,7 @@ class Ground:
         before anything else can fail, because it is what lets the
         teardown stop this daemon and refuse to stop any other.
         """
-        start_session(self.host.env, **overrides)
+        self.pid = start_session(self.host.env, **overrides).verdict.pid
         return self.claim(self.host.env.identify()["session_id"])
 
     def claim(self, session_id: str) -> str:
@@ -418,10 +416,9 @@ def test_a_reduced_fidelity_localhost_host_restarts_from_the_palette_and_comes_b
     and that is read once with no wait in front of it:
     `app.dialog_answer` runs the confirm handler to completion before it
     replies, and the disconnect inside it is synchronous, so this is a
-    fence rather than a race. `taken-over` is sampled for the whole job
-    for the reason the ssh sibling names — with a stream still up when
-    the job stops the session, the band can end up reading "taken over"
-    by nobody.
+    fence rather than a race. The states are sampled for the whole
+    restart for the reason the ssh sibling names: a client that still had
+    a stream up when the job stopped the session would hear the stop.
 
     The layout is compared by **cwd**, never by title: a restored shell
     is a fresh one and is free to rewrite what it is called.
@@ -460,10 +457,16 @@ def test_a_reduced_fidelity_localhost_host_restarts_from_the_palette_and_comes_b
 
     landed, states = watch_the_restart(ground)
     assert landed["connect"]["reduced_fidelity"] is False, landed
-    assert TAKEN_OVER not in states, (
-        f"the host read {TAKEN_OVER!r} during the restart (states "
-        f"{sorted(set(states))} over {len(states)} samples) — confirming has to "
-        "disconnect before the job owns the session"
+    # Everything a *let-go* host can be while the restart runs, and
+    # nothing else. `stopped` is the tell: it is what the far side's
+    # `session.stopping` looks like to a client that was still listening,
+    # which is precisely the client this confirm was supposed to have
+    # disconnected.
+    outside = sorted(set(states) - {"connected", "disconnected", "connecting"})
+    assert not outside, (
+        f"the host observed {outside} while the restart ran — a disconnected "
+        f"client cannot hear the session it no longer holds (states "
+        f"{sorted(set(states))} over {len(states)} samples)"
     )
     assert landed["connect"]["session_id"] != started, (
         "the host came back on the session the restart was supposed to have "
@@ -476,16 +479,44 @@ def test_a_reduced_fidelity_localhost_host_restarts_from_the_palette_and_comes_b
 
 
 # ---------------------------------------------------------------------------
-# 3. R15's takeback, on this transport
+# 3. A session killed outright, and the reconnect that finds its successor
 # ---------------------------------------------------------------------------
 
 
-def test_a_takeover_on_a_localhost_host_is_taken_back_in_place(
-    ground: Ground, roost: Roost
-):
-    """R15's sequence, called rather than copied, against a session
-    reached through the sentinel: the foreground moves to a second
-    client, the frame stays live, and `host.connect` takes it back on the
-    connection that was already there."""
-    ground.start_daemon()
-    takeback_in_place(ground.host, roost)
+def test_a_killed_session_started_again_comes_back_connected(ground: Ground):
+    """`kill -9` the daemon, start a fresh one, and the ladder comes back
+    `connected` on the new incarnation.
+
+    SIGKILL rather than `roostctl session stop`: a stop sends
+    `session.stopping`, which is terminal by contract and ends the
+    ladder. A kill is the drop auto-reconnect exists for — the socket
+    dies with no envelope at all — and nothing here asks the UI to
+    reconnect, so what lands the host is the schedule.
+
+    The failure this pins is the one the lease left behind: a scheduled
+    attempt used to present the lease its predecessor held, and a session
+    that had never issued it refused — so the host settled as somebody
+    else's and watched a session nobody was driving. A restarted session
+    is simply a different session now, and the band says so by naming its
+    id.
+    """
+    first = ground.start_daemon()
+    ground.host.connect_and_wait()
+    assert wait_live_connect(ground.host)["connect"]["session_id"] == first
+
+    killed = ground.pid
+    assert killed is not None, "the launcher reported no pid, so there is none to kill"
+    os.kill(killed, signal.SIGKILL)
+    ground.host.env.wait_pid_gone(killed)
+
+    second = ground.start_daemon()
+    assert second != first, "the relaunch came back as the same incarnation"
+
+    # Generous, and deliberately so: the ladder backs off while nothing
+    # is listening, so the first attempt after the relaunch can be a few
+    # rungs in.
+    row = wait_live_connect(ground.host, timeout=120.0)
+    assert row["connect"]["session_id"] == second, (
+        "the host came back on something other than the session this lane "
+        f"just started: {row}"
+    )

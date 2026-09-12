@@ -49,8 +49,8 @@ const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 12] = [
 /// `message` is the session's own, not `Display` (which prefixes the
 /// code and would double it).
 ///
-/// Everything else folds onto `host-unavailable`: a lease or lifecycle
-/// code, and any code a newer or older session invents. That matters
+/// Everything else folds onto `host-unavailable`: a lifecycle code, and
+/// any code a newer or older session invents. That matters
 /// because `ipc.md` tells a client to treat an unlisted code as fatal
 /// for the request, so passing an unbounded set through would put codes
 /// on the UI socket that its own contract says cannot appear there.
@@ -1615,11 +1615,10 @@ impl App {
                             // says what it is looking at, and the
                             // connect task cannot say — the selection is
                             // the UI's. Told here, on the edge where the
-                            // lease exists and the queue is draining.
+                            // queue is draining.
                             self.push_host_focus();
-                            // Same edge, same reason: the lease exists
-                            // and the queue is draining. Every connect,
-                            // with this client's current config — see
+                            // Same edge, same reason. Every connect, with
+                            // this client's current config — see
                             // `HostConnSet::wire_agent_hooks`.
                             self.wire_host_agent_hooks(host);
                         }
@@ -1639,9 +1638,6 @@ impl App {
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
                 }
-                // Nothing renders off it — it is kept for the outage a
-                // later drop opens (plan 040 §3.7).
-                EngineFeed::HostLease(host, lease) => self.hosts.apply_lease(host, lease),
                 EngineFeed::HostConnectFacts(host, facts) => {
                     self.hosts.note_connect_facts(host, facts)
                 }
@@ -2160,10 +2156,8 @@ impl App {
                     }
                     None => (host_sidebar::SectionState::Disconnected, None, None),
                 };
-                // Taken before `host.id` is moved into the view. The
-                // band's reason, not `host.status`'s: a taken-over host's
-                // is the taker's name.
-                let reason = self.hosts.band_reason(&host.id).map(str::to_string);
+                // Taken before `host.id` is moved into the view.
+                let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
                 super::HostView {
                     saved_id: host.id,
@@ -2973,9 +2967,9 @@ impl App {
     /// report the state it left the host in.
     ///
     /// `connecting` rather than `connected` is the honest answer — the
-    /// dial, the identify and the lease are a round trip this reply does
-    /// not wait for, and a client that wants the settled verdict watches
-    /// the section (or asks again).
+    /// dial, the identify and the prologue are a round trip this reply
+    /// does not wait for, and a client that wants the settled verdict
+    /// watches the section (or asks again).
     ///
     /// `test_user_origin` is `HostConnectParams::test_user_origin`,
     /// already gated in `roost-engine` on nothing — the test-mode check
@@ -3096,14 +3090,9 @@ impl App {
                 last_connected: host.last_connected,
                 generation: self.hosts.generation(&host.id),
                 state: band.state.wire().to_string(),
-                // Beside the state it explains, and from the connection
-                // rather than the band: the band's vocabulary has one
-                // `taken-over` and no room for who took it.
-                taken_by: self
-                    .hosts
-                    .state(&host.id)
-                    .and_then(crate::host_conn::HostConnState::taken_by)
-                    .map(str::to_string),
+                // Nothing drives a session any more, so nothing names a
+                // driver. The field goes at protocol 5.
+                taken_by: None,
                 // The band's input, untruncated — the ssh failure
                 // families are written as sentences and the rollup
                 // beside them is capped at 60 characters.
@@ -3154,19 +3143,7 @@ impl App {
         &self,
         host: roost_engine::persistence::HostSnapshot,
     ) -> HostConnectionResult {
-        // A takeback asked of a deposed-but-serving task is an attempt in
-        // flight, and this op reports the ask (plan 057 §3.5). Nothing
-        // about the band moved for it — the grid is still live and the
-        // facts still stand — so the divergence is deliberate: a caller
-        // that wants the settled answer polls `host.status`, which is
-        // what that split has always meant.
-        if self.hosts.taking_foreground(&host.id) {
-            return HostConnectionResult {
-                host: host.into(),
-                state: host_sidebar::SectionState::Connecting.wire().to_string(),
-            };
-        }
-        // Otherwise through the section state the sidebar itself reads,
+        // Through the section state the sidebar itself reads,
         // so the reply and the dot drawn beside it can never disagree. A
         // host this app is not driving at all reads as disconnected,
         // which is exactly what its section shows.

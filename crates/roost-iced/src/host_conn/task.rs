@@ -9,10 +9,10 @@
 //!
 //! The order of the prologue is the wire contract, not a preference
 //! (`ipc.md` #session-sockets): `session.identify` → the compatibility
-//! gate → `session.connect {takeover: true}` → `session.set_theme` →
-//! subscribe → `tab.list`. The theme lands **before any `tab.attach`**
-//! (plan 037 §3.6) and the snapshot is taken **after** the subscribe so
-//! the ack's revision is a floor the snapshot can be fenced against.
+//! gate → `session.set_theme` → subscribe → `tab.list`. The theme lands
+//! **before any `tab.attach`** (plan 037 §3.6) and the snapshot is taken
+//! **after** the subscribe so the ack's revision is a floor the snapshot
+//! can be fenced against.
 //!
 //! ## The seam C5 fills
 //!
@@ -21,9 +21,9 @@
 //! minting rides the same queue) followed by
 //! [`roost_ipc::client::DataConnection`]. C4 deliberately builds none of
 //! it: the decoder is main-thread-only, so the data path's shape is
-//! C5's to choose. What C4 guarantees it is a live control client with
-//! the lease, an ordered queue to mint tokens on, and a mirror that
-//! already knows which tabs exist.
+//! C5's to choose. What C4 guarantees it is a live control client, an
+//! ordered queue to mint tokens on, and a mirror that already knows
+//! which tabs exist.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +40,7 @@ use roost_ui_model::keys::HostId;
 use tokio::sync::{mpsc, Notify};
 
 use super::mirror::{HostMirror, SharedMirror};
-use super::queue::{self, HostIntent, HostOpError, LeasePolicy, OpFault};
+use super::queue::{self, HostIntent, HostOpError, OpFault};
 use super::state::{
     check_compatibility, ConnectFacts, HostConnState, HostStateMachine, HostTransport, ResumeFacts,
 };
@@ -87,81 +87,6 @@ impl Shutdown {
         while !self.requested.load(Ordering::Acquire) {
             self.wake.notified().await;
         }
-    }
-}
-
-/// The in-place takeback signal (plan 057 §3.5).
-///
-/// Two flags rather than one, and the pair is the whole contract between
-/// the set and the task:
-///
-/// * `in_place` is the **task's** answer to "can this host take the
-///   foreground back without reconnecting?" — raised only while it is
-///   deposed on a control connection a takeover left open, which is what
-///   an `open_input` session promises. The set reads it to decide
-///   whether ↻ is a takeback or a full reconnect.
-/// * `requested` is the **set's** ask, level-triggered for the same
-///   reason [`Shutdown`] is: a raise that lands between two `select!`
-///   arms must not be lost.
-///
-/// The narrow race — the loop exits between the set's read and its raise
-/// — costs one click, and never more than that: [`Self::serving`] clears
-/// the ask on **both** edges, so an ask raised against a round that has
-/// already ended cannot be consumed by the next one. Clearing only on
-/// the way down is not enough, because the raise can land after it: the
-/// set reads `in_place` true, the round lowers, and `request()` then
-/// stores a flag over a dead round that the next `serving(true)` would
-/// leave standing for [`serve_deposed`] to consume — a
-/// `session.connect { takeover: true }` nobody asked for, which is
-/// precisely the silent steal-back the probe policy exists to prevent.
-#[derive(Debug, Default)]
-pub(crate) struct Foreground {
-    in_place: AtomicBool,
-    requested: AtomicBool,
-    wake: Notify,
-}
-
-impl Foreground {
-    /// Take the foreground back on the connection this task already
-    /// holds. A no-op unless [`Self::in_place`] says one is being served.
-    pub(crate) fn request(&self) {
-        self.requested.store(true, Ordering::Release);
-        self.wake.notify_waiters();
-        self.wake.notify_one();
-    }
-
-    /// Whether a deposed task is serving on a live control connection,
-    /// so a takeback needs no reconnect.
-    pub(crate) fn in_place(&self) -> bool {
-        self.in_place.load(Ordering::Acquire)
-    }
-
-    /// Arm or disarm the in-place route, and clear any ask that is no
-    /// longer answerable — on either edge. See the struct doc for why
-    /// the raise has to clear one too.
-    fn serving(&self, serving: bool) {
-        self.in_place.store(serving, Ordering::Release);
-        self.requested.store(false, Ordering::Release);
-    }
-
-    /// Resolves once a takeback has been asked for, and consumes the ask.
-    async fn requested(&self) {
-        while !self.requested.swap(false, Ordering::AcqRel) {
-            self.wake.notified().await;
-        }
-    }
-
-    /// Stand in for the task, which the set's own suite never runs.
-    #[cfg(test)]
-    pub(crate) fn serving_for_test(&self, serving: bool) {
-        self.serving(serving);
-    }
-
-    /// Consume the ask the way [`Self::requested`] would, and say whether
-    /// there was one.
-    #[cfg(test)]
-    pub(crate) fn took_the_request_for_test(&self) -> bool {
-        self.requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -240,18 +165,6 @@ pub(crate) struct ConnectionConfig {
     /// own later retries.
     pub(crate) supersedes: Option<HostId>,
     pub(crate) mode: ConnectMode,
-    /// The lease the previous connection held, when this task is one the
-    /// reconnect schedule asked for (plan 040 §3.7). It seeds
-    /// [`connect_loop`]'s own `held_lease`, which [`attempt`] presents.
-    /// `None` for every explicit Connect.
-    pub(crate) held_lease: Option<String>,
-    /// Whether this task starts already knowing it is not the driver
-    /// (plan 049 §3.11). The set carries the fact across the tasks its
-    /// ladder spawns; here it seeds [`connect_loop`]'s `observing`
-    /// latch, so every attempt runs the observer prologue and none of
-    /// them ever calls `session.connect`. `false` for every explicit
-    /// Connect — taking the session back is what that button means.
-    pub(crate) observer_only: bool,
     /// Where this host's last connection left the event stream, if it
     /// reached one — seeded by the set for **every** cause, because
     /// what it describes is the session rather than who asked to dial
@@ -268,9 +181,6 @@ pub(crate) struct ConnectionConfig {
     /// `Connected` edge and emptied on every way out of one — see
     /// [`Uploads::open`] and [`serve`].
     pub(crate) uploads: Uploads,
-    /// The in-place takeback seam, shared with the set. See
-    /// [`Foreground`].
-    pub(crate) foreground: Arc<Foreground>,
 }
 
 /// The scale every budget in this module is stretched by, read once.
@@ -355,7 +265,6 @@ impl From<ClientError> for AttemptError {
     fn from(error: ClientError) -> Self {
         match error.server_code() {
             Some(ServerCode::ShuttingDown) => AttemptError::Stopping("stop".into()),
-            Some(ServerCode::TakenOver) => AttemptError::Stopping("taken-over".into()),
             _ => AttemptError::Transport(error.to_string()),
         }
     }
@@ -482,6 +391,13 @@ fn dial_failure(mode: ConnectMode, socket: &Path, error: &roost_ipc::Error) -> A
 /// A live, subscribed connection.
 struct Live {
     control: IpcClient,
+    /// The token `session.connect` answered with, for the ops whose
+    /// protocol-4 params still declare a required `lease: String`.
+    ///
+    /// Connection-local and inert: the session stopped reading the value
+    /// when every connection became symmetric, nothing here compares it
+    /// and no attempt carries it to the next one. Protocol 5 drops the
+    /// field and this with it.
     lease: String,
     events: EventRx,
     pump: tokio::task::AbortHandle,
@@ -507,48 +423,26 @@ impl Live {
         }
     }
 
-    /// The line a finished prologue writes. Driving and watching differ
-    /// only in `what`, so the fields cannot drift apart between them.
-    fn log(&self, config: &ConnectionConfig, what: &str) {
+    /// The line a finished prologue writes.
+    fn log(&self, config: &ConnectionConfig) {
         tracing::info!(
             host = %config.host,
             label = %config.label,
             session = %self.facts.session_id,
             revision = self.mirror.read().revision,
-            resume = self.facts.supports_resume,
             resumed = self.facts.resumed.is_some(),
-            "{what}"
+            "connected to host session"
         );
     }
 }
 
-/// How this client names itself when it claims the lease (plan 049
-/// §3.9).
-///
-/// The machine name, and the same one `session.set_agent_hooks` reports
-/// — a deposed window's banner and a host's agent record are answering
-/// the same question ("which of my machines was that?"), so they must
-/// not answer it differently. Display metadata, never identity: the
-/// session authenticates nothing and the banner says "reporting itself
-/// as".
+/// How this client names itself, and the same name
+/// `session.set_agent_hooks` reports — a host's agent record and a
+/// connection's own label are answering the same question ("which of my
+/// machines was that?"), so they must not answer it differently.
+/// Display metadata, never identity: the session authenticates nothing.
 fn host_client_label() -> String {
     crate::app::agent_hooks::client_label()
-}
-
-/// What a dial produced: the session is ours to drive, or somebody
-/// else's to watch.
-enum Attempt {
-    /// The lease is held. Everything a connected host can do is open.
-    Driver(Live),
-    /// Another client drives this session. The connection is real and
-    /// the stream is live — batches, titles, agent status and
-    /// notifications all land — but nothing lease-bearing is sent (plan
-    /// 049 §3.11). Reached only where there is nothing else to do: a
-    /// probe that found the session already taken, or a takeover by a
-    /// session predating `open_input`, which closed the data connections
-    /// with it and so really did stop the frame. An `open_input`
-    /// takeover keeps serving instead ([`serve_deposed`]).
-    Observer(Live),
 }
 
 /// The ops an older session answers `unknown-op` to, and whether this
@@ -580,8 +474,8 @@ struct Unsupported {
 impl Unsupported {
     /// Note an `unknown-op` refusal, and say whether it is worth a line.
     ///
-    /// `false` for every other kind of failure — a `taken-over` is not
-    /// an old session, and swallowing it here would hide it — and
+    /// `false` for every other kind of failure — a `shutting-down` is
+    /// not an old session, and swallowing it here would hide it — and
     /// `false` the second time one op says it.
     fn note(&mut self, op: &str, error: &HostOpError) -> Option<&'static str> {
         if !matches!(
@@ -666,24 +560,10 @@ async fn connect_loop(
     let mut machine = HostStateMachine::new(config.transport.is_localhost());
     let mut previous: Option<HostId> = config.supersedes;
     let mut mode = config.mode;
-    // The lease this task last held — or, seeded from the config, the
-    // one the connection this task replaces held. `Some` means an
-    // attempt nobody asked for, and such an attempt has to ask before
-    // it takes the session back — see [`attempt`].
-    let mut held_lease: Option<String> = config.held_lease.clone();
     // Task-scoped, not connection-scoped: what it latches is what this
     // *session* cannot do, and reconnecting to it does not make an old
     // session newer. See [`Unsupported`].
     let mut unsupported = Unsupported::default();
-    // `Some` once this task has learned it is not the driver — from a
-    // `session.driver_changed` envelope (with the taker's label), from a
-    // probe that came back non-current (without one), or from the set,
-    // which carries the fact across the tasks an ssh ladder spawns
-    // (there is no label to carry, so the banner names nobody). It never
-    // clears: re-taking the session is the takeback affordance, which
-    // spawns a fresh task rather than reusing this one, so a client
-    // that has learned it is deposed can never auto-reclaim.
-    let mut observing: Option<Option<String>> = config.observer_only.then_some(None);
     // This task's own checkpoint, taken from every attempt that reached
     // a session and preferred over the one the set seeded, which by then
     // describes a strictly older fence. It saves an in-task retry a trip
@@ -707,71 +587,32 @@ async fn connect_loop(
         }
         previous = Some(incarnation);
 
-        let presented = held_lease.clone();
         let checkpoint = resume.as_ref().or(config.resume.as_ref());
         let dialed = tokio::select! {
             biased;
             () = shutdown.requested() => None,
-            outcome = attempt(config, mode, &mut held_lease, &mut observing, checkpoint)
-                => Some(outcome),
+            outcome = attempt(config, mode, checkpoint) => Some(outcome),
         };
         // Only the first attempt may spawn or probe; a retry dials.
         mode = ConnectMode::Dial;
 
-        // Published here rather than on the success path, and only when
-        // the attempt actually ran: ownership moves on the wire at
-        // `session.connect`, and over ssh every attempt is a fresh task
-        // (`open_ssh` re-runs the whole ladder). A lease minted at step 2
-        // and then lost with a failed prologue would leave the *next*
-        // attempt presenting the tombstone that grant left behind — the
-        // far side answers `taken-over` and the host settles as somebody
-        // else's with no other client ever involved (plan 040 §3.7). A
-        // shutdown-cancelled select has nothing to publish and is going
-        // away regardless.
-        if dialed.is_some() && held_lease != presented {
-            if let Some(lease) = held_lease.clone() {
-                if !publish_lease(feed, incarnation, lease) {
-                    return;
-                }
-            }
-        }
-
-        let mut ended = match dialed {
+        let ended = match dialed {
             None => ConnEnd::Shutdown,
             Some(Err(error)) => error.into(),
-            Some(Ok(Attempt::Observer(live))) => {
+            Some(Ok(live)) => {
                 // Taken before the connection is served rather than
                 // after: both halves of a checkpoint are known the
                 // moment the prologue ends, and the fence is read off
                 // the handle at use time, so a `Live` that has since
                 // been consumed leaves nothing behind.
                 resume = Some(live.checkpoint());
-                let taken_by = observing.clone().flatten();
-                if !publish_workspace(
-                    feed,
-                    incarnation,
-                    HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
-                ) || !publish_state(feed, incarnation, machine.taken_over(taken_by))
-                    // Behind the state, never ahead of it: the set files
-                    // facts on the connection the state just installed,
-                    // and an observer resumes and shows a fidelity
-                    // indicator exactly like a driver.
-                    || !publish_facts(feed, incarnation, live.facts.clone())
-                {
-                    ConnEnd::FeedClosed
-                } else {
-                    // No lane: an observer holds no lease, so there is
-                    // nothing for an upload to ride.
-                    observe(config, incarnation, live, ops_rx, feed, shutdown).await
-                }
-            }
-            Some(Ok(Attempt::Driver(live))) => {
-                resume = Some(live.checkpoint());
                 if !publish_workspace(
                     feed,
                     incarnation,
                     HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
                 ) || !publish_state(feed, incarnation, machine.connected())
+                    // Behind the state, never ahead of it: the set files
+                    // facts on the connection the state just installed.
                     || !publish_facts(feed, incarnation, live.facts.clone())
                 {
                     ConnEnd::FeedClosed
@@ -781,12 +622,10 @@ async fn connect_loop(
                     // exit from `Connected`" (plan 047 §3.3): every
                     // `ConnEnd` arm below, an explicit reconnect and a
                     // `HostConn::drop` (both of which signal `shutdown`,
-                    // which `serve` returns on), the whole loop's
+                    // which `serve` returns on), and the whole loop's
                     // future being dropped by [`run`]'s grace timer —
                     // that last one runs no code, which is why this is a
-                    // `Drop` and not a line after the `await` — and a
-                    // takeover, which returns `Deposed` for exactly
-                    // this reason (plan 049 §3.11).
+                    // `Drop` and not a line after the `await`.
                     let _lane = config
                         .uploads
                         .open(config.socket.clone(), live.lease.clone());
@@ -804,25 +643,6 @@ async fn connect_loop(
             }
         };
 
-        // Driver → deposed, with the lane already dropped by the block
-        // above. What happens next is the transport decision — see
-        // [`deposed_rounds`].
-        if matches!(ended, ConnEnd::Deposed { .. }) {
-            ended = deposed_rounds(
-                config,
-                incarnation,
-                &mut machine,
-                ended,
-                ops_rx,
-                feed,
-                shutdown,
-                &mut unsupported,
-                &mut held_lease,
-                &mut observing,
-            )
-            .await;
-        }
-
         // The feed being gone means the app is: there is nobody left to
         // tell, and nobody left to hear a flushed intent either.
         if matches!(ended, ConnEnd::FeedClosed) {
@@ -834,9 +654,8 @@ async fn connect_loop(
         queue::flush(ops_rx, &HostOpError::Disconnected);
 
         let delay = match ended {
-            // Both handled above; the arms are here only for
-            // exhaustiveness.
-            ConnEnd::FeedClosed | ConnEnd::Deposed { .. } => return,
+            // Handled above; the arm is here only for exhaustiveness.
+            ConnEnd::FeedClosed => return,
             ConnEnd::Shutdown => {
                 publish_state(feed, incarnation, machine.disconnect_requested());
                 return;
@@ -846,7 +665,8 @@ async fn connect_loop(
                 return;
             }
             ConnEnd::Stopping(reason) => {
-                publish_state(feed, incarnation, machine.stopping(&reason));
+                tracing::info!(host = %config.host, %reason, "the host session is going away");
+                publish_state(feed, incarnation, machine.stopping());
                 return;
             }
             ConnEnd::Settled { reason, detail } => {
@@ -888,157 +708,6 @@ async fn connect_loop(
     }
 }
 
-/// One attempt, with the auto-retry's guard in front of it.
-///
-/// `held_lease` is `Some` only on a retry this task scheduled itself,
-/// and that is the whole distinction. Reconnecting is a takeover by
-/// construction (`ipc.md` #sessionconnect), so an auto-retry that
-/// simply reconnected would silently steal the session back whenever
-/// the drop *was* a takeover this client never heard about — takeover
-/// ping-pong between two clients, neither of which the user asked for.
-/// Probing the old lease first settles it.
-///
-/// A lease also arrives a second way: [`ConnectionConfig::held_lease`],
-/// which the app sets when this whole *task* is the retry (plan 040
-/// §3.7 — an ssh drop tears the tunnel down, so its ladder re-enters at
-/// `open_ssh` and every attempt is a fresh task). A task seeded that way
-/// runs this guard on its **first** attempt, which is the same probe a
-/// localhost auto-retry runs on its second, for the same reason.
-///
-/// An explicit Connect never comes through here with a lease. Taking
-/// the session back on purpose is exactly what that button means.
-///
-/// `observing` is the latch the other direction: once this task knows it
-/// is not the driver it never dials as one again, whatever the ladder
-/// does afterwards. Only a fresh task — which is what the takeback
-/// affordance spawns — connects as a driver again.
-///
-/// `held_lease` is also where this attempt's *own* lease is written
-/// back, which is why it is `&mut` — see [`connect`].
-async fn attempt(
-    config: &ConnectionConfig,
-    mode: ConnectMode,
-    held_lease: &mut Option<String>,
-    observing: &mut Option<Option<String>>,
-    resume: Option<&Resume>,
-) -> Result<Attempt, AttemptError> {
-    if observing.is_some() {
-        return observe_prologue(config, mode, resume)
-            .await
-            .map(Attempt::Observer);
-    }
-    if let Some(lease) = held_lease.as_deref() {
-        match probe_lease(config, lease).await {
-            // The drop was the wire, not a takeover. Resume as driver —
-            // including the `Connected` edge, so the upload lane
-            // reopens (plan 049 §3.11).
-            Probe::Current => {}
-            Probe::NotCurrent => {
-                // Nothing to hold and nothing to present any more, and
-                // this client learned it *from the session*: from here
-                // on it watches until the user says otherwise.
-                *held_lease = None;
-                *observing = Some(None);
-                return observe_prologue(config, mode, resume)
-                    .await
-                    .map(Attempt::Observer);
-            }
-            // Uncertainty NEVER authorizes a takeover. Retrying the
-            // probe under the ladder's own backoff is the whole
-            // recovery — a client that cannot reach the session has
-            // learned nothing about who drives it.
-            Probe::Unknown(reason) => return Err(AttemptError::Transport(reason)),
-        }
-    }
-    connect(config, mode, held_lease, resume)
-        .await
-        .map(Attempt::Driver)
-}
-
-/// What presenting the held lease established.
-#[derive(Debug)]
-enum Probe {
-    /// The session still recognizes this lease as the live one.
-    Current,
-    /// The session says this lease is not current — `taken-over` *or*
-    /// `connect-required`. Both mean somebody else may be driving:
-    /// there is exactly one tombstone, so a client displaced two
-    /// takeovers ago is told `connect-required` and re-taking on that
-    /// is the steal-back this policy exists to prevent.
-    NotCurrent,
-    /// Nothing was learned — a timeout, a refused dial, a session on
-    /// its way down. Never a licence to take over.
-    Unknown(String),
-}
-
-/// Present the held lease and ask whether it is still the live one.
-///
-/// A re-send of the theme this client already seeded: `session.set_theme`
-/// is lease-checked before it mutates anything, and re-stating the same
-/// palette is idempotent as far as the session's state goes. It is not
-/// *free* — the server bumps its VT theme generation and fans the
-/// command out to every tab — but the probe fires only on a reconnect
-/// attempt, which is already a round-trip-heavy moment.
-///
-/// `events.subscribe` used to be the probe and cannot be any more: it
-/// is leaseless now (plan 049 §3.7) and answers the same "ok" to a
-/// client that holds nothing.
-async fn probe_lease(config: &ConnectionConfig, lease: &str) -> Probe {
-    let theme = config
-        .theme
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let dialed = tokio::time::timeout(leg(), IpcClient::connect(&config.socket)).await;
-    let mut control = match dialed {
-        Ok(Ok(control)) => control,
-        Ok(Err(error)) => return Probe::Unknown(error.to_string()),
-        Err(_elapsed) => {
-            return Probe::Unknown(format!("dialing {} timed out", config.socket.display()))
-        }
-    };
-    // Deliberately not through [`call`]: that folds `taken-over` into a
-    // terminal `Stopping`, and the verdict this needs is finer than
-    // that — `connect-required` has to reach the same answer.
-    let sent = tokio::time::timeout(
-        leg(),
-        control.call_raw(
-            ops::SESSION_SET_THEME,
-            serde_json::json!(SessionSetThemeParams {
-                lease: lease.to_string(),
-                osc_colors: theme,
-            }),
-        ),
-    )
-    .await;
-    match sent {
-        Ok(outcome) => probe_verdict(outcome.as_ref().err()),
-        Err(_elapsed) => Probe::Unknown(format!("{} timed out", ops::SESSION_SET_THEME)),
-    }
-}
-
-/// Read one probe reply. Pure, because this is the policy (plan 049
-/// §3.11) and a table test is the only way to say it once:
-///
-/// * a success — the lease is still ours, so the drop was the wire and
-///   this client resumes as the driver;
-/// * `taken-over` **or** `connect-required` — not ours. The session
-///   keeps exactly one tombstone, so a client displaced two takeovers
-///   ago is told `connect-required`; treating that as permission to
-///   reconnect (which is a takeover) is the steal-back this closes;
-/// * anything else — a refused dial, a session on its way down, a
-///   timeout — proves nothing, and proving nothing never authorizes
-///   taking a session away from whoever has it.
-fn probe_verdict(error: Option<&ClientError>) -> Probe {
-    let Some(error) = error else {
-        return Probe::Current;
-    };
-    match error.server_code() {
-        Some(ServerCode::TakenOver | ServerCode::ConnectRequired) => Probe::NotCurrent,
-        _ => Probe::Unknown(error.to_string()),
-    }
-}
-
 /// Dial the session socket.
 ///
 /// Bounded like every other leg. A peer that accepts the connection and
@@ -1056,15 +725,11 @@ async fn dial_control(
         .map_err(|error| dial_failure(mode, &config.socket, &error))
 }
 
-/// The opening both prologues share: make sure a session is there, dial
-/// it, and gate on `session.identify` before anything else is said.
+/// The prologue's opening: make sure a session is there, dial it, and
+/// gate on `session.identify` before anything else is said.
 ///
 /// Nothing binary exists yet at this point, so every incompatibility is
-/// caught on stable JSON. Shared rather than written twice because
-/// [`connect`] and [`observe_prologue`] diverge only *after* it — one
-/// claims the lease, the other deliberately never does — and a gate that
-/// drifted between them would leave a client watching a build it cannot
-/// decode.
+/// caught on stable JSON.
 async fn open_control(
     config: &ConnectionConfig,
     mode: ConnectMode,
@@ -1114,7 +779,6 @@ async fn open_control(
 /// than republished as a different verdict for the same connection.
 async fn subscribe_prologue(
     socket: &Path,
-    lease: &str,
     control: &mut IpcClient,
     facts: &mut ConnectFacts,
     resume: Option<&Resume>,
@@ -1122,10 +786,9 @@ async fn subscribe_prologue(
     let plan = SubscribePlan {
         resume,
         session_id: &facts.session_id,
-        supports_resume: facts.supports_resume,
     };
     let offered = plan.offered();
-    let (events, pump, subscribed) = subscribe(socket, lease, control, plan).await?;
+    let (events, pump, subscribed) = subscribe(socket, control, plan).await?;
     let mirror = match (subscribed, offered) {
         (Subscribed::Fresh(mirror), _) => Arc::new(SharedMirror::new(mirror)),
         (Subscribed::Resumed { ack }, Some(resume)) => {
@@ -1146,30 +809,24 @@ async fn subscribe_prologue(
 
 /// One connect attempt: the wire prologue, in the order `ipc.md` fixes.
 ///
-/// `held_lease` is an out-parameter as much as an in-one: step 2 is
-/// where ownership actually moves, so that is where the caller starts
-/// holding the new lease — see the comment there.
-async fn connect(
+/// Every connection runs this one, whatever asked for it — there is no
+/// second shape a dial can produce.
+async fn attempt(
     config: &ConnectionConfig,
     mode: ConnectMode,
-    held_lease: &mut Option<String>,
     resume: Option<&Resume>,
 ) -> Result<Live, AttemptError> {
     // 1. Identify, and gate on it.
     let (mut control, mut facts) = open_control(config, mode).await?;
 
-    // 2. Claim the lease. Reconnect IS takeover — the lease outlives the
-    //    connection it was minted on, so a client that reconnects has to
-    //    take its own session back deliberately (`ipc.md`
-    //    #sessionconnect).
+    // 2. Take this connection's token. It grants nothing and displaces
+    //    nobody; it exists because the ops below still declare the field
+    //    — see [`Live::lease`].
     let raw = call(
         &mut control,
         ops::SESSION_CONNECT,
         serde_json::json!(SessionConnectParams {
             takeover: true,
-            // Every connect this client sends is labeled: the label is
-            // only ever read by whoever this connect deposes, and that
-            // is precisely the client that needs to know who took over.
             client_label: Some(host_client_label()),
         }),
     )
@@ -1177,14 +834,6 @@ async fn connect(
     let connected: SessionConnectResult =
         serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_CONNECT, &error))?;
     let lease = connected.lease;
-    // Ownership moved on the wire in the call above, which is why the
-    // write is here and not on the success path: it tombstoned whatever
-    // lease we held before, so from this line on *this* is the one we
-    // hold. A step below that fails must not leave the caller presenting
-    // a tombstone to its next attempt — the far side would answer
-    // `taken-over` and the host would settle as somebody else's, with
-    // nobody else ever involved (plan 040 §3.7).
-    *held_lease = Some(lease.clone());
 
     // 3. Seed the session's palette before anything is attached, so a
     //    query answered while hydrating already carries our colors.
@@ -1203,12 +852,12 @@ async fn connect(
     )
     .await?;
 
-    // 4. Subscribe — resuming from the carried fence where the session
-    //    can serve one, else subscribe then snapshot. That order is what
-    //    makes the fresh fence sound: the ack names a commit the
-    //    snapshot is guaranteed to be at or past.
+    // 4. Subscribe — resuming from the carried fence where there is one,
+    //    else subscribe then snapshot. That order is what makes the
+    //    fresh fence sound: the ack names a commit the snapshot is
+    //    guaranteed to be at or past.
     let (events, pump, mirror) =
-        subscribe_prologue(&config.socket, &lease, &mut control, &mut facts, resume).await?;
+        subscribe_prologue(&config.socket, &mut control, &mut facts, resume).await?;
 
     let live = Live {
         control,
@@ -1218,43 +867,7 @@ async fn connect(
         mirror,
         facts,
     };
-    live.log(config, "connected to host session");
-    Ok(live)
-}
-
-/// The connection sequence that claims nothing (plan 049 §3.11).
-///
-/// Dial → `session.identify` and the compatibility gate → a **leaseless**
-/// control connection → a leaseless `events.subscribe` (which the
-/// session classifies as an observer stream) → a `tab.list` fenced
-/// against the ack. It never calls `session.connect`, never seeds a
-/// theme, never attaches, and sends no lease-bearing intent — so
-/// re-establishing observation cannot silently retake a session.
-///
-/// The identify gate stays: a build this client cannot decode is
-/// unwatchable for the same reason it is undriveable.
-///
-/// The control connection is opened here rather than lazily because the
-/// snapshot needs one immediately; what is *lazy* is everything after
-/// it, since an observer has nothing to say.
-async fn observe_prologue(
-    config: &ConnectionConfig,
-    mode: ConnectMode,
-    resume: Option<&Resume>,
-) -> Result<Live, AttemptError> {
-    let (mut control, mut facts) = open_control(config, mode).await?;
-    let (events, pump, mirror) =
-        subscribe_prologue(&config.socket, "", &mut control, &mut facts, resume).await?;
-
-    let live = Live {
-        control,
-        lease: String::new(),
-        events,
-        pump,
-        mirror,
-        facts,
-    };
-    live.log(config, "watching a host session another client drives");
+    live.log(config);
     Ok(live)
 }
 
@@ -1344,38 +957,29 @@ struct SubscribePlan<'a> {
     /// The session this attempt actually reached, from
     /// `session.identify`.
     session_id: &'a str,
-    /// Whether that session serves `from_revision` at all.
-    supports_resume: bool,
 }
 
 impl<'a> SubscribePlan<'a> {
     /// The plan a mid-connection resync presents: the checkpoint of the
     /// connection it is rebuilding, which by construction names the
-    /// session that connection is already talking to — so only the
-    /// feature gate below can rule it out.
-    fn resuming(resume: &'a Resume, supports_resume: bool) -> SubscribePlan<'a> {
+    /// session that connection is already talking to.
+    fn resuming(resume: &'a Resume) -> SubscribePlan<'a> {
         SubscribePlan {
             resume: Some(resume),
             session_id: &resume.session_id,
-            supports_resume,
         }
     }
 
     /// The checkpoint this attempt may actually present, or `None` to
     /// subscribe fresh.
     ///
-    /// Both filters are decided **before any wire is touched**, and each
-    /// for its own reason. The session id is compared locally because
-    /// `session.identify` has already run: a session that restarted is
-    /// known to be a different one here, so a resume that could only
-    /// come back `session-mismatch` never costs a round trip — the
-    /// server's check stays the authority. The feature is checked
-    /// because a session from before it rejects `from_revision` as an
-    /// unknown field, which is an error *outside* the three refusals
-    /// this client knows how to fall back from.
+    /// The filter is decided **before any wire is touched**: the session
+    /// id is compared locally because `session.identify` has already
+    /// run, so a resume that could only come back `session-mismatch`
+    /// never costs a round trip — the server's check stays the
+    /// authority.
     fn offered(&self) -> Option<&'a Resume> {
         self.resume
-            .filter(|_| self.supports_resume)
             .filter(|resume| resume.session_id == self.session_id)
     }
 }
@@ -1391,24 +995,30 @@ enum Subscribed {
     Fresh(HostMirror),
 }
 
+/// What a subscription presents where protocol 4 still declares a
+/// `lease` on `events.subscribe`.
+///
+/// Nothing about a stream depends on it any more — every connection
+/// receives every event — and the field goes at protocol 5.
+const RETIRED_LEASE: &str = "";
+
 /// Subscribe, resuming from the checkpoint when the session can serve
 /// one and taking a fresh snapshot when it cannot.
 ///
-/// The single seam every subscription in this module goes through — two
-/// prologues and two resyncs — so "does this reconnect take a
-/// `tab.list`?" has exactly one answer to read.
+/// The single seam every subscription in this module goes through — the
+/// prologue and the resync — so "does this reconnect take a `tab.list`?"
+/// has exactly one answer to read.
 async fn subscribe(
     socket: &Path,
-    lease: &str,
     control: &mut IpcClient,
     plan: SubscribePlan<'_>,
 ) -> Result<(EventRx, tokio::task::AbortHandle, Subscribed), AttemptError> {
     if let Some(resume) = plan.offered() {
-        if let Some(resumed) = resume_stream(socket, lease, resume).await? {
+        if let Some(resumed) = resume_stream(socket, resume).await? {
             return Ok(resumed);
         }
     }
-    let (events, pump, mirror) = subscribe_and_snapshot(socket, lease, control).await?;
+    let (events, pump, mirror) = subscribe_and_snapshot(socket, control).await?;
     Ok((events, pump, Subscribed::Fresh(mirror)))
 }
 
@@ -1424,7 +1034,6 @@ async fn subscribe(
 /// published and a refusal is the rare path.
 async fn resume_stream(
     socket: &Path,
-    lease: &str,
     resume: &Resume,
 ) -> Result<Option<(EventRx, tokio::task::AbortHandle, Subscribed)>, AttemptError> {
     // Read here rather than carried on the checkpoint: this is the
@@ -1433,7 +1042,7 @@ async fn resume_stream(
     let dialed = tokio::time::timeout(leg(), async {
         IpcClient::connect(socket)
             .await?
-            .resume_events(lease, from_revision, &resume.session_id)
+            .resume_events(RETIRED_LEASE, from_revision, &resume.session_id)
             .await
     })
     .await
@@ -1484,12 +1093,11 @@ async fn resume_stream(
 /// can only be at or past it, so the pair is a floor either way.
 async fn subscribe_and_snapshot(
     socket: &Path,
-    lease: &str,
     control: &mut IpcClient,
 ) -> Result<(EventRx, tokio::task::AbortHandle, HostMirror), AttemptError> {
     // Bounded: this dials and handshakes, and a peer that accepts
     // without answering must not hold the connection in `Connecting`.
-    let stream = tokio::time::timeout(leg(), EventStream::connect(socket, lease))
+    let stream = tokio::time::timeout(leg(), EventStream::connect(socket, RETIRED_LEASE))
         .await
         .map_err(|_| AttemptError::Transport(format!("{} timed out", ops::EVENTS_SUBSCRIBE)))??;
     let ack = stream.revision();
@@ -1561,8 +1169,8 @@ fn spawn_event_pump(mut stream: EventStream) -> (EventRx, tokio::task::AbortHand
     (rx, handle.abort_handle())
 }
 
-/// How one round — dial, then serve — ended. Both halves produce the
-/// same four outcomes, so both funnel into one handler in [`run`].
+/// How one round — dial, then serve — ended. Both halves funnel into
+/// one handler in [`connect_loop`].
 enum ConnEnd {
     Shutdown,
     FeedClosed,
@@ -1570,24 +1178,6 @@ enum ConnEnd {
     Incompatible(Box<super::state::BuildMismatch>),
     Stopping(String),
     Dropped(String),
-    /// `session.driver_changed`: somebody else took the lease and the
-    /// stream **survived** it (plan 049 §3.8).
-    ///
-    /// The connection travels out of [`serve`] rather than being handled
-    /// inside it for one reason that is not stylistic: the upload lane
-    /// is a `Drop` guard scoped to the `serve(...)` call, and returning
-    /// is what closes it. An observer must never leave a lane open — a
-    /// background dispatcher would dial `session.put_file` with a dead
-    /// lease.
-    Deposed {
-        live: Box<Live>,
-        taken_by: Option<String>,
-        /// Whether the control leg was already seen to die — the race
-        /// rule's latch, which is exactly what a pre-`open_input`
-        /// takeover produces. [`connect_loop`]'s transport decision reads
-        /// it: there is nothing to serve on a leg that is gone.
-        control_lost: bool,
-    },
     /// The connection cannot be made and no retry could change that.
     /// Terminal on every transport — see [`spawn_failure`].
     Settled {
@@ -1598,18 +1188,6 @@ enum ConnEnd {
 
 /// The steady state: drain events into the mirror and intents into the
 /// control client, in the arrival order of whichever is ready.
-///
-/// **The race rule** (plan 049 §3.11): a takeover closes the old lease's
-/// *control* connection and injects `session.driver_changed` onto the
-/// *event* one, and nothing orders those two against each other. So a
-/// control op that fails in that window — with the wire, or with
-/// `taken-over`/`connect-required` — does not end this connection. The
-/// control leg is marked dead, its intents are refused from here on, and
-/// the stream's next frame is the verdict: the envelope deposes this
-/// client, an EOF drops it, a `session.stopping` stops it. Ending on the
-/// control error instead loses the race on a slow machine and settles a
-/// deposed client as merely `Disconnected` — which on a transport with
-/// no ladder is final, and the takeback affordance never appears.
 async fn serve(
     config: &ConnectionConfig,
     incarnation: HostId,
@@ -1619,14 +1197,6 @@ async fn serve(
     shutdown: &Shutdown,
     unsupported: &mut Unsupported,
 ) -> ConnEnd {
-    // Set by the `session.driver_changed` arm and read after the
-    // `select!`: the connection cannot be moved out of a branch that is
-    // still borrowing its own event receiver.
-    let mut deposed: Option<Option<String>> = None;
-    // The race rule's latch. Once the control leg is dead the only thing
-    // left to do is listen, so further intents are answered without
-    // touching the wire — the same answer a takeover already gives them.
-    let mut control_lost = false;
     loop {
         tokio::select! {
             biased;
@@ -1641,17 +1211,9 @@ async fn serve(
                     Some(Ok(EventFrame::Stopping(stopping))) => {
                         return ConnEnd::Stopping(stopping.reason);
                     }
-                    Some(Ok(EventFrame::DriverChanged(changed))) => {
-                        tracing::info!(
-                            host = %config.host,
-                            taken_by = %changed.taken_by,
-                            "another client took the session lease; watching from here"
-                        );
-                        // The stream stays; the *lease* is gone.
-                        deposed = Some(
-                            (!changed.taken_by.is_empty()).then_some(changed.taken_by),
-                        );
-                    }
+                    // Nothing announces a driver any more: no session
+                    // has an owner to move. The frame goes at protocol 5.
+                    Some(Ok(EventFrame::DriverChanged(_))) => {}
                     Some(Err(error)) => {
                         // A revision gap is loss and nothing else, and
                         // the contract's answer to loss is a resync —
@@ -1705,551 +1267,13 @@ async fn serve(
                     // host. Nothing left to serve.
                     return ConnEnd::Shutdown;
                 };
-                if control_lost {
-                    intent.answer(Err(HostOpError::Disconnected));
-                } else {
-                    match run_intent(&mut live, unsupported, intent).await {
-                        IntentOutcome::Live => {}
-                        IntentOutcome::Ends(end) => return end,
-                        // The lease went while an op was in flight and
-                        // the session keeps the leg (plan 057 §3.5).
-                        // Authority moves now; the envelope behind it
-                        // supplies the taker's name when it lands.
-                        IntentOutcome::Deposed => deposed = Some(None),
-                        IntentOutcome::ControlLost(reason) => {
-                            tracing::info!(
-                                host = %config.host,
-                                %reason,
-                                "the control connection is gone; the event stream decides what that means"
-                            );
-                            control_lost = true;
-                        }
-                    }
-                }
-            }
-        }
-        // Outside the `select!`, where the connection is no longer
-        // borrowed: handed back so the caller can drop the upload lane
-        // before a single observer frame is served.
-        if let Some(taken_by) = deposed.take() {
-            return ConnEnd::Deposed {
-                live: Box::new(live),
-                taken_by,
-                control_lost,
-            };
-        }
-    }
-}
-
-/// The observer steady state: apply what the surviving stream sends,
-/// refuse everything that would need a lease (plan 049 §3.11).
-///
-/// It is deliberately *not* [`serve`] with a flag. Three things are
-/// different and each one is the point:
-///
-/// * **No upload lane.** The caller dropped it on the way in here, and
-///   nothing opens another — `session.put_file` under a dead lease is
-///   exactly what plan 047's dispatcher must never do.
-/// * **No intents.** Every queued op is answered `Disconnected`, the
-///   same answer it got when a takeover ended this task outright. The
-///   app already projects `TakenOver` as not-connected, so almost
-///   nothing arrives here; what does is refused before it can reach a
-///   wire that would say `taken-over` a round trip later.
-/// * **Leaseless resync.** A revision gap re-subscribes without a lease
-///   over a fresh control connection. The deposed driver's own control
-///   connection was closed by the takeover, so `live.control` is dead
-///   from the moment this is entered — which is why the resync dials
-///   its own.
-///
-/// The `session.driver_changed` arm is a no-op here on purpose, and it
-/// is half of "the UI never consumes its own `driver_changed`": an
-/// observer is already an observer, and a takeback runs in a *different*
-/// task whose `session.connect` this pump is cancelled before.
-///
-/// **The race rule** (plan 049 §3.11) falls out of the same shape: only
-/// the stream decides when observation has ended. A control connection
-/// dying alone starts nothing, because there is no long-lived one to
-/// die — each resync dials its own and drops it. The accepted corner is
-/// the mirror image: a socket that has quietly stopped delivering while
-/// the connection stays open is waited on until the stream's own EOF or
-/// the ladder's next verdict. In practice both ride one ssh tunnel and
-/// fail together.
-async fn observe(
-    config: &ConnectionConfig,
-    incarnation: HostId,
-    mut live: Live,
-    ops_rx: &mut mpsc::Receiver<HostIntent>,
-    feed: &EngineFeedSender,
-    shutdown: &Shutdown,
-) -> ConnEnd {
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.requested() => return ConnEnd::Shutdown,
-            frame = live.events.recv() => {
-                match frame {
-                    Some(Ok(EventFrame::Batch(batch))) => {
-                        if !apply_batch(&live.mirror, batch, incarnation, feed) {
-                            return ConnEnd::FeedClosed;
-                        }
-                    }
-                    Some(Ok(EventFrame::Stopping(stopping))) => {
-                        return ConnEnd::Stopping(stopping.reason);
-                    }
-                    Some(Ok(EventFrame::DriverChanged(changed))) => {
-                        tracing::debug!(
-                            host = %config.host,
-                            taken_by = %changed.taken_by,
-                            "the session changed hands again; still watching"
-                        );
-                    }
-                    Some(Err(error)) => {
-                        if !matches!(error, ClientError::RevisionGap { .. }) {
-                            return ConnEnd::Dropped(error.to_string());
-                        }
-                        tracing::warn!(host = %config.host, %error, "resyncing a watched host mirror");
-                        match observer_resync(config, &mut live).await {
-                            Ok(()) => {
-                                if !publish_workspace(
-                                    feed,
-                                    incarnation,
-                                    HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
-                                ) {
-                                    return ConnEnd::FeedClosed;
-                                }
-                            }
-                            // Deliberately not `ConnEnd::from`: a failed
-                            // resync is a dropped watch, which the
-                            // ladder retries, and not the terminal
-                            // `Settled`/`Incompatible` a failed *dial*
-                            // means.
-                            Err(AttemptError::Stopping(reason)) => {
-                                return ConnEnd::Stopping(reason)
-                            }
-                            Err(AttemptError::Transport(reason))
-                            | Err(AttemptError::Unrecoverable { reason, .. }) => {
-                                return ConnEnd::Dropped(reason)
-                            }
-                            Err(AttemptError::Incompatible(_)) => {
-                                return ConnEnd::Dropped(
-                                    "the session changed build mid-stream".into(),
-                                )
-                            }
-                        }
-                    }
-                    // The stream closed — a real EOF, or the bare one a
-                    // takeover's undeliverable envelope leaves behind.
-                    // Either way the prologue is re-run under the
-                    // ladder, and it re-establishes observation.
-                    None => return ConnEnd::Dropped("the event stream closed".into()),
-                }
-            }
-            intent = ops_rx.recv() => {
-                let Some(intent) = intent else {
-                    return ConnEnd::Shutdown;
-                };
-                intent.answer(Err(HostOpError::Disconnected));
-            }
-        }
-    }
-}
-
-/// Everything that happens between losing the foreground and either
-/// getting it back or losing the connection too (plan 057 §3.5).
-///
-/// **The transport decision lives here**, and it is a fact about the
-/// session rather than about the UI: a session advertising `open_input`
-/// closes no control and no data connection at a takeover, so the client
-/// keeps its grid, keeps typing, and keeps every lease-free op — it is
-/// only the *foreground* it lost. A session one release older closed all
-/// of it, and there is nothing left to serve on.
-///
-/// It loops because a takeback is not terminal either: retaking re-enters
-/// [`serve`], and a second takeover comes straight back here.
-#[allow(clippy::too_many_arguments)]
-async fn deposed_rounds(
-    config: &ConnectionConfig,
-    incarnation: HostId,
-    machine: &mut HostStateMachine,
-    mut ended: ConnEnd,
-    ops_rx: &mut mpsc::Receiver<HostIntent>,
-    feed: &EngineFeedSender,
-    shutdown: &Shutdown,
-    unsupported: &mut Unsupported,
-    held_lease: &mut Option<String>,
-    observing: &mut Option<Option<String>>,
-) -> ConnEnd {
-    loop {
-        let (live, taken_by, control_lost) = match ended {
-            ConnEnd::Deposed {
-                live,
-                taken_by,
-                control_lost,
-            } => (live, taken_by, control_lost),
-            other => return other,
-        };
-        let mut live = *live;
-        // Nothing to present any more. Every `LeasePolicy::IfAvailable`
-        // intent and every resync from here on is leaseless by reading
-        // this one field.
-        live.lease.clear();
-        *held_lease = None;
-        *observing = Some(taken_by.clone());
-        // Answers whatever the deposed driver still had queued before
-        // the loop below starts refusing the lease-required ones.
-        queue::flush(ops_rx, &HostOpError::Disconnected);
-        // The transport decision, taken **before** the state is
-        // published. `TakenOver` alone cannot say which of the two
-        // deposed worlds this is, so the UI reads this flag the moment
-        // it sees the state to decide whether the frame is live or
-        // frozen — and a raise that landed afterwards would paint one
-        // scrim frame over a grid that never stopped streaming.
-        let serving_in_place = !control_lost && live.facts.supports_open_input;
-        config.foreground.serving(serving_in_place);
-
-        // Refiled, because `TakenOver` is not `Connected` and a reader
-        // that went blank here would be reporting the takeover as a loss
-        // of the session rather than of the lease. Nothing about the
-        // session changed — same id, same fidelity, same fence — and
-        // this connection is still reading it.
-        let facts = live.facts.clone();
-        if !publish_state(feed, incarnation, machine.taken_over(taken_by.clone()))
-            || !publish_facts(feed, incarnation, facts)
-        {
-            return ConnEnd::FeedClosed;
-        }
-
-        if !serving_in_place {
-            // The old-session path, and the one where the leg died under
-            // us: the server closed the data connections and the control
-            // one, so the frame stops and there is nothing to serve.
-            return observe(config, incarnation, live, ops_rx, feed, shutdown).await;
-        }
-
-        // Deposed but serving. The lane is closed (the guard round
-        // `serve` did it), and the slot now says *why* — a refused
-        // upload must not claim the host disconnected when it is right
-        // there under somebody else's foreground.
-        config.uploads.deposed(&config.label, taken_by.as_deref());
-        let outcome = serve_deposed(
-            config,
-            incarnation,
-            machine,
-            live,
-            ops_rx,
-            feed,
-            shutdown,
-            unsupported,
-            taken_by,
-            held_lease,
-            observing,
-        )
-        .await;
-        config.uploads.foreground();
-
-        match outcome {
-            DeposedEnd::Ended(end) => {
-                config.foreground.serving(false);
-                ended = end;
-            }
-            DeposedEnd::Retaken { live, lease } => {
-                // `held_lease`, `observing` and the lease's publication
-                // all happened the moment the lease moved on the wire —
-                // see [`retake_foreground`].
-                let facts = live.facts.clone();
-                if !publish_state(feed, incarnation, machine.connected())
-                    || !publish_facts(feed, incarnation, facts)
-                {
-                    return ConnEnd::FeedClosed;
-                }
-                // Lowered only once `Connected` is on the feed, the
-                // mirror of the raise above: while the UI still reads
-                // `TakenOver`, this flag is what keeps the frame live.
-                config.foreground.serving(false);
-                let _lane = config.uploads.open(config.socket.clone(), lease);
-                ended = serve(
-                    config,
-                    incarnation,
-                    *live,
-                    ops_rx,
-                    feed,
-                    shutdown,
-                    unsupported,
-                )
-                .await;
-            }
-        }
-    }
-}
-
-/// How one deposed-but-serving round ended.
-enum DeposedEnd {
-    /// The user took the foreground back on this very connection —
-    /// no reattach, no snapshot, and the grid never blinked.
-    Retaken { live: Box<Live>, lease: String },
-    /// Anything else, spelled the way every other round ends.
-    Ended(ConnEnd),
-}
-
-/// The deposed-but-serving steady state (plan 057 §3.5).
-///
-/// [`observe`] plus the control leg an `open_input` takeover left open.
-/// Batches still land, `Stopping` still ends it, and on top of that:
-/// every lease-free and lease-if-available intent still runs, every
-/// lease-required one is refused **before the wire** as
-/// [`HostOpError::NotForeground`], and a [`Foreground::request`] takes
-/// the session back in place.
-///
-/// The `session.driver_changed` arm is not the no-op it is in
-/// [`observe`]: the deposition may have been learned from an op refusal
-/// (`IntentOutcome::Deposed`) with nobody named, and this is where the
-/// envelope behind it fills the name in.
-#[allow(clippy::too_many_arguments)]
-async fn serve_deposed(
-    config: &ConnectionConfig,
-    incarnation: HostId,
-    machine: &mut HostStateMachine,
-    mut live: Live,
-    ops_rx: &mut mpsc::Receiver<HostIntent>,
-    feed: &EngineFeedSender,
-    shutdown: &Shutdown,
-    unsupported: &mut Unsupported,
-    mut taken_by: Option<String>,
-    held_lease: &mut Option<String>,
-    observing: &mut Option<Option<String>>,
-) -> DeposedEnd {
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.requested() => return DeposedEnd::Ended(ConnEnd::Shutdown),
-            () = config.foreground.requested() => {
-                let retaken = retake_foreground(
-                    config,
-                    &mut live,
-                    held_lease,
-                    observing,
-                    feed,
-                    incarnation,
-                )
-                .await;
-                return match retaken {
-                    Ok(lease) => DeposedEnd::Retaken { live: Box::new(live), lease },
-                    // A takeback that cannot finish leaves this
-                    // connection with no stream: the round ends, and the
-                    // ladder (or the user) starts a clean one.
-                    Err(end) => DeposedEnd::Ended(end),
-                };
-            }
-            frame = live.events.recv() => {
-                match frame {
-                    Some(Ok(EventFrame::Batch(batch))) => {
-                        if !apply_batch(&live.mirror, batch, incarnation, feed) {
-                            return DeposedEnd::Ended(ConnEnd::FeedClosed);
-                        }
-                    }
-                    Some(Ok(EventFrame::Stopping(stopping))) => {
-                        return DeposedEnd::Ended(ConnEnd::Stopping(stopping.reason));
-                    }
-                    Some(Ok(EventFrame::DriverChanged(changed))) => {
-                        let named = (!changed.taken_by.is_empty()).then_some(changed.taken_by);
-                        if named != taken_by {
-                            tracing::debug!(
-                                host = %config.host,
-                                taken_by = named.as_deref().unwrap_or("(unnamed)"),
-                                "the session named its foreground; still serving"
-                            );
-                            taken_by = named;
-                            config.uploads.deposed(&config.label, taken_by.as_deref());
-                            if !publish_state(
-                                feed,
-                                incarnation,
-                                machine.taken_over(taken_by.clone()),
-                            ) {
-                                return DeposedEnd::Ended(ConnEnd::FeedClosed);
-                            }
-                        }
-                    }
-                    Some(Err(error)) => {
-                        if !matches!(error, ClientError::RevisionGap { .. }) {
-                            return DeposedEnd::Ended(ConnEnd::Dropped(error.to_string()));
-                        }
-                        tracing::warn!(host = %config.host, %error, "resyncing a deposed host mirror");
-                        // `live.lease` is empty here, so this is the
-                        // leaseless resync [`observer_resync`] runs —
-                        // on the control connection this client still
-                        // holds rather than a fresh one.
-                        match resync(config, &mut live).await {
-                            Ok(()) => {
-                                if !publish_workspace(
-                                    feed,
-                                    incarnation,
-                                    HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
-                                ) {
-                                    return DeposedEnd::Ended(ConnEnd::FeedClosed);
-                                }
-                            }
-                            Err(AttemptError::Stopping(reason)) => {
-                                return DeposedEnd::Ended(ConnEnd::Stopping(reason))
-                            }
-                            Err(AttemptError::Transport(reason))
-                            | Err(AttemptError::Unrecoverable { reason, .. }) => {
-                                return DeposedEnd::Ended(ConnEnd::Dropped(reason))
-                            }
-                            Err(AttemptError::Incompatible(_)) => {
-                                return DeposedEnd::Ended(ConnEnd::Dropped(
-                                    "the session changed build mid-stream".into(),
-                                ))
-                            }
-                        }
-                    }
-                    None => {
-                        return DeposedEnd::Ended(ConnEnd::Dropped(
-                            "the event stream closed".into(),
-                        ))
-                    }
-                }
-            }
-            intent = ops_rx.recv() => {
-                let Some(intent) = intent else {
-                    return DeposedEnd::Ended(ConnEnd::Shutdown);
-                };
-                if intent.lease == LeasePolicy::Required {
-                    // The admission decision, taken here rather than a
-                    // round trip later: the session would answer
-                    // `taken-over`, and "somebody else is driving" is a
-                    // better sentence than a refusal code.
-                    intent.answer(Err(HostOpError::NotForeground {
-                        label: config.label.clone(),
-                        taken_by: taken_by.clone(),
-                    }));
-                } else {
-                    match run_intent(&mut live, unsupported, intent).await {
-                        IntentOutcome::Live => {}
-                        IntentOutcome::Ends(end) => return DeposedEnd::Ended(end),
-                        // Already deposed; nothing to transition.
-                        IntentOutcome::Deposed => {}
-                        IntentOutcome::ControlLost(reason) => {
-                            tracing::info!(
-                                host = %config.host,
-                                %reason,
-                                "a deposed client lost its control leg; watching from here"
-                            );
-                            // Re-entering [`deposed_rounds`]'s decision
-                            // with the leg gone is what drops this to a
-                            // plain observer, in one place.
-                            return DeposedEnd::Ended(ConnEnd::Deposed {
-                                live: Box::new(live),
-                                taken_by,
-                                control_lost: true,
-                            });
-                        }
-                    }
+                match run_intent(&mut live, unsupported, intent).await {
+                    IntentOutcome::Live => {}
+                    IntentOutcome::Ends(end) => return end,
                 }
             }
         }
     }
-}
-
-/// Take the foreground back on the connection this client never lost
-/// (plan 057 §3.5).
-///
-/// Three ops and one re-dial, in this order and no other:
-///
-/// 1. `session.connect {takeover}` on the **existing** control client —
-///    a new lease, with no reattach and no snapshot behind it.
-/// 2. `session.set_theme`, because a full connect seeds the palette and
-///    another client may have changed it while this one was deposed;
-///    omitting it would make taking the foreground observably weaker
-///    than reconnecting.
-/// 3. The event stream, and only the event stream: **closed first**, then
-///    re-subscribed with the new lease from the mirror's own fence, so
-///    the session classifies it as the driver's again (`tab.effect`
-///    resumes) and no batch the old stream had already queued is applied
-///    twice.
-///
-/// The control connection and every data connection are untouched, which
-/// is the whole point: the grid never blinks.
-///
-/// The error is a [`ConnEnd`] rather than an [`AttemptError`] because a
-/// closed feed is one of the ways this ends and is not an attempt
-/// failure.
-async fn retake_foreground(
-    config: &ConnectionConfig,
-    live: &mut Live,
-    held_lease: &mut Option<String>,
-    observing: &mut Option<Option<String>>,
-    feed: &EngineFeedSender,
-    incarnation: HostId,
-) -> Result<String, ConnEnd> {
-    let raw = call(
-        &mut live.control,
-        ops::SESSION_CONNECT,
-        serde_json::json!(SessionConnectParams {
-            takeover: true,
-            client_label: Some(host_client_label()),
-        }),
-    )
-    .await?;
-    let connected: SessionConnectResult =
-        serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_CONNECT, &error))?;
-    // All four written before the steps below can fail, for the same
-    // reason [`connect`] writes its lease at step 2: ownership moved on
-    // the wire, so from this line this client *is* the driver. A
-    // takeback that fell over at step 2 and left the latch armed would
-    // leave the task watching a session it actually holds, with no
-    // `driver_changed` ever coming to explain it — and one that left
-    // the *set* holding the superseded lease would hand it to the
-    // ladder the failure lands on, whose probe answers "not current"
-    // and turns the user's takeback into a watch.
-    live.lease = connected.lease;
-    *held_lease = Some(live.lease.clone());
-    *observing = None;
-    if !publish_lease(feed, incarnation, live.lease.clone()) {
-        return Err(ConnEnd::FeedClosed);
-    }
-
-    let theme = config
-        .theme
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    call(
-        &mut live.control,
-        ops::SESSION_SET_THEME,
-        serde_json::json!(SessionSetThemeParams {
-            lease: live.lease.clone(),
-            osc_colors: theme,
-        }),
-    )
-    .await?;
-
-    // Before the new subscription rather than inside [`reseat`]: the old
-    // stream is *live* here (unlike a resync, which runs after one
-    // errored), and a stream still classified as an observer has no
-    // business delivering another frame once this connection is the
-    // driver again.
-    live.pump.abort();
-    let resume = live.checkpoint();
-    let plan = SubscribePlan::resuming(&resume, live.facts.supports_resume);
-    let (events, pump, subscribed) =
-        subscribe(&config.socket, &live.lease, &mut live.control, plan).await?;
-    reseat(live, events, pump, subscribed);
-    live.log(config, "took this host session's foreground back in place");
-    Ok(live.lease.clone())
-}
-
-/// [`resync`] for a watched connection: the same seam, **leaseless**
-/// and on a fresh control connection — the one this client dialed as a
-/// driver was closed by the takeover that deposed it, so there is
-/// nothing here to reuse.
-async fn observer_resync(config: &ConnectionConfig, live: &mut Live) -> Result<(), AttemptError> {
-    let mut control = dial_control(config, ConnectMode::Dial).await?;
-    let resume = live.checkpoint();
-    let plan = SubscribePlan::resuming(&resume, live.facts.supports_resume);
-    let (events, pump, subscribed) = subscribe(&config.socket, "", &mut control, plan).await?;
-    live.control = control;
-    reseat(live, events, pump, subscribed);
-    Ok(())
 }
 
 /// Move a live connection onto a re-established subscription.
@@ -2269,25 +1293,27 @@ fn reseat(live: &mut Live, events: EventRx, pump: tokio::task::AbortHandle, what
     }
 }
 
-/// What one control op left behind. Deliberately not a `ConnEnd`:
-/// whether a dead control leg ends the connection is [`serve`]'s call —
-/// see its race rule.
+/// What one control op left behind.
 enum IntentOutcome {
     /// The control connection is still good.
     Live,
-    /// The session stated it is going away. Not a race with anything:
-    /// the stream is going with it.
+    /// The round is over: the session stated it is going away, or the
+    /// wire under this op died. `IpcClient` is strictly sequential, so a
+    /// leg that failed mid-op cannot be reused — the reply the op
+    /// abandoned would be read as the next one's.
     Ends(ConnEnd),
-    /// The lease is no longer this client's, and the session keeps the
-    /// connection that presented it (plan 057 §3.5's `open_input`). The
-    /// leg is fine; only authority moved.
-    Deposed,
-    /// The control leg is finished — the wire died, or the lease it
-    /// presents is no longer this client's on a session that closes the
-    /// connection with it. The event stream decides what that means; the
-    /// reason is carried for the log.
-    ControlLost(String),
 }
+
+/// The queued ops whose protocol-4 params declare a required
+/// `lease: String`, which the session decodes and no longer reads. Every
+/// other op either has no such field or defaults it, and a
+/// `deny_unknown_fields` struct refuses a key it does not declare — so
+/// the list is exactly this long. It goes with the field at protocol 5.
+const LEASE_BEARING_OPS: [&str; 3] = [
+    ops::SESSION_SET_THEME,
+    ops::SESSION_SET_FOCUS,
+    ops::SESSION_SET_AGENT_HOOKS,
+];
 
 /// Send one queued op through the control client and answer its caller.
 ///
@@ -2301,16 +1327,18 @@ async fn run_intent(
     // Taken rather than cloned: the params are this intent's alone, and
     // `answer` never reads them.
     let mut params = std::mem::take(&mut intent.params);
-    if let Some(lease) = intent.lease.present(&live.lease) {
-        let lease = lease.to_string();
+    if LEASE_BEARING_OPS.contains(&intent.op.as_ref()) {
         let Some(object) = params.as_object_mut() else {
             intent.answer(Err(HostOpError::Rejected {
                 code: ServerCode::InvalidParam,
-                message: "a lease-gated op needs an object for params".into(),
+                message: "a session op needs an object for params".into(),
             }));
             return IntentOutcome::Live;
         };
-        object.insert("lease".into(), serde_json::Value::String(lease));
+        object.insert(
+            "lease".into(),
+            serde_json::Value::String(live.lease.clone()),
+        );
     }
 
     let op = intent.op.clone();
@@ -2332,32 +1360,14 @@ async fn run_intent(
             intent.answer(Err(surfaced));
             match fault {
                 OpFault::Surfaced => IntentOutcome::Live,
-                // Somebody else drives this session now — or did, two
-                // takeovers ago (`connect-required`).
-                //
-                // What that means for the *leg* is the session's
-                // generation. Before `open_input` the same takeover
-                // closed this control connection and injected an
-                // envelope onto the stream, so the client could not say
-                // which had happened and let the stream decide. An
-                // `open_input` session closes nothing, so the assumption
-                // is simply false there: authority moved, the leg is
-                // fine, and the envelope behind this refusal will name
-                // the taker.
-                OpFault::LeaseLost(code) => {
-                    if live.facts.supports_open_input {
-                        IntentOutcome::Deposed
-                    } else {
-                        IntentOutcome::ControlLost(code.as_str().into())
-                    }
-                }
                 OpFault::ShuttingDown => IntentOutcome::Ends(ConnEnd::Stopping("stop".into())),
-                OpFault::Transport(reason) => IntentOutcome::ControlLost(reason),
+                OpFault::Transport(reason) => IntentOutcome::Ends(ConnEnd::Dropped(reason)),
             }
         }
         Err(_elapsed) => {
-            intent.answer(Err(HostOpError::Transport(format!("{op} timed out"))));
-            IntentOutcome::ControlLost(format!("{op} timed out"))
+            let timed_out = format!("{op} timed out");
+            intent.answer(Err(HostOpError::Transport(timed_out.clone())));
+            IntentOutcome::Ends(ConnEnd::Dropped(timed_out))
         }
     }
 }
@@ -2368,9 +1378,8 @@ async fn run_intent(
 /// where it cannot.
 async fn resync(config: &ConnectionConfig, live: &mut Live) -> Result<(), AttemptError> {
     let resume = live.checkpoint();
-    let plan = SubscribePlan::resuming(&resume, live.facts.supports_resume);
-    let (events, pump, subscribed) =
-        subscribe(&config.socket, &live.lease, &mut live.control, plan).await?;
+    let plan = SubscribePlan::resuming(&resume);
+    let (events, pump, subscribed) = subscribe(&config.socket, &mut live.control, plan).await?;
     reseat(live, events, pump, subscribed);
     Ok(())
 }
@@ -2407,10 +1416,6 @@ fn publish_state(feed: &EngineFeedSender, host: HostId, state: HostConnState) ->
 
 fn publish_workspace(feed: &EngineFeedSender, host: HostId, event: HostWorkspaceEvent) -> bool {
     feed.send(EngineFeed::HostWorkspace(host, event))
-}
-
-fn publish_lease(feed: &EngineFeedSender, host: HostId, lease: String) -> bool {
-    feed.send(EngineFeed::HostLease(host, lease))
 }
 
 fn publish_facts(feed: &EngineFeedSender, host: HostId, facts: ConnectFacts) -> bool {
@@ -2814,13 +1819,10 @@ mod tests {
             generation: 1,
             supersedes: None,
             mode,
-            held_lease: None,
-            observer_only: false,
             resume: None,
             client_build: "gb".into(),
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
             uploads: Uploads::default(),
-            foreground: Arc::new(Foreground::default()),
         }
     }
 
@@ -2870,354 +1872,6 @@ mod tests {
             panic!("expected a transport outcome");
         };
         assert!(reason.contains("localhost"), "{reason}");
-    }
-
-    /// A session socket that answers exactly one request, reports which
-    /// op it was, and refuses it.
-    ///
-    /// `taken-over` is reserved for `events.subscribe` so the two shapes
-    /// the case below tells apart end differently: a task that ran the
-    /// lease guard settles as `TakenOver`, and one that went straight to
-    /// the wire prologue drops.
-    fn one_request_session(socket: &Path) -> tokio::sync::oneshot::Receiver<String> {
-        let listener = tokio::net::UnixListener::bind(socket).expect("bind a fake session");
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let (reader, mut writer) = stream.into_split();
-            let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reader));
-            let Ok(Some(line)) = lines.next_line().await else {
-                return;
-            };
-            let request: serde_json::Value = serde_json::from_str(&line).expect("a request");
-            let op = request["op"].as_str().unwrap_or_default().to_string();
-            let code = if op == ops::SESSION_SET_THEME {
-                "taken-over"
-            } else {
-                "internal"
-            };
-            let mut body = serde_json::to_vec(&serde_json::json!({
-                "id": request["id"],
-                "ok": false,
-                "error": { "code": code, "message": "refused" },
-            }))
-            .expect("encode a response");
-            body.push(b'\n');
-            let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &body).await;
-            let _ = tx.send(op);
-        });
-        rx
-    }
-
-    /// Run one whole task against [`one_request_session`], and report
-    /// the op that session saw first alongside the state the task
-    /// settled in.
-    async fn first_op_and_final_state(
-        socket: PathBuf,
-        held_lease: Option<String>,
-    ) -> (String, HostConnState) {
-        let seen = one_request_session(&socket);
-        let mut config = config(socket, HostTransport::Ssh, ConnectMode::Dial);
-        config.held_lease = held_lease;
-        let (feed, mut rx) = crate::engine_feed::channel();
-        let (_ops, ops_rx) = super::super::HostOps::channel();
-        run(
-            config,
-            HostIdMinter::new(),
-            ops_rx,
-            feed,
-            Arc::new(Shutdown::default()),
-        )
-        .await;
-        let op = seen.await.expect("the session read a request");
-        let final_state = feed_items(&mut rx)
-            .into_iter()
-            .filter_map(|item| match item {
-                EngineFeed::HostState(_, state) => Some(state),
-                _ => None,
-            })
-            .next_back()
-            .expect("a task publishes at least one state");
-        (op, final_state)
-    }
-
-    /// A lease that arrives on the **config** is presented before the
-    /// first dial, not after it.
-    ///
-    /// This is what makes an ssh auto-reconnect as safe as a localhost
-    /// auto-retry: an ssh drop tears its tunnel down, so the retry is a
-    /// *fresh task* whose own `held_lease` starts empty — and a fresh
-    /// task that simply reconnected would take the session back from
-    /// another client with no probe at all, `takeover: true` being the
-    /// wire contract. The control case is the same task with no lease:
-    /// it opens with the prologue, exactly as an explicit Connect does.
-    #[tokio::test]
-    async fn a_config_seeded_lease_is_presented_before_the_first_dial() {
-        let dir = tempfile::tempdir().expect("temp dir");
-
-        let (op, state) = first_op_and_final_state(
-            dir.path().join("carried.sock"),
-            Some("lease-from-the-last-connection".into()),
-        )
-        .await;
-        assert_eq!(
-            op,
-            ops::SESSION_SET_THEME,
-            "the first attempt asks about the lease before dialing"
-        );
-        // Never `Connected`: the probe said the lease is not current, so
-        // this task went looking for an observer stream instead of
-        // taking the session back. It settles `Disconnected` only
-        // because this fake answers exactly one request and then stops
-        // listening, so the observer prologue has nothing to dial —
-        // what matters is the `session.connect` that never happened.
-        assert!(
-            !state.is_foreground(),
-            "a non-current probe must never reach Connected: {state:?}"
-        );
-
-        let (op, state) = first_op_and_final_state(dir.path().join("bare.sock"), None).await;
-        assert_eq!(
-            op,
-            ops::SESSION_IDENTIFY,
-            "with no lease there is nothing to ask about"
-        );
-        assert!(matches!(state, HostConnState::Disconnected(_)), "{state:?}");
-    }
-
-    /// A session that grants a lease and then refuses everything after
-    /// it, reporting the lease of every `session.set_theme` it is shown.
-    ///
-    /// `session.set_theme` is both the reconnect **probe** (plan 049
-    /// §3.11) and step 3 of the prologue, which is what makes one script
-    /// enough: the first one is answered `ok` so the attempt behind it
-    /// proceeds, and every one after it is refused — so the prologue
-    /// fails at step 3, *after* the `session.connect` that actually
-    /// moved ownership, and each retry's probe then reports which lease
-    /// that attempt believes it holds.
-    ///
-    /// The refusal is a plain `internal`, deliberately: an `internal`
-    /// probe verdict proves nothing about who drives the session, so
-    /// the task keeps retrying rather than settling — which is what
-    /// lets a test read several attempts off one fake.
-    ///
-    /// One connection at a time is enough, and deliberate: a failed
-    /// prologue drops its control client, so the next accept is the
-    /// retry's.
-    fn a_session_that_grants_a_lease_then_fails(
-        socket: &Path,
-        granted: &str,
-    ) -> mpsc::UnboundedReceiver<String> {
-        let listener = tokio::net::UnixListener::bind(socket).expect("bind a fake session");
-        let granted = granted.to_string();
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut probes = 0;
-            while let Ok((stream, _)) = listener.accept().await {
-                let (reader, mut writer) = stream.into_split();
-                let mut lines =
-                    tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reader));
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let request: serde_json::Value =
-                        serde_json::from_str(&line).expect("a request");
-                    let id = request["id"].clone();
-                    let response = match request["op"].as_str().unwrap_or_default() {
-                        ops::SESSION_IDENTIFY => {
-                            serde_json::json!({"id": id, "ok": true, "result": identify_result()})
-                        }
-                        ops::SESSION_CONNECT => serde_json::json!({
-                            "id": id,
-                            "ok": true,
-                            "result": { "lease": granted, "revision": 1 },
-                        }),
-                        ops::SESSION_SET_THEME => {
-                            let _ = tx.send(
-                                request["params"]["lease"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
-                            );
-                            probes += 1;
-                            if probes == 1 {
-                                serde_json::json!({"id": id, "ok": true, "result": {}})
-                            } else {
-                                serde_json::json!({
-                                    "id": id,
-                                    "ok": false,
-                                    "error": { "code": "internal", "message": "refused" },
-                                })
-                            }
-                        }
-                        _ => serde_json::json!({
-                            "id": id,
-                            "ok": false,
-                            "error": { "code": "internal", "message": "refused" },
-                        }),
-                    };
-                    let mut body = serde_json::to_vec(&response).expect("encode a response");
-                    body.push(b'\n');
-                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &body)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        });
-        rx
-    }
-
-    /// A lease minted by a `session.connect` whose prologue then failed
-    /// is still the lease this task holds.
-    ///
-    /// Step 2 is where ownership moves on the wire: the session grants
-    /// the new lease and tombstones the one it replaced. A step after it
-    /// failing does not undo that — so a task that went on presenting
-    /// the lease it started with would probe with a tombstone, be told
-    /// `taken-over`, and settle terminally as somebody else's session
-    /// with no other client ever involved (plan 040 §3.7).
-    #[tokio::test]
-    async fn a_lease_minted_before_a_failed_prologue_is_the_one_presented_next() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("granting.sock");
-        let mut probed = a_session_that_grants_a_lease_then_fails(&socket, "lease-minted-here");
-
-        // Localhost, so the failed attempt is retried by this same task
-        // and the second attempt's probe is what the session sees next.
-        let host = Connected::spawn(
-            socket,
-            HostTransport::LocalSession,
-            Some("lease-the-connect-replaced".into()),
-        );
-
-        // Three: the first attempt's probe, its prologue's own theme,
-        // and the retry's probe. The last one is the assertion.
-        let mut presented = Vec::new();
-        for _ in 0..3 {
-            let lease = tokio::time::timeout(Duration::from_secs(10), probed.recv())
-                .await
-                .expect("the session must be probed again")
-                .expect("the reporting channel stays open");
-            presented.push(lease);
-        }
-        host.stop().await;
-
-        assert_eq!(
-            presented,
-            vec![
-                "lease-the-connect-replaced".to_string(),
-                "lease-minted-here".to_string(),
-                "lease-minted-here".to_string(),
-            ],
-            "the retry presents the lease the failed prologue minted, not the one it started with"
-        );
-    }
-
-    /// …and over ssh it has to reach the *app*, because there is no
-    /// second attempt in this task to carry it.
-    ///
-    /// An ssh drop tears the tunnel down, so the ladder re-enters at
-    /// `open_ssh` and every attempt is a fresh task — a non-localhost
-    /// task returns instead of retrying. A lease minted at step 2 and
-    /// then lost with a failed prologue would die with the task, and the
-    /// next attempt, seeded from the outage, would present the tombstone
-    /// that grant left behind: `taken-over`, terminal, with no other
-    /// client ever involved (plan 040 §3.7). So the publication cannot
-    /// wait for a fully successful attempt.
-    #[tokio::test]
-    async fn a_lease_minted_before_a_failed_prologue_reaches_the_app_over_ssh() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("granting-ssh.sock");
-        let _probed = a_session_that_grants_a_lease_then_fails(&socket, "lease-minted-here");
-
-        let mut config = config(socket, HostTransport::Ssh, ConnectMode::Dial);
-        config.held_lease = Some("lease-the-connect-replaced".into());
-        let (feed, mut rx) = crate::engine_feed::channel();
-        let (_ops, ops_rx) = super::super::HostOps::channel();
-        run(
-            config,
-            HostIdMinter::new(),
-            ops_rx,
-            feed,
-            Arc::new(Shutdown::default()),
-        )
-        .await;
-
-        let items = feed_items(&mut rx);
-        let leases: Vec<String> = items
-            .iter()
-            .filter_map(|item| match item {
-                EngineFeed::HostLease(_, lease) => Some(lease.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            leases,
-            vec!["lease-minted-here".to_string()],
-            "the granted lease is published exactly once, prologue or no prologue"
-        );
-        let final_state = items
-            .into_iter()
-            .filter_map(|item| match item {
-                EngineFeed::HostState(_, state) => Some(state),
-                _ => None,
-            })
-            .next_back()
-            .expect("a task publishes at least one state");
-        assert!(
-            matches!(final_state, HostConnState::Disconnected(_)),
-            "and the attempt itself still failed: {final_state:?}"
-        );
-    }
-
-    /// The takeover-ping-pong guard, and the whole of plan 049 §3.11's
-    /// probe policy. Exactly one verdict resumes as driver; every
-    /// non-current answer watches instead; uncertainty retries and
-    /// never takes.
-    #[test]
-    fn one_probe_verdict_resumes_and_every_non_current_one_watches() {
-        // The lease still answers: the drop was the wire, not a
-        // takeover, so this client is still the driver.
-        assert!(matches!(probe_verdict(None), Probe::Current));
-
-        assert!(matches!(
-            probe_verdict(Some(&ClientError::Server {
-                code: "taken-over".into(),
-                message: "someone else".into(),
-            })),
-            Probe::NotCurrent
-        ));
-        // The tombstone was forgotten — a *second* takeover displaced
-        // it — or the session restarted. Either way this lease is not
-        // current, and the old behaviour (proceed, which means take the
-        // session back) was the consecutive-takeover steal-back.
-        assert!(matches!(
-            probe_verdict(Some(&ClientError::Server {
-                code: "connect-required".into(),
-                message: "no lease".into(),
-            })),
-            Probe::NotCurrent
-        ));
-
-        // The session is going down; nothing was learned about who
-        // drives it, and the ladder's next dial says so honestly.
-        assert!(matches!(
-            probe_verdict(Some(&ClientError::Server {
-                code: "shutting-down".into(),
-                message: "latched".into(),
-            })),
-            Probe::Unknown(_)
-        ));
-        // A probe that could not reach anybody proves nothing at all —
-        // and stranding a client whose session is fine is the lesser
-        // failure than silently stealing one that is not.
-        assert!(matches!(
-            probe_verdict(Some(&ClientError::Disconnected)),
-            Probe::Unknown(_)
-        ));
     }
 
     /// The fence rule from `ipc.md` #tablist: a session socket carries
@@ -3290,7 +1944,7 @@ mod tests {
         let (feed, _rx) = crate::engine_feed::channel();
         let (ops, ops_rx) = super::super::queue::HostOps::channel();
         let shutdown = Arc::new(Shutdown::default());
-        let queued = ops.call("tab.open", serde_json::json!({}), LeasePolicy::None);
+        let queued = ops.call("tab.open", serde_json::json!({}));
 
         let task = tokio::spawn(run(
             // Remote + dial, so the attempt fails at once and no retry
@@ -3317,26 +1971,19 @@ mod tests {
             .expect("the task ends")
             .expect("and does not panic");
         assert_eq!(
-            ops.call("tab.open", serde_json::json!({}), LeasePolicy::None)
-                .await,
+            ops.call("tab.open", serde_json::json!({})).await,
             Err(HostOpError::Unavailable),
             "the closed queue refuses rather than swallowing"
         );
     }
 
     #[test]
-    fn a_shutting_down_refusal_becomes_a_stop_and_a_takeover_its_own_reason() {
+    fn a_shutting_down_refusal_becomes_a_stop() {
         let stop = AttemptError::from(ClientError::Server {
             code: "shutting-down".into(),
             message: "latched".into(),
         });
         assert!(matches!(stop, AttemptError::Stopping(reason) if reason == "stop"));
-
-        let taken = AttemptError::from(ClientError::Server {
-            code: "taken-over".into(),
-            message: "someone else".into(),
-        });
-        assert!(matches!(taken, AttemptError::Stopping(reason) if reason == "taken-over"));
 
         let other = AttemptError::from(ClientError::Server {
             code: "invalid-param".into(),
@@ -3422,19 +2069,15 @@ mod tests {
     /// `session.set_agent_hooks` as `unknown-op`, and then goes away so
     /// the client reconnects.
     ///
-    /// **Goes away entirely**, not just on the control connection: a
-    /// control leg that dies while the event stream keeps answering does
-    /// not start a reconnect any more (plan 049 §3.11's race rule), so a
-    /// session that closed one and served the other forever would leave
-    /// the client watching a stream nobody is taking away. Every open
-    /// connection ends on the same generation bump.
+    /// **Goes away entirely**, not just on the control connection: every
+    /// open connection ends on the same generation bump.
     ///
     /// The `events.subscribe` counter is the script, and it is
     /// deterministic because the client's own ladder is: **#1** is the
     /// first connection's real subscribe; **#2** is the retry's, refused
-    /// `connect-required` so it drops and tries again; **#3** is the
-    /// second connection's real subscribe; **#4** is answered
-    /// `taken-over`, which is terminal and is what ends the task.
+    /// so it drops and tries again; **#3** is the second connection's
+    /// real subscribe; **#4** is answered `shutting-down`, which is
+    /// terminal and is what ends the task.
     ///
     /// Returns how many agent-hooks requests it served, so the test can
     /// assert the op really reached two separate connections rather than
@@ -3496,20 +2139,26 @@ mod tests {
                                     *count
                                 };
                                 match nth {
+                                    // A refusal the ladder retries, so
+                                    // the second ensure lands on a third
+                                    // connection.
                                     2 => serde_json::json!({
                                         "id": id,
                                         "ok": false,
                                         "error": {
-                                            "code": "connect-required",
-                                            "message": "no lease",
+                                            "code": "internal",
+                                            "message": "not this time",
                                         },
                                     }),
+                                    // And the one that ends the task, so
+                                    // `run` returns and the log can be
+                                    // read.
                                     4 => serde_json::json!({
                                         "id": id,
                                         "ok": false,
                                         "error": {
-                                            "code": "taken-over",
-                                            "message": "someone else",
+                                            "code": "shutting-down",
+                                            "message": "going away",
                                         },
                                     }),
                                     // A real subscribe. Answering and
@@ -3606,7 +2255,6 @@ mod tests {
                     .call(
                         ops::SESSION_SET_AGENT_HOOKS,
                         serde_json::json!({"mode": "auto", "skip": [], "client": "t"}),
-                        LeasePolicy::Required,
                     )
                     .await;
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3638,14 +2286,13 @@ mod tests {
     }
 
     /// Only `unknown-op` is an old session. Folding anything else in
-    /// here would silence a real refusal — a `taken-over` says the
-    /// session is somebody else's now, which is the opposite of "this is
-    /// fine".
+    /// here would silence a real refusal — a `shutting-down` says the
+    /// session is going away, which is the opposite of "this is fine".
     #[test]
     fn any_other_refusal_is_not_an_old_session() {
         let mut flags = Unsupported::default();
         for error in [
-            refused(ServerCode::TakenOver),
+            refused(ServerCode::ShuttingDown),
             refused(ServerCode::Internal),
             HostOpError::Transport("the wire died".into()),
             HostOpError::Disconnected,
@@ -3756,29 +2403,9 @@ mod tests {
         /// must not be cut by the same one.
         cut: Arc<Shutdown>,
         cuts: Arc<AtomicUsize>,
-        /// Write one non-terminal `session.driver_changed` onto a
-        /// subscribed connection when this is signalled, at most
-        /// `deposes` times. The connection stays open afterwards,
-        /// which is the whole of plan 049 §3.8.
-        depose: Arc<Shutdown>,
-        deposes: Arc<AtomicUsize>,
-        /// How long the envelope above is held back. A real takeover
-        /// closes the old lease's *control* connection and injects onto
-        /// the *event* one with nothing ordering the two, and on a slow
-        /// machine the close lands first — the race plan 049 §3.11's
-        /// race rule is about.
-        depose_delay: Duration,
-        /// Whether the same signal also closes the unsubscribed
-        /// (control) connections, which is what a takeover does to them.
-        depose_cuts_control: bool,
-        /// Raised once a control connection has been closed that way,
-        /// so a test can act inside the window rather than racing it.
-        control_cut: Arc<Shutdown>,
         /// Every `session.connect` this session has been asked for.
-        /// An observer must never produce one.
         connects: Arc<AtomicUsize>,
-        /// Every `session.identify` — the op a *reconnect* re-runs and a
-        /// takeback in place must not.
+        /// Every `session.identify` — the op a *reconnect* re-runs.
         identifies: Arc<AtomicUsize>,
         /// Every `session.set_theme`, so a re-seeded palette is
         /// countable.
@@ -3799,15 +2426,8 @@ mod tests {
         /// before the refusal arms, so an op the prologue *does* send
         /// can still be refused on the round after it.
         refuse_skips: Arc<AtomicUsize>,
-        /// Whether `session.set_theme` refuses the lease — the probe's
-        /// non-current verdict, and the only thing a session says that
-        /// may put this client into observer mode without an envelope.
-        theme_refusal: Option<&'static str>,
         puts: Arc<AtomicUsize>,
         dials: Arc<AtomicUsize>,
-        /// What this session says it can do. `[]` is a session from
-        /// before `events_resume`.
-        features: Vec<&'static str>,
         subscribe: Subscribe,
         /// Remaining resume offers [`Subscribe::Close`] hangs up on.
         resume_drops: Arc<AtomicUsize>,
@@ -3830,11 +2450,6 @@ mod tests {
                 uploading: Arc::new(Shutdown::default()),
                 cut: Arc::new(Shutdown::default()),
                 cuts: Arc::new(AtomicUsize::new(0)),
-                depose: Arc::new(Shutdown::default()),
-                deposes: Arc::new(AtomicUsize::new(0)),
-                depose_delay: Duration::ZERO,
-                depose_cuts_control: false,
-                control_cut: Arc::new(Shutdown::default()),
                 connects: Arc::new(AtomicUsize::new(0)),
                 identifies: Arc::new(AtomicUsize::new(0)),
                 themes: Arc::new(AtomicUsize::new(0)),
@@ -3842,22 +2457,13 @@ mod tests {
                 next_emit: Arc::new(AtomicU64::new(SESSION_REVISION + 1)),
                 refuse_op: None,
                 refuse_skips: Arc::new(AtomicUsize::new(0)),
-                theme_refusal: None,
                 puts: Arc::new(AtomicUsize::new(0)),
                 dials: Arc::new(AtomicUsize::new(0)),
-                features: roost_ipc::messages::SESSION_FEATURES.to_vec(),
                 subscribe: Subscribe::Serve,
                 resume_drops: Arc::new(AtomicUsize::new(0)),
                 subscribes: Arc::new(Mutex::new(Vec::new())),
                 tab_lists: Arc::new(AtomicUsize::new(0)),
             }
-        }
-
-        /// A session from before `events_resume`, which would answer an
-        /// unknown-field error rather than one of the three refusals.
-        fn without_features(mut self) -> Fake {
-            self.features = Vec::new();
-            self
         }
 
         fn refusing_the_resume(mut self, code: &'static str) -> Fake {
@@ -3885,24 +2491,6 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
-        }
-
-        fn deposing(self, times: usize) -> Fake {
-            self.deposes.store(times, Ordering::Release);
-            self
-        }
-
-        /// A takeover as it actually happens: the control connection
-        /// dies first and the envelope follows `delay` later.
-        fn control_first(mut self, delay: Duration) -> Fake {
-            self.depose_cuts_control = true;
-            self.depose_delay = delay;
-            self
-        }
-
-        fn refusing_the_lease(mut self, code: &'static str) -> Fake {
-            self.theme_refusal = Some(code);
-            self
         }
 
         fn stalling(mut self, op: &'static str) -> Fake {
@@ -3966,36 +2554,6 @@ mod tests {
                         self.cuts.fetch_sub(1, Ordering::AcqRel);
                         return;
                     }
-                    // A takeover closes the deposed lease's control
-                    // connection. Level-triggered like `cut`, and
-                    // guarded on the flag so the ordinary depose cases
-                    // keep their control conn.
-                    () = self.depose.requested(), if !subscribed && self.depose_cuts_control => {
-                        self.control_cut.request();
-                        return;
-                    }
-                    () = self.depose.requested(),
-                        if subscribed && self.deposes.load(Ordering::Acquire) > 0 =>
-                    {
-                        self.deposes.fetch_sub(1, Ordering::AcqRel);
-                        tokio::time::sleep(self.depose_delay).await;
-                        let mut frame = serde_json::to_vec(&serde_json::json!({
-                            "event": roost_ipc::messages::SESSION_DRIVER_CHANGED_EVENT,
-                            "data": { "taken_by": "a phone" },
-                        }))
-                        .expect("encode the envelope");
-                        frame.push(b'\n');
-                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &frame)
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        // Deliberately NOT a close: the stream survives
-                        // a takeover, and a client that treated this as
-                        // an EOF would be testing the old contract.
-                        continue;
-                    }
                     // Edge-triggered: one permit is one frame, so a test
                     // can say "another batch, now" without the level
                     // signals above firing forever.
@@ -4045,15 +2603,10 @@ mod tests {
                         serde_json::json!({
                             "id": id,
                             "ok": true,
-                            "result": identify_advertising(&self.features),
+                            "result": identify_result(),
                         })
                     }
                     ops::SESSION_CONNECT => {
-                        // A lease per grant, not one constant: a test that
-                        // only counts publications cannot tell the lease
-                        // this client just won from the one it superseded,
-                        // and which of the two reaches the set is the whole
-                        // of what a takeback's failure path turns on.
                         let nth = self.connects.fetch_add(1, Ordering::AcqRel) + 1;
                         serde_json::json!({
                             "id": id,
@@ -4089,14 +2642,10 @@ mod tests {
                             None => return,
                         }
                     }
-                    ops::SESSION_SET_THEME => match self.note_theme() {
-                        Some(code) => serde_json::json!({
-                            "id": id,
-                            "ok": false,
-                            "error": { "code": code, "message": "not your lease" },
-                        }),
-                        None => serde_json::json!({"id": id, "ok": true, "result": {}}),
-                    },
+                    ops::SESSION_SET_THEME => {
+                        self.themes.fetch_add(1, Ordering::AcqRel);
+                        serde_json::json!({"id": id, "ok": true, "result": {}})
+                    }
                     ops::SESSION_PUT_FILE => match self.put_file(&request, &id).await {
                         Some(response) => response,
                         None => return,
@@ -4112,12 +2661,6 @@ mod tests {
                     return;
                 }
             }
-        }
-
-        /// Count one `session.set_theme` and answer how it is scripted.
-        fn note_theme(&self) -> Option<&'static str> {
-            self.themes.fetch_add(1, Ordering::AcqRel);
-            self.theme_refusal
         }
 
         /// The scripted `events.subscribe` answer, or `None` for a
@@ -4209,10 +2752,10 @@ mod tests {
     }
 
     /// Every host state the task has published, drained as it goes,
-    /// with the connect facts, applied revisions and granted leases that
-    /// rode behind them.
+    /// with the connect facts and applied revisions that rode behind
+    /// them.
     #[derive(Default)]
-    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>, Vec<String>);
+    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>);
 
     impl States {
         fn drain(&mut self, rx: &mut crate::engine_feed::EngineFeedReceiver) {
@@ -4223,14 +2766,13 @@ mod tests {
                     EngineFeed::HostWorkspace(_, HostWorkspaceEvent::Applied { revision, .. }) => {
                         self.2.push(revision)
                     }
-                    EngineFeed::HostLease(_, lease) => self.3.push(lease),
                     _ => {}
                 }
             }
         }
 
         fn connections(&self) -> usize {
-            self.0.iter().filter(|state| state.is_foreground()).count()
+            self.0.iter().filter(|state| state.is_connected()).count()
         }
 
         fn last(&self) -> &HostConnState {
@@ -4262,49 +2804,35 @@ mod tests {
     struct Connected {
         ops: super::super::HostOps,
         shutdown: Arc<Shutdown>,
-        /// The in-place takeback seam the set would hold.
-        foreground: Arc<Foreground>,
         task: tokio::task::JoinHandle<()>,
         feed: crate::engine_feed::EngineFeedReceiver,
         states: States,
     }
 
     impl Connected {
-        /// The task, running, with nothing waited on — and optionally
-        /// seeded with a lease, which is what makes the first attempt a
-        /// probe. What a case needs when the interesting outcome is
-        /// that `Connected` never arrives.
-        fn spawn(
-            socket: PathBuf,
-            transport: HostTransport,
-            held_lease: Option<String>,
-        ) -> Connected {
-            Connected::spawn_with(socket, transport, held_lease, false, None)
+        /// The task, running, with nothing waited on. What a case needs
+        /// when the interesting outcome is that `Connected` never
+        /// arrives.
+        fn spawn(socket: PathBuf, transport: HostTransport) -> Connected {
+            Connected::spawn_with(socket, transport, None)
         }
 
         /// The same, handed a checkpoint its prologue may resume from.
         fn resuming(socket: PathBuf, transport: HostTransport, resume: Resume) -> Connected {
-            Connected::spawn_with(socket, transport, None, false, Some(resume))
+            Connected::spawn_with(socket, transport, Some(resume))
         }
 
-        /// The same, for a task the set has told it is not the driver,
-        /// or handed a checkpoint to resume from.
         fn spawn_with(
             socket: PathBuf,
             transport: HostTransport,
-            held_lease: Option<String>,
-            observer_only: bool,
             resume: Option<Resume>,
         ) -> Connected {
             let (ops, ops_rx) = super::super::HostOps::channel();
             let mut config = config(socket, transport, ConnectMode::Dial);
             config.uploads = ops.uploads();
-            config.held_lease = held_lease;
-            config.observer_only = observer_only;
             config.resume = resume;
             let (feed, rx) = crate::engine_feed::channel();
             let shutdown = Arc::new(Shutdown::default());
-            let foreground = Arc::clone(&config.foreground);
             let task = tokio::spawn(run(
                 config,
                 HostIdMinter::new(),
@@ -4315,7 +2843,6 @@ mod tests {
             Connected {
                 ops,
                 shutdown,
-                foreground,
                 task,
                 feed: rx,
                 states: States::default(),
@@ -4323,7 +2850,7 @@ mod tests {
         }
 
         async fn start(socket: PathBuf, transport: HostTransport) -> Connected {
-            let mut host = Connected::spawn(socket, transport, None);
+            let mut host = Connected::spawn(socket, transport);
             host.states.until_connected(&mut host.feed, 1).await;
             host
         }
@@ -4379,768 +2906,6 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("{what}; states were {:?}", connected.states.0));
-    }
-
-    fn taken_by(state: &HostConnState) -> Option<Option<&str>> {
-        match state {
-            HostConnState::TakenOver { taken_by } => Some(taken_by.as_deref()),
-            _ => None,
-        }
-    }
-
-    /// The C5 transition: `session.driver_changed` is **not** an EOF.
-    /// The task stays up, publishes `TakenOver` naming the claimant —
-    /// which is what the frozen-frame banner, the palette's "take the
-    /// session back" row and every transfer fact are derived from — and
-    /// the upload lane is gone, so plan 047's dispatcher can never dial
-    /// `session.put_file` with a lease this client no longer holds.
-    #[tokio::test]
-    async fn a_driver_changed_watches_on_and_takes_the_upload_lane_with_it() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("deposed.sock");
-        let fake = Fake::new(PutFile::Land).deposing(1);
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-        // Connected means a lane; `upload` panics if the host refuses.
-        let _admitted = host.upload("before.png");
-
-        fake.depose.request();
-        until_state(&mut host, "the envelope to depose this client", |state| {
-            taken_by(state) == Some(Some("a phone"))
-        })
-        .await;
-
-        assert!(
-            !host.states.last().is_foreground(),
-            "a deposed client drives nothing — every foreground fact reads that"
-        );
-        assert_eq!(
-            host.ops
-                .uploads()
-                .enqueue("after.png".into(), UploadSource::Bytes(b"png".to_vec()))
-                .err(),
-            Some(HostOpError::NotForeground {
-                label: "local".into(),
-                taken_by: Some("a phone".into()),
-            }),
-            "the lane must be gone before a single deposed frame is served, and the \
-             refusal must say which of the two reasons it is"
-        );
-
-        let states = host.stop().await;
-        assert_eq!(
-            states.connections(),
-            1,
-            "watching is not connecting: the task never re-published Connected"
-        );
-        // The prologue's, then the deposition's. `TakenOver` is not
-        // `Connected`, so the set retires the first pair on that edge —
-        // and a surviving observer that reported no session id and no
-        // fidelity would be describing a connection it is still reading.
-        assert_eq!(
-            states.1.len(),
-            2,
-            "the deposed connection must refile its facts behind the TakenOver it publishes"
-        );
-        assert_eq!(states.1[0], states.1[1], "same session, same fidelity");
-    }
-
-    /// An ask raised against a round that has already ended dies with
-    /// it (review F5).
-    ///
-    /// `HostConnSet::take_foreground_in_place` reads `in_place` and
-    /// calls `request()` as two separate steps, and nothing holds a lock
-    /// across them — the round can end in between, which is the "costs
-    /// one click" race the struct doc names. What it must not cost is a
-    /// takeover: a flag left standing over a dead round would be
-    /// consumed by the *next* deposition, and this client would issue
-    /// `session.connect { takeover: true }` that no user asked for.
-    #[test]
-    fn a_takeback_asked_of_a_finished_round_is_not_honoured_by_the_next_one() {
-        let foreground = Foreground::default();
-
-        // A round that ends, with the click landing just too late.
-        foreground.serving(true);
-        foreground.serving(false);
-        foreground.request();
-        assert!(
-            !foreground.in_place(),
-            "nothing is serving, so the set would not have asked"
-        );
-
-        // The next deposition arms the route again, and inherits nothing.
-        foreground.serving(true);
-        assert!(
-            !foreground.took_the_request_for_test(),
-            "a new round must not consume the previous round's ask"
-        );
-
-        // And the route still works when the ask is a live one.
-        foreground.request();
-        assert!(foreground.took_the_request_for_test());
-    }
-
-    /// Plan 057 §3.5's transport decision, both ways.
-    ///
-    /// A session advertising `open_input` closes nothing at a takeover,
-    /// so the deposed task keeps its control leg and keeps serving every
-    /// op that never needed the lease — which is what makes the window
-    /// keep working. A session one release older closed all of it, and a
-    /// client that kept sending would be talking into a dead socket.
-    #[tokio::test]
-    async fn a_deposed_task_keeps_serving_with_open_input_and_only_observes_without_it() {
-        for open_input in [true, false] {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let socket = dir.path().join("deposed-serving.sock");
-            let fake = Fake::new(PutFile::Land).deposing(1);
-            let fake = if open_input {
-                fake
-            } else {
-                fake.without_features()
-            };
-            fake.serve(&socket);
-            let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-            fake.depose.request();
-            // Asserted the instant the state lands, not after: the UI
-            // reads this flag to decide whether the deposed frame is
-            // live or frozen, so it has to be true *by the time*
-            // `TakenOver` is on the feed (review F3).
-            let seam = Arc::clone(&host.foreground);
-            until_state(&mut host, "the client to be deposed", |state| {
-                if taken_by(state) != Some(Some("a phone")) {
-                    return false;
-                }
-                assert_eq!(
-                    seam.in_place(),
-                    open_input,
-                    "the in-place answer must be settled before TakenOver is published"
-                );
-                true
-            })
-            .await;
-
-            let served = tokio::time::timeout(
-                Duration::from_secs(10),
-                host.ops
-                    .call(ops::TAB_OPEN, serde_json::json!({}), LeasePolicy::None),
-            )
-            .await
-            .expect("a deposed task answers its queue rather than hanging");
-            let required = tokio::time::timeout(
-                Duration::from_secs(10),
-                host.ops.call(
-                    ops::SESSION_SET_FOCUS,
-                    serde_json::json!({}),
-                    LeasePolicy::Required,
-                ),
-            )
-            .await
-            .expect("and answers a refusal just as promptly");
-
-            if open_input {
-                assert!(
-                    served.is_ok(),
-                    "a lease-free op must still run on the leg the takeover left open: {served:?}"
-                );
-                assert_eq!(
-                    required,
-                    Err(HostOpError::NotForeground {
-                        label: "local".into(),
-                        taken_by: Some("a phone".into()),
-                    }),
-                    "and a lease-required one is refused before the wire, by name"
-                );
-                assert!(
-                    host.foreground.in_place(),
-                    "the set reads this to decide whether Connect is a takeback"
-                );
-            } else {
-                assert_eq!(
-                    served,
-                    Err(HostOpError::Disconnected),
-                    "an old session closed this leg; there is nothing to serve on"
-                );
-                assert_eq!(required, Err(HostOpError::Disconnected));
-                assert!(
-                    !host.foreground.in_place(),
-                    "and no takeback in place is on offer"
-                );
-            }
-            host.stop().await;
-        }
-    }
-
-    /// The batches a deposed client keeps applying are the reason its
-    /// sidebar stays true (plan 049 §3.8) — and now the reason its grid
-    /// does too.
-    #[tokio::test]
-    async fn a_deposed_task_still_applies_event_batches_to_the_mirror() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("deposed-batches.sock");
-        let fake = Fake::new(PutFile::Land).deposing(1);
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-        fake.depose.request();
-        until_state(&mut host, "the client to be deposed", |state| {
-            taken_by(state) == Some(Some("a phone"))
-        })
-        .await;
-
-        let revision = fake.emit_batch();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                host.states.drain(&mut host.feed);
-                if host.states.2.contains(&revision) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "a deposed client applies what its surviving stream sends; got {:?}",
-                host.states.2
-            )
-        });
-        host.stop().await;
-    }
-
-    /// A `taken-over` on an op in flight is not the wire dying (plan 057
-    /// §3.5). Before `open_input` the same takeover closed the control
-    /// connection, so the client could not tell and let the stream
-    /// decide; an `open_input` session closes nothing, so authority moves
-    /// on the spot — with nobody named yet — and the leg keeps working.
-    #[tokio::test]
-    async fn a_lease_lost_fault_mid_flight_transitions_authority_and_keeps_the_control_leg() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("lease-lost.sock");
-        // Refused *after* the prologue: `session.set_focus` is not one of
-        // its ops, so the connection is established and then deposed.
-        let fake = Fake::new(PutFile::Land)
-            .refusing(ops::SESSION_SET_FOCUS, "taken-over")
-            // Armed from the start: a `select!` precondition is read when
-            // the branch is entered, so a counter raised later never
-            // wakes a connection already parked.
-            .deposing(1);
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-        let refused = tokio::time::timeout(
-            Duration::from_secs(10),
-            host.ops.call(
-                ops::SESSION_SET_FOCUS,
-                serde_json::json!({}),
-                LeasePolicy::Required,
-            ),
-        )
-        .await
-        .expect("the session answers");
-        assert!(
-            matches!(
-                refused,
-                Err(HostOpError::Rejected {
-                    code: ServerCode::TakenOver,
-                    ..
-                })
-            ),
-            "the caller still hears the session's own refusal: {refused:?}"
-        );
-
-        until_state(&mut host, "authority to move on the refusal", |state| {
-            matches!(state, HostConnState::TakenOver { .. })
-        })
-        .await;
-        assert_eq!(
-            taken_by(host.states.last()),
-            Some(None),
-            "nobody is named until the envelope arrives"
-        );
-
-        // The leg is the whole claim: a lease-free op still runs on it.
-        let served = tokio::time::timeout(
-            Duration::from_secs(10),
-            host.ops
-                .call(ops::TAB_OPEN, serde_json::json!({}), LeasePolicy::None),
-        )
-        .await
-        .expect("the control leg is still there");
-        assert!(served.is_ok(), "{served:?}");
-
-        // And the envelope behind it fills the name in, on the same
-        // connection, with no reconnect.
-        fake.depose.request();
-        until_state(&mut host, "the envelope to name the taker", |state| {
-            taken_by(state) == Some(Some("a phone"))
-        })
-        .await;
-
-        let states = host.stop().await;
-        assert_eq!(
-            states.connections(),
-            1,
-            "the connection was never re-established: only the prologue drove"
-        );
-    }
-
-    /// The takeback, and what it deliberately does *not* do (plan 057
-    /// §3.5): no identify, no `tab.list`, no attach — one
-    /// `session.connect`, one re-seeded palette, and one resumed stream
-    /// on the control connection this client never lost.
-    #[tokio::test]
-    async fn take_foreground_re_dials_only_the_event_stream_and_reseeds_theme_and_focus_once() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("takeback.sock");
-        let fake = Fake::new(PutFile::Land).deposing(1);
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-        let identifies = fake.identifies.load(Ordering::Acquire);
-        let themes = fake.themes.load(Ordering::Acquire);
-        let snapshots = fake.snapshots();
-
-        fake.depose.request();
-        until_state(&mut host, "the client to be deposed", |state| {
-            taken_by(state) == Some(Some("a phone"))
-        })
-        .await;
-
-        host.foreground.request();
-        until_state(&mut host, "the foreground to come back", |state| {
-            state.is_foreground()
-        })
-        .await;
-
-        assert_eq!(
-            fake.identifies.load(Ordering::Acquire),
-            identifies,
-            "a takeback is not a reconnect: nothing re-ran the prologue's gate"
-        );
-        assert_eq!(
-            fake.connects.load(Ordering::Acquire),
-            2,
-            "exactly one more `session.connect`, on the connection already open"
-        );
-        assert_eq!(
-            fake.themes.load(Ordering::Acquire),
-            themes + 1,
-            "the palette is re-seeded, because another client may have changed it"
-        );
-        assert_eq!(
-            fake.snapshots(),
-            snapshots,
-            "and the stream resumed rather than re-snapshotting"
-        );
-        assert_eq!(
-            fake.subscribes().last().and_then(|plan| plan.from_revision),
-            Some(SESSION_REVISION),
-            "the re-dial offers the mirror's own fence"
-        );
-
-        let states = host.stop().await;
-        assert_eq!(
-            states.connections(),
-            2,
-            "exactly one Connected edge per foreground — the app hangs its \
-             single `session.set_focus` re-send off it"
-        );
-        assert!(
-            states.1.len() >= 3,
-            "and the facts are refiled behind every state that carries them: {:?}",
-            states.1
-        );
-    }
-
-    /// The re-dial's order is "close the old stream, then subscribe from
-    /// the fence" — so a batch the deposed stream had already sent is
-    /// dropped with the channel it arrived on, rather than applied on top
-    /// of a mirror the resume is about to fence at the same revision.
-    #[tokio::test]
-    async fn take_foreground_drops_old_stream_batches_past_the_checkpoint() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("takeback-fence.sock");
-        // Skip the prologue's `session.connect` and stall the takeback's:
-        // the window between them is where the old stream gets to speak.
-        let fake = Fake::new(PutFile::Land)
-            .deposing(1)
-            .stalling_after(ops::SESSION_CONNECT, 1);
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-        fake.depose.request();
-        until_state(&mut host, "the client to be deposed", |state| {
-            taken_by(state) == Some(Some("a phone"))
-        })
-        .await;
-
-        // One batch the deposed client *does* apply, so the fence the
-        // takeback presents is a revision the old stream has passed.
-        let applied = fake.emit_batch();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                host.states.drain(&mut host.feed);
-                if host.states.2.contains(&applied) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the deposed stream delivers");
-
-        host.foreground.request();
-        cued(&fake.stalled, "the takeback's session.connect to be read").await;
-        // In flight, and nothing is draining the old stream: this frame
-        // is the one that must not survive the re-dial.
-        let orphaned = fake.emit_batch();
-        fake.release.request();
-
-        until_state(&mut host, "the foreground to come back", |state| {
-            state.is_foreground()
-        })
-        .await;
-        assert_eq!(
-            fake.subscribes().last().and_then(|plan| plan.from_revision),
-            Some(applied),
-            "the re-dial fences at what the mirror actually has"
-        );
-
-        let states = host.stop().await;
-        assert!(
-            !states.2.contains(&orphaned),
-            "a batch from the stream the takeback closed must never be applied: {:?}",
-            states.2
-        );
-    }
-
-    /// A takeback that falls over **after** the grant still hands the
-    /// set the lease it won (R17), from either step that can fail.
-    ///
-    /// Both rows are one defect — see [`retake_foreground`]'s lease
-    /// write.
-    #[tokio::test]
-    async fn a_takeback_that_fails_after_the_grant_publishes_the_lease_it_won() {
-        for (case, fake) in [
-            (
-                "set_theme",
-                Fake::new(PutFile::Land).deposing(1).refusing_after(
-                    ops::SESSION_SET_THEME,
-                    "not-supported",
-                    1,
-                ),
-            ),
-            (
-                "the re-subscribe",
-                Fake::new(PutFile::Land).deposing(1).dropping_resumes(1),
-            ),
-        ] {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let socket = dir.path().join("takeback-failing.sock");
-            fake.serve(&socket);
-            let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-            fake.depose.request();
-            until_state(&mut host, "the client to be deposed", |state| {
-                taken_by(state) == Some(Some("a phone"))
-            })
-            .await;
-
-            host.foreground.request();
-            until_state(&mut host, "the takeback to fall over", |state| {
-                matches!(state, HostConnState::Disconnected(_))
-            })
-            .await;
-
-            let states = host.stop().await;
-            assert_eq!(
-                fake.connects.load(Ordering::Acquire),
-                2,
-                "{case}: the takeover was granted before the step that failed"
-            );
-            assert_eq!(
-                states.3,
-                vec!["the-lease-1".to_string(), "the-lease-2".to_string()],
-                "{case}: the set must be holding the lease this takeback WON, not \
-                 the one it superseded — the ladder the failure lands on carries \
-                 whatever is here, and a stale one probes as not-current and \
-                 lands the user as an observer"
-            );
-        }
-    }
-
-    /// A takeback the session reads and never answers ends the round on
-    /// `call`'s own leg budget — the deposed round adds no timeout of
-    /// its own, and one round of three ops must not have to fit in one.
-    #[tokio::test]
-    async fn a_takeback_the_session_never_answers_ends_on_the_control_legs_budget() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("takeback-silent.sock");
-        // Skip the prologue's `session.connect` and hold the takeback's.
-        let fake = Fake::new(PutFile::Land)
-            .deposing(1)
-            .stalling_after(ops::SESSION_CONNECT, 1);
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-        fake.depose.request();
-        until_state(&mut host, "the client to be deposed", |state| {
-            taken_by(state) == Some(Some("a phone"))
-        })
-        .await;
-
-        host.foreground.request();
-        cued(&fake.stalled, "the takeback's session.connect to be read").await;
-
-        // Spent in virtual time, and measured: what tells one leg from
-        // a budget wrapped round the whole round is how much of it goes.
-        tokio::time::pause();
-        let started = tokio::time::Instant::now();
-        until_state_within(
-            &mut host,
-            leg() * 3,
-            "an unanswered takeback to end its round",
-            |state| matches!(state, HostConnState::Disconnected(_)),
-        )
-        .await;
-        let spent = started.elapsed();
-
-        spent_one_budget(spent, leg(), "one control leg, not a budget of its own");
-        assert_eq!(
-            reason(host.states.last()),
-            format!("{} timed out", ops::SESSION_CONNECT),
-            "and it ends on the op that hung, by name"
-        );
-
-        let states = host.stop().await;
-        assert_eq!(
-            states.3.len(),
-            1,
-            "a takeback nobody granted publishes no lease: {:?}",
-            states.3
-        );
-    }
-
-    /// Live observer → reconnecting observer → live observer, and never
-    /// driver. The stream is cut under a deposed client; the ladder
-    /// re-runs the **observer** prologue, which claims nothing.
-    #[tokio::test]
-    async fn a_deposed_client_re_establishes_as_an_observer_and_never_retakes() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("re-observe.sock");
-        let fake = Fake::new(PutFile::Land).deposing(1).cutting(1);
-        fake.serve(&socket);
-        // Localhost, because that is the transport whose ladder retries
-        // in this task: an ssh host re-enters through `open_ssh` with
-        // the carried lease, where the *probe* is what keeps it
-        // watching (pinned by the two probe cases below).
-        let mut host = Connected::start(socket, HostTransport::LocalSession).await;
-
-        fake.depose.request();
-        until_state(&mut host, "the client to be deposed", |state| {
-            taken_by(state) == Some(Some("a phone"))
-        })
-        .await;
-
-        // Cut the surviving stream. A driver would probe and reconnect;
-        // an observer re-runs the prologue.
-        fake.cut.request();
-        until_state(&mut host, "the watched stream to drop", |state| {
-            matches!(state, HostConnState::Disconnected(_))
-        })
-        .await;
-        until_state(&mut host, "observation to be re-established", |state| {
-            matches!(state, HostConnState::TakenOver { .. })
-        })
-        .await;
-
-        let states = host.stop().await;
-        assert_eq!(
-            states.connections(),
-            1,
-            "the auto-retry must never take the session back: only the first dial drove"
-        );
-    }
-
-    /// The race rule (plan 049 §3.11), which is the ordering a takeover
-    /// actually has: the control connection is closed *first* and the
-    /// envelope follows on the event stream. An intent sent in that
-    /// window fails on the wire, and a client that ended the connection
-    /// on that failure would settle as `Disconnected` — no ladder on a
-    /// `UnixSocket` host, so no envelope ever read and no takeback row
-    /// in the palette. The stream is what decides.
-    #[tokio::test]
-    async fn a_control_failure_waits_for_the_streams_verdict_rather_than_ending_the_connection() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("race.sock");
-        let fake = Fake::new(PutFile::Land)
-            .deposing(1)
-            .control_first(Duration::from_millis(200));
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-        fake.depose.request();
-        cued(&fake.control_cut, "the takeover to close the control conn").await;
-
-        // Inside the window: the envelope is still 200ms out, and this
-        // has nowhere to go but a dead socket.
-        let refused = host
-            .ops
-            .call(
-                ops::SESSION_SET_FOCUS,
-                serde_json::json!({}),
-                LeasePolicy::Required,
-            )
-            .await;
-        assert!(
-            refused.is_err(),
-            "the intent must still fail visibly: {refused:?}"
-        );
-
-        until_state(
-            &mut host,
-            "the envelope to decide, not the intent",
-            |state| taken_by(state) == Some(Some("a phone")),
-        )
-        .await;
-        // Read before the shutdown, which publishes a `Disconnected` of
-        // its own: what must not be here is one from the control error.
-        assert!(
-            !host
-                .states
-                .0
-                .iter()
-                .any(|state| matches!(state, HostConnState::Disconnected(_))),
-            "a control error must not drop the connection out from under a live stream: {:?}",
-            host.states.0
-        );
-
-        let states = host.stop().await;
-        assert_eq!(
-            states.connections(),
-            1,
-            "and it never re-dialed: {:?}",
-            states.0
-        );
-    }
-
-    /// The set's half of "only the explicit takeback promotes an
-    /// observer" (plan 049 §3.11). An ssh ladder spawns a *fresh* task
-    /// per attempt, so the deposed fact has to arrive in the config —
-    /// and a task that has it never says `session.connect`.
-    #[tokio::test]
-    async fn a_task_spawned_in_observer_mode_never_claims_the_lease() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("observer-mode.sock");
-        let fake = Fake::new(PutFile::Land);
-        fake.serve(&socket);
-
-        let mut host = Connected::spawn_with(socket, HostTransport::Ssh, None, true, None);
-        until_state(&mut host, "the task to settle as an observer", |state| {
-            matches!(state, HostConnState::TakenOver { .. })
-        })
-        .await;
-
-        assert_eq!(
-            fake.connects.load(Ordering::Acquire),
-            0,
-            "an observer-mode task must never call session.connect"
-        );
-        let states = host.stop().await;
-        assert_eq!(
-            states.connections(),
-            0,
-            "watching is not connecting: {:?}",
-            states.0
-        );
-    }
-
-    /// The probe's positive path (plan 049 §3.11). A task seeded with a
-    /// held lease presents it; the session says it is still current, so
-    /// the drop was the wire and this client resumes as **driver** —
-    /// including re-entering `Connected`, which is what reopens the
-    /// upload lane.
-    #[tokio::test]
-    async fn a_held_lease_the_session_still_honours_resumes_as_driver() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("probe-ok.sock");
-        Fake::new(PutFile::Land).serve(&socket);
-
-        let mut host = Connected::spawn(
-            socket,
-            HostTransport::UnixSocket,
-            Some("the-lease-1".into()),
-        );
-        host.states.until_connected(&mut host.feed, 1).await;
-
-        assert!(
-            host.ops
-                .uploads()
-                .enqueue("after.png".into(), UploadSource::Bytes(b"png".to_vec()))
-                .is_ok(),
-            "resuming as driver must re-enter the Connected edge, lane and all"
-        );
-
-        let states = host.stop().await;
-        assert!(
-            !states
-                .0
-                .iter()
-                .any(|s| matches!(s, HostConnState::TakenOver { .. })),
-            "a current lease is not a takeover: {:?}",
-            states.0
-        );
-    }
-
-    /// The probe's negative path, and the hole it closes. `connect-
-    /// required` — what an *older* displaced lease gets, because the
-    /// session keeps exactly one tombstone — used to mean "proceed",
-    /// and proceeding is a takeover. Now it watches, with no taker to
-    /// name because nobody told this client one.
-    #[tokio::test]
-    async fn a_connect_required_probe_watches_instead_of_taking_the_session_back() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("probe-stale.sock");
-        Fake::new(PutFile::Land)
-            .refusing_the_lease("connect-required")
-            .serve(&socket);
-
-        let mut host = Connected::spawn(
-            socket,
-            HostTransport::UnixSocket,
-            Some("a-lease-two-takeovers-ago".into()),
-        );
-        until_state(&mut host, "the client to settle as an observer", |state| {
-            matches!(state, HostConnState::TakenOver { .. })
-        })
-        .await;
-
-        assert_eq!(
-            taken_by(host.states.last()),
-            Some(None),
-            "nothing told this client who took over, so the banner names nobody"
-        );
-        assert!(
-            !host.states.last().is_foreground(),
-            "an observer projects as not connected — every transfer fact reads that"
-        );
-        assert!(
-            matches!(
-                host.ops
-                    .uploads()
-                    .enqueue("nope.png".into(), UploadSource::Bytes(b"png".to_vec())),
-                Err(HostOpError::Disconnected)
-            ),
-            "an observer never opens an upload lane"
-        );
-
-        let states = host.stop().await;
-        assert_eq!(
-            states.connections(),
-            0,
-            "a probe that came back non-current must never reach Connected"
-        );
     }
 
     // ---- resuming a stream (plan 056 §3.2) -----------------------------
@@ -5327,28 +3092,6 @@ mod tests {
         assert_eq!(resumed(&host.stop().await), None);
     }
 
-    /// A session from before `events_resume` has `deny_unknown_fields`
-    /// on the subscribe params: `from_revision` would come back as an
-    /// error **outside** the three refusals, failing the attempt
-    /// outright. The feature list is what stops it ever being sent.
-    #[tokio::test]
-    async fn a_session_that_lists_no_features_is_never_sent_a_fence() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("pre-r5.sock");
-        let fake = Fake::new(PutFile::Land).without_features();
-        fake.serve(&socket);
-
-        let mut host =
-            Connected::resuming(socket, HostTransport::UnixSocket, checkpoint(SESSION_ID, 7));
-        host.states.until_connected(&mut host.feed, 1).await;
-
-        let subscribes = fake.subscribes();
-        assert_eq!(subscribes.len(), 1);
-        assert_eq!(subscribes[0].from_revision, None);
-        assert_eq!(fake.snapshots(), 1);
-        assert_eq!(resumed(&host.stop().await), None);
-    }
-
     /// A localhost drop retries inside the same task, so it never goes
     /// back to the set for a checkpoint — it keeps its own, taken from
     /// the connection that just ended. Same fence, one fewer trip.
@@ -5405,11 +3148,7 @@ mod tests {
 
         // Wedge the control leg first, so the upload has to be admitted
         // and run past a loop that is mid-`await`.
-        let stalled = tokio::spawn(host.ops.call(
-            ops::TAB_OPEN,
-            serde_json::json!({}),
-            LeasePolicy::None,
-        ));
+        let stalled = tokio::spawn(host.ops.call(ops::TAB_OPEN, serde_json::json!({})));
         cued(&fake.stalled, "the session read the control op").await;
 
         let landed = tokio::time::timeout(
@@ -5433,11 +3172,7 @@ mod tests {
             .is_ok());
         assert!(tokio::time::timeout(
             Duration::from_secs(10),
-            host.ops.call(
-                ops::SESSION_SET_FOCUS,
-                serde_json::json!({}),
-                LeasePolicy::Required
-            )
+            host.ops.call(ops::SESSION_SET_FOCUS, serde_json::json!({}))
         )
         .await
         .expect("and the queue keeps draining afterwards")
@@ -5484,7 +3219,7 @@ mod tests {
 
         host.states.drain(&mut host.feed);
         assert!(
-            host.states.last().is_foreground(),
+            host.states.last().is_connected(),
             "a timed-out upload is not a dropped host: {:?}",
             host.states.last()
         );
@@ -5628,39 +3363,6 @@ mod tests {
         }
     }
 
-    /// A takeover reaches the upload as that upload's refusal, with the
-    /// code intact. What it means for the *host* is not this lane's
-    /// call — the control connection decides that, and here it was never
-    /// told anything.
-    #[tokio::test]
-    async fn a_takeover_mid_upload_refuses_the_upload_alone() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("taken.sock");
-        let fake = Fake::new(PutFile::Refuse("taken-over"));
-        fake.serve(&socket);
-        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-
-        let refused = tokio::time::timeout(Duration::from_secs(10), host.upload("shot.png"))
-            .await
-            .expect("the refusal comes back")
-            .expect("answered");
-        assert_eq!(
-            refused,
-            Err(HostOpError::Rejected {
-                code: ServerCode::TakenOver,
-                message: "refused".into()
-            })
-        );
-
-        host.states.drain(&mut host.feed);
-        assert!(
-            host.states.last().is_foreground(),
-            "the upload lane never moves the host's state: {:?}",
-            host.states.last()
-        );
-        host.stop().await;
-    }
-
     /// The reply re-check is really on the path, not just unit-tested:
     /// a session that answers with somebody else's file name is refused
     /// rather than pasted.
@@ -5685,7 +3387,7 @@ mod tests {
         assert!(message.contains("a different file name"), "{message}");
 
         host.states.drain(&mut host.feed);
-        assert!(host.states.last().is_foreground());
+        assert!(host.states.last().is_connected());
         host.stop().await;
     }
 
