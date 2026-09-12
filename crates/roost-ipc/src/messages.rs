@@ -1918,18 +1918,17 @@ pub struct TabAttachParams {
     /// shrink the one that is typing; its geometry still applies the
     /// moment it sends an `INPUT` or `RESIZE` frame, which is why the
     /// grid must be non-zero either way.
-    #[serde(default = "default_true")]
+    ///
+    /// Required and always serialized. Protocol 4 let it be omitted to
+    /// mean `true`, so a client could address a peer that predated the
+    /// field; at 5 there is no such peer, and an omitted `focus` is a
+    /// malformed request rather than a claim.
     pub focus: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-/// Hand-written so the Rust default and the serde default agree: a
-/// derived `Default` would make `focus` false, and a caller filling the
-/// rest of the struct with `..Default::default()` would silently ask for
-/// an unfocused attach.
+/// Hand-written because a derived `Default` would make `focus` false, and
+/// a caller filling the rest of the struct with `..Default::default()`
+/// would silently ask for an unfocused attach.
 impl Default for TabAttachParams {
     fn default() -> Self {
         TabAttachParams {

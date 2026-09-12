@@ -46,6 +46,9 @@ class EventStream:
         self._sock.settimeout(scaled_timeout(timeout))
         self._sock.connect(self.path)
         self.revision: int | None = None
+        # The incarnation that answered the subscribe, which a client
+        # compares with the one `session.identify` returned (#458).
+        self.session_id: str | None = None
         # Set when the terminal control envelope arrives; a close after
         # it is the session saying goodbye, not a dropped stream.
         self.stopping_reason: str | None = None
@@ -114,7 +117,9 @@ class EventStream:
         if not ack.get("ok"):
             err = ack.get("error") or {}
             raise RoostError(err.get("code", "unknown"), err.get("message", ""))
-        self.revision = int((ack.get("result") or {})["revision"])
+        result = ack.get("result") or {}
+        self.revision = int(result["revision"])
+        self.session_id = str(result["session_id"])
         return self.revision
 
     def recv_frame(self, timeout: float = 10.0) -> dict:

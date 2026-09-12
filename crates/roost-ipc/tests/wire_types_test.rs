@@ -514,28 +514,43 @@ fn tab_attach_params_match_their_golden_json() {
 fn tab_attach_params_default_the_pixel_geometry_only() {
     let decoded: TabAttachParams = serde_json::from_str(
         r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
-            "libghostty_build":"b"}"#,
+            "libghostty_build":"b","focus":true}"#,
     )
     .unwrap();
     assert_eq!((decoded.cell_w_px, decoded.cell_h_px), (0, 0));
     assert_eq!(decoded.tab_id, 7);
 
     assert!(serde_json::from_str::<TabAttachParams>(
-        r#"{"tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b"}"#
+        r#"{"tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b","focus":true}"#
     )
     .is_err());
 }
 
-/// `focus` is a plain always-serialized bool, and an absent key is a
-/// focused attach — the one default a watcher has to override to avoid
-/// resizing the tab someone else is typing in.
+/// `focus` is a plain bool: required on the wire, always serialized, and
+/// an absent key is a malformed request.
+///
+/// Protocol 4 let it be omitted to mean `true`, so a client could address
+/// a peer predating the field. At 5 there is no such peer, and the
+/// omit-when-true shim is gone — which this refuses to let back in,
+/// because a serde default would make every one of these decode again.
 #[test]
-fn tab_attach_params_default_a_focused_attach_and_always_spell_it_out() {
+fn tab_attach_params_require_focus_and_always_spell_it_out() {
     const NO_FOCUS_KEY: &str =
         r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b"}"#;
 
-    let decoded: TabAttachParams = serde_json::from_str(NO_FOCUS_KEY).expect("a missing key");
-    assert!(decoded.focus, "an absent `focus` is a focused attach");
+    let error = serde_json::from_str::<TabAttachParams>(NO_FOCUS_KEY)
+        .expect_err("an absent `focus` is refused at 5");
+    assert!(
+        error.to_string().contains("focus"),
+        "the refusal must name the missing field: {error}"
+    );
+
+    let decoded: TabAttachParams = serde_json::from_str(
+        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b",
+            "focus":true}"#,
+    )
+    .expect("an explicit true");
+    assert!(decoded.focus);
     assert_eq!(
         serde_json::to_string(&decoded).unwrap(),
         concat!(

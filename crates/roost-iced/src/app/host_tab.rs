@@ -407,6 +407,11 @@ impl HostAttach {
                 "cell_w_px": geometry.cell_w,
                 "cell_h_px": geometry.cell_h,
                 "libghostty_build": libghostty_build,
+                // Attach is on-focus in this client, so the claim is
+                // always true. Stated rather than omitted: protocol 5
+                // requires the field, and the omit-when-true shim that
+                // used to cover this is gone.
+                "focus": true,
             }),
         );
         let input_rx = Arc::clone(&self.input_rx);

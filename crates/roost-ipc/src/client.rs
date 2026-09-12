@@ -216,6 +216,7 @@ impl IpcClient {
             reader: self.reader,
             writer: self.writer,
             revision: ack.revision,
+            session_id: ack.session_id,
             next_revision: ack.revision.saturating_add(1),
             stopping: None,
         })
@@ -258,6 +259,7 @@ pub struct EventStream {
     #[allow(dead_code)]
     writer: OwnedWriteHalf,
     revision: u64,
+    session_id: String,
     next_revision: u64,
     stopping: Option<SessionStoppingEvent>,
 }
@@ -275,6 +277,13 @@ impl EventStream {
     /// `<=` this and applying the rest (`ipc.md` #eventssubscribe).
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// The incarnation that answered the subscribe —
+    /// [`EventsSubscribeResult::session_id`], which says why a client
+    /// compares it with the one `session.identify` returned.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Why the stream ended, once the terminal envelope has arrived.

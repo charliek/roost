@@ -664,12 +664,14 @@ def test_events_push_reaches_a_python_subscriber(env):
     started(env)
 
     with env.client() as client:
+        identified = client.call("session.identify")["session_id"]
         # Reading a session is not authority: a subscriber that asked for
         # nothing else gets a real stream — acked with a fence, and
         # delivering the session's commits.
         with EventStream(env.socket) as second:
             second_fence = second.subscribe()
             assert second_fence > 0
+            assert second.session_id == identified
 
             snapshot = client.call("tab.list")
             project = int(snapshot["projects"][0]["id"])

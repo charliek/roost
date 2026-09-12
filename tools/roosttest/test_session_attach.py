@@ -121,7 +121,7 @@ def attach_ticket(
     *,
     kinds: list[str] | None = None,
     libghostty_build: str | None = None,
-    focus: bool | None = None,
+    focus: bool = True,
 ) -> dict:
     """`tab.attach` — a single-use ticket for one data connection.
 
@@ -130,9 +130,9 @@ def attach_ticket(
     have to be updated every time `third_party/ghostty` moves. The
     mismatch case mutates this value on purpose.
 
-    `focus` rides the wire only when a caller asks for it, so the default
-    here is the wire's: an omitted `focus` is a focused attach, and every
-    other case in this module goes on exercising that by saying nothing.
+    `focus` is always sent. Protocol 5 requires it — the omit-when-true
+    shim that let a caller say nothing is gone — so the default here is
+    the claim an ordinary attach makes rather than the wire's.
     """
     if libghostty_build is None:
         libghostty_build = client.call("session.identify")["libghostty_build"]
@@ -144,9 +144,8 @@ def attach_ticket(
         "cell_w_px": 0,
         "cell_h_px": 0,
         "libghostty_build": libghostty_build,
+        "focus": focus,
     }
-    if focus is not None:
-        params["focus"] = focus
     return client.call("tab.attach", params)
 
 
@@ -178,7 +177,7 @@ def attached_as(
     cols: int = COLS,
     rows: int = ROWS,
     *,
-    focus: bool | None = None,
+    focus: bool = True,
 ) -> tuple[DataPlane, dataplane.Reply, dict]:
     """The same prologue, offering exactly one kind.
 

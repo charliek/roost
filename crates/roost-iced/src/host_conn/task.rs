@@ -968,12 +968,31 @@ async fn subscribe(
     plan: SubscribePlan<'_>,
 ) -> Result<(EventRx, tokio::task::AbortHandle, Subscribed), AttemptError> {
     if let Some(resume) = plan.offered() {
-        if let Some(resumed) = resume_stream(socket, resume).await? {
+        if let Some(resumed) = resume_stream(socket, resume, plan.session_id).await? {
             return Ok(resumed);
         }
     }
-    let (events, pump, mirror) = subscribe_and_snapshot(socket, control).await?;
+    let (events, pump, mirror) = subscribe_and_snapshot(socket, control, plan.session_id).await?;
     Ok((events, pump, Subscribed::Fresh(mirror)))
+}
+
+/// Refuse an ack that came back from a different run of the session than
+/// `session.identify` reached.
+///
+/// A subscribe is its own dial, so a restart — or a replaced socket —
+/// between the two legs lands the stream on an incarnation whose
+/// revisions and rows are a different history, and this client would fold
+/// one onto the other (#458). Checked before the pump is spawned: a pump
+/// that has started is already folding.
+fn one_incarnation(stream: &EventStream, identified: &str) -> Result<(), AttemptError> {
+    let answered = stream.session_id();
+    if answered != identified {
+        return Err(AttemptError::Transport(format!(
+            "session {answered} answered the subscribe; \
+             this attempt identified session {identified}"
+        )));
+    }
+    Ok(())
 }
 
 /// Offer the checkpoint. `Ok(None)` is the session refusing by name —
@@ -989,6 +1008,7 @@ async fn subscribe(
 async fn resume_stream(
     socket: &Path,
     resume: &Resume,
+    identified: &str,
 ) -> Result<Option<(EventRx, tokio::task::AbortHandle, Subscribed)>, AttemptError> {
     // Read here rather than carried on the checkpoint: this is the
     // moment the fence has to be true — see [`Resume`].
@@ -1024,6 +1044,7 @@ async fn resume_stream(
         }
     };
 
+    one_incarnation(&stream, identified)?;
     let ack = stream.revision();
     if ack != from_revision {
         // The ack echoes the fence by contract. A different one with no
@@ -1048,12 +1069,14 @@ async fn resume_stream(
 async fn subscribe_and_snapshot(
     socket: &Path,
     control: &mut IpcClient,
+    identified: &str,
 ) -> Result<(EventRx, tokio::task::AbortHandle, HostMirror), AttemptError> {
     // Bounded: this dials and handshakes, and a peer that accepts
     // without answering must not hold the connection in `Connecting`.
     let stream = tokio::time::timeout(leg(), EventStream::connect(socket))
         .await
         .map_err(|_| AttemptError::Transport(format!("{} timed out", ops::EVENTS_SUBSCRIBE)))??;
+    one_incarnation(&stream, identified)?;
     let ack = stream.revision();
     let (events, pump) = spawn_event_pump(stream);
 
@@ -1391,10 +1414,16 @@ mod tests {
     }
 
     fn seeded_list(revision: Option<u64>) -> TabListResult {
+        seeded_list_named("p", revision)
+    }
+
+    /// A one-project snapshot named after the session that answers it, so
+    /// a mirror built from one incarnation can be told from another's.
+    fn seeded_list_named(project: &str, revision: Option<u64>) -> TabListResult {
         TabListResult {
             projects: vec![Project {
                 id: 1,
-                name: "p".into(),
+                name: project.into(),
                 cwd: "/tmp".into(),
                 position: 0,
                 created_at: 0,
@@ -1411,19 +1440,19 @@ mod tests {
     /// The `session.identify` result every fake session in this module
     /// answers with — the one shape that clears the compatibility gate
     /// against the build [`config`] claims.
-    fn identify_result() -> serde_json::Value {
+    fn identify_result(session_id: &str) -> serde_json::Value {
         serde_json::json!({
             "app_version": "test",
             "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
             "payload_kinds": super::super::state::CLIENT_PAYLOAD_KINDS,
             "libghostty_build": "gb",
-            "session_id": SESSION_ID,
+            "session_id": session_id,
             "started_at": "2026-01-01T00:00:00Z",
         })
     }
 
-    /// The session id [`identify_result`] answers with, and the one a
-    /// checkpoint has to name to be offered.
+    /// The session id a [`Fake`] names unless a test names another, and
+    /// the one a checkpoint has to name to be offered.
     const SESSION_ID: &str = "s1";
 
     /// The revision every fake session's `tab.list` and fresh subscribe
@@ -2036,7 +2065,7 @@ mod tests {
                             ops::SESSION_IDENTIFY => serde_json::json!({
                                 "id": id,
                                 "ok": true,
-                                "result": identify_result(),
+                                "result": identify_result(SESSION_ID),
                             }),
                             ops::SESSION_SET_THEME => {
                                 serde_json::json!({"id": id, "ok": true, "result": {}})
@@ -2298,6 +2327,10 @@ mod tests {
     /// *control* connection and nothing else.
     #[derive(Clone)]
     struct Fake {
+        /// The incarnation this session names on every ack — `identify`
+        /// and `events.subscribe` alike, which is what lets a test point
+        /// the two legs of one subscribe at two sessions.
+        session_id: &'static str,
         put_file: PutFile,
         /// A control op this session reads and does not answer until
         /// [`Self::release`] is signalled.
@@ -2348,11 +2381,15 @@ mod tests {
         /// How many `tab.list` snapshots it has been asked for. A
         /// resumed reconnect takes none, which is the whole of R11.
         tab_lists: Arc<AtomicUsize>,
+        /// Subscribed connections whose peer has hung up. Read through
+        /// [`Self::held_streams`].
+        streams_ended: Arc<AtomicUsize>,
     }
 
     impl Fake {
         fn new(put_file: PutFile) -> Fake {
             Fake {
+                session_id: SESSION_ID,
                 put_file,
                 stall: None,
                 stall_skips: Arc::new(AtomicUsize::new(0)),
@@ -2373,6 +2410,15 @@ mod tests {
                 resume_drops: Arc::new(AtomicUsize::new(0)),
                 subscribes: Arc::new(Mutex::new(Vec::new())),
                 tab_lists: Arc::new(AtomicUsize::new(0)),
+                streams_ended: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// A plain session that calls itself `session_id`.
+        fn naming(session_id: &'static str) -> Fake {
+            Fake {
+                session_id,
+                ..Fake::new(PutFile::Land)
             }
         }
 
@@ -2394,6 +2440,20 @@ mod tests {
 
         fn snapshots(&self) -> usize {
             self.tab_lists.load(Ordering::Acquire)
+        }
+
+        fn identifies(&self) -> usize {
+            self.identifies.load(Ordering::Acquire)
+        }
+
+        /// Subscribed connections whose peer is still on the other end.
+        /// Only an event pump reads an event stream, and it holds the
+        /// connection for as long as it lives — so zero is the proof that
+        /// none was spawned on a stream this session answered.
+        fn held_streams(&self) -> usize {
+            self.subscribes()
+                .len()
+                .saturating_sub(self.streams_ended.load(Ordering::Acquire))
         }
 
         fn subscribes(&self) -> Vec<EventsSubscribeParams> {
@@ -2486,7 +2546,12 @@ mod tests {
                     }
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => line,
-                        _ => return,
+                        _ => {
+                            if subscribed {
+                                self.streams_ended.fetch_add(1, Ordering::AcqRel);
+                            }
+                            return;
+                        }
                     },
                 };
                 let request: serde_json::Value = serde_json::from_str(&line).expect("a request");
@@ -2513,7 +2578,7 @@ mod tests {
                         serde_json::json!({
                             "id": id,
                             "ok": true,
-                            "result": identify_result(),
+                            "result": identify_result(self.session_id),
                         })
                     }
                     ops::TAB_LIST => {
@@ -2521,7 +2586,7 @@ mod tests {
                         serde_json::json!({
                             "id": id,
                             "ok": true,
-                            "result": seeded_list(Some(SESSION_REVISION)),
+                            "result": seeded_list_named(self.session_id, Some(SESSION_REVISION)),
                         })
                     }
                     ops::EVENTS_SUBSCRIBE => {
@@ -2573,7 +2638,7 @@ mod tests {
                 serde_json::json!({
                     "id": id,
                     "ok": true,
-                    "result": {"revision": revision, "session_id": SESSION_ID},
+                    "result": {"revision": revision, "session_id": self.session_id},
                 })
             };
             let Some(from) = from_revision else {
@@ -2990,6 +3055,123 @@ mod tests {
         assert_eq!(subscribes[0].from_revision, None);
         assert_eq!(fake.snapshots(), 1);
         assert_eq!(resumed(&host.stop().await), None);
+    }
+
+    // ---- one subscribe, one incarnation (#458) --------------------------
+
+    /// A session that answers the control leg and is then replaced, with
+    /// its accepted connection still serving. The recipe for "the socket
+    /// moved between the dials": A identified, B answers the subscribe.
+    async fn identified_then_replaced(
+        socket: &Path,
+        a: &Fake,
+        b: &Fake,
+    ) -> (IpcClient, ConnectFacts) {
+        a.serve(socket);
+        let config = config(
+            socket.to_path_buf(),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+        );
+        let identified = open_control(&config, ConnectMode::Dial)
+            .await
+            .expect("the control leg identifies A");
+        std::fs::remove_file(socket).expect("unlink the socket A is bound to");
+        b.serve(socket);
+        identified
+    }
+
+    /// **#458.** A subscribe has two legs, and nothing but this check
+    /// says they reached one session: the ack names B, `session.identify`
+    /// named A, and the alternative is a mirror of A's rows fenced
+    /// against B's revisions.
+    #[tokio::test]
+    async fn a_subscribe_that_reaches_another_incarnation_fails_before_it_snapshots() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("two-legs.sock");
+        let fake_a = Fake::new(PutFile::Land);
+        let fake_b = Fake::naming("s2");
+        let (mut control, facts) = identified_then_replaced(&socket, &fake_a, &fake_b).await;
+        assert_eq!(facts.session_id, SESSION_ID);
+
+        let plan = SubscribePlan {
+            resume: None,
+            session_id: &facts.session_id,
+        };
+        let error = match subscribe(&socket, &mut control, plan).await {
+            Err(error) => error,
+            Ok((_events, _pump, Subscribed::Fresh(mirror))) => panic!(
+                "expected a refusal; B answered the subscribe and the mirror holds {:?} \
+                 off {} snapshot(s) of A",
+                mirror
+                    .projects
+                    .iter()
+                    .map(|project| project.name.as_str())
+                    .collect::<Vec<_>>(),
+                fake_a.snapshots()
+            ),
+            Ok((_events, _pump, Subscribed::Resumed { ack })) => {
+                panic!("expected a refusal; nothing was offered, yet a resume acked {ack}")
+            }
+        };
+
+        assert_eq!(
+            transport(&error),
+            "session s2 answered the subscribe; this attempt identified session s1"
+        );
+        assert_eq!(fake_a.identifies(), 1, "the control leg identified A");
+        assert_eq!(fake_b.identifies(), 0, "and nothing identified B");
+        assert_eq!(fake_b.subscribes().len(), 1, "the event leg reached B");
+        assert_eq!(
+            fake_a.snapshots(),
+            0,
+            "and A was never listed onto B's fence"
+        );
+    }
+
+    /// The resume leg is a dial too, so it can land on the same mismatch.
+    /// B echoes the fence the checkpoint names — only the incarnation
+    /// tells the two apart — and the refusal lands *before* the pump: B's
+    /// stream is dropped unread, where a pump would have started folding
+    /// B's events onto A's mirror.
+    #[tokio::test]
+    async fn a_resume_ack_naming_another_incarnation_is_refused_before_the_pump_starts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("two-legs-resume.sock");
+        let fake_a = Fake::new(PutFile::Land);
+        let fake_b = Fake::naming("s2");
+        let (mut control, facts) = identified_then_replaced(&socket, &fake_a, &fake_b).await;
+        assert_eq!(facts.session_id, SESSION_ID);
+
+        let resume = checkpoint(SESSION_ID, 7);
+        let plan = SubscribePlan::resuming(&resume);
+        let error = match subscribe(&socket, &mut control, plan).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected a refusal; B answered the resume this attempt offered A"),
+        };
+
+        assert_eq!(
+            transport(&error),
+            "session s2 answered the subscribe; this attempt identified session s1"
+        );
+        assert_eq!(
+            fake_b.subscribes()[0].from_revision,
+            Some(7),
+            "the fence was offered to B, which echoed it"
+        );
+        assert_eq!(
+            fake_a.snapshots(),
+            0,
+            "and a mismatched ack fails the attempt rather than falling back"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while fake_b.held_streams() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("B's stream is dropped, not pumped: a pump would hold it open");
     }
 
     /// A localhost drop retries inside the same task, so it never goes

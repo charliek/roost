@@ -503,6 +503,7 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
                     "cell_w_px": 0,
                     "cell_h_px": 0,
                     "libghostty_build": build,
+                    "focus": True,
                 },
             )
 
