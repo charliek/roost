@@ -718,6 +718,28 @@ impl PtySupervisor {
         rows: u16,
         socket_path: &std::path::Path,
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
+        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, || {})
+    }
+
+    /// [`Self::spawn`], plus a seam for the one window nothing else can
+    /// reach: `before_promote` runs after the child exists and before
+    /// the promotion re-checks `pending`, so a test can land a `close()`
+    /// inside it deterministically. It is invoked **outside every
+    /// lock** — a hook holding `sessions` or `pending` would deadlock
+    /// the very `close()` it exists to let in.
+    // `spawn`'s own list is already at clippy's bar; the seam is the
+    // one over it.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with(
+        &self,
+        tab_id: i64,
+        cwd: &str,
+        argv: &[String],
+        cols: u16,
+        rows: u16,
+        socket_path: &std::path::Path,
+        before_promote: impl FnOnce(),
+    ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
         // Reserve the slot atomically. Two concurrent
         // `spawn(tab_id, ...)` calls used to be racy: the first
         // would `contains_key` and the second would do the same
@@ -975,6 +997,7 @@ impl PtySupervisor {
                 .as_ref()
                 .map(|pipe| (pipe.cmd_tx.clone(), pipe.tab_generation)),
         };
+        before_promote();
         // Promote the slot from pending → sessions atomically, BEFORE
         // the reap task exists (see below).
         //
@@ -2507,5 +2530,85 @@ mod tests {
         );
         signaller.join().expect("signal thread");
         poller.join().expect("poll thread");
+    }
+
+    /// A shell that dies on SIGHUP as one process, leaving no
+    /// descendant to hold the PTY open. The `COOPERATIVE` idiom of
+    /// `tests/pty_shutdown_test.rs`, restated because that file is a
+    /// separate crate target.
+    const COOPERATIVE: &str = "exec sleep 100";
+
+    /// Bounded wait for a tab's reap to reach the lifecycle channel.
+    async fn exited(lifecycle: &mut broadcast::Receiver<SupervisorEvent>, tab_id: i64) -> bool {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match lifecycle.recv().await {
+                    Ok(SupervisorEvent::TabExited { tab_id: id, .. }) if id == tab_id => return,
+                    Ok(_) => {}
+                    Err(err) => panic!("lifecycle recv: {err:?}"),
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_close_inside_the_promotion_window_cancels_the_spawn() {
+        let sup = Arc::new(PtySupervisor::new());
+        let mut lifecycle = sup.subscribe_lifecycle();
+        let tab_id = 469;
+        let socket = std::path::PathBuf::from("/tmp/roost-pty-promotion-window.sock");
+        let argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), COOPERATIVE.into()];
+
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let spawning = tokio::task::spawn_blocking({
+            let sup = sup.clone();
+            let (socket, argv) = (socket.clone(), argv.clone());
+            move || {
+                sup.spawn_with(tab_id, "/tmp", &argv, 80, 24, &socket, || {
+                    parked_tx.send(()).expect("the test is listening");
+                    release_rx.recv().expect("the test releases the park");
+                })
+            }
+        });
+
+        parked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the spawn reaches the promotion window");
+        sup.close(tab_id);
+        release_tx.send(()).expect("the spawn is parked");
+        let spawned = spawning.await.expect("the spawn task joins");
+
+        // A promotion that installed the session anyway leaves a live
+        // `sleep 100` behind, and tokio's shutdown waits out its reap
+        // task — so tear it down here rather than stall the whole test
+        // binary on the assertion below.
+        if spawned.is_ok() {
+            sup.close(tab_id);
+            exited(&mut lifecycle, tab_id).await;
+        }
+
+        let Err(err) = spawned else {
+            panic!("a close inside the promotion window cancels the spawn");
+        };
+        assert!(
+            matches!(err.downcast_ref::<PtyError>(), Some(PtyError::Cancelled(id)) if *id == tab_id),
+            "the cancellation names this tab: {err:?}"
+        );
+        assert!(!sup.has(tab_id), "the cancelled spawn installed no session");
+        assert!(
+            exited(&mut lifecycle, tab_id).await,
+            "the unwanted child was terminated and reaped"
+        );
+
+        sup.spawn(tab_id, "/tmp", &argv, 80, 24, &socket)
+            .expect("the freed slot leaked into neither pending nor sessions");
+        sup.close(tab_id);
+        assert!(
+            exited(&mut lifecycle, tab_id).await,
+            "the replacement child was reaped too"
+        );
     }
 }
