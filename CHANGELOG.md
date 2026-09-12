@@ -123,8 +123,8 @@ release workflow asserts they agree).
   `session-mismatch` — all three, plus `invalid-param` for a bare
   `from_revision`, land on the ack before the stream ever spawns, so the
   connection stays usable for a plain re-subscribe. `tab.effect` (bells,
-  clipboard writes) is never replayed, driver included — only live
-  clients see it — while `notification.fired` is. No protocol bump: the
+  clipboard writes) is never replayed — only live clients see it —
+  while `notification.fired` is. No protocol bump: the
   capability rides `session.identify.features` as `events_resume`.
 - **`gx.remote` metadata key surfaces a gx session's remote lane (#425)** —
   when gx's remote lane is up it stamps its loopback base URL (`gxRemote`,
@@ -249,32 +249,54 @@ release workflow asserts they agree).
   observed, since the row is dropped a commit later regardless. #170's
   hard-restart, if it ever ships, rebuilds the same reset inside its own
   respawn commit.
+- **`ROOST_LEASE` is gone (#468)** — every child a tab spawns used to have
+  a driver lease token injected into its environment, and `roostctl`
+  read the same variable to fill in a write it was sending, printing a
+  hint naming it when a session refused the write for lacking one. There
+  is no lease left to hold, so nothing sets the variable and nothing
+  reads it: a shell profile or script that still exports it is exporting
+  dead weight, harmless but pointless, and should drop it.
 
 ### Changed
 
+- **Session protocol 5: no lease, no takeover, every connection
+  symmetric (#468)** — the interactive lease host sessions grew across
+  R1–R17 is retired outright rather than amended again. `session.connect`
+  and everything it minted are gone: opening a control connection and
+  sending `session.identify` is the whole handshake now. The `lease`
+  field is gone from every op that carried one — `tab.write`,
+  `tab.attach`, `events.subscribe`, `session.set_theme`,
+  `session.set_focus`, `session.set_agent_hooks`, `session.put_file` — a
+  session refuses any of them with `unknown-field` if a client still
+  sends it, and refuses `session.connect` itself with `unknown-op`.
+  `events.subscribe`'s ack now always carries `session_id`, naming the
+  incarnation the subscribe landed on (see the #458 fix below).
+  `session.identify` no longer reports a `features` array — at protocol
+  5 the version number says the whole contract, so there is nothing left
+  to feature-detect. `tab.attach`'s `focus` parameter is no longer
+  optional: every attach states it, always. None of this is eased in
+  with a shim, by decision — a session or client stuck on protocol 2
+  through 4 is refused loudly rather than half-supported. Concretely: a
+  `roost-session` from v0.0.19 still speaks protocol 2, so it lands
+  exactly where a libghostty build skew Roost can't cover already
+  lands — the existing compatibility gate's amber "needs restart" state,
+  offering to fix it in place: the update offer on a host reached over
+  SSH, the restart offer on `localhost`. Restarting (by either route, or
+  by hand) is the only way forward, and it costs what a restart always
+  has — every shell on that session comes back only as **layout**
+  (title, cwd, position), never as the process or scrollback that was
+  running.
 - **A second window, or a phone, can type into a tab you already have
-  open — without taking it over (#453)** — attaching to a tab and
-  writing into it used to need the session's one interactive lease, so
-  picking up a session from a second device meant deposing whatever had
-  it first, which froze the first device's terminal grid. Typing and
-  attaching are now open to any client on the same machine and user; the
-  lease survives only as the tab's **foreground** — who gets bells and
-  clipboard writes, whose focus mutes notifications, and who can push
-  theme/agent-hook/file-upload changes. Taking over the foreground no
-  longer freezes anything: the desktop keeps typing, resizing, and
-  switching tabs, its status band names whoever now holds the
-  foreground, and **"Take the foreground"** takes it back in place —
-  no reconnect, no snapshot, no blink. A tab is now sized by whichever
-  client last interacted with it (typed, resized, or focus-attached),
-  not by the foreground alone, so two clients typing at different sizes
-  will flip the grid between them by design. On the wire:
-  `session.identify.features` gains `"open_input"`, `tab.attach` takes
-  an optional `focus` parameter, a takeover no longer closes any
-  connection (so `taken-over` is no longer a close reason, and
-  `superseded` is gone entirely — nothing displaces a data connection
-  any more), and `SESSION_PROTOCOL_VERSION` stays `4`. **Skew note:** against a `roost-session` built before this
-  change, the old behavior still applies — a takeover still closes the
-  connection, and ↻ is a full reconnect rather than an in-place retake.
+  open — nobody is deposed (#453)** — attaching to a tab and writing
+  into it used to need the session's one interactive lease, so picking
+  up a session from a second device meant deposing whatever had it
+  first, which froze the first device's terminal grid. Typing and
+  attaching are now open to every same-UID client at once: nothing is
+  deposed, nothing freezes, and nothing reconnects because another
+  client showed up. A tab is sized by whichever client last interacted
+  with it (typed, resized, or attached), not by a single owner, so two
+  clients typing at different sizes will flip the grid between them by
+  design.
 - **`tab.reorder` / `project.reorder` narrow the ids they accept** — the
   new host-qualified ref parser requires the canonical integer spelling,
   so non-canonical forms like `"+4"` or `"04"`, which the old codec
@@ -303,6 +325,29 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **A subscribe that lands on a different incarnation than the one just
+  identified is refused before it can mix the two sessions' state
+  (#458)** — `session.identify` and `events.subscribe` are two separate
+  connections, dialed moments apart; if the session had restarted, or
+  the socket had moved onto a fresh incarnation, in that gap, a client
+  could identify session A and have its subscribe answered by session
+  B — folding B's tabs and revisions onto rows the client believed were
+  A's, with nothing on the wire to say so. `events.subscribe`'s ack now
+  always carries `session_id`, and every prologue and resume compares it
+  against identify's before the event pump ever spawns: a mismatch fails
+  the attempt outright, rather than snapshotting the wrong session, and
+  the reconnect ladder retries — identifying fresh against whichever
+  session actually answers next.
+- **A second client focusing a different tab no longer un-mutes the
+  first client's tab (#468)** — focus used to be one slot per session:
+  whichever client claimed it last decided the single tab whose
+  notifications were suppressed, so a second window or a phone focusing
+  tab 2 silently un-muted tab 1 for the client still looking at it
+  there. Focus is now a per-connection statement of what that connection
+  is looking at, and a tab is muted while *any* connection is viewing
+  it — closing a connection, or that connection moving off the tab, is
+  the only way its share of the mute goes away. A session with no
+  viewers at all — headless, nobody attached yet — mutes nothing.
 - **The app in `/Applications` now carries its own notarization ticket
   (#405)** — the release pipeline stapled only the DMG, so a user who
   dragged `Roost.app` (or `Roost-Iced.app`) out of the image and first
@@ -327,27 +372,6 @@ release workflow asserts they agree).
   gone" path does. Hitting it needs two things acting on one tab at
   once — the UI and `roostctl`, or two clients on one host session —
   so it was rare but silent, which is the bad combination.
-
-- **Taking the foreground back on an SSH host no longer reconnects, and
-  no longer resizes the tab under whoever else is looking (#462)** —
-  a takeover moves the *foreground*, and the client it deposed keeps its
-  connection, its stream and its attach. Pressing ↻ or "Take the
-  foreground" on a `localhost` host claimed that foreground back on the
-  connection already there: no reconnect, no reattach, no blink. On a
-  host reached over SSH the same button did a full reconnect instead,
-  because reconnecting there tore down the tunnel — and the deposed
-  client's control leg with it — before anything could ask. The reattach
-  that followed was focused, so it also resized the shared tab to this
-  window's grid, which the phone or laptop still watching it saw happen.
-  The retake now runs on every transport, riding the tunnel that is
-  already open. The one case that still reconnects is a connection whose
-  tunnel has already been replaced, which is a genuinely different
-  connection. `roostctl host connect` takes the same path. Separately, a
-  retake that is granted and then fails part-way now leaves the
-  reconnect ladder holding the lease it actually won rather than the one
-  it superseded — that ladder used to probe with the stale lease, be
-  told it was not current, and quietly land the user as an observer of a
-  session they had just taken back.
 
 - **A `tab.resize` no longer blanks the terminal's cell metrics, so
   in-band size reports stop reading `0x0` (#463)** — `tab.resize` states
