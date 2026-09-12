@@ -36,7 +36,7 @@ flowchart LR
     TabTask --- PTY
   end
 
-  Control -- "session.identify, session.connect,<br/>session.set_theme, tab.attach,<br/>workspace mutations" --> SessionIPC
+  Control -- "session.identify, session.set_theme,<br/>tab.attach, workspace mutations" --> SessionIPC
   EventsConn -- "events.subscribe →<br/>EventBatch stream" --> SessionIPC
   Data -- "ROOSTDP2 handshake →<br/>SNAP / PTY / EXIT frames" --> TabTask
 ```
@@ -113,8 +113,8 @@ per-connection statement — "this connection is looking at tab N" — and
 moves nothing else: the session's active selection and persisted
 selection move only through `tab.focus`. A tab is muted while **any**
 connection says it is looking at that tab
-(`attention_suppressed_by_focus(tab) = (window_focused && active_tab_id
-== tab) || focused.values().any(|t| *t == tab)`); a connection's
+(`tab_is_being_watched(tab) = (window_focused && active_tab_id
+== tab) || viewing.values().any(|t| *t == tab)`); a connection's
 statement is forgotten the moment it restates `null` or the connection
 closes, and nothing else clears it. Two clients on two different tabs
 therefore both get muted correctly, with zero further coordination
@@ -150,7 +150,7 @@ already attached.
 Two small additions ride the existing events stream as new event types — additive, and of the kind that does not move `SESSION_PROTOCOL_VERSION` (an older client simply ignores an event name it doesn't recognize), so it stayed at `2` for HS-2. Plan 047 later moved it to `3` for `session.put_file`, which a pre-047 session could only answer `unknown-op` — see the versioning rule in [`ipc.md`](../reference/ipc.md#session-sockets):
 
 - **`tab.effect` events** — a session's per-tab OSC scan now emits `bell` and OSC 52 `clipboard-write` as client-directed effects on the events stream (`crates/roost-engine/src/tab_task.rs`), fanned out to every subscriber for each to apply by its own rule (see [Multiple clients](#the-leasetakeover-lifecycle)) — not to a single owner, and not gated on who is actually typing. Everything else the scanner sees (pointer shape, today) stays dropped and debug-logged in the tab task, by design — the envelope is scoped to these two effects rather than left open to "just one more."
-- **`session.set_theme`** — closes the reseed gap the architecture doc left open: a connecting client seeds every tab's server `Terminal` with its own palette (sent right after `session.connect`, before the first `tab.attach`), so a program that queries a color from a session gets back what the attached client is actually rendering, not the server's factory default.
+- **`session.set_theme`** — closes the reseed gap the architecture doc left open: a connecting client seeds every tab's server `Terminal` with its own palette (sent right after `session.identify`, before the first `tab.attach`), so a program that queries a color from a session gets back what the attached client is actually rendering, not the server's factory default.
 
 See [`reference/ipc.md`](../reference/ipc.md#events) for the full event catalog and [`session.set_theme`](../reference/ipc.md#sessionset_theme)'s wire shape.
 
@@ -389,7 +389,7 @@ Each of the five pytest lanes needs a UI **and** a daemon, so none of them rides
 
 ## Known limitations
 
-- **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten the moment that connection closes. It remains true against a session too old to serve the op — that refusal is harmless (`unknown-op`, logged once per connection) and leaves HS-2's behavior: `notification.fired` never fires for whichever tab that session considers active.
+- **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten the moment that connection closes. There is no longer an older-session case beneath it: protocol 5's compatibility gate tests exact equality, so a session too old to serve the op never reaches a connected state to exhibit HS-2's behaviour — it lands in `NeedsRestart` with the update or restart offer instead.
 - **Kitty images render blank after attach.** The snapshot payload doesn't currently carry Kitty graphics protocol state (architecture §5).
 - **Missed-while-detached effects still are not replayed; notifications within the replay window now are.** A `tab.effect` (bell, clipboard write) that fired while nobody was attached is still gone, by design (non-goal, not a bug). But a reconnect to the same `session_id` that lands inside the session's bounded replay ring (`ROOST_SESSION_REPLAY_WINDOW`) now *resumes* `events.subscribe` from the last-applied revision instead of re-snapshotting, so any `notification.fired` committed during the gap replays onto the carried mirror and its inbox row appears — the once-only replay and the no-effect rule are the server's existing contract (R5, #440), inherited here rather than changed. A reconnect that falls outside the window, or that the session refuses for any other reason (`replay-expired`, `revision-ahead`, `session-mismatch`), falls back to the ordinary fresh subscribe + `tab.list` snapshot — never fatal, just back to *current* state, exactly as before R11.
 - **One attached tab per host at a time from this client — a client policy, not a server limit.** As of R15 (plan 057) the server itself admits any number of data connections to one tab (bounded only by the outstanding-token quota per TTL plus the concurrent-snapshot cap, both named in [`ipc.md`](../reference/ipc.md)); a second window or a phone can attach to the same tab this client has open and both type, with neither displacing the other. What is unchanged is this client's own attach-on-focus policy: it dials a tab's data connection only while that tab is focused and detaches on blur, so it never itself holds more than one live data connection at a time. Multi-attach *from one client* (a warm pool of several tabs' connections at once) is still explicit future work.

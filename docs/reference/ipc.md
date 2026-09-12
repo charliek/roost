@@ -1689,7 +1689,7 @@ optional and, per the wire's usual rule, omitted rather than sent as
 Response (the last request/response frame on the connection):
 
 ```json
-{"id": "7", "ok": true, "result": {"revision": 42}}
+{"id": "7", "ok": true, "result": {"revision": 42, "session_id": "8ba08e0d1c4f4a9e"}}
 ```
 
 On a resume the ack echoes `from_revision` back as `revision`, so **"the
@@ -1815,9 +1815,12 @@ ignored — HS-2 scope. Silently serving an unfiltered stream to a client
 that asked for one tab would make it mis-attribute every other tab's
 events.
 
-This op has never gated on anything but the socket's own same-UID
-check, and at `SESSION_PROTOCOL_VERSION` `5` there is no other
-classification left to describe — every subscriber gets every event.
+At `SESSION_PROTOCOL_VERSION` `5` this op gates on nothing but the
+socket's own same-UID check, and there is no other classification left
+to describe — every subscriber gets every event. That is a change, not a
+constant: generations 2 through 4 required the lease here, and a
+leaseless subscribe opened an observer stream with `tab.effect` stripped
+(see [the history below](#sessionconnect)).
 The history of how this op's shape moved across earlier generations is
 in [Versioning](#versioning) and CHANGELOG.
 
@@ -2048,9 +2051,14 @@ Protocol generations 1 through 4 required a client to claim an
 against, and which connection the `session.set_theme` /
 `session.set_agent_hooks` / `session.put_file` ops would accept.
 Reconnecting was always a takeover — the same op, with `takeover: true`,
-displaced whoever held the lease — and a takeover left every control
-and data connection open, demoting only the displaced client's event
-stream to a **`session.driver_changed`**-notified observer.
+displaced whoever held the lease — and what that did to the displaced
+client's connections changed within the generation. Through protocol 2
+and 3 a takeover **closed every connection** the previous holder had,
+each told why: a terminal `session.stopping` envelope on the events
+connection, an `ERROR` frame on the data connections. R15, late in
+generation 4, left them open instead and demoted only the displaced
+client's event stream to a **`session.driver_changed`**-notified
+observer.
 
 Protocol 5 retired all of it. There is no `session.connect` op, no
 `lease` field on any op, and no `session.driver_changed` event; every
@@ -2075,7 +2083,7 @@ Request:
 
 Response: `{"tabs": 3}` — the number of live tabs whose server Terminal was reseeded. `0` is a success: a session with no tabs yet still remembers the theme for the ones it opens next.
 
-`palette` must carry exactly 256 `#rrggbb` entries (lowercase, the same spelling [`tab.dump_resolved`](#tabdump_resolved) uses); a short or long array is `invalid-param` rather than a partial application.
+`palette` must carry exactly 256 `#rrggbb` entries; a short or long array is `invalid-param` rather than a partial application. The parser takes either case, and roost writes lowercase — the same spelling [`tab.dump_resolved`](#tabdump_resolved) uses — so the vectors have one spelling to agree about. Only the long form is accepted: `#abc` would be a second spelling of one color.
 
 A client sends this **right after connecting and before its first `tab.attach`** — attaching before the theme lands would paint the session's factory colors for one frame — and again whenever its own theme changes thereafter. Concurrent callers are last-writer-wins by design: the theme store mints a generation on every apply, so a `set_theme` racing a tab spawn is caught up at promotion rather than silently lost, and interleaved fan-outs converge on the newest theme instead of whichever send landed last — including between two different clients' palettes.
 
@@ -2094,7 +2102,7 @@ Request:
 
 Response: `{}` — nothing to report beyond "applied".
 
-**Why it exists.** A session is headless: it has no window, so nothing tells it which tab a connected client's terminal widget is actually showing. Without this op the session cannot suppress a notification for the tab you are looking at, so an agent's attention would always fire even while you watch it happen. With it, each connected client states the truth for itself, and the session suppresses a tab's notification while **any** connection says it is looking at that tab — `attention_suppressed_by_focus(tab) = (window_focused && active_tab_id == tab) || focused.values().any(|t| *t == tab)`, where the first clause is the local UI's own window-focus rule and the second is every session connection's stated focus, unioned. Two clients on two different tabs therefore both get muted, correctly, with no coordination between them and no further traffic once each has stated its own tab.
+**Why it exists.** A session is headless: it has no window, so nothing tells it which tab a connected client's terminal widget is actually showing. Without this op the session cannot suppress a notification for the tab you are looking at, so an agent's attention would always fire even while you watch it happen. With it, each connected client states the truth for itself, and the session suppresses a tab's notification while **any** connection says it is looking at that tab — `tab_is_being_watched(tab) = (window_focused && active_tab_id == tab) || viewing.values().any(|t| *t == tab)`, where the first clause is the local UI's own window-focus rule and the second is every session connection's stated focus, unioned. Two clients on two different tabs therefore both get muted, correctly, with no coordination between them and no further traffic once each has stated its own tab.
 
 **`focused_tab_id` is required, and nullable.** `null` means "this connection is looking at nothing on this session" — the client's window lost focus, or its selection moved to another host or to a local tab. An **omitted** field is not the same statement and is refused with `missing-param`: a client that forgot to say is exactly the one that must not be guessed for, since guessing "focused" re-creates the mute this op exists to fix.
 

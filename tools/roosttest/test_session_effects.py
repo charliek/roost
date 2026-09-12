@@ -677,7 +677,7 @@ def test_two_clients_settle_with_no_focus_churn(env):
     """Two clients on two tabs mute both tabs and then go quiet.
 
     The mute is a union, so neither statement displaces the other, and
-    neither moves the session's selection (`Workspace::set_client_focus`
+    neither moves the session's selection (`Workspace::set_viewed_tab`
     says why that would not settle).
 
     Counted rather than timed: the sentinel notification is committed
