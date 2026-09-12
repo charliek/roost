@@ -304,8 +304,10 @@ impl ReapLatch {
 /// child that made itself traced (`PTRACE_TRACEME` names *us* as its
 /// tracer) reports its ptrace stops here too, and a `wait()` on a
 /// stopped child blocks — which the caller would run under the latch.
-/// So only `CLD_EXITED` / `CLD_KILLED` / `CLD_DUMPED` answer `Ok`;
-/// anything else is refused, and the caller polls instead.
+/// So only `CLD_EXITED` / `CLD_KILLED` / `CLD_DUMPED` answer `Ok`, and
+/// anything else keeps waiting — which is what the name promises anyway.
+/// Returning on a stop would be worse than useless: it would hand the
+/// caller to a `try_wait` that reads that same stop as an exit.
 fn exited_without_reaping(pid: u32) -> std::io::Result<()> {
     loop {
         // SAFETY: `waitid` only writes the `siginfo_t` we hand it, and
@@ -327,12 +329,17 @@ fn exited_without_reaping(pid: u32) -> std::io::Result<()> {
             }
             return Err(err);
         }
-        return match si_code {
-            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Ok(()),
-            other => Err(std::io::Error::other(format!(
-                "waitid reported si_code {other}, not a terminal status"
-            ))),
-        };
+        if matches!(
+            si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
+            return Ok(());
+        }
+        // Reported, but not dead: keep waiting rather than answering, and
+        // sleep so a stop that `WNOWAIT` leaves in place cannot spin. The
+        // poll fallback is no refuge here — `try_wait` reads a stop as an
+        // exit — so a non-terminal report must never leave this loop.
+        std::thread::sleep(REAP_POLL_INTERVAL);
     }
 }
 
@@ -1086,11 +1093,11 @@ impl PtySupervisor {
         // the session is reachable: the reader only publishes once
         // this task hands it a status.
         tokio::task::spawn_blocking(move || {
-            // Pin the exit as a zombie first, so the `wait()` that
-            // finally releases the pid runs under the latch and cannot
-            // block it (see `ReapLatch`). Without a pid — or if
-            // `waitid` refuses — fall back to polling, which reaps
-            // under the latch too but never holds it across a wait.
+            // Two branches because only one of them can prove the
+            // `wait()` immediate (see `ReapLatch`): with a pid, `waitid`
+            // pins the exit as a zombie first; without one, or if
+            // `waitid` fails outright, polling is what keeps the latch
+            // off a blocking wait.
             let waited = match pid.map(exited_without_reaping) {
                 Some(Ok(())) => latch_for_wait.reap(|| child.wait()),
                 other => {
